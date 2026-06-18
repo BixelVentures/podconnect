@@ -1,3 +1,8 @@
 #!/usr/bin/with-contenv bashio
 export HOME=/root
+for i in $(seq 1 30); do
+  dbus-send --system --dest=org.freedesktop.Avahi --print-reply / \
+    org.freedesktop.Avahi.Server.GetState >/dev/null 2>&1 && break
+  sleep 0.5
+done
 exec go-librespot
