@@ -104,7 +104,9 @@ func fetchOutputs() ([]device, bool) {
 	out := []device{}
 	for _, o := range raw.Outputs {
 		typ, _ := o["type"].(string)
-		if !strings.EqualFold(typ, "airplay") {
+		// OwnTone reports HomePods as "AirPlay 2" (not "AirPlay"), so match the prefix — an exact
+		// "airplay" compare silently dropped every device and left the picker empty.
+		if !strings.HasPrefix(strings.ToLower(typ), "airplay") {
 			continue
 		}
 		name, _ := o["name"].(string)

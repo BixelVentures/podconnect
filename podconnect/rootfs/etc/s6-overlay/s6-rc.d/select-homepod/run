@@ -25,7 +25,8 @@ while true; do
     lasttarget="$HOMEPOD"
   fi
   if curl -fsS -o /dev/null "${URL}/api/config" 2>/dev/null; then
-    airplay="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c '[.outputs[]? | select((.type // "" | ascii_downcase) == "airplay")]')"
+    # OwnTone reports HomePods as "AirPlay 2" (not "AirPlay") — match the prefix, not an exact string.
+    airplay="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c '[.outputs[]? | select((.type // "" | ascii_downcase) | startswith("airplay"))]')"
     [ -z "$airplay" ] && airplay="[]"
     count="$(echo "$airplay" | jq 'length')"
     names="$(echo "$airplay" | jq -r '[.[].name] | join(", ")')"
