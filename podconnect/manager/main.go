@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -80,6 +81,8 @@ func readSpeaker() string {
 }
 
 // fetchOutputs returns the AirPlay outputs OwnTone has discovered, and whether OwnTone answered.
+// Parsed defensively (map + UseNumber) so a field OwnTone serializes as a number rather than a
+// string — notably the 64-bit output "id" — can't make a strict decoder drop every device.
 func fetchOutputs() ([]device, bool) {
 	cl := &http.Client{Timeout: 4 * time.Second}
 	resp, err := cl.Get(owntone + "/api/outputs")
@@ -87,28 +90,33 @@ func fetchOutputs() ([]device, bool) {
 		return nil, false
 	}
 	defer resp.Body.Close()
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
 	var raw struct {
-		Outputs []struct {
-			ID           string `json:"id"`
-			Name         string `json:"name"`
-			Type         string `json:"type"`
-			Selected     bool   `json:"selected"`
-			NeedsAuthKey bool   `json:"needs_auth_key"`
-			RequiresAuth bool   `json:"requires_auth"`
-		} `json:"outputs"`
+		Outputs []map[string]any `json:"outputs"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := dec.Decode(&raw); err != nil {
+		log.Printf("outputs decode error: %v", err)
 		return nil, true
 	}
 	out := []device{}
 	for _, o := range raw.Outputs {
-		if !strings.EqualFold(o.Type, "airplay") {
+		typ, _ := o["type"].(string)
+		if !strings.EqualFold(typ, "airplay") {
 			continue
 		}
-		out = append(out, device{ID: o.ID, Name: o.Name, Selected: o.Selected, NeedsAuth: o.NeedsAuthKey || o.RequiresAuth})
+		name, _ := o["name"].(string)
+		out = append(out, device{
+			ID:        fmt.Sprint(o["id"]), // works whether id is a JSON string or number
+			Name:      name,
+			Selected:  asBool(o["selected"]),
+			NeedsAuth: asBool(o["needs_auth_key"]) || asBool(o["requires_auth"]),
+		})
 	}
 	return out, true
 }
+
+func asBool(v any) bool { b, _ := v.(bool); return b }
 
 // selectOnOwntone activates exactly one output (the proven call select-homepod uses).
 func selectOnOwntone(id string) {
@@ -125,10 +133,15 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 func main() {
+	lastCount := -1
 	http.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		devs, up := fetchOutputs()
 		if devs == nil {
 			devs = []device{}
+		}
+		if up && len(devs) != lastCount {
+			log.Printf("AirPlay devices visible to picker: %d", len(devs))
+			lastCount = len(devs)
 		}
 		writeJSON(w, stateResp{Speaker: readSpeaker(), Saved: readSaved(), OwntoneUp: up, Devices: devs})
 	})
