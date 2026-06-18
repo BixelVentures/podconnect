@@ -1,33 +1,43 @@
 #!/usr/bin/with-contenv bashio
+# Selects the HomePod AirPlay output in OwnTone. Forgiving: auto-selects if there's exactly
+# one AirPlay device, matches the name case-insensitively, and logs the names it finds so the
+# user can copy the exact one. Does NOT touch volume — OwnTone remembers each speaker's last level.
 HOMEPOD="$(jq -r '.homepod_name // ""' /data/options.json)"
-VOL="$(jq -r '.default_volume // 35' /data/options.json)"
 URL="http://localhost:3689"
-bashio::log.info "select-homepod: targeting HomePod '${HOMEPOD}'"
-warned_missing=false
-warned_auth=false
+if [ -n "$HOMEPOD" ]; then
+  bashio::log.info "select-homepod: target '${HOMEPOD}'"
+else
+  bashio::log.info "select-homepod: no homepod_name set — auto-selecting if exactly one AirPlay device is found"
+fi
+listed=""
 while true; do
   if curl -fsS -o /dev/null "${URL}/api/config" 2>/dev/null; then
-    row="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c --arg n "$HOMEPOD" '.outputs[]? | select(.name==$n)' | head -n1)"
+    airplay="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c '[.outputs[]? | select((.type // "" | ascii_downcase) == "airplay")]')"
+    [ -z "$airplay" ] && airplay="[]"
+    count="$(echo "$airplay" | jq 'length')"
+    names="$(echo "$airplay" | jq -r '[.[].name] | join(", ")')"
+    if [ "$count" -gt 0 ] && [ "$names" != "$listed" ]; then
+      bashio::log.info "AirPlay devices found: ${names}"
+      listed="$names"
+    fi
+    row=""
+    if [ -n "$HOMEPOD" ]; then
+      row="$(echo "$airplay" | jq -c --arg n "$HOMEPOD" 'map(select((.name // "" | ascii_downcase) == ($n | ascii_downcase)))[0] // empty')"
+    elif [ "$count" = "1" ]; then
+      row="$(echo "$airplay" | jq -c '.[0]')"
+    fi
     if [ -n "$row" ]; then
       ID="$(echo "$row" | jq -r '.id')"
       SEL="$(echo "$row" | jq -r '.selected')"
+      NM="$(echo "$row" | jq -r '.name')"
       AUTH="$(echo "$row" | jq -r '(.needs_auth_key // .requires_auth) // false')"
       if [ "$AUTH" = "true" ]; then
-        if [ "$warned_auth" = false ]; then
-          bashio::log.warning "HomePod '${HOMEPOD}' needs AirPlay verification. In the Apple Home app: open this HomePod > settings > 'Allow Speaker & Display Access' and set it to 'Anyone on the Same Network' (or 'Everyone')."
-          warned_auth=true
-        fi
+        bashio::log.warning "HomePod '${NM}' needs AirPlay verification — Apple Home app > this HomePod > 'Allow Speaker & Display Access' > 'Anyone on the Same Network'."
       elif [ "$SEL" != "true" ]; then
         if curl -fsS -X PUT "${URL}/api/outputs/set" --data "{\"outputs\":[\"${ID}\"]}" >/dev/null 2>&1; then
-          curl -fsS -X PUT "${URL}/api/player/volume?volume=${VOL}&output_id=${ID}" >/dev/null 2>&1 || true
-          bashio::log.info "Selected HomePod '${HOMEPOD}' (id=${ID}) at volume ${VOL}."
-          warned_missing=false
-          warned_auth=false
+          bashio::log.info "Selected HomePod '${NM}' (volume left at its last setting)."
         fi
       fi
-    elif [ "$warned_missing" = false ]; then
-      bashio::log.info "Waiting for HomePod '${HOMEPOD}' to be discovered... (the name must match the Apple Home app exactly)"
-      warned_missing=true
     fi
   fi
   sleep 10

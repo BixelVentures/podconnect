@@ -23,9 +23,9 @@ hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 | Option | What to put |
 |---|---|
 | `speaker_name` | The name shown in Spotify, e.g. `Kitchen` |
-| `homepod_name` | The **exact** HomePod name from the Apple **Home** app, e.g. `Living Room` |
-| `default_volume` | Starting volume `0`–`100` (e.g. `35`) |
+| `homepod_name` | Which HomePod to play to. **Leave blank** if you have just one HomePod (it's auto-selected). With several, set the Apple **Home** name — the add-on **Log** prints `AirPlay devices found: …` so you can copy the exact name. Matching is case-insensitive. |
 | `bitrate` | `320` |
+| `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface |
 
 Save.
 
