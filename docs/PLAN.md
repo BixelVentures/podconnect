@@ -11,6 +11,12 @@ the Spotify app as a Connect device. Playback can start **from the Spotify app o
 Assist** (voice/automation), and **volume stays in sync** across the Spotify app, Home
 Assistant, and the HomePod.
 
+> **Status (2026-06): this document is the target roadmap.** Built today: the single-HomePod
+> add-on (**PodConnect Speakers** 0.1.4) and the control integration (**PodConnect Control**
+> 0.1.2 — Spotify control of all your Connect devices, polling-based). The multi-room manager,
+> the "Add speaker" Ingress UI, push state, and HomePod volume sync described below are **not
+> yet built**. See `docs/control-plan.md` for the integration's current status.
+
 ## Architecture
 
 ```

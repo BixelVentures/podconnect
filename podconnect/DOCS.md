@@ -1,4 +1,4 @@
-# PodConnect (test slice) — install & test on your HA Green
+# PodConnect Speakers — install on Home Assistant
 
 This add-on makes **one HomePod** appear as a **Spotify Connect speaker**, running on your
 Home Assistant Green. It's the first proof that the full PodConnect idea works on your
@@ -15,7 +15,7 @@ hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 
 ## 2. Install (downloads a prebuilt image — ~2 min, no compiling)
 
-1. Refresh the store → open **PodConnect (test slice)** → **INSTALL**.
+1. Refresh the store → open **PodConnect Speakers** → **INSTALL**.
 2. It **downloads a ready-made image** for your Green — no on-device build.
 
 ## 3. Configure

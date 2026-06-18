@@ -10,6 +10,18 @@ integration, no MQTT. PodConnect owns the whole experience.
 - **PodConnect integration** (new, `custom_components/podconnect/`, distributed via **HACS custom repo**):
   OAuth + Spotify Web API control + `media_player` entities + media browsing.
 
+## Status (current)
+**Built & shipping:**
+- **PodConnect Speakers** add-on `0.1.4` — go-librespot + OwnTone, single HomePod (auto-selected by name);
+  avahi/mDNS reliability fixes. (`external_volume: false` — Spotify volume scales the audio for now.)
+- **PodConnect Control** integration `0.1.2` — Application-Credentials OAuth (own dev app); device-list-driven
+  `media_player` per Connect device; play/pause/next/prev/seek/volume + now-playing; **"Connect to a device"**
+  transfer (Transfer Playback); graceful handling of Spotify "restriction" rejections.
+  **State is Web-API polling (~10s)** — the "push-first" design below is the *target*, not yet built.
+
+**Not yet built:** go-librespot push state; `external_volume: true` + the volume relay (HomePod real-level
+sync); browse & search (Phase 2); multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5).
+
 ## Account model (Family plan)
 - Spotify **Web API is per-account**; a Family plan = separate independent accounts.
 - "**One account owns a speaker at a time**" is standard Spotify Connect behavior — not our limitation.
@@ -27,7 +39,7 @@ integration, no MQTT. PodConnect owns the whole experience.
 - **PodConnect HomePods = first-class managed `media_player` entities** (+ AirPlay volume relay).
 - **Other Connect devices** (MacBook, phone, …) = available **playback targets** → "find Connect in HA" free.
 
-## State updates (push-first, NOT poll-first)
+## State updates (TARGET design — today it polls; push not yet built)
 - **HomePods → go-librespot `/events` websocket (push):** real-time now-playing / play-pause / volume /
   position; **zero Web-API quota**. HA extrapolates the progress bar from position+timestamp.
 - **Foreign devices → light Web-API polling:** one `DataUpdateCoordinator` per account (poll once, fan
@@ -35,18 +47,18 @@ integration, no MQTT. PodConnect owns the whole experience.
 - **Commands (play/pause/next/volume/transfer/browse) → Web API:** occasional, uniform, cloud-consistent.
 - Rationale: keeps us comfortably inside **dev-mode** rate limits and gives instant UI.
 
-## Volume
+## Volume (TARGET — not yet built; today `external_volume: false`)
 - go-librespot `external_volume: true` (no PCM scaling). **Volume-relay in the add-on** watches
   go-librespot `/events`/local API → sets OwnTone/AirPlay output volume → HomePod's real level follows.
   Lives in the add-on for locality + independence from HA. Bidirectional (OwnTone→go-librespot) = stretch.
 
 ## Phases
-0. **Add-on reliability (0.1.3) — current:** wait for avahi ready before OwnTone/go-librespot; single
-   mDNS stack (`zeroconf_backend: avahi`); create `.metadata` pipe. *Volume stays as-is (external_volume
-   false) — not touched here.*
-1. **Integration core:** Application-Credentials OAuth (primary account); Web API client; device-list-driven
-   `media_player`(s) — HomePods managed (push state via go-librespot events), others as targets;
-   play/pause/next/prev/seek/volume + now-playing. **Ships `external_volume: true` + the volume relay.**
+0. **Add-on reliability — ✅ done (0.1.3/0.1.4):** avahi-readiness wait before OwnTone/go-librespot; single
+   mDNS stack (`zeroconf_backend: avahi`); `.metadata` pipe. (`external_volume` stays `false` for now.)
+1. **Integration core — ✅ mostly done (Control 0.1.2):** Application-Credentials OAuth (primary account);
+   Web API client; device-list-driven `media_player`s; play/pause/next/prev/seek/volume + now-playing +
+   "Connect to a device" transfer. **Still pending in Phase 1:** push state (go-librespot events) and
+   `external_volume: true` + the volume relay — deferred, not shipped yet.
 2. **Browse & play:** `browse_media` (playlists/albums/search) + `play_media`.
 3. **HA Assist:** expose entities → voice transport/volume via primary account + "play [content] on [device]".
 4. **Multi-account:** per-family-member config entries; explicit "from <device/account>" routing.
