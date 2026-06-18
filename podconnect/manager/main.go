@@ -156,11 +156,23 @@ func playTestTone() {
 		return
 	}
 	defer f.Close()
-	const rate, secs, freq = 44100, 3, 440.0
-	amp := 0.25 * 32767.0
-	buf := make([]byte, 0, rate*secs*4)
-	for i := 0; i < rate*secs; i++ {
-		u := uint16(int16(amp * math.Sin(2*math.Pi*freq*float64(i)/float64(rate))))
+	// A soft, calming ~330 Hz sine with a gentle fade-in and a long fade-out (no startling
+	// clicks). Deliberately quiet — meant to be just audible in a silent house at night.
+	const rate = 44100
+	const n = rate * 5 / 2 // 2.5 s
+	const freq = 330.0
+	const peak = 0.12 * 32767.0
+	const attack = n * 15 / 100 // fade in over the first 15%
+	const release = n / 2       // fade out over the last 50%
+	buf := make([]byte, 0, n*4)
+	for i := 0; i < n; i++ {
+		env := 1.0
+		if i < attack {
+			env = float64(i) / float64(attack)
+		} else if i > n-release {
+			env = float64(n-i) / float64(release)
+		}
+		u := uint16(int16(peak * env * math.Sin(2*math.Pi*freq*float64(i)/float64(rate))))
 		lo, hi := byte(u), byte(u>>8)
 		buf = append(buf, lo, hi, lo, hi) // little-endian s16, L+R
 	}
@@ -237,7 +249,7 @@ func main() {
 		if target != "" {
 			selectOnOwntone(target)
 		}
-		setMasterVolume(55)
+		setMasterVolume(13) // gentle — just audible in a quiet house
 		go playTestTone()
 		log.Printf("test tone requested (target output id=%q)", target)
 		writeJSON(w, map[string]any{"ok": true, "playing": target != ""})
@@ -354,7 +366,7 @@ document.getElementById('auto').onclick = async function () {
 document.getElementById('test').onclick = async function () {
   this.disabled = true;
   var m = document.getElementById('testmsg');
-  m.textContent = 'Sending a 3-second tone to the HomePod — listen now…';
+  m.textContent = 'Sending a soft, low-volume tone to the HomePod — listen closely…';
   try {
     var r = await (await fetch('api/test', { method: 'POST' })).json();
     m.textContent = r.playing
