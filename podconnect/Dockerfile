@@ -1,4 +1,12 @@
 ARG BUILD_FROM
+
+# --- PodConnect manager (Ingress picker UI) — tiny static Go binary, stdlib only ---
+FROM golang:1.22-bookworm AS manager-build
+WORKDIR /src
+COPY manager/go.mod ./
+COPY manager/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /podconnect-manager .
+
 FROM ${BUILD_FROM}
 
 # Single-stage on purpose for this test slice: keeping the -dev packages guarantees the
@@ -42,6 +50,9 @@ RUN set -eux; \
 
 # Dedicated user for OwnTone (it drops privileges to this uid).
 RUN useradd -r -s /usr/sbin/nologin owntone || true
+
+# PodConnect manager binary (serves the Ingress picker UI)
+COPY --from=manager-build /podconnect-manager /usr/local/bin/podconnect-manager
 
 # s6-overlay v3 services + init scripts
 COPY rootfs /

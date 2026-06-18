@@ -23,11 +23,18 @@ hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 | Option | What to put |
 |---|---|
 | `speaker_name` | The name shown in Spotify, e.g. `Kitchen` |
-| `homepod_name` | Which HomePod to play to. **Leave blank** if you have just one HomePod (it's auto-selected). With several, set the Apple **Home** name — the add-on **Log** prints `AirPlay devices found: …` so you can copy the exact name. Matching is case-insensitive. |
+| `homepod_name` | *(optional fallback)* **Leave blank** and use the **PodConnect panel** instead (see below) — it lets you **pick** the HomePod from a live list, no typing. If you'd rather type, set the Apple **Home** name (case-insensitive). |
 | `bitrate` | `320` |
 | `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface |
 
 Save.
+
+### Pick your HomePod — no typing (recommended)
+
+After starting the add-on, a **PodConnect** item appears in the Home Assistant **sidebar**. Open it
+to see a **live network scan** of every AirPlay device found (the same scan Spotify Connect uses) —
+just **click your HomePod and Save**. Your choice is remembered across restarts and overrides the
+`homepod_name` box. (The panel is also reachable directly at `http://<your-HA-IP>:8099`.)
 
 ## 4. Start & test
 

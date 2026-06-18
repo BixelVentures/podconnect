@@ -2,15 +2,28 @@
 # Selects the HomePod AirPlay output in OwnTone. Forgiving: auto-selects if there's exactly
 # one AirPlay device, matches the name case-insensitively, and logs the names it finds so the
 # user can copy the exact one. Does NOT touch volume — OwnTone remembers each speaker's last level.
-HOMEPOD="$(jq -r '.homepod_name // ""' /data/options.json)"
 URL="http://localhost:3689"
-if [ -n "$HOMEPOD" ]; then
-  bashio::log.info "select-homepod: target '${HOMEPOD}'"
-else
-  bashio::log.info "select-homepod: no homepod_name set — auto-selecting if exactly one AirPlay device is found"
-fi
+# The Ingress picker (manager) writes the chosen device to selected_output.json. It wins over the
+# static homepod_name config option, which is now just a fallback for users who prefer typing.
+read_target() {
+  local saved cfg
+  saved="$(jq -r '.name // ""' /data/selected_output.json 2>/dev/null)"
+  cfg="$(jq -r '.homepod_name // ""' /data/options.json)"
+  if [ -n "$saved" ]; then echo "$saved"; else echo "$cfg"; fi
+}
 listed=""
+lasttarget="__unset__"
 while true; do
+  # Re-read each loop so picking in the Ingress panel takes effect live (no add-on restart).
+  HOMEPOD="$(read_target)"
+  if [ "$HOMEPOD" != "$lasttarget" ]; then
+    if [ -n "$HOMEPOD" ]; then
+      bashio::log.info "select-homepod: target '${HOMEPOD}'"
+    else
+      bashio::log.info "select-homepod: no HomePod chosen yet — open the PodConnect panel to pick one (auto-selects if exactly one AirPlay device is found)"
+    fi
+    lasttarget="$HOMEPOD"
+  fi
   if curl -fsS -o /dev/null "${URL}/api/config" 2>/dev/null; then
     airplay="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c '[.outputs[]? | select((.type // "" | ascii_downcase) == "airplay")]')"
     [ -z "$airplay" ] && airplay="[]"

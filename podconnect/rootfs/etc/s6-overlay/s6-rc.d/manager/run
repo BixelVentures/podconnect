@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bashio
+# PodConnect manager: serves the HA Ingress panel (the no-typing "pick a HomePod" UI) on :8099.
+# It reads OwnTone's live AirPlay scan and persists the chosen device for select-homepod.
+bashio::log.info "PodConnect manager (Ingress picker UI) starting on :8099"
+export OWNTONE_URL="http://localhost:3689"
+export DATA_DIR="/data"
+export PORT="8099"
+exec podconnect-manager
