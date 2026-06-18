@@ -4,11 +4,6 @@ name: Build add-on
 # fetches the go-librespot binary) for both architectures. amd64 gives fast feedback;
 # aarch64 (the HA Green target) is built under QEMU emulation.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "podconnect/**"
-      - ".github/workflows/build.yaml"
   pull_request:
     paths:
       - "podconnect/**"

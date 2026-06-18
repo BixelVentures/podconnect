@@ -1,0 +1,45 @@
+name: Publish add-on image
+
+# Builds the add-on once in CI and publishes per-arch images to GHCR, so installing the
+# add-on on the HA Green PULLS a ready image (~2 min) instead of compiling OwnTone on-device.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "podconnect/**"
+      - ".github/workflows/publish.yaml"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: publish-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, amd64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build & push (${{ matrix.arch }})
+        uses: home-assistant/builder@master
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target /data/podconnect \
+            --image "{arch}-podconnect" \
+            --docker-hub "ghcr.io/bixelventures" \
+            --addon

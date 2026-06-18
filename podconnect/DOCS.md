@@ -5,20 +5,34 @@ Home Assistant Green. It's the first proof that the full PodConnect idea works o
 hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 [`docs/PLAN.md`](../docs/PLAN.md).)
 
-## 1. Get the files onto the Green
+## 1. Copy the files onto the Green (via Samba)
 
-1. Install the **Samba share** add-on (or **Advanced SSH & Web Terminal**) and start it.
-2. Copy the whole **`podconnect/`** folder into the Green's **`/addons`** share, so you end
-   up with `/addons/podconnect/config.yaml` (and `Dockerfile`, `build.yaml`, `rootfs/`).
+1. On your Mac, open **Finder** → press **⌘K** (menu: Go → Connect to Server).
+2. Enter **`smb://homeassistant.local`** (or `smb://<your-Green-IP>`) → **Connect** → log in
+   with your Home Assistant username/password.
+3. A list of shared folders appears. Open the **`addons`** folder.
+4. From your computer, copy the **`podconnect`** folder **into** `addons`.
+   - ✅ Correct: `addons/podconnect/config.yaml`
+   - ❌ Wrong: `addons/PodConnect/podconnect/config.yaml` (nested) — the folder you drop into
+     `addons` must contain `config.yaml` **directly**.
 
 ## 2. Install the add-on
 
-1. **Settings → Add-ons → Add-on Store**.
-2. Top-right **⋮ → Check for updates**.
-3. A **Local add-ons** section appears with **"PodConnect (test slice)"**. Open it → **Install**.
+1. In Home Assistant, click **Settings** (the ⚙️ gear, bottom of the left sidebar).
+2. Click **Add-ons** (puzzle-piece icon).
+3. Bottom-right, click the blue **ADD-ON STORE** button.
+4. Top-right **⋮ (three dots) → Check for updates**, then refresh the browser page.
+5. Scroll to the top — a **"Local add-ons"** section shows **"PodConnect (test slice)"**.
+   Click it → **INSTALL**.
 
-> ⏳ The first install **compiles OwnTone from source** on the Green — expect **~15–40 minutes**.
-> This happens only once. Later starts are instant.
+> ⏳ The first install **compiles OwnTone** on the Green — **~15–40 minutes**, one time only.
+> (Once the prebuilt image is published, this becomes a ~2-minute pull instead.)
+
+**Don't see "Local add-ons" / "PodConnect"?**
+- Re-check step 1.4: `addons/podconnect/config.yaml` must exist with that exact nesting.
+- Redo **⋮ → Check for updates** and hard-refresh the browser.
+- No **Add-ons** entry under Settings? Enable **Advanced Mode** in your HA user profile
+  (click your name, bottom-left → toggle *Advanced Mode*).
 
 ## 3. Configure
 
