@@ -27,6 +27,7 @@ SUPPORTED = (
     | MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.VOLUME_STEP
     | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.SELECT_SOURCE
 )
 
 
@@ -160,6 +161,23 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
     def media_content_id(self) -> str | None:
         return self._item.get("uri") if self._item else None
 
+    @property
+    def source(self) -> str | None:
+        """The Connect device the session is currently on."""
+        pb = self._playback
+        if pb and pb.get("device"):
+            return pb["device"].get("name")
+        return None
+
+    @property
+    def source_list(self) -> list[str]:
+        """All available Connect devices — selecting one moves the session there."""
+        return [
+            dev["name"]
+            for dev in (self.coordinator.data or {}).get("devices", [])
+            if dev.get("name")
+        ]
+
     # --- control (targets this device) ---
     async def _send(self, action) -> None:
         """Run a player command, tolerating Spotify's "restriction" rejections.
@@ -199,3 +217,18 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
             await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
+
+    async def async_select_source(self, source: str) -> None:
+        """"Connect to a device": transfer the session to `source`, keeping play/pause state."""
+        device_id = next(
+            (
+                dev["id"]
+                for dev in (self.coordinator.data or {}).get("devices", [])
+                if dev.get("name") == source and dev.get("id")
+            ),
+            None,
+        )
+        if device_id is None:
+            return
+        is_playing = bool(self._playback and self._playback.get("is_playing"))
+        await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
