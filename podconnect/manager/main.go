@@ -82,6 +82,18 @@ func readSpeaker() string {
 	return o.SpeakerName
 }
 
+func readHomepodName() string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return ""
+	}
+	var o struct {
+		HomepodName string `json:"homepod_name"`
+	}
+	_ = json.Unmarshal(b, &o)
+	return o.HomepodName
+}
+
 // fetchOutputs returns the AirPlay outputs OwnTone has discovered, and whether OwnTone answered.
 // Parsed defensively (map + UseNumber) so a field OwnTone serializes as a number rather than a
 // string — notably the 64-bit output "id" — can't make a strict decoder drop every device.
@@ -237,24 +249,30 @@ func main() {
 			return
 		}
 		devs, _ := fetchOutputs()
-		saved := readSaved()
-		target := ""
+		// Resolve the target the same way select-homepod does: panel choice, then the
+		// homepod_name option, then the first discovered device — and report the NAME back so the
+		// user can see exactly which HomePod the tone went to.
+		want := readSaved()
+		if want == "" {
+			want = readHomepodName()
+		}
+		target, targetName := "", ""
 		for _, d := range devs {
-			if saved != "" && strings.EqualFold(d.Name, saved) {
-				target = d.ID
+			if want != "" && strings.EqualFold(d.Name, want) {
+				target, targetName = d.ID, d.Name
 				break
 			}
 		}
 		if target == "" && len(devs) > 0 {
-			target = devs[0].ID // fall back to the first discovered AirPlay device
+			target, targetName = devs[0].ID, devs[0].Name // fall back to the first discovered device
 		}
 		if target != "" {
 			selectOnOwntone(target)
 		}
 		setMasterVolume(13) // gentle — just audible in a quiet house
 		go playTestTone()
-		log.Printf("test tone requested (target output id=%q)", target)
-		writeJSON(w, map[string]any{"ok": true, "playing": target != ""})
+		log.Printf("test tone requested (target=%q id=%q)", targetName, target)
+		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -372,7 +390,7 @@ document.getElementById('test').onclick = async function () {
   try {
     var r = await (await fetch('api/test', { method: 'POST' })).json();
     m.textContent = r.playing
-      ? 'Tone sent. You should hear a beep on the HomePod. No sound? Then it is the AirPlay/volume leg — not Spotify.'
+      ? 'Playing a soft tone on: ' + (r.target || 'the selected HomePod') + ' — listen now. No sound? Then it is the AirPlay/volume leg, not Spotify.'
       : 'No HomePod discovered/selected yet — wait for the list above, or pick one and Save first.';
   } catch (e) { m.textContent = 'Could not send the test.'; }
   var btn = this;
