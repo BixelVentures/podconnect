@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
-HOMEPOD="$(bashio::config 'homepod_name')"
-VOL="$(bashio::config 'default_volume')"
+HOMEPOD="$(jq -r '.homepod_name // ""' /data/options.json)"
+VOL="$(jq -r '.default_volume // 35' /data/options.json)"
 URL="http://localhost:3689"
 bashio::log.info "select-homepod: targeting HomePod '${HOMEPOD}'"
 warned_missing=false

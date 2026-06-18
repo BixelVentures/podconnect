@@ -1,20 +1,23 @@
 #!/usr/bin/with-contenv bashio
 set -e
-SPEAKER="$(bashio::config 'speaker_name')"
-HOMEPOD="$(bashio::config 'homepod_name')"
-BITRATE="$(bashio::config 'bitrate')"
+OPTS=/data/options.json
+[ -f "$OPTS" ] || echo '{}' > "$OPTS"
+SPEAKER="$(jq -r '.speaker_name // "PodConnect"' "$OPTS")"
+HOMEPOD="$(jq -r '.homepod_name // ""' "$OPTS")"
+BITRATE="$(jq -r '.bitrate // "320"' "$OPTS")"
 
-mkdir -p /data/go-librespot /data/owntone /srv/media
+mkdir -p /data/go-librespot /data/owntone /srv/media /root/.config
 chmod 0755 /srv/media
 [ -p /srv/media/spotify ] || mkfifo -m 0666 /srv/media/spotify
 chown -R owntone:owntone /data/owntone || true
+# go-librespot reads ~/.config/go-librespot/config.yml (HOME=/root); persist on /data
+ln -sfn /data/go-librespot /root/.config/go-librespot
 
 cat > /data/go-librespot/config.yml <<EOF2
 device_name: "${SPEAKER}"
 device_type: speaker
 bitrate: ${BITRATE}
 zeroconf_enabled: true
-zeroconf_backend: avahi
 credentials:
   type: zeroconf
   zeroconf:
