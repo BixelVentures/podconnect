@@ -15,14 +15,15 @@ _Updated 2026-06-19, after full end-to-end success (HA → Spotify → HomePod).
 
 ## 🎯 Tomorrow — top priorities
 
-### P1 — Volume-sync (the last rough edge) ★ start here
-One slider should rule them all. Today three volumes multiply (Spotify app × OwnTone master ×
-per-output), which is why levels feel random.
-- go-librespot `external_volume: true` (stop double-scaling the PCM).
-- Manager subscribes to go-librespot `/events`; on `volume`, relay to OwnTone
-  `PUT /api/player/volume` (0–100 mapping).
-- Result: the **Spotify slider** controls HomePod loudness; HA reflects it.
-- Testable on the VM (audio already works there) — no Green required.
+### ✅ Volume-sync — BUILT (Speakers 0.3.0), needs real-world verification
+One slider rules them all. Shipped:
+- go-librespot `external_volume: true` (no more PCM double-scaling).
+- Manager runs a per-room `syncVolume` goroutine: polls go-librespot `/status` (volume /
+  volume_steps, self-describing), and on change mirrors it to OwnTone `PUT /api/player/volume`.
+- HA → Spotify → go-librespot was already wired (Control `set_volume` → Web API); this closes the
+  go-librespot → HomePod half. Built per-`Room` so multi-room = N goroutines.
+- **Verify tomorrow on the device:** move the Spotify slider → HomePod loudness follows; HA
+  reflects it. (Couldn't exercise the active-session path in Docker — no Spotify login / HomePod.)
 
 ### P1 — Deploy to the wired HA Green + verify E2E
 Move off the VM to the real target.

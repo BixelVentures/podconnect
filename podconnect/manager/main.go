@@ -25,10 +25,26 @@ import (
 )
 
 var (
-	owntone = envOr("OWNTONE_URL", "http://localhost:3689")
-	dataDir = envOr("DATA_DIR", "/data")
-	port    = envOr("PORT", "8099")
+	owntone   = envOr("OWNTONE_URL", "http://localhost:3689")
+	librespot = envOr("LIBRESPOT_URL", "http://localhost:3678")
+	dataDir   = envOr("DATA_DIR", "/data")
+	port      = envOr("PORT", "8099")
 )
+
+// Room is one (go-librespot + OwnTone) pair — a Spotify-Connect speaker bound to one HomePod.
+// There is exactly one today; every per-speaker concern (volume sync now; spawn/supervise/pick
+// later) takes a Room, so the multi-room phase is "more rooms", not a rewrite.
+type Room struct {
+	Name      string
+	Librespot string
+	OwnTone   string
+}
+
+// rooms returns the live set of speakers. Single-room for now; the multi-room phase will build
+// this from persisted config + dynamically spawned instances, each with its own ports.
+func rooms() []Room {
+	return []Room{{Name: readSpeaker(), Librespot: librespot, OwnTone: owntone}}
+}
 
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
@@ -143,13 +159,93 @@ func selectOnOwntone(id string) {
 	}
 }
 
-// setMasterVolume sets OwnTone's player volume (0-100) so a stuck-near-zero level can't make the
-// test (or playback) silent.
-func setMasterVolume(pct int) {
-	cl := &http.Client{Timeout: 4 * time.Second}
-	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/player/volume?volume=%d", owntone, pct), nil)
+func clampPct(p int) int {
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
+}
+
+// setOwnToneVolume sets one OwnTone instance's master volume (0-100). With a single HomePod
+// selected per room, master == that HomePod's level.
+func setOwnToneVolume(base string, pct int) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/player/volume?volume=%d", base, clampPct(pct)), nil)
 	if resp, err := cl.Do(req); err == nil {
 		resp.Body.Close()
+	}
+}
+
+// librespotVolumePct reads go-librespot's current volume as 0-100, or ok=false when there's no
+// active session reporting volume. go-librespot is the single source of truth: it runs
+// external_volume, so it reports the volume instead of scaling the PCM (OwnTone/AirPlay applies it).
+func librespotVolumePct(base string) (int, bool) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cl.Get(base + "/status")
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	var st struct {
+		Volume      json.Number `json:"volume"`
+		VolumeSteps json.Number `json:"volume_steps"`
+	}
+	if err := dec.Decode(&st); err != nil {
+		return 0, false
+	}
+	vol, _ := st.Volume.Float64()
+	max, _ := st.VolumeSteps.Float64()
+	if max <= 0 {
+		return 0, false // idle / no session reporting volume
+	}
+	return clampPct(int(math.Round(vol / max * 100))), true
+}
+
+// setLibrespotVolumePct best-effort sets go-librespot's volume from a percent (it reports
+// volume_steps as the max). Used by the test so the gentle level holds even if a session is active
+// and the syncer would otherwise mirror a louder level.
+func setLibrespotVolumePct(base string, pct int) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cl.Get(base + "/status")
+	if err != nil {
+		return
+	}
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	var st struct {
+		VolumeSteps json.Number `json:"volume_steps"`
+	}
+	_ = dec.Decode(&st)
+	resp.Body.Close()
+	max, _ := st.VolumeSteps.Float64()
+	if max <= 0 {
+		return
+	}
+	raw := int(math.Round(float64(clampPct(pct)) / 100 * max))
+	req, _ := http.NewRequest(http.MethodPost, base+"/player/volume", bytes.NewBufferString(fmt.Sprintf(`{"volume":%d}`, raw)))
+	req.Header.Set("Content-Type", "application/json")
+	if r, e := cl.Do(req); e == nil {
+		r.Body.Close()
+	}
+}
+
+// syncVolume mirrors one room's go-librespot volume onto its OwnTone, so the Spotify slider is the
+// single volume control. Acts only on change (a manual OwnTone tweak persists until Spotify next
+// moves) and only while a session reports volume. Per-room → multi-room is just N of these.
+func syncVolume(room Room) {
+	last := -1
+	for {
+		if pct, ok := librespotVolumePct(room.Librespot); ok && pct != last {
+			setOwnToneVolume(room.OwnTone, pct)
+			log.Printf("volume sync [%s]: %d%%", room.Name, pct)
+			last = pct
+		}
+		time.Sleep(750 * time.Millisecond)
 	}
 }
 
@@ -269,7 +365,10 @@ func main() {
 		if target != "" {
 			selectOnOwntone(target)
 		}
-		setMasterVolume(13) // gentle — just audible in a quiet house
+		// Gentle level on BOTH sides so the volume syncer can't bump the test up to a louder
+		// active-session level.
+		setLibrespotVolumePct(librespot, 13)
+		setOwnToneVolume(owntone, 13)
 		go playTestTone()
 		log.Printf("test tone requested (target=%q id=%q)", targetName, target)
 		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
@@ -284,7 +383,14 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	log.Printf("podconnect-manager listening on :%s (owntone=%s)", port, owntone)
+	// Volume sync: one goroutine per room mirrors go-librespot's volume onto OwnTone, so the
+	// Spotify slider is the single control. (HA → Spotify → go-librespot is handled by the Control
+	// integration's Web API call; this closes the go-librespot → HomePod half.)
+	for _, r := range rooms() {
+		go syncVolume(r)
+	}
+
+	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 

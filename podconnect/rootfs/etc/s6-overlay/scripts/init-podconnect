@@ -45,7 +45,7 @@ credentials:
 audio_backend: pipe
 audio_output_pipe: /srv/media/spotify
 audio_output_pipe_format: s16le
-external_volume: false
+external_volume: true
 server:
   enabled: true
   address: 0.0.0.0
