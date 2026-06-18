@@ -3,18 +3,31 @@ HOMEPOD="$(bashio::config 'homepod_name')"
 VOL="$(bashio::config 'default_volume')"
 URL="http://localhost:3689"
 bashio::log.info "select-homepod: targeting HomePod '${HOMEPOD}'"
+warned_missing=false
+warned_auth=false
 while true; do
-  if curl -fsS -o /dev/null "${URL}/api/config"; then
-    ID="$(curl -fsS "${URL}/api/outputs" | jq -r --arg n "$HOMEPOD" '.outputs[] | select(.name==$n) | .id' | head -n1)"
-    if [ -n "$ID" ] && [ "$ID" != "null" ]; then
-      SEL="$(curl -fsS "${URL}/api/outputs" | jq -r --arg n "$HOMEPOD" '.outputs[] | select(.name==$n) | .selected' | head -n1)"
-      if [ "$SEL" != "true" ]; then
-        curl -fsS -X PUT "${URL}/api/outputs/set" --data "{\"outputs\":[\"${ID}\"]}" >/dev/null || true
-        curl -fsS -X PUT "${URL}/api/player/volume?volume=${VOL}&output_id=${ID}" >/dev/null || true
-        bashio::log.info "Selected HomePod '${HOMEPOD}' (id=${ID}) at volume ${VOL}"
+  if curl -fsS -o /dev/null "${URL}/api/config" 2>/dev/null; then
+    row="$(curl -fsS "${URL}/api/outputs" 2>/dev/null | jq -c --arg n "$HOMEPOD" '.outputs[]? | select(.name==$n)' | head -n1)"
+    if [ -n "$row" ]; then
+      ID="$(echo "$row" | jq -r '.id')"
+      SEL="$(echo "$row" | jq -r '.selected')"
+      AUTH="$(echo "$row" | jq -r '(.needs_auth_key // .requires_auth) // false')"
+      if [ "$AUTH" = "true" ]; then
+        if [ "$warned_auth" = false ]; then
+          bashio::log.warning "HomePod '${HOMEPOD}' needs AirPlay verification. In the Apple Home app: open this HomePod > settings > 'Allow Speaker & Display Access' and set it to 'Anyone on the Same Network' (or 'Everyone')."
+          warned_auth=true
+        fi
+      elif [ "$SEL" != "true" ]; then
+        if curl -fsS -X PUT "${URL}/api/outputs/set" --data "{\"outputs\":[\"${ID}\"]}" >/dev/null 2>&1; then
+          curl -fsS -X PUT "${URL}/api/player/volume?volume=${VOL}&output_id=${ID}" >/dev/null 2>&1 || true
+          bashio::log.info "Selected HomePod '${HOMEPOD}' (id=${ID}) at volume ${VOL}."
+          warned_missing=false
+          warned_auth=false
+        fi
       fi
-    else
-      bashio::log.info "Waiting for HomePod '${HOMEPOD}' to be discovered on the network..."
+    elif [ "$warned_missing" = false ]; then
+      bashio::log.info "Waiting for HomePod '${HOMEPOD}' to be discovered... (the name must match the Apple Home app exactly)"
+      warned_missing=true
     fi
   fi
   sleep 10

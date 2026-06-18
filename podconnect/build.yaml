@@ -7,4 +7,4 @@ build_from:
   amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
 args:
   GO_LIBRESPOT_VERSION: "v0.7.3"
-  OWNTONE_REF: "master"
+  OWNTONE_REF: "29.2"

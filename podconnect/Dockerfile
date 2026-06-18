@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # --- OwnTone (AirPlay 2 sender) — built from source (no ARM64 package exists) ---
-ARG OWNTONE_REF=master
+ARG OWNTONE_REF=29.2
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
   && autoreconf -fi \

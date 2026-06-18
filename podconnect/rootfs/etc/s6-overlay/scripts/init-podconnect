@@ -4,13 +4,10 @@ SPEAKER="$(bashio::config 'speaker_name')"
 HOMEPOD="$(bashio::config 'homepod_name')"
 BITRATE="$(bashio::config 'bitrate')"
 
-mkdir -p /data/go-librespot /data/owntone /srv/media /root/.config
+mkdir -p /data/go-librespot /data/owntone /srv/media
 chmod 0755 /srv/media
 [ -p /srv/media/spotify ] || mkfifo -m 0666 /srv/media/spotify
 chown -R owntone:owntone /data/owntone || true
-
-# go-librespot reads ~/.config/go-librespot/config.yml (HOME=/root)
-ln -sfn /data/go-librespot /root/.config/go-librespot
 
 cat > /data/go-librespot/config.yml <<EOF2
 device_name: "${SPEAKER}"
@@ -36,7 +33,7 @@ cat > /etc/owntone.conf <<EOF2
 general {
 	uid = "owntone"
 	db_path = "/data/owntone/songs3.db"
-	cache_path = "/data/owntone/cache.db"
+	cache_dir = "/data/owntone"
 	logfile = "/data/owntone/owntone.log"
 }
 library {

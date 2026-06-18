@@ -12,6 +12,7 @@ startup: application
 boot: manual
 host_network: true       # required: Spotify Connect + AirPlay discovery (mDNS) need the LAN
 host_dbus: false         # we run our own dbus + avahi inside the container
+watchdog: "tcp://[HOST]:3689"   # auto-restart the add-on if OwnTone's API stops responding
 map:
   - type: addon_config
     read_only: false
