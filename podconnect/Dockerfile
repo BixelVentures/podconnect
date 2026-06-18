@@ -3,9 +3,9 @@ ARG BUILD_FROM
 # --- PodConnect manager (Ingress picker UI) — tiny static Go binary, stdlib only ---
 FROM golang:1.22-bookworm AS manager-build
 WORKDIR /src
-COPY manager/go.mod ./
-COPY manager/main.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /podconnect-manager .
+COPY manager/ ./
+RUN go vet ./... && go test ./... \
+  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /podconnect-manager .
 
 FROM ${BUILD_FROM}
 
