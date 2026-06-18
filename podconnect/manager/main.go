@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -127,6 +129,46 @@ func selectOnOwntone(id string) {
 	}
 }
 
+// setMasterVolume sets OwnTone's player volume (0-100) so a stuck-near-zero level can't make the
+// test (or playback) silent.
+func setMasterVolume(pct int) {
+	cl := &http.Client{Timeout: 4 * time.Second}
+	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/player/volume?volume=%d", owntone, pct), nil)
+	if resp, err := cl.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+var toneMu sync.Mutex
+
+// playTestTone writes ~3s of a 440 Hz sine (s16le/44100/stereo) into the pipe. OwnTone's
+// pipe_autostart picks it up and plays it to the selected output — proving the OwnTone→AirPlay→
+// HomePod leg with zero dependency on Spotify or go-librespot. Runs in a goroutine (the write
+// drains at real time, ~3s). The lock prevents overlapping tones.
+func playTestTone() {
+	if !toneMu.TryLock() {
+		return
+	}
+	defer toneMu.Unlock()
+	f, err := os.OpenFile("/srv/media/spotify", os.O_WRONLY, 0)
+	if err != nil {
+		log.Printf("test tone: open pipe: %v", err)
+		return
+	}
+	defer f.Close()
+	const rate, secs, freq = 44100, 3, 440.0
+	amp := 0.25 * 32767.0
+	buf := make([]byte, 0, rate*secs*4)
+	for i := 0; i < rate*secs; i++ {
+		u := uint16(int16(amp * math.Sin(2*math.Pi*freq*float64(i)/float64(rate))))
+		lo, hi := byte(u), byte(u>>8)
+		buf = append(buf, lo, hi, lo, hi) // little-endian s16, L+R
+	}
+	if _, err := f.Write(buf); err != nil {
+		log.Printf("test tone: write: %v", err)
+	}
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -173,6 +215,32 @@ func main() {
 		}
 		log.Printf("selection saved: %q", name)
 		writeJSON(w, map[string]bool{"ok": true})
+	})
+
+	http.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		devs, _ := fetchOutputs()
+		saved := readSaved()
+		target := ""
+		for _, d := range devs {
+			if saved != "" && strings.EqualFold(d.Name, saved) {
+				target = d.ID
+				break
+			}
+		}
+		if target == "" && len(devs) > 0 {
+			target = devs[0].ID // fall back to the first discovered AirPlay device
+		}
+		if target != "" {
+			selectOnOwntone(target)
+		}
+		setMasterVolume(55)
+		go playTestTone()
+		log.Printf("test tone requested (target output id=%q)", target)
+		writeJSON(w, map[string]any{"ok": true, "playing": target != ""})
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -233,9 +301,14 @@ const indexHTML = `<!doctype html>
     <button id="save" disabled>Save selection</button>
     <button id="auto" class="ghost">Auto (clear choice)</button>
   </div>
+  <div class="actions">
+    <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
+  </div>
+  <p id="testmsg" class="hint"></p>
   <p class="hint">This list is a live network scan (OwnTone AirPlay discovery) — the same one that
   feeds Spotify Connect. No typing: pick a device and Save. Your speaker keeps playing to it across
-  restarts.</p>
+  restarts.<br><br><b>Play test sound</b> sends a 3-second tone straight to the selected HomePod via
+  AirPlay — no Spotify needed. Hear it = the HomePod audio path works.</p>
 </div>
 <script>
 var chosen = null;
@@ -277,6 +350,19 @@ document.getElementById('auto').onclick = async function () {
   chosen = null;
   document.getElementById('save').disabled = true;
   await load();
+};
+document.getElementById('test').onclick = async function () {
+  this.disabled = true;
+  var m = document.getElementById('testmsg');
+  m.textContent = 'Sending a 3-second tone to the HomePod — listen now…';
+  try {
+    var r = await (await fetch('api/test', { method: 'POST' })).json();
+    m.textContent = r.playing
+      ? 'Tone sent. You should hear a beep on the HomePod. No sound? Then it is the AirPlay/volume leg — not Spotify.'
+      : 'No HomePod discovered/selected yet — wait for the list above, or pick one and Save first.';
+  } catch (e) { m.textContent = 'Could not send the test.'; }
+  var btn = this;
+  setTimeout(function () { btn.disabled = false; }, 4000);
 };
 load();
 setInterval(load, 5000);
