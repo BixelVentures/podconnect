@@ -98,7 +98,7 @@ README.md
 docs/PLAN.md                         # this document
 repository.yaml                      # lets you add this repo as an HA add-on repository
 .github/workflows/publish.yaml       # CI: build & publish the add-on image to GHCR
-podconnect/                          # the HA add-on (single-room test slice today; manager/UI later)
+podconnect/                          # the HA add-on "PodConnect Speakers" (single HomePod today; multi-room later)
   config.yaml                        # manifest: image, host_network, options, watchdog
   build.yaml                         # base image per arch (Debian)
   Dockerfile                         # builds OwnTone (from source) + go-librespot into one image
