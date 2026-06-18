@@ -13,9 +13,12 @@ chmod 0755 /srv/media
 chown -R owntone:owntone /data/owntone || true
 ln -sfn /data/go-librespot /root/.config/go-librespot
 
-# Restrict mDNS advertising to the real LAN interface. Under host networking the container
-# also has docker0/hassio/veth* interfaces with internal IPs the Spotify app / HomePod can't
-# reach; advertising there makes the speaker "drop". Default = auto-detect the default route.
+# Stable device id (derived from the speaker name) so the Connect speaker is the SAME device
+# across restarts. Without this go-librespot makes a new id each start -> duplicate "ghost"
+# PodConnect devices pile up in Spotify.
+DEVID="$(printf '%s' "podconnect-${SPEAKER}" | sha1sum | cut -c1-40)"
+
+# Restrict mDNS advertising to the real LAN interface (avoid dead docker0/hassio/veth IPs).
 IFACE="$(jq -r '.network_interface // ""' "$OPTS")"
 if [ -z "$IFACE" ]; then
   IFACE="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
@@ -30,6 +33,7 @@ fi
 
 cat > /data/go-librespot/config.yml <<EOF2
 device_name: "${SPEAKER}"
+device_id: "${DEVID}"
 device_type: speaker
 bitrate: ${BITRATE}
 zeroconf_enabled: true
@@ -65,4 +69,4 @@ audio {
 }
 EOF2
 
-bashio::log.info "PodConnect configured: speaker='${SPEAKER}', HomePod='${HOMEPOD}', bitrate=${BITRATE}"
+bashio::log.info "PodConnect configured: speaker='${SPEAKER}', HomePod='${HOMEPOD}', device_id=${DEVID}"
