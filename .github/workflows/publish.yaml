@@ -2,6 +2,7 @@ name: Publish add-on image
 
 # Builds the add-on once in CI and publishes per-arch images to GHCR, so installing the
 # add-on on the HA Green PULLS a ready image (~2 min) instead of compiling OwnTone on-device.
+# aarch64 builds on a NATIVE ARM runner (fast + reliable; free for public repos).
 on:
   push:
     branches: [main]
@@ -13,14 +14,18 @@ on:
 jobs:
   publish:
     name: publish-${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        arch: [aarch64, amd64]
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -30,9 +35,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Build & push (${{ matrix.arch }})
         uses: home-assistant/builder@master
