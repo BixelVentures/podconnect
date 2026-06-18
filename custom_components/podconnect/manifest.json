@@ -1,6 +1,6 @@
 {
   "domain": "podconnect",
-  "name": "PodConnect",
+  "name": "PodConnect Control",
   "codeowners": ["@BixelVentures"],
   "config_flow": true,
   "dependencies": ["application_credentials"],

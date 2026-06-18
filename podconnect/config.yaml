@@ -1,9 +1,9 @@
 ---
-name: "PodConnect (test slice)"
+name: "PodConnect Speakers"
 version: "0.1.3"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
-description: "One HomePod as a Spotify Connect speaker — single-room test slice for PodConnect"
+description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
 url: "https://github.com/BixelVentures/podconnect"
 arch:
   - aarch64
