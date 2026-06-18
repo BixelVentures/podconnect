@@ -1,0 +1,16 @@
+# Spotify credentials / runtime state — never commit
+dev/go-librespot/state.json
+dev/go-librespot/credentials.json
+
+# Runtime named pipe + any media dropped into the shared dir
+dev/media/*
+!dev/media/.gitkeep
+
+# OwnTone runtime (if bind-mounted locally)
+dev/owntone/*.db
+dev/owntone/cache/
+dev/owntone/logs/
+*.log
+
+# OS cruft
+.DS_Store

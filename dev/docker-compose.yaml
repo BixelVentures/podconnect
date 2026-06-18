@@ -1,0 +1,51 @@
+# PodConnect — single-room vertical test slice
+#
+# Proves the core: Spotify Connect -> go-librespot -> named pipe -> OwnTone -> AirPlay 2 -> HomePod.
+#
+# IMPORTANT: run this on a LINUX machine on the SAME network as your HomePod
+# (a spare PC, a Raspberry Pi, or your HA Green). It will NOT work on macOS or
+# Windows Docker Desktop, because Spotify Connect + AirPlay need host networking
+# and mDNS, which Docker Desktop does not support.
+
+name: podconnect-test
+
+services:
+  # Creates the shared named pipe (FIFO) both containers use to pass audio.
+  init-pipe:
+    image: alpine:3
+    command: sh -c '[ -p /srv/media/spotify.pipe ] || mkfifo -m 0666 /srv/media/spotify.pipe; ls -l /srv/media'
+    volumes:
+      - ./media:/srv/media
+
+  # Spotify Connect receiver -> writes raw PCM into the pipe.
+  go-librespot:
+    image: ghcr.io/devgianlu/go-librespot:latest
+    container_name: podconnect_librespot
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      init-pipe:
+        condition: service_completed_successfully
+    volumes:
+      - ./go-librespot:/root/.config/go-librespot   # config.yml + saved Spotify credentials (state.json)
+      - ./media:/srv/media                          # the shared pipe
+
+  # AirPlay 2 sender -> reads the pipe, streams to the HomePod.
+  owntone:
+    image: docker.io/owntone/owntone:latest
+    container_name: podconnect_owntone
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      init-pipe:
+        condition: service_completed_successfully
+    environment:
+      - UID=1000
+      - GID=1000
+    volumes:
+      - ./owntone:/etc/owntone        # owntone.conf
+      - ./media:/srv/media            # the shared pipe (OwnTone's library)
+      - ot_cache:/var/cache/owntone   # OwnTone database/cache
+
+volumes:
+  ot_cache:
