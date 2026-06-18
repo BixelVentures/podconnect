@@ -1,0 +1,52 @@
+#!/usr/bin/with-contenv bashio
+set -e
+SPEAKER="$(bashio::config 'speaker_name')"
+HOMEPOD="$(bashio::config 'homepod_name')"
+BITRATE="$(bashio::config 'bitrate')"
+
+mkdir -p /data/go-librespot /data/owntone /srv/media /root/.config
+chmod 0755 /srv/media
+[ -p /srv/media/spotify ] || mkfifo -m 0666 /srv/media/spotify
+chown -R owntone:owntone /data/owntone || true
+
+# go-librespot reads ~/.config/go-librespot/config.yml (HOME=/root)
+ln -sfn /data/go-librespot /root/.config/go-librespot
+
+cat > /data/go-librespot/config.yml <<EOF2
+device_name: "${SPEAKER}"
+device_type: speaker
+bitrate: ${BITRATE}
+zeroconf_enabled: true
+zeroconf_backend: avahi
+credentials:
+  type: zeroconf
+  zeroconf:
+    persist_credentials: true
+audio_backend: pipe
+audio_output_pipe: /srv/media/spotify
+audio_output_pipe_format: s16le
+external_volume: false
+server:
+  enabled: true
+  address: 0.0.0.0
+  port: 3678
+EOF2
+
+cat > /etc/owntone.conf <<EOF2
+general {
+	uid = "owntone"
+	db_path = "/data/owntone/songs3.db"
+	cache_path = "/data/owntone/cache.db"
+	logfile = "/data/owntone/owntone.log"
+}
+library {
+	name = "${SPEAKER}"
+	directories = { "/srv/media" }
+	pipe_autostart = true
+}
+audio {
+	type = "disabled"
+}
+EOF2
+
+bashio::log.info "PodConnect configured: speaker='${SPEAKER}', HomePod='${HOMEPOD}', bitrate=${BITRATE}"

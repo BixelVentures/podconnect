@@ -1,0 +1,27 @@
+---
+name: "PodConnect (test slice)"
+version: "0.1.0"
+slug: "podconnect"
+description: "One HomePod as a Spotify Connect speaker — single-room test slice for PodConnect"
+url: "https://github.com/BixelVentures/podconnect"
+arch:
+  - aarch64
+  - amd64
+init: false              # the Debian base image's s6-overlay is PID 1
+startup: application
+boot: manual
+host_network: true       # required: Spotify Connect + AirPlay discovery (mDNS) need the LAN
+host_dbus: false         # we run our own dbus + avahi inside the container
+map:
+  - type: addon_config
+    read_only: false
+options:
+  speaker_name: "PodConnect Test"
+  homepod_name: "Living Room"
+  default_volume: 35
+  bitrate: "320"
+schema:
+  speaker_name: str
+  homepod_name: str
+  default_volume: int(0,100)
+  bitrate: "list(96|160|320)"

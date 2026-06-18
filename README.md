@@ -20,9 +20,20 @@ building the add-on and its management UI.
 
 ## Getting started
 
-- **Try the proof-of-concept:** [`dev/README.md`](dev/README.md) — run one HomePod end to
-  end with Docker on a Linux machine.
+- **Test it on your HA Green:** [`podconnect/DOCS.md`](podconnect/DOCS.md) — install the
+  single-room test add-on (one HomePod as a Spotify Connect speaker) and try it in your house.
 - **Full design:** [`docs/PLAN.md`](docs/PLAN.md) — architecture, stack, build phases.
+- **Docker-only harness (any Linux box):** [`dev/README.md`](dev/README.md) — the same pipeline
+  via docker-compose, for iterating outside Home Assistant.
+
+## Repository layout
+
+```
+podconnect/        HA add-on: single-room test slice (go-librespot + OwnTone, auto-selects your HomePod)
+dev/               docker-compose version of the same pipeline (Linux box)
+docs/PLAN.md       full architecture & roadmap
+repository.yaml    lets you add this repo as a Home Assistant add-on repository
+```
 
 ## Built on
 

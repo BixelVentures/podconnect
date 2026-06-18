@@ -1,0 +1,10 @@
+---
+# Home Assistant passes BUILD_FROM (per arch) and BUILD_ARCH to the Dockerfile.
+# Debian (glibc) base is required: the go-librespot release binary is glibc-dynamic
+# and links libasound2, so a musl/Alpine base would not run it.
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm
+  amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
+args:
+  GO_LIBRESPOT_VERSION: "v0.7.3"
+  OWNTONE_REF: "master"

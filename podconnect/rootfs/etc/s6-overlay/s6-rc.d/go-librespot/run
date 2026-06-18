@@ -1,0 +1,3 @@
+#!/usr/bin/with-contenv bashio
+export HOME=/root
+exec go-librespot

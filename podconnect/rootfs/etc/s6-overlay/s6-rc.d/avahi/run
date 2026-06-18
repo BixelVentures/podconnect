@@ -1,0 +1,2 @@
+#!/usr/bin/with-contenv bashio
+exec avahi-daemon --no-chroot --no-drop-root

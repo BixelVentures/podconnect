@@ -1,0 +1,21 @@
+#!/usr/bin/with-contenv bashio
+HOMEPOD="$(bashio::config 'homepod_name')"
+VOL="$(bashio::config 'default_volume')"
+URL="http://localhost:3689"
+bashio::log.info "select-homepod: targeting HomePod '${HOMEPOD}'"
+while true; do
+  if curl -fsS -o /dev/null "${URL}/api/config"; then
+    ID="$(curl -fsS "${URL}/api/outputs" | jq -r --arg n "$HOMEPOD" '.outputs[] | select(.name==$n) | .id' | head -n1)"
+    if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+      SEL="$(curl -fsS "${URL}/api/outputs" | jq -r --arg n "$HOMEPOD" '.outputs[] | select(.name==$n) | .selected' | head -n1)"
+      if [ "$SEL" != "true" ]; then
+        curl -fsS -X PUT "${URL}/api/outputs/set" --data "{\"outputs\":[\"${ID}\"]}" >/dev/null || true
+        curl -fsS -X PUT "${URL}/api/player/volume?volume=${VOL}&output_id=${ID}" >/dev/null || true
+        bashio::log.info "Selected HomePod '${HOMEPOD}' (id=${ID}) at volume ${VOL}"
+      fi
+    else
+      bashio::log.info "Waiting for HomePod '${HOMEPOD}' to be discovered on the network..."
+    fi
+  fi
+  sleep 10
+done
