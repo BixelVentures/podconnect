@@ -3,8 +3,8 @@
 Turn each Apple **HomePod** into its own **Spotify Connect speaker** — packaged as a
 **Home Assistant add-on** for the HA Green.
 
-Open the PodConnect panel in Home Assistant, click **"Add speaker"**, name it, pick a
-HomePod from a dropdown of devices found on your network, and it shows up in the Spotify
+The full product: open the PodConnect panel in Home Assistant, click **"Add speaker"**, pick
+a HomePod from a dropdown of devices found on your network, and it shows up in the Spotify
 app. Start music from the **Spotify app or Home Assistant Assist**, with **volume synced**
 across Spotify, Home Assistant, and the HomePod.
 
@@ -15,24 +15,22 @@ Spotify app / HA Assist ─► go-librespot (Connect identity) ─► pipe ─�
 
 ## Status
 
-Early development. Validating the architecture with a single-room test slice before
-building the add-on and its management UI.
+Early development. A single-room **test slice** is working (one HomePod as a Spotify Connect
+speaker); the multi-room manager + "Add speaker" UI come next.
 
 ## Getting started
 
-- **Test it on your HA Green:** [`podconnect/DOCS.md`](podconnect/DOCS.md) — install the
-  single-room test add-on (one HomePod as a Spotify Connect speaker) and try it in your house.
+- **Install & test on your HA Green:** [`podconnect/DOCS.md`](podconnect/DOCS.md) — add the
+  repository, install the add-on, and try it in your house.
 - **Full design:** [`docs/PLAN.md`](docs/PLAN.md) — architecture, stack, build phases.
-- **Docker-only harness (any Linux box):** [`dev/README.md`](dev/README.md) — the same pipeline
-  via docker-compose, for iterating outside Home Assistant.
 
 ## Repository layout
 
 ```
-podconnect/        HA add-on: single-room test slice (go-librespot + OwnTone, auto-selects your HomePod)
-dev/               docker-compose version of the same pipeline (Linux box)
+podconnect/        HA add-on (go-librespot + OwnTone in one image; auto-selects your HomePod)
 docs/PLAN.md       full architecture & roadmap
 repository.yaml    lets you add this repo as a Home Assistant add-on repository
+.github/workflows/ CI that builds & publishes the add-on image to GHCR
 ```
 
 ## Built on

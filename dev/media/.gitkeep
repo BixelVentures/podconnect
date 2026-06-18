@@ -1,2 +1,0 @@
-# This folder is the shared audio pipe directory.
-# The named pipe (spotify.pipe) is created at runtime by the init-pipe service.

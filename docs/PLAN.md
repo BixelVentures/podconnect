@@ -88,25 +88,23 @@ own web UI with the live HomePod dropdown and add/remove flow.
 ## Repository layout
 
 ```
-podconnect/
-  README.md
-  docs/PLAN.md                       # this document
-  dev/                               # local vertical-test slice (single room, docker-compose)
-  podconnect/                        # the HA add-on (built in later phases)
-    config.yaml                      # manifest: host_network, ingress, map /data, arch [aarch64, amd64], watchdog
-    build.yaml
-    Dockerfile                       # s6 base; OwnTone + avahi/dbus; go-librespot binary; manager binary
-    rootfs/etc/s6-overlay/s6-rc.d/   # supervises: manager, avahi, dbus
-    manager/                         # Go: mDNS discovery, speaker CRUD, lifecycle, volume relay, Ingress UI
-      web/                           # Ingress UI
-      templates/                     # per-room go-librespot + owntone.conf templates
-    DOCS.md  icon.png  logo.png
+README.md
+docs/PLAN.md                         # this document
+repository.yaml                      # lets you add this repo as an HA add-on repository
+.github/workflows/publish.yaml       # CI: build & publish the add-on image to GHCR
+podconnect/                          # the HA add-on (single-room test slice today; manager/UI later)
+  config.yaml                        # manifest: image, host_network, options, watchdog
+  build.yaml                         # base image per arch (Debian)
+  Dockerfile                         # builds OwnTone (from source) + go-librespot into one image
+  rootfs/etc/s6-overlay/             # s6 services: dbus, avahi, go-librespot, owntone, select-homepod
+  DOCS.md
+  (later) manager/                   # Go: mDNS discovery, speaker CRUD, lifecycle, volume relay, Ingress UI
 ```
 
 ## Build phases
 
-1. **Vertical slice (this repo's `dev/`):** one go-librespot + one OwnTone via docker-compose;
-   prove Spotify app → HomePod audio + persistence on real hardware.
+1. **Vertical slice (current — `podconnect/` add-on):** one go-librespot + one OwnTone,
+   HomePod auto-selected by name; prove Spotify app → HomePod audio + persistence on the Green.
 2. **Manager core:** speaker CRUD, dynamic spawn/supervise, per-room port allocation,
    credential/db persistence, volume relay for N rooms.
 3. **Ingress UI:** mDNS HomePod discovery → dropdown; add/rename/remove; per-room status & volume.

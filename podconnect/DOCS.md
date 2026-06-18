@@ -5,42 +5,24 @@ Home Assistant Green. It's the first proof that the full PodConnect idea works o
 hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 [`docs/PLAN.md`](../docs/PLAN.md).)
 
-## 1. Copy the files onto the Green (via Samba)
+**You need:** Spotify **Premium**, and the HomePod on the same network as the Green.
 
-1. On your Mac, open **Finder** → press **⌘K** (menu: Go → Connect to Server).
-2. Enter **`smb://homeassistant.local`** (or `smb://<your-Green-IP>`) → **Connect** → log in
-   with your Home Assistant username/password.
-3. A list of shared folders appears. Open the **`addons`** folder.
-4. From your computer, copy the **`podconnect`** folder **into** `addons`.
-   - ✅ Correct: `addons/podconnect/config.yaml`
-   - ❌ Wrong: `addons/PodConnect/podconnect/config.yaml` (nested) — the folder you drop into
-     `addons` must contain `config.yaml` **directly**.
+## 1. Add the repository
 
-## 2. Install the add-on
+1. In Home Assistant: **Settings → Apps → Add-on Store**.
+2. Top-right **⋮ → Repositories**.
+3. Paste **`https://github.com/BixelVentures/podconnect`** → **Add** → close.
 
-1. In Home Assistant, click **Settings** (the ⚙️ gear, bottom of the left sidebar).
-2. Click **Add-ons** (puzzle-piece icon).
-3. Bottom-right, click the blue **ADD-ON STORE** button.
-4. Top-right **⋮ (three dots) → Check for updates**, then refresh the browser page.
-5. Scroll to the top — a **"Local add-ons"** section shows **"PodConnect (test slice)"**.
-   Click it → **INSTALL**.
+## 2. Install (downloads a prebuilt image — ~2 min, no compiling)
 
-> ⏳ The first install **compiles OwnTone** on the Green — **~15–40 minutes**, one time only.
-> (Once the prebuilt image is published, this becomes a ~2-minute pull instead.)
-
-**Don't see "Local add-ons" / "PodConnect"?**
-- Re-check step 1.4: `addons/podconnect/config.yaml` must exist with that exact nesting.
-- Redo **⋮ → Check for updates** and hard-refresh the browser.
-- No **Add-ons** entry under Settings? Enable **Advanced Mode** in your HA user profile
-  (click your name, bottom-left → toggle *Advanced Mode*).
+1. Refresh the store → open **PodConnect (test slice)** → **INSTALL**.
+2. It **downloads a ready-made image** for your Green — no on-device build.
 
 ## 3. Configure
 
-On the add-on's **Configuration** tab:
-
 | Option | What to put |
 |---|---|
-| `speaker_name` | The name you want in Spotify, e.g. `Kitchen` |
+| `speaker_name` | The name shown in Spotify, e.g. `Kitchen` |
 | `homepod_name` | The **exact** HomePod name from the Apple **Home** app, e.g. `Living Room` |
 | `default_volume` | Starting volume `0`–`100` (e.g. `35`) |
 | `bitrate` | `320` |
@@ -49,24 +31,27 @@ Save.
 
 ## 4. Start & test
 
-1. **Start** the add-on, then open the **Log** tab.
-2. Watch for: `Waiting for HomePod '…' to be discovered…` followed by `Selected HomePod '…'`.
-   - If it keeps saying *Waiting*, the `homepod_name` doesn't match exactly, or the HomePod
-     is on a different network/VLAN than the Green.
-3. Open **Spotify** (Premium) on the same network → **Connect to a device** → choose your
-   **`speaker_name`** → press **Play**.
-4. 🎉 Audio plays on the HomePod. The **Spotify volume slider** changes the volume.
+1. **Start** the add-on → open the **Log** tab.
+2. Watch for `Selected HomePod '…'` (it found and locked onto your HomePod).
+   - Stuck on `Waiting for HomePod '…'`? The `homepod_name` doesn't match exactly, or the
+     HomePod is on a different network/VLAN than the Green.
+   - `… needs AirPlay verification`? In the Apple **Home** app, set this HomePod's
+     **"Allow Speaker & Display Access"** to **"Anyone on the Same Network"**.
+3. Open **Spotify** (Premium) → **Connect to a device** → choose your **`speaker_name`** → **Play**.
+4. 🎉 Audio plays on the HomePod; the Spotify volume slider changes the volume.
 
-## 5. What it proves
+## How it works
 
-Spotify Connect → go-librespot → pipe → OwnTone → AirPlay 2 → HomePod, all on the Green,
-with the HomePod auto-selected by name (no manual clicking). Credentials are saved, so the
-speaker stays paired across restarts.
+Spotify Connect → go-librespot → pipe → OwnTone → AirPlay 2 → HomePod, all inside this
+add-on, with the HomePod auto-selected by name. It uses standard **Spotify Connect** (no
+Spotify developer keys needed) and does **not** use the Apple TV integration. Credentials
+are saved, so the speaker stays paired across restarts.
 
 ## Troubleshooting
 
-- **"Waiting for HomePod…" forever** → wrong `homepod_name`, or HomePod not on the same
-  network as the Green.
-- **Speaker missing in Spotify** → confirm the add-on is *started*, you have Spotify
-  Premium, and the phone is on the same network. Check the **Log**.
+- **Install can't pull the image** → the GHCR package must be **public**:
+  github.com/BixelVentures → **Packages** → `aarch64-podconnect` → **Package settings** →
+  **Change visibility → Public**.
+- **"Waiting for HomePod…" forever** → wrong `homepod_name`, or HomePod on a different network.
+- **Speaker missing in Spotify** → add-on started? Spotify Premium? Same network? Check the Log.
 - **Selected but no sound** → check the Log for `go-librespot` / `owntone` errors and share them.
