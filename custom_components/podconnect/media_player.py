@@ -14,7 +14,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import PodConnectConfigEntry
-from .const import DOMAIN
+from .api import SpotifyApiError
+from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
 
 SUPPORTED = (
@@ -160,34 +161,41 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         return self._item.get("uri") if self._item else None
 
     # --- control (targets this device) ---
-    async def async_media_play(self) -> None:
-        await self.coordinator.api.play(self._device_id)
+    async def _send(self, action) -> None:
+        """Run a player command, tolerating Spotify's "restriction" rejections.
+
+        Spotify returns 403 'Restriction violated' for a command that doesn't match the
+        *current* playback state (e.g. pausing what's already paused) — common when our
+        polled state is a few seconds stale. Honour the restriction: swallow it and resync
+        rather than alarm the user; the end state is almost always what they intended.
+        """
+        try:
+            await action
+        except SpotifyApiError as err:
+            LOGGER.debug("Spotify rejected a command (resyncing): %s", err)
         await self.coordinator.async_request_refresh()
+
+    async def async_media_play(self) -> None:
+        await self._send(self.coordinator.api.play(self._device_id))
 
     async def async_media_pause(self) -> None:
-        await self.coordinator.api.pause(self._device_id)
-        await self.coordinator.async_request_refresh()
+        await self._send(self.coordinator.api.pause(self._device_id))
 
     async def async_media_next_track(self) -> None:
-        await self.coordinator.api.next(self._device_id)
-        await self.coordinator.async_request_refresh()
+        await self._send(self.coordinator.api.next(self._device_id))
 
     async def async_media_previous_track(self) -> None:
-        await self.coordinator.api.previous(self._device_id)
-        await self.coordinator.async_request_refresh()
+        await self._send(self.coordinator.api.previous(self._device_id))
 
     async def async_media_seek(self, position: float) -> None:
-        await self.coordinator.api.seek(int(position * 1000), self._device_id)
-        await self.coordinator.async_request_refresh()
+        await self._send(self.coordinator.api.seek(int(position * 1000), self._device_id))
 
     async def async_set_volume_level(self, volume: float) -> None:
-        await self.coordinator.api.set_volume(round(volume * 100), self._device_id)
-        await self.coordinator.async_request_refresh()
+        await self._send(self.coordinator.api.set_volume(round(volume * 100), self._device_id))
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Play a Spotify URI (track -> uris; album/playlist/artist -> context_uri)."""
         if media_id.startswith("spotify:track:"):
-            await self.coordinator.api.play(self._device_id, uris=[media_id])
+            await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
-            await self.coordinator.api.play(self._device_id, context_uri=media_id)
-        await self.coordinator.async_request_refresh()
+            await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
