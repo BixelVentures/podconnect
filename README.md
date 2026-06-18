@@ -27,11 +27,17 @@ speaker); the multi-room manager + "Add speaker" UI come next.
 ## Repository layout
 
 ```
-podconnect/        HA add-on (go-librespot + OwnTone in one image; auto-selects your HomePod)
-docs/PLAN.md       full architecture & roadmap
-repository.yaml    lets you add this repo as a Home Assistant add-on repository
-.github/workflows/ CI that builds & publishes the add-on image to GHCR
+podconnect/                 HA add-on (go-librespot + OwnTone in one image; the Connect speaker)
+custom_components/podconnect HA integration (Spotify OAuth + Web API control + media_player entities)
+hacs.json                   makes this repo a HACS-installable integration
+docs/PLAN.md · docs/control-plan.md   architecture & roadmap
+repository.yaml             lets you add this repo as a Home Assistant add-on repository
+.github/workflows/          CI that builds & publishes the add-on image to GHCR
 ```
+
+The **add-on** makes each HomePod a Spotify Connect speaker; the **integration** gives Home
+Assistant full Spotify control (play/pause/skip/volume + voice) of those speakers via your own
+Spotify developer app. See [`docs/control-plan.md`](docs/control-plan.md).
 
 ## Built on
 

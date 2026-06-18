@@ -1,0 +1,12 @@
+{
+  "domain": "podconnect",
+  "name": "PodConnect",
+  "codeowners": ["@BixelVentures"],
+  "config_flow": true,
+  "dependencies": ["application_credentials"],
+  "documentation": "https://github.com/BixelVentures/podconnect",
+  "issue_tracker": "https://github.com/BixelVentures/podconnect/issues",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "version": "0.1.0"
+}
