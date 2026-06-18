@@ -13,6 +13,21 @@ chmod 0755 /srv/media
 chown -R owntone:owntone /data/owntone || true
 ln -sfn /data/go-librespot /root/.config/go-librespot
 
+# Restrict mDNS advertising to the real LAN interface. Under host networking the container
+# also has docker0/hassio/veth* interfaces with internal IPs the Spotify app / HomePod can't
+# reach; advertising there makes the speaker "drop". Default = auto-detect the default route.
+IFACE="$(jq -r '.network_interface // ""' "$OPTS")"
+if [ -z "$IFACE" ]; then
+  IFACE="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+fi
+if [ -n "$IFACE" ] && [ -f /etc/avahi/avahi-daemon.conf ]; then
+  sed -i '/^allow-interfaces=/d' /etc/avahi/avahi-daemon.conf
+  sed -i "/^\[server\]/a allow-interfaces=${IFACE}" /etc/avahi/avahi-daemon.conf
+  bashio::log.info "mDNS restricted to interface '${IFACE}'"
+else
+  bashio::log.info "mDNS interface restriction: none (advertising on all interfaces)"
+fi
+
 cat > /data/go-librespot/config.yml <<EOF2
 device_name: "${SPEAKER}"
 device_type: speaker

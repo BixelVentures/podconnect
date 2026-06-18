@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libasound2-dev libgcrypt20-dev libavahi-client-dev zlib1g-dev libevent-dev libplist-dev \
       libsodium-dev libjson-c-dev libwebsockets-dev libcurl4-openssl-dev libprotobuf-c-dev \
       libunistring-dev libgnutls28-dev libconfuse-dev libxml2-dev nodejs npm ca-certificates \
-      avahi-daemon dbus libnss-mdns ffmpeg curl jq tar \
+      avahi-daemon dbus libnss-mdns ffmpeg curl jq tar iproute2 \
   && rm -rf /var/lib/apt/lists/*
 
 # --- OwnTone (AirPlay 2 sender) — built from source (no ARM64 package exists) ---
