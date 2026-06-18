@@ -1,6 +1,6 @@
 ---
 name: "PodConnect (test slice)"
-version: "0.1.0"
+version: "0.1.1"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "One HomePod as a Spotify Connect speaker — single-room test slice for PodConnect"
