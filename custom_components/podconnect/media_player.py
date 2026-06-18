@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from homeassistant.components.media_player import (
+    BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -28,6 +30,7 @@ SUPPORTED = (
     | MediaPlayerEntityFeature.VOLUME_STEP
     | MediaPlayerEntityFeature.PLAY_MEDIA
     | MediaPlayerEntityFeature.SELECT_SOURCE
+    | MediaPlayerEntityFeature.BROWSE_MEDIA
 )
 
 
@@ -232,3 +235,37 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             return
         is_playing = bool(self._playback and self._playback.get("is_playing"))
         await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
+
+    async def async_browse_media(
+        self, media_content_type: str | None = None, media_content_id: str | None = None
+    ) -> BrowseMedia:
+        """Browse the user's Spotify playlists — pick one to play on this device."""
+        try:
+            playlists = await self.coordinator.api.playlists()
+        except SpotifyApiError as err:
+            LOGGER.warning("Could not load Spotify playlists: %s", err)
+            playlists = []
+
+        children = [
+            BrowseMedia(
+                title=pl.get("name") or "Playlist",
+                media_class=MediaClass.PLAYLIST,
+                media_content_type=MediaType.PLAYLIST,
+                media_content_id=pl["uri"],
+                can_play=True,
+                can_expand=False,
+                thumbnail=(pl.get("images") or [{}])[0].get("url"),
+            )
+            for pl in playlists
+            if pl.get("uri")
+        ]
+        return BrowseMedia(
+            title="Spotify playlists",
+            media_class=MediaClass.DIRECTORY,
+            media_content_type="playlists",
+            media_content_id="root",
+            can_play=False,
+            can_expand=True,
+            children=children,
+            children_media_class=MediaClass.PLAYLIST,
+        )
