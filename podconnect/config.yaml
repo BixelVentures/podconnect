@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.5.2"
+version: "0.5.3"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -17,7 +17,7 @@ watchdog: "tcp://[HOST]:3689"   # auto-restart the add-on if OwnTone's API stops
 ingress: true                   # serve the "pick a HomePod" panel inside the HA sidebar
 ingress_port: 8099              # the manager binary listens here (also reachable directly on host:8099)
 panel_icon: "mdi:speaker-multiple"
-panel_title: "PodConnect"
+panel_title: "PodConnect Speakers"
 map:
   - type: addon_config
     read_only: false
