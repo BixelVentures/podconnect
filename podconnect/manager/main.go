@@ -169,11 +169,54 @@ func clampPct(p int) int {
 	return p
 }
 
-// setOwnToneVolume sets one OwnTone instance's master volume (0-100). With a single HomePod
-// selected per room, master == that HomePod's level.
-func setOwnToneVolume(base string, pct int) {
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// owntoneOutputVolume returns the volume (0-100) and id of the room's active HomePod — the first
+// SELECTED AirPlay output. ok=false when none is selected. Reading/writing the specific output
+// (not OwnTone's master) is what makes the sync deterministic on multi-output setups.
+func owntoneOutputVolume(base string) (vol int, id string, ok bool) {
 	cl := &http.Client{Timeout: 3 * time.Second}
-	req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/player/volume?volume=%d", base, clampPct(pct)), nil)
+	resp, err := cl.Get(base + "/api/outputs")
+	if err != nil {
+		return 0, "", false
+	}
+	defer resp.Body.Close()
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	var raw struct {
+		Outputs []map[string]any `json:"outputs"`
+	}
+	if err := dec.Decode(&raw); err != nil {
+		return 0, "", false
+	}
+	for _, o := range raw.Outputs {
+		typ, _ := o["type"].(string)
+		if !strings.HasPrefix(strings.ToLower(typ), "airplay") {
+			continue
+		}
+		if sel, _ := o["selected"].(bool); !sel {
+			continue
+		}
+		v := 0
+		if n, ok2 := o["volume"].(json.Number); ok2 {
+			f, _ := n.Float64()
+			v = int(f)
+		}
+		return clampPct(v), fmt.Sprint(o["id"]), true
+	}
+	return 0, "", false
+}
+
+// setOwntoneOutputVolume sets one specific HomePod output's volume (0-100).
+func setOwntoneOutputVolume(base, id string, pct int) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest(http.MethodPut,
+		fmt.Sprintf("%s/api/player/volume?volume=%d&output_id=%s", base, clampPct(pct), id), nil)
 	if resp, err := cl.Do(req); err == nil {
 		resp.Body.Close()
 	}
@@ -234,18 +277,68 @@ func setLibrespotVolumePct(base string, pct int) {
 	}
 }
 
-// syncVolume mirrors one room's go-librespot volume onto its OwnTone, so the Spotify slider is the
-// single volume control. Acts only on change (a manual OwnTone tweak persists until Spotify next
-// moves) and only while a session reports volume. Per-room → multi-room is just N of these.
-func syncVolume(room Room) {
-	last := -1
-	for {
-		if pct, ok := librespotVolumePct(room.Librespot); ok && pct != last {
-			setOwnToneVolume(room.OwnTone, pct)
-			log.Printf("volume sync [%s]: %d%%", room.Name, pct)
-			last = pct
+const volTolerance = 2 // ±%, absorbs 0-100 <-> 0-volume_steps rounding so echoes aren't seen as input
+
+// volumeReconciler keeps a room's Spotify volume (go-librespot) and its HomePod volume (the
+// selected OwnTone output) in agreement in BOTH directions, with echo/loop protection.
+//
+// One canonical percent. Each tick: read both sides; whichever drifted from canon beyond the
+// tolerance becomes the new canon (Spotify wins ties — it's the intent source); push canon to any
+// side that still differs. Comparing against canon (not against the other side) with a tolerance
+// means our own writes are never mistaken for user changes — no ping-pong. Self-healing: a missed
+// change is corrected next tick. Per-room → multi-room is just N reconcilers.
+type volumeReconciler struct {
+	room  Room
+	canon int // -1 until known
+}
+
+// decideVolume is the pure reconcile decision (no I/O, so it's unit-tested): given the canonical
+// value and both sides' current readings, return the new canon and whether each side needs a
+// corrective write. The tolerance comparison against canon is what prevents echo/ping-pong.
+func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, setGl, setOt bool) {
+	if !glOk && !otOk {
+		return canon, false, false
+	}
+	if canon < 0 {
+		if glOk { // first sync: Spotify is the truth if there's a session, else the HomePod level
+			canon = gl
+		} else {
+			canon = ot
 		}
-		time.Sleep(750 * time.Millisecond)
+	} else {
+		glChanged := glOk && abs(gl-canon) > volTolerance
+		otChanged := otOk && abs(ot-canon) > volTolerance
+		switch {
+		case glChanged: // Spotify wins simultaneous changes
+			canon = gl
+		case otChanged: // HomePod button moved it
+			canon = ot
+		}
+	}
+	setGl = glOk && abs(gl-canon) > volTolerance
+	setOt = otOk && abs(ot-canon) > volTolerance
+	return canon, setGl, setOt
+}
+
+func (vr *volumeReconciler) tick() {
+	gl, glOk := librespotVolumePct(vr.room.Librespot)
+	ot, otID, otOk := owntoneOutputVolume(vr.room.OwnTone)
+	newCanon, setGl, setOt := decideVolume(vr.canon, gl, glOk, ot, otOk)
+	vr.canon = newCanon
+	if setGl {
+		setLibrespotVolumePct(vr.room.Librespot, vr.canon)
+		log.Printf("volume [%s]: -> Spotify %d%%", vr.room.Name, vr.canon)
+	}
+	if setOt {
+		setOwntoneOutputVolume(vr.room.OwnTone, otID, vr.canon)
+		log.Printf("volume [%s]: -> HomePod %d%%", vr.room.Name, vr.canon)
+	}
+}
+
+func (vr *volumeReconciler) run() {
+	for {
+		vr.tick()
+		time.Sleep(350 * time.Millisecond)
 	}
 }
 
@@ -364,11 +457,11 @@ func main() {
 		}
 		if target != "" {
 			selectOnOwntone(target)
+			setOwntoneOutputVolume(owntone, target, 13) // gentle, on the specific HomePod
 		}
-		// Gentle level on BOTH sides so the volume syncer can't bump the test up to a louder
+		// Also nudge go-librespot down so the reconciler can't bump the test up to a louder
 		// active-session level.
 		setLibrespotVolumePct(librespot, 13)
-		setOwnToneVolume(owntone, 13)
 		go playTestTone()
 		log.Printf("test tone requested (target=%q id=%q)", targetName, target)
 		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
@@ -383,11 +476,10 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	// Volume sync: one goroutine per room mirrors go-librespot's volume onto OwnTone, so the
-	// Spotify slider is the single control. (HA → Spotify → go-librespot is handled by the Control
-	// integration's Web API call; this closes the go-librespot → HomePod half.)
+	// Bidirectional volume sync: one reconciler per room keeps the Spotify volume and the HomePod
+	// output in agreement both ways (Spotify/HA slider <-> HomePod buttons), loop-protected.
 	for _, r := range rooms() {
-		go syncVolume(r)
+		go (&volumeReconciler{room: r, canon: -1}).run()
 	}
 
 	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
