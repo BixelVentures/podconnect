@@ -288,30 +288,38 @@ const volTolerance = 2 // ±%, absorbs 0-100 <-> 0-volume_steps rounding so echo
 // means our own writes are never mistaken for user changes — no ping-pong. Self-healing: a missed
 // change is corrected next tick. Per-room → multi-room is just N reconcilers.
 type volumeReconciler struct {
-	room  Room
-	canon int // -1 until known
+	room     Room
+	canon    int  // -1 until known
+	prevGlOk bool // was go-librespot reporting a session last tick (to detect reconnects)
 }
 
 // decideVolume is the pure reconcile decision (no I/O, so it's unit-tested): given the canonical
 // value and both sides' current readings, return the new canon and whether each side needs a
 // corrective write. The tolerance comparison against canon is what prevents echo/ping-pong.
-func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, setGl, setOt bool) {
+func decideVolume(canon, gl int, glOk bool, ot int, otOk bool, prevGlOk bool) (newCanon int, setGl, setOt bool) {
 	if !glOk && !otOk {
 		return canon, false, false
 	}
-	if canon < 0 {
-		if glOk { // first sync: Spotify is the truth if there's a session, else the HomePod level
+	switch {
+	case canon < 0:
+		// Cold start: adopt the active Spotify session (the user's current intent) if there is
+		// one, else the HomePod's remembered level.
+		if glOk {
 			canon = gl
 		} else {
 			canon = ot
 		}
-	} else {
+	case glOk && !prevGlOk:
+		// Spotify (re)connected mid-run: KEEP what was playing — canon already tracks the HomePod's
+		// last level — and push it up to Spotify, so a stale session default can't blast/mute the
+		// room. (canon stays as-is.)
+	default:
 		glChanged := glOk && abs(gl-canon) > volTolerance
 		otChanged := otOk && abs(ot-canon) > volTolerance
 		switch {
 		case glChanged: // Spotify wins simultaneous changes
 			canon = gl
-		case otChanged: // HomePod button moved it
+		case otChanged: // HomePod button (or Home app / Siri) moved it
 			canon = ot
 		}
 	}
@@ -323,8 +331,9 @@ func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, se
 func (vr *volumeReconciler) tick() {
 	gl, glOk := librespotVolumePct(vr.room.Librespot)
 	ot, otID, otOk := owntoneOutputVolume(vr.room.OwnTone)
-	newCanon, setGl, setOt := decideVolume(vr.canon, gl, glOk, ot, otOk)
+	newCanon, setGl, setOt := decideVolume(vr.canon, gl, glOk, ot, otOk, vr.prevGlOk)
 	vr.canon = newCanon
+	vr.prevGlOk = glOk
 	if setGl {
 		setLibrespotVolumePct(vr.room.Librespot, vr.canon)
 		log.Printf("volume [%s]: -> Spotify %d%%", vr.room.Name, vr.canon)
