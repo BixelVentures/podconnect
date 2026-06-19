@@ -547,7 +547,8 @@ func reclaimHomePod(room *Room) {
 func roomBridge(room *Room, tone *boolFlag) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
-	capped := false
+	prevActive := false      // re-cap EVERY fresh session (the old once-per-boot flag let a 2nd account through)
+	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
 	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
 	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
 	// reads off the 200ms hot loop.
@@ -587,14 +588,32 @@ func roomBridge(room *Room, tone *boolFlag) {
 				}
 			}
 
+			// Volume safety — a session must NEVER start at full blast (e.g. another account's
+			// remembered 100%). Two guards: (1) while no session is active, hold the HomePod output
+			// at/under the cap (throttled) so the FIRST audio of any new session can't exceed it; and
+			// (2) on every inactive->active transition, cap go-librespot too. Re-armed per session —
+			// the old once-per-boot flag let a 2nd account's fresh session through at 100%.
+			if !gl.Active && time.Now().After(prearmNext) {
+				prearmNext = time.Now().Add(2 * time.Second)
+				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {
+					setOwntoneOutputVolume(room.OwnTone, id, initialVolumeCap)
+					log.Printf("volume [%s]: idle HomePod held at %d%% (never start loud)", room.Name, initialVolumeCap)
+				}
+			}
+
 			if gl.Active && !released {
-				if !capped {
-					capped = true
+				if !prevActive {
+					// Fresh session: cap BOTH sides to <= the ceiling before the reconcile can mirror
+					// a remembered 100% up to the HomePod.
 					if gl.HasVol && gl.VolPct > initialVolumeCap {
 						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
 						gl.VolPct = initialVolumeCap
-						log.Printf("volume [%s]: capped fresh start to %d%%", room.Name, initialVolumeCap)
+						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
 					}
+					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {
+						setOwntoneOutputVolume(room.OwnTone, id, initialVolumeCap)
+					}
+					volCanon = -1 // re-seed the reconcile from the capped level
 				}
 				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
 				otState := owntonePlayerState(room.OwnTone)
@@ -626,6 +645,7 @@ func roomBridge(room *Room, tone *boolFlag) {
 					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(so))
 				}
 			}
+			prevActive = gl.Active
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

@@ -67,6 +67,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.11.1 — 2026-06-19  (never-loud safety fix)
+- **A fresh session can no longer start at full blast.** The volume cap was a one-time-per-boot flag,
+  so a *second* account's new session (e.g. a family member's Spotify, with a remembered 100%) slipped
+  through loud — and the cap was reactive (after audio started). Now: (1) while no session is active
+  the HomePod output is held at/under the cap (so the FIRST audio of any new session can't exceed it),
+  and (2) EVERY inactive→active transition caps both go-librespot and the HomePod. Re-armed per
+  session, proactive, per room. `initial_volume`/cap = 35%%.
+
 ## Speakers 0.11.0 — 2026-06-19  (UX-1b: per-room settings)
 - **Per-room grace + bitrate, editable in the panel** (⚙ Settings per speaker). Stored in rooms.json;
   empty = inherit the global add-on option (which stays the default). Grace takes effect live; a
