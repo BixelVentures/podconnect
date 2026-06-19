@@ -95,6 +95,8 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         # play/pause icon lags the (instant) audio. Show the user's intent immediately, then let
         # the poll confirm. None = no pending guess.
         self._optimistic_playing: bool | None = None
+        self._optimistic_shuffle: bool | None = None
+        self._optimistic_repeat: RepeatMode | None = None
         self._attr_unique_id = f"{entry_id}_{device_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
@@ -134,14 +136,18 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Drop the optimistic guess once the polled state confirms it."""
-        if (
-            self._optimistic_playing is not None
-            and self._is_active
-            and self._playback
-            and self._playback.get("is_playing") == self._optimistic_playing
-        ):
+        """Drop each optimistic guess once the polled state confirms it."""
+        pb = self._playback if self._is_active else None
+        if self._optimistic_playing is not None and pb and pb.get("is_playing") == self._optimistic_playing:
             self._optimistic_playing = None
+        if self._optimistic_shuffle is not None and pb and pb.get("shuffle_state") == self._optimistic_shuffle:
+            self._optimistic_shuffle = None
+        if (
+            self._optimistic_repeat is not None
+            and pb
+            and _SPOTIFY_TO_HA_REPEAT.get(pb.get("repeat_state")) == self._optimistic_repeat
+        ):
+            self._optimistic_repeat = None
         super()._handle_coordinator_update()
 
     @property
@@ -209,11 +215,15 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @property
     def shuffle(self) -> bool | None:
+        if self._optimistic_shuffle is not None:
+            return self._optimistic_shuffle
         pb = self._playback
         return pb.get("shuffle_state") if (self._is_active and pb) else None
 
     @property
     def repeat(self) -> RepeatMode | None:
+        if self._optimistic_repeat is not None:
+            return self._optimistic_repeat
         pb = self._playback
         if not (self._is_active and pb):
             return None
@@ -257,11 +267,14 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         await self._send(self.coordinator.api.set_volume(round(volume * 100), self._device_id))
 
     async def async_set_shuffle(self, shuffle: bool) -> None:
+        self._optimistic_shuffle = shuffle
+        self.async_write_ha_state()
         await self._send(self.coordinator.api.set_shuffle(shuffle, self._device_id))
 
     async def async_set_repeat(self, repeat: RepeatMode) -> None:
-        state = _HA_TO_SPOTIFY_REPEAT.get(repeat, "off")
-        await self._send(self.coordinator.api.set_repeat(state, self._device_id))
+        self._optimistic_repeat = repeat
+        self.async_write_ha_state()
+        await self._send(self.coordinator.api.set_repeat(_HA_TO_SPOTIFY_REPEAT.get(repeat, "off"), self._device_id))
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Play a Spotify URI (track -> uris; album/playlist/artist -> context_uri)."""
