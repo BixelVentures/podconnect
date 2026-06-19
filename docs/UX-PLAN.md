@@ -24,7 +24,13 @@ No third thing. The companion `media_player` folds into Control (below).
 
 ## Workstreams
 
-### UX-1 — The panel becomes the single control surface (add-on)
+### UX-1 — ✅ core DONE (Speakers 0.10.0): self-healing naming
+Bound to the HomePod by **stable OwnTone output id**, self-heals on rename → Apple-Home rename syncs
+the Connect device + HA entity automatically (unless the room name is user-pinned via the panel's
+✎ Rename). Migrated r0 self-populates its id. **UX-1b still to do:** per-room grace/bitrate in the
+panel + shrink the Configuration tab to advanced-only. (Original spec below.)
+
+#### UX-1 — The panel becomes the single control surface (add-on)
 - The panel is the room manager: **list rooms**, **"Add speaker → pick HomePod"** (auto-named, zero
   typing), **rename / remove**, and **per-room settings** (grace, bitrate) inline.
 - **Auto-naming lives here.** Picking a HomePod names the speaker (Connect device + HA entity). There

@@ -22,6 +22,7 @@ first** — it replaced the s6 audio services with manager supervision.
 - [ ] Both rooms **play independently**; per-room volume + play/pause work.
 - [ ] **Remove** a room → its HomePod is freed, no leftover/ghost, r0 unaffected.
 - [ ] Reboot the add-on → both rooms come back (rooms.json persisted).
+- [ ] **Rename a HomePod in Apple Home** → the speaker name follows everywhere (Connect + HA entity), no re-pick. Then ✎ **Rename** a room in the panel → that custom name sticks (auto-sync won't overwrite it).
 
 ## D. Control — Spotify
 - [ ] media_player per Connect device: play/pause/next/seek/volume/**shuffle/repeat**.
