@@ -48,15 +48,14 @@ device-list-driven; multi-account = allow multiple config entries + per-entry co
 Built-in media intents (pause/next/volume) work once the entity is exposed. Area assignment and
 Assist **aliases are user data in HA's registry** — set in the UI, not by integration code. The
 code lever we *do* have is HomePod-name-forwarding (done), so the entity self-names to its room and
-`suggested_area` becomes meaningful. Remaining: document the assign-to-area + expose-to-Assist flow.
+`suggested_area` becomes meaningful. ✅ Setup documented in
+[`docs/AREAS-AND-ASSIST.md`](AREAS-AND-ASSIST.md).
 
 ---
 
 ## 📋 Polish / quality
-- **Track-change buffer-flush** (next/skip latency): the ~2-4s AirPlay buffer means a skip is heard
-  late; flushing OwnTone on a go-librespot track change would make it instant — but risks a glitch
-  (and worse underruns on the VM). **Build & test on the wired Green**, not the VM. (Variable
-  fast/slow is Spotify prefetch — not ours.)
+- **Track-change buffer-flush** (next/skip latency): **build & test on the wired Green** — full
+  spec + acceptance criteria in [`docs/GREEN-TESTING.md`](GREEN-TESTING.md) §D.
 - ✅ **Configurable grace-release** (`grace_minutes`, Speakers 0.7.0).
 - ✅ **Picker now-playing / released / idle** line (Speakers 0.7.0). Remaining: a fuller visual polish.
 - ✅ `CHANGELOG.md` (both components). Keep batching releases → fewer HA store-cache dances.
