@@ -82,6 +82,14 @@ class SpotifyApi:
         data = await self._request("GET", "/me/playlists", params={"limit": limit})
         return (data or {}).get("items", [])
 
+    async def search(
+        self, query: str, types: str = "track,artist,album,playlist", limit: int = 8
+    ) -> dict[str, Any]:
+        """GET /search — returns {tracks,artists,albums,playlists: {items:[...]}}."""
+        return await self._request(
+            "GET", "/search", params={"q": query, "type": types, "limit": limit}
+        ) or {}
+
     # --- control (device_id targets a specific Connect device) ---
     async def play(
         self,

@@ -21,6 +21,15 @@ from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
 
+# SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
+# integration still loads on older cores (it just won't advertise search there).
+try:
+    from homeassistant.components.media_player import SearchMedia, SearchMediaQuery
+
+    _HAS_SEARCH = True
+except ImportError:  # pragma: no cover - depends on HA core version
+    _HAS_SEARCH = False
+
 SUPPORTED = (
     MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
@@ -35,6 +44,17 @@ SUPPORTED = (
     | MediaPlayerEntityFeature.SHUFFLE_SET
     | MediaPlayerEntityFeature.REPEAT_SET
 )
+if _HAS_SEARCH:
+    SUPPORTED |= MediaPlayerEntityFeature.SEARCH_MEDIA
+
+# Spotify search-result type -> (HA MediaClass, HA MediaType). Tracks are leaves; the rest are
+# containers you can also play (an artist/album/playlist URI is a valid play context).
+_SEARCH_KINDS = {
+    "tracks": (MediaClass.TRACK, MediaType.TRACK),
+    "artists": (MediaClass.ARTIST, MediaType.ARTIST),
+    "albums": (MediaClass.ALBUM, MediaType.ALBUM),
+    "playlists": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
+}
 
 # Spotify repeat_state <-> HA RepeatMode.
 _SPOTIFY_TO_HA_REPEAT = {
@@ -331,3 +351,69 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             children=children,
             children_media_class=MediaClass.PLAYLIST,
         )
+
+    @staticmethod
+    def _result_item(item: dict, media_class: MediaClass, media_type: MediaType) -> BrowseMedia:
+        """Map one Spotify object to a playable BrowseMedia (its URI is the play target)."""
+        title = item.get("name") or "?"
+        if media_type == MediaType.TRACK and item.get("artists"):
+            artists = ", ".join(a.get("name") for a in item["artists"] if a.get("name"))
+            if artists:
+                title = f"{title} — {artists}"
+        # Tracks carry their cover on the album; artists/albums/playlists carry their own.
+        images = item.get("images") or (item.get("album") or {}).get("images") or []
+        return BrowseMedia(
+            title=title,
+            media_class=media_class,
+            media_content_type=media_type,
+            media_content_id=item["uri"],
+            can_play=True,
+            can_expand=media_type != MediaType.TRACK,
+            thumbnail=images[0].get("url") if images else None,
+        )
+
+    async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
+        """Search Spotify so Assist ("play X in the kitchen") and the UI can find music.
+
+        Results are ranked so the best name match is first — the search-and-play intent plays
+        result[0], so an exact title/artist hit must win over an incidental substring match.
+        """
+        types = "track,artist,album,playlist"
+        if query.media_filter_classes:
+            wanted = {
+                MediaClass.TRACK: "track",
+                MediaClass.ARTIST: "artist",
+                MediaClass.ALBUM: "album",
+                MediaClass.PLAYLIST: "playlist",
+            }
+            sel = [wanted[c] for c in query.media_filter_classes if c in wanted]
+            if sel:
+                types = ",".join(sel)
+        try:
+            data = await self.coordinator.api.search(query.search_query, types)
+        except SpotifyApiError as err:
+            LOGGER.warning("Spotify search failed: %s", err)
+            return SearchMedia(result=[])
+
+        q = query.search_query.strip().lower()
+
+        def relevance(name: str | None) -> int:
+            n = (name or "").lower()
+            if n == q:
+                return 3
+            if n.startswith(q):
+                return 2
+            if q in n:
+                return 1
+            return 0
+
+        scored: list[tuple[int, BrowseMedia]] = []
+        for key, (media_class, media_type) in _SEARCH_KINDS.items():
+            for item in (data.get(key) or {}).get("items", []):
+                if item and item.get("uri"):
+                    scored.append(
+                        (relevance(item.get("name")), self._result_item(item, media_class, media_type))
+                    )
+        # Stable sort keeps Spotify's per-type relevance order within an equal name-match score.
+        scored.sort(key=lambda s: s[0], reverse=True)
+        return SearchMedia(result=[bm for _, bm in scored])
