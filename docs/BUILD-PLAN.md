@@ -155,8 +155,14 @@ isolated additions.
 
 ## Parallel execution map
 
+> **Wave 1 ✅ DONE** — WS-A (`podconnect_speakers` 0.1.0) + WS-D1 (start_buffer_ms=500) + WS-D2
+> (`/api/play`, `/api/volume`, `volume` in state) shipped as Speakers add-on **0.8.0** + the new
+> companion integration. Distribution caveat: HACS = one integration per repo, so
+> `podconnect_speakers` installs manually for now (a dedicated repo is the follow-up).
+> **Next: Wave 2 (WS-C multi-room).**
+
 ```
-Wave 1 (fully parallel — disjoint files)
+Wave 1 (fully parallel — disjoint files)   ✅ done
 ├─ Agent 1 ▶ WS-A  custom_components/podconnect_speakers/**         (new dir, zero manager overlap)
 └─ Agent 2 ▶ WS-D1 owntone.conf start_buffer_ms=500                 (config render only)
 

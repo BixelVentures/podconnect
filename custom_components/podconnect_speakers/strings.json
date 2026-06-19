@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to PodConnect Speakers",
+        "description": "Enter the base URL of the PodConnect add-on manager. The add-on uses host networking, so this is your Home Assistant host's LAN IP on port 8099.",
+        "data": {
+          "base_url": "Base URL"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the PodConnect add-on manager. Check the URL and that the add-on is running."
+    },
+    "abort": {
+      "already_configured": "This PodConnect speaker is already configured."
+    }
+  }
+}
