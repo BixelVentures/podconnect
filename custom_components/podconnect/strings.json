@@ -24,27 +24,6 @@
       "default": "Successfully authenticated with Spotify."
     }
   },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Local speakers (PodConnect add-on)",
-        "description": "Optional. Enter the PodConnect add-on manager URL to add account-agnostic local speaker controls (a media player and a Release button per HomePod room). The add-on uses host networking, so this is your Home Assistant host's LAN IP on port 8099. Leave empty to use Spotify control only.",
-        "data": {
-          "base_url": "Add-on manager URL"
-        }
-      }
-    },
-    "error": {
-      "cannot_connect": "Failed to connect to the PodConnect add-on manager. Check the URL and that the add-on is running."
-    }
-  },
-  "entity": {
-    "button": {
-      "release": {
-        "name": "Release HomePod"
-      }
-    }
-  },
   "application_credentials": {
     "description": "Create an app in the [Spotify developer dashboard]({developer_console_url}) with redirect URI `https://my.home-assistant.io/redirect/oauth`, add your Spotify account under User Management, then enter the Client ID and Client Secret below."
   }

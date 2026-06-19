@@ -8,7 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## Control 0.7.0 — 2026-06-19
+## Control 0.7.1 — 2026-06-19  (reverts the 0.7.0 local entities)
+- **No duplicate entities.** 0.7.0 surfaced a *second* media_player (+ Release button) per HomePod
+  alongside the Spotify Connect one — two players per speaker, which is the wrong UX. Reverted: Control
+  is **pure Spotify control again, one entity per Connect device**. The local-speaker plumbing
+  (options URL, speakers_api/coordinator, button) is removed.
+- **Account-agnostic Stop/Release stays where it belongs:** the add-on **panel** buttons (+ Siri).
+  And "stop music" / "pause the kitchen" in HA Assist already works on your *own* playback via the
+  Spotify entity — no extra entity needed. (Cross-account voice-stop was deprioritized by design.)
+- Keeps 0.6.x search (audiobooks + popularity ranking).
+
+## Control 0.7.0 — 2026-06-19  (superseded by 0.7.1 — reverted)
 - **Companion folded into Control.** The separate `podconnect_speakers` integration is retired —
   set the **add-on manager URL** in Control's options (Settings → Devices & Services → PodConnect
   Control → Configure; the HA host's LAN IP on `:8099`) and the account-agnostic local controls

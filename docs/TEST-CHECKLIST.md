@@ -6,7 +6,6 @@ first** — it replaced the s6 audio services with manager supervision.
 ## A. Update / install
 - [ ] Add-on → **0.9.0** (Add-on Store). Control → **0.7.0** (HACS).
 - [ ] **Re-authorize Control once** (profile scopes from 0.5.0 — else Top/Recent/Liked are empty).
-- [ ] (Optional, for voice stop) Control → **Configure** → set add-on URL `http://<HA-IP>:8099`.
 
 ## B. Speakers — single room (r0 must still work after the multi-room migration)
 - [ ] Audio plays on the HomePod; **migration kept it** (no Spotify re-login, no duplicate device).
@@ -28,7 +27,7 @@ first** — it replaced the s6 audio services with manager supervision.
 - [ ] media_player per Connect device: play/pause/next/seek/volume/**shuffle/repeat**.
 - [ ] **Browse**: Playlists / Top Artists / Top Tracks / Recently Played / Liked (after re-auth).
 - [ ] **Search**: "spil <kunstner/sang>" picks the *right/popular* version; "spil <lydbog>" finds the **audiobook** (not a random song).
-- [ ] **Local speaker entity** (if URL set): pause/play/volume + **Release** button work per room.
+- [ ] **One entity per HomePod** — no duplicate "account-agnostic" player (removed in 0.7.1).
 
 ## E. Assist (Gemini)
 - [ ] Gemini safety → **Block none** (no more `PROHIBITED_CONTENT` on normal input).
@@ -37,7 +36,7 @@ first** — it replaced the s6 audio services with manager supervision.
 - [ ] "spil X i <rum>" searches + plays on that room's speaker.
 
 ## F. Cross-account (the wife scenario)
-- [ ] Another account plays on a HomePod → you **⏹ Stop** (panel, or by voice via the local entity) → it stops.
+- [ ] Another account plays on a HomePod → **⏹ Stop** in the add-on **panel** (or "Hey Siri, stop") → it stops.
 
 ---
 _Reference: `docs/GREEN-TESTING.md` (deeper bring-up + the deferred buffer-flush §D)._

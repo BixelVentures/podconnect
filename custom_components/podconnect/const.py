@@ -28,13 +28,3 @@ SPOTIFY_SCOPES = [
 # How often to poll Spotify's Web API for playback state + devices.
 # Gentle on dev-mode rate limits; HomePod push-state (go-librespot events) lands in a later phase.
 POLL_INTERVAL_SECONDS = 10
-
-# Optional local-speaker (add-on manager) integration. Set the manager base URL in the
-# integration's options to surface account-agnostic local speaker entities + a Release button.
-# Empty / unset = Control works purely as Spotify control with no add-on dependency.
-CONF_BASE_URL = "base_url"
-DEFAULT_BASE_URL = "http://homeassistant.local:8099"
-
-# How often to poll the add-on's manager HTTP API for per-room speaker state.
-# Local LAN call, so a tight interval keeps the dashboard / Assist state responsive.
-SPEAKERS_POLL_INTERVAL_SECONDS = 5

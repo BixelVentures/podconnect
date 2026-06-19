@@ -39,10 +39,13 @@ No third thing. The companion `media_player` folds into Control (below).
 - The multi-room panel already exists (0.9.0); this is polish: settings inline, clearer naming, a
   "this is the only place you need" layout.
 
-### UX-2 — ✅ DONE (Control 0.7.0) — companion folded into Control
-Set the add-on URL in Control's Options → local speaker media_player + Release button per room appear
-inside Control; the separate `podconnect_speakers` integration is retired. Control still works fully
-without the URL. **Two installs, not three.** (Original spec below.)
+### UX-2 — ✅ RESOLVED: no local entities (companion retired; reverted in 0.7.1)
+Decision: **never show two media_players per HomePod.** The companion `podconnect_speakers` is retired
+(deleted), AND the brief 0.7.0 attempt to re-expose a local speaker media_player inside Control was
+**reverted in 0.7.1** — Control is one Spotify entity per Connect device, period. The account-agnostic
+Stop/Release lives **only in the add-on panel** (+ Siri); HA Assist "stop music" already pauses your
+own playback via the Spotify entity. So: **two installs (add-on + Control), one entity per HomePod.**
+(Original fold spec kept below for history.)
 
 #### UX-2 — Fold the companion media_player into Control (retire the 3rd piece)
 - Move the account-agnostic speaker `media_player` (+ Release button) **into Control**, created
