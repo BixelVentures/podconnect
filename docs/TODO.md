@@ -1,60 +1,58 @@
 # PodConnect — TODO
 
-_Updated 2026-06-19, after full end-to-end success (HA → Spotify → HomePod)._
+_Updated 2026-06-19. Volume + transport + sharing all built & largely VM-validated._
 
-## ✅ Done — the product does its core job
-- **Speakers** add-on `0.2.5`: HomePod discovery (`AirPlay 2` fix), no-typing Ingress picker,
-  named 🔊 test tone, stable device-id, mDNS interface restriction, go-librespot watchdog.
-- **Control** integration `0.2.0`: OAuth (own Spotify app), media_player per Connect device,
-  Browse & Play.
-- **Proven end-to-end:** PodConnect Control plays Spotify on the mapped HomePod. Audio out of the
-  HomePod confirmed (test tone + real playback). HA-driven control held where the Spotify app's
-  Connect picker dropped on the VM.
-
----
-
-## 🎯 Tomorrow — top priorities
-
-### ✅ Volume-sync — BUILT (Speakers 0.3.0), needs real-world verification
-One slider rules them all. Shipped:
-- go-librespot `external_volume: true` (no more PCM double-scaling).
-- Manager runs a per-room `syncVolume` goroutine: polls go-librespot `/status` (volume /
-  volume_steps, self-describing), and on change mirrors it to OwnTone `PUT /api/player/volume`.
-- HA → Spotify → go-librespot was already wired (Control `set_volume` → Web API); this closes the
-  go-librespot → HomePod half. Built per-`Room` so multi-room = N goroutines.
-- **Verify tomorrow on the device:** move the Spotify slider → HomePod loudness follows; HA
-  reflects it. (Couldn't exercise the active-session path in Docker — no Spotify login / HomePod.)
-
-### P1 — Deploy to the wired HA Green + verify E2E
-Move off the VM to the real target.
-- Install Speakers + Control on the Green (Ethernet).
-- Confirm: discovery is instant, the **Spotify-app Connect picker holds** (the VM's only genuine
-  network failure), playback stable over time.
-- This is the "is it production-real" checkpoint. Can run in parallel with volume-sync.
+## ✅ Done (it works, end to end)
+**Speakers (add-on, 0.6.0):** HomePod picker (no-typing, `AirPlay 2` fix), test-sound, stable
+device-id, mDNS interface restriction, go-librespot watchdog. **Bidirectional volume sync**
+(Spotify/HA ⇄ HomePod buttons, per-output). **Transport sync** (play/pause, flicker-free,
+rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). **Grace-release**
+("deling": hold through brief interruptions, free after 3min idle, reclaim on resume, + manual
+"⏏ Release" button).
+**Control (integration, 0.3.2):** media_player per Connect device (transport/volume/browse/play/
+source), **shuffle**, **repeat**, **optimistic UI** (instant play/pause/shuffle/repeat).
+**Proven on the VM:** HA + Spotify app + HomePod all control & reflect. (Every "VM" bug was code.)
 
 ---
 
-## 📋 Backlog — after the above
+## 🎯 Next — prioritized
 
-### Robustness / UX
-- `CHANGELOG.md` for the add-on (kills the "No changelog found" + clarifies updates).
-- Batch changes into fewer releases to reduce the HA store-cache dance.
-- Live "▶ playing here" marker in the picker that updates as the active output changes.
-- Re-check for ghost duplicate Connect devices after the Green move; auto-clean stale ones if needed.
+### P1 — Multi-room ("Add speaker") ★ the big one
+N HomePods, each its own (go-librespot + OwnTone) pair with unique ports/db/mDNS name. The
+manager already takes a `Room` + `rooms()` (the seed) — multi-room = build the real list +
+spawn/supervise per room + an "Add speaker → pick HomePod → name it" flow in the panel. Per-room
+volume/transport/grace-release already generalize (N goroutines).
 
-### Features (roadmap)
-- Control: deeper **browse/search** (track-level, search box), not just playlists.
-- **Multi-room "Add speaker"** — N× (go-librespot + OwnTone) pairs, dynamic spawn/supervise,
-  per-room picker. (The manager binary is the seed for this.)
-- **Multi-account** (one HA config entry per family member).
+### P1 — HomePod name forwarding (nice, small)
+Default the speaker name to the **picked HomePod's name** (e.g. "Køkkenalrum") instead of a manual
+`speaker_name`, so the Connect device + HA entity auto-name sensibly. Needs a go-librespot
+`device_name` update + restart on pick.
 
-### Architecture / compatibility
-- `docs/CONTRACT.md` — stable contract between Control and the Speakers manager
-  (`/podconnect/info`, events WS, volume) so the integration never binds directly to
-  go-librespot:3678 / OwnTone:3689. HA Repairs card for version mismatches.
+### P2 — Multi-account
+One Control (HACS) config entry per family member (each its own Spotify OAuth). Control is already
+device-list-driven; multi-account = allow multiple config entries + per-entry coordinator.
+
+### P2 — HA Assist + Areas (mostly config, smooth it)
+Works once the entity is exposed (built-in media intents: pause/next/volume). Polish: set a
+**suggested_area** + **aliases** from the integration so "pause the kitchen" works with less setup;
+document the room/area assignment.
 
 ---
 
-## Notes
-- Volume-sync and the Green move are independent — do both tomorrow (one is code, one is hardware).
-- Everything below the line is "make it nice / scale it," not "make it work" — that part is done.
+## 📋 Polish / quality
+- **Track-change buffer-flush** (next/skip latency): the ~2-4s AirPlay buffer means a skip is heard
+  late; flushing OwnTone on a go-librespot track change would make it instant — but risks a glitch
+  (and worse underruns on the VM). **Build & test on the wired Green**, not the VM. (Variable
+  fast/slow is Spotify prefetch — not ours.)
+- **Picker UI** — a more polished look; show current grace-release state; maybe a "now playing" line.
+- **Configurable grace-release** period (3min default).
+- `CHANGELOG.md` + batch releases → fewer HA store-cache dances.
+- `docs/CONTRACT.md` — the stable Speakers↔Control facade (so Control never binds to :3678/:3689).
+
+## 🚫 Investigated dead-ends (don't re-attempt)
+- HomePod **double/triple-tap (next/prev)** — gesture doesn't reach OwnTone; pipe next = stop+clear.
+- iOS **system/native volume → Connect** — Apple killed it (iOS 17.3-17.6) for ALL Connect apps.
+
+## Environment
+- All proven on the **VM**. The wired **Green** is still the right home for smooth audio (no
+  underruns/session-flap) and for safely testing the buffer-flush.
