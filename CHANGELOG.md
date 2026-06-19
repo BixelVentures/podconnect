@@ -33,6 +33,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.9.0 — 2026-06-19  (multi-room — needs on-device validation)
+- **Multi-room.** N HomePods, each its own (go-librespot + OwnTone) pair, added live from the panel
+  ("Add speaker → pick HomePod") with no add-on restart. Per-room volume/transport/grace all
+  generalize (one goroutine each).
+- **Architecture change:** the Go manager now **forks & supervises** each room's two child processes
+  (os/exec; restart-on-exit + the folded go-librespot hang-watchdog + per-room HomePod selection).
+  The s6 services `go-librespot`, `owntone`, `gl-watchdog`, `select-homepod` are **removed** — the
+  manager owns them. Children run in their own process group (die-with-parent via Pdeathsig).
+- **Back-compat:** on first boot the existing single speaker is migrated to room `r0`, keeping its
+  **legacy paths + ports** (`/data/go-librespot` creds + device_id, `/data/owntone` library,
+  `/srv/media/spotify`, go-librespot 3678 / OwnTone 3689/3688 — HA's watchdog stays on 3689). New
+  rooms (idx ≥ 1) get `/data/rooms/<id>` + ports 37xx/38xx/39xx. Room ids/idx are monotonic.
+- New API: `GET /api/rooms`, `POST /api/rooms`, `DELETE /api/rooms/<id>`, `GET /api/discover`;
+  `/api/state` stays as the room-0 back-compat view. New unit tests: port allocator, rooms.json
+  round-trip, add-room uniqueness, device-id stability.
+- ⚠️ **Test on the VM first.** This rips out the s6 audio services in favour of manager supervision;
+  the Go compiles + unit-tests green, but process-spawning / mDNS / two-rooms-at-once are only
+  verifiable on real hardware. See `docs/GREEN-TESTING.md`.
+
 ## Speakers 0.8.0 — 2026-06-19
 - **Snappy skips:** OwnTone `start_buffer_ms = 500` (was the default 2250 ms output pre-buffer —
   the cause of the ~2–4 s AirPlay skip lag). Maintainer-blessed floor; raise toward 700–1000 ms if

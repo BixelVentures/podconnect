@@ -1,8 +1,16 @@
 #!/usr/bin/with-contenv bashio
-# PodConnect manager: serves the HA Ingress panel (the no-typing "pick a HomePod" UI) on :8099.
-# It reads OwnTone's live AirPlay scan and persists the chosen device for select-homepod.
-bashio::log.info "PodConnect manager (Ingress picker UI) starting on :8099"
-export OWNTONE_URL="http://localhost:3689"
+# PodConnect manager: serves the HA Ingress panel (the no-typing "pick a HomePod" UI) on :8099 AND
+# forks + supervises each room's (go-librespot + OwnTone) children — replacing the old s6 services
+# go-librespot/owntone/gl-watchdog/select-homepod. Depends on avahi (children need mDNS).
+bashio::log.info "PodConnect manager starting on :8099 (multi-room supervisor + picker UI)"
 export DATA_DIR="/data"
 export PORT="8099"
+# Wait up to ~15s for Avahi to be ready on D-Bus before the manager spawns the rooms' children
+# (which need mDNS for Spotify Connect + AirPlay discovery). Bounded — never hangs.
+for i in $(seq 1 30); do
+  dbus-send --system --dest=org.freedesktop.Avahi --print-reply / \
+    org.freedesktop.Avahi.Server.GetState >/dev/null 2>&1 && break
+  sleep 0.5
+done
+export HOME=/root
 exec podconnect-manager

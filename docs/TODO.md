@@ -24,23 +24,20 @@ rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). *
 > [`docs/BUILD-PLAN.md`](BUILD-PLAN.md) (companion integration · push-state · multi-room · snappy
 > skips). Multi-account deferred by request.
 
-### P1 — Multi-room ("Add speaker") ★ the big one
-N HomePods, each its own (go-librespot + OwnTone) pair with unique ports/db/mDNS name. The
-manager already takes a `Room` + `rooms()` (the seed) — multi-room = build the real list +
-spawn/supervise per room + an "Add speaker → pick HomePod → name it" flow in the panel. Per-room
-volume/transport/grace-release already generalize (N goroutines).
+### ✅ Multi-room ("Add speaker") — built (Speakers 0.9.0), needs on-device validation
+N HomePods, each its own (go-librespot + OwnTone) pair. Manager forks/supervises children; s6 audio
+services removed; rooms.json + r0 legacy migration; `/api/rooms` + `/api/discover` + Add-speaker
+panel. **Validate on the VM/Green** (process spawning / mDNS / two rooms) — see `GREEN-TESTING.md`.
 
 ### ✅ HomePod name forwarding (done — Speakers 0.7.0)
 Empty `speaker_name` → speaker auto-names after the picked HomePod; live `device_name` update +
 go-librespot bounce; device id persisted independently (no ghost on rename).
 
-### P1 — Speaker as a HA entity → voice "stop/release/take over" (MQTT)
-The chosen "best practice" for account-agnostic voice control (deferred for now — panel only).
-Publish each physical speaker from the add-on as a real **`media_player`** (+ a "release"
-`button`) via **MQTT discovery**. Then "stop the music in the kitchen" hits the built-in pause
-intent → `/api/stop` (local, any account), in the right **Area**, no custom sentences. Needs an
-MQTT broker + a discovery publisher in the Go manager. Alt for no-broker setups: a documented
-`rest_command` + `script` snippet calling `/api/stop` & `/api/release`.
+### ✅ Speaker as a HA media_player → voice "stop/release" (done — `podconnect_speakers` 0.1.0)
+NOT MQTT (HA has no MQTT media_player) — a companion custom integration wraps `/api/*` as a real
+`media_player` (+ Release button). "stop the kitchen" → `HassMediaPause` → `/api/stop`, account-
+agnostic. Distribution: installs manually for now (HACS = one integration per repo); a dedicated
+repo is the follow-up.
 
 ### P2 — Multi-account
 One Control (HACS) config entry per family member (each its own Spotify OAuth). Control is already

@@ -111,8 +111,7 @@ func TestFetchOutputsRealisticOwnTone(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	owntone = srv.URL // override the package-level target at runtime
-	devs, up := fetchOutputs()
+	devs, up := fetchOutputsFrom(srv.URL)
 
 	if !up {
 		t.Fatal("expected owntone_up=true when OwnTone answers")

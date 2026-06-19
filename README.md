@@ -47,13 +47,20 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what
   Integration → PodConnect Control** → enter your Spotify Client ID/Secret and sign in.
 - **Rooms + voice:** see [`docs/AREAS-AND-ASSIST.md`](docs/AREAS-AND-ASSIST.md).
 
+**Multi-room** (add-on 0.9.0): several HomePods, each its own speaker, added live from the panel
+("Add speaker → pick HomePod"); the manager forks & supervises each room's engine. _New — validate
+on hardware before relying on it._
+
+**Account-agnostic voice control** (`podconnect_speakers` companion integration): each physical
+speaker as a real `media_player` (+ Release button), so "stop the kitchen" works by voice
+regardless of whose Spotify is playing. (Install notes in `CHANGELOG.md`.)
+
 ## Roadmap (planned — not yet built)
 
-- **Multi-room:** several HomePods, each its own speaker, with an **"Add speaker → pick HomePod"** UI.
 - **Multi-account** (whole family): one Control config entry per person.
 - **Instant push state** for HomePods (live go-librespot events instead of ~10s polling).
-- **Voice stop/release** (account-agnostic) by exposing each speaker as a `media_player` via MQTT.
-- **Track-change buffer-flush** (snappier skips) — to be tuned on the wired Green.
+- Polish: multi-room on-device hardening; a dedicated repo so the companion integration installs via
+  HACS; picker visual refresh.
 
 See [`docs/TODO.md`](docs/TODO.md) (living roadmap), [`docs/PLAN.md`](docs/PLAN.md) (architecture)
 and [`docs/control-plan.md`](docs/control-plan.md) (integration spec).

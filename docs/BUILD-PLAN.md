@@ -159,7 +159,11 @@ isolated additions.
 > (`/api/play`, `/api/volume`, `volume` in state) shipped as Speakers add-on **0.8.0** + the new
 > companion integration. Distribution caveat: HACS = one integration per repo, so
 > `podconnect_speakers` installs manually for now (a dedicated repo is the follow-up).
-> **Next: Wave 2 (WS-C multi-room).**
+>
+> **Wave 2 ✅ DONE (code) — WS-C multi-room shipped as Speakers add-on 0.9.0.** Manager forks/
+> supervises children; s6 audio services removed; rooms.json + migration (r0 legacy back-compat);
+> `/api/rooms` + `/api/discover` + Add-speaker panel. **Needs on-device validation** (process
+> spawning / mDNS / two rooms). **Next: Wave 3 (WS-B push-state) — after the Green validates 0.9.0.**
 
 ```
 Wave 1 (fully parallel — disjoint files)   ✅ done

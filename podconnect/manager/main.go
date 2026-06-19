@@ -1,12 +1,13 @@
-// PodConnect manager — a tiny stdlib HTTP service that powers the HA Ingress panel.
+// PodConnect manager — a tiny stdlib HTTP service that powers the HA Ingress panel AND forks +
+// supervises each room's (go-librespot + OwnTone) child processes.
 //
-// It surfaces OwnTone's live AirPlay scan (GET /api/outputs) as a click-to-pick list so the
-// user never has to type a HomePod name. The chosen name is persisted to
-// /data/selected_output.json, which the select-homepod s6 service reads (preferring it over the
-// static homepod_name config option) to lock OwnTone onto that output.
+// Multi-room: N HomePods, each its own (go-librespot + OwnTone) pair, added live from the panel with
+// no add-on restart. The set of rooms is persisted to /data/rooms.json (room 0 migrated from the
+// legacy single-room setup, keeping its creds/identity/library). The manager renders each room's
+// configs, spawns + supervises its children (replacing the s6 services go-librespot/owntone/
+// gl-watchdog/select-homepod), runs the volume/transport bridge, and serves the picker UI.
 //
-// No third-party deps on purpose: this is also the seed of the future manager (volume relay,
-// multi-room spawn). Keep it boring and dependency-free.
+// No third-party deps on purpose. Keep it boring and dependency-free.
 package main
 
 import (
@@ -14,39 +15,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	stdlog "log"
 	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
+// log is the package-wide logger (aliased so the other files can call log.Printf without each
+// importing "log"). Same behavior as the stdlib default logger.
+var log = stdlog.Default()
+
 var (
-	owntone   = envOr("OWNTONE_URL", "http://localhost:3689")
-	librespot = envOr("LIBRESPOT_URL", "http://localhost:3678")
-	dataDir   = envOr("DATA_DIR", "/data")
-	port      = envOr("PORT", "8099")
+	dataDir = envOr("DATA_DIR", "/data")
+	port    = envOr("PORT", "8099")
 )
-
-// Room is one (go-librespot + OwnTone) pair — a Spotify-Connect speaker bound to one HomePod.
-// There is exactly one today; every per-speaker concern (volume sync now; spawn/supervise/pick
-// later) takes a Room, so the multi-room phase is "more rooms", not a rewrite.
-type Room struct {
-	Name      string
-	Librespot string
-	OwnTone   string
-}
-
-// rooms returns the live set of speakers. Single-room for now; the multi-room phase will build
-// this from persisted config + dynamically spawned instances, each with its own ports.
-func rooms() []Room {
-	return []Room{{Name: readSpeaker(), Librespot: librespot, OwnTone: owntone}}
-}
 
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
@@ -149,12 +135,12 @@ func readHomepodName() string {
 	return o.HomepodName
 }
 
-// fetchOutputs returns the AirPlay outputs OwnTone has discovered, and whether OwnTone answered.
-// Parsed defensively (map + UseNumber) so a field OwnTone serializes as a number rather than a
-// string — notably the 64-bit output "id" — can't make a strict decoder drop every device.
-func fetchOutputs() ([]device, bool) {
+// fetchOutputsFrom returns the AirPlay outputs a given OwnTone instance has discovered, and whether
+// it answered. Parsed defensively (map + UseNumber) so a field OwnTone serializes as a number rather
+// than a string — notably the 64-bit output "id" — can't make a strict decoder drop every device.
+func fetchOutputsFrom(base string) ([]device, bool) {
 	cl := &http.Client{Timeout: 4 * time.Second}
-	resp, err := cl.Get(owntone + "/api/outputs")
+	resp, err := cl.Get(base + "/api/outputs")
 	if err != nil {
 		return nil, false
 	}
@@ -189,10 +175,11 @@ func fetchOutputs() ([]device, bool) {
 
 func asBool(v any) bool { b, _ := v.(bool); return b }
 
-// selectOnOwntone activates exactly one output (the proven call select-homepod uses).
-func selectOnOwntone(id string) {
+// selectOnOwntoneAt activates exactly one output on a given OwnTone (the proven call select-homepod
+// uses).
+func selectOnOwntoneAt(base, id string) {
 	cl := &http.Client{Timeout: 4 * time.Second}
-	req, _ := http.NewRequest(http.MethodPut, owntone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":["`+id+`"]}`))
+	req, _ := http.NewRequest(http.MethodPut, base+"/api/outputs/set", bytes.NewBufferString(`{"outputs":["`+id+`"]}`))
 	if resp, err := cl.Do(req); err == nil {
 		resp.Body.Close()
 	}
@@ -366,13 +353,14 @@ func librespotTransport(base, action string) {
 	}
 }
 
-func glConfigPath() string { return filepath.Join(dataDir, "go-librespot", "config.yml") }
+func glConfigPath(r *Room) string { return filepath.Join(r.ConfigDir, "config.yml") }
 
-// setGLDeviceName rewrites the device_name line in go-librespot's config.yml. Returns true if it
-// actually changed (so the caller only restarts when needed). The device_id is persisted
+// setGLDeviceName rewrites the device_name line in a room's go-librespot config.yml. Returns true if
+// it actually changed (so the caller only restarts when needed). The device_id is persisted
 // separately, so renaming never spawns a ghost Connect device.
-func setGLDeviceName(name string) bool {
-	b, err := os.ReadFile(glConfigPath())
+func setGLDeviceName(r *Room, name string) bool {
+	p := glConfigPath(r)
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return false
 	}
@@ -384,21 +372,10 @@ func setGLDeviceName(name string) bool {
 				return false
 			}
 			lines[i] = want
-			return os.WriteFile(glConfigPath(), []byte(strings.Join(lines, "\n")), 0o644) == nil
+			return os.WriteFile(p, []byte(strings.Join(lines, "\n")), 0o644) == nil
 		}
 	}
 	return false
-}
-
-// restartLibrespot bounces just the go-librespot service so a new device_name takes effect — same
-// mechanism the watchdog uses (s6-svc -r, rc state stays "up").
-func restartLibrespot() {
-	for _, dir := range []string{"/run/service/go-librespot", "/var/run/service/go-librespot"} {
-		if exec.Command("s6-svc", "-r", dir).Run() == nil {
-			return
-		}
-	}
-	log.Printf("name-forward: could not locate go-librespot service to restart")
 }
 
 // nowPlaying returns a best-effort "Artist — Track" from go-librespot's /status ("" if idle or the
@@ -517,30 +494,33 @@ func playWord(c int) string {
 	return "pause"
 }
 
-func releasedPath() string { return filepath.Join(dataDir, "released") }
+// legacyReleasedPath is the single-room flag the migration reads to seed room 0's Released field.
+func legacyReleasedPath() string { return filepath.Join(dataDir, "released") }
+
+// releasedPath is a room's per-room release flag at /data/rooms/<id>/released. The bridge honors it
+// so a freed HomePod isn't re-grabbed until Spotify resumes.
+func releasedPath(r *Room) string { return filepath.Join(dataDir, "rooms", r.ID, "released") }
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // releaseHomePod frees the HomePod for other AirPlay senders (Mofibo, Apple Music, …): deselect all
-// OwnTone outputs and drop a flag that select-homepod honors so it won't immediately re-grab it.
-func releaseHomePod(room Room) {
+// of the room's OwnTone outputs and drop the room's flag so selection won't immediately re-grab it.
+func releaseHomePod(room *Room) {
 	cl := &http.Client{Timeout: 3 * time.Second}
 	req, _ := http.NewRequest(http.MethodPut, room.OwnTone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":[]}`))
 	if r, e := cl.Do(req); e == nil {
 		r.Body.Close()
 	}
-	_ = os.WriteFile(releasedPath(), []byte("1"), 0o644)
+	_ = os.MkdirAll(filepath.Dir(releasedPath(room)), 0o755)
+	_ = os.WriteFile(releasedPath(room), []byte("1"), 0o644)
 }
 
-// reclaimHomePod takes the HomePod back: clear the flag and re-select the target output now, for a
-// snappy resume instead of waiting on select-homepod's 10s loop.
-func reclaimHomePod(room Room) {
-	_ = os.Remove(releasedPath())
-	devs, _ := fetchOutputs()
-	want := readSaved()
-	if want == "" {
-		want = readHomepodName()
-	}
+// reclaimHomePod takes the HomePod back: clear the room's flag and re-select its target output now,
+// for a snappy resume instead of waiting on the selection tick.
+func reclaimHomePod(room *Room) {
+	_ = os.Remove(releasedPath(room))
+	devs, _ := fetchOutputsFrom(room.OwnTone)
+	want := room.HomepodName
 	target := ""
 	for _, d := range devs {
 		if want != "" && strings.EqualFold(d.Name, want) {
@@ -552,7 +532,7 @@ func reclaimHomePod(room Room) {
 		target = devs[0].ID
 	}
 	if target != "" {
-		selectOnOwntone(target)
+		selectOnOwntoneAt(room.OwnTone, target)
 	}
 }
 
@@ -568,18 +548,18 @@ func reclaimHomePod(room Room) {
 //
 // Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
 // from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
-// while a test tone plays. Per-room. Uses only verified APIs.
-func roomBridge(room Room) {
+// while THIS room's test tone plays. Per-room. Uses only verified APIs.
+func roomBridge(room *Room, tone *boolFlag) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	capped := false
 	grace := time.Duration(readGraceMinutes()) * time.Minute // options change restarts the add-on
 	var idleSince time.Time
 	for {
-		if !tonePlaying.Load() {
+		if !tone.Load() {
 			gl := librespotStatus(room.Librespot)
 			playing := gl.Active && !gl.Paused && !gl.Stopped
-			released := fileExists(releasedPath())
+			released := fileExists(releasedPath(room))
 
 			// Grace-release ("deling"): hold the HomePod through brief interruptions (still
 			// playing, so Siri/notifications recover), but free it after sustained idle so other
@@ -646,23 +626,21 @@ func roomBridge(room Room) {
 	}
 }
 
-var (
-	toneMu      sync.Mutex
-	tonePlaying atomic.Bool // pauses the transport relay so it doesn't cut a test tone off
-)
+var toneMu sync.Mutex // serializes tone writes across rooms (one writer at a time is plenty)
 
-// playTestTone writes ~3s of a 440 Hz sine (s16le/44100/stereo) into the pipe. OwnTone's
+// playTestTone writes ~2.5s of a soft sine (s16le/44100/stereo) into the room's pipe. OwnTone's
 // pipe_autostart picks it up and plays it to the selected output — proving the OwnTone→AirPlay→
 // HomePod leg with zero dependency on Spotify or go-librespot. Runs in a goroutine (the write
-// drains at real time, ~3s). The lock prevents overlapping tones.
-func playTestTone() {
+// drains at real time). tone gates THIS room's bridge so it doesn't cut the tone off; the lock
+// prevents overlapping tones.
+func playTestTone(pipePath string, tone *boolFlag) {
 	if !toneMu.TryLock() {
 		return
 	}
 	defer toneMu.Unlock()
-	tonePlaying.Store(true)
-	defer tonePlaying.Store(false)
-	f, err := os.OpenFile("/srv/media/spotify", os.O_WRONLY, 0)
+	tone.Store(true)
+	defer tone.Store(false)
+	f, err := os.OpenFile(pipePath, os.O_WRONLY, 0)
 	if err != nil {
 		log.Printf("test tone: open pipe: %v", err)
 		return
@@ -698,10 +676,89 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// roomInfo is the per-room status row returned by /api/rooms (and embedded in the panel).
+type roomInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	HomepodName string `json:"homepod_name"`
+	OwntoneUp   bool   `json:"owntone_up"`
+	Playing     bool   `json:"playing"`
+	Released    bool   `json:"released"`
+	NowPlaying  string `json:"now_playing"`
+	Volume      int    `json:"volume"` // 0..100, or -1 if unknown
+}
+
+// mgr is the global room supervisor + store. main() builds it; the HTTP handlers read through it.
+var (
+	store *roomStore
+	mgr   *roomManager
+)
+
+// loadRooms is the single entry to the current room set (migrates on first boot).
+func loadRooms() []*Room {
+	rs, err := store.load()
+	if err != nil {
+		log.Printf("rooms: load failed: %v", err)
+		return nil
+	}
+	return rs
+}
+
+// roomByID returns the current room with the given id, or nil.
+func roomByID(id string) *Room {
+	for _, r := range loadRooms() {
+		if r.ID == id {
+			return r
+		}
+	}
+	return nil
+}
+
+// primaryRoom is room r0 (back-compat target for the legacy single-room panel calls + /api/state).
+func primaryRoom() *Room {
+	rs := loadRooms()
+	for _, r := range rs {
+		if r.ID == "r0" {
+			return r
+		}
+	}
+	if len(rs) > 0 {
+		return rs[0]
+	}
+	return nil
+}
+
+func toneFor(id string) *boolFlag {
+	if rt := mgr.runtime(id); rt != nil {
+		return &rt.tonePlaying
+	}
+	return &boolFlag{} // detached gate if the room isn't supervised (tests / race on add)
+}
+
 func main() {
+	store = newRoomStore()
+	mgr = newRoomManager(store)
+
+	// Build rooms (migrating the single-room setup on first boot), then start each one's children +
+	// bridge. The supervise loop owns the children; reconcile == just (re)spawn everything we know of.
+	for _, rm := range loadRooms() {
+		mgr.ensureRunning(rm)
+		go roomBridge(rm, toneFor(rm.ID))
+	}
+
 	lastCount := -1
+
+	// /api/state — back-compat single-speaker view reflecting room 0, so the existing panel/HA calls
+	// keep working unchanged. Multi-room consumers should use /api/rooms.
 	http.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		devs, up := fetchOutputs()
+		rm := primaryRoom()
+		var (
+			devs []device
+			up   bool
+		)
+		if rm != nil {
+			devs, up = fetchOutputsFrom(rm.OwnTone)
+		}
 		if devs == nil {
 			devs = []device{}
 		}
@@ -709,23 +766,76 @@ func main() {
 			log.Printf("AirPlay devices visible to picker: %d", len(devs))
 			lastCount = len(devs)
 		}
-		gl := librespotStatus(librespot)
-		playing := gl.Active && !gl.Paused && !gl.Stopped
-		vol := -1
-		if gl.HasVol {
-			vol = gl.VolPct
+		resp := stateResp{OwntoneUp: up, Devices: devs, Volume: -1}
+		if rm != nil {
+			gl := librespotStatus(rm.Librespot)
+			resp.Speaker = rm.Name
+			resp.Saved = rm.HomepodName
+			resp.Playing = gl.Active && !gl.Paused && !gl.Stopped
+			resp.Released = fileExists(releasedPath(rm))
+			resp.NowPlaying = nowPlaying(rm.Librespot)
+			if gl.HasVol {
+				resp.Volume = gl.VolPct
+			}
 		}
-		writeJSON(w, stateResp{
-			Speaker:    readSpeaker(),
-			Saved:      readSaved(),
-			OwntoneUp:  up,
-			Devices:    devs,
-			Playing:    playing,
-			Released:   fileExists(releasedPath()),
-			NowPlaying: nowPlaying(librespot),
-			Volume:     vol,
-		})
+		writeJSON(w, resp)
 	})
+
+	// /api/rooms — GET full multi-room status (one row per speaker); POST adds a speaker.
+	http.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			roomsItemHandler(w, r)
+			return
+		}
+		out := []roomInfo{}
+		for _, rm := range loadRooms() {
+			_, up := fetchOutputsFrom(rm.OwnTone)
+			gl := librespotStatus(rm.Librespot)
+			info := roomInfo{
+				ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName,
+				OwntoneUp:  up,
+				Playing:    gl.Active && !gl.Paused && !gl.Stopped,
+				Released:   fileExists(releasedPath(rm)),
+				NowPlaying: nowPlaying(rm.Librespot),
+				Volume:     -1,
+			}
+			if gl.HasVol {
+				info.Volume = gl.VolPct
+			}
+			out = append(out, info)
+		}
+		writeJSON(w, map[string]any{"rooms": out})
+	})
+
+	// /api/discover — live AirPlay scan (from any running OwnTone) minus HomePods already claimed by
+	// a room, so the "Add speaker" picker only offers free HomePods.
+	http.HandleFunc("/api/discover", func(w http.ResponseWriter, r *http.Request) {
+		claimed := map[string]bool{}
+		var scanBase string
+		for _, rm := range loadRooms() {
+			if rm.HomepodName != "" {
+				claimed[strings.ToLower(rm.HomepodName)] = true
+			}
+			if scanBase == "" {
+				scanBase = rm.OwnTone // any running OwnTone sees the whole LAN's AirPlay devices
+			}
+		}
+		devs, up := []device{}, false
+		if scanBase != "" {
+			devs, up = fetchOutputsFrom(scanBase)
+		}
+		free := []device{}
+		for _, d := range devs {
+			if !claimed[strings.ToLower(d.Name)] {
+				free = append(free, d)
+			}
+		}
+		writeJSON(w, map[string]any{"owntone_up": up, "devices": free})
+	})
+
+	// POST /api/rooms {homepod_name, name?} — add a speaker: validate uniqueness, allocate, render,
+	// spawn, select. DELETE /api/rooms/<id> — remove a speaker.
+	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
 	http.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -734,32 +844,45 @@ func main() {
 		}
 		var body struct {
 			Name string `json:"name"`
+			Room string `json:"room"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		name := strings.TrimSpace(body.Name)
-		if err := writeSaved(name); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		rm := primaryRoom()
+		if body.Room != "" {
+			rm = roomByID(body.Room)
+		}
+		if rm == nil {
+			http.Error(w, "no such room", http.StatusNotFound)
 			return
 		}
-		// Apply immediately for instant feedback; select-homepod also keeps it locked.
+		// Persist the chosen HomePod on the room + keep legacy selected_output.json in sync for r0.
+		store.setHomePod(rm.ID, name)
+		if rm.ID == "r0" {
+			_ = writeSaved(name)
+		}
+		rm.HomepodName = name
+		// Apply immediately for instant feedback; the selection tick also keeps it locked.
 		if name != "" {
-			if devs, _ := fetchOutputs(); devs != nil {
+			if devs, _ := fetchOutputsFrom(rm.OwnTone); devs != nil {
 				for _, d := range devs {
 					if strings.EqualFold(d.Name, name) {
-						selectOnOwntone(d.ID)
+						selectOnOwntoneAt(rm.OwnTone, d.ID)
 						break
 					}
 				}
 			}
 		}
-		// Auto-name forwarding: with no explicit speaker_name, the Connect device adopts the picked
-		// HomePod's name. Rewrite device_name + bounce go-librespot so it takes effect now (the
-		// device_id is persisted separately, so this renames in place — no ghost device).
-		if name != "" && speakerNameOpt() == "" && setGLDeviceName(name) {
+		// Auto-name forwarding (r0 only, where speaker_name may be empty): the Connect device adopts
+		// the picked HomePod's name. Rewrite device_name + restart THAT room's go-librespot.
+		if name != "" && rm.ID == "r0" && speakerNameOpt() == "" && setGLDeviceName(rm, name) {
+			store.setName(rm.ID, name)
 			log.Printf("name-forward: Connect device -> %q (restarting go-librespot)", name)
-			go restartLibrespot()
+			if rt := mgr.runtime(rm.ID); rt != nil {
+				go rt.restartGL()
+			}
 		}
-		log.Printf("selection saved: %q", name)
+		log.Printf("selection saved: room=%s %q", rm.ID, name)
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
@@ -768,14 +891,22 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		devs, _ := fetchOutputs()
-		// Resolve the target the same way select-homepod does: panel choice, then the
-		// homepod_name option, then the first discovered device — and report the NAME back so the
-		// user can see exactly which HomePod the tone went to.
-		want := readSaved()
-		if want == "" {
-			want = readHomepodName()
+		var body struct {
+			Room string `json:"room"`
 		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		rm := primaryRoom()
+		if body.Room != "" {
+			rm = roomByID(body.Room)
+		}
+		if rm == nil {
+			http.Error(w, "no such room", http.StatusNotFound)
+			return
+		}
+		devs, _ := fetchOutputsFrom(rm.OwnTone)
+		// Resolve the target: the room's HomePod, then the first discovered device — and report the
+		// NAME back so the user can see exactly which HomePod the tone went to.
+		want := rm.HomepodName
 		target, targetName := "", ""
 		for _, d := range devs {
 			if want != "" && strings.EqualFold(d.Name, want) {
@@ -787,14 +918,13 @@ func main() {
 			target, targetName = devs[0].ID, devs[0].Name // fall back to the first discovered device
 		}
 		if target != "" {
-			selectOnOwntone(target)
-			setOwntoneOutputVolume(owntone, target, 13) // gentle, on the specific HomePod
+			selectOnOwntoneAt(rm.OwnTone, target)
+			setOwntoneOutputVolume(rm.OwnTone, target, 13) // gentle, on the specific HomePod
 		}
-		// Also nudge go-librespot down so the reconciler can't bump the test up to a louder
-		// active-session level.
-		setLibrespotVolumePct(librespot, 13)
-		go playTestTone()
-		log.Printf("test tone requested (target=%q id=%q)", targetName, target)
+		// Also nudge go-librespot down so the reconciler can't bump the test up to a louder level.
+		setLibrespotVolumePct(rm.Librespot, 13)
+		go playTestTone(rm.Pipe, toneFor(rm.ID))
+		log.Printf("test tone requested (room=%s target=%q id=%q)", rm.ID, targetName, target)
 		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
 	})
 
@@ -803,61 +933,69 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		for _, rm := range rooms() {
+		for _, rm := range targetRooms(r) {
 			librespotTransport(rm.Librespot, "pause") // stop Spotify so the bridge doesn't instantly reclaim
 			releaseHomePod(rm)
+			store.setReleased(rm.ID, true)
 		}
 		log.Printf("HomePod released on request — free for other apps")
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
-	// /api/stop pauses whatever is playing on the speaker WITHOUT giving the HomePod away. It talks
-	// to go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the
-	// session (e.g. a family member's) — the account-agnostic "stop the music here" the Web API
-	// can't do across accounts. The bridge's transState then mirrors the pause onto OwnTone.
+	// /api/stop pauses whatever is playing on a speaker WITHOUT giving the HomePod away. It talks to
+	// go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the session
+	// (e.g. a family member's) — the account-agnostic "stop the music here" the Web API can't do
+	// across accounts. The bridge's transState then mirrors the pause onto OwnTone.
 	http.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		for _, rm := range rooms() {
+		for _, rm := range targetRooms(r) {
 			librespotTransport(rm.Librespot, "pause") // local pause — stops any account's session
 			owntoneTransport(rm.OwnTone, "pause")     // silence the AirPlay leg immediately
 		}
-		log.Printf("stop requested — paused playback on all speakers (account-agnostic)")
+		log.Printf("stop requested — paused playback (account-agnostic)")
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
-	// /api/play resumes playback on every room (go-librespot resume). The bridge's transState then
-	// mirrors the resume onto OwnTone. Counterpart to /api/stop for the HA integration.
+	// /api/play resumes playback (go-librespot resume). The bridge's transState then mirrors the
+	// resume onto OwnTone. Counterpart to /api/stop for the HA integration.
 	http.HandleFunc("/api/play", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		for _, rm := range rooms() {
+		for _, rm := range targetRooms(r) {
 			librespotTransport(rm.Librespot, "resume")
 		}
-		log.Printf("play requested — resumed playback on all speakers")
+		log.Printf("play requested — resumed playback")
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
-	// /api/volume sets the speaker volume (0..100) on every room via go-librespot; the bridge mirrors
-	// the change to the HomePod's OwnTone output. PUT with {"volume":<int>}.
+	// /api/volume sets the speaker volume (0..100) via go-librespot; the bridge mirrors the change to
+	// the HomePod's OwnTone output. PUT with {"volume":<int>, "room"?:"<id>"}.
 	http.HandleFunc("/api/volume", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var body struct {
-			Volume int `json:"volume"`
+			Volume int    `json:"volume"`
+			Room   string `json:"room"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		pct := clampPct(body.Volume)
-		for _, rm := range rooms() {
+		rooms := loadRooms()
+		if body.Room != "" {
+			if rm := roomByID(body.Room); rm != nil {
+				rooms = []*Room{rm}
+			}
+		}
+		for _, rm := range rooms {
 			setLibrespotVolumePct(rm.Librespot, pct)
 		}
-		log.Printf("volume set to %d%% on all speakers (via API)", pct)
+		log.Printf("volume set to %d%% (via API)", pct)
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
@@ -870,14 +1008,55 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	// Per-room bridge: mirror go-librespot volume AND transport (play/pause) onto the HomePod, so
-	// controls feel immediate instead of waiting on the 2-4s AirPlay buffer.
-	for _, r := range rooms() {
-		go roomBridge(r)
-	}
-
-	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
+	log.Printf("podconnect-manager listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+// targetRooms resolves which rooms a transport/release request applies to: a "room" query param
+// selects one; otherwise all rooms (preserves the legacy "all speakers" behavior).
+func targetRooms(r *http.Request) []*Room {
+	if id := r.URL.Query().Get("room"); id != "" {
+		if rm := roomByID(id); rm != nil {
+			return []*Room{rm}
+		}
+		return nil
+	}
+	return loadRooms()
+}
+
+// roomsItemHandler serves POST /api/rooms (add) and DELETE /api/rooms/<id> (remove). It's registered
+// on "/api/rooms/" but POST /api/rooms (no trailing slash) is routed here too via the explicit check.
+func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			HomepodName string `json:"homepod_name"`
+			Name        string `json:"name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		rm, err := store.addRoom(body.Name, body.HomepodName)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mgr.ensureRunning(rm)
+		go roomBridge(rm, toneFor(rm.ID))
+		writeJSON(w, map[string]any{"ok": true, "id": rm.ID, "name": rm.Name})
+	case http.MethodDelete:
+		id := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+		id = strings.Trim(id, "/")
+		if id == "" {
+			http.Error(w, "missing room id", http.StatusBadRequest)
+			return
+		}
+		if err := mgr.removeRoom(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 const indexHTML = `<!doctype html>
@@ -913,39 +1092,163 @@ const indexHTML = `<!doctype html>
   button:disabled { opacity: .4; cursor: default; }
   button.ghost { background: transparent; color: inherit; border: 1px solid rgba(120,120,128,.4); }
   .hint { margin-top: 18px; font-size: .82rem; opacity: .6; line-height: 1.4; }
+  .section { margin-top: 28px; }
+  .section h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  .room { padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(120,120,128,.25); margin-bottom: 10px; }
+  .room .top { display: flex; align-items: center; gap: 10px; }
+  .room .rname { flex: 1; font-weight: 700; }
+  .room .meta { margin-top: 6px; font-size: .82rem; opacity: .7; }
+  .room .ctl { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .room button { padding: 8px 12px; font-size: .82rem; }
+  button.danger { background: transparent; color: #ff453a; border: 1px solid rgba(255,69,58,.5); }
+  .err { color: #ff453a; font-size: .82rem; margin-top: 8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Pick a HomePod</h1>
+  <h1>PodConnect speakers</h1>
   <p class="sub" id="speaker"></p>
-  <div id="status" class="status warn">Loading…</div>
-  <div id="playstate" class="status" style="display:none"></div>
-  <div id="list" class="list"></div>
-  <div class="actions">
-    <button id="save" disabled>Save selection</button>
-    <button id="auto" class="ghost">Auto (clear choice)</button>
+
+  <div class="section">
+    <h2>Your speakers</h2>
+    <div id="rooms" class="list"></div>
+    <div class="actions">
+      <button id="addbtn">＋ Add speaker</button>
+    </div>
+    <div id="addpanel" style="display:none">
+      <div id="addstatus" class="status warn">Scanning for free HomePods…</div>
+      <div id="addlist" class="list"></div>
+      <div class="actions">
+        <button id="addsave" disabled>Add this HomePod</button>
+        <button id="addcancel" class="ghost">Cancel</button>
+      </div>
+      <p id="adderr" class="err"></p>
+    </div>
   </div>
-  <div class="actions">
-    <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
-    <button id="stop" class="ghost">⏹ Stop music (any account)</button>
-    <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
+
+  <div class="section">
+    <h2>Primary speaker — pick its HomePod</h2>
+    <div id="status" class="status warn">Loading…</div>
+    <div id="playstate" class="status" style="display:none"></div>
+    <div id="list" class="list"></div>
+    <div class="actions">
+      <button id="save" disabled>Save selection</button>
+      <button id="auto" class="ghost">Auto (clear choice)</button>
+    </div>
+    <div class="actions">
+      <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
+      <button id="stop" class="ghost">⏹ Stop music (any account)</button>
+      <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
+    </div>
+    <p id="testmsg" class="hint"></p>
+    <p id="stopmsg" class="hint"></p>
+    <p id="releasemsg" class="hint"></p>
   </div>
-  <p id="testmsg" class="hint"></p>
-  <p id="stopmsg" class="hint"></p>
-  <p id="releasemsg" class="hint"></p>
-  <p class="hint">This list is a live network scan (OwnTone AirPlay discovery) — the same one that
-  feeds Spotify Connect. No typing: pick a device and Save. Your speaker keeps playing to it across
-  restarts.<br><br><b>Play test sound</b> sends a 3-second tone straight to the selected HomePod via
+
+  <p class="hint">These lists are a live network scan (OwnTone AirPlay discovery) — the same one that
+  feeds Spotify Connect. No typing: pick a device and Save. Each speaker keeps playing to its HomePod
+  across restarts. <b>Add speaker</b> spins up a new Spotify Connect speaker bound to a free HomePod,
+  live — no restart.<br><br><b>Play test sound</b> sends a soft tone straight to the HomePod via
   AirPlay — no Spotify needed. Hear it = the HomePod audio path works.</p>
 </div>
 <script>
 var chosen = null;
+var addChosen = null;
+
+// --- Multi-room list (/api/rooms) ---
+async function loadRooms() {
+  var data;
+  try { data = await (await fetch('api/rooms', {cache:'no-store'})).json(); }
+  catch (e) { return; }
+  var wrap = document.getElementById('rooms');
+  wrap.innerHTML = '';
+  (data.rooms || []).forEach(function (rm) {
+    var box = document.createElement('div'); box.className = 'room';
+    var top = document.createElement('div'); top.className = 'top';
+    var nm = document.createElement('span'); nm.className = 'rname'; nm.textContent = rm.name;
+    top.appendChild(nm);
+    var badge = document.createElement('span'); badge.className = 'badge';
+    if (rm.released) { badge.textContent = 'released'; }
+    else if (rm.playing) { badge.className = 'badge live'; badge.textContent = 'playing'; }
+    else if (rm.owntone_up) { badge.textContent = 'idle'; }
+    else { badge.textContent = 'starting…'; }
+    top.appendChild(badge);
+    box.appendChild(top);
+    var meta = document.createElement('div'); meta.className = 'meta';
+    meta.textContent = 'HomePod: ' + (rm.homepod_name || '(auto)') + (rm.now_playing ? ('  •  ' + rm.now_playing) : '');
+    box.appendChild(meta);
+    var ctl = document.createElement('div'); ctl.className = 'ctl';
+    var t = document.createElement('button'); t.className = 'ghost'; t.textContent = '🔊 Test';
+    t.onclick = function () { fetch('api/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ room: rm.id }) }); };
+    var st = document.createElement('button'); st.className = 'ghost'; st.textContent = '⏹ Stop';
+    st.onclick = function () { fetch('api/stop?room=' + encodeURIComponent(rm.id), { method:'POST' }); };
+    ctl.appendChild(t); ctl.appendChild(st);
+    if (rm.id !== 'r0') {
+      var rmv = document.createElement('button'); rmv.className = 'danger'; rmv.textContent = '🗑 Remove';
+      rmv.onclick = async function () {
+        if (!confirm('Remove speaker "' + rm.name + '"? Its HomePod is freed for other apps.')) return;
+        await fetch('api/rooms/' + encodeURIComponent(rm.id), { method:'DELETE' });
+        await loadRooms();
+      };
+      ctl.appendChild(rmv);
+    }
+    box.appendChild(ctl);
+    wrap.appendChild(box);
+  });
+}
+
+// --- Add-speaker flow (/api/discover + POST /api/rooms) ---
+async function loadDiscover() {
+  var data;
+  try { data = await (await fetch('api/discover', {cache:'no-store'})).json(); }
+  catch (e) { return; }
+  var st = document.getElementById('addstatus');
+  var list = document.getElementById('addlist');
+  list.innerHTML = '';
+  if (!data.owntone_up) { st.textContent = 'Audio engine starting…'; st.className = 'status warn'; return; }
+  if (!data.devices.length) { st.textContent = 'No free HomePods found (all claimed, or still scanning).'; st.className = 'status warn'; return; }
+  st.textContent = data.devices.length + ' free HomePod(s) — pick one'; st.className = 'status ok';
+  data.devices.forEach(function (d) {
+    var row = document.createElement('label'); row.className = 'row';
+    var rb = document.createElement('input'); rb.type = 'radio'; rb.name = 'addhp'; rb.value = d.name;
+    rb.onchange = function () { addChosen = d.name; document.getElementById('addsave').disabled = false; };
+    var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
+    row.appendChild(rb); row.appendChild(nm);
+    if (d.needs_auth) { var b = document.createElement('span'); b.className = 'badge'; b.textContent = 'needs verification'; row.appendChild(b); }
+    list.appendChild(row);
+  });
+}
+document.getElementById('addbtn').onclick = function () {
+  document.getElementById('addpanel').style.display = '';
+  this.disabled = true;
+  loadDiscover();
+};
+document.getElementById('addcancel').onclick = function () {
+  document.getElementById('addpanel').style.display = 'none';
+  document.getElementById('addbtn').disabled = false;
+  document.getElementById('adderr').textContent = '';
+  addChosen = null;
+};
+document.getElementById('addsave').onclick = async function () {
+  if (addChosen === null) return;
+  this.disabled = true;
+  document.getElementById('adderr').textContent = '';
+  try {
+    var r = await fetch('api/rooms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ homepod_name: addChosen }) });
+    if (!r.ok) { document.getElementById('adderr').textContent = await r.text(); this.disabled = false; return; }
+  } catch (e) { document.getElementById('adderr').textContent = 'Could not add the speaker.'; this.disabled = false; return; }
+  addChosen = null;
+  document.getElementById('addpanel').style.display = 'none';
+  document.getElementById('addbtn').disabled = false;
+  await loadRooms();
+};
+
+// --- Primary speaker (room 0) picker — back-compat /api/state ---
 async function load() {
   var s;
   try { s = await (await fetch('api/state', {cache:'no-store'})).json(); }
   catch (e) { return; }
-  document.getElementById('speaker').textContent = s.speaker ? ('Speaker: ' + s.speaker) : '';
+  document.getElementById('speaker').textContent = s.speaker ? ('Primary speaker: ' + s.speaker) : '';
   var ps = document.getElementById('playstate');
   if (s.released) {
     ps.textContent = '⏏ Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
@@ -1022,8 +1325,9 @@ document.getElementById('release').onclick = async function () {
   var btn = this;
   setTimeout(function () { btn.disabled = false; }, 3000);
 };
-load();
-setInterval(load, 5000);
+function tick() { load(); loadRooms(); }
+tick();
+setInterval(tick, 5000);
 </script>
 </body>
 </html>`

@@ -1,38 +1,19 @@
 #!/usr/bin/with-contenv bashio
 set -e
+# Global, room-agnostic setup only. The PER-ROOM config (go-librespot config.yml + owntone.conf +
+# device_id) is now rendered by the manager (see manager/render.go) so rooms can be added live with
+# no add-on restart. This script just prepares the shared filesystem + mDNS, then the manager (an
+# s6 longrun that depends on avahi) forks + supervises each room's children.
 OPTS=/data/options.json
 [ -f "$OPTS" ] || echo '{}' > "$OPTS"
-SPEAKER_OPT="$(jq -r '.speaker_name // ""' "$OPTS")"
-HOMEPOD="$(jq -r '.homepod_name // ""' "$OPTS")"
-BITRATE="$(jq -r '.bitrate // "320"' "$OPTS")"
-PICKED="$(jq -r '.name // ""' /data/selected_output.json 2>/dev/null)"
-# Auto-name: with no explicit speaker_name, the Connect speaker takes the chosen HomePod's name
-# (e.g. "Koekkenalrum") so the device + HA entity name themselves. Falls back to "PodConnect".
-if [ -n "$SPEAKER_OPT" ]; then
-  SPEAKER="$SPEAKER_OPT"
-elif [ -n "$PICKED" ]; then
-  SPEAKER="$PICKED"
-else
-  SPEAKER="PodConnect"
-fi
 
-mkdir -p /data/go-librespot /data/owntone /srv/media /root/.config
+# Shared dirs. /data/go-librespot + /data/owntone are room 0's LEGACY paths (preserved so the
+# existing Spotify creds/identity/library keep working); /data/rooms holds new rooms.
+mkdir -p /data/go-librespot /data/owntone /data/rooms /srv/media /srv/media/rooms /root/.config
 chmod 0755 /srv/media
-[ -p /srv/media/spotify ] || mkfifo -m 0666 /srv/media/spotify
-[ -p /srv/media/spotify.metadata ] || mkfifo -m 0666 /srv/media/spotify.metadata
 chown -R owntone:owntone /data/owntone || true
+# Room 0 keeps its legacy go-librespot config dir reachable at the default ~/.config path.
 ln -sfn /data/go-librespot /root/.config/go-librespot
-
-# Stable device id, persisted INDEPENDENTLY of the display name — so auto-naming the speaker after
-# the HomePod (or any later rename) never changes the id and never spawns duplicate "ghost"
-# PodConnect devices in Spotify. Seeded once from the initial name; reused verbatim thereafter.
-DEVID_FILE=/data/go-librespot/device_id
-if [ -s "$DEVID_FILE" ]; then
-  DEVID="$(cat "$DEVID_FILE")"
-else
-  DEVID="$(printf '%s' "podconnect-${SPEAKER}" | sha1sum | cut -c1-40)"
-  printf '%s' "$DEVID" > "$DEVID_FILE"
-fi
 
 # Restrict mDNS advertising to the real LAN interface (avoid dead docker0/hassio/veth IPs).
 IFACE="$(jq -r '.network_interface // ""' "$OPTS")"
@@ -47,53 +28,4 @@ else
   bashio::log.info "mDNS interface restriction: none (advertising on all interfaces)"
 fi
 
-cat > /data/go-librespot/config.yml <<EOF2
-device_name: "${SPEAKER}"
-device_id: "${DEVID}"
-device_type: speaker
-bitrate: ${BITRATE}
-zeroconf_enabled: true
-zeroconf_backend: avahi
-credentials:
-  type: zeroconf
-  zeroconf:
-    persist_credentials: true
-audio_backend: pipe
-audio_output_pipe: /srv/media/spotify
-audio_output_pipe_format: s16le
-# Volume = Music Assistant's pattern. external_volume:true -> go-librespot does NOT bake volume into
-# the PCM; it reports it (via /status) and the manager applies it to the HomePod's OwnTone output, so
-# changes are responsive (not delayed behind 2-4s of buffered audio). volume_steps:100 makes it a
-# clean 1:1 map to OwnTone's 0-100. initial_volume:35 so a fresh session NEVER starts at full blast.
-external_volume: true
-volume_steps: 100
-initial_volume: 35
-server:
-  enabled: true
-  address: 0.0.0.0
-  port: 3678
-EOF2
-
-cat > /etc/owntone.conf <<EOF2
-general {
-	uid = "owntone"
-	db_path = "/data/owntone/songs3.db"
-	cache_dir = "/data/owntone"
-	logfile = "/data/owntone/owntone.log"
-	# OwnTone's default output pre-buffer is 2250 ms — the cause of the ~2-4 s AirPlay skip lag.
-	# The maintainer documents dropping start_buffer_ms to ~500 ms for "perceptually instant" skips;
-	# 500 ms is the maintainer-blessed floor. Raise toward 700-1000 ms if underruns (audio dropouts)
-	# appear on weak networks.
-	start_buffer_ms = 500
-}
-library {
-	name = "${SPEAKER}"
-	directories = { "/srv/media" }
-	pipe_autostart = true
-}
-audio {
-	type = "disabled"
-}
-EOF2
-
-bashio::log.info "PodConnect configured: speaker='${SPEAKER}', HomePod='${HOMEPOD}', device_id=${DEVID}"
+bashio::log.info "PodConnect global setup done — manager will render + supervise rooms"
