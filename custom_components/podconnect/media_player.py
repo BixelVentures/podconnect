@@ -56,6 +56,15 @@ _SEARCH_KINDS = {
     "playlists": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
 }
 
+# Browse root: (category id, display title, child MediaClass). Each expands to playable leaves.
+_BROWSE_CATEGORIES = [
+    ("playlists", "Playlists", MediaClass.PLAYLIST),
+    ("top_artists", "Top Artists", MediaClass.ARTIST),
+    ("top_tracks", "Top Tracks", MediaClass.TRACK),
+    ("recent", "Recently Played", MediaClass.TRACK),
+    ("liked", "Liked Songs", MediaClass.TRACK),
+]
+
 # Spotify repeat_state <-> HA RepeatMode.
 _SPOTIFY_TO_HA_REPEAT = {
     "off": RepeatMode.OFF,
@@ -318,38 +327,74 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         is_playing = bool(self._playback and self._playback.get("is_playing"))
         await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
 
+    async def _browse_category(self, category: str) -> list[BrowseMedia]:
+        """Fetch one profile category as playable leaves."""
+        api = self.coordinator.api
+        try:
+            if category == "playlists":
+                items = await api.playlists()
+                kind = (MediaClass.PLAYLIST, MediaType.PLAYLIST)
+            elif category == "top_artists":
+                items = await api.top_artists()
+                kind = (MediaClass.ARTIST, MediaType.ARTIST)
+            elif category == "top_tracks":
+                items = await api.top_tracks()
+                kind = (MediaClass.TRACK, MediaType.TRACK)
+            elif category == "recent":
+                items = await api.recently_played()
+                kind = (MediaClass.TRACK, MediaType.TRACK)
+            elif category == "liked":
+                items = await api.saved_tracks()
+                kind = (MediaClass.TRACK, MediaType.TRACK)
+            else:
+                return []
+        except SpotifyApiError as err:
+            # 403 here usually means the token predates the profile scopes — re-auth needed.
+            LOGGER.warning("Could not browse '%s' (re-auth may be needed): %s", category, err)
+            return []
+        return [self._result_item(it, *kind) for it in items if it and it.get("uri")]
+
     async def async_browse_media(
         self, media_content_type: str | None = None, media_content_id: str | None = None
     ) -> BrowseMedia:
-        """Browse the user's Spotify playlists — pick one to play on this device."""
-        try:
-            playlists = await self.coordinator.api.playlists()
-        except SpotifyApiError as err:
-            LOGGER.warning("Could not load Spotify playlists: %s", err)
-            playlists = []
-
-        children = [
-            BrowseMedia(
-                title=pl.get("name") or "Playlist",
-                media_class=MediaClass.PLAYLIST,
-                media_content_type=MediaType.PLAYLIST,
-                media_content_id=pl["uri"],
-                can_play=True,
-                can_expand=False,
-                thumbnail=(pl.get("images") or [{}])[0].get("url"),
+        """Browse Spotify by category (playlists + your top/recent/liked) — pick one to play."""
+        if media_content_id in (None, "root"):
+            children = [
+                BrowseMedia(
+                    title=title,
+                    media_class=MediaClass.DIRECTORY,
+                    media_content_type=cid,
+                    media_content_id=cid,
+                    can_play=False,
+                    can_expand=True,
+                    children_media_class=child_class,
+                )
+                for cid, title, child_class in _BROWSE_CATEGORIES
+            ]
+            return BrowseMedia(
+                title="Spotify",
+                media_class=MediaClass.DIRECTORY,
+                media_content_type="root",
+                media_content_id="root",
+                can_play=False,
+                can_expand=True,
+                children=children,
+                children_media_class=MediaClass.DIRECTORY,
             )
-            for pl in playlists
-            if pl.get("uri")
-        ]
+
+        title = next((t for c, t, _ in _BROWSE_CATEGORIES if c == media_content_id), "Spotify")
+        child_class = next(
+            (cc for c, _, cc in _BROWSE_CATEGORIES if c == media_content_id), MediaClass.TRACK
+        )
         return BrowseMedia(
-            title="Spotify playlists",
+            title=title,
             media_class=MediaClass.DIRECTORY,
-            media_content_type="playlists",
-            media_content_id="root",
+            media_content_type=media_content_id or "root",
+            media_content_id=media_content_id or "root",
             can_play=False,
             can_expand=True,
-            children=children,
-            children_media_class=MediaClass.PLAYLIST,
+            children=await self._browse_category(media_content_id),
+            children_media_class=child_class,
         )
 
     @staticmethod
@@ -368,7 +413,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             media_content_type=media_type,
             media_content_id=item["uri"],
             can_play=True,
-            can_expand=media_type != MediaType.TRACK,
+            # Leaves are play targets, not folders: a playlist/album/artist URI is played
+            # directly (context_uri), so don't offer a drill-in that we don't serve.
+            can_expand=False,
             thumbnail=images[0].get("url") if images else None,
         )
 

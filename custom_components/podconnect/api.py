@@ -90,6 +90,36 @@ class SpotifyApi:
             "GET", "/search", params={"q": query, "type": types, "limit": limit}
         ) or {}
 
+    async def top_artists(self, limit: int = 20) -> list[dict[str, Any]]:
+        """GET /me/top/artists (needs user-top-read)."""
+        data = await self._request("GET", "/me/top/artists", params={"limit": limit})
+        return (data or {}).get("items", [])
+
+    async def top_tracks(self, limit: int = 20) -> list[dict[str, Any]]:
+        """GET /me/top/tracks (needs user-top-read)."""
+        data = await self._request("GET", "/me/top/tracks", params={"limit": limit})
+        return (data or {}).get("items", [])
+
+    async def recently_played(self, limit: int = 25) -> list[dict[str, Any]]:
+        """GET /me/player/recently-played → de-duplicated track objects (needs user-read-recently-played)."""
+        data = await self._request(
+            "GET", "/me/player/recently-played", params={"limit": limit}
+        )
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in (data or {}).get("items", []):
+            track = entry.get("track") or {}
+            uri = track.get("uri")
+            if uri and uri not in seen:
+                seen.add(uri)
+                out.append(track)
+        return out
+
+    async def saved_tracks(self, limit: int = 50) -> list[dict[str, Any]]:
+        """GET /me/tracks → the user's Liked Songs as track objects (needs user-library-read)."""
+        data = await self._request("GET", "/me/tracks", params={"limit": limit})
+        return [entry.get("track") or {} for entry in (data or {}).get("items", [])]
+
     # --- control (device_id targets a specific Connect device) ---
     async def play(
         self,
