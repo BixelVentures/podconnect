@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -62,10 +63,13 @@ type device struct {
 }
 
 type stateResp struct {
-	Speaker   string   `json:"speaker"`
-	Saved     string   `json:"saved"`
-	OwntoneUp bool     `json:"owntone_up"`
-	Devices   []device `json:"devices"`
+	Speaker    string   `json:"speaker"`
+	Saved      string   `json:"saved"`
+	OwntoneUp  bool     `json:"owntone_up"`
+	Devices    []device `json:"devices"`
+	Playing    bool     `json:"playing"`
+	Released   bool     `json:"released"`
+	NowPlaying string   `json:"now_playing"`
 }
 
 func selectionPath() string { return filepath.Join(dataDir, "selected_output.json") }
@@ -87,7 +91,18 @@ func writeSaved(name string) error {
 	return os.WriteFile(selectionPath(), b, 0o644)
 }
 
+// readSpeaker returns the speaker's effective display name: the explicit speaker_name option, or —
+// in auto-name mode (option empty) — the picked HomePod's name. This is what the Connect device and
+// the HA entity end up called.
 func readSpeaker() string {
+	if s := speakerNameOpt(); s != "" {
+		return s
+	}
+	return readSaved()
+}
+
+// speakerNameOpt is the raw speaker_name option ("" => auto-name mode).
+func speakerNameOpt() string {
 	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
 	if err != nil {
 		return ""
@@ -96,7 +111,29 @@ func readSpeaker() string {
 		SpeakerName string `json:"speaker_name"`
 	}
 	_ = json.Unmarshal(b, &o)
-	return o.SpeakerName
+	return strings.TrimSpace(o.SpeakerName)
+}
+
+const defaultGraceMinutes = 3 // grace-release default if the option is unset
+
+// readGraceMinutes is the configurable grace-release period (minutes) before an idle HomePod is
+// freed for other apps. Defaults to 3; 0 = release as soon as playback stops.
+func readGraceMinutes() int {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return defaultGraceMinutes
+	}
+	var o struct {
+		GraceMinutes *json.Number `json:"grace_minutes"`
+	}
+	if json.Unmarshal(b, &o) != nil || o.GraceMinutes == nil {
+		return defaultGraceMinutes
+	}
+	n, err := o.GraceMinutes.Int64()
+	if err != nil || n < 0 {
+		return defaultGraceMinutes
+	}
+	return int(n)
 }
 
 func readHomepodName() string {
@@ -328,6 +365,65 @@ func librespotTransport(base, action string) {
 	}
 }
 
+func glConfigPath() string { return filepath.Join(dataDir, "go-librespot", "config.yml") }
+
+// setGLDeviceName rewrites the device_name line in go-librespot's config.yml. Returns true if it
+// actually changed (so the caller only restarts when needed). The device_id is persisted
+// separately, so renaming never spawns a ghost Connect device.
+func setGLDeviceName(name string) bool {
+	b, err := os.ReadFile(glConfigPath())
+	if err != nil {
+		return false
+	}
+	want := `device_name: "` + name + `"`
+	lines := strings.Split(string(b), "\n")
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "device_name:") {
+			if strings.TrimSpace(ln) == want {
+				return false
+			}
+			lines[i] = want
+			return os.WriteFile(glConfigPath(), []byte(strings.Join(lines, "\n")), 0o644) == nil
+		}
+	}
+	return false
+}
+
+// restartLibrespot bounces just the go-librespot service so a new device_name takes effect — same
+// mechanism the watchdog uses (s6-svc -r, rc state stays "up").
+func restartLibrespot() {
+	for _, dir := range []string{"/run/service/go-librespot", "/var/run/service/go-librespot"} {
+		if exec.Command("s6-svc", "-r", dir).Run() == nil {
+			return
+		}
+	}
+	log.Printf("name-forward: could not locate go-librespot service to restart")
+}
+
+// nowPlaying returns a best-effort "Artist — Track" from go-librespot's /status ("" if idle or the
+// field shape differs — it's only a status-line nicety).
+func nowPlaying(base string) string {
+	cl := &http.Client{Timeout: 2 * time.Second}
+	resp, err := cl.Get(base + "/status")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Track struct {
+			Name        string   `json:"name"`
+			ArtistNames []string `json:"artist_names"`
+		} `json:"track"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&st) != nil || st.Track.Name == "" {
+		return ""
+	}
+	if len(st.Track.ArtistNames) > 0 && st.Track.ArtistNames[0] != "" {
+		return st.Track.ArtistNames[0] + " — " + st.Track.Name
+	}
+	return st.Track.Name
+}
+
 const volTol = 2 // ±%, absorbs 0-100 <-> 0-volume_steps rounding so our own writes aren't seen as input
 
 // decideVolume is the pure bidirectional volume reconcile (no I/O -> unit-tested). One canonical
@@ -420,8 +516,6 @@ func playWord(c int) string {
 	return "pause"
 }
 
-const releaseGrace = 3 * time.Minute // grace-release: free the HomePod after this much idle ("deling")
-
 func releasedPath() string { return filepath.Join(dataDir, "released") }
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
@@ -478,6 +572,7 @@ func roomBridge(room Room) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	capped := false
+	grace := time.Duration(readGraceMinutes()) * time.Minute // options change restarts the add-on
 	var idleSince time.Time
 	for {
 		if !tonePlaying.Load() {
@@ -499,9 +594,9 @@ func roomBridge(room Room) {
 				if idleSince.IsZero() {
 					idleSince = time.Now()
 				}
-				if !released && time.Since(idleSince) > releaseGrace {
+				if !released && time.Since(idleSince) > grace {
 					releaseHomePod(room)
-					log.Printf("[%s]: released HomePod after %v idle — free for other apps", room.Name, releaseGrace)
+					log.Printf("[%s]: released HomePod after %v idle — free for other apps", room.Name, grace)
 					released = true
 				}
 			}
@@ -613,7 +708,17 @@ func main() {
 			log.Printf("AirPlay devices visible to picker: %d", len(devs))
 			lastCount = len(devs)
 		}
-		writeJSON(w, stateResp{Speaker: readSpeaker(), Saved: readSaved(), OwntoneUp: up, Devices: devs})
+		gl := librespotStatus(librespot)
+		playing := gl.Active && !gl.Paused && !gl.Stopped
+		writeJSON(w, stateResp{
+			Speaker:    readSpeaker(),
+			Saved:      readSaved(),
+			OwntoneUp:  up,
+			Devices:    devs,
+			Playing:    playing,
+			Released:   fileExists(releasedPath()),
+			NowPlaying: nowPlaying(librespot),
+		})
 	})
 
 	http.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
@@ -640,6 +745,13 @@ func main() {
 					}
 				}
 			}
+		}
+		// Auto-name forwarding: with no explicit speaker_name, the Connect device adopts the picked
+		// HomePod's name. Rewrite device_name + bounce go-librespot so it takes effect now (the
+		// device_id is persisted separately, so this renames in place — no ghost device).
+		if name != "" && speakerNameOpt() == "" && setGLDeviceName(name) {
+			log.Printf("name-forward: Connect device -> %q (restarting go-librespot)", name)
+			go restartLibrespot()
 		}
 		log.Printf("selection saved: %q", name)
 		writeJSON(w, map[string]bool{"ok": true})
@@ -769,6 +881,7 @@ const indexHTML = `<!doctype html>
   <h1>Pick a HomePod</h1>
   <p class="sub" id="speaker"></p>
   <div id="status" class="status warn">Loading…</div>
+  <div id="playstate" class="status" style="display:none"></div>
   <div id="list" class="list"></div>
   <div class="actions">
     <button id="save" disabled>Save selection</button>
@@ -794,6 +907,19 @@ async function load() {
   try { s = await (await fetch('api/state', {cache:'no-store'})).json(); }
   catch (e) { return; }
   document.getElementById('speaker').textContent = s.speaker ? ('Speaker: ' + s.speaker) : '';
+  var ps = document.getElementById('playstate');
+  if (s.released) {
+    ps.textContent = '⏏ Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
+    ps.className = 'status warn'; ps.style.display = '';
+  } else if (s.playing) {
+    ps.textContent = s.now_playing ? ('▶ Playing: ' + s.now_playing) : '▶ Playing';
+    ps.className = 'status ok'; ps.style.display = '';
+  } else if (s.owntone_up) {
+    ps.textContent = '⏸ Idle';
+    ps.className = 'status'; ps.style.display = '';
+  } else {
+    ps.style.display = 'none';
+  }
   var st = document.getElementById('status');
   var list = document.getElementById('list');
   list.innerHTML = '';

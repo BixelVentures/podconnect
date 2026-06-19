@@ -2,9 +2,19 @@
 set -e
 OPTS=/data/options.json
 [ -f "$OPTS" ] || echo '{}' > "$OPTS"
-SPEAKER="$(jq -r '.speaker_name // "PodConnect"' "$OPTS")"
+SPEAKER_OPT="$(jq -r '.speaker_name // ""' "$OPTS")"
 HOMEPOD="$(jq -r '.homepod_name // ""' "$OPTS")"
 BITRATE="$(jq -r '.bitrate // "320"' "$OPTS")"
+PICKED="$(jq -r '.name // ""' /data/selected_output.json 2>/dev/null)"
+# Auto-name: with no explicit speaker_name, the Connect speaker takes the chosen HomePod's name
+# (e.g. "Koekkenalrum") so the device + HA entity name themselves. Falls back to "PodConnect".
+if [ -n "$SPEAKER_OPT" ]; then
+  SPEAKER="$SPEAKER_OPT"
+elif [ -n "$PICKED" ]; then
+  SPEAKER="$PICKED"
+else
+  SPEAKER="PodConnect"
+fi
 
 mkdir -p /data/go-librespot /data/owntone /srv/media /root/.config
 chmod 0755 /srv/media
@@ -13,10 +23,16 @@ chmod 0755 /srv/media
 chown -R owntone:owntone /data/owntone || true
 ln -sfn /data/go-librespot /root/.config/go-librespot
 
-# Stable device id (derived from the speaker name) so the Connect speaker is the SAME device
-# across restarts. Without this go-librespot makes a new id each start -> duplicate "ghost"
-# PodConnect devices pile up in Spotify.
-DEVID="$(printf '%s' "podconnect-${SPEAKER}" | sha1sum | cut -c1-40)"
+# Stable device id, persisted INDEPENDENTLY of the display name — so auto-naming the speaker after
+# the HomePod (or any later rename) never changes the id and never spawns duplicate "ghost"
+# PodConnect devices in Spotify. Seeded once from the initial name; reused verbatim thereafter.
+DEVID_FILE=/data/go-librespot/device_id
+if [ -s "$DEVID_FILE" ]; then
+  DEVID="$(cat "$DEVID_FILE")"
+else
+  DEVID="$(printf '%s' "podconnect-${SPEAKER}" | sha1sum | cut -c1-40)"
+  printf '%s' "$DEVID" > "$DEVID_FILE"
+fi
 
 # Restrict mDNS advertising to the real LAN interface (avoid dead docker0/hassio/veth IPs).
 IFACE="$(jq -r '.network_interface // ""' "$OPTS")"

@@ -33,6 +33,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.7.0 — 2026-06-19
+- **Stop button (account-agnostic).** Panel "⏹ Stop music" + `/api/stop` pause go-librespot
+  *locally*, so they stop whoever is playing — including a family member's Spotify the Web API
+  can't reach — without giving the HomePod away (distinct from Release).
+- **HomePod-name forwarding.** Leave `speaker_name` empty → the Connect speaker + HA entity
+  auto-name after the HomePod you pick (e.g. "Køkkenalrum"); applied live (go-librespot bounce).
+  Device id is now persisted independently of the name, so renaming never spawns a ghost device.
+- **Configurable grace-release** via `grace_minutes` (default 3; 0 = free as soon as idle).
+- **Picker now-playing line:** shows ▶ playing (with track) / ⏏ released / ⏸ idle.
+- CI: `manager/**` now triggers the image build (the manager compiles into the image).
+
 ## Speakers 0.6.0 — 2026-06-19
 - **Grace-release ("deling").** Hold the HomePod through brief Siri/notification
   interruptions; free it after 3 min idle for other AirPlay apps; reclaim on resume.

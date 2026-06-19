@@ -14,6 +14,7 @@ on:
       - "podconnect/build.yaml"
       - "podconnect/config.yaml"
       - "podconnect/rootfs/**"
+      - "podconnect/manager/**" # the manager binary is compiled into the image
       - ".github/workflows/publish.yaml"
   workflow_dispatch:
 
