@@ -227,7 +227,7 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 type glStatus struct {
 	Active  bool // a Spotify session is present (status returned data)
 	HasVol  bool
-	VolPct  int  // 0-100
+	VolPct  int // 0-100
 	Paused  bool
 	Stopped bool
 }
@@ -693,6 +693,23 @@ func main() {
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
+	// /api/stop pauses whatever is playing on the speaker WITHOUT giving the HomePod away. It talks
+	// to go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the
+	// session (e.g. a family member's) — the account-agnostic "stop the music here" the Web API
+	// can't do across accounts. The bridge's transState then mirrors the pause onto OwnTone.
+	http.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		for _, rm := range rooms() {
+			librespotTransport(rm.Librespot, "pause") // local pause — stops any account's session
+			owntoneTransport(rm.OwnTone, "pause")     // silence the AirPlay leg immediately
+		}
+		log.Printf("stop requested — paused playback on all speakers (account-agnostic)")
+		writeJSON(w, map[string]bool{"ok": true})
+	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -759,9 +776,11 @@ const indexHTML = `<!doctype html>
   </div>
   <div class="actions">
     <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
+    <button id="stop" class="ghost">⏹ Stop music (any account)</button>
     <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
   </div>
   <p id="testmsg" class="hint"></p>
+  <p id="stopmsg" class="hint"></p>
   <p id="releasemsg" class="hint"></p>
   <p class="hint">This list is a live network scan (OwnTone AirPlay discovery) — the same one that
   feeds Spotify Connect. No typing: pick a device and Save. Your speaker keeps playing to it across
@@ -821,6 +840,14 @@ document.getElementById('test').onclick = async function () {
   } catch (e) { m.textContent = 'Could not send the test.'; }
   var btn = this;
   setTimeout(function () { btn.disabled = false; }, 4000);
+};
+document.getElementById('stop').onclick = async function () {
+  this.disabled = true;
+  var m = document.getElementById('stopmsg');
+  m.textContent = 'Stopping playback on the speaker — this works no matter whose Spotify is playing.';
+  try { await fetch('api/stop', { method: 'POST' }); } catch (e) {}
+  var btn = this;
+  setTimeout(function () { btn.disabled = false; }, 3000);
 };
 document.getElementById('release').onclick = async function () {
   this.disabled = true;
