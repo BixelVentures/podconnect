@@ -277,77 +277,29 @@ func setLibrespotVolumePct(base string, pct int) {
 	}
 }
 
-const volTolerance = 2 // ±%, absorbs 0-100 <-> 0-volume_steps rounding so echoes aren't seen as input
-
-// volumeReconciler keeps a room's Spotify volume (go-librespot) and its HomePod volume (the
-// selected OwnTone output) in agreement in BOTH directions, with echo/loop protection.
+// volumeBridge mirrors go-librespot's volume onto the room's selected HomePod output, so the
+// Spotify/HA slider controls the HomePod loudness responsively.
 //
-// One canonical percent. Each tick: read both sides; whichever drifted from canon beyond the
-// tolerance becomes the new canon (Spotify wins ties — it's the intent source); push canon to any
-// side that still differs. Comparing against canon (not against the other side) with a tolerance
-// means our own writes are never mistaken for user changes — no ping-pong. Self-healing: a missed
-// change is corrected next tick. Per-room → multi-room is just N reconcilers.
-type volumeReconciler struct {
-	room     Room
-	canon    int  // -1 until known
-	prevGlOk bool // was go-librespot reporting a session last tick (to detect reconnects)
-}
-
-// decideVolume is the pure reconcile decision (no I/O, so it's unit-tested): given the canonical
-// value and both sides' current readings, return the new canon and whether each side needs a
-// corrective write. The tolerance comparison against canon is what prevents echo/ping-pong.
-func decideVolume(canon, gl int, glOk bool, ot int, otOk bool, prevGlOk bool) (newCanon int, setGl, setOt bool) {
-	if !glOk && !otOk {
-		return canon, false, false
-	}
-	switch {
-	case canon < 0:
-		// Cold start: adopt the active Spotify session (the user's current intent) if there is
-		// one, else the HomePod's remembered level.
-		if glOk {
-			canon = gl
-		} else {
-			canon = ot
-		}
-	case glOk && !prevGlOk:
-		// Spotify (re)connected mid-run: KEEP what was playing — canon already tracks the HomePod's
-		// last level — and push it up to Spotify, so a stale session default can't blast/mute the
-		// room. (canon stays as-is.)
-	default:
-		glChanged := glOk && abs(gl-canon) > volTolerance
-		otChanged := otOk && abs(ot-canon) > volTolerance
-		switch {
-		case glChanged: // Spotify wins simultaneous changes
-			canon = gl
-		case otChanged: // HomePod button (or Home app / Siri) moved it
-			canon = ot
-		}
-	}
-	setGl = glOk && abs(gl-canon) > volTolerance
-	setOt = otOk && abs(ot-canon) > volTolerance
-	return canon, setGl, setOt
-}
-
-func (vr *volumeReconciler) tick() {
-	gl, glOk := librespotVolumePct(vr.room.Librespot)
-	ot, otID, otOk := owntoneOutputVolume(vr.room.OwnTone)
-	newCanon, setGl, setOt := decideVolume(vr.canon, gl, glOk, ot, otOk, vr.prevGlOk)
-	vr.canon = newCanon
-	vr.prevGlOk = glOk
-	if setGl {
-		setLibrespotVolumePct(vr.room.Librespot, vr.canon)
-		log.Printf("volume [%s]: -> Spotify %d%%", vr.room.Name, vr.canon)
-	}
-	if setOt {
-		setOwntoneOutputVolume(vr.room.OwnTone, otID, vr.canon)
-		log.Printf("volume [%s]: -> HomePod %d%%", vr.room.Name, vr.canon)
-	}
-}
-
-func (vr *volumeReconciler) run() {
+// ONE-WAY by design — this is Music Assistant's pattern: Spotify/HA are the authoritative downstream
+// control, and the HomePod's hardware buttons / Control Center stay best-effort/local, because
+// AirPlay-2 receivers don't reliably report a button press back to the sender (a limitation MA also
+// accepts by ignoring Apple-device volume feedback). With external_volume:true, go-librespot no
+// longer bakes volume into the PCM — OwnTone applies it at the AirPlay output, so a change takes
+// effect immediately instead of after the 2-4s of buffered audio drains. Only writes on a
+// go-librespot change, so a HomePod-side tweak persists until Spotify next moves (no fighting).
+// Per-room → multi-room is just N bridges. Uses only verified APIs (/status, /api/outputs, the
+// per-output volume PUT) — no unverified websocket envelope.
+func volumeBridge(room Room) {
+	last := -1
 	for {
-		vr.tick()
-		time.Sleep(350 * time.Millisecond)
+		if pct, ok := librespotVolumePct(room.Librespot); ok && pct != last {
+			if _, id, hasOut := owntoneOutputVolume(room.OwnTone); hasOut {
+				setOwntoneOutputVolume(room.OwnTone, id, pct)
+				log.Printf("volume [%s]: Spotify %d%% -> HomePod", room.Name, pct)
+				last = pct
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
@@ -485,14 +437,12 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	// Volume reconciler is PARKED: with external_volume:false (go-librespot scales the PCM), running
-	// it would double-attenuate, and it proved unreliable on the VM's flaky sessions. The Spotify
-	// slider controls loudness directly. Re-enable (with external_volume:true) only once it can be
-	// verified against real go-librespot/OwnTone — ideally on the wired Green where sessions hold.
-	// for _, r := range rooms() {
-	// 	go (&volumeReconciler{room: r, canon: -1}).run()
-	// }
-	_ = rooms // keep referenced; reconciler code retained for the verified redesign
+	// One-way volume bridge per room: Spotify/HA volume -> the selected HomePod output. Responsive
+	// because external_volume:true makes OwnTone apply volume at the AirPlay output (no baked-in PCM
+	// buffer delay). HomePod hardware buttons stay best-effort (MA's accepted limitation).
+	for _, r := range rooms() {
+		go volumeBridge(r)
+	}
 
 	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
 	log.Fatal(http.ListenAndServe(":"+port, nil))

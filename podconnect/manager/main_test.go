@@ -6,42 +6,6 @@ import (
 	"testing"
 )
 
-// TestDecideVolume covers the bidirectional reconcile: initial sync, echo (no ping-pong),
-// Spotify-side change, HomePod-side change, simultaneous (Spotify wins), and tolerance.
-func TestDecideVolume(t *testing.T) {
-	cases := []struct {
-		name                 string
-		canon, gl            int
-		glOk                 bool
-		ot                   int
-		otOk                 bool
-		prevGlOk             bool
-		wantCanon            int
-		wantSetGl, wantSetOt bool
-	}{
-		{"cold start from spotify pushes homepod", -1, 60, true, 8, true, false, 60, false, true},
-		{"cold start from homepod when no session", -1, 0, false, 30, true, false, 30, false, false},
-		{"steady echo: both equal canon -> no writes", 60, 60, true, 60, true, true, 60, false, false},
-		{"rounding within tolerance -> no writes", 60, 61, true, 59, true, true, 60, false, false},
-		{"spotify changed -> push homepod", 60, 80, true, 60, true, true, 80, false, true},
-		{"homepod button changed -> push spotify", 60, 60, true, 35, true, true, 35, true, false},
-		{"both changed -> spotify wins, push homepod", 60, 80, true, 20, true, true, 80, false, true},
-		{"no session, no output -> nothing", 60, 0, false, 0, false, true, 60, false, false},
-		// Reconnect: session reappears (prevGlOk=false) — keep the HomePod's last level, bring Spotify to it.
-		{"reconnect keeps homepod, pushes spotify", 30, 80, true, 30, true, false, 30, true, false},
-		{"reconnect with no homepod reading keeps canon", 45, 80, true, 0, false, false, 45, true, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			gotCanon, gotGl, gotOt := decideVolume(c.canon, c.gl, c.glOk, c.ot, c.otOk, c.prevGlOk)
-			if gotCanon != c.wantCanon || gotGl != c.wantSetGl || gotOt != c.wantSetOt {
-				t.Fatalf("decideVolume = (canon %d, setGl %v, setOt %v); want (%d, %v, %v)",
-					gotCanon, gotGl, gotOt, c.wantCanon, c.wantSetGl, c.wantSetOt)
-			}
-		})
-	}
-}
-
 // TestFetchOutputsRealisticOwnTone uses the EXACT shape OwnTone 29.2 returns for HomePods —
 // captured from a real device. The key trap: type is "AirPlay 2" (not "AirPlay"), so an exact
 // "airplay" match drops every device and blanks the picker. Also covers string id, numeric id

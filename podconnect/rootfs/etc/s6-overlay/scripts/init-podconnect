@@ -45,10 +45,13 @@ credentials:
 audio_backend: pipe
 audio_output_pipe: /srv/media/spotify
 audio_output_pipe_format: s16le
-# external_volume:false -> go-librespot scales the PCM itself, so the Spotify slider directly and
-# instantly controls loudness (the reliable, known-good behavior). The external_volume:true + relay
-# approach is parked until it can be verified against real /status data (it can't be from Docker).
-external_volume: false
+# Volume = Music Assistant's pattern. external_volume:true -> go-librespot does NOT bake volume into
+# the PCM; it reports it (via /status) and the manager applies it to the HomePod's OwnTone output, so
+# changes are responsive (not delayed behind 2-4s of buffered audio). volume_steps:100 makes it a
+# clean 1:1 map to OwnTone's 0-100. initial_volume:35 so a fresh session NEVER starts at full blast.
+external_volume: true
+volume_steps: 100
+initial_volume: 35
 server:
   enabled: true
   address: 0.0.0.0
