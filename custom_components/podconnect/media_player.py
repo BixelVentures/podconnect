@@ -463,13 +463,18 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
                 return 1
             return 0
 
-        scored: list[tuple[int, BrowseMedia]] = []
+        scored: list[tuple[int, int, BrowseMedia]] = []
         for key, (media_class, media_type) in _SEARCH_KINDS.items():
             for item in (data.get(key) or {}).get("items", []):
                 if item and item.get("uri"):
+                    # Tie-break equal name matches by Spotify popularity (0-100; tracks & artists
+                    # carry it). This is why the iconic "Den Danske Sommer" wins over a niche cover:
+                    # many tracks share the exact title, so popularity decides among them.
+                    pop = item.get("popularity") or 0
                     scored.append(
-                        (relevance(item.get("name")), self._result_item(item, media_class, media_type))
+                        (relevance(item.get("name")), pop, self._result_item(item, media_class, media_type))
                     )
-        # Stable sort keeps Spotify's per-type relevance order within an equal name-match score.
-        scored.sort(key=lambda s: s[0], reverse=True)
-        return SearchMedia(result=[bm for _, bm in scored])
+        # Sort by name-match first, then popularity — so result[0] (what the intent auto-plays) is the
+        # version people actually mean, not whichever Spotify happened to return first.
+        scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+        return SearchMedia(result=[bm for _, _, bm in scored])

@@ -8,6 +8,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Control 0.6.1 — 2026-06-19
+- **Search picks the version people mean.** When several results share the exact title (e.g. the
+  many "Den Danske Sommer" songs), ties are now broken by Spotify **popularity** — so the iconic hit
+  wins over a niche cover, instead of whichever Spotify returned first. (Gemini just passes the query;
+  this is our ranking, not the prompt.)
+
 ## Control 0.6.0 — 2026-06-19
 - **Audiobooks / podcasts / episodes in search.** Search now includes `audiobook,show,episode`, so
   "play <a children's bedtime story / audiobook / podcast>" resolves to the real audiobook instead of
