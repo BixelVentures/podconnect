@@ -417,6 +417,8 @@ func playWord(c int) string {
 func roomBridge(room Room) {
 	volCanon, playCanon := -1, -1
 	capped := false
+	var settleUntil time.Time // after a transport command, ignore transport briefly so OwnTone's
+	// ~1-2s startup-to-"play" lag isn't misread as a HomePod pause (the play/pause flicker).
 	for {
 		if !tonePlaying.Load() {
 			gl := librespotStatus(room.Librespot)
@@ -444,20 +446,26 @@ func roomBridge(room Room) {
 					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
 				}
 
-				// Transport — both directions.
-				tc, tGl, tOt := decideTransport(playCanon, !gl.Paused && !gl.Stopped, true, otState == "play", otState != "")
-				playCanon = tc
-				if tGl {
-					if tc == 1 {
-						librespotTransport(room.Librespot, "resume")
-					} else {
-						librespotTransport(room.Librespot, "pause")
+				// Transport — both directions. Skip during the settle window so OwnTone's startup
+				// lag after a "play" can't bounce Spotify (the play/pause flicker).
+				if time.Now().After(settleUntil) {
+					tc, tGl, tOt := decideTransport(playCanon, !gl.Paused && !gl.Stopped, true, otState == "play", otState != "")
+					playCanon = tc
+					if tGl {
+						if tc == 1 {
+							librespotTransport(room.Librespot, "resume")
+						} else {
+							librespotTransport(room.Librespot, "pause")
+						}
+						log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(tc))
 					}
-					log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(tc))
-				}
-				if tOt {
-					owntoneTransport(room.OwnTone, playWord(tc))
-					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(tc))
+					if tOt {
+						owntoneTransport(room.OwnTone, playWord(tc))
+						log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(tc))
+					}
+					if tGl || tOt {
+						settleUntil = time.Now().Add(1500 * time.Millisecond)
+					}
 				}
 			}
 		}
