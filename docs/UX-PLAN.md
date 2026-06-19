@@ -29,13 +29,22 @@ No third thing. The companion `media_player` folds into Control (below).
   typing), **rename / remove**, and **per-room settings** (grace, bitrate) inline.
 - **Auto-naming lives here.** Picking a HomePod names the speaker (Connect device + HA entity). There
   is no global `speaker_name` in multi-room — each room self-names.
+- **Name auto-sync (robustness fix).** Today selection + naming key off the HomePod's *name*, so
+  renaming the HomePod in Apple Home would break the match and lose the speaker. Switch to selecting
+  by the AirPlay output's **stable id**, and auto-update the stored room name when the HomePod's name
+  changes → renaming the HomePod in Apple Home propagates everywhere automatically, no re-pick.
 - **Shrink the add-on Configuration tab** to *advanced-only* (`network_interface`). Keep
   `speaker_name`/`homepod_name`/`grace_minutes` readable for one release as a deprecated fallback
   (migrated into rooms.json), then drop from the schema. The user should never need the config tab.
 - The multi-room panel already exists (0.9.0); this is polish: settings inline, clearer naming, a
   "this is the only place you need" layout.
 
-### UX-2 — Fold the companion media_player into Control (retire the 3rd piece)
+### UX-2 — ✅ DONE (Control 0.7.0) — companion folded into Control
+Set the add-on URL in Control's Options → local speaker media_player + Release button per room appear
+inside Control; the separate `podconnect_speakers` integration is retired. Control still works fully
+without the URL. **Two installs, not three.** (Original spec below.)
+
+#### UX-2 — Fold the companion media_player into Control (retire the 3rd piece)
 - Move the account-agnostic speaker `media_player` (+ Release button) **into Control**, created
   **only when** an optional **"PodConnect Speakers add-on URL"** is set in Control's options
   (default-suggest `http://<HA-IP>:8099`, validated against `/api/state`).
