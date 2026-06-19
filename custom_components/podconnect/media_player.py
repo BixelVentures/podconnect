@@ -91,6 +91,10 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         """Initialise the entity."""
         super().__init__(coordinator)
         self._device_id = device_id
+        # Optimistic play/pause: HA's state comes from a 10s Spotify poll, so the card's
+        # play/pause icon lags the (instant) audio. Show the user's intent immediately, then let
+        # the poll confirm. None = no pending guess.
+        self._optimistic_playing: bool | None = None
         self._attr_unique_id = f"{entry_id}_{device_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
@@ -123,11 +127,22 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
     def state(self) -> MediaPlayerState:
         if not self._is_active:
             return MediaPlayerState.IDLE
-        return (
-            MediaPlayerState.PLAYING
-            if self._playback.get("is_playing")
-            else MediaPlayerState.PAUSED
-        )
+        playing = self._playback.get("is_playing")
+        if self._optimistic_playing is not None:
+            playing = self._optimistic_playing  # show intent until the poll confirms
+        return MediaPlayerState.PLAYING if playing else MediaPlayerState.PAUSED
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Drop the optimistic guess once the polled state confirms it."""
+        if (
+            self._optimistic_playing is not None
+            and self._is_active
+            and self._playback
+            and self._playback.get("is_playing") == self._optimistic_playing
+        ):
+            self._optimistic_playing = None
+        super()._handle_coordinator_update()
 
     @property
     def volume_level(self) -> float | None:
@@ -220,9 +235,13 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         await self.coordinator.async_request_refresh()
 
     async def async_media_play(self) -> None:
+        self._optimistic_playing = True
+        self.async_write_ha_state()
         await self._send(self.coordinator.api.play(self._device_id))
 
     async def async_media_pause(self) -> None:
+        self._optimistic_playing = False
+        self.async_write_ha_state()
         await self._send(self.coordinator.api.pause(self._device_id))
 
     async def async_media_next_track(self) -> None:
