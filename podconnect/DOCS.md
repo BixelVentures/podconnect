@@ -22,19 +22,29 @@ hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 
 | Option | What to put |
 |---|---|
-| `speaker_name` | The name shown in Spotify, e.g. `Kitchen` |
+| `speaker_name` | The name shown in Spotify, e.g. `Kitchen`. **Leave blank to auto-name** the speaker after the HomePod you pick in the panel. |
 | `homepod_name` | *(optional fallback)* **Leave blank** and use the **PodConnect panel** instead (see below) — it lets you **pick** the HomePod from a live list, no typing. If you'd rather type, set the Apple **Home** name (case-insensitive). |
 | `bitrate` | `320` |
 | `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface |
+| `grace_minutes` | How long to hold the HomePod after playback stops before freeing it for other apps (default `3`; `0` = free as soon as idle). |
 
 Save.
 
 ### Pick your HomePod — no typing (recommended)
 
-After starting the add-on, a **PodConnect** item appears in the Home Assistant **sidebar**. Open it
-to see a **live network scan** of every AirPlay device found (the same scan Spotify Connect uses) —
-just **click your HomePod and Save**. Your choice is remembered across restarts and overrides the
-`homepod_name` box. (The panel is also reachable directly at `http://<your-HA-IP>:8099`.)
+After starting the add-on, a **PodConnect Speakers** item appears in the Home Assistant **sidebar**.
+Open it to see a **live network scan** of every AirPlay device found (the same scan Spotify Connect
+uses) — just **click your HomePod and Save**. Your choice is remembered across restarts and
+overrides the `homepod_name` box. (The panel is also reachable directly at `http://<your-HA-IP>:8099`.)
+
+The panel also has:
+- **🔊 Play test sound** — sends a soft tone straight to the HomePod (proves the AirPlay path, no
+  Spotify needed).
+- **⏹ Stop music** — pauses whatever is playing, *regardless of which account* — without giving the
+  HomePod away.
+- **⏏ Release HomePod** — frees the HomePod so another AirPlay app (Mofibo, Apple Music…) can use
+  it; press play in Spotify to take it back.
+- A **now-playing / released / idle** status line.
 
 ## 4. Start & test
 

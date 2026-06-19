@@ -11,16 +11,22 @@ integration, no MQTT. PodConnect owns the whole experience.
   OAuth + Spotify Web API control + `media_player` entities + media browsing.
 
 ## Status (current)
+_Versions live in [`../CHANGELOG.md`](../CHANGELOG.md); this tracks what's built vs pending._
+
 **Built & shipping:**
-- **PodConnect Speakers** add-on `0.1.4` — go-librespot + OwnTone, single HomePod (auto-selected by name);
-  avahi/mDNS reliability fixes. (`external_volume: false` — Spotify volume scales the audio for now.)
-- **PodConnect Control** integration `0.1.2` — Application-Credentials OAuth (own dev app); device-list-driven
-  `media_player` per Connect device; play/pause/next/prev/seek/volume + now-playing; **"Connect to a device"**
-  transfer (Transfer Playback); graceful handling of Spotify "restriction" rejections.
+- **PodConnect Speakers** add-on — go-librespot + OwnTone, single HomePod; **no-typing picker** + live
+  AirPlay scan; **`external_volume: true` + the volume relay** (bidirectional HomePod ⇄ Spotify/HA, per
+  output, initial-volume cap); **transport sync** (play/pause, flicker-free, rapid-tap-safe); **sharing**
+  (account-agnostic **Stop**, **Release**, configurable grace-release, auto-reclaim); **HomePod-name
+  forwarding** (auto-name + ghost-free stable id); test tone; watchdog.
+- **PodConnect Control** integration — Application-Credentials OAuth (own dev app); device-list-driven
+  `media_player` per Connect device; play/pause/next/prev/seek/volume/**shuffle/repeat** + now-playing,
+  **optimistic UI**; **"Connect to a device"** transfer; **search + browse** (playlists, Top Artists/Tracks,
+  Recently Played, Liked Songs) so Assist can pick music; graceful "restriction" handling.
   **State is Web-API polling (~10s)** — the "push-first" design below is the *target*, not yet built.
 
-**Not yet built:** go-librespot push state; `external_volume: true` + the volume relay (HomePod real-level
-sync); browse & search (Phase 2); multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5).
+**Not yet built:** go-librespot push state (still polling); voice stop/release via MQTT `media_player`;
+multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5); track-change buffer-flush (tune on Green).
 
 ## Account model (Family plan)
 - Spotify **Web API is per-account**; a Family plan = separate independent accounts.
@@ -47,22 +53,25 @@ sync); browse & search (Phase 2); multi-account (Phase 4); multi-room "Add speak
 - **Commands (play/pause/next/volume/transfer/browse) → Web API:** occasional, uniform, cloud-consistent.
 - Rationale: keeps us comfortably inside **dev-mode** rate limits and gives instant UI.
 
-## Volume (TARGET — not yet built; today `external_volume: false`)
-- go-librespot `external_volume: true` (no PCM scaling). **Volume-relay in the add-on** watches
-  go-librespot `/events`/local API → sets OwnTone/AirPlay output volume → HomePod's real level follows.
-  Lives in the add-on for locality + independence from HA. Bidirectional (OwnTone→go-librespot) = stretch.
+## Volume (✅ built — `external_volume: true` + bidirectional relay)
+- go-librespot `external_volume: true` (no PCM scaling). The **manager** (in the add-on) reconciles
+  go-librespot `/status` ↔ the OwnTone/AirPlay **per-output** volume on a tick, with canonical-value
+  loop-protection. **Bidirectional:** HomePod hardware buttons move Spotify/HA and vice-versa; a fresh
+  session is capped so it never starts at full blast. Lives in the add-on for locality + independence.
 
 ## Phases
-0. **Add-on reliability — ✅ done (0.1.3/0.1.4):** avahi-readiness wait before OwnTone/go-librespot; single
-   mDNS stack (`zeroconf_backend: avahi`); `.metadata` pipe. (`external_volume` stays `false` for now.)
-1. **Integration core — ✅ mostly done (Control 0.1.2):** Application-Credentials OAuth (primary account);
-   Web API client; device-list-driven `media_player`s; play/pause/next/prev/seek/volume + now-playing +
-   "Connect to a device" transfer. **Still pending in Phase 1:** push state (go-librespot events) and
-   `external_volume: true` + the volume relay — deferred, not shipped yet.
-2. **Browse & play:** `browse_media` (playlists/albums/search) + `play_media`.
-3. **HA Assist:** expose entities → voice transport/volume via primary account + "play [content] on [device]".
-4. **Multi-account:** per-family-member config entries; explicit "from <device/account>" routing.
-5. **Multi-room "Add speaker" UI + manager** (later).
+0. **Add-on reliability — ✅ done:** avahi-readiness wait; single mDNS stack (`zeroconf_backend: avahi`);
+   `.metadata` pipe; go-librespot watchdog.
+1. **Integration core — ✅ done:** Application-Credentials OAuth (primary account); Web API client;
+   device-list-driven `media_player`s; play/pause/next/prev/seek/volume/shuffle/repeat + now-playing +
+   "Connect to a device" transfer + optimistic UI. **`external_volume: true` + the volume relay — ✅ done.**
+   **Still pending:** push state (go-librespot events) — still ~10s polling.
+2. **Browse & play — ✅ done:** `browse_media` (playlists + Top Artists/Tracks/Recently/Liked) + `search_media`
+   + `play_media`.
+3. **HA Assist — ✅ works:** entities exposed → voice transport/volume + search-and-play. Area/alias setup is
+   user-side (documented in `AREAS-AND-ASSIST.md`). Account-agnostic voice stop/release via MQTT = pending.
+4. **Multi-account:** per-family-member config entries; explicit "from <device/account>" routing. *(pending)*
+5. **Multi-room "Add speaker" UI + manager.** *(pending)*
 
 ## Repo / distribution
 ```

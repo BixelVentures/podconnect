@@ -10,20 +10,34 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 
 ## What works today
 
-**PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`, v0.1.4)
+**PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`)
 - Turns a HomePod into a **Spotify Connect speaker**: `go-librespot` (Connect receiver) → a
   named pipe → `OwnTone` (AirPlay 2 sender) → HomePod.
-- **Single room:** you set one HomePod's name; it auto-selects that speaker.
-- Installed via the HA **Add-on Store** (prebuilt image, aarch64 + amd64 — no on-device build).
+- **Pick your HomePod with no typing:** a sidebar panel shows a live network scan — click and save.
+  The speaker can **auto-name itself** after the HomePod you pick.
+- **Bidirectional volume sync** — the Spotify/HA slider and the HomePod's hardware buttons move
+  together (per-output AirPlay level), and a fresh session never starts at full blast.
+- **Transport sync** — a Spotify pause stops the HomePod instantly (beating the AirPlay buffer);
+  a HomePod top-tap pauses/resumes Spotify. Flicker-free, rapid-tap-safe.
+- **Sharing ("deling"):** **⏹ Stop** pauses whoever is playing (any account, local); **⏏ Release**
+  frees the HomePod for other AirPlay apps (Mofibo, Apple Music). Auto-release after an idle grace
+  period, auto-reclaim on resume.
+- Built-in **test tone**, go-librespot watchdog. Installed via the HA **Add-on Store** (prebuilt
+  image, aarch64 + amd64 — no on-device build).
 
-**PodConnect Control** — the Home Assistant **integration** (`custom_components/podconnect/`, v0.1.2)
+**PodConnect Control** — the Home Assistant **integration** (`custom_components/podconnect/`)
 - Sign in to **Spotify** with your **own developer app** (via HA Application Credentials) — no
   SpotifyPlus, no built-in Spotify integration.
 - Creates a `media_player` **for each of your Spotify Connect devices** (the HomePod speaker,
   plus any other Connect device — a MacBook, a car, a phone).
-- Controls: **play / pause / next / previous / seek / volume / now-playing**, plus
-  **"Connect to a device"** (a real Spotify *Transfer Playback* handoff). Voice via HA Assist.
+- Controls: **play / pause / next / previous / seek / volume / shuffle / repeat / now-playing**,
+  with **optimistic UI** (icons react instantly), plus **"Connect to a device"** (a real Spotify
+  *Transfer Playback* handoff).
+- **Search + Browse** your Spotify in HA — search, Playlists, Top Artists, Top Tracks, Recently
+  Played, Liked Songs — so **HA Assist can pick music** ("spil noget afslappende i køkkenet").
 - State via the Spotify Web API, polled ~10s. Installed via **HACS** (custom repository).
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what changed.
 
 ## Install
 
@@ -31,26 +45,29 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 - **Control (integration):** add this repo as a **HACS custom repository** (type: *Integration*)
   → install **PodConnect Control** → restart HA → **Settings → Devices & Services → Add
   Integration → PodConnect Control** → enter your Spotify Client ID/Secret and sign in.
+- **Rooms + voice:** see [`docs/AREAS-AND-ASSIST.md`](docs/AREAS-AND-ASSIST.md).
 
 ## Roadmap (planned — not yet built)
 
 - **Multi-room:** several HomePods, each its own speaker, with an **"Add speaker → pick HomePod"** UI.
-- **Instant push state** for HomePods (live updates from the speaker instead of ~10s polling).
-- **Full HomePod volume sync** (the HomePod's real AirPlay level follows Spotify).
-- **Browse & search** Spotify content in HA; **multi-account** (whole family).
+- **Multi-account** (whole family): one Control config entry per person.
+- **Instant push state** for HomePods (live go-librespot events instead of ~10s polling).
+- **Voice stop/release** (account-agnostic) by exposing each speaker as a `media_player` via MQTT.
+- **Track-change buffer-flush** (snappier skips) — to be tuned on the wired Green.
 
-See [`docs/PLAN.md`](docs/PLAN.md) (roadmap) and [`docs/control-plan.md`](docs/control-plan.md)
-(integration spec + current status).
+See [`docs/TODO.md`](docs/TODO.md) (living roadmap), [`docs/PLAN.md`](docs/PLAN.md) (architecture)
+and [`docs/control-plan.md`](docs/control-plan.md) (integration spec).
 
 ## Repository layout
 
 ```
-podconnect/                   add-on "PodConnect Speakers" (go-librespot + OwnTone)
+podconnect/                    add-on "PodConnect Speakers" (go-librespot + OwnTone + manager/panel)
 custom_components/podconnect/  integration "PodConnect Control" (Spotify OAuth + Web API + entities)
-hacs.json                     makes this repo a HACS-installable integration
-repository.yaml               makes this repo a Home Assistant add-on repository
-docs/                         PLAN.md (roadmap) · control-plan.md (control spec) · releasing.md (versioning)
-.github/workflows/            CI that builds & publishes the add-on image to GHCR
+hacs.json                      makes this repo a HACS-installable integration
+repository.yaml                makes this repo a Home Assistant add-on repository
+CHANGELOG.md                   per-half version history
+docs/                          PLAN · TODO · control-plan · AREAS-AND-ASSIST · GREEN-TESTING · releasing
+.github/workflows/             CI that builds & publishes the add-on image to GHCR
 ```
 
 ## Versioning & updates
