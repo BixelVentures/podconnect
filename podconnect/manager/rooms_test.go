@@ -101,23 +101,23 @@ func TestAddRoomUniqueness(t *testing.T) {
 	_ = s.saveLocked(&roomsFile{NextIdx: 1, Rooms: []*Room{{ID: "r0", Idx: 0, Name: "Kitchen", HomepodName: "Kitchen HomePod"}}})
 	s.mu.Unlock()
 
-	r1, err := s.addRoom("Office", "Office HomePod")
+	r1, err := s.addRoom("Office", "Office HomePod", "")
 	if err != nil {
 		t.Fatalf("addRoom: %v", err)
 	}
 	if r1.Idx != 1 || r1.ID != "r1" {
 		t.Fatalf("first new room idx/id wrong: %+v", r1)
 	}
-	if _, err := s.addRoom("office", "Other HomePod"); err == nil {
+	if _, err := s.addRoom("office", "Other HomePod", ""); err == nil {
 		t.Fatalf("duplicate name (case-insensitive) should be rejected")
 	}
-	if _, err := s.addRoom("Living Room", "kitchen homepod"); err == nil {
+	if _, err := s.addRoom("Living Room", "kitchen homepod", ""); err == nil {
 		t.Fatalf("duplicate HomePod (case-insensitive) should be rejected")
 	}
-	if _, err := s.addRoom("Bedroom", ""); err == nil {
+	if _, err := s.addRoom("Bedroom", "", ""); err == nil {
 		t.Fatalf("missing HomePod should be rejected")
 	}
-	r2, err := s.addRoom("Bedroom", "Bedroom HomePod")
+	r2, err := s.addRoom("Bedroom", "Bedroom HomePod", "")
 	if err != nil {
 		t.Fatalf("addRoom r2: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestAddRoomUniqueness(t *testing.T) {
 	if _, err := s.removeRoom("r1"); err != nil {
 		t.Fatalf("removeRoom: %v", err)
 	}
-	r3, err := s.addRoom("Garage", "Garage HomePod")
+	r3, err := s.addRoom("Garage", "Garage HomePod", "")
 	if err != nil {
 		t.Fatalf("addRoom r3: %v", err)
 	}

@@ -67,6 +67,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.10.0 — 2026-06-19  (UX-1: self-healing naming)
+- **Rename a HomePod in Apple Home → it syncs everywhere, automatically.** A room is now bound to its
+  HomePod by the **stable OwnTone output id** (not the name), and the selection loop **self-heals**:
+  on a rename it persists the new name and (unless you pinned the room name) follows it on the Connect
+  device + HA entity, re-rendering + bouncing that room's go-librespot. No re-pick needed.
+- **Picking captures the id** (`/api/select` + `POST /api/rooms`); migrated r0 self-populates its id on
+  the first tick (matches by name once, then by id forever).
+- **Per-room rename in the panel** (`POST /api/rooms/<id>/rename`) — a "✎ Rename" pins a custom name
+  (`name_manual`) that the auto-sync won't overwrite.
+- New unit tests: `matchOutput` (id-first / name-fallback / sole-device), rooms.json round-trip with
+  the new fields.
+- **UX-1b (still to do):** per-room grace/bitrate in the panel; shrink the add-on Configuration tab.
+
 ## Speakers 0.9.0 — 2026-06-19  (multi-room — needs on-device validation)
 - **Multi-room.** N HomePods, each its own (go-librespot + OwnTone) pair, added live from the panel
   ("Add speaker → pick HomePod") with no add-on restart. Per-room volume/transport/grace all

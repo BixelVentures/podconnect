@@ -520,15 +520,10 @@ func releaseHomePod(room *Room) {
 func reclaimHomePod(room *Room) {
 	_ = os.Remove(releasedPath(room))
 	devs, _ := fetchOutputsFrom(room.OwnTone)
-	want := room.HomepodName
 	target := ""
-	for _, d := range devs {
-		if want != "" && strings.EqualFold(d.Name, want) {
-			target = d.ID
-			break
-		}
-	}
-	if target == "" && len(devs) > 0 {
+	if idx, _ := matchOutput(devs, room.HomepodID, room.HomepodName); idx >= 0 {
+		target = devs[idx].ID
+	} else if len(devs) > 0 {
 		target = devs[0].ID
 	}
 	if target != "" {
@@ -856,23 +851,28 @@ func main() {
 			http.Error(w, "no such room", http.StatusNotFound)
 			return
 		}
-		// Persist the chosen HomePod on the room + keep legacy selected_output.json in sync for r0.
-		store.setHomePod(rm.ID, name)
-		if rm.ID == "r0" {
-			_ = writeSaved(name)
-		}
-		rm.HomepodName = name
-		// Apply immediately for instant feedback; the selection tick also keeps it locked.
+		// Capture the chosen output's live id (the stable binding) alongside its name, so a later
+		// Apple-Home rename can't break the match. Apply immediately for instant feedback; the
+		// selection tick also keeps it locked + heals drift.
+		homepodID := ""
 		if name != "" {
 			if devs, _ := fetchOutputsFrom(rm.OwnTone); devs != nil {
 				for _, d := range devs {
 					if strings.EqualFold(d.Name, name) {
+						homepodID = d.ID
 						selectOnOwntoneAt(rm.OwnTone, d.ID)
 						break
 					}
 				}
 			}
 		}
+		// Persist the chosen HomePod (id+name) on the room + keep legacy selected_output.json for r0.
+		store.setHomePodBinding(rm.ID, homepodID, name)
+		if rm.ID == "r0" {
+			_ = writeSaved(name)
+		}
+		rm.HomepodName = name
+		rm.HomepodID = homepodID
 		// Auto-name forwarding (r0 only, where speaker_name may be empty): the Connect device adopts
 		// the picked HomePod's name. Rewrite device_name + restart THAT room's go-librespot.
 		if name != "" && rm.ID == "r0" && speakerNameOpt() == "" && setGLDeviceName(rm, name) {
@@ -1027,14 +1027,38 @@ func targetRooms(r *http.Request) []*Room {
 // roomsItemHandler serves POST /api/rooms (add) and DELETE /api/rooms/<id> (remove). It's registered
 // on "/api/rooms/" but POST /api/rooms (no trailing slash) is routed here too via the explicit check.
 func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
+	// POST /api/rooms/<id>/rename is the per-room rename override (distinct from POST /api/rooms add).
+	if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/rename") {
+		renameRoomHandler(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		var body struct {
 			HomepodName string `json:"homepod_name"`
+			HomepodID   string `json:"homepod_id"`
 			Name        string `json:"name"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		rm, err := store.addRoom(body.Name, body.HomepodName)
+		// Capture the chosen HomePod's live OwnTone id (the stable binding) so an Apple-Home rename
+		// can't later break the match. Resolve from any running OwnTone if the client didn't send it.
+		homepodID := strings.TrimSpace(body.HomepodID)
+		if homepodID == "" && strings.TrimSpace(body.HomepodName) != "" {
+			for _, rm := range loadRooms() {
+				if devs, _ := fetchOutputsFrom(rm.OwnTone); devs != nil {
+					for _, d := range devs {
+						if strings.EqualFold(d.Name, body.HomepodName) {
+							homepodID = d.ID
+							break
+						}
+					}
+				}
+				if homepodID != "" {
+					break
+				}
+			}
+		}
+		rm, err := store.addRoom(body.Name, body.HomepodName, homepodID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -1057,6 +1081,46 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// renameRoomHandler serves POST /api/rooms/<id>/rename {name}. It records a user override (NameManual)
+// so the self-heal loop won't auto-rename the room back, then re-renders + restarts that room's
+// go-librespot so the Connect device + HA entity adopt the new name.
+func renameRoomHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+	id := strings.TrimSuffix(strings.Trim(rest, "/"), "/rename")
+	id = strings.Trim(id, "/")
+	if id == "" {
+		http.Error(w, "missing room id", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	rm := roomByID(id)
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	store.setNameManual(id, name)
+	rm.Name = name
+	if setGLDeviceName(rm, name) {
+		log.Printf("rooms[%s]: renamed to %q (restarting go-librespot)", id, name)
+		if rt := mgr.runtime(id); rt != nil {
+			go rt.restartGL()
+		}
+	}
+	writeJSON(w, map[string]any{"ok": true, "id": id, "name": name})
 }
 
 const indexHTML = `<!doctype html>
@@ -1154,6 +1218,7 @@ const indexHTML = `<!doctype html>
 <script>
 var chosen = null;
 var addChosen = null;
+var addChosenId = null;
 
 // --- Multi-room list (/api/rooms) ---
 async function loadRooms() {
@@ -1182,7 +1247,19 @@ async function loadRooms() {
     t.onclick = function () { fetch('api/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ room: rm.id }) }); };
     var st = document.createElement('button'); st.className = 'ghost'; st.textContent = '⏹ Stop';
     st.onclick = function () { fetch('api/stop?room=' + encodeURIComponent(rm.id), { method:'POST' }); };
-    ctl.appendChild(t); ctl.appendChild(st);
+    var ren = document.createElement('button'); ren.className = 'ghost'; ren.textContent = '✎ Rename';
+    ren.onclick = async function () {
+      var nv = prompt('Rename this speaker (the Spotify Connect device + HA entity follow):', rm.name);
+      if (nv === null) return;
+      nv = nv.trim();
+      if (!nv || nv === rm.name) return;
+      try {
+        var r = await fetch('api/rooms/' + encodeURIComponent(rm.id) + '/rename', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: nv }) });
+        if (!r.ok) { alert(await r.text()); return; }
+      } catch (e) { alert('Could not rename the speaker.'); return; }
+      await loadRooms();
+    };
+    ctl.appendChild(t); ctl.appendChild(st); ctl.appendChild(ren);
     if (rm.id !== 'r0') {
       var rmv = document.createElement('button'); rmv.className = 'danger'; rmv.textContent = '🗑 Remove';
       rmv.onclick = async function () {
@@ -1211,7 +1288,7 @@ async function loadDiscover() {
   data.devices.forEach(function (d) {
     var row = document.createElement('label'); row.className = 'row';
     var rb = document.createElement('input'); rb.type = 'radio'; rb.name = 'addhp'; rb.value = d.name;
-    rb.onchange = function () { addChosen = d.name; document.getElementById('addsave').disabled = false; };
+    rb.onchange = function () { addChosen = d.name; addChosenId = d.id; document.getElementById('addsave').disabled = false; };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
     if (d.needs_auth) { var b = document.createElement('span'); b.className = 'badge'; b.textContent = 'needs verification'; row.appendChild(b); }
@@ -1227,17 +1304,17 @@ document.getElementById('addcancel').onclick = function () {
   document.getElementById('addpanel').style.display = 'none';
   document.getElementById('addbtn').disabled = false;
   document.getElementById('adderr').textContent = '';
-  addChosen = null;
+  addChosen = null; addChosenId = null;
 };
 document.getElementById('addsave').onclick = async function () {
   if (addChosen === null) return;
   this.disabled = true;
   document.getElementById('adderr').textContent = '';
   try {
-    var r = await fetch('api/rooms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ homepod_name: addChosen }) });
+    var r = await fetch('api/rooms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ homepod_name: addChosen, homepod_id: addChosenId || '' }) });
     if (!r.ok) { document.getElementById('adderr').textContent = await r.text(); this.disabled = false; return; }
   } catch (e) { document.getElementById('adderr').textContent = 'Could not add the speaker.'; this.disabled = false; return; }
-  addChosen = null;
+  addChosen = null; addChosenId = null;
   document.getElementById('addpanel').style.display = 'none';
   document.getElementById('addbtn').disabled = false;
   await loadRooms();

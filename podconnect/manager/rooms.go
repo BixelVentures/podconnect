@@ -40,6 +40,8 @@ type Room struct {
 	Idx         int    `json:"idx"`
 	Name        string `json:"name"`
 	HomepodName string `json:"homepod_name"`
+	HomepodID   string `json:"homepod_id,omitempty"`  // OwnTone output id — the stable binding; heals name changes.
+	NameManual  bool   `json:"name_manual,omitempty"` // user explicitly renamed this room: don't auto-overwrite Name.
 	DeviceID    string `json:"device_id,omitempty"`
 	Released    bool   `json:"released"`
 
@@ -174,8 +176,9 @@ func (s *roomStore) migrateLocked() *roomsFile {
 }
 
 // addRoom validates uniqueness, allocates a monotonic idx, persists, and returns the new Room.
-// It does NOT spawn anything — the caller (supervisor) renders + starts it.
-func (s *roomStore) addRoom(name, homepod string) (*Room, error) {
+// It does NOT spawn anything — the caller (supervisor) renders + starts it. homepodID (the live
+// OwnTone output id) is the stable binding; it may be "" if the caller only has the name.
+func (s *roomStore) addRoom(name, homepod, homepodID string) (*Room, error) {
 	name = strings.TrimSpace(name)
 	homepod = strings.TrimSpace(homepod)
 	if homepod == "" {
@@ -202,7 +205,7 @@ func (s *roomStore) addRoom(name, homepod string) (*Room, error) {
 	if idx < 1 {
 		idx = 1
 	}
-	r := &Room{ID: fmt.Sprintf("r%d", idx), Idx: idx, Name: name, HomepodName: homepod}
+	r := &Room{ID: fmt.Sprintf("r%d", idx), Idx: idx, Name: name, HomepodName: homepod, HomepodID: strings.TrimSpace(homepodID)}
 	r.fill()
 	rf.Rooms = append(rf.Rooms, r)
 	rf.NextIdx = idx + 1
@@ -267,8 +270,28 @@ func (s *roomStore) setReleased(id string, released bool) {
 	}
 }
 
-// setHomePod persists a room's chosen HomePod name (the panel's pick), so it survives restarts and
-// drives the per-room selection loop.
+// setHomePodBinding persists a room's chosen HomePod as an id+name pair (the panel's pick / add).
+// The id is the stable binding the self-healing selectHomePod matches on first; the name is the
+// human label + fallback match. Either may be ""; both are stored as given (trimmed).
+func (s *roomStore) setHomePodBinding(id, homepodID, homepodName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rf, err := s.loadLocked()
+	if err != nil {
+		return
+	}
+	for _, r := range rf.Rooms {
+		if r.ID == id {
+			r.HomepodID = strings.TrimSpace(homepodID)
+			r.HomepodName = strings.TrimSpace(homepodName)
+			_ = s.saveLocked(rf)
+			return
+		}
+	}
+}
+
+// setHomePod persists a room's chosen HomePod name only (legacy name-only pick). Kept for callers
+// that don't have an id to hand; the next selection tick self-populates HomepodID.
 func (s *roomStore) setHomePod(id, homepod string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -285,7 +308,8 @@ func (s *roomStore) setHomePod(id, homepod string) {
 	}
 }
 
-// setName persists a room's display name (used by r0 auto-naming after the picked HomePod).
+// setName persists a room's display name (used by r0 auto-naming after the picked HomePod). Does NOT
+// set NameManual — this is the automatic path.
 func (s *roomStore) setName(id, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -300,6 +324,62 @@ func (s *roomStore) setName(id, name string) {
 			return
 		}
 	}
+}
+
+// setNameManual persists a user-chosen display name AND flips NameManual so the self-healing
+// selectHomePod won't auto-overwrite it when the bound HomePod is later renamed in Apple Home.
+func (s *roomStore) setNameManual(id, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rf, err := s.loadLocked()
+	if err != nil {
+		return
+	}
+	for _, r := range rf.Rooms {
+		if r.ID == id {
+			r.Name = strings.TrimSpace(name)
+			r.NameManual = true
+			_ = s.saveLocked(rf)
+			return
+		}
+	}
+}
+
+// healBinding persists the drift selectHomePod discovers: the output's current id (self-populating a
+// migrated/stale HomepodID) and, when the HomePod was renamed, its new name — and, unless the user
+// pinned the name, the room's display Name too. Idempotent: only writes when something changed, and
+// returns whether the Name field itself changed (so the caller can re-render + restart go-librespot).
+func (s *roomStore) healBinding(id, newID, newName string, syncName bool) (nameChanged bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rf, err := s.loadLocked()
+	if err != nil {
+		return false
+	}
+	for _, r := range rf.Rooms {
+		if r.ID != id {
+			continue
+		}
+		changed := false
+		if newID != "" && r.HomepodID != newID {
+			r.HomepodID = newID
+			changed = true
+		}
+		if newName != "" && r.HomepodName != newName {
+			r.HomepodName = newName
+			changed = true
+		}
+		if syncName && newName != "" && !r.NameManual && r.Name != newName {
+			r.Name = newName
+			changed = true
+			nameChanged = true
+		}
+		if changed {
+			_ = s.saveLocked(rf)
+		}
+		return nameChanged
+	}
+	return false
 }
 
 // roomDeviceID returns the stable Spotify device_id for a room, seeding it once from

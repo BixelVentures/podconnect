@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -130,5 +132,70 @@ func TestFetchOutputsRealisticOwnTone(t *testing.T) {
 	// Numeric id must still survive as a string (defensive parsing).
 	if devs[2].ID != "47226606268305" {
 		t.Fatalf("device[2] numeric id not stringified: %+v", devs[2])
+	}
+}
+
+// TestMatchOutput covers the self-healing binding decision: id-first match (survives renames),
+// name-fallback (signals the caller to persist the id), single-device adoption for unbound rooms,
+// and the not-found cases.
+func TestMatchOutput(t *testing.T) {
+	devs := []device{
+		{ID: "111", Name: "Living Room"},
+		{ID: "222", Name: "Kitchen"},
+	}
+	cases := []struct {
+		name         string
+		devs         []device
+		hpID, hpName string
+		wantIdx      int
+		wantByName   bool
+	}{
+		{"id matches (renamed homepod still found)", devs, "222", "Old Kitchen Name", 1, false},
+		{"id wins over name", devs, "111", "Kitchen", 0, false},
+		{"name fallback when id empty -> signals persist id", devs, "", "kitchen", 1, true},
+		{"name fallback when id stale -> signals persist id", devs, "999", "Living Room", 0, true},
+		{"unbound single device adopts it", devs[:1], "", "", 0, true},
+		{"unbound multi device -> none", devs, "", "", -1, false},
+		{"name not found -> none", devs, "", "Bedroom", -1, false},
+		{"id not found, no name -> none", devs, "999", "", -1, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			idx, byName := matchOutput(c.devs, c.hpID, c.hpName)
+			if idx != c.wantIdx || byName != c.wantByName {
+				t.Fatalf("got (idx %d, byName %v) want (%d, %v)", idx, byName, c.wantIdx, c.wantByName)
+			}
+		})
+	}
+}
+
+// TestRoomRoundTripNewFields ensures the new persisted fields (homepod_id, name_manual) survive a
+// rooms.json marshal/unmarshal round-trip, and that the omitempty zero values stay absent.
+func TestRoomRoundTripNewFields(t *testing.T) {
+	rf := roomsFile{NextIdx: 2, Rooms: []*Room{
+		{ID: "r0", Idx: 0, Name: "Kitchen", HomepodName: "Kitchen HomePod", HomepodID: "227114848637555", NameManual: true},
+		{ID: "r1", Idx: 1, Name: "Den", HomepodName: "Den HomePod"}, // no id, not manual -> omitempty
+	}}
+	b, err := json.Marshal(rf)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got roomsFile
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Rooms) != 2 {
+		t.Fatalf("expected 2 rooms, got %d", len(got.Rooms))
+	}
+	if got.Rooms[0].HomepodID != "227114848637555" || !got.Rooms[0].NameManual {
+		t.Fatalf("r0 new fields lost: %+v", got.Rooms[0])
+	}
+	if got.Rooms[1].HomepodID != "" || got.Rooms[1].NameManual {
+		t.Fatalf("r1 should have zero-value new fields: %+v", got.Rooms[1])
+	}
+	// The new fields must serialize for r0.
+	s := string(b)
+	if !strings.Contains(s, `"homepod_id":"227114848637555"`) || !strings.Contains(s, `"name_manual":true`) {
+		t.Fatalf("r0 fields not serialized: %s", s)
 	}
 }
