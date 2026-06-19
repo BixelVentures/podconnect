@@ -56,7 +56,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, readBitrate(), r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), r.Pipe, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 

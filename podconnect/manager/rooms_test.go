@@ -140,6 +140,87 @@ func TestAddRoomUniqueness(t *testing.T) {
 	}
 }
 
+// TestSetRoomSettings covers the per-room grace/bitrate override round-trip: persistence, the
+// bitrate-changed signal, validation, and clearing grace back to inherit (UX-1b).
+func TestSetRoomSettings(t *testing.T) {
+	dataDir = t.TempDir()
+	s := newRoomStore()
+	s.mu.Lock()
+	_ = s.saveLocked(&roomsFile{NextIdx: 1, Rooms: []*Room{{ID: "r0", Idx: 0, Name: "Kitchen", HomepodName: "Kitchen HomePod"}}})
+	s.mu.Unlock()
+
+	// Set both -> bitrate changed (was empty), persisted.
+	g := 7
+	changed, err := s.setRoomSettings("r0", &g, "160")
+	if err != nil {
+		t.Fatalf("setRoomSettings: %v", err)
+	}
+	if !changed {
+		t.Fatalf("bitrate should report changed on first set")
+	}
+	rooms, _ := s.load()
+	if rooms[0].GraceMinutes == nil || *rooms[0].GraceMinutes != 7 || rooms[0].Bitrate != "160" {
+		t.Fatalf("settings not persisted: %+v", rooms[0])
+	}
+
+	// Same bitrate again -> not changed.
+	changed, err = s.setRoomSettings("r0", &g, "160")
+	if err != nil || changed {
+		t.Fatalf("same bitrate should not report changed (changed=%v err=%v)", changed, err)
+	}
+
+	// Empty bitrate -> left untouched (no change), grace cleared back to inherit.
+	changed, err = s.setRoomSettings("r0", nil, "")
+	if err != nil || changed {
+		t.Fatalf("empty bitrate should be a no-op for bitrate (changed=%v err=%v)", changed, err)
+	}
+	rooms, _ = s.load()
+	if rooms[0].GraceMinutes != nil {
+		t.Fatalf("grace should be cleared to inherit, got %v", *rooms[0].GraceMinutes)
+	}
+	if rooms[0].Bitrate != "160" {
+		t.Fatalf("bitrate should be untouched by empty value, got %q", rooms[0].Bitrate)
+	}
+
+	// Validation.
+	bad := 200
+	if _, err := s.setRoomSettings("r0", &bad, ""); err == nil {
+		t.Fatalf("grace 200 should be rejected")
+	}
+	neg := -1
+	if _, err := s.setRoomSettings("r0", &neg, ""); err == nil {
+		t.Fatalf("grace -1 should be rejected")
+	}
+	if _, err := s.setRoomSettings("r0", nil, "128"); err == nil {
+		t.Fatalf("bitrate 128 should be rejected")
+	}
+	if _, err := s.setRoomSettings("nope", nil, "320"); err == nil {
+		t.Fatalf("unknown room should be rejected")
+	}
+}
+
+// TestRoomGraceBitrateAccessors verifies the inherit-vs-override accessors fall back to the globals
+// (which default to 3 / "320" when options.json is absent) and honor per-room overrides.
+func TestRoomGraceBitrateAccessors(t *testing.T) {
+	dataDir = t.TempDir() // no options.json -> globals return their defaults
+	r := &Room{ID: "r0", Idx: 0, Name: "Kitchen"}
+	if got := roomGrace(r); got != defaultGraceMinutes {
+		t.Fatalf("roomGrace inherit: want %d, got %d", defaultGraceMinutes, got)
+	}
+	if got := roomBitrate(r); got != "320" {
+		t.Fatalf("roomBitrate inherit: want 320, got %q", got)
+	}
+	g := 0
+	r.GraceMinutes = &g
+	r.Bitrate = "96"
+	if got := roomGrace(r); got != 0 {
+		t.Fatalf("roomGrace override 0: got %d", got)
+	}
+	if got := roomBitrate(r); got != "96" {
+		t.Fatalf("roomBitrate override: got %q", got)
+	}
+}
+
 // TestRoomDeviceIDStable verifies the per-room device_id seeds once and is reused thereafter.
 func TestRoomDeviceIDStable(t *testing.T) {
 	dataDir = t.TempDir()

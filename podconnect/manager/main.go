@@ -548,9 +548,19 @@ func roomBridge(room *Room, tone *boolFlag) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	capped := false
-	grace := time.Duration(readGraceMinutes()) * time.Minute // options change restarts the add-on
+	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
+	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
+	// reads off the 200ms hot loop.
+	grace := time.Duration(roomGrace(room)) * time.Minute
+	graceNext := time.Now().Add(10 * time.Second)
 	var idleSince time.Time
 	for {
+		if time.Now().After(graceNext) {
+			if rm := roomByID(room.ID); rm != nil {
+				grace = time.Duration(roomGrace(rm)) * time.Minute
+			}
+			graceNext = time.Now().Add(10 * time.Second)
+		}
 		if !tone.Load() {
 			gl := librespotStatus(room.Librespot)
 			playing := gl.Active && !gl.Paused && !gl.Stopped
@@ -681,6 +691,13 @@ type roomInfo struct {
 	Released    bool   `json:"released"`
 	NowPlaying  string `json:"now_playing"`
 	Volume      int    `json:"volume"` // 0..100, or -1 if unknown
+
+	// Per-room settings (UX-1b): the EFFECTIVE values plus whether each is a per-room override (true)
+	// or inherited from the global add-on default (false), so the panel can prefill + label them.
+	GraceMinutes      int    `json:"grace_minutes"`
+	GraceOverridden   bool   `json:"grace_overridden"`
+	Bitrate           string `json:"bitrate"`
+	BitrateOverridden bool   `json:"bitrate_overridden"`
 }
 
 // mgr is the global room supervisor + store. main() builds it; the HTTP handlers read through it.
@@ -793,6 +810,11 @@ func main() {
 				Released:   fileExists(releasedPath(rm)),
 				NowPlaying: nowPlaying(rm.Librespot),
 				Volume:     -1,
+
+				GraceMinutes:      roomGrace(rm),
+				GraceOverridden:   rm.GraceMinutes != nil,
+				Bitrate:           roomBitrate(rm),
+				BitrateOverridden: rm.Bitrate != "",
 			}
 			if gl.HasVol {
 				info.Volume = gl.VolPct
@@ -1034,6 +1056,11 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 		renameRoomHandler(w, r)
 		return
 	}
+	// POST /api/rooms/<id>/settings is the per-room grace/bitrate override (UX-1b).
+	if strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/settings") {
+		roomSettingsHandler(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		var body struct {
@@ -1125,6 +1152,75 @@ func renameRoomHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "id": id, "name": name})
 }
 
+// roomSettingsHandler serves POST /api/rooms/<id>/settings {grace_minutes?:int|null, bitrate?:string}
+// — the per-room override of the global grace/bitrate defaults (UX-1b). grace_minutes is honored LIVE
+// by the bridge (no restart). A CHANGED bitrate is baked into go-librespot's config.yml, so we
+// re-render that room's config + restart its go-librespot. Both fields are optional; an omitted
+// grace_minutes leaves the override untouched, an explicit null clears it back to inherit.
+func roomSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
+	id := strings.TrimSuffix(strings.Trim(rest, "/"), "/settings")
+	id = strings.Trim(id, "/")
+	if id == "" {
+		http.Error(w, "missing room id", http.StatusBadRequest)
+		return
+	}
+	rm := roomByID(id)
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	// Defensive decode: distinguish "field absent" from "explicit null" for grace so omitting it
+	// leaves the override as-is, while null clears it. json.RawMessage captures that distinction.
+	var body struct {
+		GraceMinutes json.RawMessage `json:"grace_minutes"`
+		Bitrate      string          `json:"bitrate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// grace: absent -> keep current; null -> clear (nil); number -> override.
+	grace := rm.GraceMinutes
+	if len(body.GraceMinutes) > 0 {
+		trimmed := strings.TrimSpace(string(body.GraceMinutes))
+		if trimmed == "null" {
+			grace = nil
+		} else {
+			var n int
+			if err := json.Unmarshal(body.GraceMinutes, &n); err != nil {
+				http.Error(w, "grace_minutes must be an integer or null", http.StatusBadRequest)
+				return
+			}
+			grace = &n
+		}
+	}
+	bitrateChanged, err := store.setRoomSettings(id, grace, body.Bitrate)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Reflect the persisted bitrate on the in-memory room so the re-render writes the new value.
+	if strings.TrimSpace(body.Bitrate) != "" {
+		rm.Bitrate = strings.TrimSpace(body.Bitrate)
+	}
+	if bitrateChanged {
+		if rerr := renderGLConfig(rm); rerr != nil {
+			log.Printf("rooms[%s]: re-render after bitrate change failed: %v", id, rerr)
+		}
+		log.Printf("rooms[%s]: bitrate -> %s (restarting go-librespot)", id, rm.Bitrate)
+		if rt := mgr.runtime(id); rt != nil {
+			go rt.restartGL()
+		}
+	}
+	log.Printf("rooms[%s]: settings saved (grace=%v bitrate=%q)", id, grace, rm.Bitrate)
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 const indexHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -1168,6 +1264,15 @@ const indexHTML = `<!doctype html>
   .room button { padding: 8px 12px; font-size: .82rem; }
   button.danger { background: transparent; color: #ff453a; border: 1px solid rgba(255,69,58,.5); }
   .err { color: #ff453a; font-size: .82rem; margin-top: 8px; }
+  .settings { margin-top: 10px; padding: 12px; border-radius: 10px; border: 1px solid rgba(120,120,128,.25);
+              display: flex; flex-direction: column; gap: 10px; }
+  .settings .field { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .settings label { font-size: .82rem; font-weight: 600; min-width: 110px; }
+  .settings input[type=number], .settings select { font: inherit; padding: 6px 8px; border-radius: 8px;
+              border: 1px solid rgba(120,120,128,.4); background: transparent; color: inherit; }
+  .settings input[type=number] { width: 80px; }
+  .settings .shint { font-size: .76rem; opacity: .6; line-height: 1.35; }
+  .settings .srow { display: flex; gap: 8px; }
 </style>
 </head>
 <body>
@@ -1261,7 +1366,8 @@ async function loadRooms() {
       } catch (e) { alert('Could not rename the speaker.'); return; }
       await loadRooms();
     };
-    ctl.appendChild(t); ctl.appendChild(st); ctl.appendChild(ren);
+    var cog = document.createElement('button'); cog.className = 'ghost'; cog.textContent = '⚙ Settings';
+    ctl.appendChild(t); ctl.appendChild(st); ctl.appendChild(ren); ctl.appendChild(cog);
     if (rm.id !== 'r0') {
       var rmv = document.createElement('button'); rmv.className = 'danger'; rmv.textContent = '🗑 Remove';
       rmv.onclick = async function () {
@@ -1272,6 +1378,50 @@ async function loadRooms() {
       ctl.appendChild(rmv);
     }
     box.appendChild(ctl);
+
+    // Per-room settings panel (grace minutes + bitrate). Hidden until ⚙ Settings is clicked.
+    var sp = document.createElement('div'); sp.className = 'settings'; sp.style.display = 'none';
+    var gField = document.createElement('div'); gField.className = 'field';
+    var gLabel = document.createElement('label'); gLabel.textContent = 'Grace minutes';
+    var gInput = document.createElement('input'); gInput.type = 'number'; gInput.min = '0'; gInput.max = '120';
+    gInput.value = rm.grace_minutes;
+    gField.appendChild(gLabel); gField.appendChild(gInput); sp.appendChild(gField);
+    var bField = document.createElement('div'); bField.className = 'field';
+    var bLabel = document.createElement('label'); bLabel.textContent = 'Bitrate';
+    var bSelect = document.createElement('select');
+    ['96','160','320'].forEach(function (v) {
+      var o = document.createElement('option'); o.value = v; o.textContent = v + ' kbps';
+      if (String(rm.bitrate) === v) o.selected = true;
+      bSelect.appendChild(o);
+    });
+    bField.appendChild(bLabel); bField.appendChild(bSelect); sp.appendChild(bField);
+    var sh = document.createElement('div'); sh.className = 'shint';
+    sh.textContent = 'Defaults come from the add-on options' +
+      ' (grace ' + (rm.grace_overridden ? 'overridden' : 'inherited') +
+      ', bitrate ' + (rm.bitrate_overridden ? 'overridden' : 'inherited') + ').' +
+      ' Clear grace to inherit the global default.';
+    sp.appendChild(sh);
+    var serr = document.createElement('p'); serr.className = 'err'; sp.appendChild(serr);
+    var srow = document.createElement('div'); srow.className = 'srow';
+    var ssave = document.createElement('button'); ssave.textContent = 'Save settings';
+    var sclose = document.createElement('button'); sclose.className = 'ghost'; sclose.textContent = 'Close';
+    srow.appendChild(ssave); srow.appendChild(sclose); sp.appendChild(srow);
+    cog.onclick = function () { sp.style.display = (sp.style.display === 'none') ? '' : 'none'; };
+    sclose.onclick = function () { sp.style.display = 'none'; };
+    ssave.onclick = async function () {
+      serr.textContent = ''; ssave.disabled = true;
+      var gv = gInput.value.trim();
+      var payload = { bitrate: bSelect.value };
+      payload.grace_minutes = (gv === '') ? null : parseInt(gv, 10);
+      try {
+        var r = await fetch('api/rooms/' + encodeURIComponent(rm.id) + '/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+        if (!r.ok) { serr.textContent = await r.text(); ssave.disabled = false; return; }
+      } catch (e) { serr.textContent = 'Could not save settings.'; ssave.disabled = false; return; }
+      ssave.disabled = false;
+      await loadRooms();
+    };
+    box.appendChild(sp);
+
     wrap.appendChild(box);
   });
 }

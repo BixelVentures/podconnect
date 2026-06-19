@@ -45,6 +45,10 @@ type Room struct {
 	DeviceID    string `json:"device_id,omitempty"`
 	Released    bool   `json:"released"`
 
+	// Per-room overrides of the global add-on defaults (UX-1b). nil/"" = inherit the global option.
+	GraceMinutes *int   `json:"grace_minutes,omitempty"` // grace-release minutes; nil = inherit readGraceMinutes().
+	Bitrate      string `json:"bitrate,omitempty"`       // go-librespot bitrate "96"/"160"/"320"; "" = inherit readBitrate().
+
 	// Derived (not persisted): set by fill().
 	ConfigDir string `json:"-"` // go-librespot --config_dir
 	OwnConf   string `json:"-"` // OwnTone -c path
@@ -343,6 +347,61 @@ func (s *roomStore) setNameManual(id, name string) {
 			return
 		}
 	}
+}
+
+// setRoomSettings persists a room's per-room overrides of the global grace/bitrate defaults (UX-1b).
+// Only the provided fields are touched: a nil grace clears that override (back to inherit), a non-nil
+// grace must be in [0,120]; an empty bitrate is ignored (no change) and a non-empty one must be one
+// of {96,160,320}. Returns whether the BITRATE changed (the caller re-renders + restarts go-librespot
+// only then — grace is read live by the bridge and needs no restart).
+func (s *roomStore) setRoomSettings(id string, grace *int, bitrate string) (bitrateChanged bool, err error) {
+	if grace != nil && (*grace < 0 || *grace > 120) {
+		return false, fmt.Errorf("grace_minutes must be 0..120")
+	}
+	bitrate = strings.TrimSpace(bitrate)
+	if bitrate != "" && bitrate != "96" && bitrate != "160" && bitrate != "320" {
+		return false, fmt.Errorf("bitrate must be one of 96, 160, 320")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rf, lerr := s.loadLocked()
+	if lerr != nil {
+		return false, lerr
+	}
+	for _, r := range rf.Rooms {
+		if r.ID != id {
+			continue
+		}
+		// grace is always applied (nil = clear the override back to inherit).
+		r.GraceMinutes = grace
+		if bitrate != "" && r.Bitrate != bitrate {
+			r.Bitrate = bitrate
+			bitrateChanged = true
+		}
+		if serr := s.saveLocked(rf); serr != nil {
+			return false, serr
+		}
+		return bitrateChanged, nil
+	}
+	return false, fmt.Errorf("no such room: %s", id)
+}
+
+// roomGrace is the room's effective grace-release minutes: its per-room override if set, else the
+// global readGraceMinutes() default. Pure given the Room (the global fallback reads options.json).
+func roomGrace(r *Room) int {
+	if r.GraceMinutes != nil {
+		return *r.GraceMinutes
+	}
+	return readGraceMinutes()
+}
+
+// roomBitrate is the room's effective go-librespot bitrate: its per-room override if set, else the
+// global readBitrate() default.
+func roomBitrate(r *Room) string {
+	if r.Bitrate != "" {
+		return r.Bitrate
+	}
+	return readBitrate()
 }
 
 // healBinding persists the drift selectHomePod discovers: the output's current id (self-populating a

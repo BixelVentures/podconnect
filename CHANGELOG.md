@@ -67,6 +67,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.11.0 — 2026-06-19  (UX-1b: per-room settings)
+- **Per-room grace + bitrate, editable in the panel** (⚙ Settings per speaker). Stored in rooms.json;
+  empty = inherit the global add-on option (which stays the default). Grace takes effect live; a
+  bitrate change re-renders + restarts that room's go-librespot.
+- New endpoint `POST /api/rooms/<id>/settings`; `/api/rooms` rows expose effective values + override
+  flags. **No config.yaml fields removed** — `speaker_name`/`homepod_name`/`bitrate`/
+  `network_interface`/`grace_minutes` all kept (bitrate/grace are now the global defaults).
+
 ## Speakers 0.10.2 — 2026-06-19  (panel owns naming)
 - **Picking a HomePod now names the speaker after it — for every room, including the primary.** The
   legacy `speaker_name` option no longer overrides an explicit pick (it was only the migration seed);
