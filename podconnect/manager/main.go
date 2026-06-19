@@ -319,42 +319,145 @@ func owntoneTransport(base, action string) {
 	}
 }
 
-// roomBridge keeps one room's HomePod in step with go-librespot for BOTH volume and transport, so
-// the Spotify/HA controls feel immediate instead of waiting on the 2-4s AirPlay buffer.
+// librespotTransport issues a go-librespot transport command ("pause" or "resume").
+func librespotTransport(base, action string) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest(http.MethodPost, base+"/player/"+action, nil)
+	if r, e := cl.Do(req); e == nil {
+		r.Body.Close()
+	}
+}
+
+const volTol = 2 // ±%, absorbs 0-100 <-> 0-volume_steps rounding so our own writes aren't seen as input
+
+// decideVolume is the pure bidirectional volume reconcile (no I/O -> unit-tested). One canonical
+// percent: whichever side drifted from canon beyond the tolerance becomes the new canon (Spotify
+// wins ties), then canon is pushed to any side that still differs. Comparing to canon with a
+// tolerance is what prevents echo/ping-pong between the two writes.
+func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, setGl, setOt bool) {
+	if !glOk && !otOk {
+		return canon, false, false
+	}
+	if canon < 0 {
+		if glOk {
+			canon = gl
+		} else {
+			canon = ot
+		}
+	} else {
+		glCh := glOk && abs(gl-canon) > volTol
+		otCh := otOk && abs(ot-canon) > volTol
+		switch {
+		case glCh: // Spotify wins ties
+			canon = gl
+		case otCh: // HomePod button moved it
+			canon = ot
+		}
+	}
+	setGl = glOk && abs(gl-canon) > volTol
+	setOt = otOk && abs(ot-canon) > volTol
+	return canon, setGl, setOt
+}
+
+// decideTransport is the pure bidirectional play/pause reconcile. canon: -1 unknown, 0 paused,
+// 1 playing. Same canonical loop-protection as decideVolume — a HomePod top-tap (otPlaying change)
+// propagates to Spotify and vice-versa, without ping-pong. (For a binary value at most one side can
+// differ from canon at a time, so this is naturally conflict-free.)
+func decideTransport(canon int, glPlaying, glOk, otPlaying, otOk bool) (newCanon int, setGl, setOt bool) {
+	b := func(p bool) int {
+		if p {
+			return 1
+		}
+		return 0
+	}
+	if !glOk && !otOk {
+		return canon, false, false
+	}
+	if canon < 0 {
+		if glOk {
+			canon = b(glPlaying)
+		} else {
+			canon = b(otPlaying)
+		}
+	} else {
+		switch {
+		case glOk && b(glPlaying) != canon: // Spotify wins ties
+			canon = b(glPlaying)
+		case otOk && b(otPlaying) != canon: // HomePod top-tap moved it
+			canon = b(otPlaying)
+		}
+	}
+	setGl = glOk && b(glPlaying) != canon
+	setOt = otOk && b(otPlaying) != canon
+	return canon, setGl, setOt
+}
+
+const initialVolumeCap = 35 // "never full blast": cap the FIRST session's volume after a (re)start
+
+func playWord(c int) string {
+	if c == 1 {
+		return "play"
+	}
+	return "pause"
+}
+
+// roomBridge keeps one room's HomePod and go-librespot in step in BOTH directions, for volume and
+// transport — so Spotify/HA, the HomePod buttons and the HomePod top-tap all converge on one state.
 //
-//   - Volume: mirror go-librespot's volume onto the selected HomePod output (per-output). With
-//     external_volume:true OwnTone applies it at the AirPlay output, so it's responsive. One-way
-//     (MA's pattern): Spotify/HA are authoritative; HomePod hardware buttons stay best-effort.
-//   - Transport: the instant go-librespot pauses/stops, pause OwnTone — otherwise the already-buffered
-//     2-4s keeps playing after you hit pause. Resume mirrors back too (pipe_autostart also covers it).
+//   - Volume (decideVolume): Spotify/HA slider <-> HomePod hardware buttons. external_volume:true
+//     makes OwnTone apply volume at the AirPlay output (responsive). OwnTone 29.2 was verified live
+//     to surface the receiver's volume on this hardware, so the back-direction works here.
+//   - Transport (decideTransport): a Spotify pause pauses the HomePod instantly (beating the buffer),
+//     and a HomePod top-tap pauses/resumes Spotify (OwnTone forwards HomePod MediaRemote events —
+//     best-effort, firmware-dependent).
 //
-// Skipped while a test tone plays so it isn't cut off. Per-room → multi-room is just N bridges.
-// Uses only verified APIs (no unverified websocket envelope).
+// Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
+// from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
+// while a test tone plays. Per-room. Uses only verified APIs.
 func roomBridge(room Room) {
-	lastVol := -1
+	volCanon, playCanon := -1, -1
+	capped := false
 	for {
 		if !tonePlaying.Load() {
-			st := librespotStatus(room.Librespot)
-			if st.Active {
-				if st.HasVol && st.VolPct != lastVol {
-					if _, id, hasOut := owntoneOutputVolume(room.OwnTone); hasOut {
-						setOwntoneOutputVolume(room.OwnTone, id, st.VolPct)
-						log.Printf("volume [%s]: Spotify %d%% -> HomePod", room.Name, st.VolPct)
-						lastVol = st.VolPct
+			gl := librespotStatus(room.Librespot)
+			if gl.Active {
+				if !capped {
+					capped = true
+					if gl.HasVol && gl.VolPct > initialVolumeCap {
+						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
+						gl.VolPct = initialVolumeCap
+						log.Printf("volume [%s]: capped fresh start to %d%%", room.Name, initialVolumeCap)
 					}
 				}
-				shouldPlay := !st.Paused && !st.Stopped
-				switch owntonePlayerState(room.OwnTone) {
-				case "play":
-					if !shouldPlay {
-						owntoneTransport(room.OwnTone, "pause")
-						log.Printf("transport [%s]: pause", room.Name)
+				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
+				otState := owntonePlayerState(room.OwnTone)
+
+				// Volume — both directions.
+				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
+				volCanon = vc
+				if vGl {
+					setLibrespotVolumePct(room.Librespot, vc)
+					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
+				}
+				if vOt && otID != "" {
+					setOwntoneOutputVolume(room.OwnTone, otID, vc)
+					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
+				}
+
+				// Transport — both directions.
+				tc, tGl, tOt := decideTransport(playCanon, !gl.Paused && !gl.Stopped, true, otState == "play", otState != "")
+				playCanon = tc
+				if tGl {
+					if tc == 1 {
+						librespotTransport(room.Librespot, "resume")
+					} else {
+						librespotTransport(room.Librespot, "pause")
 					}
-				case "pause", "stop":
-					if shouldPlay {
-						owntoneTransport(room.OwnTone, "play")
-						log.Printf("transport [%s]: play", room.Name)
-					}
+					log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(tc))
+				}
+				if tOt {
+					owntoneTransport(room.OwnTone, playWord(tc))
+					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(tc))
 				}
 			}
 		}
