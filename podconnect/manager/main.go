@@ -363,33 +363,52 @@ func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, se
 // 1 playing. Same canonical loop-protection as decideVolume — a HomePod top-tap (otPlaying change)
 // propagates to Spotify and vice-versa, without ping-pong. (For a binary value at most one side can
 // differ from canon at a time, so this is naturally conflict-free.)
-func decideTransport(canon int, glPlaying, glOk, otPlaying, otOk bool) (newCanon int, setGl, setOt bool) {
-	b := func(p bool) int {
-		if p {
-			return 1
-		}
-		return 0
+func b(p bool) int {
+	if p {
+		return 1
 	}
-	if !glOk && !otOk {
-		return canon, false, false
+	return 0
+}
+
+// transState tracks play/pause sync with awareness of OwnTone's startup lag. OwnTone reaches "play"
+// ~1-2s after a command (buffering), so its state can't be trusted for the back-direction until it
+// has CONFIRMED our last command — otherwise the lag reads as a HomePod pause (the flicker), and a
+// blanket time delay would also stall rapid toggling. So: forward (Spotify->OwnTone) always runs;
+// back (HomePod->Spotify) only fires once OwnTone has confirmed our command, so a genuine top-tap (a
+// divergence AFTER confirmation) is caught but startup lag is not. Rapid play/pause works because the
+// forward path is never delayed.
+type transState struct {
+	canon       int  // -1 unknown, 0 paused, 1 playing
+	otTarget    int  // -1 none, else the last state we commanded OwnTone
+	otConfirmed bool // has OwnTone reached otTarget since we set it
+}
+
+// decide consumes one tick's readings and returns the state to command each side (-1 = no command).
+func (ts *transState) decide(glPlaying, otPlaying, otValid bool) (setGl, setOt int) {
+	gp, op := b(glPlaying), b(otPlaying)
+	if ts.canon < 0 {
+		ts.canon = gp
 	}
-	if canon < 0 {
-		if glOk {
-			canon = b(glPlaying)
-		} else {
-			canon = b(otPlaying)
-		}
-	} else {
-		switch {
-		case glOk && b(glPlaying) != canon: // Spotify wins ties
-			canon = b(glPlaying)
-		case otOk && b(otPlaying) != canon: // HomePod top-tap moved it
-			canon = b(otPlaying)
+	if otValid && ts.otTarget >= 0 && op == ts.otTarget {
+		ts.otConfirmed = true
+	}
+	switch {
+	case gp != ts.canon: // Spotify changed -> wins
+		ts.canon = gp
+	case otValid && ts.otConfirmed && op != ts.canon: // genuine HomePod tap (post-confirmation divergence)
+		ts.canon = op
+	}
+	setGl, setOt = -1, -1
+	if gp != ts.canon {
+		setGl = ts.canon
+	}
+	if otValid && op != ts.canon {
+		setOt = ts.canon
+		if ts.otTarget != ts.canon {
+			ts.otTarget, ts.otConfirmed = ts.canon, false
 		}
 	}
-	setGl = glOk && b(glPlaying) != canon
-	setOt = otOk && b(otPlaying) != canon
-	return canon, setGl, setOt
+	return
 }
 
 const initialVolumeCap = 35 // "never full blast": cap the FIRST session's volume after a (re)start
@@ -407,18 +426,17 @@ func playWord(c int) string {
 //   - Volume (decideVolume): Spotify/HA slider <-> HomePod hardware buttons. external_volume:true
 //     makes OwnTone apply volume at the AirPlay output (responsive). OwnTone 29.2 was verified live
 //     to surface the receiver's volume on this hardware, so the back-direction works here.
-//   - Transport (decideTransport): a Spotify pause pauses the HomePod instantly (beating the buffer),
+//   - Transport (transState): a Spotify pause pauses the HomePod instantly (beating the buffer),
 //     and a HomePod top-tap pauses/resumes Spotify (OwnTone forwards HomePod MediaRemote events —
-//     best-effort, firmware-dependent).
+//     best-effort, firmware-dependent). Startup-aware so it never flickers or stalls rapid taps.
 //
 // Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
 // from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
 // while a test tone plays. Per-room. Uses only verified APIs.
 func roomBridge(room Room) {
-	volCanon, playCanon := -1, -1
+	volCanon := -1
+	trans := transState{canon: -1, otTarget: -1}
 	capped := false
-	var settleUntil time.Time // after a transport command, ignore transport briefly so OwnTone's
-	// ~1-2s startup-to-"play" lag isn't misread as a HomePod pause (the play/pause flicker).
 	for {
 		if !tonePlaying.Load() {
 			gl := librespotStatus(room.Librespot)
@@ -446,26 +464,19 @@ func roomBridge(room Room) {
 					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
 				}
 
-				// Transport — both directions. Skip during the settle window so OwnTone's startup
-				// lag after a "play" can't bounce Spotify (the play/pause flicker).
-				if time.Now().After(settleUntil) {
-					tc, tGl, tOt := decideTransport(playCanon, !gl.Paused && !gl.Stopped, true, otState == "play", otState != "")
-					playCanon = tc
-					if tGl {
-						if tc == 1 {
-							librespotTransport(room.Librespot, "resume")
-						} else {
-							librespotTransport(room.Librespot, "pause")
-						}
-						log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(tc))
+				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
+				sg, so := trans.decide(!gl.Paused && !gl.Stopped, otState == "play", otState != "")
+				if sg >= 0 {
+					if sg == 1 {
+						librespotTransport(room.Librespot, "resume")
+					} else {
+						librespotTransport(room.Librespot, "pause")
 					}
-					if tOt {
-						owntoneTransport(room.OwnTone, playWord(tc))
-						log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(tc))
-					}
-					if tGl || tOt {
-						settleUntil = time.Now().Add(1500 * time.Millisecond)
-					}
+					log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(sg))
+				}
+				if so >= 0 {
+					owntoneTransport(room.OwnTone, playWord(so))
+					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(so))
 				}
 			}
 		}

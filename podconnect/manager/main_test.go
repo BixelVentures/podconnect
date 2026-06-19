@@ -37,33 +37,61 @@ func TestDecideVolume(t *testing.T) {
 	}
 }
 
-// TestDecideTransport covers the bidirectional play/pause reconcile — including the "HomePod top-tap
-// resumes Spotify" case (the second-tap bug) and echo suppression.
-func TestDecideTransport(t *testing.T) {
-	cases := []struct {
-		name                 string
-		canon                int
-		glPlaying, glOk      bool
-		otPlaying, otOk      bool
-		wantCanon            int
-		wantSetGl, wantSetOt bool
-	}{
-		{"init playing -> play homepod", -1, true, true, false, true, 1, false, true},
-		{"init from homepod when no session", -1, false, false, true, true, 1, false, false},
-		{"steady both playing -> nothing", 1, true, true, true, true, 1, false, false},
-		{"spotify paused -> pause homepod", 1, false, true, true, true, 0, false, true},
-		{"homepod top-tap pause -> pause spotify", 1, true, true, false, true, 0, true, false},
-		{"homepod top-tap play -> resume spotify", 0, false, true, true, true, 1, true, false},
-		{"both flip to play -> agree, no writes", 0, true, true, true, true, 1, false, false},
-		{"no session, no output -> nothing", 1, false, false, false, false, 1, false, false},
+// TestTransState_NoFlickerOnPlay: pressing play must NOT bounce Spotify while OwnTone is still
+// starting up (otPlaying=false for a few ticks). It should only command OwnTone to play, never
+// command Spotify to pause.
+func TestTransState_NoFlickerOnPlay(t *testing.T) {
+	ts := transState{canon: -1, otTarget: -1}
+	// Tick 1: Spotify playing, OwnTone not yet (startup).
+	sg, so := ts.decide(true, false, true)
+	if sg != -1 || so != 1 {
+		t.Fatalf("tick1 got (sg %d, so %d) want (-1, 1)", sg, so)
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			gc, gg, go_ := decideTransport(c.canon, c.glPlaying, c.glOk, c.otPlaying, c.otOk)
-			if gc != c.wantCanon || gg != c.wantSetGl || go_ != c.wantSetOt {
-				t.Fatalf("got (%d,%v,%v) want (%d,%v,%v)", gc, gg, go_, c.wantCanon, c.wantSetGl, c.wantSetOt)
-			}
-		})
+	// Ticks 2-5: OwnTone still starting — must keep NOT pausing Spotify (no flicker).
+	for i := 0; i < 4; i++ {
+		sg, _ = ts.decide(true, false, true)
+		if sg != -1 {
+			t.Fatalf("tick %d flickered Spotify (sg=%d)", i+2, sg)
+		}
+	}
+	// OwnTone reaches play -> steady, no commands.
+	if sg, so = ts.decide(true, true, true); sg != -1 || so != -1 {
+		t.Fatalf("steady got (%d,%d) want (-1,-1)", sg, so)
+	}
+}
+
+// TestTransState_HomePodTap: once OwnTone has confirmed our play, a top-tap pause must pause Spotify;
+// a following top-tap play must resume Spotify (the "second tap" fix).
+func TestTransState_HomePodTap(t *testing.T) {
+	ts := transState{canon: -1, otTarget: -1}
+	ts.decide(true, false, true) // play; commands OwnTone
+	ts.decide(true, true, true)  // OwnTone confirms play
+	// Top-tap pause: Spotify still playing, OwnTone now paused.
+	if sg, _ := ts.decide(true, false, true); sg != 0 {
+		t.Fatalf("top-tap pause: sg=%d want 0 (pause Spotify)", sg)
+	}
+	ts.decide(false, false, true) // Spotify now paused, settle
+	// Top-tap play: Spotify paused, OwnTone now playing.
+	if sg, _ := ts.decide(false, true, true); sg != 1 {
+		t.Fatalf("top-tap play: sg=%d want 1 (resume Spotify)", sg)
+	}
+}
+
+// TestTransState_RapidToggle: the forward path is never delayed, so each Spotify flip immediately
+// commands OwnTone to follow (OwnTone is modelled as obeying our last command).
+func TestTransState_RapidToggle(t *testing.T) {
+	ts := transState{canon: -1, otTarget: -1}
+	otPlaying := false
+	_, so := ts.decide(true, otPlaying, true) // initial play
+	if so >= 0 {
+		otPlaying = so == 1 // OwnTone follows our command
+	}
+	for i, gl := range []bool{false, true, false, true} {
+		_, so := ts.decide(gl, otPlaying, true)
+		if so != b(gl) {
+			t.Fatalf("toggle %d: so=%d want %d (OwnTone must follow Spotify each flip)", i, so, b(gl))
+		}
+		otPlaying = so == 1
 	}
 }
 
