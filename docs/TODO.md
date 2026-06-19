@@ -43,10 +43,11 @@ NOT MQTT (HA has no MQTT media_player) — a companion custom integration wraps 
 agnostic. Distribution: installs manually for now (HACS = one integration per repo); a dedicated
 repo is the follow-up.
 
-### P2 — Multi-account  → scoped in [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md)
-Separated out: the account-agnostic **panel Stop/Release are the "house" controls** (the
-"stop my wife's music" answer — account-neutral, already shipped). The real fix = **multiple Control
-entries (one per person)** + voice account-routing; deferred until the engine is validated.
+### (Optional) Multi-account — likely SKIPPABLE → see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md)
+**Reality check:** multi-account *playback* already works for free (each person plays from their own
+Spotify app; different rooms = different accounts simultaneously). The deferred build (multiple
+Control entries) only adds **HA-level** visibility/control/automation across accounts — low value for
+a phone-first household. Build only if HA cross-account dashboards/voice-routing are wanted.
 
 ### P2 — Multi-account (old notes)
 One Control (HACS) config entry per family member (each its own Spotify OAuth). Control is already

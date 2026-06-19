@@ -43,6 +43,21 @@ snappy skips) is **general** — it works the same with one account or five.
 - **Don't break single-account:** multiple entries is purely additive — one entry = today's exact
   behavior.
 
+## Reality check: the valuable part already works for free
+**Multi-account *playback* is NOT a feature we need to build — it's inherent to Spotify Connect.**
+Every PodConnect speaker is a zeroconf Connect device, so any family member on the LAN can play to
+any speaker from their own Spotify app, and — because each room is its own independent go-librespot —
+**different people can play different music to different rooms simultaneously, today, with no extra
+setup.** Stopping anyone is the account-neutral panel Stop / Siri.
+
+So the deferred "multi-account" build (multiple Control entries) adds **only one thing**: letting
+**Home Assistant** see / control / automate *each person's* Spotify (a dashboard of who's playing
+what, voice/automation routed to a specific account). For a **phone-first household** that's low
+value and may be skipped indefinitely. Build it only if HA-level cross-account visibility/automation
+is genuinely wanted. (Spotify **Jam** covers the "listen together / co-control" case socially: if one
+starts a Jam and another joins, they share the session — and the joiner's HA Control then reflects
+it, because they're in the session.)
+
 ## Why it's still deferred
 It needs the engine to be solid first (multi-room validated on hardware, push-state). This doc is the
 scoped plan so the multi-account build is ready to pick up without re-deciding the shape. The
