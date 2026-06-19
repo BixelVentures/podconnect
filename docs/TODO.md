@@ -23,6 +23,10 @@ rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). *
 > **Build-ready, research-validated, parallel-agent decomposition:**
 > [`docs/BUILD-PLAN.md`](BUILD-PLAN.md) (companion integration · push-state · multi-room · snappy
 > skips). Multi-account deferred by request.
+>
+> **Unified UX / install plan (2 parts, panel owns everything):**
+> [`docs/UX-PLAN.md`](UX-PLAN.md) — fold the companion media_player into Control (retire the 3rd
+> piece), panel-owns-all-setup, zero-typing naming. Assist: [`gemini-system-prompt.md`](gemini-system-prompt.md).
 
 ### ✅ Multi-room ("Add speaker") — built (Speakers 0.9.0), needs on-device validation
 N HomePods, each its own (go-librespot + OwnTone) pair. Manager forks/supervises children; s6 audio

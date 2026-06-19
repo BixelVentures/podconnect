@@ -83,7 +83,10 @@ class SpotifyApi:
         return (data or {}).get("items", [])
 
     async def search(
-        self, query: str, types: str = "track,artist,album,playlist", limit: int = 8
+        self,
+        query: str,
+        types: str = "track,artist,album,playlist,show,episode,audiobook",
+        limit: int = 8,
     ) -> dict[str, Any]:
         """GET /search — returns {tracks,artists,albums,playlists: {items:[...]}}."""
         return await self._request(

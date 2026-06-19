@@ -8,6 +8,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Control 0.6.0 — 2026-06-19
+- **Audiobooks / podcasts / episodes in search.** Search now includes `audiobook,show,episode`, so
+  "play <a children's bedtime story / audiobook / podcast>" resolves to the real audiobook instead of
+  a random same-named song. `play_media` routes episodes as track URIs, shows/audiobooks as contexts.
+- Pairs with `docs/gemini-system-prompt.md` (Assist confirms *what* it played + says when it can't)
+  and the Gemini "Block none" safety fix for the `PROHIBITED_CONTENT` errors.
+
 ## Control 0.5.0 — 2026-06-19
 - **Profile insights in Browse + Assist.** Browse Spotify by category: Playlists, **Top
   Artists**, **Top Tracks**, **Recently Played**, **Liked Songs** — each item plays directly.

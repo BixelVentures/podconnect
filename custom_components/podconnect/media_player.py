@@ -54,6 +54,11 @@ _SEARCH_KINDS = {
     "artists": (MediaClass.ARTIST, MediaType.ARTIST),
     "albums": (MediaClass.ALBUM, MediaType.ALBUM),
     "playlists": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
+    # Spoken content so "play <a children's bedtime story / audiobook / podcast>" resolves to the
+    # actual audiobook/show — not a random same-named song. (getattr keeps it loading on older HA.)
+    "audiobooks": (getattr(MediaClass, "AUDIOBOOK", MediaClass.PODCAST), getattr(MediaType, "AUDIOBOOK", "audiobook")),
+    "shows": (MediaClass.PODCAST, MediaType.PODCAST),
+    "episodes": (MediaClass.EPISODE, MediaType.EPISODE),
 }
 
 # Browse root: (category id, display title, child MediaClass). Each expands to playable leaves.
@@ -307,7 +312,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Play a Spotify URI (track -> uris; album/playlist/artist -> context_uri)."""
-        if media_id.startswith("spotify:track:"):
+        if media_id.startswith(("spotify:track:", "spotify:episode:")):
             await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
             await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
@@ -425,13 +430,17 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         Results are ranked so the best name match is first — the search-and-play intent plays
         result[0], so an exact title/artist hit must win over an incidental substring match.
         """
-        types = "track,artist,album,playlist"
+        # Include spoken content (audiobooks/shows/episodes) so bedtime stories etc. resolve to the
+        # real audiobook, not a same-named song.
+        types = "track,artist,album,playlist,show,episode,audiobook"
         if query.media_filter_classes:
             wanted = {
                 MediaClass.TRACK: "track",
                 MediaClass.ARTIST: "artist",
                 MediaClass.ALBUM: "album",
                 MediaClass.PLAYLIST: "playlist",
+                MediaClass.PODCAST: "show",
+                MediaClass.EPISODE: "episode",
             }
             sel = [wanted[c] for c in query.media_filter_classes if c in wanted]
             if sel:
