@@ -67,6 +67,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.10.1 — 2026-06-19  (multi-room port fix)
+- **Fix: each room's OwnTone now binds its own HTTP/DAAP port.** `renderOTConfig` set
+  `websocket_port` but not the library `port`, so every OwnTone instance fell back to the default
+  3689. Single-room (r0) happened to match; a **second room** would collide on 3689 and its OwnTone
+  would be unreachable. Now `port = <OTPort>` is written per room (r0 still 3689; new rooms 38xx).
+- No effect on the working single-room setup.
+
 ## Speakers 0.10.0 — 2026-06-19  (UX-1: self-healing naming)
 - **Rename a HomePod in Apple Home → it syncs everywhere, automatically.** A room is now bound to its
   HomePod by the **stable OwnTone output id** (not the name), and the selection loop **self-heals**:

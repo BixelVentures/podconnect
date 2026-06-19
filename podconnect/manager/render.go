@@ -83,6 +83,7 @@ func renderOTConfig(r *Room) error {
 	start_buffer_ms = 500
 }
 library {
+	port = %d
 	name = "%s"
 	directories = { "%s" }
 	pipe_autostart = true
@@ -93,7 +94,7 @@ audio {
 mpd {
 	port = 0
 }
-`, r.OwnDir, r.OwnDir, r.OwnDir, r.OTWSPort, r.Name, mediaDir)
+`, r.OwnDir, r.OwnDir, r.OwnDir, r.OTWSPort, r.OTPort, r.Name, mediaDir)
 	return os.WriteFile(r.OwnConf, []byte(cfg), 0o644)
 }
 
