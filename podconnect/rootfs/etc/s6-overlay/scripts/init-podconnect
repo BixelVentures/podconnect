@@ -80,6 +80,11 @@ general {
 	db_path = "/data/owntone/songs3.db"
 	cache_dir = "/data/owntone"
 	logfile = "/data/owntone/owntone.log"
+	# OwnTone's default output pre-buffer is 2250 ms — the cause of the ~2-4 s AirPlay skip lag.
+	# The maintainer documents dropping start_buffer_ms to ~500 ms for "perceptually instant" skips;
+	# 500 ms is the maintainer-blessed floor. Raise toward 700-1000 ms if underruns (audio dropouts)
+	# appear on weak networks.
+	start_buffer_ms = 500
 }
 library {
 	name = "${SPEAKER}"

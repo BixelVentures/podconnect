@@ -33,6 +33,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.8.0 — 2026-06-19
+- **Snappy skips:** OwnTone `start_buffer_ms = 500` (was the default 2250 ms output pre-buffer —
+  the cause of the ~2–4 s AirPlay skip lag). Maintainer-blessed floor; raise toward 700–1000 ms if
+  underruns appear on a weak network.
+- **Manager API for the new companion integration:** `POST /api/play` (resume), `PUT /api/volume`
+  `{"volume":0..100}`, and a `volume` field added to `GET /api/state`.
+
+## New: PodConnect Speakers integration 0.1.0 — 2026-06-19
+- A second, local custom integration (`custom_components/podconnect_speakers/`) that wraps the
+  add-on's HTTP API as a real **`media_player`** (+ a "Release HomePod" button), so the
+  **account-agnostic Stop/Pause works via HA Assist voice** ("stop the kitchen") and dashboards, in
+  the right Area — independent of which Spotify account is playing. `media_pause`/`media_stop` →
+  `/api/stop`, `media_play` → `/api/play`, volume → `/api/volume`.
+- Distribution note: HACS allows one integration per repo (that's the Spotify `podconnect`
+  Control), so install this one **manually** for now (copy the folder to `config/custom_components/`)
+  — a dedicated repo / HACS path is a follow-up. Needs Speakers add-on ≥ 0.8.0 for play/volume.
+
 ## Speakers 0.7.0 — 2026-06-19
 - **Stop button (account-agnostic).** Panel "⏹ Stop music" + `/api/stop` pause go-librespot
   *locally*, so they stop whoever is playing — including a family member's Spotify the Web API

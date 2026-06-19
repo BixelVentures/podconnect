@@ -70,6 +70,7 @@ type stateResp struct {
 	Playing    bool     `json:"playing"`
 	Released   bool     `json:"released"`
 	NowPlaying string   `json:"now_playing"`
+	Volume     int      `json:"volume"` // 0..100, or -1 if unknown
 }
 
 func selectionPath() string { return filepath.Join(dataDir, "selected_output.json") }
@@ -710,6 +711,10 @@ func main() {
 		}
 		gl := librespotStatus(librespot)
 		playing := gl.Active && !gl.Paused && !gl.Stopped
+		vol := -1
+		if gl.HasVol {
+			vol = gl.VolPct
+		}
 		writeJSON(w, stateResp{
 			Speaker:    readSpeaker(),
 			Saved:      readSaved(),
@@ -718,6 +723,7 @@ func main() {
 			Playing:    playing,
 			Released:   fileExists(releasedPath()),
 			NowPlaying: nowPlaying(librespot),
+			Volume:     vol,
 		})
 	})
 
@@ -819,6 +825,39 @@ func main() {
 			owntoneTransport(rm.OwnTone, "pause")     // silence the AirPlay leg immediately
 		}
 		log.Printf("stop requested — paused playback on all speakers (account-agnostic)")
+		writeJSON(w, map[string]bool{"ok": true})
+	})
+
+	// /api/play resumes playback on every room (go-librespot resume). The bridge's transState then
+	// mirrors the resume onto OwnTone. Counterpart to /api/stop for the HA integration.
+	http.HandleFunc("/api/play", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		for _, rm := range rooms() {
+			librespotTransport(rm.Librespot, "resume")
+		}
+		log.Printf("play requested — resumed playback on all speakers")
+		writeJSON(w, map[string]bool{"ok": true})
+	})
+
+	// /api/volume sets the speaker volume (0..100) on every room via go-librespot; the bridge mirrors
+	// the change to the HomePod's OwnTone output. PUT with {"volume":<int>}.
+	http.HandleFunc("/api/volume", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Volume int `json:"volume"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		pct := clampPct(body.Volume)
+		for _, rm := range rooms() {
+			setLibrespotVolumePct(rm.Librespot, pct)
+		}
+		log.Printf("volume set to %d%% on all speakers (via API)", pct)
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
