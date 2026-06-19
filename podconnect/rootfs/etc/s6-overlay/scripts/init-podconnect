@@ -45,7 +45,10 @@ credentials:
 audio_backend: pipe
 audio_output_pipe: /srv/media/spotify
 audio_output_pipe_format: s16le
-external_volume: true
+# external_volume:false -> go-librespot scales the PCM itself, so the Spotify slider directly and
+# instantly controls loudness (the reliable, known-good behavior). The external_volume:true + relay
+# approach is parked until it can be verified against real /status data (it can't be from Docker).
+external_volume: false
 server:
   enabled: true
   address: 0.0.0.0

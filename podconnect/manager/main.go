@@ -485,11 +485,14 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	// Bidirectional volume sync: one reconciler per room keeps the Spotify volume and the HomePod
-	// output in agreement both ways (Spotify/HA slider <-> HomePod buttons), loop-protected.
-	for _, r := range rooms() {
-		go (&volumeReconciler{room: r, canon: -1}).run()
-	}
+	// Volume reconciler is PARKED: with external_volume:false (go-librespot scales the PCM), running
+	// it would double-attenuate, and it proved unreliable on the VM's flaky sessions. The Spotify
+	// slider controls loudness directly. Re-enable (with external_volume:true) only once it can be
+	// verified against real go-librespot/OwnTone — ideally on the wired Green where sessions hold.
+	// for _, r := range rooms() {
+	// 	go (&volumeReconciler{room: r, canon: -1}).run()
+	// }
+	_ = rooms // keep referenced; reconciler code retained for the verified redesign
 
 	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
