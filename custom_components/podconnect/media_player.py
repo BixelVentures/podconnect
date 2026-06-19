@@ -20,6 +20,7 @@ from . import PodConnectConfigEntry
 from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
+from .speakers_coordinator import SpeakersCoordinator
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
 # integration still loads on older cores (it just won't advertise search there).
@@ -105,6 +106,28 @@ async def async_setup_entry(
 
     _discover()
     entry.async_on_unload(coordinator.async_add_listener(_discover))
+
+    # Local (account-agnostic) speaker entities — one per room from the add-on manager.
+    # Only present when the optional add-on URL is configured (speakers_coordinator exists).
+    speakers = getattr(entry.runtime_data, "speakers_coordinator", None)
+    if speakers is not None:
+        known_rooms: set[str] = set()
+
+        @callback
+        def _discover_speakers() -> None:
+            new_speakers: list[PodConnectLocalSpeaker] = []
+            for room in speakers.data or []:
+                room_id = room.get("id")
+                if room_id and room_id not in known_rooms:
+                    known_rooms.add(room_id)
+                    new_speakers.append(
+                        PodConnectLocalSpeaker(speakers, entry.entry_id, room_id)
+                    )
+            if new_speakers:
+                async_add_entities(new_speakers)
+
+        _discover_speakers()
+        entry.async_on_unload(speakers.async_add_listener(_discover_speakers))
 
 
 class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlayerEntity):
@@ -478,3 +501,94 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         # version people actually mean, not whichever Spotify happened to return first.
         scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
         return SearchMedia(result=[bm for _, _, bm in scored])
+
+
+# Local speaker controls map to the add-on manager (account-agnostic), so this entity
+# is intentionally minimal: pause/play + volume only.
+_LOCAL_SUPPORTED = (
+    MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.VOLUME_SET
+)
+
+
+class PodConnectLocalSpeaker(
+    CoordinatorEntity[SpeakersCoordinator], MediaPlayerEntity
+):
+    """One PodConnect room exposed as an account-agnostic local media_player.
+
+    This is a DISTINCT device from the cloud Spotify Connect entity for the same physical
+    HomePod: it talks to the add-on manager (go-librespot / OwnTone) instead of the Spotify
+    cloud, so it keeps working regardless of which account is signed in. It surfaces only
+    when the add-on URL is configured in the integration's options.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = None
+    _attr_supported_features = _LOCAL_SUPPORTED
+
+    def __init__(
+        self, coordinator: SpeakersCoordinator, entry_id: str, room_id: str
+    ) -> None:
+        """Initialise the entity for one room."""
+        super().__init__(coordinator)
+        self._room_id = room_id
+        self._attr_unique_id = f"{entry_id}_speaker_{room_id}"
+        room_name = self._room.get("name") if self._room else None
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, f"speaker_{room_id}")},
+            name=room_name or f"PodConnect {room_id}",
+            manufacturer="PodConnect",
+            model="HomePod (account-agnostic)",
+        )
+
+    @property
+    def _room(self) -> dict | None:
+        for room in self.coordinator.data or []:
+            if room.get("id") == self._room_id:
+                return room
+        return None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._room is not None
+
+    @property
+    def state(self) -> MediaPlayerState:
+        room = self._room or {}
+        if room.get("released"):
+            return MediaPlayerState.IDLE
+        if room.get("playing"):
+            return MediaPlayerState.PLAYING
+        return MediaPlayerState.IDLE
+
+    @property
+    def volume_level(self) -> float | None:
+        vol = (self._room or {}).get("volume")
+        if vol is not None and vol >= 0:
+            return vol / 100
+        return None
+
+    @property
+    def media_title(self) -> str | None:
+        return (self._room or {}).get("now_playing") or None
+
+    async def async_media_pause(self) -> None:
+        """Account-agnostic local pause (maps to the manager's /api/stop)."""
+        await self.coordinator.api.stop(self._room_id)
+        await self.coordinator.async_request_refresh()
+
+    async def async_media_stop(self) -> None:
+        """Stop -> same as pause for the local engine."""
+        await self.coordinator.api.stop(self._room_id)
+        await self.coordinator.async_request_refresh()
+
+    async def async_media_play(self) -> None:
+        """Resume playback on this room."""
+        await self.coordinator.api.play(self._room_id)
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set this room's volume (0.0..1.0 -> 0..100)."""
+        await self.coordinator.api.set_volume(round(volume * 100), self._room_id)
+        await self.coordinator.async_request_refresh()

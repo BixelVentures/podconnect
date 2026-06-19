@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Control 0.7.0 — 2026-06-19
+- **Companion folded into Control.** The separate `podconnect_speakers` integration is retired —
+  set the **add-on manager URL** in Control's options (Settings → Devices & Services → PodConnect
+  Control → Configure; the HA host's LAN IP on `:8099`) and the account-agnostic local controls
+  appear: a **local speaker `media_player`** (pause / play / volume) and a **Release HomePod**
+  button **per room** (multi-room aware via `/api/rooms`, with a single-room fallback for older
+  add-ons). These are distinct devices from the cloud Spotify Connect entities for the same HomePod.
+- **Two things to install, not three:** add-on + Control. Control still works **fully without** the
+  add-on URL — it stays a pure Spotify controller, no add-on dependency, no errors when the URL is
+  unset or unreachable. Adding/clearing the URL reloads the entry to spin local speakers up/down.
+
 ## Control 0.6.1 — 2026-06-19
 - **Search picks the version people mean.** When several results share the exact title (e.g. the
   many "Den Danske Sommer" songs), ties are now broken by Spotify **popularity** — so the iconic hit
