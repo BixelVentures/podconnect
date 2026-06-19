@@ -20,6 +20,10 @@ rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). *
 
 ## 🎯 Next — prioritized
 
+> **Build-ready, research-validated, parallel-agent decomposition:**
+> [`docs/BUILD-PLAN.md`](BUILD-PLAN.md) (companion integration · push-state · multi-room · snappy
+> skips). Multi-account deferred by request.
+
 ### P1 — Multi-room ("Add speaker") ★ the big one
 N HomePods, each its own (go-librespot + OwnTone) pair with unique ports/db/mDNS name. The
 manager already takes a `Room` + `rooms()` (the seed) — multi-room = build the real list +
