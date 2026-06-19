@@ -9,8 +9,9 @@ device-id, mDNS interface restriction, go-librespot watchdog. **Bidirectional vo
 rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). **Grace-release**
 ("deling": hold through brief interruptions, free after 3min idle, reclaim on resume, + manual
 "⏏ Release" button).
-**Control (integration, 0.3.2):** media_player per Connect device (transport/volume/browse/play/
-source), **shuffle**, **repeat**, **optimistic UI** (instant play/pause/shuffle/repeat).
+**Control (integration, 0.4.0):** media_player per Connect device (transport/volume/browse/play/
+source), **shuffle**, **repeat**, **optimistic UI** (instant play/pause/shuffle/repeat), **search**
+(`SEARCH_MEDIA` → Spotify `/search`, ranked) — HA Assist "spil X i køkkenet" works, no re-auth.
 **Proven on the VM:** HA + Spotify app + HomePod all control & reflect. (Every "VM" bug was code.)
 
 ---
@@ -28,9 +29,22 @@ Default the speaker name to the **picked HomePod's name** (e.g. "Køkkenalrum") 
 `speaker_name`, so the Connect device + HA entity auto-name sensibly. Needs a go-librespot
 `device_name` update + restart on pick.
 
-### P2 — Multi-account
+### P1 — Profile-based suggestions (insights)
+Browse/Assist categories from the user's profile: **Top Artists, Top Tracks, Recently Played,
+Liked Songs**. Needs three new scopes (`user-top-read`, `user-read-recently-played`,
+`user-library-read`) → **one-time re-auth**. Add to `const.py`, new `api.py` reads, and a category
+tree in `async_browse_media` (root DIRECTORY → category dirs → playable leaves).
+
+### P2 — Multi-account ("stop the wife's music")
 One Control (HACS) config entry per family member (each its own Spotify OAuth). Control is already
 device-list-driven; multi-account = allow multiple config entries + per-entry coordinator.
+**Key design point:** stopping *another account's* playback on a HomePod can't go through your own
+Spotify (the Web API only controls your own devices). It must happen at the **speaker level** —
+the Speakers add-on talks to go-librespot *locally* (not via Spotify cloud), so a local pause stops
+whoever is playing. Today the panel's **"⏏ Release HomePod"** button already does this (local pause
++ free). Next: a clean per-speaker **"Stop"** in the panel (and a manager HTTP endpoint) that is
+account-agnostic — the shared, physical-speaker control that lives on the Speakers side, separate
+from each person's per-account Control.
 
 ### P2 — HA Assist + Areas (mostly config, smooth it)
 Works once the entity is exposed (built-in media intents: pause/next/volume). Polish: set a
