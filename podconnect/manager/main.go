@@ -873,11 +873,13 @@ func main() {
 		}
 		rm.HomepodName = name
 		rm.HomepodID = homepodID
-		// Auto-name forwarding (r0 only, where speaker_name may be empty): the Connect device adopts
-		// the picked HomePod's name. Rewrite device_name + restart THAT room's go-librespot.
-		if name != "" && rm.ID == "r0" && speakerNameOpt() == "" && setGLDeviceName(rm, name) {
+		// Picking a HomePod auto-names the speaker after it — the panel owns naming. The legacy
+		// speaker_name option no longer overrides an explicit pick (it was only the migration seed);
+		// only a user Rename (NameManual) pins a custom name. Rewrite device_name + restart this room.
+		if name != "" && !rm.NameManual && setGLDeviceName(rm, name) {
 			store.setName(rm.ID, name)
-			log.Printf("name-forward: Connect device -> %q (restarting go-librespot)", name)
+			rm.Name = name
+			log.Printf("name-forward: room %s -> %q (restarting go-librespot)", rm.ID, name)
 			if rt := mgr.runtime(rm.ID); rt != nil {
 				go rt.restartGL()
 			}

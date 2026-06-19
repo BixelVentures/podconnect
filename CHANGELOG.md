@@ -67,6 +67,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.10.2 — 2026-06-19  (panel owns naming)
+- **Picking a HomePod now names the speaker after it — for every room, including the primary.** The
+  legacy `speaker_name` option no longer overrides an explicit pick (it was only the migration seed);
+  only a panel **Rename** pins a custom name. Fixes the primary staying "PodConnect Test" after you
+  picked "Køkkenalrum HomePod". Re-Save the selection once on 0.10.2 to apply it to an already-picked
+  primary.
+
 ## Speakers 0.10.1 — 2026-06-19  (multi-room port fix)
 - **Fix: each room's OwnTone now binds its own HTTP/DAAP port.** `renderOTConfig` set
   `websocket_port` but not the library `port`, so every OwnTone instance fell back to the default
