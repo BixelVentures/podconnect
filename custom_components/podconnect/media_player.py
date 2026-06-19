@@ -9,6 +9,7 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
+    RepeatMode,
 )
 from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -31,7 +32,17 @@ SUPPORTED = (
     | MediaPlayerEntityFeature.PLAY_MEDIA
     | MediaPlayerEntityFeature.SELECT_SOURCE
     | MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.SHUFFLE_SET
+    | MediaPlayerEntityFeature.REPEAT_SET
 )
+
+# Spotify repeat_state <-> HA RepeatMode.
+_SPOTIFY_TO_HA_REPEAT = {
+    "off": RepeatMode.OFF,
+    "track": RepeatMode.ONE,
+    "context": RepeatMode.ALL,
+}
+_HA_TO_SPOTIFY_REPEAT = {v: k for k, v in _SPOTIFY_TO_HA_REPEAT.items()}
 
 
 async def async_setup_entry(
@@ -181,6 +192,18 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             if dev.get("name")
         ]
 
+    @property
+    def shuffle(self) -> bool | None:
+        pb = self._playback
+        return pb.get("shuffle_state") if (self._is_active and pb) else None
+
+    @property
+    def repeat(self) -> RepeatMode | None:
+        pb = self._playback
+        if not (self._is_active and pb):
+            return None
+        return _SPOTIFY_TO_HA_REPEAT.get(pb.get("repeat_state"), RepeatMode.OFF)
+
     # --- control (targets this device) ---
     async def _send(self, action) -> None:
         """Run a player command, tolerating Spotify's "restriction" rejections.
@@ -213,6 +236,13 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     async def async_set_volume_level(self, volume: float) -> None:
         await self._send(self.coordinator.api.set_volume(round(volume * 100), self._device_id))
+
+    async def async_set_shuffle(self, shuffle: bool) -> None:
+        await self._send(self.coordinator.api.set_shuffle(shuffle, self._device_id))
+
+    async def async_set_repeat(self, repeat: RepeatMode) -> None:
+        state = _HA_TO_SPOTIFY_REPEAT.get(repeat, "off")
+        await self._send(self.coordinator.api.set_repeat(state, self._device_id))
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Play a Spotify URI (track -> uris; album/playlist/artist -> context_uri)."""

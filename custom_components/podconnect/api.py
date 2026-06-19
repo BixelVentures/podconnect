@@ -131,6 +131,20 @@ class SpotifyApi:
             params={"volume_percent": int(volume_percent), "device_id": device_id},
         )
 
+    async def set_repeat(self, state: str, device_id: str | None = None) -> None:
+        """PUT /me/player/repeat (state = track | context | off)."""
+        await self._request(
+            "PUT", "/me/player/repeat", params={"state": state, "device_id": device_id}
+        )
+
+    async def set_shuffle(self, state: bool, device_id: str | None = None) -> None:
+        """PUT /me/player/shuffle (state = true | false)."""
+        await self._request(
+            "PUT",
+            "/me/player/shuffle",
+            params={"state": "true" if state else "false", "device_id": device_id},
+        )
+
     async def transfer(self, device_id: str, play: bool = True) -> None:
         """PUT /me/player — move playback to a device."""
         await self._request(
