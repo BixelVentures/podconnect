@@ -420,6 +420,47 @@ func playWord(c int) string {
 	return "pause"
 }
 
+const releaseGrace = 3 * time.Minute // grace-release: free the HomePod after this much idle ("deling")
+
+func releasedPath() string { return filepath.Join(dataDir, "released") }
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// releaseHomePod frees the HomePod for other AirPlay senders (Mofibo, Apple Music, …): deselect all
+// OwnTone outputs and drop a flag that select-homepod honors so it won't immediately re-grab it.
+func releaseHomePod(room Room) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest(http.MethodPut, room.OwnTone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":[]}`))
+	if r, e := cl.Do(req); e == nil {
+		r.Body.Close()
+	}
+	_ = os.WriteFile(releasedPath(), []byte("1"), 0o644)
+}
+
+// reclaimHomePod takes the HomePod back: clear the flag and re-select the target output now, for a
+// snappy resume instead of waiting on select-homepod's 10s loop.
+func reclaimHomePod(room Room) {
+	_ = os.Remove(releasedPath())
+	devs, _ := fetchOutputs()
+	want := readSaved()
+	if want == "" {
+		want = readHomepodName()
+	}
+	target := ""
+	for _, d := range devs {
+		if want != "" && strings.EqualFold(d.Name, want) {
+			target = d.ID
+			break
+		}
+	}
+	if target == "" && len(devs) > 0 {
+		target = devs[0].ID
+	}
+	if target != "" {
+		selectOnOwntone(target)
+	}
+}
+
 // roomBridge keeps one room's HomePod and go-librespot in step in BOTH directions, for volume and
 // transport — so Spotify/HA, the HomePod buttons and the HomePod top-tap all converge on one state.
 //
@@ -437,10 +478,35 @@ func roomBridge(room Room) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	capped := false
+	var idleSince time.Time
 	for {
 		if !tonePlaying.Load() {
 			gl := librespotStatus(room.Librespot)
-			if gl.Active {
+			playing := gl.Active && !gl.Paused && !gl.Stopped
+			released := fileExists(releasedPath())
+
+			// Grace-release ("deling"): hold the HomePod through brief interruptions (still
+			// playing, so Siri/notifications recover), but free it after sustained idle so other
+			// apps can use it — and reclaim it the moment Spotify resumes.
+			if playing {
+				idleSince = time.Time{}
+				if released {
+					reclaimHomePod(room)
+					log.Printf("[%s]: reclaimed HomePod (playback resumed)", room.Name)
+					released = false
+				}
+			} else {
+				if idleSince.IsZero() {
+					idleSince = time.Now()
+				}
+				if !released && time.Since(idleSince) > releaseGrace {
+					releaseHomePod(room)
+					log.Printf("[%s]: released HomePod after %v idle — free for other apps", room.Name, releaseGrace)
+					released = true
+				}
+			}
+
+			if gl.Active && !released {
 				if !capped {
 					capped = true
 					if gl.HasVol && gl.VolPct > initialVolumeCap {
@@ -614,6 +680,19 @@ func main() {
 		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
 	})
 
+	http.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		for _, rm := range rooms() {
+			librespotTransport(rm.Librespot, "pause") // stop Spotify so the bridge doesn't instantly reclaim
+			releaseHomePod(rm)
+		}
+		log.Printf("HomePod released on request — free for other apps")
+		writeJSON(w, map[string]bool{"ok": true})
+	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -680,8 +759,10 @@ const indexHTML = `<!doctype html>
   </div>
   <div class="actions">
     <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
+    <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
   </div>
   <p id="testmsg" class="hint"></p>
+  <p id="releasemsg" class="hint"></p>
   <p class="hint">This list is a live network scan (OwnTone AirPlay discovery) — the same one that
   feeds Spotify Connect. No typing: pick a device and Save. Your speaker keeps playing to it across
   restarts.<br><br><b>Play test sound</b> sends a 3-second tone straight to the selected HomePod via
@@ -740,6 +821,14 @@ document.getElementById('test').onclick = async function () {
   } catch (e) { m.textContent = 'Could not send the test.'; }
   var btn = this;
   setTimeout(function () { btn.disabled = false; }, 4000);
+};
+document.getElementById('release').onclick = async function () {
+  this.disabled = true;
+  var m = document.getElementById('releasemsg');
+  m.textContent = 'Released — the HomePod is now free to AirPlay from other apps (Mofibo, Apple Music…). Press play in Spotify to take it back.';
+  try { await fetch('api/release', { method: 'POST' }); } catch (e) {}
+  var btn = this;
+  setTimeout(function () { btn.disabled = false; }, 3000);
 };
 load();
 setInterval(load, 5000);

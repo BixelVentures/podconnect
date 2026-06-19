@@ -14,6 +14,8 @@ read_target() {
 listed=""
 lasttarget="__unset__"
 while true; do
+  # Grace-release: while the manager has freed the HomePod for other apps, don't re-grab it.
+  if [ -f /data/released ]; then sleep 5; continue; fi
   # Re-read each loop so picking in the Ingress panel takes effect live (no add-on restart).
   HOMEPOD="$(read_target)"
   if [ "$HOMEPOD" != "$lasttarget" ]; then
