@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -222,31 +223,46 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 	}
 }
 
-// librespotVolumePct reads go-librespot's current volume as 0-100, or ok=false when there's no
-// active session reporting volume. go-librespot is the single source of truth: it runs
-// external_volume, so it reports the volume instead of scaling the PCM (OwnTone/AirPlay applies it).
-func librespotVolumePct(base string) (int, bool) {
+// glStatus is the slice of go-librespot's /status the bridge needs.
+type glStatus struct {
+	Active  bool // a Spotify session is present (status returned data)
+	HasVol  bool
+	VolPct  int  // 0-100
+	Paused  bool
+	Stopped bool
+}
+
+// librespotStatus reads go-librespot's /status once (volume + transport). With external_volume:true
+// go-librespot reports the volume (0..volume_steps) instead of scaling the PCM. Active=false when
+// there's no session (idle /status is empty).
+func librespotStatus(base string) glStatus {
 	cl := &http.Client{Timeout: 3 * time.Second}
 	resp, err := cl.Get(base + "/status")
 	if err != nil {
-		return 0, false
+		return glStatus{}
 	}
 	defer resp.Body.Close()
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
 	var st struct {
-		Volume      json.Number `json:"volume"`
-		VolumeSteps json.Number `json:"volume_steps"`
+		Username    string       `json:"username"`
+		Volume      *json.Number `json:"volume"`
+		VolumeSteps *json.Number `json:"volume_steps"`
+		Paused      bool         `json:"paused"`
+		Stopped     bool         `json:"stopped"`
 	}
 	if err := dec.Decode(&st); err != nil {
-		return 0, false
+		return glStatus{} // empty body / no session
 	}
-	vol, _ := st.Volume.Float64()
-	max, _ := st.VolumeSteps.Float64()
-	if max <= 0 {
-		return 0, false // idle / no session reporting volume
+	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped}
+	if st.Volume != nil && st.VolumeSteps != nil {
+		v, _ := st.Volume.Float64()
+		m, _ := st.VolumeSteps.Float64()
+		if m > 0 {
+			out.VolPct, out.HasVol = clampPct(int(math.Round(v/m*100))), true
+		}
 	}
-	return clampPct(int(math.Round(vol / max * 100))), true
+	return out
 }
 
 // setLibrespotVolumePct best-effort sets go-librespot's volume from a percent (it reports
@@ -277,33 +293,79 @@ func setLibrespotVolumePct(base string, pct int) {
 	}
 }
 
-// volumeBridge mirrors go-librespot's volume onto the room's selected HomePod output, so the
-// Spotify/HA slider controls the HomePod loudness responsively.
-//
-// ONE-WAY by design — this is Music Assistant's pattern: Spotify/HA are the authoritative downstream
-// control, and the HomePod's hardware buttons / Control Center stay best-effort/local, because
-// AirPlay-2 receivers don't reliably report a button press back to the sender (a limitation MA also
-// accepts by ignoring Apple-device volume feedback). With external_volume:true, go-librespot no
-// longer bakes volume into the PCM — OwnTone applies it at the AirPlay output, so a change takes
-// effect immediately instead of after the 2-4s of buffered audio drains. Only writes on a
-// go-librespot change, so a HomePod-side tweak persists until Spotify next moves (no fighting).
-// Per-room → multi-room is just N bridges. Uses only verified APIs (/status, /api/outputs, the
-// per-output volume PUT) — no unverified websocket envelope.
-func volumeBridge(room Room) {
-	last := -1
-	for {
-		if pct, ok := librespotVolumePct(room.Librespot); ok && pct != last {
-			if _, id, hasOut := owntoneOutputVolume(room.OwnTone); hasOut {
-				setOwntoneOutputVolume(room.OwnTone, id, pct)
-				log.Printf("volume [%s]: Spotify %d%% -> HomePod", room.Name, pct)
-				last = pct
-			}
-		}
-		time.Sleep(250 * time.Millisecond)
+// owntonePlayerState returns OwnTone's player state ("play"/"pause"/"stop"), or "" on error.
+func owntonePlayerState(base string) string {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cl.Get(base + "/api/player")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var p struct {
+		State string `json:"state"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&p) != nil {
+		return ""
+	}
+	return p.State
+}
+
+// owntoneTransport issues a player transport command ("play" or "pause").
+func owntoneTransport(base, action string) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, _ := http.NewRequest(http.MethodPut, base+"/api/player/"+action, nil)
+	if r, e := cl.Do(req); e == nil {
+		r.Body.Close()
 	}
 }
 
-var toneMu sync.Mutex
+// roomBridge keeps one room's HomePod in step with go-librespot for BOTH volume and transport, so
+// the Spotify/HA controls feel immediate instead of waiting on the 2-4s AirPlay buffer.
+//
+//   - Volume: mirror go-librespot's volume onto the selected HomePod output (per-output). With
+//     external_volume:true OwnTone applies it at the AirPlay output, so it's responsive. One-way
+//     (MA's pattern): Spotify/HA are authoritative; HomePod hardware buttons stay best-effort.
+//   - Transport: the instant go-librespot pauses/stops, pause OwnTone — otherwise the already-buffered
+//     2-4s keeps playing after you hit pause. Resume mirrors back too (pipe_autostart also covers it).
+//
+// Skipped while a test tone plays so it isn't cut off. Per-room → multi-room is just N bridges.
+// Uses only verified APIs (no unverified websocket envelope).
+func roomBridge(room Room) {
+	lastVol := -1
+	for {
+		if !tonePlaying.Load() {
+			st := librespotStatus(room.Librespot)
+			if st.Active {
+				if st.HasVol && st.VolPct != lastVol {
+					if _, id, hasOut := owntoneOutputVolume(room.OwnTone); hasOut {
+						setOwntoneOutputVolume(room.OwnTone, id, st.VolPct)
+						log.Printf("volume [%s]: Spotify %d%% -> HomePod", room.Name, st.VolPct)
+						lastVol = st.VolPct
+					}
+				}
+				shouldPlay := !st.Paused && !st.Stopped
+				switch owntonePlayerState(room.OwnTone) {
+				case "play":
+					if !shouldPlay {
+						owntoneTransport(room.OwnTone, "pause")
+						log.Printf("transport [%s]: pause", room.Name)
+					}
+				case "pause", "stop":
+					if shouldPlay {
+						owntoneTransport(room.OwnTone, "play")
+						log.Printf("transport [%s]: play", room.Name)
+					}
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+var (
+	toneMu      sync.Mutex
+	tonePlaying atomic.Bool // pauses the transport relay so it doesn't cut a test tone off
+)
 
 // playTestTone writes ~3s of a 440 Hz sine (s16le/44100/stereo) into the pipe. OwnTone's
 // pipe_autostart picks it up and plays it to the selected output — proving the OwnTone→AirPlay→
@@ -314,6 +376,8 @@ func playTestTone() {
 		return
 	}
 	defer toneMu.Unlock()
+	tonePlaying.Store(true)
+	defer tonePlaying.Store(false)
 	f, err := os.OpenFile("/srv/media/spotify", os.O_WRONLY, 0)
 	if err != nil {
 		log.Printf("test tone: open pipe: %v", err)
@@ -437,11 +501,10 @@ func main() {
 		_, _ = io.WriteString(w, indexHTML)
 	})
 
-	// One-way volume bridge per room: Spotify/HA volume -> the selected HomePod output. Responsive
-	// because external_volume:true makes OwnTone apply volume at the AirPlay output (no baked-in PCM
-	// buffer delay). HomePod hardware buttons stay best-effort (MA's accepted limitation).
+	// Per-room bridge: mirror go-librespot volume AND transport (play/pause) onto the HomePod, so
+	// controls feel immediate instead of waiting on the 2-4s AirPlay buffer.
 	for _, r := range rooms() {
-		go volumeBridge(r)
+		go roomBridge(r)
 	}
 
 	log.Printf("podconnect-manager listening on :%s (owntone=%s librespot=%s)", port, owntone, librespot)
