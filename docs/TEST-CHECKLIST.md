@@ -4,7 +4,7 @@ Everything shipped but not yet validated on hardware. Tick as you go. **Do multi
 first** — it replaced the s6 audio services with manager supervision.
 
 ## A. Update / install
-- [ ] Add-on → **0.9.0** (Add-on Store). Control → **0.7.0** (HACS).
+- [ ] Add-on → **0.12.0** (Add-on Store). Control → **0.7.1** (HACS).
 - [ ] **Re-authorize Control once** (profile scopes from 0.5.0 — else Top/Recent/Liked are empty).
 
 ## B. Speakers — single room (r0 must still work after the multi-room migration)
@@ -15,6 +15,7 @@ first** — it replaced the s6 audio services with manager supervision.
 - [ ] **⏏ Release** frees it for AirPlay apps; auto-release after `grace_minutes` idle; reclaim on play.
 - [ ] **Auto-name:** blank `speaker_name` → pick a HomePod → Connect device renames to it.
 - [ ] **Snappy skips:** a skip lands ~0.5 s (not 2–4 s); listen for dropouts (raise `start_buffer_ms` if any).
+- [ ] **Push-state (0.12.0):** volume/transport reflect promptly; force a ws drop → falls back to polling and still tracks.
 - [ ] Picker shows ▶ now-playing / ⏸ idle / ⏏ released.
 
 ## C. Speakers — multi-room (0.9.0 — VM FIRST)

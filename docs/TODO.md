@@ -1,61 +1,60 @@
 # PodConnect — TODO
 
-_Updated 2026-06-19. Volume + transport + sharing all built & largely VM-validated._
+_Updated 2026-06-20. Speakers add-on **0.12.0**, Control integration **0.7.1**. The engine roadmap
+(multi-room · naming · per-room settings · never-loud · push-state) and the Control feature set
+(search/browse/shuffle/repeat) are all built. What's left is on-device validation + a couple of
+polish items._
 
 ## ✅ Done (it works, end to end)
-**Speakers (add-on, 0.7.0):** HomePod picker (no-typing, `AirPlay 2` fix), test-sound, stable
-device-id, mDNS interface restriction, go-librespot watchdog. **Bidirectional volume sync**
-(Spotify/HA ⇄ HomePod buttons, per-output). **Transport sync** (play/pause, flicker-free,
-rapid-tap-safe via confirm-tracking). **initialVolumeCap** (never full blast). **Grace-release**
-("deling": configurable `grace_minutes`, reclaim on resume, + manual "⏏ Release" button).
-**Stop button** (`/api/stop`, account-agnostic local pause). **HomePod-name forwarding**
-(auto-name the speaker; ghost-free). **Picker now-playing/released/idle** line.
-**Control (integration, 0.5.0):** media_player per Connect device (transport/volume/play/source),
-**shuffle**, **repeat**, **optimistic UI**, **search** (`SEARCH_MEDIA` → `/search`, ranked) and
-**profile browse** (Playlists/Top Artists/Top Tracks/Recently Played/Liked Songs) — HA Assist
-"spil X i køkkenet" works. (Profile browse needs a one-time re-auth for the extra scopes.)
+**Speakers (add-on, 0.12.0):** HomePod picker (no-typing, `AirPlay 2` fix), test-sound, stable
+device-id, mDNS interface restriction, go-librespot watchdog. **Multi-room** — N HomePods, each its
+own (go-librespot + OwnTone) pair; manager forks/supervises children; rooms.json + r0 legacy
+migration; Add / Remove / Rename / **⚙ per-room Settings** (grace + bitrate) in the panel, live with
+no restart. **Self-healing naming** — bound by stable OwnTone output id; an Apple-Home rename syncs
+the Connect device + HA entity automatically (unless the room name is pinned). **Bidirectional
+volume sync** (per-output) + **proactive never-loud cap** (re-armed per session, so even a second
+account's new session can't start loud). **Transport sync** (flicker-free, rapid-tap-safe).
+**Snappy skips** (`start_buffer_ms = 500`). **Push-state** (go-librespot `/events` websocket, stdlib
+client, with `/status` poll fallback + 3 s re-seed). **Grace-release** (configurable `grace_minutes`,
+reclaim on resume, + manual "⏏ Release"). **Stop button** (`/api/stop`, account-agnostic local pause).
+**Control (integration, 0.7.1):** media_player per Connect device (transport/volume/play/source),
+**shuffle**, **repeat**, **optimistic UI**, **search** (`SEARCH_MEDIA` → `/search`, popularity-ranked,
+incl. **audiobooks / shows / episodes**) and **profile browse** (Playlists / Top Artists / Top Tracks
+/ Recently Played / Liked Songs) — HA Assist "spil X i køkkenet" works. **One entity per HomePod**
+(the brief 0.7.0 local-speaker player was reverted in 0.7.1). (Profile browse needs a one-time re-auth
+for the extra scopes.)
 **Proven on the VM:** HA + Spotify app + HomePod all control & reflect. (Every "VM" bug was code.)
 
 ---
 
-## 🎯 Next — prioritized
+## 🎯 Next — what actually remains
 
-> **Build-ready, research-validated, parallel-agent decomposition:**
-> [`docs/BUILD-PLAN.md`](BUILD-PLAN.md) (companion integration · push-state · multi-room · snappy
-> skips). Multi-account deferred by request.
->
-> **Unified UX / install plan (2 parts, panel owns everything):**
-> [`docs/UX-PLAN.md`](UX-PLAN.md) — fold the companion media_player into Control (retire the 3rd
-> piece), panel-owns-all-setup, zero-typing naming. Assist: [`gemini-system-prompt.md`](gemini-system-prompt.md).
+> History / rationale: [`docs/BUILD-PLAN.md`](BUILD-PLAN.md) (the engine waves — now essentially
+> complete) and [`docs/UX-PLAN.md`](UX-PLAN.md) (the 2-part UX, panel-owns-everything). Assist prompt:
+> [`gemini-system-prompt.md`](gemini-system-prompt.md).
 
-### ✅ Multi-room ("Add speaker") — built (Speakers 0.9.0), needs on-device validation
-N HomePods, each its own (go-librespot + OwnTone) pair. Manager forks/supervises children; s6 audio
-services removed; rooms.json + r0 legacy migration; `/api/rooms` + `/api/discover` + Add-speaker
-panel. **Validate on the VM/Green** (process spawning / mDNS / two rooms) — see `GREEN-TESTING.md`.
+### On-device validation (the main open item)
+Multi-room ships as code but needs the VM/Green to prove process spawning, mDNS, and two rooms at
+once. Push-state likewise needs the real ws connect + event payloads confirmed (poll fallback keeps
+it working regardless). See [`GREEN-TESTING.md`](GREEN-TESTING.md) and [`TEST-CHECKLIST.md`](TEST-CHECKLIST.md).
 
-### ✅ HomePod name forwarding (done — Speakers 0.7.0)
-Empty `speaker_name` → speaker auto-names after the picked HomePod; live `device_name` update +
-go-librespot bounce; device id persisted independently (no ghost on rename).
-
-### ✅ Speaker as a HA media_player → voice "stop/release" (done — `podconnect_speakers` 0.1.0)
-NOT MQTT (HA has no MQTT media_player) — a companion custom integration wraps `/api/*` as a real
-`media_player` (+ Release button). "stop the kitchen" → `HassMediaPause` → `/api/stop`, account-
-agnostic. Distribution: installs manually for now (HACS = one integration per repo); a dedicated
-repo is the follow-up.
+### Track-change buffer-flush (Green-deferred)
+Unblocked by push-state's track-change signal (`metadata.uri`); still built + tuned on the wired
+Green to avoid underruns. Full spec in [`GREEN-TESTING.md`](GREEN-TESTING.md) §D.
 
 ### (Optional) Multi-account — likely SKIPPABLE → see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md)
-**Reality check:** multi-account *playback* already works for free (each person plays from their own
-Spotify app; different rooms = different accounts simultaneously). The deferred build (multiple
-Control entries) only adds **HA-level** visibility/control/automation across accounts — low value for
-a phone-first household. Build only if HA cross-account dashboards/voice-routing are wanted.
+**Reality check:** multi-account *playback* already works for free — each person plays from their own
+Spotify app, and because each room is its own go-librespot, **different people can play different
+music to different rooms at the same time, today, no extra setup.** The deferred build (multiple
+Control entries) only adds **HA-level** cross-account visibility/control/automation — low value for a
+phone-first household. Account-agnostic "stop the wife's music" is already solved by the panel **⏹
+Stop** (+ Siri). Build the rest only if HA cross-account dashboards/voice-routing are wanted.
 
-### P2 — Multi-account (old notes)
-One Control (HACS) config entry per family member (each its own Spotify OAuth). Control is already
-device-list-driven; multi-account = allow multiple config entries + per-entry coordinator. The
-"stop another account's playback" problem is **already solved at the speaker level** (Stop button +
-`/api/stop`, local pause — Speakers 0.7.0); per-account *play* control stays in each person's Control.
+### (Optional) Synchronized groups
+Multi-room = **independent** speakers, not synchronized groups. Playing the *same* music in sync
+across rooms is a separate, not-yet-built feature.
 
-### P2 — HA Assist + Areas (honest scope)
+### HA Assist + Areas (honest scope)
 Built-in media intents (pause/next/volume) work once the entity is exposed. Area assignment and
 Assist **aliases are user data in HA's registry** — set in the UI, not by integration code. The
 code lever we *do* have is HomePod-name-forwarding (done), so the entity self-names to its room and
@@ -65,12 +64,11 @@ code lever we *do* have is HomePod-name-forwarding (done), so the entity self-na
 ---
 
 ## 📋 Polish / quality
-- **Track-change buffer-flush** (next/skip latency): **build & test on the wired Green** — full
-  spec + acceptance criteria in [`docs/GREEN-TESTING.md`](GREEN-TESTING.md) §D.
-- ✅ **Configurable grace-release** (`grace_minutes`, Speakers 0.7.0).
-- ✅ **Picker now-playing / released / idle** line (Speakers 0.7.0). Remaining: a fuller visual polish.
-- ✅ `CHANGELOG.md` (both components). Keep batching releases → fewer HA store-cache dances.
-- `docs/CONTRACT.md` — the stable Speakers↔Control facade (so Control never binds to :3678/:3689).
+- ✅ **Configurable grace-release** + **per-room** grace/bitrate in the panel (Speakers 0.11.0).
+- ✅ **Picker now-playing / released / idle** line. Remaining: a fuller visual polish.
+- Keep batching releases → fewer HA store-cache dances; keep `CHANGELOG.md` current for both halves.
+- ~~`docs/CONTRACT.md` (Speakers↔Control facade)~~ — **moot.** Control and Speakers are fully
+  decoupled (the local-entity fold was reverted in 0.7.1), so there's no facade to stabilize.
 
 ## 🚫 Investigated dead-ends (don't re-attempt)
 - HomePod **double/triple-tap (next/prev)** — gesture doesn't reach OwnTone; pipe next = stop+clear.

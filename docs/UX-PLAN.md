@@ -24,11 +24,13 @@ No third thing. The companion `media_player` folds into Control (below).
 
 ## Workstreams
 
-### UX-1 — ✅ core DONE (Speakers 0.10.0): self-healing naming
+### UX-1 — ✅ DONE (Speakers 0.10.0 + 0.11.0): self-healing naming + per-room settings
 Bound to the HomePod by **stable OwnTone output id**, self-heals on rename → Apple-Home rename syncs
 the Connect device + HA entity automatically (unless the room name is user-pinned via the panel's
-✎ Rename). Migrated r0 self-populates its id. **UX-1b still to do:** per-room grace/bitrate in the
-panel + shrink the Configuration tab to advanced-only. (Original spec below.)
+✎ Rename). Migrated r0 self-populates its id. **UX-1b ✅ (0.11.0):** per-room grace + bitrate are now
+editable in the panel (⚙ Settings; empty = inherit the global default). The legacy config-tab options
+are kept as defaults/fallback (not yet shrunk to advanced-only — minor cosmetic follow-up).
+(Original spec below.)
 
 #### UX-1 — The panel becomes the single control surface (add-on)
 - The panel is the room manager: **list rooms**, **"Add speaker → pick HomePod"** (auto-named, zero
@@ -92,9 +94,10 @@ own playback via the Spotify entity. So: **two installs (add-on + Control), one 
 - Each step ships behind a version bump with the CHANGELOG/README/TODO updated (see memory:
   keep-docs-in-sync-on-release).
 
-## Sequencing
-1. **Assist fixes** (done — Control 0.6.0) — immediate value, zero risk.
-2. **UX-2 fold-into-Control** — retires the 3rd piece (biggest clarity win), Control-only change.
-3. **UX-1 panel consolidation** — add-on change (new image); per-room settings + shrink config tab.
-4. **UX-3 docs** — one Getting-started pass once 1–3 land.
-5. Then resume the engine roadmap (Wave 3 push-state; multi-account later).
+## Sequencing (all landed)
+1. ✅ **Assist fixes** (Control 0.6.0) — immediate value, zero risk.
+2. ✅ **UX-2** — resolved by *not* folding: the local entity was tried (0.7.0) and reverted (0.7.1).
+   Two installs, one entity per HomePod; account-agnostic Stop/Release stays in the add-on panel.
+3. ✅ **UX-1 panel consolidation** — self-healing naming (0.10.0) + per-room settings (0.11.0).
+4. ✅ **UX-3 docs** — `GETTING-STARTED.md` covers the two-part install.
+5. ✅ **Wave 3 push-state** (0.12.0). Remaining: on-device validation; multi-account later (optional).

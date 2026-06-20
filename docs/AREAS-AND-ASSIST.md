@@ -12,18 +12,19 @@ the Speakers add-on names the speaker, and the Control integration exposes it to
 
 ## 1. Speakers side — name the speaker after its room
 
-PodConnect Speakers **0.7.0** auto-names the Connect speaker after the HomePod you pick
-(HomePod-name forwarding):
+PodConnect Speakers auto-names each Connect speaker after the HomePod you pick, and **self-heals** on
+rename:
 
 1. Open the **PodConnect Speakers** panel in the HA sidebar.
-2. Leave the `speaker_name` option **empty** (Settings → Add-ons → PodConnect Speakers →
-   Configuration). Empty = auto-name mode.
-3. **Pick your HomePod** in the panel. The Connect device + the HA entity now take the HomePod's
-   name (e.g. *"Køkkenalrum"*).
+2. **Pick your HomePod** in the panel. The Connect device + the HA entity take the HomePod's name
+   (e.g. *"Køkkenalrum"*). No config-tab fields needed — the panel owns naming.
    - ⚠️ Picking briefly restarts go-librespot, so the Connect device disappears/reappears in the
-     Spotify app once. The device **id is stable** (persisted independently of the name), so this
-     renames in place — no duplicate "ghost" device.
-   - Prefer a custom name? Set `speaker_name` instead; it wins over auto-naming.
+     Spotify app once. The room is bound by a **stable OwnTone output id**, so this renames in place —
+     no duplicate "ghost" device.
+   - **Rename in Apple Home and it follows automatically** — the selection loop self-heals the Connect
+     device + HA entity to the new name.
+   - Prefer a fixed custom name? Use the panel's **✎ Rename** — it pins a name the auto-sync won't
+     overwrite.
 
 This is the only part that needs the add-on: it makes the entity *self-describe* its room, which is
 what makes the next step (Area + `suggested_area`) sensible.
@@ -63,11 +64,11 @@ satellite's area.
 
 ## Honest limitations (so expectations match reality)
 
-- **Stopping *another account's* music by voice is not wired yet.** The built-in media intents
-  control **your** Spotify session (via Control / the Web API), which can't touch a family member's
-  playback. To stop whoever is playing, use the panel **"⏹ Stop"** button (account-agnostic, local).
-  The planned best-practice fix is to expose each physical speaker as a **`media_player` via MQTT
-  discovery** from the add-on, so *"stop the kitchen"* hits a local, account-agnostic pause — see
-  `docs/TODO.md` (P1). Until then: voice = your session; panel = anyone's.
+- **Stopping *another account's* music** is done from the **add-on panel** (or Siri), not a HA voice
+  entity. The built-in media intents control **your** Spotify session (via Control / the Web API),
+  which can't touch a family member's playback — so "stop music" in Assist pauses *your own* session.
+  To stop whoever is playing, use the panel **"⏹ Stop"** button (account-agnostic, local) or "Hey
+  Siri, stop". (An earlier plan to expose a local-speaker `media_player` for voice-stop was tried and
+  **reverted** — it duplicated entities; the panel + Siri are the intended path. See `MULTI-ACCOUNT.md`.)
 - **Area assignment + aliases are manual** (HA UI), by design. The add-on's job is to name the
   speaker well; HA owns rooms and exposure.

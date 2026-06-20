@@ -11,11 +11,12 @@ the Spotify app as a Connect device. Playback can start **from the Spotify app o
 Assist** (voice/automation), and **volume stays in sync** across the Spotify app, Home
 Assistant, and the HomePod.
 
-> **Status (2026-06): this document is the target roadmap.** Built today: the single-HomePod
-> add-on (**PodConnect Speakers** 0.1.4) and the control integration (**PodConnect Control**
-> 0.1.2 — Spotify control of all your Connect devices, polling-based). The multi-room manager,
-> the "Add speaker" Ingress UI, push state, and HomePod volume sync described below are **not
-> yet built**. See `docs/control-plan.md` for the integration's current status.
+> **Status (2026-06-20): the architecture below is now BUILT.** Shipped: the **multi-room manager**
+> (forks/supervises one go-librespot + OwnTone pair per HomePod), the **"Add speaker" panel** (live
+> mDNS picker, add/rename/remove, per-room settings), **bidirectional volume sync**, and **push-state**
+> (go-librespot `/events`) — Speakers add-on **0.12.0**. The **PodConnect Control** integration
+> (**0.7.1**) controls all your Connect devices (Web-API, polling). Remaining: on-device validation +
+> the track-change buffer-flush (Green-deferred). See `docs/control-plan.md` and `docs/TODO.md`.
 
 ## Architecture
 
@@ -102,9 +103,11 @@ podconnect/                          # the HA add-on "PodConnect Speakers" (sing
   config.yaml                        # manifest: image, host_network, options, watchdog
   build.yaml                         # base image per arch (Debian)
   Dockerfile                         # builds OwnTone (from source) + go-librespot into one image
-  rootfs/etc/s6-overlay/             # s6 services: dbus, avahi, go-librespot, owntone, select-homepod
+  rootfs/etc/s6-overlay/             # s6 services: dbus, avahi, init-podconnect, manager
+                                     #   (the manager now forks/supervises per-room go-librespot+OwnTone;
+                                     #    the old per-engine s6 services were removed in 0.9.0)
   DOCS.md
-  (later) manager/                   # Go: mDNS discovery, speaker CRUD, lifecycle, volume relay, Ingress UI
+  manager/                           # Go: mDNS discovery, room CRUD, lifecycle, volume relay, push-state, panel
 ```
 
 ## Build phases

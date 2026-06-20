@@ -294,24 +294,6 @@ func (s *roomStore) setHomePodBinding(id, homepodID, homepodName string) {
 	}
 }
 
-// setHomePod persists a room's chosen HomePod name only (legacy name-only pick). Kept for callers
-// that don't have an id to hand; the next selection tick self-populates HomepodID.
-func (s *roomStore) setHomePod(id, homepod string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rf, err := s.loadLocked()
-	if err != nil {
-		return
-	}
-	for _, r := range rf.Rooms {
-		if r.ID == id {
-			r.HomepodName = strings.TrimSpace(homepod)
-			_ = s.saveLocked(rf)
-			return
-		}
-	}
-}
-
 // setName persists a room's display name (used by r0 auto-naming after the picked HomePod). Does NOT
 // set NameManual — this is the automatic path.
 func (s *roomStore) setName(id, name string) {

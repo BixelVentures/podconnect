@@ -6,9 +6,10 @@ volume — using **the user's own Spotify Developer app**. No SpotifyPlus, no HA
 integration, no MQTT. PodConnect owns the whole experience.
 
 ## Two parts of PodConnect
-- **Add-on** (exists): `go-librespot` + `OwnTone` per HomePod = Spotify Connect speakers + AirPlay 2.
-- **PodConnect integration** (new, `custom_components/podconnect/`, distributed via **HACS custom repo**):
-  OAuth + Spotify Web API control + `media_player` entities + media browsing.
+- **Add-on** (PodConnect Speakers): `go-librespot` + `OwnTone` per HomePod = multi-room Spotify
+  Connect speakers + AirPlay 2, with a panel that owns all speaker setup.
+- **PodConnect Control** integration (`custom_components/podconnect/`, distributed via **HACS custom
+  repo**): OAuth + Spotify Web API control + `media_player` entities + search/browse.
 
 ## Status (current)
 _Versions live in [`../CHANGELOG.md`](../CHANGELOG.md); this tracks what's built vs pending._
@@ -19,14 +20,20 @@ _Versions live in [`../CHANGELOG.md`](../CHANGELOG.md); this tracks what's built
   output, initial-volume cap); **transport sync** (play/pause, flicker-free, rapid-tap-safe); **sharing**
   (account-agnostic **Stop**, **Release**, configurable grace-release, auto-reclaim); **HomePod-name
   forwarding** (auto-name + ghost-free stable id); test tone; watchdog.
-- **PodConnect Control** integration — Application-Credentials OAuth (own dev app); device-list-driven
-  `media_player` per Connect device; play/pause/next/prev/seek/volume/**shuffle/repeat** + now-playing,
-  **optimistic UI**; **"Connect to a device"** transfer; **search + browse** (playlists, Top Artists/Tracks,
-  Recently Played, Liked Songs) so Assist can pick music; graceful "restriction" handling.
-  **State is Web-API polling (~10s)** — the "push-first" design below is the *target*, not yet built.
+- **PodConnect Control** integration (0.7.1) — Application-Credentials OAuth (own dev app);
+  device-list-driven `media_player` per Connect device; play/pause/next/prev/seek/volume/**shuffle/
+  repeat** + now-playing, **optimistic UI**; **"Connect to a device"** transfer; **search** (incl.
+  audiobooks/shows/episodes, popularity-ranked) **+ browse** (playlists, Top Artists/Tracks, Recently
+  Played, Liked Songs) so Assist can pick music; graceful "restriction" handling. **One entity per
+  HomePod** (the brief 0.7.0 local-speaker player was reverted in 0.7.1). **Control's own state is
+  Web-API polling (~10s)** and stays so — see the note below.
+- **Multi-room** ("Add speaker" UI + manager) and **push-state** (go-librespot `/events`) **shipped in
+  the add-on** (Speakers 0.9.0 / 0.12.0). Push-state lives in the add-on's go-librespot↔OwnTone
+  bridge; it makes the *speaker* react instantly, but it does not change how Control polls the cloud.
 
-**Not yet built:** go-librespot push state (still polling); voice stop/release via MQTT `media_player`;
-multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5); track-change buffer-flush (tune on Green).
+**Not yet built:** multi-account (Phase 4, optional); track-change buffer-flush (tune on Green).
+**Decoupled by design:** Control and Speakers are fully independent — there is no Speakers↔Control
+facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTRACT.md` idea is moot.
 
 ## Account model (Family plan)
 - Spotify **Web API is per-account**; a Family plan = separate independent accounts.
@@ -45,13 +52,16 @@ multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5); track-change buf
 - **PodConnect HomePods = first-class managed `media_player` entities** (+ AirPlay volume relay).
 - **Other Connect devices** (MacBook, phone, …) = available **playback targets** → "find Connect in HA" free.
 
-## State updates (TARGET design — today it polls; push not yet built)
-- **HomePods → go-librespot `/events` websocket (push):** real-time now-playing / play-pause / volume /
-  position; **zero Web-API quota**. HA extrapolates the progress bar from position+timestamp.
-- **Foreign devices → light Web-API polling:** one `DataUpdateCoordinator` per account (poll once, fan
-  out), ~10s active / ~30s idle.
+## State updates
+- **Inside the add-on (✅ shipped, Speakers 0.12.0):** the go-librespot↔OwnTone **bridge** consumes
+  go-librespot's `/events` websocket (with a `/status` poll fallback + 3 s re-seed) so the *speaker*
+  reacts to volume/transport/track changes in real time, at zero Web-API quota.
+- **Control's HA entities (today):** one `DataUpdateCoordinator` per account, **light Web-API polling
+  ~10s** active. This is intentionally kept — Control is the cloud controller; its optimistic UI makes
+  commands feel instant, and polling keeps it comfortably inside **dev-mode** rate limits.
 - **Commands (play/pause/next/volume/transfer/browse) → Web API:** occasional, uniform, cloud-consistent.
-- Rationale: keeps us comfortably inside **dev-mode** rate limits and gives instant UI.
+- (A future enhancement could let Control read the add-on's pushed state for HomePod entities, but it's
+  not built — and not required: the add-on already reacts instantly on its own.)
 
 ## Volume (✅ built — `external_volume: true` + bidirectional relay)
 - go-librespot `external_volume: true` (no PCM scaling). The **manager** (in the add-on) reconciles
@@ -65,13 +75,17 @@ multi-account (Phase 4); multi-room "Add speaker" UI (Phase 5); track-change buf
 1. **Integration core — ✅ done:** Application-Credentials OAuth (primary account); Web API client;
    device-list-driven `media_player`s; play/pause/next/prev/seek/volume/shuffle/repeat + now-playing +
    "Connect to a device" transfer + optimistic UI. **`external_volume: true` + the volume relay — ✅ done.**
-   **Still pending:** push state (go-librespot events) — still ~10s polling.
+   Control's own state stays ~10s Web-API polling (by design; push-state shipped in the add-on bridge).
 2. **Browse & play — ✅ done:** `browse_media` (playlists + Top Artists/Tracks/Recently/Liked) + `search_media`
-   + `play_media`.
+   (incl. audiobooks/shows/episodes, popularity-ranked) + `play_media`.
 3. **HA Assist — ✅ works:** entities exposed → voice transport/volume + search-and-play. Area/alias setup is
-   user-side (documented in `AREAS-AND-ASSIST.md`). Account-agnostic voice stop/release via MQTT = pending.
-4. **Multi-account:** per-family-member config entries; explicit "from <device/account>" routing. *(pending)*
-5. **Multi-room "Add speaker" UI + manager.** *(pending)*
+   user-side (documented in `AREAS-AND-ASSIST.md`). Account-agnostic stop/release lives in the **add-on
+   panel** (+ Siri) — no extra HA entity (the local-entity attempt was reverted in 0.7.1).
+4. **Multi-account *(optional, deferred)*:** per-family-member config entries; explicit "from
+   <device/account>" routing. Multi-account *playback* already works via Spotify Connect — see
+   `MULTI-ACCOUNT.md`.
+5. **Multi-room "Add speaker" UI + manager — ✅ done in the add-on** (Speakers 0.9.0+); needs on-device
+   validation.
 
 ## Repo / distribution
 ```

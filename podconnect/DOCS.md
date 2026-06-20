@@ -1,11 +1,10 @@
 # PodConnect Speakers — install on Home Assistant
 
-This add-on makes **one HomePod** appear as a **Spotify Connect speaker**, running on your
-Home Assistant Green. It's the first proof that the full PodConnect idea works on your
-hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
-[`docs/PLAN.md`](../docs/PLAN.md).)
+This add-on makes your Apple **HomePods** appear as **Spotify Connect speakers**, running on your
+Home Assistant Green. It's **multi-room** — add several HomePods from the sidebar panel, each its own
+independent Connect speaker.
 
-**You need:** Spotify **Premium**, and the HomePod on the same network as the Green.
+**You need:** Spotify **Premium**, and the HomePod(s) on the same network as the Green.
 
 ## 1. Add the repository
 
@@ -18,57 +17,69 @@ hardware. (Multi-room + the "Add speaker / pick HomePod" UI come later — see
 1. Refresh the store → open **PodConnect Speakers** → **INSTALL**.
 2. It **downloads a ready-made image** for your Green — no on-device build.
 
-## 3. Configure
-
-| Option | What to put |
-|---|---|
-| `speaker_name` | The name shown in Spotify, e.g. `Kitchen`. **Leave blank to auto-name** the speaker after the HomePod you pick in the panel. |
-| `homepod_name` | *(optional fallback)* **Leave blank** and use the **PodConnect panel** instead (see below) — it lets you **pick** the HomePod from a live list, no typing. If you'd rather type, set the Apple **Home** name (case-insensitive). |
-| `bitrate` | `320` |
-| `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface |
-| `grace_minutes` | How long to hold the HomePod after playback stops before freeing it for other apps (default `3`; `0` = free as soon as idle). |
-
-Save.
-
-### Pick your HomePod — no typing (recommended)
+## 3. Set up your HomePods in the panel (no typing — this is the main way)
 
 After starting the add-on, a **PodConnect Speakers** item appears in the Home Assistant **sidebar**.
-Open it to see a **live network scan** of every AirPlay device found (the same scan Spotify Connect
-uses) — just **click your HomePod and Save**. Your choice is remembered across restarts and
-overrides the `homepod_name` box. (The panel is also reachable directly at `http://<your-HA-IP>:8099`.)
+**The panel owns all speaker setup** — you normally never touch the Configuration tab.
 
-The panel also has:
-- **🔊 Play test sound** — sends a soft tone straight to the HomePod (proves the AirPlay path, no
-  Spotify needed).
-- **⏹ Stop music** — pauses whatever is playing, *regardless of which account* — without giving the
+Open the panel to see a **live network scan** of every AirPlay device found (the same scan Spotify
+Connect uses). From here you:
+
+- **Pick the primary HomePod** → **Save**. The speaker **auto-names itself** after the HomePod (e.g.
+  "Køkkenalrum HomePod").
+- **+ Add speaker** → pick another HomePod → it becomes its own Connect speaker, live, **no restart**.
+- Per room: **🔊 Test** (a soft tone — proves the AirPlay path, no Spotify needed), **✎ Rename** (pins
+  a custom name the auto-sync won't overwrite), **Remove**, and **⚙ Settings** (per-room **grace** +
+  **bitrate**; empty = inherit the global default).
+- **⏹ Stop music** — pauses whatever is playing, *regardless of which account*, without giving the
   HomePod away.
-- **⏏ Release HomePod** — frees the HomePod so another AirPlay app (Mofibo, Apple Music…) can use
-  it; press play in Spotify to take it back.
-- A **now-playing / released / idle** status line.
+- **⏏ Release HomePod** — frees the HomePod so another AirPlay app (Mofibo, Apple Music…) can use it;
+  press play in Spotify to take it back.
+- A **now-playing / released / idle** status line per room.
 
-## 4. Start & test
+**Self-healing naming:** a room is bound to its HomePod by a stable id, so **renaming the HomePod in
+Apple Home syncs everywhere automatically** (Connect device + HA entity) — no re-pick needed (unless
+you pinned a custom name with ✎ Rename).
 
-1. **Start** the add-on → open the **Log** tab.
-2. Watch for `Selected HomePod '…'` (it found and locked onto your HomePod).
-   - Stuck on `Waiting for HomePod '…'`? The `homepod_name` doesn't match exactly, or the
-     HomePod is on a different network/VLAN than the Green.
+Your choices persist across restarts (`rooms.json`). The panel is also reachable directly at
+`http://<your-HA-IP>:8099`.
+
+## 4. (Advanced) Configuration tab options
+
+You normally don't need these — the panel covers everything. The tab keeps a few global defaults/
+fallbacks:
+
+| Option | What it does |
+|---|---|
+| `speaker_name` / `homepod_name` | Legacy single-room seeds (migrated into `rooms.json` on first boot). An explicit panel pick wins; only ✎ **Rename** pins a custom name. |
+| `bitrate` | **Default** bitrate (`320`); a per-room ⚙ Settings value overrides it. |
+| `grace_minutes` | **Default** hold time before freeing an idle HomePod (`3`; `0` = free as soon as idle); per-room ⚙ Settings overrides it. |
+| `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface. |
+
+## 5. Test it
+
+1. Open the **Log** tab and watch for `Selected HomePod '…'` (it locked onto the HomePod you picked).
    - `… needs AirPlay verification`? In the Apple **Home** app, set this HomePod's
      **"Allow Speaker & Display Access"** to **"Anyone on the Same Network"**.
-3. Open **Spotify** (Premium) → **Connect to a device** → choose your **`speaker_name`** → **Play**.
-4. 🎉 Audio plays on the HomePod; the Spotify volume slider changes the volume.
+   - Nothing found? The HomePod may be on a different network/VLAN than the Green.
+2. Open **Spotify** (Premium) → **Connect to a device** → choose the speaker (named after its
+   HomePod) → **Play**.
+3. 🎉 Audio plays on the HomePod; the Spotify volume slider changes the volume.
 
 ## How it works
 
-Spotify Connect → go-librespot → pipe → OwnTone → AirPlay 2 → HomePod, all inside this
-add-on, with the HomePod auto-selected by name. It uses standard **Spotify Connect** (no
-Spotify developer keys needed) and does **not** use the Apple TV integration. Credentials
-are saved, so the speaker stays paired across restarts.
+For **each room**, the manager forks & supervises its own pair:
+Spotify Connect → go-librespot → pipe → OwnTone → AirPlay 2 → HomePod — all inside this add-on, with
+the HomePod bound by a stable id. It uses standard **Spotify Connect** (no Spotify developer keys
+needed) and does **not** use the Apple TV integration. Credentials + room config are saved, so
+speakers stay paired across restarts.
 
 ## Troubleshooting
 
 - **Install can't pull the image** → the GHCR package must be **public**:
   github.com/BixelVentures → **Packages** → `aarch64-podconnect` → **Package settings** →
   **Change visibility → Public**.
-- **"Waiting for HomePod…" forever** → wrong `homepod_name`, or HomePod on a different network.
+- **HomePod not in the panel's scan** → on a different network/VLAN than the Green, or AirPlay access
+  isn't "Anyone on the Same Network" (Apple Home app).
 - **Speaker missing in Spotify** → add-on started? Spotify Premium? Same network? Check the Log.
 - **Selected but no sound** → check the Log for `go-librespot` / `owntone` errors and share them.

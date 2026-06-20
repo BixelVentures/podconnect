@@ -1,4 +1,10 @@
-# PodConnect — build-ready plan (next wave)
+# PodConnect — build-ready plan (engine waves)
+
+> **Status (2026-06-20): the wave plan is essentially COMPLETE.** Wave 1 (companion + snappy skips),
+> Wave 2 (multi-room), and **Wave 3 (push-state)** all shipped. The companion integration (WS-A) was
+> later **retired** — the local-speaker entity it provided was folded into Control, then reverted, so
+> account-agnostic stop/release lives only in the add-on panel. This doc is kept as history /
+> rationale; the live remaining work is in [`TODO.md`](TODO.md) (on-device validation, buffer-flush).
 
 _Research-validated, decomposed for parallel agents. **Multi-account is deliberately out of scope**
 (deferred). Every design decision below is backed by source-cited research (HA core, go-librespot,
@@ -27,7 +33,11 @@ OwnTone) — the citations live in the workstream notes._
 
 ## Workstreams
 
-### WS-A — `podconnect_speakers` companion integration (account-agnostic voice)
+### WS-A — `podconnect_speakers` companion integration (account-agnostic voice) — ⚠️ RETIRED
+> **Outcome:** shipped as 0.1.0, then **retired.** Decision: never show two media_players per HomePod.
+> The local-speaker entity was folded into Control (0.7.0) and then **reverted (0.7.1)**. Account-
+> agnostic Stop/Release lives **only in the add-on panel** (+ Siri). Kept below for history.
+
 **Goal:** "stop / pause the kitchen" (any account) + speaker play/idle/released state + volume, by
 voice and on dashboards, in the right Area.
 
@@ -155,27 +165,34 @@ isolated additions.
 
 ## Parallel execution map
 
-> **Wave 1 ✅ DONE** — WS-A (`podconnect_speakers` 0.1.0) + WS-D1 (start_buffer_ms=500) + WS-D2
-> (`/api/play`, `/api/volume`, `volume` in state) shipped as Speakers add-on **0.8.0** + the new
-> companion integration. Distribution caveat: HACS = one integration per repo, so
-> `podconnect_speakers` installs manually for now (a dedicated repo is the follow-up).
+> **Wave 1 ✅ DONE** — WS-D1 (start_buffer_ms=500) + WS-D2 (`/api/play`, `/api/volume`, `volume` in
+> state) shipped as Speakers add-on **0.8.0**. WS-A (`podconnect_speakers` 0.1.0) also shipped but was
+> **later retired** — its account-agnostic media_player was folded into Control then reverted (0.7.1);
+> Stop/Release now lives only in the add-on panel + Siri.
 >
 > **Wave 2 ✅ DONE (code) — WS-C multi-room shipped as Speakers add-on 0.9.0.** Manager forks/
 > supervises children; s6 audio services removed; rooms.json + migration (r0 legacy back-compat);
-> `/api/rooms` + `/api/discover` + Add-speaker panel. **Needs on-device validation** (process
-> spawning / mDNS / two rooms). **Next: Wave 3 (WS-B push-state) — after the Green validates 0.9.0.**
+> `/api/rooms` + `/api/discover` + Add-speaker panel. (On-device validation still pending.) Polished
+> further in 0.10–0.11 (self-healing naming, per-room settings, never-loud).
+>
+> **Wave 3 ✅ DONE — WS-B push-state shipped as Speakers add-on 0.12.0.** The bridge consumes
+> go-librespot's `/events` websocket (stdlib RFC 6455 client) instead of per-200 ms `/status` polling,
+> with a `/status` seed on connect, a poll **fallback** on any ws error, and a 3 s re-seed. It also
+> lays the **track-change signal** (`metadata.uri`) that the still-deferred buffer-flush (WS-D1b)
+> will consume. On-device: confirm the real ws connect + payload shapes on the VM.
 
 ```
-Wave 1 (fully parallel — disjoint files)   ✅ done
-├─ Agent 1 ▶ WS-A  custom_components/podconnect_speakers/**         (new dir, zero manager overlap)
-└─ Agent 2 ▶ WS-D1 owntone.conf start_buffer_ms=500                 (config render only)
+Wave 1 ✅ done
+├─ WS-A  podconnect_speakers companion media_player   (later retired — see status note above)
+└─ WS-D1 owntone.conf start_buffer_ms=500             (config render only)
 
-Wave 2 (the manager core — single owner to avoid main.go conflicts)
-└─ Agent 3 ▶ WS-C  multi-room refactor (rooms.go/supervisor.go/render.go/select.go + s6 prune + panel)
-              … folds in WS-D1 into render.go, and adds WS-D2 endpoints in the new HTTP section
+Wave 2 ✅ done  (the manager core)
+└─ WS-C  multi-room refactor (rooms.go/supervisor.go/render.go/select.go + s6 prune + panel)
+          … folds WS-D1 into render.go, adds WS-D2 endpoints in the new HTTP section
 
-Wave 3 (on top of the WS-C structure)
-└─ Agent 4 ▶ WS-B  push-state events.go + bridge consumes events; wire WS-D1b track-change→flush
+Wave 3 ✅ done  (on top of the WS-C structure)
+└─ WS-B  push-state events.go + bridge consumes events
+          (WS-D1b track-change→flush still Green-deferred — see GREEN-TESTING.md §D)
 ```
 
 **Why these waves:** WS-A and WS-D1 touch disjoint files from everything else → safe to run together
@@ -187,11 +204,12 @@ snappy skips (WS-D1) without touching the multi-room refactor at all.
 **Worktrees:** give Agent 3 (WS-C) its own git worktree (large refactor); Agents 1/2 can share since
 their paths are disjoint.
 
-## Release lines
-- WS-A → **PodConnect Speakers integration `podconnect_speakers` 0.1.0** (new HACS entry).
+## Release lines (as shipped)
+- WS-A → `podconnect_speakers` 0.1.0 — **later retired** (folded into Control then reverted in 0.7.1).
 - WS-D1 (+D2) → **Speakers add-on 0.8.0** (snappy skips + volume/resume API).
-- WS-C → **Speakers add-on 0.9.0** (multi-room).
-- WS-B → **Speakers add-on 0.10.0** (push-state).
+- WS-C → **Speakers add-on 0.9.0** (multi-room); polished in **0.10–0.11** (naming, per-room
+  settings, never-loud).
+- WS-B → **Speakers add-on 0.12.0** (push-state).
 - Update `CHANGELOG.md`, `README.md`, `docs/TODO.md`, `docs/control-plan.md` per release
   (see memory: keep-docs-in-sync-on-release).
 

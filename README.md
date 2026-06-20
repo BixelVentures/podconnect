@@ -13,12 +13,22 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 **PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`)
 - Turns a HomePod into a **Spotify Connect speaker**: `go-librespot` (Connect receiver) → a
   named pipe → `OwnTone` (AirPlay 2 sender) → HomePod.
-- **Pick your HomePod with no typing:** a sidebar panel shows a live network scan — click and save.
-  The speaker can **auto-name itself** after the HomePod you pick.
+- **Multi-room:** several HomePods, each its own independent Connect speaker. The sidebar **panel**
+  is the room manager — **Add / Remove / Rename** speakers and **⚙ per-room Settings**, all live with
+  no add-on restart. The manager forks & supervises each room's own (go-librespot + OwnTone) pair.
+- **Pick your HomePod with no typing:** the panel shows a live network scan — click and save. Each
+  speaker **auto-names itself** after its HomePod.
+- **Self-healing naming:** a room is bound to its HomePod by a stable id, so renaming the HomePod in
+  Apple Home **syncs everywhere automatically** (Connect device + HA entity) — no re-pick.
+- **Per-room grace + bitrate** in the panel (empty = inherit the global add-on default).
 - **Bidirectional volume sync** — the Spotify/HA slider and the HomePod's hardware buttons move
-  together (per-output AirPlay level), and a fresh session never starts at full blast.
+  together (per-output AirPlay level), and **no fresh session can start at full blast** (the cap is
+  proactive and re-armed per session, so even a second account's new session stays capped).
 - **Transport sync** — a Spotify pause stops the HomePod instantly (beating the AirPlay buffer);
   a HomePod top-tap pauses/resumes Spotify. Flicker-free, rapid-tap-safe.
+- **Snappy skips** (`start_buffer_ms = 500`) and **instant push-state** — the bridge reads
+  go-librespot's `/events` websocket (with a `/status` poll fallback), so volume/transport/track
+  changes register as they happen.
 - **Sharing ("deling"):** **⏹ Stop** pauses whoever is playing (any account, local); **⏏ Release**
   frees the HomePod for other AirPlay apps (Mofibo, Apple Music). Auto-release after an idle grace
   period, auto-reclaim on resume.
@@ -35,6 +45,8 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
   *Transfer Playback* handoff).
 - **Search + Browse** your Spotify in HA — search, Playlists, Top Artists, Top Tracks, Recently
   Played, Liked Songs — so **HA Assist can pick music** ("spil noget afslappende i køkkenet").
+  Search includes **audiobooks / shows / episodes** and breaks same-title ties by **popularity**.
+- **One entity per HomePod** (pure Spotify control — no duplicate local-speaker player).
 - State via the Spotify Web API, polled ~10s. Installed via **HACS** (custom repository).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what changed.
@@ -45,22 +57,23 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what
 - **Control (integration):** add this repo as a **HACS custom repository** (type: *Integration*)
   → install **PodConnect Control** → restart HA → **Settings → Devices & Services → Add
   Integration → PodConnect Control** → enter your Spotify Client ID/Secret and sign in.
-- **Rooms + voice:** see [`docs/AREAS-AND-ASSIST.md`](docs/AREAS-AND-ASSIST.md).
+- **Rooms + voice:** see [`docs/AREAS-AND-ASSIST.md`](docs/AREAS-AND-ASSIST.md) and the quick
+  [`docs/GETTING-STARTED.md`](docs/GETTING-STARTED.md).
 
-**Multi-room** (add-on 0.9.0): several HomePods, each its own speaker, added live from the panel
-("Add speaker → pick HomePod"); the manager forks & supervises each room's engine. _New — validate
-on hardware before relying on it._
-
-**Account-agnostic voice control** (`podconnect_speakers` companion integration): each physical
-speaker as a real `media_player` (+ Release button), so "stop the kitchen" works by voice
-regardless of whose Spotify is playing. (Install notes in `CHANGELOG.md`.)
+**Account-agnostic stop/release** lives in the **add-on panel** (⏹ Stop / ⏏ Release) and via Siri —
+they pause whoever is playing, regardless of which Spotify account owns the speaker. HA Assist's
+"stop music" / "pause the kitchen" already pauses *your own* session via the Spotify entity.
 
 ## Roadmap (planned — not yet built)
 
-- **Multi-account** (whole family): one Control config entry per person.
-- **Instant push state** for HomePods (live go-librespot events instead of ~10s polling).
-- Polish: multi-room on-device hardening; a dedicated repo so the companion integration installs via
-  HACS; picker visual refresh.
+- **On-device validation** of multi-room on real hardware (process spawning / mDNS / two rooms at
+  once) — the code ships; the Green is the proving ground.
+- **Track-change buffer-flush** (sub-second skips) — unblocked by push-state's track-change signal,
+  still tuned on the wired Green to avoid underruns.
+- **Multi-account** (optional): multi-account *playback* already works for free via Spotify Connect;
+  the deferred build only adds HA-level cross-account visibility/control. **Synchronized same-music
+  groups** across rooms are a separate, not-yet-built feature.
+- Picker visual polish.
 
 See [`docs/TODO.md`](docs/TODO.md) (living roadmap), [`docs/PLAN.md`](docs/PLAN.md) (architecture)
 and [`docs/control-plan.md`](docs/control-plan.md) (integration spec).
