@@ -433,10 +433,7 @@ func decideVolume(canon, gl int, glOk bool, ot int, otOk bool) (newCanon int, se
 	return canon, setGl, setOt
 }
 
-// decideTransport is the pure bidirectional play/pause reconcile. canon: -1 unknown, 0 paused,
-// 1 playing. Same canonical loop-protection as decideVolume — a HomePod top-tap (otPlaying change)
-// propagates to Spotify and vice-versa, without ping-pong. (For a binary value at most one side can
-// differ from canon at a time, so this is naturally conflict-free.)
+// b maps a bool to 1/0 — the canonical play(1)/pause(0) encoding the transport reconcile works in.
 func b(p bool) int {
 	if p {
 		return 1
@@ -1267,51 +1264,136 @@ const indexHTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PodConnect</title>
 <style>
-  :root { color-scheme: light dark; }
+  /* Theme tokens. color-scheme drives the native form controls; the explicit dark overrides below
+     keep the surfaces/borders/pills readable in both schemes (HA Ingress can be either). */
+  :root {
+    color-scheme: light dark;
+    --bg: transparent;
+    --fg: #1c1c1e;
+    --fg-dim: #6b6b70;
+    --card: rgba(255,255,255,.66);
+    --card-elev: 0 1px 2px rgba(0,0,0,.05), 0 1px 3px rgba(0,0,0,.04);
+    --border: rgba(120,120,128,.28);
+    --border-strong: rgba(120,120,128,.45);
+    --field: rgba(255,255,255,.5);
+    --accent: #0a84ff;
+    --accent-soft: rgba(10,132,255,.12);
+    --danger: #ff3b30;
+    --danger-soft: rgba(255,59,48,.12);
+    /* status palette */
+    --green: #1f9e57;   --green-bg: rgba(48,209,88,.16);
+    --grey: #6b6b70;    --grey-bg: rgba(120,120,128,.16);
+    --blue: #0a84ff;    --blue-bg: rgba(10,132,255,.14);
+    --amber: #b8730a;   --amber-bg: rgba(255,159,10,.18);
+    --red: #d93025;     --red-bg: rgba(255,59,48,.15);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f2f2f7;
+      --fg-dim: #9a9aa0;
+      --card: rgba(118,118,128,.12);
+      --card-elev: 0 1px 2px rgba(0,0,0,.25);
+      --border: rgba(120,120,128,.32);
+      --border-strong: rgba(120,120,128,.5);
+      --field: rgba(118,118,128,.16);
+      --accent-soft: rgba(10,132,255,.22);
+      --green: #4ade80;   --green-bg: rgba(48,209,88,.2);
+      --grey: #a0a0a6;    --grey-bg: rgba(120,120,128,.22);
+      --blue: #6cb6ff;    --blue-bg: rgba(10,132,255,.22);
+      --amber: #ffb340;   --amber-bg: rgba(255,159,10,.22);
+      --red: #ff6b60;     --red-bg: rgba(255,59,48,.22);
+    }
+  }
+
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         margin: 0; padding: 24px; color: #1c1c1e; background: transparent; }
-  @media (prefers-color-scheme: dark) { body { color: #f2f2f7; } }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+         margin: 0; padding: 20px 16px 40px; color: var(--fg); background: var(--bg);
+         -webkit-font-smoothing: antialiased; line-height: 1.45; }
   .wrap { max-width: 560px; margin: 0 auto; }
-  h1 { font-size: 1.35rem; margin: 0 0 4px; }
-  .sub { margin: 0 0 16px; opacity: .65; font-size: .9rem; }
-  .status { padding: 10px 14px; border-radius: 10px; font-size: .9rem; margin-bottom: 14px; }
-  .status.ok { background: rgba(48,209,88,.15); }
-  .status.warn { background: rgba(255,159,10,.15); }
-  .list { display: flex; flex-direction: column; gap: 8px; }
-  .row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 12px;
-         border: 1px solid rgba(120,120,128,.25); cursor: pointer; transition: border-color .15s; }
-  .row:hover { border-color: rgba(10,132,255,.6); }
-  .row.active { border-color: rgba(48,209,88,.7); }
-  .row input { width: 18px; height: 18px; accent-color: #0a84ff; }
-  .name { flex: 1; font-weight: 600; }
-  .badge { font-size: .72rem; padding: 3px 8px; border-radius: 999px; background: rgba(255,159,10,.2); }
-  .badge.live { background: rgba(48,209,88,.22); }
-  .actions { display: flex; gap: 10px; margin-top: 18px; }
-  button { font: inherit; font-weight: 600; padding: 11px 18px; border-radius: 10px; border: 0;
-           cursor: pointer; background: #0a84ff; color: #fff; }
-  button:disabled { opacity: .4; cursor: default; }
-  button.ghost { background: transparent; color: inherit; border: 1px solid rgba(120,120,128,.4); }
-  .hint { margin-top: 18px; font-size: .82rem; opacity: .6; line-height: 1.4; }
-  .section { margin-top: 28px; }
-  .section h2 { font-size: 1.05rem; margin: 0 0 10px; }
-  .room { padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(120,120,128,.25); margin-bottom: 10px; }
+
+  h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.01em; margin: 0 0 2px; }
+  .sub { margin: 0 0 8px; color: var(--fg-dim); font-size: .88rem; }
+
+  .section { margin-top: 30px; }
+  .section > h2 { font-size: .82rem; font-weight: 700; text-transform: uppercase;
+                  letter-spacing: .05em; color: var(--fg-dim); margin: 0 0 12px; }
+
+  /* Inline status banners (engine-up / now-playing / add-flow scan results). */
+  .status { padding: 11px 14px; border-radius: 12px; font-size: .88rem; margin-bottom: 14px;
+            background: var(--grey-bg); border: 1px solid transparent; color: var(--fg); }
+  .status.ok    { background: var(--green-bg); border-color: var(--green-bg); color: var(--fg); }
+  .status.warn  { background: var(--amber-bg); border-color: var(--amber-bg); color: var(--fg); }
+  .status.info  { background: var(--blue-bg);  border-color: var(--blue-bg);  color: var(--fg); }
+
+  .list { display: flex; flex-direction: column; gap: 10px; }
+
+  /* Speaker cards. */
+  .room { padding: 16px; border-radius: 16px; border: 1px solid var(--border);
+          background: var(--card); box-shadow: var(--card-elev); }
   .room .top { display: flex; align-items: center; gap: 10px; }
-  .room .rname { flex: 1; font-weight: 700; }
-  .room .meta { margin-top: 6px; font-size: .82rem; opacity: .7; }
-  .room .ctl { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-  .room button { padding: 8px 12px; font-size: .82rem; }
-  button.danger { background: transparent; color: #ff453a; border: 1px solid rgba(255,69,58,.5); }
-  .err { color: #ff453a; font-size: .82rem; margin-top: 8px; }
-  .settings { margin-top: 10px; padding: 12px; border-radius: 10px; border: 1px solid rgba(120,120,128,.25);
-              display: flex; flex-direction: column; gap: 10px; }
-  .settings .field { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .settings label { font-size: .82rem; font-weight: 600; min-width: 110px; }
-  .settings input[type=number], .settings select { font: inherit; padding: 6px 8px; border-radius: 8px;
-              border: 1px solid rgba(120,120,128,.4); background: transparent; color: inherit; }
-  .settings input[type=number] { width: 80px; }
-  .settings .shint { font-size: .76rem; opacity: .6; line-height: 1.35; }
+  .room .rname { flex: 1; font-weight: 700; font-size: 1.02rem; letter-spacing: -.01em;
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room .meta { margin-top: 5px; font-size: .82rem; color: var(--fg-dim); }
+  .room .meta .np { color: var(--accent); }
+  .room .ctl { display: flex; gap: 7px; margin-top: 13px; flex-wrap: wrap; }
+
+  /* Status pills (speaker state). One base + a color modifier per state. */
+  .pill { flex: none; font-size: .7rem; font-weight: 700; letter-spacing: .02em;
+          padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+          display: inline-flex; align-items: center; gap: 5px; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill-playing  { color: var(--green); background: var(--green-bg); }
+  .pill-idle     { color: var(--grey);  background: var(--grey-bg); }
+  .pill-released { color: var(--blue);  background: var(--blue-bg); }
+  .pill-starting { color: var(--amber); background: var(--amber-bg); }
+  .pill-auth     { color: var(--red);   background: var(--red-bg); }
+  .pill.plain::before { display: none; } /* small inline tags (needs-verification / playing here) */
+
+  /* Buttons. */
+  button { font: inherit; font-weight: 600; font-size: .9rem; padding: 10px 16px; border-radius: 10px;
+           border: 1px solid transparent; cursor: pointer; background: var(--accent); color: #fff;
+           transition: filter .12s, background .12s, border-color .12s; }
+  button:hover:not(:disabled) { filter: brightness(1.06); }
+  button:active:not(:disabled) { filter: brightness(.94); }
+  button:disabled { opacity: .42; cursor: default; }
+  button.ghost { background: transparent; color: var(--fg); border-color: var(--border-strong); }
+  button.ghost:hover:not(:disabled) { background: var(--grey-bg); filter: none; }
+  button.danger { background: transparent; color: var(--danger); border-color: var(--danger-soft); }
+  button.danger:hover:not(:disabled) { background: var(--danger-soft); filter: none; }
+  .room button, .ctl button { padding: 7px 12px; font-size: .8rem; border-radius: 9px; }
+
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .actions.stack button { flex: 1 1 auto; }
+
+  .hint { margin-top: 16px; font-size: .8rem; color: var(--fg-dim); line-height: 1.5; }
+  .err { color: var(--danger); font-size: .82rem; margin-top: 8px; }
+
+  /* HomePod picker rows (radio cards). */
+  .row { display: flex; align-items: center; gap: 12px; padding: 13px 15px; border-radius: 13px;
+         border: 1px solid var(--border); background: var(--card); cursor: pointer;
+         transition: border-color .14s, background .14s; }
+  .row:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .row:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .row.active { border-color: var(--green); }
+  .row input { width: 19px; height: 19px; accent-color: var(--accent); flex: none; margin: 0; }
+  .name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Per-room settings drawer. */
+  .settings { margin-top: 12px; padding: 14px; border-radius: 12px; border: 1px solid var(--border);
+              background: var(--grey-bg); display: flex; flex-direction: column; gap: 12px; }
+  .settings .field { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .settings label { font-size: .82rem; font-weight: 600; min-width: 104px; }
+  .settings input[type=number], .settings select { font: inherit; padding: 7px 9px; border-radius: 9px;
+              border: 1px solid var(--border-strong); background: var(--field); color: inherit; }
+  .settings input[type=number] { width: 84px; }
+  .settings .shint { font-size: .76rem; color: var(--fg-dim); line-height: 1.4; }
   .settings .srow { display: flex; gap: 8px; }
+
+  @media (max-width: 420px) {
+    body { padding: 16px 12px 36px; }
+    h1 { font-size: 1.28rem; }
+    .room button, .ctl button, .actions button { flex: 1 1 calc(50% - 4px); }
+  }
 </style>
 </head>
 <body>
@@ -1338,14 +1420,14 @@ const indexHTML = `<!doctype html>
 
   <div class="section">
     <h2>Primary speaker — pick its HomePod</h2>
-    <div id="status" class="status warn">Loading…</div>
     <div id="playstate" class="status" style="display:none"></div>
+    <div id="status" class="status warn">Loading…</div>
     <div id="list" class="list"></div>
     <div class="actions">
       <button id="save" disabled>Save selection</button>
       <button id="auto" class="ghost">Auto (clear choice)</button>
     </div>
-    <div class="actions">
+    <div class="actions stack">
       <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
       <button id="stop" class="ghost">⏹ Stop music (any account)</button>
       <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
@@ -1378,15 +1460,19 @@ async function loadRooms() {
     var top = document.createElement('div'); top.className = 'top';
     var nm = document.createElement('span'); nm.className = 'rname'; nm.textContent = rm.name;
     top.appendChild(nm);
-    var badge = document.createElement('span'); badge.className = 'badge';
-    if (rm.released) { badge.textContent = 'released'; }
-    else if (rm.playing) { badge.className = 'badge live'; badge.textContent = 'playing'; }
-    else if (rm.owntone_up) { badge.textContent = 'idle'; }
-    else { badge.textContent = 'starting…'; }
+    var badge = document.createElement('span'); badge.className = 'pill';
+    if (rm.released) { badge.classList.add('pill-released'); badge.textContent = 'released'; }
+    else if (rm.playing) { badge.classList.add('pill-playing'); badge.textContent = 'playing'; }
+    else if (rm.owntone_up) { badge.classList.add('pill-idle'); badge.textContent = 'idle'; }
+    else { badge.classList.add('pill-starting'); badge.textContent = 'starting…'; }
     top.appendChild(badge);
     box.appendChild(top);
     var meta = document.createElement('div'); meta.className = 'meta';
-    meta.textContent = 'HomePod: ' + (rm.homepod_name || '(auto)') + (rm.now_playing ? ('  •  ' + rm.now_playing) : '');
+    meta.appendChild(document.createTextNode('HomePod: ' + (rm.homepod_name || '(auto)')));
+    if (rm.now_playing) {
+      var np = document.createElement('span'); np.className = 'np'; np.textContent = '  •  ' + rm.now_playing;
+      meta.appendChild(np);
+    }
     box.appendChild(meta);
     var ctl = document.createElement('div'); ctl.className = 'ctl';
     var t = document.createElement('button'); t.className = 'ghost'; t.textContent = '🔊 Test';
@@ -1482,7 +1568,7 @@ async function loadDiscover() {
     rb.onchange = function () { addChosen = d.name; addChosenId = d.id; document.getElementById('addsave').disabled = false; };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
-    if (d.needs_auth) { var b = document.createElement('span'); b.className = 'badge'; b.textContent = 'needs verification'; row.appendChild(b); }
+    if (d.needs_auth) { var b = document.createElement('span'); b.className = 'pill plain pill-auth'; b.textContent = 'needs verification'; row.appendChild(b); }
     list.appendChild(row);
   });
 }
@@ -1520,7 +1606,7 @@ async function load() {
   var ps = document.getElementById('playstate');
   if (s.released) {
     ps.textContent = '⏏ Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
-    ps.className = 'status warn'; ps.style.display = '';
+    ps.className = 'status info'; ps.style.display = '';
   } else if (s.playing) {
     ps.textContent = s.now_playing ? ('▶ Playing: ' + s.now_playing) : '▶ Playing';
     ps.className = 'status ok'; ps.style.display = '';
@@ -1546,8 +1632,8 @@ async function load() {
     rb.onchange = function () { chosen = d.name; document.getElementById('save').disabled = false; };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
-    if (d.needs_auth) { var b = document.createElement('span'); b.className = 'badge'; b.textContent = 'needs verification'; row.appendChild(b); }
-    if (d.selected) { var p = document.createElement('span'); p.className = 'badge live'; p.textContent = 'playing here'; row.appendChild(p); }
+    if (d.needs_auth) { var b = document.createElement('span'); b.className = 'pill plain pill-auth'; b.textContent = 'needs verification'; row.appendChild(b); }
+    if (d.selected) { var p = document.createElement('span'); p.className = 'pill pill-playing'; p.textContent = 'playing here'; row.appendChild(p); }
     list.appendChild(row);
   });
 }

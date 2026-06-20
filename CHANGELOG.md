@@ -67,6 +67,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.13.0 — 2026-06-20  (cleanup + panel redesign)
+- **Panel redesign (Ingress).** The "pick a HomePod" sidebar panel is rebuilt for a clean,
+  Home-Assistant-native look — all functionality and behavior unchanged. Card-based speaker list
+  with subtle borders/elevation and a clearer name → "HomePod: …" hierarchy; **color-coded status
+  pills** (playing → green, idle → grey, released → blue, starting… → amber, needs-verification →
+  red) that read correctly in light *and* dark; consistent primary / ghost / destructive button
+  styling; selectable HomePod picker rows with a "playing here" indicator; a tidier per-room
+  ⚙ Settings drawer; and a responsive layout that holds up in a narrow (~360px) Ingress pane. Still
+  a single self-contained HTML string — no external fonts/CSS/JS/images, system font stack only.
+- **Dead-code removal.** Dropped the unused `roomStore.setHomePod` (the name-only store setter
+  superseded by `setHomePodBinding` / `setName` / `setNameManual` — no callers anywhere) and a stale
+  refactor-leftover comment. No behavior change; all tests still pass.
+
 ## Speakers 0.12.0 — 2026-06-20  (Wave 3: push-state)
 - **go-librespot `/events` websocket instead of per-200ms `/status` polling** in the bridge — cuts
   the multi-room polling churn ~15x and reacts to volume/transport/track changes as they happen.
