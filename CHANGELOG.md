@@ -67,6 +67,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.12.0 — 2026-06-20  (Wave 3: push-state)
+- **go-librespot `/events` websocket instead of per-200ms `/status` polling** in the bridge — cuts
+  the multi-room polling churn ~15x and reacts to volume/transport/track changes as they happen.
+  Implemented as a **minimal stdlib RFC 6455 client** (no new dependency).
+- **Safe + additive:** `/status` seeds on every (re)connect; on any ws error it **falls back to
+  polling**; and a **/status re-seed every ~3s while connected** bounds staleness if go-librespot's
+  event payloads ever differ from what we map. The bridge's reconcilers + the "never start loud"
+  volume cap are unchanged — only the per-tick state SOURCE moved to in-memory pushed state.
+- Lays the **track-change signal** (metadata.uri) for the future buffer-flush. New unit tests:
+  event→state mapping, ws frame parser, RFC accept-key vector.
+- ⚠️ **On-device:** verify the real ws connect + event payload shapes on the VM (the poll fallback +
+  3s re-seed keep it working regardless, but confirm the fast-path actually fires).
+
 ## Speakers 0.11.1 — 2026-06-19  (never-loud safety fix)
 - **A fresh session can no longer start at full blast.** The volume cap was a one-time-per-boot flag,
   so a *second* account's new session (e.g. a family member's Spotify, with a remembered 100%) slipped

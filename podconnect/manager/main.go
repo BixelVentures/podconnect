@@ -544,7 +544,7 @@ func reclaimHomePod(room *Room) {
 // Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
 // from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
 // while THIS room's test tone plays. Per-room. Uses only verified APIs.
-func roomBridge(room *Room, tone *boolFlag) {
+func roomBridge(room *Room, tone *boolFlag, live *glLive) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // re-cap EVERY fresh session (the old once-per-boot flag let a 2nd account through)
@@ -563,7 +563,10 @@ func roomBridge(room *Room, tone *boolFlag) {
 			graceNext = time.Now().Add(10 * time.Second)
 		}
 		if !tone.Load() {
-			gl := librespotStatus(room.Librespot)
+			// Wave 3: read the room's live state in-memory (pushed by runGLEvents from the /events
+			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
+			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
+			gl := live.Get()
 			playing := gl.Active && !gl.Paused && !gl.Stopped
 			released := fileExists(releasedPath(room))
 
@@ -767,6 +770,22 @@ func toneFor(id string) *boolFlag {
 	return &boolFlag{} // detached gate if the room isn't supervised (tests / race on add)
 }
 
+// startRoomBridge wires up one room's push-state pipeline: a glLive fed by runGLEvents (ws /events,
+// seeded + falling back to /status polling) and the roomBridge that reads it in-memory each tick.
+// Both stop when the runtime's stop channel closes (room removal / shutdown); if the room isn't
+// supervised (tests / race on add) it degrades to a detached live + bridge over /status polling.
+func startRoomBridge(room *Room) {
+	rt := mgr.runtime(room.ID)
+	if rt == nil {
+		live := &glLive{}
+		go runGLEvents(room, live, make(chan struct{}))
+		go roomBridge(room, &boolFlag{}, live)
+		return
+	}
+	go runGLEvents(room, &rt.live, rt.stop)
+	go roomBridge(room, &rt.tonePlaying, &rt.live)
+}
+
 func main() {
 	store = newRoomStore()
 	mgr = newRoomManager(store)
@@ -775,7 +794,7 @@ func main() {
 	// bridge. The supervise loop owns the children; reconcile == just (re)spawn everything we know of.
 	for _, rm := range loadRooms() {
 		mgr.ensureRunning(rm)
-		go roomBridge(rm, toneFor(rm.ID))
+		startRoomBridge(rm)
 	}
 
 	lastCount := -1
@@ -1113,7 +1132,7 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		mgr.ensureRunning(rm)
-		go roomBridge(rm, toneFor(rm.ID))
+		startRoomBridge(rm)
 		writeJSON(w, map[string]any{"ok": true, "id": rm.ID, "name": rm.Name})
 	case http.MethodDelete:
 		id := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
