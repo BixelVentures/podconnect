@@ -8,6 +8,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.21.0 — 2026-06-22  (Bring back physical HomePod volume — without the oscillation)
+- **Turning the HomePod up/down physically works again.** 0.20.0 went one-directional and lost the
+  "magic" hardware-button → Spotify/HA sync. Restored the **bidirectional** `decideVolume` reconcile —
+  but **kept the simple, edge-safe one-shot never-loud cap** (the `capped` latch) instead of the
+  0.16–0.17 held-window that actually caused R1/R2.
+- **Why this is safe:** the oscillation (90→25→12→17) came from the held-window re-seeding `volCanon`
+  every tick, **not** from `decideVolume` — which uses a canonical value + tolerance precisely to avoid
+  echo/ping-pong. With the held-window gone, the reconcile is stable (this is how ≤0.14 behaved).
+- **Never-loud is now edge-safe:** `capped` resets only on a fresh inactive→active session, so it
+  survives paused/released ticks (no more blast-on-claim from a missed edge) and a resume of **your
+  own** session is never re-capped (keeps your level).
+- Net: physical volume both ways ✅, no oscillation ✅, no blast-on-claim ✅. Needs on-device check.
+
 ## Speakers 0.20.0 — 2026-06-22  (Volume: back to standard Spotify Connect — drop the bidirectional relay)
 - **Spotify now owns volume, like a normal Connect speaker.** The custom bidirectional volume relay
   (`decideVolume` reconcile + the never-loud held-window: `lastGoodVol`/`capTarget`/`freshCapWindow`/

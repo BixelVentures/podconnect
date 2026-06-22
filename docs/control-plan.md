@@ -63,16 +63,16 @@ facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTR
 - (A future enhancement could let Control read the add-on's pushed state for HomePod entities, but it's
   not built — and not required: the add-on already reacts instantly on its own.)
 
-## Volume (✅ built — `external_volume: true` + one-directional mirror, since 0.20.0)
+## Volume (✅ built — `external_volume: true` + bidirectional reconcile, since 0.21.0)
 - go-librespot `external_volume: true` (no PCM scaling — avoids double-attenuation; loudness lives in
-  the OwnTone/AirPlay output). **Standard Spotify Connect: Spotify owns volume.** The **manager** (in
-  the add-on) **mirrors** go-librespot's reported volume onto the room's OwnTone per-output volume,
-  **one-directionally** (Spotify/HA → HomePod). One never-loud guard caps a brand-new session's first
-  volume to 35% (resuming your own session keeps your level).
-- **History:** 0.x up to 0.19 ran a *bidirectional* relay (HomePod hardware button → Spotify too) with
-  a canonical reconcile + never-loud held-window. It caused volume oscillation/blast (R1/R2) and was
-  replaced in **0.20.0** by the one-directional mirror. Trade-off: a HomePod hardware button no longer
-  moves the Spotify slider back.
+  the OwnTone/AirPlay output). The **manager** runs `decideVolume`: go-librespot `/status` ↔ the OwnTone
+  per-output volume on one **canonical value** with ±2% tolerance (no echo). **Bidirectional:** the
+  Spotify/HA slider moves the HomePod, and a **HomePod hardware button moves Spotify/HA back**. One
+  edge-safe one-shot never-loud cap stops a brand-new session starting at full blast.
+- **History:** the never-loud *held-window* (0.16–0.17) caused oscillation/blast (R1/R2); 0.20.0
+  over-corrected to a one-directional mirror (lost physical volume); **0.21.0** restored the
+  bidirectional reconcile while keeping only the simple one-shot cap — physical volume both ways,
+  no oscillation, no blast.
 
 ## Voice ducking — the Attention API (✅ built, Speakers 0.14.0)
 - The add-on exposes **`/api/attention`** so an *external* voice-assistant gatekeeper can dip a room's

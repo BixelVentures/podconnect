@@ -543,18 +543,21 @@ func reclaimHomePod(room *Room) {
 	}
 }
 
-// roomBridge keeps one room's HomePod and go-librespot in step. Standard Spotify Connect model:
+// roomBridge keeps one room's HomePod and go-librespot in step, BIDIRECTIONALLY:
 //
-//   - Volume: Spotify OWNS it. external_volume:true means loudness lives in OwnTone's AirPlay output,
-//     so we MIRROR go-librespot's reported volume onto that output one-directionally (Spotify/HA slider
-//     -> HomePod). No bidirectional reconcile (a HomePod hardware button no longer moves the slider
-//     back — deliberate; it removed the oscillation/echo class of bugs). One never-loud guard caps a
-//     brand-new session's first volume (see initialVolumeCap) so a remembered 100% can't blast.
+//   - Volume (decideVolume): Spotify/HA slider <-> HomePod hardware buttons. external_volume:true means
+//     loudness lives in OwnTone's AirPlay output; the reconcile keeps that output and go-librespot's
+//     reported volume on ONE canonical value (tolerance prevents echo), so turning the HomePod down
+//     physically moves Spotify/HA and vice-versa. ONE edge-safe never-loud guard caps a brand-new
+//     session's first volume (initialVolumeCap) so a remembered 100% can't blast; your own resume is
+//     not re-capped. (The 0.16-0.17 held-window cap caused oscillation and was removed in 0.20-0.21;
+//     this reconcile itself is stable.)
 //   - Transport (transState): a Spotify pause pauses the HomePod instantly, and a HomePod top-tap
 //     pauses/resumes Spotify (best-effort). Startup-aware so it never flickers or stalls rapid taps.
 //
 // Skipped while THIS room's test tone plays, and while a duck holds the room. Per-room.
 func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
+	volCanon := -1           // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
@@ -585,14 +588,16 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			}
 
 			// Wave 4: attention/duck. An external agent (voice gatekeeper) holds the room quiet. The
-			// duck WINS — hold the HomePod at the target and SKIP the volume mirror this tick (so it
-			// can't fight the duck); transport below keeps running so the music plays quietly underneath.
-			// On the release edge, restore the pre-duck level explicitly (covers an idle room).
+			// duck WINS — hold the HomePod at the target and SKIP the reconcile this tick (so a HomePod
+			// button can't fight it); transport below keeps running so the music plays quietly underneath.
+			// volCanon=-1 re-seeds the reconcile so it re-converges once the duck ends; on the release
+			// edge restore the pre-duck level explicitly (covers an idle room).
 			if hold, lvl, attReleased, restoreTo := att.tick(time.Now()); hold {
 				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v != lvl {
 					setOwntoneOutputVolume(room.OwnTone, id, lvl)
 					log.Printf("attention [%s]: held at %d%%", room.Name, lvl)
 				}
+				volCanon = -1
 				// The top-of-loop latch already reset `capped` if a session (re)started during the duck,
 				// so the never-loud cap fires on release — no remembered 100% blasts out from under a duck.
 				prevActive = gl.Active
@@ -605,6 +610,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						log.Printf("attention [%s]: released — restored to %d%%", room.Name, restoreTo)
 					}
 				}
+				volCanon = -1
 			}
 
 			playing := gl.Active && !gl.Paused && !gl.Stopped
@@ -646,29 +652,37 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			}
 
 			if gl.Active && !released {
-				// Never-loud (the ONE guard): cap a brand-NEW session's go-librespot volume down to the
-				// ceiling until it reports <= the ceiling (our cap took, or the user lowered it) — then the
-				// user owns volume from there. `capped` resets only on a fresh inactive->active session, so
-				// resuming your own paused session is NOT re-capped and keeps your level.
+				// Never-loud (one-shot, edge-safe): cap a brand-NEW session's go-librespot volume to the
+				// ceiling until it reports <= the ceiling, then hand control to the user. `capped` resets
+				// ONLY on a fresh inactive->active session (top latch), so it survives paused/released
+				// ticks (no edge-miss blast) and a resume of your own session is NOT re-capped.
 				if !capped && gl.HasVol {
 					if gl.VolPct > initialVolumeCap {
 						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
 						gl.VolPct = initialVolumeCap
+						volCanon = -1 // re-seed the reconcile from the capped level
 						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
 					} else {
-						capped = true
+						capped = true // settled at/below the ceiling — the user owns volume from here
 					}
 				}
-				// Mirror Spotify's volume onto the HomePod (the only loudness control); tolerance avoids
-				// rewrites on rounding noise.
-				if gl.HasVol {
-					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-gl.VolPct) > volTol {
-						setOwntoneOutputVolume(room.OwnTone, id, gl.VolPct)
-						log.Printf("volume [%s]: -> HomePod %d%%", room.Name, gl.VolPct)
-					}
-				}
-
+				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
 				otState := owntonePlayerState(room.OwnTone)
+
+				// Volume — BIDIRECTIONAL: Spotify/HA slider <-> HomePod hardware buttons (turn it down
+				// physically and Spotify/HA follows). One canonical value + tolerance prevent echo, so our
+				// own writes aren't re-read as input. NOTE: the R1/R2 oscillation came from the later
+				// held-window cap re-seeding volCanon every tick — NOT from this reconcile, which is stable.
+				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
+				volCanon = vc
+				if vGl {
+					setLibrespotVolumePct(room.Librespot, vc)
+					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
+				}
+				if vOt && otID != "" {
+					setOwntoneOutputVolume(room.OwnTone, otID, vc)
+					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
+				}
 
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
 				sg, so := trans.decide(!gl.Paused && !gl.Stopped, otState == "play", otState != "")
@@ -1596,6 +1610,10 @@ const indexHTML = `<!doctype html>
 
   <details class="changelog">
     <summary>What's new</summary>
+    <div class="rel">
+      <h3>0.21.0 <span class="when">— 2026-06-22</span></h3>
+      <ul><li>Physically turning the HomePod volume up/down works again (and moves the Spotify/HA slider) — restored without the jumping, by keeping the simple one-shot never-loud cap instead of the old held-window.</li></ul>
+    </div>
     <div class="rel">
       <h3>0.20.0 <span class="when">— 2026-06-22</span></h3>
       <ul>

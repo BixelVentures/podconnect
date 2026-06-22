@@ -43,12 +43,12 @@ playback). PodVoice is a separate repo and can't be diagnosed from here.
 
 | Feature | Expected behavior | Where | Status |
 |---|---|---|---|
-| Volume model (0.20.0) | **Standard Connect**: Spotify owns volume; bridge **mirrors** go-librespot's reported volume → OwnTone output **one-directionally**. No reconcile, no echo. (Lost: HomePod hardware button → Spotify back-sync) | mirror `main.go:662-669` | 🟡 verify on-device |
+| Volume model (0.21.0) | **Bidirectional restored**: `decideVolume` keeps go-librespot ↔ OwnTone output on one canonical value (tolerance prevents echo). Spotify/HA slider ↔ **HomePod hardware buttons** both work. One edge-safe one-shot never-loud cap. (0.20 was one-directional mirror — reverted; physical volume was missed) | `decideVolume` + bridge `main.go:648-680` | 🟡 verify on-device |
 | `external_volume:true` model | go-librespot reports volume only; **OwnTone applies actual loudness** at the AirPlay output (avoids double-attenuation) | `render.go:52` | ⚪ |
 | Never-loud — idle prearm | While no session active, hold the HomePod output ≤35% (every 2 s) so the first audio can't blast | `main.go:641-646` | ⚪ |
 | Never-loud — the ONE guard (0.20.0) | A brand-new session's go-librespot volume capped to 35% until it reports ≤35%; resets only on inactive→active so your own resume is **not** capped | `main.go:648-661` | 🟡 verify |
 | Manual volume set | `PUT /api/volume {volume,room?}` → go-librespot; bridge mirrors to HomePod | `main.go` /api/volume | ⚪ |
-| `decideVolume` (legacy) | Old bidirectional reconcile — **no longer called** by the bridge (kept only for its unit test); safe to delete later | `main.go:439-462` | ⚪ dead code |
+| `decideVolume` | Bidirectional reconcile — **in use again** (0.21.0). Canonical value + ±2% tolerance prevent echo/ping-pong; unit-tested | `main.go:439-462`, `main_test.go` | ⚪ verify |
 
 ## B. Audio bridge — transport, grace, duck
 
