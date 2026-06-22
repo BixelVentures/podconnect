@@ -263,19 +263,6 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 	}
 }
 
-// capFreshClaim lowers a just-(re)selected HomePod output to initialVolumeCap if it would otherwise
-// start above it. With external_volume:true loudness is the OwnTone AirPlay output level, so this is
-// the cap that matters — and it must land BEFORE the first audio of a claim. Selecting an output
-// (selectOnOwntoneAt) sets no volume, so a HomePod another account drove to 100% would blast for the
-// window before the bridge reconcile catches it. Call right after selecting, with the now-selected
-// output id. Lower-only: a session already under the cap is untouched (so it never raises volume).
-func capFreshClaim(base, id string) {
-	if v, selID, ok := owntoneOutputVolume(base); ok && selID == id && v > initialVolumeCap {
-		setOwntoneOutputVolume(base, id, initialVolumeCap)
-		log.Printf("volume: capped fresh claim on output %s to %d%% (never start loud)", id, initialVolumeCap)
-	}
-}
-
 // glStatus is the slice of go-librespot's /status the bridge needs.
 type glStatus struct {
 	Active  bool // a Spotify session is present (status returned data)
@@ -510,8 +497,7 @@ func (ts *transState) decide(glPlaying, otPlaying, otValid bool) (setGl, setOt i
 	return
 }
 
-const initialVolumeCap = 35       // "never full blast": default cap for a brand-new session's volume
-const freshCapWindow = 8 * time.Second // how long the fresh-session volume clamp holds after a claim/reclaim
+const initialVolumeCap = 35 // "never full blast": cap for a brand-new session's first volume
 
 func playWord(c int) string {
 	if c == 1 {
@@ -554,32 +540,25 @@ func reclaimHomePod(room *Room) {
 	}
 	if target != "" {
 		selectOnOwntoneAt(room.OwnTone, target)
-		capFreshClaim(room.OwnTone, target) // reclaim from a released HomePod must never resume at full blast
 	}
 }
 
-// roomBridge keeps one room's HomePod and go-librespot in step in BOTH directions, for volume and
-// transport — so Spotify/HA, the HomePod buttons and the HomePod top-tap all converge on one state.
+// roomBridge keeps one room's HomePod and go-librespot in step. Standard Spotify Connect model:
 //
-//   - Volume (decideVolume): Spotify/HA slider <-> HomePod hardware buttons. external_volume:true
-//     makes OwnTone apply volume at the AirPlay output (responsive). OwnTone 29.2 was verified live
-//     to surface the receiver's volume on this hardware, so the back-direction works here.
-//   - Transport (transState): a Spotify pause pauses the HomePod instantly (beating the buffer),
-//     and a HomePod top-tap pauses/resumes Spotify (OwnTone forwards HomePod MediaRemote events —
-//     best-effort, firmware-dependent). Startup-aware so it never flickers or stalls rapid taps.
+//   - Volume: Spotify OWNS it. external_volume:true means loudness lives in OwnTone's AirPlay output,
+//     so we MIRROR go-librespot's reported volume onto that output one-directionally (Spotify/HA slider
+//     -> HomePod). No bidirectional reconcile (a HomePod hardware button no longer moves the slider
+//     back — deliberate; it removed the oscillation/echo class of bugs). One never-loud guard caps a
+//     brand-new session's first volume (see initialVolumeCap) so a remembered 100% can't blast.
+//   - Transport (transState): a Spotify pause pauses the HomePod instantly, and a HomePod top-tap
+//     pauses/resumes Spotify (best-effort). Startup-aware so it never flickers or stalls rapid taps.
 //
-// Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
-// from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
-// while THIS room's test tone plays. Per-room. Uses only verified APIs.
+// Skipped while THIS room's test tone plays, and while a duck holds the room. Per-room.
 func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
-	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
-	prevActive := false              // edge-detect a NEW session (inactive->active) to arm the never-loud cap
-	freshCapPending := false         // fresh-session volume clamp is armed (held for freshCapWindow)
-	lastGoodVol := initialVolumeCap  // rolling "house" level, updated during steady playback
-	capTarget := initialVolumeCap    // FROZEN target held during the fresh-session window (captured when armed)
-	var capDeadline time.Time        // end of the current fresh-session clamp window
-	prearmNext := time.Now()         // throttle for the idle "hold the HomePod output low" safety guard
+	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
+	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
+	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
 	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
 	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
 	// reads off the 200ms hot loop.
@@ -599,31 +578,23 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl := live.Get()
 
-			// Never-loud latch: the instant a NEW session appears (inactive->active), arm the
-			// fresh-session clamp and HOLD it for a window — independent of prevActive, which gets
-			// consumed even on ticks where the clamp is gated out (session attaches while still
-			// released or paused), letting a remembered 100% slip through on the play edge. Re-armed
-			// on reclaim below (resume after a grace-release). This is the backup so no claim is loud.
+			// Never-loud: a brand-NEW session (inactive->active) re-arms the one-shot cap. A resume of
+			// your own paused session keeps gl.Active true, so it is NOT a new session — not re-capped.
 			if gl.Active && !prevActive {
-				freshCapPending = true
-				capTarget = lastGoodVol
-				capDeadline = time.Now().Add(freshCapWindow)
+				capped = false
 			}
 
 			// Wave 4: attention/duck. An external agent (voice gatekeeper) holds the room quiet. The
-			// duck WINS — hold the HomePod at the target and SKIP the reconcile this tick (so a HomePod
-			// button or the volume mirror can't fight it); transport below keeps running so the music
-			// plays quietly underneath. volCanon=-1 re-seeds the reconcile so it re-converges on the
-			// live go-librespot truth once the duck ends. On the release edge, restore the pre-duck
-			// level explicitly (covers an idle room, where the reconcile wouldn't run).
+			// duck WINS — hold the HomePod at the target and SKIP the volume mirror this tick (so it
+			// can't fight the duck); transport below keeps running so the music plays quietly underneath.
+			// On the release edge, restore the pre-duck level explicitly (covers an idle room).
 			if hold, lvl, attReleased, restoreTo := att.tick(time.Now()); hold {
 				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v != lvl {
 					setOwntoneOutputVolume(room.OwnTone, id, lvl)
 					log.Printf("attention [%s]: held at %d%%", room.Name, lvl)
 				}
-				volCanon = -1
-				// The top-of-loop latch already armed freshCapPending if a session (re)started during
-				// the duck, so it fires on release — no remembered 100% can blast out from under a duck.
+				// The top-of-loop latch already reset `capped` if a session (re)started during the duck,
+				// so the never-loud cap fires on release — no remembered 100% blasts out from under a duck.
 				prevActive = gl.Active
 				time.Sleep(200 * time.Millisecond)
 				continue
@@ -634,7 +605,6 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						log.Printf("attention [%s]: released — restored to %d%%", room.Name, restoreTo)
 					}
 				}
-				volCanon = -1
 			}
 
 			playing := gl.Active && !gl.Paused && !gl.Stopped
@@ -649,11 +619,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					reclaimHomePod(room)
 					log.Printf("[%s]: reclaimed HomePod (playback resumed)", room.Name)
 					released = false
-					// Resume after a grace-release is a (re)claim: re-arm the clamp window so the first
-					// audio can't blast (held at lastGoodVol — your own level, not a hard floor).
-					freshCapPending = true
-					capTarget = lastGoodVol
-					capDeadline = time.Now().Add(freshCapWindow)
+					// NOT a fresh session — gl.Active stayed true across the grace-release, so `capped`
+					// is untouched and your own volume is preserved on resume (no never-loud nerf).
 				}
 			} else {
 				if idleSince.IsZero() {
@@ -666,61 +633,42 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				}
 			}
 
-			// Volume safety — a session must NEVER start at full blast (e.g. another account's
-			// remembered 100%). Two guards: (1) while no session is active, hold the HomePod output
-			// at/under the cap (throttled) so the FIRST audio of any new session can't exceed it; and
-			// (2) on every inactive->active transition, cap go-librespot too. Re-armed per session —
-			// the old once-per-boot flag let a 2nd account's fresh session through at 100%.
+			// Volume — STANDARD Spotify Connect: Spotify owns the level. With external_volume:true the
+			// loudness IS the OwnTone AirPlay output, so we simply MIRROR go-librespot's reported volume
+			// onto it — one-directional, no bidirectional reconcile, no oscillation. (Trade-off: a HomePod
+			// hardware button no longer moves the Spotify slider back.) While idle, hold the output at/under
+			// the cap so the first audio of any new session can't blast.
 			if !gl.Active && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
 				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {
 					setOwntoneOutputVolume(room.OwnTone, id, initialVolumeCap)
-					log.Printf("volume [%s]: idle HomePod held at %d%% (never start loud)", room.Name, initialVolumeCap)
 				}
 			}
 
 			if gl.Active && !released {
-				inCapWindow := false
-				if freshCapPending {
-					if time.Now().Before(capDeadline) {
-						// Fresh-session HOLD: pin BOTH sides to a FROZEN target for the window and SKIP the
-						// reconcile below — so it can't oscillate (the old per-tick re-seed ping-ponged with
-						// decideVolume). Spotify re-asserts a remembered 100% several times during a claim;
-						// we just re-pin capTarget (your last steady level; defaults to initialVolumeCap for
-						// a brand-new session). Re-pin only when off by > tolerance, so no log/IO spam.
-						inCapWindow = true
-						if gl.HasVol && abs(gl.VolPct-capTarget) > volTol {
-							setLibrespotVolumePct(room.Librespot, capTarget)
-						}
-						if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-capTarget) > volTol {
-							setOwntoneOutputVolume(room.OwnTone, id, capTarget)
-						}
-						volCanon = capTarget
+				// Never-loud (the ONE guard): cap a brand-NEW session's go-librespot volume down to the
+				// ceiling until it reports <= the ceiling (our cap took, or the user lowered it) — then the
+				// user owns volume from there. `capped` resets only on a fresh inactive->active session, so
+				// resuming your own paused session is NOT re-capped and keeps your level.
+				if !capped && gl.HasVol {
+					if gl.VolPct > initialVolumeCap {
+						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
+						gl.VolPct = initialVolumeCap
+						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
 					} else {
-						freshCapPending = false
-						volCanon = -1 // window over: re-seed the reconcile from live truth
-						log.Printf("volume [%s]: fresh-session cap lifted (held at %d%%)", room.Name, capTarget)
+						capped = true
 					}
 				}
-				otState := owntonePlayerState(room.OwnTone)
+				// Mirror Spotify's volume onto the HomePod (the only loudness control); tolerance avoids
+				// rewrites on rounding noise.
+				if gl.HasVol {
+					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-gl.VolPct) > volTol {
+						setOwntoneOutputVolume(room.OwnTone, id, gl.VolPct)
+						log.Printf("volume [%s]: -> HomePod %d%%", room.Name, gl.VolPct)
+					}
+				}
 
-				// Volume — both directions. Skipped while the fresh-session hold pins a frozen level.
-				if !inCapWindow {
-					otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
-					vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
-					volCanon = vc
-					if playing {
-						lastGoodVol = vc // track your chosen level during steady playback — the next cap target
-					}
-					if vGl {
-						setLibrespotVolumePct(room.Librespot, vc)
-						log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
-					}
-					if vOt && otID != "" {
-						setOwntoneOutputVolume(room.OwnTone, otID, vc)
-						log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
-					}
-				}
+				otState := owntonePlayerState(room.OwnTone)
 
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
 				sg, so := trans.decide(!gl.Paused && !gl.Stopped, otState == "play", otState != "")
@@ -1026,7 +974,6 @@ func main() {
 					if strings.EqualFold(d.Name, name) {
 						homepodID = d.ID
 						selectOnOwntoneAt(rm.OwnTone, d.ID)
-						capFreshClaim(rm.OwnTone, d.ID) // a fresh (re)bind must not inherit a remembered 100%
 						break
 					}
 				}
@@ -1649,6 +1596,14 @@ const indexHTML = `<!doctype html>
 
   <details class="changelog">
     <summary>What's new</summary>
+    <div class="rel">
+      <h3>0.20.0 <span class="when">— 2026-06-22</span></h3>
+      <ul>
+        <li>Volume is back to <b>standard Spotify Connect</b>: Spotify owns the level, the HomePod just follows it. Removed the custom two-way relay that caused the jumping/blasting.</li>
+        <li>Resuming your own paused music keeps your volume; only a brand-new session is gently capped so it can't start at full blast.</li>
+        <li>Trade-off: a HomePod hardware button no longer moves the Spotify slider back.</li>
+      </ul>
+    </div>
     <div class="rel">
       <h3>0.19.0 <span class="when">— 2026-06-22</span></h3>
       <ul><li>"Play &lt;song&gt;" via voice no longer un-pauses random old music on every speaker — PodConnect now rejects play-by-query (that belongs to the Spotify Web API, not the local engine).</li></ul>

@@ -98,6 +98,5 @@ func selectHomePod(r *Room) {
 		return
 	}
 	selectOnOwntoneAt(r.OwnTone, target.ID)
-	capFreshClaim(r.OwnTone, target.ID) // selecting a previously-unselected output is a fresh claim: never start loud
 	log.Printf("rooms[%s]: selected HomePod %q", r.ID, target.Name)
 }

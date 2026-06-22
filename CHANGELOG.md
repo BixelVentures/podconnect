@@ -8,6 +8,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.20.0 — 2026-06-22  (Volume: back to standard Spotify Connect — drop the bidirectional relay)
+- **Spotify now owns volume, like a normal Connect speaker.** The custom bidirectional volume relay
+  (`decideVolume` reconcile + the never-loud held-window: `lastGoodVol`/`capTarget`/`freshCapWindow`/
+  `capFreshClaim`) is **gone**. The bridge now **mirrors** go-librespot's reported volume onto the
+  HomePod (OwnTone AirPlay output) **one-directionally**. This removes the whole oscillation/echo bug
+  class (R1/R2) — the volume can't fight itself anymore.
+- **One minimal never-loud guard remains:** a brand-**new** session (inactive→active) has its first
+  volume capped to 35% until go-librespot reports ≤35%; then the user owns volume. **Resuming your own
+  paused session is *not* a new session, so your level is preserved** (no more 35% nerf).
+- **Trade-off (accepted):** a HomePod *hardware* volume button no longer moves the Spotify slider back
+  (the back-direction was the source of the complexity). Spotify/HA volume → HomePod still works.
+- `external_volume:true` kept (avoids double-attenuation: go-librespot doesn't scale PCM; OwnTone/
+  AirPlay applies the level). Transport sync, grace-release, and the duck API are unchanged.
+- **Needs on-device verification** — this is the audio path and there's no Go build/device here.
+
 ## Speakers 0.19.0 — 2026-06-22  (Reject play-by-query — stop the wrong-music blast, R5)
 - **`/api/play?query=…` is now rejected (400) instead of silently resuming.** PodVoice/Gemini was
   calling `POST /api/play?query=Dua Lipa`; `/api/play` ignored the query and sent **resume to every

@@ -63,11 +63,16 @@ facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTR
 - (A future enhancement could let Control read the add-on's pushed state for HomePod entities, but it's
   not built — and not required: the add-on already reacts instantly on its own.)
 
-## Volume (✅ built — `external_volume: true` + bidirectional relay)
-- go-librespot `external_volume: true` (no PCM scaling). The **manager** (in the add-on) reconciles
-  go-librespot `/status` ↔ the OwnTone/AirPlay **per-output** volume on a tick, with canonical-value
-  loop-protection. **Bidirectional:** HomePod hardware buttons move Spotify/HA and vice-versa; a fresh
-  session is capped so it never starts at full blast. Lives in the add-on for locality + independence.
+## Volume (✅ built — `external_volume: true` + one-directional mirror, since 0.20.0)
+- go-librespot `external_volume: true` (no PCM scaling — avoids double-attenuation; loudness lives in
+  the OwnTone/AirPlay output). **Standard Spotify Connect: Spotify owns volume.** The **manager** (in
+  the add-on) **mirrors** go-librespot's reported volume onto the room's OwnTone per-output volume,
+  **one-directionally** (Spotify/HA → HomePod). One never-loud guard caps a brand-new session's first
+  volume to 35% (resuming your own session keeps your level).
+- **History:** 0.x up to 0.19 ran a *bidirectional* relay (HomePod hardware button → Spotify too) with
+  a canonical reconcile + never-loud held-window. It caused volume oscillation/blast (R1/R2) and was
+  replaced in **0.20.0** by the one-directional mirror. Trade-off: a HomePod hardware button no longer
+  moves the Spotify slider back.
 
 ## Voice ducking — the Attention API (✅ built, Speakers 0.14.0)
 - The add-on exposes **`/api/attention`** so an *external* voice-assistant gatekeeper can dip a room's

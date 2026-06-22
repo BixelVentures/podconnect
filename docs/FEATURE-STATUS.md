@@ -22,8 +22,8 @@ User report: *"Højt, skift af lydstyrke, miste forbindelse til connect-højtale
 
 | # | Symptom | Most likely cause (suspect) | Where |
 |---|---------|------------------------------|-------|
-| R1 | Volume still goes **loud** on a fresh claim | Held-window cap; if `lastGoodVol` latched high during steady playback, the frozen `capTarget` is high. 0.18.0 holds a fixed level (no oscillation) — **needs on-device check** that the level is right | `main.go:683-707` | 🟡 (improved 0.18.0, verify) |
-| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | Cap block set `volCanon=-1` every tick → ping-pong with `decideVolume`. **Fixed 0.18.0**: window holds a frozen `capTarget` and skips the reconcile entirely while open | `main.go:683-734` | ✅ **fixed 0.18.0** (verify) |
+| R1 | Volume still goes **loud** on a fresh claim | **Redesigned in 0.20.0**: dropped the whole bidirectional relay; one-directional mirror + a single fresh-session cap (35% until go-librespot reports ≤35%). Resuming your own session keeps your level | `main.go:636-669` | 🟡 redesigned 0.20.0 — **verify on-device** |
+| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | Caused by the bidirectional reconcile fighting itself. **0.20.0 removes the reconcile entirely** (mirror is one-directional → nothing to oscillate) | `main.go:636-669` | ✅ **fixed by redesign 0.20.0** (verify) |
 | R3 | **Loses the Connect speaker** in the Spotify app | go-librespot restarted on name-forward, fired by the panel's auto-apply-on-pick (0.15.0). **Mitigated 0.18.0**: explicit **Save HomePod** button — picking no longer restarts until you confirm. (A deliberate Save still restarts once — unavoidable for a re-point.) | `main.go` picker; `/api/select` `main.go:1000-1051` | 🟡 **mitigated 0.18.0** |
 | R4 | General "weird" instability | Recurring `/events` websocket errors (`StatusNoStatusRcvd`) every ~30 s — **predates these versions** (Wave 3, 0.12.0), present in the 10:35 log before 0.16/0.17. Polling fallback keeps state fresh, so noisy but likely not the main cause | `events.go:139-256` | ⚪ open (pre-existing) |
 
@@ -43,13 +43,12 @@ playback). PodVoice is a separate repo and can't be diagnosed from here.
 
 | Feature | Expected behavior | Where | Status |
 |---|---|---|---|
-| Bidirectional volume sync | One canonical %; side drifting >2% becomes canon (Spotify wins ties); pushed to the other side; tolerance prevents echo | `main.go:439-462` (decideVolume), loop `main.go:700-719` | 🟡 (core logic sound; destabilized by cap interaction) |
-| `external_volume:true` model | go-librespot reports volume only; **OwnTone applies actual loudness** at the AirPlay output | `render.go:52` | ⚪ |
-| Never-loud — idle prearm | While no session active, hold the HomePod output ≤35% (every 2 s) so the first audio can't blast | `main.go:671-677` | 🟡 |
-| Never-loud — fresh-session window | On claim/reclaim, clamp both sides ≤`lastGoodVol` for 8 s, re-applied each tick; hard-clamp the pushed value | `main.go:680-710` | 🔴 (R1, R2) |
-| Never-loud — `lastGoodVol` target | Track the room's last steady level so your **own** resume returns to it (not a hard 35%) | `main.go:579,710` | 🔴 (R1 — can latch high) |
-| `capFreshClaim` (select-time guard) | Lower-only: cap the just-selected output ≤35% before the first reconcile | `main.go:272-277`; callers `main.go:101,557,1025`, `select.go:101` | 🟡 |
-| Manual volume set | `PUT /api/volume {volume,room?}` → go-librespot; bridge mirrors to HomePod | `main.go:1142-1164` | ⚪ |
+| Volume model (0.20.0) | **Standard Connect**: Spotify owns volume; bridge **mirrors** go-librespot's reported volume → OwnTone output **one-directionally**. No reconcile, no echo. (Lost: HomePod hardware button → Spotify back-sync) | mirror `main.go:662-669` | 🟡 verify on-device |
+| `external_volume:true` model | go-librespot reports volume only; **OwnTone applies actual loudness** at the AirPlay output (avoids double-attenuation) | `render.go:52` | ⚪ |
+| Never-loud — idle prearm | While no session active, hold the HomePod output ≤35% (every 2 s) so the first audio can't blast | `main.go:641-646` | ⚪ |
+| Never-loud — the ONE guard (0.20.0) | A brand-new session's go-librespot volume capped to 35% until it reports ≤35%; resets only on inactive→active so your own resume is **not** capped | `main.go:648-661` | 🟡 verify |
+| Manual volume set | `PUT /api/volume {volume,room?}` → go-librespot; bridge mirrors to HomePod | `main.go` /api/volume | ⚪ |
+| `decideVolume` (legacy) | Old bidirectional reconcile — **no longer called** by the bridge (kept only for its unit test); safe to delete later | `main.go:439-462` | ⚪ dead code |
 
 ## B. Audio bridge — transport, grace, duck
 
