@@ -311,11 +311,57 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         await self._send(self.coordinator.api.set_repeat(_HA_TO_SPOTIFY_REPEAT.get(repeat, "off"), self._device_id))
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
-        """Play a Spotify URI (track -> uris; album/playlist/artist -> context_uri)."""
+        """Play a Spotify URI — or, when media_id is NOT a spotify: URI, treat it as a free-text
+        QUERY and play the top-ranked match. The query path makes the *standard*
+        media_player.play_media service "play by name" in one call (so a generic caller — HA Assist,
+        a voice agent, a script — can do play_media music "Dua Lipa" without a separate search step)."""
+        if not media_id.startswith("spotify:"):
+            query = media_id
+            media_id = await self._search_top_uri(query, media_type) or ""
+            if not media_id:
+                LOGGER.warning("play_media: no Spotify match for %r", query)
+                return
         if media_id.startswith(("spotify:track:", "spotify:episode:")):
             await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
             await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
+
+    async def _search_top_uri(self, query: str, media_type: str | None) -> str | None:
+        """Resolve a free-text query to the best-matching Spotify URI — same ranking as search:
+        name relevance first (exact > prefix > substring), then popularity. media_type narrows the
+        Spotify search (defaults to track); 'music' is treated as track."""
+        type_map = {
+            "track": "track", "music": "track", "song": "track",
+            "artist": "artist", "album": "album", "playlist": "playlist",
+            "show": "show", "podcast": "show", "episode": "episode", "audiobook": "audiobook",
+        }
+        want = type_map.get((media_type or "").lower(), "track")
+        try:
+            data = await self.coordinator.api.search(query, want)
+        except SpotifyApiError as err:
+            LOGGER.warning("play_media search failed for %r: %s", query, err)
+            return None
+        q = query.strip().lower()
+
+        def relevance(name: str | None) -> int:
+            n = (name or "").lower()
+            if n == q:
+                return 3
+            if n.startswith(q):
+                return 2
+            if q in n:
+                return 1
+            return 0
+
+        best_uri: str | None = None
+        best_key = (-1, -1)
+        # Spotify returns matches under the pluralized key (track -> "tracks", etc.).
+        for item in (data.get(want + "s") or {}).get("items", []):
+            if item and item.get("uri"):
+                key = (relevance(item.get("name")), item.get("popularity") or 0)
+                if key > best_key:
+                    best_key, best_uri = key, item["uri"]
+        return best_uri
 
     async def async_select_source(self, source: str) -> None:
         """"Connect to a device": transfer the session to `source`, keeping play/pause state."""

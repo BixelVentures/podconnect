@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Control 0.8.0 — 2026-06-22  (Play-by-name via the standard media_player.play_media — fixes R5 cleanly)
+- **`media_player.play_media` now accepts a free-text name, not just a Spotify URI.** When
+  `media_content_id` isn't a `spotify:` URI, Control treats it as a **search query** and plays the
+  top-ranked match (same relevance + popularity ranking as search). So "play Dua Lipa" works in **one
+  standard call**: `media_player.play_media` on the Control entity, `media_content_id: "Dua Lipa"`,
+  `media_content_type: "music"` (also `artist`/`album`/`playlist`/`podcast`/`episode`).
+- **This is the right home for R5.** A generic caller (HA Assist, a voice agent like PodVoice, a
+  script) plays music with the *standard* HA service — no bespoke API, no caller-side search→play
+  stitching, no PodConnect-specific code in the caller. PodVoice 0.11.0 correctly went fully generic;
+  this is the PodConnect-side capability that makes its generic `home_call` "just work".
+- URIs still play exactly as before (track/episode → uris; album/playlist/artist → context_uri).
+
 ## Speakers 0.21.0 — 2026-06-22  (Bring back physical HomePod volume — without the oscillation)
 - **Turning the HomePod up/down physically works again.** 0.20.0 went one-directional and lost the
   "magic" hardware-button → Spotify/HA sync. Restored the **bidirectional** `decideVolume` reconcile —
