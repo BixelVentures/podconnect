@@ -25,17 +25,17 @@ After starting the add-on, a **PodConnect Speakers** item appears in the Home As
 Open the panel to see a **live network scan** of every AirPlay device found (the same scan Spotify
 Connect uses). From here you:
 
-- **Pick the primary HomePod** → **Save**. The speaker **auto-names itself** after the HomePod (e.g.
-  "Køkkenalrum HomePod").
+- The **top card is your primary speaker** — subtly highlighted with a `main` pill. It **auto-names
+  itself** after its HomePod (e.g. "Køkkenalrum HomePod").
 - **+ Add speaker** → pick another HomePod → it becomes its own Connect speaker, live, **no restart**.
-- Per room: **🔊 Test** (a soft tone — proves the AirPlay path, no Spotify needed), **✎ Rename** (pins
-  a custom name the auto-sync won't overwrite), **Remove**, and **⚙ Settings** (per-room **grace** +
-  **bitrate**; empty = inherit the global default).
-- **⏹ Stop music** — pauses whatever is playing, *regardless of which account*, without giving the
-  HomePod away.
-- **⏏ Release HomePod** — frees the HomePod so another AirPlay app (Mofibo, Apple Music…) can use it;
-  press play in Spotify to take it back.
-- A **now-playing / released / idle** status line per room.
+- Per room: **🔊 Test** (a soft tone — proves the AirPlay path, no Spotify needed), **⏹ Stop** (pauses
+  whatever is playing, *regardless of which account*, without giving the HomePod away), **✎ Rename**
+  (pins a custom name the auto-sync won't overwrite), **Remove**, and **⚙ Settings** (per-room
+  **grace** + **bitrate**; empty = inherit the global default).
+- The **primary's ⚙ Settings** also holds a **"Plays to HomePod"** picker (switch which HomePod it
+  plays to — applies on pick) and **⏏ Release** (frees the HomePod so another AirPlay app — Mofibo,
+  Apple Music… — can use it; press play in Spotify to take it back).
+- A **now-playing / released / idle** status pill per room.
 
 **Self-healing naming:** a room is bound to its HomePod by a stable id, so **renaming the HomePod in
 Apple Home syncs everywhere automatically** (Connect device + HA entity) — no re-pick needed (unless

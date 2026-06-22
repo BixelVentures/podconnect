@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.15.0 — 2026-06-22  (Panel cleanup — one primary card, no second picker)
+- **The top speaker card *is* the primary.** The separate "Primary speaker — pick its HomePod"
+  section is gone. The top card now carries a subtle accent tint and a small `main` pill, so the
+  primary reads as primary at a glance — no radio list to choose "which one is main".
+- **Re-pointing the primary's HomePod moved into its ⚙ Settings drawer.** A "Plays to HomePod"
+  picker (the same live OwnTone AirPlay scan) sits alongside grace/bitrate; **picking applies
+  immediately** (no separate Save click), and the drawer stays open across the 5 s refresh.
+- **⏏ Release for other apps** lives in that same drawer. The old duplicate global **Test / Stop /
+  Release** buttons are removed — per-card 🔊 Test / ⏹ Stop already cover it.
+- Dropped the redundant `Primary speaker: …` subline, the play-state banner, and now-dead CSS. Pure
+  UI/template change — no API, data-model, or behavior change.
+
 ## Speakers 0.14.0 — 2026-06-20  (Attention/duck API — Wave 4)
 - **New `/api/attention` duck primitive** so an external agent (a voice-assistant gatekeeper) can
   dip a room's music while it talks, then let it back up — without ever fighting the volume relay.

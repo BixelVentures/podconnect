@@ -1480,7 +1480,6 @@ const indexHTML = `<!doctype html>
             background: var(--grey-bg); border: 1px solid transparent; color: var(--fg); }
   .status.ok    { background: var(--green-bg); border-color: var(--green-bg); color: var(--fg); }
   .status.warn  { background: var(--amber-bg); border-color: var(--amber-bg); color: var(--fg); }
-  .status.info  { background: var(--blue-bg);  border-color: var(--blue-bg);  color: var(--fg); }
 
   .list { display: flex; flex-direction: column; gap: 10px; }
 
@@ -1504,7 +1503,14 @@ const indexHTML = `<!doctype html>
   .pill-released { color: var(--blue);  background: var(--blue-bg); }
   .pill-starting { color: var(--amber); background: var(--amber-bg); }
   .pill-auth     { color: var(--red);   background: var(--red-bg); }
-  .pill.plain::before { display: none; } /* small inline tags (needs-verification / playing here) */
+  .pill-main     { color: var(--accent); background: var(--accent-soft); }
+  .pill.plain::before { display: none; } /* small inline tags (main / needs-verification / playing here) */
+
+  /* Primary speaker card — subtle accent tint so the top card quietly reads as "main". */
+  .room.primary { border-color: var(--accent); background: var(--accent-soft); }
+  /* HomePod re-point block inside the primary card's settings drawer. */
+  .hpsub { font-size: .82rem; font-weight: 700; color: var(--fg-dim); margin-top: 2px; }
+  .hpmsg { font-size: .76rem; color: var(--fg-dim); line-height: 1.4; min-height: 1em; }
 
   /* Buttons. */
   button { font: inherit; font-weight: 600; font-size: .9rem; padding: 10px 16px; border-radius: 10px;
@@ -1520,7 +1526,6 @@ const indexHTML = `<!doctype html>
   .room button, .ctl button { padding: 7px 12px; font-size: .8rem; border-radius: 9px; }
 
   .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
-  .actions.stack button { flex: 1 1 auto; }
 
   .hint { margin-top: 16px; font-size: .8rem; color: var(--fg-dim); line-height: 1.5; }
   .err { color: var(--danger); font-size: .82rem; margin-top: 8px; }
@@ -1556,7 +1561,6 @@ const indexHTML = `<!doctype html>
 <body>
 <div class="wrap">
   <h1>PodConnect speakers</h1>
-  <p class="sub" id="speaker"></p>
 
   <div class="section">
     <h2>Your speakers</h2>
@@ -1575,35 +1579,14 @@ const indexHTML = `<!doctype html>
     </div>
   </div>
 
-  <div class="section">
-    <h2>Primary speaker — pick its HomePod</h2>
-    <div id="playstate" class="status" style="display:none"></div>
-    <div id="status" class="status warn">Loading…</div>
-    <div id="list" class="list"></div>
-    <div class="actions">
-      <button id="save" disabled>Save selection</button>
-      <button id="auto" class="ghost">Auto (clear choice)</button>
-    </div>
-    <div class="actions stack">
-      <button id="test" class="ghost">🔊 Play test sound on HomePod</button>
-      <button id="stop" class="ghost">⏹ Stop music (any account)</button>
-      <button id="release" class="ghost">⏏ Release HomePod (for other apps)</button>
-    </div>
-    <p id="testmsg" class="hint"></p>
-    <p id="stopmsg" class="hint"></p>
-    <p id="releasemsg" class="hint"></p>
-  </div>
-
-  <p class="hint">These lists are a live network scan (OwnTone AirPlay discovery) — the same one that
-  feeds Spotify Connect. No typing: pick a device and Save. Each speaker keeps playing to its HomePod
-  across restarts. <b>Add speaker</b> spins up a new Spotify Connect speaker bound to a free HomePod,
-  live — no restart.<br><br><b>Play test sound</b> sends a soft tone straight to the HomePod via
-  AirPlay — no Spotify needed. Hear it = the HomePod audio path works.</p>
+  <p class="hint">The top speaker is your <b>main</b> one — open its <b>⚙ Settings</b> to switch its
+  HomePod or release it for other apps. <b>＋ Add speaker</b> binds a new one to a free HomePod, live.</p>
 </div>
 <script>
 var chosen = null;
 var addChosen = null;
 var addChosenId = null;
+var r0SettingsOpen = false; // keep the primary card's settings drawer open across 5s refreshes
 
 // --- Multi-room list (/api/rooms) ---
 async function loadRooms() {
@@ -1613,10 +1596,12 @@ async function loadRooms() {
   var wrap = document.getElementById('rooms');
   wrap.innerHTML = '';
   (data.rooms || []).forEach(function (rm) {
-    var box = document.createElement('div'); box.className = 'room';
+    var isPrimary = (rm.id === 'r0');
+    var box = document.createElement('div'); box.className = 'room' + (isPrimary ? ' primary' : '');
     var top = document.createElement('div'); top.className = 'top';
     var nm = document.createElement('span'); nm.className = 'rname'; nm.textContent = rm.name;
     top.appendChild(nm);
+    if (isPrimary) { var mp = document.createElement('span'); mp.className = 'pill plain pill-main'; mp.textContent = 'main'; top.appendChild(mp); }
     var badge = document.createElement('span'); badge.className = 'pill';
     if (rm.released) { badge.classList.add('pill-released'); badge.textContent = 'released'; }
     else if (rm.playing) { badge.classList.add('pill-playing'); badge.textContent = 'playing'; }
@@ -1662,7 +1647,8 @@ async function loadRooms() {
     box.appendChild(ctl);
 
     // Per-room settings panel (grace minutes + bitrate). Hidden until ⚙ Settings is clicked.
-    var sp = document.createElement('div'); sp.className = 'settings'; sp.style.display = 'none';
+    var sp = document.createElement('div'); sp.className = 'settings';
+    sp.style.display = (isPrimary && r0SettingsOpen) ? '' : 'none';
     var gField = document.createElement('div'); gField.className = 'field';
     var gLabel = document.createElement('label'); gLabel.textContent = 'Grace minutes';
     var gInput = document.createElement('input'); gInput.type = 'number'; gInput.min = '0'; gInput.max = '120';
@@ -1683,13 +1669,38 @@ async function loadRooms() {
       ', bitrate ' + (rm.bitrate_overridden ? 'overridden' : 'inherited') + ').' +
       ' Clear grace to inherit the global default.';
     sp.appendChild(sh);
+
+    // Primary speaker only: re-point its HomePod + release, folded in from the old separate section.
+    if (isPrimary) {
+      var hl = document.createElement('div'); hl.className = 'hpsub'; hl.textContent = 'Plays to HomePod'; sp.appendChild(hl);
+      var hp = document.createElement('div'); hp.className = 'list'; hp.id = 'hppicker'; sp.appendChild(hp);
+      var hpm = document.createElement('p'); hpm.className = 'hpmsg'; hpm.id = 'hpmsg'; sp.appendChild(hpm);
+      var hrow = document.createElement('div'); hrow.className = 'srow';
+      var hauto = document.createElement('button'); hauto.className = 'ghost'; hauto.textContent = 'Auto (no fixed HomePod)';
+      hauto.onclick = async function () {
+        var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Cleared — auto-picks a free HomePod.';
+        await fetch('api/select', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: '' }) });
+        chosen = null; await load();
+      };
+      var hrel = document.createElement('button'); hrel.className = 'ghost'; hrel.textContent = '⏏ Release for other apps';
+      hrel.onclick = async function () {
+        var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
+        try { await fetch('api/release', { method:'POST' }); } catch (e) {}
+      };
+      hrow.appendChild(hauto); hrow.appendChild(hrel); sp.appendChild(hrow);
+    }
+
     var serr = document.createElement('p'); serr.className = 'err'; sp.appendChild(serr);
     var srow = document.createElement('div'); srow.className = 'srow';
     var ssave = document.createElement('button'); ssave.textContent = 'Save settings';
     var sclose = document.createElement('button'); sclose.className = 'ghost'; sclose.textContent = 'Close';
     srow.appendChild(ssave); srow.appendChild(sclose); sp.appendChild(srow);
-    cog.onclick = function () { sp.style.display = (sp.style.display === 'none') ? '' : 'none'; };
-    sclose.onclick = function () { sp.style.display = 'none'; };
+    cog.onclick = function () {
+      var open = sp.style.display === 'none';
+      sp.style.display = open ? '' : 'none';
+      if (isPrimary) { r0SettingsOpen = open; if (open) load(); } // fill the HomePod picker right away
+    };
+    sclose.onclick = function () { sp.style.display = 'none'; if (isPrimary) r0SettingsOpen = false; };
     ssave.onclick = async function () {
       serr.textContent = ''; ssave.disabled = true;
       var gv = gInput.value.trim();
@@ -1756,29 +1767,18 @@ document.getElementById('addsave').onclick = async function () {
 
 // --- Primary speaker (room 0) picker — back-compat /api/state ---
 async function load() {
+  var list = document.getElementById('hppicker');
+  if (!list) return; // primary card's settings drawer is closed — nothing to fill
   var s;
   try { s = await (await fetch('api/state', {cache:'no-store'})).json(); }
   catch (e) { return; }
-  document.getElementById('speaker').textContent = s.speaker ? ('Primary speaker: ' + s.speaker) : '';
-  var ps = document.getElementById('playstate');
-  if (s.released) {
-    ps.textContent = '⏏ Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
-    ps.className = 'status info'; ps.style.display = '';
-  } else if (s.playing) {
-    ps.textContent = s.now_playing ? ('▶ Playing: ' + s.now_playing) : '▶ Playing';
-    ps.className = 'status ok'; ps.style.display = '';
-  } else if (s.owntone_up) {
-    ps.textContent = '⏸ Idle';
-    ps.className = 'status'; ps.style.display = '';
-  } else {
-    ps.style.display = 'none';
-  }
-  var st = document.getElementById('status');
-  var list = document.getElementById('list');
+  list = document.getElementById('hppicker'); // re-resolve: a refresh may have rebuilt the drawer
+  if (!list) return;
   list.innerHTML = '';
-  if (!s.owntone_up) { st.textContent = 'Audio engine starting…'; st.className = 'status warn'; return; }
-  if (!s.devices.length) { st.textContent = 'Scanning the network for HomePods… (this can take a moment)'; st.className = 'status warn'; }
-  else { st.textContent = s.devices.length + ' AirPlay device(s) found on your network'; st.className = 'status ok'; }
+  var msg = document.getElementById('hpmsg');
+  if (!s.owntone_up) { if (msg) msg.textContent = 'Audio engine starting…'; return; }
+  if (!s.devices.length) { if (msg) msg.textContent = 'Scanning the network for HomePods…'; return; }
+  if (msg && !msg.textContent) msg.textContent = s.devices.length + ' AirPlay device(s) found — pick one to switch.';
   var current = (chosen !== null) ? chosen : s.saved;
   s.devices.forEach(function (d) {
     var row = document.createElement('label');
@@ -1786,57 +1786,20 @@ async function load() {
     var rb = document.createElement('input');
     rb.type = 'radio'; rb.name = 'hp'; rb.value = d.name;
     if (d.name === current) rb.checked = true;
-    rb.onchange = function () { chosen = d.name; document.getElementById('save').disabled = false; };
+    rb.onchange = async function () { // pick = apply immediately (re-points the primary speaker)
+      chosen = d.name;
+      var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Switching to ' + d.name + '…';
+      await fetch('api/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: d.name }) });
+      await load();
+    };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
     if (d.needs_auth) { var b = document.createElement('span'); b.className = 'pill plain pill-auth'; b.textContent = 'needs verification'; row.appendChild(b); }
-    if (d.selected) { var p = document.createElement('span'); p.className = 'pill pill-playing'; p.textContent = 'playing here'; row.appendChild(p); }
+    if (d.selected) { var p = document.createElement('span'); p.className = 'pill plain pill-playing'; p.textContent = 'playing here'; row.appendChild(p); }
     list.appendChild(row);
   });
 }
-document.getElementById('save').onclick = async function () {
-  if (chosen === null) return;
-  this.disabled = true;
-  await fetch('api/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: chosen }) });
-  chosen = null;
-  await load();
-};
-document.getElementById('auto').onclick = async function () {
-  await fetch('api/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '' }) });
-  chosen = null;
-  document.getElementById('save').disabled = true;
-  await load();
-};
-document.getElementById('test').onclick = async function () {
-  this.disabled = true;
-  var m = document.getElementById('testmsg');
-  m.textContent = 'Sending a soft, low-volume tone to the HomePod — listen closely…';
-  try {
-    var r = await (await fetch('api/test', { method: 'POST' })).json();
-    m.textContent = r.playing
-      ? 'Playing a soft tone on: ' + (r.target || 'the selected HomePod') + ' — listen now. No sound? Then it is the AirPlay/volume leg, not Spotify.'
-      : 'No HomePod discovered/selected yet — wait for the list above, or pick one and Save first.';
-  } catch (e) { m.textContent = 'Could not send the test.'; }
-  var btn = this;
-  setTimeout(function () { btn.disabled = false; }, 4000);
-};
-document.getElementById('stop').onclick = async function () {
-  this.disabled = true;
-  var m = document.getElementById('stopmsg');
-  m.textContent = 'Stopping playback on the speaker — this works no matter whose Spotify is playing.';
-  try { await fetch('api/stop', { method: 'POST' }); } catch (e) {}
-  var btn = this;
-  setTimeout(function () { btn.disabled = false; }, 3000);
-};
-document.getElementById('release').onclick = async function () {
-  this.disabled = true;
-  var m = document.getElementById('releasemsg');
-  m.textContent = 'Released — the HomePod is now free to AirPlay from other apps (Mofibo, Apple Music…). Press play in Spotify to take it back.';
-  try { await fetch('api/release', { method: 'POST' }); } catch (e) {}
-  var btn = this;
-  setTimeout(function () { btn.disabled = false; }, 3000);
-};
-function tick() { load(); loadRooms(); }
+function tick() { loadRooms().then(load); } // build rooms first so #hppicker exists before load() fills it
 tick();
 setInterval(tick, 5000);
 </script>
