@@ -22,16 +22,16 @@ User report: *"Højt, skift af lydstyrke, miste forbindelse til connect-højtale
 
 | # | Symptom | Most likely cause (suspect) | Where |
 |---|---------|------------------------------|-------|
-| R1 | Volume still goes **loud** on a fresh claim | The held-window cap (0.17.0) fights Spotify re-asserting its level; `lastGoodVol` may have latched a high value during steady playback, so the "cap" target is high | `main.go:680-710` |
-| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | Cap block sets `volCanon=-1` every tick during the 8 s window → reconcile re-seeds each tick while the cap re-applies → ping-pong with `decideVolume` | `main.go:680-710`, `decideVolume` `main.go:439-462` |
-| R3 | **Loses the Connect speaker** in the Spotify app | go-librespot is **restarted** on name-forward, which now fires from the panel's auto-apply-on-pick (0.15.0) and from any HomePod re-bind; each restart drops the Connect session | `/api/select` `main.go:996-1051`, `select.go:82-90` |
-| R4 | General "weird" instability | Recurring `/events` websocket errors (`StatusNoStatusRcvd`) every ~30 s → manager keeps reconnecting to go-librespot; combined with restarts above | `events.go:139-256` |
+| R1 | Volume still goes **loud** on a fresh claim | Held-window cap; if `lastGoodVol` latched high during steady playback, the frozen `capTarget` is high. 0.18.0 holds a fixed level (no oscillation) — **needs on-device check** that the level is right | `main.go:683-707` | 🟡 (improved 0.18.0, verify) |
+| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | Cap block set `volCanon=-1` every tick → ping-pong with `decideVolume`. **Fixed 0.18.0**: window holds a frozen `capTarget` and skips the reconcile entirely while open | `main.go:683-734` | ✅ **fixed 0.18.0** (verify) |
+| R3 | **Loses the Connect speaker** in the Spotify app | go-librespot restarted on name-forward, fired by the panel's auto-apply-on-pick (0.15.0). **Mitigated 0.18.0**: explicit **Save HomePod** button — picking no longer restarts until you confirm. (A deliberate Save still restarts once — unavoidable for a re-point.) | `main.go` picker; `/api/select` `main.go:1000-1051` | 🟡 **mitigated 0.18.0** |
+| R4 | General "weird" instability | Recurring `/events` websocket errors (`StatusNoStatusRcvd`) every ~30 s — **predates these versions** (Wave 3, 0.12.0), present in the 10:35 log before 0.16/0.17. Polling fallback keeps state fresh, so noisy but likely not the main cause | `events.go:139-256` | ⚪ open (pre-existing) |
 
-**Recommended next step (decision needed):** the volume + connection core was stable at **0.14.0**.
-The cleanest path is to **revert the manager volume/never-loud + auto-apply changes to the 0.14.0
-baseline** (ship as 0.18.0), confirm stability on-device, then re-introduce never-loud *carefully with
-on-device testing before shipping*. Keep the panel cleanup (0.15.0 UI) and in-panel changelog, which
-are unrelated to the audio path. See "Revert plan" at the bottom.
+**Decision taken (2026-06-22):** user chose **fix-forward**. 0.18.0 fixes R2 (oscillation) and mitigates
+R3 (explicit Save). R1 needs an on-device check of the held level; R4 (ws churn) is older and tracked
+separately. "Auto-play on select" is **standard Spotify Connect** (selecting a device transfers+plays)
+or the **PodVoice/Gemini** add-on issuing play — *not* PodConnect (its `/api/select` never starts
+playback). PodVoice is a separate repo and can't be diagnosed from here.
 
 ---
 

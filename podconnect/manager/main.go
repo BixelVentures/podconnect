@@ -576,7 +576,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false              // edge-detect a NEW session (inactive->active) to arm the never-loud cap
 	freshCapPending := false         // fresh-session volume clamp is armed (held for freshCapWindow)
-	lastGoodVol := initialVolumeCap  // rolling "house" level: the cap TARGET, so your own resume returns here
+	lastGoodVol := initialVolumeCap  // rolling "house" level, updated during steady playback
+	capTarget := initialVolumeCap    // FROZEN target held during the fresh-session window (captured when armed)
 	var capDeadline time.Time        // end of the current fresh-session clamp window
 	prearmNext := time.Now()         // throttle for the idle "hold the HomePod output low" safety guard
 	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
@@ -605,6 +606,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// on reclaim below (resume after a grace-release). This is the backup so no claim is loud.
 			if gl.Active && !prevActive {
 				freshCapPending = true
+				capTarget = lastGoodVol
 				capDeadline = time.Now().Add(freshCapWindow)
 			}
 
@@ -648,8 +650,9 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					log.Printf("[%s]: reclaimed HomePod (playback resumed)", room.Name)
 					released = false
 					// Resume after a grace-release is a (re)claim: re-arm the clamp window so the first
-					// audio can't blast (clamped to lastGoodVol — your own level, not a hard floor).
+					// audio can't blast (held at lastGoodVol — your own level, not a hard floor).
 					freshCapPending = true
+					capTarget = lastGoodVol
 					capDeadline = time.Now().Add(freshCapWindow)
 				}
 			} else {
@@ -677,45 +680,46 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			}
 
 			if gl.Active && !released {
+				inCapWindow := false
 				if freshCapPending {
-					// Fresh-session clamp. Held for freshCapWindow (not one-shot) because Spotify can
-					// RE-ASSERT a remembered 100% across several ticks during a claim — a single cap then
-					// gets mirrored back up. Clamp BOTH sides to <= lastGoodVol (the house's last steady
-					// level), so YOUR OWN resume returns to your level while a brand-new session — where
-					// lastGoodVol defaults to initialVolumeCap — starts quiet. Lower-only; re-seed from
-					// the capped go-librespot level so the reconcile can't adopt the HomePod's loud read.
-					if gl.HasVol && gl.VolPct > lastGoodVol {
-						setLibrespotVolumePct(room.Librespot, lastGoodVol)
-						gl.VolPct = lastGoodVol
-					}
-					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > lastGoodVol {
-						setOwntoneOutputVolume(room.OwnTone, id, lastGoodVol)
-					}
-					volCanon = -1
-					if time.Now().After(capDeadline) {
+					if time.Now().Before(capDeadline) {
+						// Fresh-session HOLD: pin BOTH sides to a FROZEN target for the window and SKIP the
+						// reconcile below — so it can't oscillate (the old per-tick re-seed ping-ponged with
+						// decideVolume). Spotify re-asserts a remembered 100% several times during a claim;
+						// we just re-pin capTarget (your last steady level; defaults to initialVolumeCap for
+						// a brand-new session). Re-pin only when off by > tolerance, so no log/IO spam.
+						inCapWindow = true
+						if gl.HasVol && abs(gl.VolPct-capTarget) > volTol {
+							setLibrespotVolumePct(room.Librespot, capTarget)
+						}
+						if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-capTarget) > volTol {
+							setOwntoneOutputVolume(room.OwnTone, id, capTarget)
+						}
+						volCanon = capTarget
+					} else {
 						freshCapPending = false
-						log.Printf("volume [%s]: fresh-session cap lifted (held <= %d%%)", room.Name, lastGoodVol)
+						volCanon = -1 // window over: re-seed the reconcile from live truth
+						log.Printf("volume [%s]: fresh-session cap lifted (held at %d%%)", room.Name, capTarget)
 					}
 				}
-				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
 				otState := owntonePlayerState(room.OwnTone)
 
-				// Volume — both directions.
-				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
-				if freshCapPending && vc > lastGoodVol {
-					vc = lastGoodVol // hard backup: the HomePod must NEVER exceed the safe level mid-window
-				}
-				volCanon = vc
-				if !freshCapPending && playing {
-					lastGoodVol = vc // track your chosen level during steady playback — the next cap target
-				}
-				if vGl {
-					setLibrespotVolumePct(room.Librespot, vc)
-					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
-				}
-				if vOt && otID != "" {
-					setOwntoneOutputVolume(room.OwnTone, otID, vc)
-					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
+				// Volume — both directions. Skipped while the fresh-session hold pins a frozen level.
+				if !inCapWindow {
+					otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
+					vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
+					volCanon = vc
+					if playing {
+						lastGoodVol = vc // track your chosen level during steady playback — the next cap target
+					}
+					if vGl {
+						setLibrespotVolumePct(room.Librespot, vc)
+						log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
+					}
+					if vOt && otID != "" {
+						setOwntoneOutputVolume(room.OwnTone, otID, vc)
+						log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
+					}
 				}
 
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
@@ -1636,6 +1640,13 @@ const indexHTML = `<!doctype html>
   <details class="changelog">
     <summary>What's new</summary>
     <div class="rel">
+      <h3>0.18.0 <span class="when">— 2026-06-22</span></h3>
+      <ul>
+        <li>Fixed volume jumping around on a fresh claim — the cap now holds one steady level instead of fighting Spotify each tick.</li>
+        <li>Picking a HomePod no longer drops the Connect speaker in the Spotify app on every tap — use the new <b>Save HomePod</b> button to confirm a change.</li>
+      </ul>
+    </div>
+    <div class="rel">
       <h3>0.17.0 <span class="when">— 2026-06-22</span></h3>
       <ul>
         <li>Never-loud, properly: a freshly-claimed speaker can no longer blast at 100%. The cap now holds for a few seconds across the claim and clamps to your own last level — so resuming after a grace-release returns to <i>your</i> volume, not a hard 35%.</li>
@@ -1750,6 +1761,16 @@ async function loadRooms() {
       var hp = document.createElement('div'); hp.className = 'list'; hp.id = 'hppicker'; sp.appendChild(hp);
       var hpm = document.createElement('p'); hpm.className = 'hpmsg'; hpm.id = 'hpmsg'; sp.appendChild(hpm);
       var hrow = document.createElement('div'); hrow.className = 'srow';
+      // Explicit Save — picking a HomePod restarts go-librespot (the Connect device blips in the
+      // Spotify app), so DON'T apply on every radio tap; apply once when the user confirms.
+      var hsave = document.createElement('button'); hsave.id = 'hpsave'; hsave.textContent = 'Save HomePod'; hsave.disabled = true;
+      hsave.onclick = async function () {
+        if (chosen === null) return;
+        hsave.disabled = true;
+        var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Switching to ' + chosen + '… (the Connect device briefly re-appears in Spotify)';
+        await fetch('api/select', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: chosen }) });
+        chosen = null; await load();
+      };
       var hauto = document.createElement('button'); hauto.className = 'ghost'; hauto.textContent = 'Auto (no fixed HomePod)';
       hauto.onclick = async function () {
         var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Cleared — auto-picks a free HomePod.';
@@ -1761,7 +1782,7 @@ async function loadRooms() {
         var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
         try { await fetch('api/release', { method:'POST' }); } catch (e) {}
       };
-      hrow.appendChild(hauto); hrow.appendChild(hrel); sp.appendChild(hrow);
+      hrow.appendChild(hsave); hrow.appendChild(hauto); hrow.appendChild(hrel); sp.appendChild(hrow);
     }
 
     var serr = document.createElement('p'); serr.className = 'err'; sp.appendChild(serr);
@@ -1860,11 +1881,10 @@ async function load() {
     var rb = document.createElement('input');
     rb.type = 'radio'; rb.name = 'hp'; rb.value = d.name;
     if (d.name === current) rb.checked = true;
-    rb.onchange = async function () { // pick = apply immediately (re-points the primary speaker)
+    rb.onchange = function () { // pick selects only — apply via "Save HomePod" (avoids a restart per tap)
       chosen = d.name;
-      var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Switching to ' + d.name + '…';
-      await fetch('api/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: d.name }) });
-      await load();
+      var sv = document.getElementById('hpsave'); if (sv) sv.disabled = false;
+      var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Press "Save HomePod" to switch to ' + d.name + '.';
     };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);

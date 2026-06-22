@@ -8,6 +8,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.18.0 — 2026-06-22  (Stop the volume oscillation + Connect-drop on every pick)
+- **Volume no longer jumps around (R2).** The 0.17.0 fresh-session cap re-seeded the reconcile
+  (`volCanon=-1`) on every 200 ms tick, which ping-ponged with `decideVolume` (the 90→25→12→17
+  cascade). Now the fresh-session window **holds a single frozen level** (`capTarget`, captured when
+  the window arms) and **skips the volume reconcile entirely** while it's open — then resumes normal
+  bidirectional sync when the window ends. No oscillation.
+- **Picking a HomePod no longer drops the Connect device on every tap (R3).** 0.15.0 auto-applied the
+  picker on every radio change → each one restarted go-librespot (the Connect speaker blips out of the
+  Spotify app). Restored an explicit **Save HomePod** button: the radio just selects; nothing restarts
+  until you press Save.
+- Known/unchanged: the recurring `/events` websocket reconnects predate these versions (Wave 3,
+  0.12.0) and are tracked separately; "auto-play on select" is standard Spotify Connect / the PodVoice
+  voice add-on, not PodConnect. See [`docs/FEATURE-STATUS.md`](docs/FEATURE-STATUS.md).
+
 ## Speakers 0.17.0 — 2026-06-22  (Never-loud done right + in-panel changelog)
 - **A freshly-claimed speaker can no longer blast at 100% — for real this time.** 0.16.0 capped only
   at selection time, but the reconcile then mirrored go-librespot's remembered 100% straight back to
