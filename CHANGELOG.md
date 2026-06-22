@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.19.0 — 2026-06-22  (Reject play-by-query — stop the wrong-music blast, R5)
+- **`/api/play?query=…` is now rejected (400) instead of silently resuming.** PodVoice/Gemini was
+  calling `POST /api/play?query=Dua Lipa`; `/api/play` ignored the query and sent **resume to every
+  room**, so a "play X" voice command un-paused whatever was last loaded on **all** speakers (the
+  "weird auto-play / random blast"). go-librespot is a Connect *receiver* with no Web API — it can't
+  search/start a track. Now a `?query=` returns a clear 400 pointing callers at the right path.
+- **The correct path for "play X"** is the Spotify **Web API** via the Control integration
+  (`media_player.play_media` on the speaker entity) — not PodConnect. The PodVoice fix routing voice
+  "play" there is tracked separately (different add-on/repo). See [`docs/FEATURE-STATUS.md`](docs/FEATURE-STATUS.md) R5.
+- `/api/play` with no `query` still resumes (honoring an optional `room`) exactly as before.
+
 ## Speakers 0.18.0 — 2026-06-22  (Stop the volume oscillation + Connect-drop on every pick)
 - **Volume no longer jumps around (R2).** The 0.17.0 fresh-session cap re-seeded the reconcile
   (`volCanon=-1`) on every 200 ms tick, which ping-ponged with `decideVolume` (the 90→25→12→17

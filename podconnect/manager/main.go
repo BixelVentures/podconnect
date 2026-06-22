@@ -1134,6 +1134,16 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		// /api/play only RESUMES a paused session. It CANNOT play-by-query: go-librespot is a Spotify
+		// Connect *receiver* with no Web API, so a ?query=<text> can't be searched/started here. Reject
+		// it loudly instead of silently resuming the wrong/last track on every room (the R5 bug) — a
+		// caller wanting "play X" must use the Spotify Web API: the Control integration's
+		// media_player.play_media on the target speaker entity.
+		if q := r.URL.Query().Get("query"); q != "" {
+			log.Printf("play rejected: ?query=%q not supported — use the Web API (Control media_player.play_media)", q)
+			http.Error(w, "play-by-query not supported: /api/play only resumes. Play a track via the Spotify Web API (Control media_player.play_media) on the speaker entity.", http.StatusBadRequest)
+			return
+		}
 		for _, rm := range targetRooms(r) {
 			librespotTransport(rm.Librespot, "resume")
 		}
@@ -1639,6 +1649,10 @@ const indexHTML = `<!doctype html>
 
   <details class="changelog">
     <summary>What's new</summary>
+    <div class="rel">
+      <h3>0.19.0 <span class="when">— 2026-06-22</span></h3>
+      <ul><li>"Play &lt;song&gt;" via voice no longer un-pauses random old music on every speaker — PodConnect now rejects play-by-query (that belongs to the Spotify Web API, not the local engine).</li></ul>
+    </div>
     <div class="rel">
       <h3>0.18.0 <span class="when">— 2026-06-22</span></h3>
       <ul>
