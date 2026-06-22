@@ -32,6 +32,10 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 - **Sharing ("deling"):** **⏹ Stop** pauses whoever is playing (any account, local); **⏏ Release**
   frees the HomePod for other AirPlay apps (Mofibo, Apple Music). Auto-release after an idle grace
   period, auto-reclaim on resume.
+- **Voice-duck Attention API** (`/api/attention`) — an external voice-assistant gatekeeper can dip a
+  room's music while it talks and let it back up, without fighting the volume sync. The duck wins
+  while held and **auto-releases** if the agent stops (heartbeat + deadline), so the music can't get
+  stuck quiet. Optional shared-secret guard. Contract: [`docs/ATTENTION-API.md`](docs/ATTENTION-API.md).
 - Built-in **test tone**, go-librespot watchdog. Installed via the HA **Add-on Store** (prebuilt
   image, aarch64 + amd64 — no on-device build).
 

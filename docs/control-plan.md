@@ -69,6 +69,18 @@ facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTR
   loop-protection. **Bidirectional:** HomePod hardware buttons move Spotify/HA and vice-versa; a fresh
   session is capped so it never starts at full blast. Lives in the add-on for locality + independence.
 
+## Voice ducking — the Attention API (✅ built, Speakers 0.14.0)
+- The add-on exposes **`/api/attention`** so an *external* voice-assistant gatekeeper can dip a room's
+  music while it talks, then release it — an **absolute, idempotent, owner+deadline** duck the volume
+  relay respects (the duck wins; the reconcile is suspended while held; transport keeps playing
+  underneath). A **heartbeat** (re-POST) holds it; stop and it **auto-releases** on the deadline, so a
+  crashed agent can't leave the music stuck quiet. Optional `attention_token` guards it.
+- **Decoupled by design — the voice agent is a separate project.** PodConnect owns audio + volume;
+  the gatekeeper (Gemini Live, Voice PE, VAD, tool-calling) lives in its own repo and consumes only
+  this one endpoint. Contract: [`ATTENTION-API.md`](ATTENTION-API.md). Same separation rationale as
+  Control ↔ Speakers — different language, runtime, and failure domain; a voice hiccup must never take
+  playback down.
+
 ## Phases
 0. **Add-on reliability — ✅ done:** avahi-readiness wait; single mDNS stack (`zeroconf_backend: avahi`);
    `.metadata` pipe; go-librespot watchdog.

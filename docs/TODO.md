@@ -1,9 +1,9 @@
 # PodConnect — TODO
 
-_Updated 2026-06-20. Speakers add-on **0.12.0**, Control integration **0.7.1**. The engine roadmap
-(multi-room · naming · per-room settings · never-loud · push-state) and the Control feature set
-(search/browse/shuffle/repeat) are all built. What's left is on-device validation + a couple of
-polish items._
+_Updated 2026-06-20. Speakers add-on **0.14.0**, Control integration **0.7.1**. The engine roadmap
+(multi-room · naming · per-room settings · never-loud · push-state · **voice-duck attention API**) and
+the Control feature set (search/browse/shuffle/repeat) are all built. What's left is on-device
+validation + a couple of polish items._
 
 ## ✅ Done (it works, end to end)
 **Speakers (add-on, 0.12.0):** HomePod picker (no-typing, `AirPlay 2` fix), test-sound, stable
@@ -17,6 +17,9 @@ account's new session can't start loud). **Transport sync** (flicker-free, rapid
 **Snappy skips** (`start_buffer_ms = 500`). **Push-state** (go-librespot `/events` websocket, stdlib
 client, with `/status` poll fallback + 3 s re-seed). **Grace-release** (configurable `grace_minutes`,
 reclaim on resume, + manual "⏏ Release"). **Stop button** (`/api/stop`, account-agnostic local pause).
+**Voice-duck Attention API** (`/api/attention`, 0.14.0) — external voice gatekeeper ducks a room with
+an owner+deadline heartbeat; duck wins over the relay; auto-releases if the agent stops. Contract in
+[`ATTENTION-API.md`](ATTENTION-API.md); the voice agent itself is a **separate project**.
 **Control (integration, 0.7.1):** media_player per Connect device (transport/volume/play/source),
 **shuffle**, **repeat**, **optimistic UI**, **search** (`SEARCH_MEDIA` → `/search`, popularity-ranked,
 incl. **audiobooks / shows / episodes**) and **profile browse** (Playlists / Top Artists / Top Tracks
@@ -37,6 +40,12 @@ for the extra scopes.)
 Multi-room ships as code but needs the VM/Green to prove process spawning, mDNS, and two rooms at
 once. Push-state likewise needs the real ws connect + event payloads confirmed (poll fallback keeps
 it working regardless). See [`GREEN-TESTING.md`](GREEN-TESTING.md) and [`TEST-CHECKLIST.md`](TEST-CHECKLIST.md).
+
+**Attention/duck API (0.14.0):** the duck state machine (`att.tick`) and the HTTP layer are
+unit/httptest-covered, but the **`roomBridge` loop integration** — forcing the level, *skipping the
+reconcile* while held, restore, and the never-loud latch — is **not loop-tested** (consistent with
+`roomBridge` never having had a loop test) and needs Green/VM validation. Steps in
+[`TEST-CHECKLIST.md`](TEST-CHECKLIST.md) §G.
 
 ### Track-change buffer-flush (Green-deferred)
 Unblocked by push-state's track-change signal (`metadata.uri`); still built + tuned on the wired

@@ -135,6 +135,21 @@ func readHomepodName() string {
 	return o.HomepodName
 }
 
+// readAttentionToken is the optional shared secret guarding the Attention API. Empty ("" option, the
+// default) leaves /api/attention open — fine on a trusted LAN. When set, requests must carry it in
+// the X-PodConnect-Token header (the duck primitive is the one endpoint built for EXTERNAL control).
+func readAttentionToken() string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return ""
+	}
+	var o struct {
+		AttentionToken string `json:"attention_token"`
+	}
+	_ = json.Unmarshal(b, &o)
+	return strings.TrimSpace(o.AttentionToken)
+}
+
 // fetchOutputsFrom returns the AirPlay outputs a given OwnTone instance has discovered, and whether
 // it answered. Parsed defensively (map + UseNumber) so a field OwnTone serializes as a number rather
 // than a string — notably the 64-bit output "id" — can't make a strict decoder drop every device.
@@ -541,10 +556,11 @@ func reclaimHomePod(room *Room) {
 // Loop-protected via canonical values. initialVolumeCap stops a session Spotify remembers at 100%
 // from starting at full blast (once per manager start, so it doesn't fight reconnects). Skipped
 // while THIS room's test tone plays. Per-room. Uses only verified APIs.
-func roomBridge(room *Room, tone *boolFlag, live *glLive) {
+func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // re-cap EVERY fresh session (the old once-per-boot flag let a 2nd account through)
+	freshCapPending := false // a session (re)started while a duck held the loop: cap it on release (never-loud)
 	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
 	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
 	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
@@ -564,6 +580,38 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive) {
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl := live.Get()
+
+			// Wave 4: attention/duck. An external agent (voice gatekeeper) holds the room quiet. The
+			// duck WINS — hold the HomePod at the target and SKIP the reconcile this tick (so a HomePod
+			// button or the volume mirror can't fight it); transport below keeps running so the music
+			// plays quietly underneath. volCanon=-1 re-seeds the reconcile so it re-converges on the
+			// live go-librespot truth once the duck ends. On the release edge, restore the pre-duck
+			// level explicitly (covers an idle room, where the reconcile wouldn't run).
+			if hold, lvl, attReleased, restoreTo := att.tick(time.Now()); hold {
+				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v != lvl {
+					setOwntoneOutputVolume(room.OwnTone, id, lvl)
+					log.Printf("attention [%s]: held at %d%%", room.Name, lvl)
+				}
+				volCanon = -1
+				// Keep the never-loud bookkeeping alive while ducked: if a session (re)starts during the
+				// duck (e.g. another account grabs the HomePod), latch it so the fresh-session cap fires
+				// on release — otherwise the reconcile would re-seed from a remembered 100% and blast.
+				if gl.Active && !prevActive {
+					freshCapPending = true
+				}
+				prevActive = gl.Active
+				time.Sleep(200 * time.Millisecond)
+				continue
+			} else if attReleased {
+				if restoreTo >= 0 {
+					if _, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" {
+						setOwntoneOutputVolume(room.OwnTone, id, restoreTo)
+						log.Printf("attention [%s]: released — restored to %d%%", room.Name, restoreTo)
+					}
+				}
+				volCanon = -1
+			}
+
 			playing := gl.Active && !gl.Paused && !gl.Stopped
 			released := fileExists(releasedPath(room))
 
@@ -602,9 +650,12 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive) {
 			}
 
 			if gl.Active && !released {
-				if !prevActive {
-					// Fresh session: cap BOTH sides to <= the ceiling before the reconcile can mirror
-					// a remembered 100% up to the HomePod.
+				if !prevActive || freshCapPending {
+					// Fresh session (or one that (re)started while a duck held the loop): cap BOTH sides
+					// to <= the ceiling before the reconcile can mirror a remembered 100% up to the
+					// HomePod. freshCapPending covers a session swap during a duck, where prevActive was
+					// kept truthful across the hold and so wouldn't trip the !prevActive path alone.
+					freshCapPending = false
 					if gl.HasVol && gl.VolPct > initialVolumeCap {
 						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
 						gl.VolPct = initialVolumeCap
@@ -767,6 +818,21 @@ func toneFor(id string) *boolFlag {
 	return &boolFlag{} // detached gate if the room isn't supervised (tests / race on add)
 }
 
+// attentionFor returns a room's live duck state, or nil if the room isn't supervised (the bridge that
+// consumes it isn't running, so engaging would have no effect).
+func attentionFor(id string) *attention {
+	if rt := mgr.runtime(id); rt != nil {
+		return &rt.att
+	}
+	return nil
+}
+
+// attentionAuthed checks the optional shared-secret header. Open when no token is configured.
+func attentionAuthed(r *http.Request) bool {
+	tok := readAttentionToken()
+	return tok == "" || r.Header.Get("X-PodConnect-Token") == tok
+}
+
 // startRoomBridge wires up one room's push-state pipeline: a glLive fed by runGLEvents (ws /events,
 // seeded + falling back to /status polling) and the roomBridge that reads it in-memory each tick.
 // Both stop when the runtime's stop channel closes (room removal / shutdown); if the room isn't
@@ -776,11 +842,11 @@ func startRoomBridge(room *Room) {
 	if rt == nil {
 		live := &glLive{}
 		go runGLEvents(room, live, make(chan struct{}))
-		go roomBridge(room, &boolFlag{}, live)
+		go roomBridge(room, &boolFlag{}, live, &attention{})
 		return
 	}
 	go runGLEvents(room, &rt.live, rt.stop)
-	go roomBridge(room, &rt.tonePlaying, &rt.live)
+	go roomBridge(room, &rt.tonePlaying, &rt.live, &rt.att)
 }
 
 func main() {
@@ -1059,6 +1125,11 @@ func main() {
 		writeJSON(w, map[string]bool{"ok": true})
 	})
 
+	// /api/attention[/release] — the duck primitive for external agents (e.g. a voice gatekeeper).
+	// Extracted into package-level handlers (below) so they're testable; see attentionHandler.
+	http.HandleFunc("/api/attention", attentionHandler)
+	http.HandleFunc("/api/attention/release", attentionReleaseHandler)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -1070,6 +1141,92 @@ func main() {
 
 	log.Printf("podconnect-manager listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+// attentionHandler serves /api/attention.
+//
+//	GET                                           → current per-room duck state
+//	POST {room, level, owner?, ttl_ms?, fade_ms?} → engage or heartbeat-extend a room's duck
+//
+// Idempotent: re-POSTing the same room extends the deadline (heartbeat); if the heartbeat stops the
+// duck AUTO-RELEASES at the deadline (ttl_ms clamped to maxAttentionTTL) and the bridge restores the
+// pre-duck level. fade_ms is accepted and reserved (v1 is instant). Guarded by attention_token.
+func attentionHandler(w http.ResponseWriter, r *http.Request) {
+	if !attentionAuthed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method == http.MethodGet {
+		out := map[string]attSnapshot{}
+		for _, rm := range loadRooms() {
+			if a := attentionFor(rm.ID); a != nil {
+				out[rm.ID] = a.snapshot(time.Now())
+			}
+		}
+		writeJSON(w, map[string]any{"rooms": out})
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Room   string `json:"room"`
+		Level  int    `json:"level"`
+		Owner  string `json:"owner"`
+		TTLMS  int    `json:"ttl_ms"`
+		FadeMS int    `json:"fade_ms"` // reserved (v1 is instant)
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	rm := roomByID(body.Room)
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	a := attentionFor(rm.ID)
+	if a == nil {
+		http.Error(w, "room not supervised", http.StatusServiceUnavailable)
+		return
+	}
+	ttl := clampAttentionTTL(time.Duration(body.TTLMS) * time.Millisecond)
+	owner := strings.TrimSpace(body.Owner)
+	if owner == "" {
+		owner = "external"
+	}
+	prev := -1 // capture the pre-duck HomePod level so the bridge can restore it on release
+	if v, _, ok := owntoneOutputVolume(rm.OwnTone); ok {
+		prev = v
+	}
+	a.engage(body.Level, prev, owner, ttl, time.Now())
+	log.Printf("attention [%s]: duck to %d%% (owner=%s ttl=%s)", rm.Name, clampPct(body.Level), owner, ttl)
+	writeJSON(w, a.snapshot(time.Now()))
+}
+
+// attentionReleaseHandler serves POST /api/attention/release — end a room's duck now; the bridge
+// restores the pre-duck level on its next tick.
+func attentionReleaseHandler(w http.ResponseWriter, r *http.Request) {
+	if !attentionAuthed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Room string `json:"room"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	rm := roomByID(body.Room)
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	if a := attentionFor(rm.ID); a != nil {
+		a.release()
+		log.Printf("attention [%s]: release requested", rm.Name)
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 // targetRooms resolves which rooms a transport/release request applies to: a "room" query param

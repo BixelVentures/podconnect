@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.13.0"
+version: "0.14.0"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -27,9 +27,11 @@ options:
   bitrate: "320"             # GLOBAL DEFAULT — overridable per-room in the panel (⚙ Settings)
   network_interface: ""
   grace_minutes: 3           # GLOBAL DEFAULT (hold the HomePod this long after playback stops) — overridable per-room
+  attention_token: ""        # optional shared secret for the /api/attention duck API (voice gatekeeper); empty = open on the LAN
 schema:
   speaker_name: "str?"
   homepod_name: "str?"
   bitrate: "list(96|160|320)"
   network_interface: "str?"
   grace_minutes: "int(0,120)?"
+  attention_token: "str?"

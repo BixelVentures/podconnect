@@ -55,6 +55,7 @@ fallbacks:
 | `bitrate` | **Default** bitrate (`320`); a per-room ⚙ Settings value overrides it. |
 | `grace_minutes` | **Default** hold time before freeing an idle HomePod (`3`; `0` = free as soon as idle); per-room ⚙ Settings overrides it. |
 | `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface. |
+| `attention_token` | *(advanced)* optional shared secret guarding the `/api/attention` **duck API** (for a voice-assistant gatekeeper). When set, those requests must send `X-PodConnect-Token`. Blank = open on the LAN. See [`docs/ATTENTION-API.md`](../docs/ATTENTION-API.md). |
 
 ## 5. Test it
 

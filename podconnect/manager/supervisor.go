@@ -32,8 +32,9 @@ type roomRuntime struct {
 	glCmd *exec.Cmd
 	otCmd *exec.Cmd
 
-	tonePlaying boolFlag // per-room test-tone gate (pauses that room's bridge)
-	live        glLive   // Wave 3: latest go-librespot state, pushed by runGLEvents (poll fallback)
+	tonePlaying boolFlag  // per-room test-tone gate (pauses that room's bridge)
+	live        glLive    // Wave 3: latest go-librespot state, pushed by runGLEvents (poll fallback)
+	att         attention // Wave 4: external duck/attention state (voice gatekeeper)
 }
 
 // roomManager owns every room's runtime, guarded by a mutex.

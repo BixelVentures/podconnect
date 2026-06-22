@@ -8,6 +8,31 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.14.0 — 2026-06-20  (Attention/duck API — Wave 4)
+- **New `/api/attention` duck primitive** so an external agent (a voice-assistant gatekeeper) can
+  dip a room's music while it talks, then let it back up — without ever fighting the volume relay.
+  `POST {room, level, owner?, ttl_ms?}` engages or **heartbeat-extends** a duck; `POST
+  /api/attention/release {room}` ends it; `GET` returns per-room state. Absolute, idempotent target
+  with an **owner + deadline**.
+- **Auto-release watchdog, built into the API.** A duck holds only as long as the agent keeps
+  re-POSTing (heartbeat). Stop — crash, Wi-Fi drop, killed session — and it **auto-releases at the
+  deadline** (default 2 s), restoring the pre-duck level. The agent never has to clean up; the music
+  can't get stuck quiet.
+- **The duck wins, locally.** While active, the per-room bridge **holds the HomePod at the target and
+  suspends the volume reconcile**, so a HomePod button or the Spotify mirror can't undo it. Transport
+  keeps running — the music plays quietly underneath (the "polite waiter"), exactly as the voice
+  design intends. On release the pre-duck level is restored and the reconcile re-seeds.
+- **Optional `attention_token`** option: when set, `/api/attention` requires an `X-PodConnect-Token`
+  header (this is the one endpoint built for *external* control). Empty = open on a trusted LAN.
+- **`ttl_ms` clamped to a 15 s ceiling** so a single large-TTL request + crash can't pin the music
+  quiet and defeat the auto-release — the model is "hold only as long as you heartbeat".
+- **Never-loud survives a duck.** A fresh session that starts *while* a room is ducked (another
+  account grabbing the HomePod mid-conversation) is still capped on release — it can't escape to a
+  remembered 100%.
+- v1 is instant (no fade); `fade_ms` is accepted and reserved. Contract documented in
+  [`docs/ATTENTION-API.md`](docs/ATTENTION-API.md) — the only binding between PodConnect and a
+  separate voice project.
+
 ## Control 0.7.1 — 2026-06-19  (reverts the 0.7.0 local entities)
 - **No duplicate entities.** 0.7.0 surfaced a *second* media_player (+ Release button) per HomePod
   alongside the Spotify Connect one — two players per speaker, which is the wrong UX. Reverted: Control

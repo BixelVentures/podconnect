@@ -4,7 +4,7 @@ Everything shipped but not yet validated on hardware. Tick as you go. **Do multi
 first** — it replaced the s6 audio services with manager supervision.
 
 ## A. Update / install
-- [ ] Add-on → **0.12.0** (Add-on Store). Control → **0.7.1** (HACS).
+- [ ] Add-on → **0.14.0** (Add-on Store). Control → **0.7.1** (HACS).
 - [ ] **Re-authorize Control once** (profile scopes from 0.5.0 — else Top/Recent/Liked are empty).
 
 ## B. Speakers — single room (r0 must still work after the multi-room migration)
@@ -40,5 +40,24 @@ first** — it replaced the s6 audio services with manager supervision.
 ## F. Cross-account (the wife scenario)
 - [ ] Another account plays on a HomePod → **⏹ Stop** in the add-on **panel** (or "Hey Siri, stop") → it stops.
 
+## G. Attention / voice-duck API (0.14.0 — the only part not loop-tested)
+> **Coverage note.** The duck state machine is **unit-tested** (`att.tick` engage/heartbeat/expiry/
+> release, TTL clamp) and the HTTP layer is **httptest-covered** (engage/GET/release, auth, 404/503/
+> 405). What is **not** unit-tested is the `roomBridge` *loop integration* — the actual I/O of forcing
+> the HomePod level, **skipping the reconcile** while held, restoring on release, and the **never-loud
+> latch** (a fresh session that starts mid-duck). `roomBridge` has never had a loop test (it's a
+> live-I/O 200 ms loop), so this gap is on par with existing coverage and lands here, on hardware.
+- [ ] **Duck:** `curl -XPOST <host>:8099/api/attention -d '{"room":"r0","level":5,"ttl_ms":2000}'`
+      while music plays → HomePod drops to ~5% within a tick; **music keeps playing** (not paused).
+- [ ] **Heartbeat holds:** re-POST every ~0.5 s → stays ducked; a HomePod button press does **not**
+      pull it back up while held (the duck wins).
+- [ ] **Auto-release:** stop POSTing → within ~`ttl_ms` the volume **restores** to the pre-duck level
+      on its own (no release call needed).
+- [ ] **Explicit release:** `POST /api/attention/release {"room":"r0"}` → restores immediately.
+- [ ] **Lounge step:** `level:35` after the AI "finishes" → fades to ~35% and holds; release → back up.
+- [ ] **Never-loud across a duck:** while ducked, have a *second* account grab the HomePod → on
+      release the volume must **not** jump to a remembered 100% (the fresh-session cap still fires).
+- [ ] **Auth:** set `attention_token` → requests without `X-PodConnect-Token` get **401**.
+
 ---
-_Reference: `docs/GREEN-TESTING.md` (deeper bring-up + the deferred buffer-flush §D)._
+_Reference: `docs/ATTENTION-API.md` (the duck contract) · `docs/GREEN-TESTING.md` (deeper bring-up + the deferred buffer-flush §D)._
