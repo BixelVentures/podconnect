@@ -8,6 +8,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.17.0 — 2026-06-22  (Never-loud done right + in-panel changelog)
+- **A freshly-claimed speaker can no longer blast at 100% — for real this time.** 0.16.0 capped only
+  at selection time, but the reconcile then mirrored go-librespot's remembered 100% straight back to
+  the HomePod (and a session that attached *paused/released* slipped past the inactive→active edge
+  entirely, so the cap never fired). Logs showed the HomePod sitting at 100% for ~20s after a claim.
+- **The cap is now a held window, not a one-shot.** On every claim/reclaim the fresh-session clamp is
+  armed for a few seconds (`freshCapWindow`) and re-applied each tick, because Spotify re-asserts a
+  remembered 100% several times during a claim. A hard backup also clamps the value the reconcile
+  pushes to the HomePod while the window is open — so no claim is ever loud.
+- **Smarter target — your own resume isn't nerfed.** The clamp target is `lastGoodVol` (the room's
+  last steady level), not a hard 35%. So resuming **your own** session after a grace-release returns
+  to *your* volume; a brand-new session (where `lastGoodVol` defaults to 35%) still starts quiet, and
+  a foreign 100% can never escalate the target.
+- **In-panel changelog.** The Speakers panel now has a collapsible **What's new** section showing the
+  release history (mirrors the PodVoice panel).
+
 ## Speakers 0.16.0 — 2026-06-22  (Never-loud: cap the claim moment, not just steady state)
 - **A freshly-claimed speaker no longer blasts at 100%.** Selecting a HomePod output sets no volume,
   so the first audio of a claim played at whatever level the HomePod/another account remembered (often

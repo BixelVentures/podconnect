@@ -510,7 +510,8 @@ func (ts *transState) decide(glPlaying, otPlaying, otValid bool) (setGl, setOt i
 	return
 }
 
-const initialVolumeCap = 35 // "never full blast": cap the FIRST session's volume after a (re)start
+const initialVolumeCap = 35       // "never full blast": default cap for a brand-new session's volume
+const freshCapWindow = 8 * time.Second // how long the fresh-session volume clamp holds after a claim/reclaim
 
 func playWord(c int) string {
 	if c == 1 {
@@ -573,9 +574,11 @@ func reclaimHomePod(room *Room) {
 func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	volCanon := -1
 	trans := transState{canon: -1, otTarget: -1}
-	prevActive := false      // re-cap EVERY fresh session (the old once-per-boot flag let a 2nd account through)
-	freshCapPending := false // a session (re)started while a duck held the loop: cap it on release (never-loud)
-	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
+	prevActive := false              // edge-detect a NEW session (inactive->active) to arm the never-loud cap
+	freshCapPending := false         // fresh-session volume clamp is armed (held for freshCapWindow)
+	lastGoodVol := initialVolumeCap  // rolling "house" level: the cap TARGET, so your own resume returns here
+	var capDeadline time.Time        // end of the current fresh-session clamp window
+	prearmNext := time.Now()         // throttle for the idle "hold the HomePod output low" safety guard
 	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
 	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
 	// reads off the 200ms hot loop.
@@ -595,6 +598,16 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl := live.Get()
 
+			// Never-loud latch: the instant a NEW session appears (inactive->active), arm the
+			// fresh-session clamp and HOLD it for a window — independent of prevActive, which gets
+			// consumed even on ticks where the clamp is gated out (session attaches while still
+			// released or paused), letting a remembered 100% slip through on the play edge. Re-armed
+			// on reclaim below (resume after a grace-release). This is the backup so no claim is loud.
+			if gl.Active && !prevActive {
+				freshCapPending = true
+				capDeadline = time.Now().Add(freshCapWindow)
+			}
+
 			// Wave 4: attention/duck. An external agent (voice gatekeeper) holds the room quiet. The
 			// duck WINS — hold the HomePod at the target and SKIP the reconcile this tick (so a HomePod
 			// button or the volume mirror can't fight it); transport below keeps running so the music
@@ -607,12 +620,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					log.Printf("attention [%s]: held at %d%%", room.Name, lvl)
 				}
 				volCanon = -1
-				// Keep the never-loud bookkeeping alive while ducked: if a session (re)starts during the
-				// duck (e.g. another account grabs the HomePod), latch it so the fresh-session cap fires
-				// on release — otherwise the reconcile would re-seed from a remembered 100% and blast.
-				if gl.Active && !prevActive {
-					freshCapPending = true
-				}
+				// The top-of-loop latch already armed freshCapPending if a session (re)started during
+				// the duck, so it fires on release — no remembered 100% can blast out from under a duck.
 				prevActive = gl.Active
 				time.Sleep(200 * time.Millisecond)
 				continue
@@ -638,6 +647,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					reclaimHomePod(room)
 					log.Printf("[%s]: reclaimed HomePod (playback resumed)", room.Name)
 					released = false
+					// Resume after a grace-release is a (re)claim: re-arm the clamp window so the first
+					// audio can't blast (clamped to lastGoodVol — your own level, not a hard floor).
+					freshCapPending = true
+					capDeadline = time.Now().Add(freshCapWindow)
 				}
 			} else {
 				if idleSince.IsZero() {
@@ -664,28 +677,38 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			}
 
 			if gl.Active && !released {
-				if !prevActive || freshCapPending {
-					// Fresh session (or one that (re)started while a duck held the loop): cap BOTH sides
-					// to <= the ceiling before the reconcile can mirror a remembered 100% up to the
-					// HomePod. freshCapPending covers a session swap during a duck, where prevActive was
-					// kept truthful across the hold and so wouldn't trip the !prevActive path alone.
-					freshCapPending = false
-					if gl.HasVol && gl.VolPct > initialVolumeCap {
-						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
-						gl.VolPct = initialVolumeCap
-						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
+				if freshCapPending {
+					// Fresh-session clamp. Held for freshCapWindow (not one-shot) because Spotify can
+					// RE-ASSERT a remembered 100% across several ticks during a claim — a single cap then
+					// gets mirrored back up. Clamp BOTH sides to <= lastGoodVol (the house's last steady
+					// level), so YOUR OWN resume returns to your level while a brand-new session — where
+					// lastGoodVol defaults to initialVolumeCap — starts quiet. Lower-only; re-seed from
+					// the capped go-librespot level so the reconcile can't adopt the HomePod's loud read.
+					if gl.HasVol && gl.VolPct > lastGoodVol {
+						setLibrespotVolumePct(room.Librespot, lastGoodVol)
+						gl.VolPct = lastGoodVol
 					}
-					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {
-						setOwntoneOutputVolume(room.OwnTone, id, initialVolumeCap)
+					if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > lastGoodVol {
+						setOwntoneOutputVolume(room.OwnTone, id, lastGoodVol)
 					}
-					volCanon = -1 // re-seed the reconcile from the capped level
+					volCanon = -1
+					if time.Now().After(capDeadline) {
+						freshCapPending = false
+						log.Printf("volume [%s]: fresh-session cap lifted (held <= %d%%)", room.Name, lastGoodVol)
+					}
 				}
 				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
 				otState := owntonePlayerState(room.OwnTone)
 
 				// Volume — both directions.
 				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
+				if freshCapPending && vc > lastGoodVol {
+					vc = lastGoodVol // hard backup: the HomePod must NEVER exceed the safe level mid-window
+				}
 				volCanon = vc
+				if !freshCapPending && playing {
+					lastGoodVol = vc // track your chosen level during steady playback — the next cap target
+				}
 				if vGl {
 					setLibrespotVolumePct(room.Librespot, vc)
 					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
@@ -1543,6 +1566,19 @@ const indexHTML = `<!doctype html>
   .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 
   .hint { margin-top: 16px; font-size: .8rem; color: var(--fg-dim); line-height: 1.5; }
+
+  /* In-panel changelog (What's new) — a quiet, collapsible release history. */
+  .changelog { margin-top: 26px; border-top: 1px solid var(--border); padding-top: 14px; }
+  .changelog > summary { cursor: pointer; font-size: .82rem; font-weight: 700; text-transform: uppercase;
+                         letter-spacing: .05em; color: var(--fg-dim); list-style: none; }
+  .changelog > summary::-webkit-details-marker { display: none; }
+  .changelog > summary::before { content: "▸ "; }
+  .changelog[open] > summary::before { content: "▾ "; }
+  .changelog .rel { margin-top: 14px; }
+  .changelog .rel h3 { margin: 0 0 4px; font-size: .9rem; font-weight: 700; letter-spacing: -.01em; }
+  .changelog .rel .when { font-weight: 400; color: var(--fg-dim); font-size: .82rem; }
+  .changelog .rel ul { margin: 4px 0 0; padding-left: 18px; }
+  .changelog .rel li { font-size: .82rem; color: var(--fg-dim); line-height: 1.5; margin: 2px 0; }
   .err { color: var(--danger); font-size: .82rem; margin-top: 8px; }
 
   /* HomePod picker rows (radio cards). */
@@ -1596,6 +1632,29 @@ const indexHTML = `<!doctype html>
 
   <p class="hint">The top speaker is your <b>main</b> one — open its <b>⚙ Settings</b> to switch its
   HomePod or release it for other apps. <b>＋ Add speaker</b> binds a new one to a free HomePod, live.</p>
+
+  <details class="changelog">
+    <summary>What's new</summary>
+    <div class="rel">
+      <h3>0.17.0 <span class="when">— 2026-06-22</span></h3>
+      <ul>
+        <li>Never-loud, properly: a freshly-claimed speaker can no longer blast at 100%. The cap now holds for a few seconds across the claim and clamps to your own last level — so resuming after a grace-release returns to <i>your</i> volume, not a hard 35%.</li>
+        <li>This panel now shows a <b>What's new</b> changelog per release.</li>
+      </ul>
+    </div>
+    <div class="rel">
+      <h3>0.16.0 <span class="when">— 2026-06-22</span></h3>
+      <ul><li>First never-loud pass: cap the HomePod output the moment a speaker is claimed (later hardened in 0.17.0).</li></ul>
+    </div>
+    <div class="rel">
+      <h3>0.15.0 <span class="when">— 2026-06-22</span></h3>
+      <ul><li>Panel cleanup: the top card <i>is</i> the primary (subtle highlight + “main” pill); the HomePod picker and Release moved into its ⚙ Settings. No more separate picker section.</li></ul>
+    </div>
+    <div class="rel">
+      <h3>0.14.0 <span class="when">— 2026-06-20</span></h3>
+      <ul><li>Attention/duck API (<code>/api/attention</code>) so an external voice assistant can dip a room's music while it talks, with a crash-safe auto-release.</li></ul>
+    </div>
+  </details>
 </div>
 <script>
 var chosen = null;
