@@ -263,6 +263,19 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 	}
 }
 
+// capFreshClaim lowers a just-(re)selected HomePod output to initialVolumeCap if it would otherwise
+// start above it. With external_volume:true loudness is the OwnTone AirPlay output level, so this is
+// the cap that matters — and it must land BEFORE the first audio of a claim. Selecting an output
+// (selectOnOwntoneAt) sets no volume, so a HomePod another account drove to 100% would blast for the
+// window before the bridge reconcile catches it. Call right after selecting, with the now-selected
+// output id. Lower-only: a session already under the cap is untouched (so it never raises volume).
+func capFreshClaim(base, id string) {
+	if v, selID, ok := owntoneOutputVolume(base); ok && selID == id && v > initialVolumeCap {
+		setOwntoneOutputVolume(base, id, initialVolumeCap)
+		log.Printf("volume: capped fresh claim on output %s to %d%% (never start loud)", id, initialVolumeCap)
+	}
+}
+
 // glStatus is the slice of go-librespot's /status the bridge needs.
 type glStatus struct {
 	Active  bool // a Spotify session is present (status returned data)
@@ -540,6 +553,7 @@ func reclaimHomePod(room *Room) {
 	}
 	if target != "" {
 		selectOnOwntoneAt(room.OwnTone, target)
+		capFreshClaim(room.OwnTone, target) // reclaim from a released HomePod must never resume at full blast
 	}
 }
 
@@ -985,6 +999,7 @@ func main() {
 					if strings.EqualFold(d.Name, name) {
 						homepodID = d.ID
 						selectOnOwntoneAt(rm.OwnTone, d.ID)
+						capFreshClaim(rm.OwnTone, d.ID) // a fresh (re)bind must not inherit a remembered 100%
 						break
 					}
 				}

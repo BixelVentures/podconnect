@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.16.0 — 2026-06-22  (Never-loud: cap the claim moment, not just steady state)
+- **A freshly-claimed speaker no longer blasts at 100%.** Selecting a HomePod output sets no volume,
+  so the first audio of a claim played at whatever level the HomePod/another account remembered (often
+  100%) for the window before the reconcile caught it. With `external_volume:true` the loudness *is*
+  the OwnTone AirPlay output level, so that window was audible full blast.
+- **Cap now lands at selection time, at the source.** New `capFreshClaim` lowers a just-(re)selected
+  output to the never-loud ceiling (35%) **before** audio flows, in every claim path: reclaim from a
+  released HomePod, an explicit panel re-pick (`/api/select`), and the heal/initial selection tick.
+  Lower-only — a session already under the cap is never raised. The bridge's steady-state cap stays
+  as the backstop.
+
 ## Speakers 0.15.0 — 2026-06-22  (Panel cleanup — one primary card, no second picker)
 - **The top speaker card *is* the primary.** The separate "Primary speaker — pick its HomePod"
   section is gone. The top card now carries a subtle accent tint and a small `main` pill, so the
