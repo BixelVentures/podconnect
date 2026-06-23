@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.22.0 — 2026-06-23  (EXPERIMENT: persistent_connect — 3 Connect devices on one account)
+- **New opt-in option `persistent_connect` (default false).** When on, each room's go-librespot runs
+  with **zeroconf discovery OFF** and reconnects via its persisted credentials — the model real
+  hardware (Sonos etc.) uses — to avoid the multi-instance **same-account discovery race** that makes
+  3 Connect devices on one account flip/kick each other (librespot #793) and starve the audio.
+- **Default unchanged.** Flag off = today's behavior exactly. Flag on = experiment; **toggle off to
+  revert instantly.** Claim each room once (so credentials cache) BEFORE enabling.
+- This targets the real goal: 3 Connect devices, switch in the Spotify app, normal audio, one account.
+  It is **experimental & unverified on hardware** — enable on 2 rooms first and check the go-librespot
+  log. The config is a best-informed first attempt; it may need tuning based on what the log shows.
+
 ## Speakers 0.21.2 — 2026-06-22  (Two small UX/doc clarifications)
 - **Panel hint** now says a speaker appears in Home Assistant only after you've played to it once from
   Spotify (the zeroconf-visibility gotcha), and that **⏹ Stop** is account-agnostic.

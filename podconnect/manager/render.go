@@ -29,6 +29,23 @@ func readBitrate() string {
 	return o.Bitrate
 }
 
+// persistentConnect is the EXPERIMENTAL opt-in option. When true, a room's go-librespot runs with
+// zeroconf discovery OFF and relies on its persisted credentials to reconnect as a stable, registered
+// Connect device — the model real hardware (Sonos etc.) uses, which avoids the multi-instance
+// same-account discovery race (librespot #793). Default false = today's zeroconf behavior unchanged.
+// NOTE: a room must have been claimed once (so credentials are cached) BEFORE this helps; an
+// unclaimed room with discovery off can't be picked. Toggle off to revert instantly.
+func persistentConnect() bool {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return false
+	}
+	var o struct {
+		PersistentConnect bool `json:"persistent_connect"`
+	}
+	return json.Unmarshal(b, &o) == nil && o.PersistentConnect
+}
+
 // renderGLConfig writes the room's go-librespot config.yml. Identical settings to the single-room
 // build; the device_id is seeded/reused per room so renaming never spawns a ghost Connect device.
 func renderGLConfig(r *Room) error {
@@ -36,11 +53,19 @@ func renderGLConfig(r *Room) error {
 		return err
 	}
 	devID := roomDeviceID(r)
+	// EXPERIMENT (persistent_connect): discovery OFF → reconnect via persisted credentials as a stable
+	// registered device (like real hardware), avoiding the multi-instance same-account discovery race.
+	// Default: discovery ON (unchanged). credentials.type stays zeroconf either way — persist_credentials
+	// caches the login so it can reconnect even with advertising off.
+	zeroconfEnabled := "true"
+	if persistentConnect() {
+		zeroconfEnabled = "false"
+	}
 	cfg := fmt.Sprintf(`device_name: "%s"
 device_id: "%s"
 device_type: speaker
 bitrate: %s
-zeroconf_enabled: true
+zeroconf_enabled: %s
 zeroconf_backend: avahi
 credentials:
   type: zeroconf
@@ -56,7 +81,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), zeroconfEnabled, r.Pipe, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 
