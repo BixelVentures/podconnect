@@ -39,6 +39,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Docs: reconciled `FEATURE-STATUS.md` R1/R2 to the 0.21 model, and added a DOCS.md note that a
   Connect device only appears in HA after the account plays to it once (zeroconf visibility).
 
+## Control 0.9.0 — 2026-06-23  (Taste/history as an AI tool — `play_from_library`)
+- **New entity service `podconnect.play_from_library`** (additive — doesn't touch existing playback).
+  Plays one of the user's own collections on a speaker: **`liked`** (Liked Songs), **`top_tracks`**, or
+  **`recent`** (recently played), with optional `shuffle`. This is the direct "play something I like /
+  play my recent" tool a voice assistant (HA Assist / PodVoice) can call — beyond explicit search.
+- Builds on the scopes/data Control already had (`user-top-read`, `user-read-recently-played`,
+  `user-library-read`). Re-uses the existing 403-tolerant send + coordinator refresh.
+- Combined surface for an AI to find music: **search** (`media_player.search_media`) + **play by name**
+  (`media_player.play_media`, 0.8.0) + **taste/history** (`play_from_library`, this) + **browse**.
+
 ## Control 0.8.0 — 2026-06-22  (Play-by-name via the standard media_player.play_media — fixes R5 cleanly)
 - **`media_player.play_media` now accepts a free-text name, not just a Spotify URI.** When
   `media_content_id` isn't a `spotify:` URI, Control treats it as a **search query** and plays the

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import voluptuous as vol
+
 from homeassistant.components.media_player import (
     BrowseMedia,
     MediaClass,
@@ -12,6 +14,7 @@ from homeassistant.components.media_player import (
     RepeatMode,
 )
 from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -87,6 +90,17 @@ async def async_setup_entry(
     """Create a media_player for each Connect device, adding new ones as they appear."""
     coordinator = entry.runtime_data.coordinator
     known: set[str] = set()
+
+    # Taste/history "play something I like" tool for an AI assist (and the UI): play the user's
+    # Liked Songs, top tracks, or recently played on a speaker. Additive — doesn't touch playback.
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        "play_from_library",
+        {
+            vol.Required("source"): vol.In(["liked", "top_tracks", "recent"]),
+            vol.Optional("shuffle", default=False): cv.boolean,
+        },
+        "async_play_from_library",
+    )
 
     @callback
     def _discover() -> None:
@@ -325,6 +339,29 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
             await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
+
+    async def async_play_from_library(self, source: str, shuffle: bool = False) -> None:
+        """Play one of the user's own collections on THIS device — the AI tool for "play something
+        I like" / "play my recent". source: liked | top_tracks | recent. Fetches the tracks and
+        plays their URIs (up to 50); optional shuffle."""
+        api = self.coordinator.api
+        try:
+            if source == "liked":
+                items = await api.saved_tracks()
+            elif source == "top_tracks":
+                items = await api.top_tracks()
+            else:  # "recent"
+                items = await api.recently_played()
+        except SpotifyApiError as err:
+            LOGGER.warning("play_from_library(%s) failed (re-auth may be needed): %s", source, err)
+            return
+        uris = [it["uri"] for it in items if it and it.get("uri")][:50]
+        if not uris:
+            LOGGER.warning("play_from_library(%s): nothing to play", source)
+            return
+        if shuffle:
+            await self._send(self.coordinator.api.set_shuffle(True, self._device_id))
+        await self._send(self.coordinator.api.play(self._device_id, uris=uris))
 
     async def _search_top_uri(self, query: str, media_type: str | None) -> str | None:
         """Resolve a free-text query to the best-matching Spotify URI — same ranking as search:

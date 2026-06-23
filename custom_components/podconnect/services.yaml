@@ -1,0 +1,28 @@
+play_from_library:
+  name: Play from library
+  description: >-
+    Play the user's own Spotify collection on a PodConnect speaker — Liked Songs, top tracks, or
+    recently played. The "play something I like / play my recent" tool for voice assistants.
+  target:
+    entity:
+      integration: podconnect
+      domain: media_player
+  fields:
+    source:
+      name: Source
+      description: Which of the user's collections to play.
+      required: true
+      example: top_tracks
+      selector:
+        select:
+          options:
+            - liked
+            - top_tracks
+            - recent
+    shuffle:
+      name: Shuffle
+      description: Shuffle the collection before playing.
+      required: false
+      default: false
+      selector:
+        boolean:
