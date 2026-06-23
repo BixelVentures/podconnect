@@ -639,11 +639,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				}
 			}
 
-			// Volume — STANDARD Spotify Connect: Spotify owns the level. With external_volume:true the
-			// loudness IS the OwnTone AirPlay output, so we simply MIRROR go-librespot's reported volume
-			// onto it — one-directional, no bidirectional reconcile, no oscillation. (Trade-off: a HomePod
-			// hardware button no longer moves the Spotify slider back.) While idle, hold the output at/under
-			// the cap so the first audio of any new session can't blast.
+			// Volume — bidirectional reconcile (decideVolume) runs in the active branch below: Spotify/HA
+			// slider <-> HomePod hardware buttons, on one canonical value. Here we only handle the IDLE
+			// case: while no session is active, hold the output at/under the cap so the first audio of any
+			// new session can't blast (the active branch's one-shot never-loud cap takes over from there).
 			if !gl.Active && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
 				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {

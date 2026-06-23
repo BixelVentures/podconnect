@@ -1,4 +1,6 @@
-ARG BUILD_FROM
+# BUILD_FROM is injected per-arch by publish.yaml / the HA builder; this default just keeps a bare
+# `docker build` (and the Dockerfile linter) valid. CI always overrides it with the matching base.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 
 # --- PodConnect manager (Ingress picker UI) — tiny static Go binary, stdlib only ---
 FROM golang:1.22-bookworm AS manager-build

@@ -8,6 +8,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.21.1 — 2026-06-22  (Housekeeping — no behavior change)
+- Fixed a stale code comment that still described the (removed) 0.20 one-directional mirror; the
+  volume path is the bidirectional `decideVolume` reconcile (0.21.0).
+- Gave `Dockerfile` `ARG BUILD_FROM` a default so a bare `docker build` / linter no longer warns
+  (`InvalidDefaultArgInFrom`); CI still overrides it per-arch.
+- Docs: reconciled `FEATURE-STATUS.md` R1/R2 to the 0.21 model, and added a DOCS.md note that a
+  Connect device only appears in HA after the account plays to it once (zeroconf visibility).
+
 ## Control 0.8.0 — 2026-06-22  (Play-by-name via the standard media_player.play_media — fixes R5 cleanly)
 - **`media_player.play_media` now accepts a free-text name, not just a Spotify URI.** When
   `media_content_id` isn't a `spotify:` URI, Control treats it as a **search query** and plays the

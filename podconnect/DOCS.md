@@ -44,6 +44,11 @@ you pinned a custom name with ✎ Rename).
 Your choices persist across restarts (`rooms.json`). The panel is also reachable directly at
 `http://<your-HA-IP>:8099`.
 
+> **Not seeing a speaker in Home Assistant (PodConnect Control / `media_player`)?** A Spotify Connect
+> device only appears in the Web API — and therefore in HA — **after your Spotify account has played to
+> it once**. Open the Spotify app (same account as Control), pick the speaker under *Spotify Connect*
+> (not its AirPlay entry) and press play for a moment; it then shows in HA and persists across restarts.
+
 ## 4. (Advanced) Configuration tab options
 
 You normally don't need these — the panel covers everything. The tab keeps a few global defaults/

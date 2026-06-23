@@ -22,8 +22,8 @@ User report: *"Højt, skift af lydstyrke, miste forbindelse til connect-højtale
 
 | # | Symptom | Most likely cause (suspect) | Where |
 |---|---------|------------------------------|-------|
-| R1 | Volume still goes **loud** on a fresh claim | **Redesigned in 0.20.0**: dropped the whole bidirectional relay; one-directional mirror + a single fresh-session cap (35% until go-librespot reports ≤35%). Resuming your own session keeps your level | `main.go:636-669` | 🟡 redesigned 0.20.0 — **verify on-device** |
-| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | Caused by the bidirectional reconcile fighting itself. **0.20.0 removes the reconcile entirely** (mirror is one-directional → nothing to oscillate) | `main.go:636-669` | ✅ **fixed by redesign 0.20.0** (verify) |
+| R1 | Volume goes **loud** on a fresh claim | Caused by the 0.16–0.17 never-loud *held-window*. Removed; **0.21.0** uses bidirectional `decideVolume` + one edge-safe one-shot cap (go-librespot capped to 35% on a NEW session until it reports ≤35%; your own resume is not re-capped) | `main.go` bridge volume block | 🟡 **verify on-device** |
+| R2 | Volume **jumps/oscillates** by itself (e.g. 90→25→12→17) | The held-window re-seeded `volCanon` every tick → ping-pong. **Removed** (0.20 then 0.21). `decideVolume`'s canonical value + ±2% tolerance don't oscillate (≤0.14 behaviour) | `decideVolume` + bridge | ✅ **fixed (held-window gone)** (verify) |
 | R3 | **Loses the Connect speaker** in the Spotify app | go-librespot restarted on name-forward, fired by the panel's auto-apply-on-pick (0.15.0). **Mitigated 0.18.0**: explicit **Save HomePod** button — picking no longer restarts until you confirm. (A deliberate Save still restarts once — unavoidable for a re-point.) | `main.go` picker; `/api/select` `main.go:1000-1051` | 🟡 **mitigated 0.18.0** |
 | R4 | General "weird" instability | Recurring `/events` websocket errors (`StatusNoStatusRcvd`) every ~30 s — **predates these versions** (Wave 3, 0.12.0), present in the 10:35 log before 0.16/0.17. Polling fallback keeps state fresh, so noisy but likely not the main cause | `events.go:139-256` | ⚪ open (pre-existing) |
 
