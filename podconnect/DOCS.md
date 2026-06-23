@@ -49,6 +49,19 @@ Your choices persist across restarts (`rooms.json`). The panel is also reachable
 > it once**. Open the Spotify app (same account as Control), pick the speaker under *Spotify Connect*
 > (not its AirPlay entry) and press play for a moment; it then shows in HA and persists across restarts.
 
+> **Stopping playback regardless of which account is playing.** The panel's per-speaker **⏹ Stop** (and
+> Siri) pause a HomePod no matter whose Spotify owns the session — this is the **account-agnostic** stop.
+> The HA `media_player` (Control) entity's pause only stops *your own* session (Spotify Web API). To get
+> the account-agnostic stop from a HA automation or voice, point a `rest_command` at the add-on
+> (`room` ids come from `GET /api/rooms`; `/api/stop` needs no token):
+>
+> ```yaml
+> rest_command:
+>   podconnect_stop_kitchen:
+>     url: "http://<your-HA-IP>:8099/api/stop?room=r0"
+>     method: POST
+> ```
+
 ## 4. (Advanced) Configuration tab options
 
 You normally don't need these — the panel covers everything. The tab keeps a few global defaults/

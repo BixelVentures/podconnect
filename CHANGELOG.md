@@ -8,6 +8,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.21.2 — 2026-06-22  (Two small UX/doc clarifications)
+- **Panel hint** now says a speaker appears in Home Assistant only after you've played to it once from
+  Spotify (the zeroconf-visibility gotcha), and that **⏹ Stop** is account-agnostic.
+- **DOCS:** documented that account-agnostic stop lives in the panel (⏹) + Siri by design, and added a
+  copy-paste `rest_command` so HA automations/voice can call `/api/stop` directly if cross-account stop
+  is wanted from HA — without re-coupling Control to the add-on.
+
 ## Speakers 0.21.1 — 2026-06-22  (Housekeeping — no behavior change)
 - Fixed a stale code comment that still described the (removed) 0.20 one-directional mirror; the
   volume path is the bidirectional `decideVolume` reconcile (0.21.0).

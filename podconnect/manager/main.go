@@ -1605,7 +1605,9 @@ const indexHTML = `<!doctype html>
   </div>
 
   <p class="hint">The top speaker is your <b>main</b> one — open its <b>⚙ Settings</b> to switch its
-  HomePod or release it for other apps. <b>＋ Add speaker</b> binds a new one to a free HomePod, live.</p>
+  HomePod or release it for other apps. <b>＋ Add speaker</b> binds a new one to a free HomePod, live.
+  <b>⏹ Stop</b> pauses a speaker no matter whose Spotify is playing. A speaker appears in Home Assistant
+  once you've played to it from Spotify at least once.</p>
 
   <details class="changelog">
     <summary>What's new</summary>
