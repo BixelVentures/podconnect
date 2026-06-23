@@ -8,16 +8,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## Speakers 0.22.0 — 2026-06-23  (EXPERIMENT: persistent_connect — 3 Connect devices on one account)
+## Speakers 0.22.1 — 2026-06-23  (EXPERIMENT: persistent_connect — 3 Connect devices on one account)
 - **New opt-in option `persistent_connect` (default false).** When on, each room's go-librespot runs
-  with **zeroconf discovery OFF** and reconnects via its persisted credentials — the model real
-  hardware (Sonos etc.) uses — to avoid the multi-instance **same-account discovery race** that makes
-  3 Connect devices on one account flip/kick each other (librespot #793) and starve the audio.
-- **Default unchanged.** Flag off = today's behavior exactly. Flag on = experiment; **toggle off to
-  revert instantly.** Claim each room once (so credentials cache) BEFORE enabling.
-- This targets the real goal: 3 Connect devices, switch in the Spotify app, normal audio, one account.
-  It is **experimental & unverified on hardware** — enable on 2 rooms first and check the go-librespot
-  log. The config is a best-informed first attempt; it may need tuning based on what the log shows.
+  the **documented headless model**: `zeroconf_enabled: false` + `credentials.type: interactive`,
+  which **reuses the credentials persisted during the earlier zeroconf claim** (no browser prompt) and
+  registers as a stable Connect device — like real hardware (Sonos etc.). This avoids the
+  multi-instance **same-account discovery race** that makes 3 Connect devices on one account flip/kick
+  each other (librespot #793) and starve the audio.
+- **Default unchanged & byte-identical to before.** Flag off = today's behavior exactly. Flag on =
+  experiment; **toggle off to revert instantly.** Claim each room once (so credentials cache) BEFORE
+  enabling, else interactive mode has nothing to reuse.
+- (0.22.0 had the wrong combo — `type: zeroconf` + discovery off — which would wait forever for a
+  claim that can't arrive. 0.22.1 uses the documented `type: interactive` instead.)
+- Targets the real goal: 3 Connect devices, switch in the Spotify app, normal audio, one account.
+  **Experimental & unverified on hardware** — enable on 2 rooms first, check the go-librespot log
+  (`authenticated AP` on each = good); the config may still need tuning based on the log.
 
 ## Speakers 0.21.2 — 2026-06-22  (Two small UX/doc clarifications)
 - **Panel hint** now says a speaker appears in Home Assistant only after you've played to it once from

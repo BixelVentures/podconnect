@@ -53,13 +53,16 @@ func renderGLConfig(r *Room) error {
 		return err
 	}
 	devID := roomDeviceID(r)
-	// EXPERIMENT (persistent_connect): discovery OFF → reconnect via persisted credentials as a stable
-	// registered device (like real hardware), avoiding the multi-instance same-account discovery race.
-	// Default: discovery ON (unchanged). credentials.type stays zeroconf either way — persist_credentials
-	// caches the login so it can reconnect even with advertising off.
+	// EXPERIMENT (persistent_connect): the documented headless model — discovery OFF + credentials
+	// type "interactive", which REUSES the credentials persisted during the earlier zeroconf claim (no
+	// browser prompt). That makes the room a stable, registered Connect device like real hardware,
+	// avoiding the multi-instance same-account discovery race (librespot #793). Default = zeroconf
+	// discovery ON (unchanged). A room must be claimed once (persist_credentials caches) BEFORE this.
 	zeroconfEnabled := "true"
+	credsBlock := "credentials:\n  type: zeroconf\n  zeroconf:\n    persist_credentials: true"
 	if persistentConnect() {
 		zeroconfEnabled = "false"
+		credsBlock = "credentials:\n  type: interactive"
 	}
 	cfg := fmt.Sprintf(`device_name: "%s"
 device_id: "%s"
@@ -67,10 +70,7 @@ device_type: speaker
 bitrate: %s
 zeroconf_enabled: %s
 zeroconf_backend: avahi
-credentials:
-  type: zeroconf
-  zeroconf:
-    persist_credentials: true
+%s
 audio_backend: pipe
 audio_output_pipe: %s
 audio_output_pipe_format: s16le
@@ -81,7 +81,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), zeroconfEnabled, r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), zeroconfEnabled, credsBlock, r.Pipe, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 
