@@ -24,6 +24,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   **Experimental & unverified on hardware** — enable on 2 rooms first, check the go-librespot log
   (`authenticated AP` on each = good); the config may still need tuning based on the log.
 
+## Speakers 0.22.2 — 2026-06-23  (Config-tab cleanup — drop dead legacy options)
+- **Removed `speaker_name` + `homepod_name` from the add-on Configuration tab.** They were only ever
+  first-boot **migration seeds** (read solely by `migrateLocked`, which runs once when `rooms.json` is
+  absent) — dead at runtime. Naming + HomePod selection live in the **panel** (Add speaker / ✎ Rename /
+  ⚙ Settings). The tab now shows only real global settings: bitrate, network_interface, grace_minutes,
+  attention_token, persistent_connect.
+- No runtime change. If HA still shows the old values after updating, just blank them and save.
+
 ## Speakers 0.21.2 — 2026-06-22  (Two small UX/doc clarifications)
 - **Panel hint** now says a speaker appears in Home Assistant only after you've played to it once from
   Spotify (the zeroconf-visibility gotcha), and that **⏹ Stop** is account-agnostic.

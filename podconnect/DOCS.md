@@ -69,7 +69,6 @@ fallbacks:
 
 | Option | What it does |
 |---|---|
-| `speaker_name` / `homepod_name` | Legacy single-room seeds (migrated into `rooms.json` on first boot). An explicit panel pick wins; only ✎ **Rename** pins a custom name. |
 | `bitrate` | **Default** bitrate (`320`); a per-room ⚙ Settings value overrides it. |
 | `grace_minutes` | **Default** hold time before freeing an idle HomePod (`3`; `0` = free as soon as idle); per-room ⚙ Settings overrides it. |
 | `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface. |

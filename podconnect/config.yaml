@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.22.1"
+version: "0.22.2"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -22,16 +22,14 @@ map:
   - type: addon_config
     read_only: false
 options:
-  speaker_name: ""           # empty = auto-name the Connect speaker after the HomePod you pick
-  homepod_name: ""
+  # Naming + HomePod selection live in the PANEL (Add speaker / ✎ Rename / ⚙ Settings) — the legacy
+  # speaker_name/homepod_name seeds were removed (they only ever fed first-boot migration).
   bitrate: "320"             # GLOBAL DEFAULT — overridable per-room in the panel (⚙ Settings)
   network_interface: ""
   grace_minutes: 3           # GLOBAL DEFAULT (hold the HomePod this long after playback stops) — overridable per-room
   attention_token: ""        # optional shared secret for the /api/attention duck API (voice gatekeeper); empty = open on the LAN
   persistent_connect: false  # EXPERIMENT: run speakers as persistent (discovery-off) Connect devices so 3 can coexist on one account. Claim each room ONCE first, then enable. Toggle off to revert.
 schema:
-  speaker_name: "str?"
-  homepod_name: "str?"
   bitrate: "list(96|160|320)"
   network_interface: "str?"
   grace_minutes: "int(0,120)?"
