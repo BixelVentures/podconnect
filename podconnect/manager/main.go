@@ -1880,8 +1880,16 @@ async function load() {
     if (d.selected) { var p = document.createElement('span'); p.className = 'pill plain pill-playing'; p.textContent = 'playing here'; row.appendChild(p); }
     list.appendChild(row);
   });
+  // If the user already picked a HomePod (pending Save), keep the Save button enabled across refreshes.
+  if (chosen !== null) { var sv = document.getElementById('hpsave'); if (sv) sv.disabled = false; }
 }
-function tick() { loadRooms().then(load); } // build rooms first so #hppicker exists before load() fills it
+function tick() {
+  // While the primary's ⚙ Settings drawer is open, DON'T rebuild the whole card list — that nukes the
+  // open drawer + resets the "Save HomePod" button to disabled mid-interaction (so a pick never saves).
+  // Just refresh the HomePod picker in place. Full rebuild resumes once the drawer is closed.
+  if (r0SettingsOpen) { load(); return; }
+  loadRooms().then(load); // build rooms first so #hppicker exists before load() fills it
+}
 tick();
 setInterval(tick, 5000);
 </script>

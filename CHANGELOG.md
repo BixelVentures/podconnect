@@ -24,6 +24,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   **Experimental & unverified on hardware** — enable on 2 rooms first, check the go-librespot log
   (`authenticated AP` on each = good); the config may still need tuning based on the log.
 
+## Speakers 0.22.3 — 2026-06-23  (Fix: HomePod pick / Test didn't save — 5s rebuild reset the drawer)
+- **The "Plays to HomePod" pick wasn't saving.** The panel rebuilt the whole speaker list every 5 s
+  (`loadRooms` → `innerHTML=''`), which recreated the **Save HomePod** button as *disabled*
+  mid-interaction — so a pick made just before a refresh couldn't be saved, the output never switched,
+  and Test/play kept going to the previously-selected HomePod.
+- Fix: while the primary's ⚙ Settings drawer is **open**, the 5 s tick no longer rebuilds the card list
+  (it just refreshes the picker in place); and the Save button is re-enabled whenever a pick is pending.
+- Now: open Settings → pick a HomePod → **Save HomePod** sticks → Test/play go to that HomePod.
+
 ## Speakers 0.22.2 — 2026-06-23  (Config-tab cleanup — drop dead legacy options)
 - **Removed `speaker_name` + `homepod_name` from the add-on Configuration tab.** They were only ever
   first-boot **migration seeds** (read solely by `migrateLocked`, which runs once when `rooms.json` is
