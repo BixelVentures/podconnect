@@ -18,8 +18,8 @@ on:
       - ".github/workflows/publish.yaml"
   workflow_dispatch:
     inputs:
-      gl_aliases:
-        description: "Build the device-aliases go-librespot fork (Stage A probe) into this image"
+      gl_prebuilt:
+        description: "Use the prebuilt go-librespot instead of the device-aliases fork (disables aliases)"
         type: boolean
         default: false
 
@@ -73,4 +73,4 @@ jobs:
           build-args: |
             BUILD_FROM=${{ matrix.base }}
             BUILD_ARCH=${{ matrix.arch }}
-            GL_ALIASES=${{ github.event.inputs.gl_aliases == 'true' && '1' || '0' }}
+            GL_ALIASES=${{ github.event.inputs.gl_prebuilt == 'true' && '0' || '1' }}

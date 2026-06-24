@@ -63,25 +63,34 @@ func experimentAliases() bool {
 }
 
 // connectAliases is the list of room names to advertise as aliases in the Spotify Connect menu when
-// experimentAliases() is on. Empty = no aliases (falls back to the normal single device name).
+// experimentAliases() is on. By DEFAULT it auto-derives from your configured rooms (in rooms.json
+// order) — zero config. The connect_aliases option is an advanced override; if set, its order MUST
+// match the room order, since routeAliasOutput maps alias id N -> loadRooms()[N-1].
 func connectAliases() []string {
-	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
-	if err != nil {
-		return nil
-	}
-	var o struct {
-		ConnectAliases []string `json:"connect_aliases"`
-	}
-	if json.Unmarshal(b, &o) != nil {
-		return nil
-	}
-	out := make([]string, 0, len(o.ConnectAliases))
-	for _, s := range o.ConnectAliases {
-		if s = strings.TrimSpace(s); s != "" {
-			out = append(out, s)
+	if b, err := os.ReadFile(filepath.Join(dataDir, "options.json")); err == nil {
+		var o struct {
+			ConnectAliases []string `json:"connect_aliases"`
+		}
+		if json.Unmarshal(b, &o) == nil {
+			out := make([]string, 0, len(o.ConnectAliases))
+			for _, s := range o.ConnectAliases {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
 		}
 	}
-	return out
+	// Default: one alias per configured room, in room order.
+	var names []string
+	for _, r := range loadRooms() {
+		if n := strings.TrimSpace(r.Name); n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 // renderGLConfig writes the room's go-librespot config.yml. Identical settings to the single-room

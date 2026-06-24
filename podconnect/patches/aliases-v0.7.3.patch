@@ -34,6 +34,20 @@ index eb8e73f..1e73c3e 100644
  
  		AudioBackend:              c.AudioBackend,
  		AudioBackendRuntimeSocket: c.AudioBackendRuntimeSocket,
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index d830363..06aa6a1 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -270,6 +270,9 @@ type ApiResponseStatus struct {
+ 	RepeatTrack    bool                    `json:"repeat_track"`
+ 	ShuffleContext bool                    `json:"shuffle_context"`
+ 	Track          *ApiResponseStatusTrack `json:"track"`
++	// device-aliases: the alias the controller currently selected (0 = none). Lets an external
++	// supervisor route output to the matching room.
++	SelectedAliasId uint32 `json:"selected_alias_id"`
+ }
+ 
+ type ApiResponseRoot struct {
 diff --git a/daemon/app.go b/daemon/app.go
 index f1e1b53..95a2ffa 100644
 --- a/daemon/app.go
@@ -68,7 +82,7 @@ index d64f19f..85d0cc7 100644
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..f6591cc 100644
+index c255f83..5073083 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
 @@ -171,6 +171,28 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
@@ -100,6 +114,22 @@ index c255f83..f6591cc 100644
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
+@@ -462,10 +484,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 			RepeatContext:  p.state.player.Options.RepeatingContext,
+ 			RepeatTrack:    p.state.player.Options.RepeatingTrack,
+ 			ShuffleContext: p.state.player.Options.ShufflingContext,
+-			Stopped:        !p.state.player.IsPlaying,
+-			Paused:         p.state.player.IsPaused,
+-			Buffering:      p.state.player.IsBuffering,
+-			PlayOrigin:     p.state.player.PlayOrigin.FeatureIdentifier,
++			Stopped:         !p.state.player.IsPlaying,
++			Paused:          p.state.player.IsPaused,
++			Buffering:       p.state.player.IsBuffering,
++			PlayOrigin:      p.state.player.PlayOrigin.FeatureIdentifier,
++			SelectedAliasId: p.state.device.SelectedAliasId,
+ 		}
+ 
+ 		if p.primaryStream != nil && p.prodInfo != nil {
 diff --git a/daemon/player_state.go b/daemon/player_state.go
 index 4221671..92b5e11 100644
 --- a/daemon/player_state.go

@@ -8,6 +8,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.0 — 2026-06-24  (Device-aliases as a real one-switch feature — fork ships by default)
+- **The fork now ships in the normal image** (publish builds `GL_ALIASES=1` by default; manual dispatch
+  with `gl_prebuilt: true` reverts to the prebuilt binary). No more GitHub-Actions dance to test.
+- **One-switch + real audio routing.** Turn on `experiment_aliases` (+ restart). Then:
+  - aliases auto-derive from your rooms (`connect_aliases` is now only an advanced override);
+  - **single-engine mode** — only the primary engine runs; the other rooms become aliases on it (one
+    session = no contention); the per-room HomePod pin is suppressed so it can't fight routing;
+  - the fork exposes `selected_alias_id` on `/status`; the primary bridge **routes the OwnTone output to
+    the chosen room's HomePod** (`routeAliasOutput`) when you pick a room in Spotify's Connect menu.
+- Rollback is the switch: `experiment_aliases: false` + restart → today's per-room behaviour, identical.
+- Patch extended (9 files, +93/-23) — `/status` selected-alias exposure; applies clean to fresh v0.7.3,
+  compiles + runs (Docker, Go 1.25). Manager `go vet`/`go test` green.
+- **Unverifiable until you look:** whether Spotify renders aliases for a non-certified client, and the
+  exact live selection-signal shape, can only be seen on first run — see `docs/ALIASES-PROBE.md`.
+
 ## Speakers 0.23.0 — 2026-06-24  (Stage A: device-aliases probe — multiple Connect devices on one account)
 - **The breakthrough path, scaffolded + verified.** Spotify's official `device_aliases` (multiroom
   zones) is the only way to show MULTIPLE selectable PodConnect rooms in the Spotify Connect menu on

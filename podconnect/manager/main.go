@@ -293,11 +293,12 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 
 // glStatus is the slice of go-librespot's /status the bridge needs.
 type glStatus struct {
-	Active  bool // a Spotify session is present (status returned data)
-	HasVol  bool
-	VolPct  int // 0-100
-	Paused  bool
-	Stopped bool
+	Active   bool // a Spotify session is present (status returned data)
+	HasVol   bool
+	VolPct   int // 0-100
+	Paused   bool
+	Stopped  bool
+	SelAlias int // device-aliases: currently selected alias id (0 = none), from the fork's /status
 }
 
 // librespotStatus reads go-librespot's /status once (volume + transport). With external_volume:true
@@ -313,16 +314,22 @@ func librespotStatus(base string) glStatus {
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
 	var st struct {
-		Username    string       `json:"username"`
-		Volume      *json.Number `json:"volume"`
-		VolumeSteps *json.Number `json:"volume_steps"`
-		Paused      bool         `json:"paused"`
-		Stopped     bool         `json:"stopped"`
+		Username      string       `json:"username"`
+		Volume        *json.Number `json:"volume"`
+		VolumeSteps   *json.Number `json:"volume_steps"`
+		Paused        bool         `json:"paused"`
+		Stopped       bool         `json:"stopped"`
+		SelectedAlias *json.Number `json:"selected_alias_id"`
 	}
 	if err := dec.Decode(&st); err != nil {
 		return glStatus{} // empty body / no session
 	}
 	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped}
+	if st.SelectedAlias != nil {
+		if n, e := st.SelectedAlias.Int64(); e == nil {
+			out.SelAlias = int(n)
+		}
+	}
 	if st.Volume != nil && st.VolumeSteps != nil {
 		v, _ := st.Volume.Float64()
 		m, _ := st.VolumeSteps.Float64()
@@ -555,6 +562,30 @@ func releaseHomePod(room *Room) {
 	_ = os.WriteFile(releasedPath(room), []byte("1"), 0o644)
 }
 
+// routeAliasOutput is the device-aliases router: when the user picks alias N in Spotify's Connect
+// menu, point the (single, primary) OwnTone at room N's HomePod so the audio follows the choice. Alias
+// ids are 1-based and indexed into connectAliases() order (= the room list order). Returns whether it
+// successfully selected an output. Best-effort; matches the HomePod by id then name.
+func routeAliasOutput(primaryOwnTone string, aliasId int) bool {
+	rooms := loadRooms()
+	if aliasId < 1 || aliasId > len(rooms) {
+		return false
+	}
+	target := rooms[aliasId-1]
+	devs, ok := fetchOutputsFrom(primaryOwnTone)
+	if !ok || len(devs) == 0 {
+		return false
+	}
+	idx, _ := matchOutput(devs, target.HomepodID, target.HomepodName)
+	if idx < 0 {
+		log.Printf("alias-route: alias %d (%s) — HomePod %q not found on primary OwnTone", aliasId, target.Name, target.HomepodName)
+		return false
+	}
+	selectOnOwntoneAt(primaryOwnTone, devs[idx].ID)
+	log.Printf("alias-route: alias %d -> room %q -> HomePod %q", aliasId, target.Name, devs[idx].Name)
+	return true
+}
+
 // reclaimHomePod takes the HomePod back: clear the room's flag and re-select its target output now,
 // for a snappy resume instead of waiting on the selection tick.
 func reclaimHomePod(room *Room) {
@@ -588,6 +619,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	volCanon := -1           // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
 	lastPlayVol := -1        // last canonical volume while actually PLAYING — distinguishes your own
 	                         // pause/resume (same level) from a transfer that brings a remembered/loud one
+	lastAlias := 0           // device-aliases: last alias id we routed output for (0 = none yet)
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
@@ -610,6 +642,15 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl := live.Get()
+
+			// Device-aliases routing: when the primary engine reports a newly-selected alias, point THIS
+			// (single) OwnTone at the matching room's HomePod so audio follows the Spotify menu choice.
+			// Only the primary room runs in alias mode (single-engine), so this is the one router.
+			if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 && gl.SelAlias != lastAlias {
+				if routeAliasOutput(room.OwnTone, gl.SelAlias) {
+					lastAlias = gl.SelAlias
+				}
+			}
 
 			// Never-loud: a brand-NEW session (inactive->active) re-arms the one-shot cap. A resume of
 			// your own paused session keeps gl.Active true, so it is NOT a new session — not re-capped.
@@ -914,7 +955,14 @@ func main() {
 
 	// Build rooms (migrating the single-room setup on first boot), then start each one's children +
 	// bridge. The supervise loop owns the children; reconcile == just (re)spawn everything we know of.
+	// Alias mode (single-engine): run ONLY the primary room's engine — the other rooms become aliases
+	// advertised on it (one session = no contention). Output is routed per alias by the primary bridge.
+	aliasMode := experimentAliases()
 	for _, rm := range loadRooms() {
+		if aliasMode && rm.Idx != 0 {
+			log.Printf("alias mode: room %s runs as an alias on the primary engine (its own engine not started)", rm.ID)
+			continue
+		}
 		mgr.ensureRunning(rm)
 		startRoomBridge(rm)
 	}

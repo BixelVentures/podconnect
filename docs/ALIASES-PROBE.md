@@ -1,49 +1,49 @@
-# Stage A — device-aliases probe (runbook)
+# Device-aliases — one-switch test (and how it works)
 
-Goal: prove whether a non-certified go-librespot can make ONE Spotify session show **multiple
-selectable rooms** in the Spotify app's Connect menu (Spotify "device aliases" / multiroom zones),
-with clean audio and no flip-flop. This is the only architecture that can keep multiple PodConnect
-rooms visible in the Connect menu on ONE account (see memory: device-aliases path).
+Goal: ONE Spotify session that shows **multiple selectable rooms** in the Spotify Connect menu (Spotify
+"device aliases" / multiroom zones), on ONE account, clean audio, no flip-flop — and picking a room
+**moves the audio** to that HomePod. This is the only architecture that keeps multiple PodConnect rooms
+visible in the Connect menu on one account (see memory: device-aliases path).
 
-The implementation is **dormant by default** — the released image ships the prebuilt go-librespot and
-the runtime flags are off. Nothing below affects a normal install until you opt in.
+As of Speakers 0.24.0 this is a **real feature behind one switch**, not a manual probe. The released
+image already contains the device-aliases fork of go-librespot; it is dormant and behaviourally
+identical to stock until you flip the switch.
 
-## What ships
+## Turn it on (no GitHub steps)
 
-- `podconnect/patches/aliases-v0.7.3.patch` — the verified fork of go-librespot v0.7.3 (8 touchpoints:
-  emit `aliases` in zeroconf getInfo with empty `remoteName`, populate `DeviceInfo.device_aliases` +
-  `selected_alias_id`, read `target_alias_id` on the transfer command, log + echo the selection).
-- Dockerfile `GL_ALIASES` build-arg (default `0` = prebuilt binary, unchanged). `1` = build the fork.
-- Runtime options `experiment_aliases` (bool) + `connect_aliases` (list of room names).
-- CI `verify-aliases-patch` job — compile-guards the patch on every change.
-
-## Running the probe
-
-1. **Build the fork image:** GitHub → Actions → "Publish add-on image" → Run workflow →
-   tick **"Build the device-aliases fork"** → run. This rebuilds the current version tag with the fork
-   binary (behaviourally identical to stock until the runtime flags below are set).
-2. **Update the add-on** in HA → it pulls the fork image → restart.
-3. **Configuration tab:** set
+1. Update the **PodConnect Speakers** add-on to 0.24.0+ → restart.
+2. Configuration tab:
    ```yaml
    experiment_aliases: true
-   connect_aliases: ["Køkken", "Stue", "Soveværelse"]
    ```
-   (Use the rooms you want to see.) Save → restart the add-on.
-4. **Open the Spotify app** → Connect/device menu.
+   That's it — aliases auto-derive from your configured rooms. (Optional advanced override:
+   `connect_aliases: ["Køkken","Stue"]` — order must match your room order.)
+3. Save → restart the add-on.
 
-## Reading the result (go/no-go)
+What happens when it's on:
+- only the **primary** room's engine runs; the other rooms become **aliases** on it (one session, no
+  contention);
+- the per-room HomePod pin is suppressed; the **alias router** moves the single OwnTone output to the
+  chosen room's HomePod;
+- pick a room in Spotify's Connect menu → audio follows.
 
-- **GREEN** — both must hold:
-  - (a) the rooms appear as **separate devices** in the Spotify Connect menu;
-  - (b) tapping a room logs `ALIAS-PROBE: ... selected alias id=N name="Stue"` in the add-on log, over
-    the one session, with **no flip-flop** (play → switch → wait 60 s → no auto-switch-back).
-  → The mechanism works. Next: wire the manager to map alias→room and move the OwnTone output on
-  select (Stage B integration).
-- **RED** — aliases never render, or selection arrives with `NO target_alias_id`:
-  → non-certified clients are gated. Fall back to the N-session-in-one-process probe, else architecture
-  A (room switch in our panel/voice).
+## What to look for
 
-## Reverting
+- **Spotify app → Connect menu:** do your rooms show up as separate devices?
+- **Add-on log when you tap a room:** `ALIAS-PROBE: ... selected alias id=N name="Stue"` then
+  `alias-route: alias N -> room "Stue" -> HomePod "..."`.
+- Pick a different room → audio should move there, and not auto-switch-back within ~60 s.
 
-Set `experiment_aliases: false` (instant), and/or re-run Publish without the fork tick (back to the
-prebuilt binary). The patch and flags are inert when off.
+## The one thing nobody can predict
+
+`device_aliases` is documented for Spotify's **certified eSDK**. Whether a non-certified client
+(go-librespot) gets the aliases rendered + the selection signal is the single unknown — visible the
+moment you open the Connect menu. If the rooms appear and the log shows the route, it works. If they
+never appear, non-certified clients are gated → fall back to architecture A (room switch in our panel /
+voice). Routing maps the selection from `/status selected_alias_id`; if the live log shows the signal
+arriving differently, it's a one-line tweak in `routeAliasOutput`.
+
+## Rollback
+
+Set `experiment_aliases: false` → restart. Back to today's per-room behaviour, identical. (To also drop
+the fork binary: re-run Publish with `gl_prebuilt: true`.)

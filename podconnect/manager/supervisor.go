@@ -131,11 +131,14 @@ func (rt *roomRuntime) supervise() {
 	fails := 0
 
 	// Initial selection attempt shortly after start (OwnTone needs a moment to discover outputs).
+	// In alias mode the primary bridge's alias-router owns output selection, so skip the per-room pin.
 	time.AfterFunc(8*time.Second, func() {
 		select {
 		case <-rt.stop:
 		default:
-			selectHomePod(r)
+			if !experimentAliases() {
+				selectHomePod(r)
+			}
 		}
 	})
 
@@ -164,7 +167,9 @@ func (rt *roomRuntime) supervise() {
 				warmedUp = false
 			}
 		case <-selectTick.C:
-			selectHomePod(r)
+			if !experimentAliases() {
+				selectHomePod(r)
+			}
 		}
 	}
 }
