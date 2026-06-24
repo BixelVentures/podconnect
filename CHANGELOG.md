@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.22.5 — 2026-06-24  (Fix: second 100%-blast path — reclaim after release adopted a drifted-loud output)
+- **Bug (edge case found in a full state-space sweep):** after the HomePod was freed (grace-release or
+  `/api/release`), another AirPlay sender could leave it loud. On Spotify resume, `reclaimHomePod`
+  re-selected the output but never re-set its volume; because grace-resume deliberately keeps `capped`
+  (to preserve your level), the bidirectional reconcile read the drifted-loud output as a "HomePod
+  button move" — **blasting the HomePod AND pushing 100% back to Spotify.**
+- **Fix:** on reclaim, re-seat the output volume + canonical at `lastPlayVol` (your last *playing* level,
+  or the 35% ceiling if unknown) so the reconcile starts from a known-safe value instead of adopting
+  whatever another app left behind.
+- Full matrix now covered: fresh claim, transfer (Active+paused), transfer (inactive), own pause/resume,
+  track-change gap, go-librespot respawn, and release→reclaim. No remaining auto-blast path.
+
 ## Speakers 0.22.4 — 2026-06-24  (Fix: 100% blast when switching output away and back)
 - **Bug:** switching Spotify output to another device (e.g. "this Mac") and back blasted the HomePod
   to ~100%. When playback transfers away, go-librespot stays *Active but not-playing* and reports a

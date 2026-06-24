@@ -635,10 +635,22 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				idleSince = time.Time{}
 				if released {
 					reclaimHomePod(room)
-					log.Printf("[%s]: reclaimed HomePod (playback resumed)", room.Name)
+					// Restore YOUR level on reclaim. While the HomePod was freed, another AirPlay sender
+					// (Mofibo/Apple Music/…) can leave its volume loud/100%; without this the bidirectional
+					// reconcile would read that as a "HomePod button move", blast, AND push 100% to Spotify.
+					// Re-seat the output + canon at your last playing level (or the ceiling if unknown) so
+					// the reconcile starts safe. gl.Active stayed true across grace, so `capped` is untouched
+					// and your own volume is preserved on resume (no never-loud nerf).
+					restore := lastPlayVol
+					if restore < 0 {
+						restore = initialVolumeCap
+					}
+					if _, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" {
+						setOwntoneOutputVolume(room.OwnTone, id, restore)
+					}
+					volCanon = restore
+					log.Printf("[%s]: reclaimed HomePod (playback resumed, restored %d%%)", room.Name, restore)
 					released = false
-					// NOT a fresh session — gl.Active stayed true across the grace-release, so `capped`
-					// is untouched and your own volume is preserved on resume (no never-loud nerf).
 				}
 			} else {
 				if idleSince.IsZero() {
