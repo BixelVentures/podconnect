@@ -34,21 +34,44 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && make install \
   && cd / && rm -rf /src
 
-# --- go-librespot (Spotify Connect receiver) — prebuilt binary for the target arch ---
+# --- go-librespot (Spotify Connect receiver) ---
+# Default (GL_ALIASES=0): prebuilt binary for the target arch — unchanged, fast.
+# GL_ALIASES=1 (Stage A probe): build the device-aliases fork from source (v0.7.3 + our patch) so the
+# primary engine can advertise multiroom-zone aliases in Spotify's Connect menu. Needs Go + C libs.
 ARG GO_LIBRESPOT_VERSION=v0.7.3
 ARG BUILD_ARCH
+ARG GL_ALIASES=0
+COPY patches/ /tmp/patches/
 RUN set -eux; \
-    case "${BUILD_ARCH}" in \
-      aarch64) ASSET="go-librespot_linux_arm64.tar.gz" ;; \
-      amd64)   ASSET="go-librespot_linux_x86_64.tar.gz" ;; \
-      armv7)   ASSET="go-librespot_linux_armv6.tar.gz" ;; \
-      *) echo "unsupported arch: ${BUILD_ARCH}" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL -o /tmp/gl.tgz \
-      "https://github.com/devgianlu/go-librespot/releases/download/${GO_LIBRESPOT_VERSION}/${ASSET}"; \
-    tar -xzf /tmp/gl.tgz -C /usr/local/bin go-librespot; \
-    chmod +x /usr/local/bin/go-librespot; \
-    rm -f /tmp/gl.tgz
+    if [ "${GL_ALIASES}" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends pkg-config libflac-dev libvorbis-dev libogg-dev; \
+      rm -rf /var/lib/apt/lists/*; \
+      case "${BUILD_ARCH}" in \
+        aarch64) GOTGZ="arm64" ;; \
+        amd64)   GOTGZ="amd64" ;; \
+        *) echo "GL_ALIASES fork build unsupported arch: ${BUILD_ARCH}" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go1.25.5.linux-${GOTGZ}.tar.gz"; \
+      tar -C /usr/local -xzf /tmp/go.tgz; \
+      git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/devgianlu/go-librespot.git /tmp/gl; \
+      cd /tmp/gl; \
+      git apply "/tmp/patches/aliases-${GO_LIBRESPOT_VERSION}.patch"; \
+      PATH="/usr/local/go/bin:${PATH}" go build -trimpath -ldflags="-s -w" -o /usr/local/bin/go-librespot ./cmd/daemon; \
+      cd /; rm -rf /tmp/gl /tmp/go.tgz /usr/local/go /root/go; \
+      echo "go-librespot: built device-aliases fork (${GO_LIBRESPOT_VERSION} + patch)"; \
+    else \
+      case "${BUILD_ARCH}" in \
+        aarch64) ASSET="go-librespot_linux_arm64.tar.gz" ;; \
+        amd64)   ASSET="go-librespot_linux_x86_64.tar.gz" ;; \
+        armv7)   ASSET="go-librespot_linux_armv6.tar.gz" ;; \
+        *) echo "unsupported arch: ${BUILD_ARCH}" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSL -o /tmp/gl.tgz \
+        "https://github.com/devgianlu/go-librespot/releases/download/${GO_LIBRESPOT_VERSION}/${ASSET}"; \
+      tar -xzf /tmp/gl.tgz -C /usr/local/bin go-librespot; \
+      chmod +x /usr/local/bin/go-librespot; \
+      rm -f /tmp/gl.tgz; \
+    fi
 
 # Dedicated user for OwnTone (it drops privileges to this uid).
 RUN useradd -r -s /usr/sbin/nologin owntone || true

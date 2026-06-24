@@ -17,6 +17,11 @@ on:
       - "podconnect/manager/**" # the manager binary is compiled into the image
       - ".github/workflows/publish.yaml"
   workflow_dispatch:
+    inputs:
+      gl_aliases:
+        description: "Build the device-aliases go-librespot fork (Stage A probe) into this image"
+        type: boolean
+        default: false
 
 jobs:
   publish:
@@ -68,3 +73,4 @@ jobs:
           build-args: |
             BUILD_FROM=${{ matrix.base }}
             BUILD_ARCH=${{ matrix.arch }}
+            GL_ALIASES=${{ github.event.inputs.gl_aliases == 'true' && '1' || '0' }}

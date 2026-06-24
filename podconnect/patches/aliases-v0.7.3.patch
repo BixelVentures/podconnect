@@ -1,0 +1,244 @@
+diff --git a/cmd/daemon/cli_config.go b/cmd/daemon/cli_config.go
+index eb8e73f..1e73c3e 100644
+--- a/cmd/daemon/cli_config.go
++++ b/cmd/daemon/cli_config.go
+@@ -29,10 +29,11 @@ type cliConfig struct {
+ 	LogLevel            log.Level `koanf:"log_level"`
+ 	LogDisableTimestamp bool      `koanf:"log_disable_timestamp"`
+ 
+-	DeviceId    string `koanf:"device_id"`
+-	DeviceName  string `koanf:"device_name"`
+-	DeviceType  string `koanf:"device_type"`
+-	ClientToken string `koanf:"client_token"`
++	DeviceId      string   `koanf:"device_id"`
++	DeviceName    string   `koanf:"device_name"`
++	DeviceAliases []string `koanf:"device_aliases"`
++	DeviceType    string   `koanf:"device_type"`
++	ClientToken   string   `koanf:"client_token"`
+ 
+ 	AudioBackend              string `koanf:"audio_backend"`
+ 	AudioBackendRuntimeSocket string `koanf:"audio_backend_runtime_socket"`
+@@ -88,10 +89,11 @@ type cliConfig struct {
+ 
+ func (c *cliConfig) toDaemonConfig() *daemon.Config {
+ 	dc := &daemon.Config{
+-		DeviceId:    c.DeviceId,
+-		DeviceName:  c.DeviceName,
+-		DeviceType:  c.DeviceType,
+-		ClientToken: c.ClientToken,
++		DeviceId:      c.DeviceId,
++		DeviceName:    c.DeviceName,
++		DeviceAliases: c.DeviceAliases,
++		DeviceType:    c.DeviceType,
++		ClientToken:   c.ClientToken,
+ 
+ 		AudioBackend:              c.AudioBackend,
+ 		AudioBackendRuntimeSocket: c.AudioBackendRuntimeSocket,
+diff --git a/daemon/app.go b/daemon/app.go
+index f1e1b53..95a2ffa 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -330,7 +330,7 @@ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Co
+ 		return fmt.Errorf("failed getting endpoints from resolver: %w", err)
+ 	}
+ 
+-	app.zeroconf, err = zeroconf.NewZeroconf(app.log, app.cfg.ZeroconfPort, app.cfg.DeviceName, app.deviceId, app.deviceType, app.cfg.ZeroconfInterfacesToAdvertise, app.cfg.ZeroconfBackend == "avahi")
++	app.zeroconf, err = zeroconf.NewZeroconf(app.log, app.cfg.ZeroconfPort, app.cfg.DeviceName, app.cfg.DeviceAliases, app.deviceId, app.deviceType, app.cfg.ZeroconfInterfacesToAdvertise, app.cfg.ZeroconfBackend == "avahi")
+ 	if err != nil {
+ 		return fmt.Errorf("failed initializing zeroconf: %w", err)
+ 	}
+diff --git a/daemon/config.go b/daemon/config.go
+index d64f19f..85d0cc7 100644
+--- a/daemon/config.go
++++ b/daemon/config.go
+@@ -2,10 +2,11 @@ package daemon
+ 
+ // Config carries the runtime configuration for a daemon instance.
+ type Config struct {
+-	DeviceId    string
+-	DeviceName  string
+-	DeviceType  string
+-	ClientToken string
++	DeviceId      string
++	DeviceName    string
++	DeviceAliases []string
++	DeviceType    string
++	ClientToken   string
+ 
+ 	AudioBackend              string
+ 	AudioBackendRuntimeSocket string
+diff --git a/daemon/player.go b/daemon/player.go
+index c255f83..f6591cc 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -171,6 +171,28 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+ 
+ 	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+ 
++	// device-aliases probe: log + echo which alias the controller selected. The id can arrive at the
++	// command level or inside options depending on the controller — capture whichever is set. Echoing
++	// SelectedAliasId on the next put_state closes the loop so the app shows the active room.
++	if len(p.app.cfg.DeviceAliases) > 0 {
++		var aliasId *uint32
++		if req.Command.TargetAliasId != nil {
++			aliasId = req.Command.TargetAliasId
++		} else if req.Command.Options.TargetAliasId != nil {
++			aliasId = req.Command.Options.TargetAliasId
++		}
++		if aliasId != nil {
++			name := ""
++			if int(*aliasId) >= 1 && int(*aliasId) <= len(p.app.cfg.DeviceAliases) {
++				name = p.app.cfg.DeviceAliases[*aliasId-1]
++			}
++			p.app.log.Infof("ALIAS-PROBE: endpoint=%s selected alias id=%d name=%q", req.Command.Endpoint, *aliasId, name)
++			p.state.device.SelectedAliasId = *aliasId
++		} else {
++			p.app.log.Infof("ALIAS-PROBE: endpoint=%s command received with NO target_alias_id", req.Command.Endpoint)
++		}
++	}
++
+ 	switch req.Command.Endpoint {
+ 	case "transfer":
+ 		if len(req.Command.Data) == 0 {
+diff --git a/daemon/player_state.go b/daemon/player_state.go
+index 4221671..92b5e11 100644
+--- a/daemon/player_state.go
++++ b/daemon/player_state.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/devgianlu/go-librespot/dealer"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ )
+ 
+@@ -153,6 +154,20 @@ func (p *AppPlayer) initState() {
+ 			},
+ 		},
+ 	}
++
++	// device-aliases (multiroom zones): mirror the configured aliases into the connect-state DeviceInfo
++	// so the cloud renders each as a selectable device. Selection arrives as target_alias_id over the
++	// dealer (see controls.go). Default the selected alias to the first.
++	if len(p.app.cfg.DeviceAliases) > 0 {
++		m := make(map[uint32]*devicespb.DeviceAlias, len(p.app.cfg.DeviceAliases))
++		for i, name := range p.app.cfg.DeviceAliases {
++			id := uint32(i + 1)
++			m[id] = &devicespb.DeviceAlias{Id: id, DisplayName: name, IsGroup: false}
++		}
++		p.state.device.DeviceAliases = m
++		p.state.device.SelectedAliasId = 1
++	}
++
+ 	p.state.reset()
+ }
+ 
+diff --git a/dealer/recv.go b/dealer/recv.go
+index a9cc04d..c0f8372 100644
+--- a/dealer/recv.go
++++ b/dealer/recv.go
+@@ -44,6 +44,7 @@ type RequestPayload struct {
+ 	SentByDeviceId string `json:"sent_by_device_id"`
+ 	Command        struct {
+ 		Endpoint         string                    `json:"endpoint"`
++		TargetAliasId    *uint32                   `json:"target_alias_id"`
+ 		SessionId        string                    `json:"session_id"`
+ 		Data             []byte                    `json:"data"`
+ 		Value            interface{}               `json:"value"`
+@@ -82,6 +83,7 @@ type RequestPayload struct {
+ 			AudioStream           string                                  `json:"audio_stream"`
+ 			SessionId             string                                  `json:"session_id"`
+ 			License               string                                  `json:"license"`
++			TargetAliasId         *uint32                                 `json:"target_alias_id"`
+ 		} `json:"options"`
+ 		PlayOptions struct {
+ 			OverrideRestrictions bool   `json:"override_restrictions"`
+diff --git a/zeroconf/json.go b/zeroconf/json.go
+index 009136c..a70f198 100644
+--- a/zeroconf/json.go
++++ b/zeroconf/json.go
+@@ -21,6 +21,16 @@ type GetInfoResponse struct {
+ 	PublicKey        string `json:"publicKey"`
+ 	DeviceType       string `json:"deviceType"`
+ 	ActiveUser       string `json:"activeUser"`
++	Aliases          []Alias `json:"aliases,omitempty"`
++}
++
++// Alias is one entry in the getInfo "aliases" array (Spotify device-aliases / multiroom zones). When
++// present, remoteName MUST be empty — the per-alias display name comes from here. Values are strings
++// per Spotify's ZeroConf API (id/isGroup are stringified).
++type Alias struct {
++	Name    string `json:"name"`
++	Id      string `json:"id"`
++	IsGroup string `json:"isGroup"`
+ }
+ 
+ type AddUserResponse struct {
+diff --git a/zeroconf/zeroconf.go b/zeroconf/zeroconf.go
+index c49cf8c..d15f370 100644
+--- a/zeroconf/zeroconf.go
++++ b/zeroconf/zeroconf.go
+@@ -11,6 +11,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/http"
++	"strconv"
+ 	"sync"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+@@ -21,9 +22,10 @@ import (
+ type Zeroconf struct {
+ 	log librespot.Logger
+ 
+-	deviceName string
+-	deviceId   string
+-	deviceType devicespb.DeviceType
++	deviceName    string
++	deviceAliases []string
++	deviceId      string
++	deviceType    devicespb.DeviceType
+ 
+ 	listener  net.Listener
+ 	registrar ServiceRegistrar
+@@ -46,8 +48,8 @@ type NewUserRequest struct {
+ 	result chan bool
+ }
+ 
+-func NewZeroconf(log librespot.Logger, port int, deviceName, deviceId string, deviceType devicespb.DeviceType, interfacesToAdvertise []string, useAvahi bool) (_ *Zeroconf, err error) {
+-	z := &Zeroconf{log: log, deviceId: deviceId, deviceName: deviceName, deviceType: deviceType}
++func NewZeroconf(log librespot.Logger, port int, deviceName string, deviceAliases []string, deviceId string, deviceType devicespb.DeviceType, interfacesToAdvertise []string, useAvahi bool) (_ *Zeroconf, err error) {
++	z := &Zeroconf{log: log, deviceId: deviceId, deviceName: deviceName, deviceAliases: deviceAliases, deviceType: deviceType}
+ 	z.reqsChan = make(chan NewUserRequest)
+ 
+ 	z.dh, err = dh.NewDiffieHellman()
+@@ -134,6 +136,17 @@ func (z *Zeroconf) handleGetInfo(writer http.ResponseWriter, _ *http.Request) er
+ 	currentUsername := z.currentUser
+ 	z.userLock.RUnlock()
+ 
++	// device-aliases (multiroom zones): when configured, advertise each alias as a separate Connect
++	// device and leave remoteName empty (per Spotify's ZeroConf API the display name comes from aliases).
++	remoteName := z.deviceName
++	var aliases []Alias
++	if len(z.deviceAliases) > 0 {
++		remoteName = ""
++		for i, name := range z.deviceAliases {
++			aliases = append(aliases, Alias{Name: name, Id: strconv.Itoa(i + 1), IsGroup: "false"})
++		}
++	}
++
+ 	return json.NewEncoder(writer).Encode(GetInfoResponse{
+ 		Status:           101,
+ 		StatusString:     "OK",
+@@ -152,10 +165,11 @@ func (z *Zeroconf) handleGetInfo(writer http.ResponseWriter, _ *http.Request) er
+ 		Scope:            "streaming,client-authorization-universal",
+ 
+ 		DeviceID:   z.deviceId,
+-		RemoteName: z.deviceName,
++		RemoteName: remoteName,
+ 		PublicKey:  base64.StdEncoding.EncodeToString(z.dh.PublicKeyBytes()),
+ 		DeviceType: z.deviceType.String(),
+ 		ActiveUser: currentUsername,
++		Aliases:    aliases,
+ 	})
+ }
+ 

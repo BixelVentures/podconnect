@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // readBitrate is the bitrate option ("320" default), shared by every room's go-librespot config.
@@ -46,6 +47,43 @@ func persistentConnect() bool {
 	return json.Unmarshal(b, &o) == nil && o.PersistentConnect
 }
 
+// experimentAliases is the PROBE opt-in (Stage A). When true, the PRIMARY room's go-librespot
+// advertises connectAliases() as Spotify device-aliases (multiroom zones) — one session, N selectable
+// devices in the Connect menu. Requires the GL_ALIASES=1 image (the device-aliases fork). Default
+// false = unchanged. See podconnect/patches/aliases-v0.7.3.patch.
+func experimentAliases() bool {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return false
+	}
+	var o struct {
+		ExperimentAliases bool `json:"experiment_aliases"`
+	}
+	return json.Unmarshal(b, &o) == nil && o.ExperimentAliases
+}
+
+// connectAliases is the list of room names to advertise as aliases in the Spotify Connect menu when
+// experimentAliases() is on. Empty = no aliases (falls back to the normal single device name).
+func connectAliases() []string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return nil
+	}
+	var o struct {
+		ConnectAliases []string `json:"connect_aliases"`
+	}
+	if json.Unmarshal(b, &o) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(o.ConnectAliases))
+	for _, s := range o.ConnectAliases {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // renderGLConfig writes the room's go-librespot config.yml. Identical settings to the single-room
 // build; the device_id is seeded/reused per room so renaming never spawns a ghost Connect device.
 func renderGLConfig(r *Room) error {
@@ -64,6 +102,19 @@ func renderGLConfig(r *Room) error {
 		zeroconfEnabled = "false"
 		credsBlock = "credentials:\n  type: interactive"
 	}
+	// PROBE (Stage A): the primary room's engine advertises device-aliases (multiroom zones). Only the
+	// primary room (Idx 0) carries them — one session, N selectable rooms. No-op without the fork image.
+	aliasesBlock := ""
+	if experimentAliases() && r.Idx == 0 {
+		if al := connectAliases(); len(al) > 0 {
+			var b strings.Builder
+			b.WriteString("device_aliases:\n")
+			for _, name := range al {
+				fmt.Fprintf(&b, "  - %q\n", name)
+			}
+			aliasesBlock = b.String()
+		}
+	}
 	cfg := fmt.Sprintf(`device_name: "%s"
 device_id: "%s"
 device_type: speaker
@@ -71,7 +122,7 @@ bitrate: %s
 zeroconf_enabled: %s
 zeroconf_backend: avahi
 %s
-audio_backend: pipe
+%saudio_backend: pipe
 audio_output_pipe: %s
 audio_output_pipe_format: s16le
 external_volume: true
@@ -81,7 +132,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), zeroconfEnabled, credsBlock, r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), zeroconfEnabled, credsBlock, aliasesBlock, r.Pipe, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 

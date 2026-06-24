@@ -8,6 +8,23 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.23.0 — 2026-06-24  (Stage A: device-aliases probe — multiple Connect devices on one account)
+- **The breakthrough path, scaffolded + verified.** Spotify's official `device_aliases` (multiroom
+  zones) is the only way to show MULTIPLE selectable PodConnect rooms in the Spotify Connect menu on
+  ONE account without contention: ONE go-librespot session advertises N aliases. See
+  `docs/ALIASES-PROBE.md` and the saved memory.
+- **`podconnect/patches/aliases-v0.7.3.patch`** — verified fork of go-librespot v0.7.3 (8 touchpoints):
+  emit `aliases` in zeroconf getInfo + empty `remoteName`; populate `DeviceInfo.device_aliases` +
+  `selected_alias_id`; read `target_alias_id` on transfer; log + echo the selection. Applies clean to a
+  fresh v0.7.3 checkout and **compiles + runs** (proven in Docker, Go 1.25).
+- **Dockerfile `GL_ALIASES` build-arg** (default `0` = prebuilt binary, unchanged). `1` builds the fork.
+- **Runtime options `experiment_aliases` (false) + `connect_aliases` ([])** — when on, the primary
+  engine advertises the listed rooms as aliases. **Dormant by default; behaviourally identical to stock
+  when off.**
+- **CI `verify-aliases-patch`** — compile-guards the patch on every change (the release image ships
+  prebuilt, so this is the patch's continuous safety net).
+- Manager `go vet`/`go test` green; nothing in the existing audio/volume/transport paths changed.
+
 ## Speakers 0.22.6 — 2026-06-24  (Tunable skip buffer — `buffer_ms` option)
 - **New option `buffer_ms` (default 500)** drives OwnTone's `start_buffer_ms`. LOWER = snappier track
   skips but more "Source is not providing sufficient data" underruns (dropouts) on weak networks;

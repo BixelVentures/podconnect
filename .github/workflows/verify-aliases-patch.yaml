@@ -1,0 +1,38 @@
+name: Verify device-aliases patch
+
+# Continuous compile-guard for the Stage-A device-aliases fork. The release image (publish.yaml)
+# ships the PREBUILT go-librespot by default (GL_ALIASES=0), so a broken patch would NOT surface
+# there. This job applies podconnect/patches/aliases-v0.7.3.patch to a fresh go-librespot v0.7.3
+# checkout and builds it — proving the patch stays clean + compiles on every change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "podconnect/patches/**"
+      - ".github/workflows/verify-aliases-patch.yaml"
+  pull_request:
+    paths:
+      - "podconnect/patches/**"
+  workflow_dispatch:
+
+jobs:
+  build-fork:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Install go-librespot C deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libflac-dev libasound2-dev libvorbis-dev libogg-dev
+      - name: Clone go-librespot v0.7.3
+        run: git clone --depth 1 --branch v0.7.3 https://github.com/devgianlu/go-librespot.git /tmp/gl
+      - name: Apply patch (must be clean)
+        run: |
+          cd /tmp/gl
+          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
+          git apply "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
+      - name: Build patched fork
+        run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
+      - name: Smoke-check binary
+        run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
