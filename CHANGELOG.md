@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.22.4 — 2026-06-24  (Fix: 100% blast when switching output away and back)
+- **Bug:** switching Spotify output to another device (e.g. "this Mac") and back blasted the HomePod
+  to ~100%. When playback transfers away, go-librespot stays *Active but not-playing* and reports a
+  remembered/default volume (100%); the bidirectional reconcile faithfully mirrored that to the
+  HomePod. The one-shot `capped` guard only re-armed on an `inactive→active` edge — a transfer never
+  makes that edge, so it slipped through (log: `13:44:09 volume -> HomePod 100%`).
+- **Fix:** track `lastPlayVol` (last volume seen while *actually playing*) and **re-arm the never-loud
+  cap when a foreign, above-ceiling volume appears while not playing** (`gl.VolPct > lastPlayVol &&
+  gl.VolPct > 35`). A normal pause/resume keeps the same volume (`==lastPlayVol`) so it is never
+  re-capped — your own level is preserved; only a transfer's remembered-loud value trips it.
+- Net: output local → back to speaker now returns at the capped level, not 100%.
+
 ## Speakers 0.22.1 — 2026-06-23  (EXPERIMENT: persistent_connect — 3 Connect devices on one account)
 - **New opt-in option `persistent_connect` (default false).** When on, each room's go-librespot runs
   the **documented headless model**: `zeroconf_enabled: false` + `credentials.type: interactive`,

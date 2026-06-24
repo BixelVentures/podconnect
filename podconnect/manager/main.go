@@ -558,6 +558,8 @@ func reclaimHomePod(room *Room) {
 // Skipped while THIS room's test tone plays, and while a duck holds the room. Per-room.
 func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	volCanon := -1           // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
+	lastPlayVol := -1        // last canonical volume while actually PLAYING — distinguishes your own
+	                         // pause/resume (same level) from a transfer that brings a remembered/loud one
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
@@ -615,6 +617,16 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 
 			playing := gl.Active && !gl.Paused && !gl.Stopped
 			released := fileExists(releasedPath(room))
+
+			// Never-loud on transfer: when you move playback to ANOTHER device (e.g. pick "this Mac"
+			// in Spotify), go-librespot stays Active but not-playing and reports a remembered/default
+			// volume (often 100%) — NOT your level. Re-arm the one-shot cap so playback returning can't
+			// blast the HomePod. A normal pause keeps the SAME volume (gl.VolPct == lastPlayVol), so this
+			// never re-caps your own pause/resume; only a foreign jump above the ceiling trips it.
+			if !playing && lastPlayVol >= 0 && gl.HasVol &&
+				gl.VolPct > lastPlayVol && gl.VolPct > initialVolumeCap {
+				capped = false
+			}
 
 			// Grace-release ("deling"): hold the HomePod through brief interruptions (still
 			// playing, so Siri/notifications recover), but free it after sustained idle so other
@@ -681,6 +693,11 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				if vOt && otID != "" {
 					setOwntoneOutputVolume(room.OwnTone, otID, vc)
 					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
+				}
+				// Remember the level only while truly playing — a transferred-away/paused tick reports a
+				// foreign volume we must NOT adopt as "yours" (that's what the re-arm above keys off).
+				if playing {
+					lastPlayVol = vc
 				}
 
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
