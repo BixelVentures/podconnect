@@ -123,6 +123,34 @@ func readGraceMinutes() int {
 	return int(n)
 }
 
+const defaultBufferMs = 500 // OwnTone start_buffer_ms default (vs OwnTone's own 2250 ms)
+
+// readBufferMs is the configurable OwnTone start_buffer_ms — the output pre-buffer before playback
+// starts. LOWER = snappier track skips but more "Source is not providing sufficient data" underruns
+// (audio dropouts) on weak networks; HIGHER = rock-solid but a touch more skip lag. Note: the bulk of
+// the ~2 s HomePod skip latency is AirPlay 2's inherent sync buffer and is NOT removable here. Clamped
+// to [50, 2000]; defaults to 500.
+func readBufferMs() int {
+	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return defaultBufferMs
+	}
+	var o struct {
+		BufferMs *json.Number `json:"buffer_ms"`
+	}
+	if json.Unmarshal(b, &o) != nil || o.BufferMs == nil {
+		return defaultBufferMs
+	}
+	n, err := o.BufferMs.Int64()
+	if err != nil || n < 50 {
+		return defaultBufferMs
+	}
+	if n > 2000 {
+		n = 2000
+	}
+	return int(n)
+}
+
 func readHomepodName() string {
 	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
 	if err != nil {

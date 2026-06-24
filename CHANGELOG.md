@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.22.6 — 2026-06-24  (Tunable skip buffer — `buffer_ms` option)
+- **New option `buffer_ms` (default 500)** drives OwnTone's `start_buffer_ms`. LOWER = snappier track
+  skips but more "Source is not providing sufficient data" underruns (dropouts) on weak networks;
+  HIGHER (700-1000) = rock-solid. Clamped to [50, 2000]; takes effect on add-on restart.
+- **Honest note (researched):** the bulk of the ~2 s HomePod next-track latency is **AirPlay 2's
+  inherent sync buffer** to the HomePod — the same floor you get AirPlaying Spotify from an iPhone —
+  and is **not** removable in config. The pipe backend (go-librespot → FIFO → OwnTone) has no gapless
+  option either. `buffer_ms` only tunes the small re-buffer-on-skip slice, not the AirPlay floor.
+  If the log shows underruns at 500, raise toward 800.
+
 ## Speakers 0.22.5 — 2026-06-24  (Fix: second 100%-blast path — reclaim after release adopted a drifted-loud output)
 - **Bug (edge case found in a full state-space sweep):** after the HomePod was freed (grace-release or
   `/api/release`), another AirPlay sender could leave it loud. On Spotify resume, `reclaimHomePod`

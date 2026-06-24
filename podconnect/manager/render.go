@@ -2,7 +2,7 @@
 // These templates were heredocs in init-podconnect; moving them here lets the manager spawn rooms
 // live (no add-on restart). The go-librespot + OwnTone settings are byte-for-byte the same as the
 // single-room setup (external_volume, volume_steps:100, initial_volume:35, pipe backend, AirPlay-2
-// disabled local audio, start_buffer_ms=500) — only the ports/paths/names vary per room.
+// disabled local audio, start_buffer_ms from buffer_ms) — only the ports/paths/names vary per room.
 package main
 
 import (
@@ -87,7 +87,7 @@ server:
 
 // renderOTConfig writes the room's owntone.conf. db/cache/log live under r.OwnDir (legacy
 // /data/owntone for room 0, per-room tree otherwise). Unique ports + library.name per instance,
-// MPD disabled, local audio disabled (AirPlay only), start_buffer_ms=500 for snappy skips.
+// MPD disabled, local audio disabled (AirPlay only), start_buffer_ms from the buffer_ms option.
 func renderOTConfig(r *Room) error {
 	if err := os.MkdirAll(filepath.Dir(r.OwnConf), 0o755); err != nil {
 		return err
@@ -102,10 +102,10 @@ func renderOTConfig(r *Room) error {
 	cache_dir = "%s"
 	logfile = "%s/owntone.log"
 	websocket_port = %d
-	# OwnTone's default output pre-buffer is 2250 ms — the cause of the ~2-4 s AirPlay skip lag.
-	# 500 ms is the maintainer-blessed floor for "perceptually instant" skips. Raise toward
-	# 700-1000 ms if underruns (audio dropouts) appear on weak networks.
-	start_buffer_ms = 500
+	# OwnTone's default output pre-buffer is 2250 ms. We default to 500 ms (snappier skips) and expose
+	# it as the buffer_ms option: LOWER = snappier but more underruns; HIGHER (700-1000) = rock-solid.
+	# The bulk of the ~2 s HomePod skip latency is AirPlay 2's inherent sync buffer, NOT this knob.
+	start_buffer_ms = %d
 }
 library {
 	port = %d
@@ -119,7 +119,7 @@ audio {
 mpd {
 	port = 0
 }
-`, r.OwnDir, r.OwnDir, r.OwnDir, r.OTWSPort, r.OTPort, r.Name, mediaDir)
+`, r.OwnDir, r.OwnDir, r.OwnDir, r.OTWSPort, readBufferMs(), r.OTPort, r.Name, mediaDir)
 	return os.WriteFile(r.OwnConf, []byte(cfg), 0o644)
 }
 
