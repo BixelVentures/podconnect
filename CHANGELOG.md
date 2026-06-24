@@ -56,6 +56,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Docs: reconciled `FEATURE-STATUS.md` R1/R2 to the 0.21 model, and added a DOCS.md note that a
   Connect device only appears in HA after the account plays to it once (zeroconf visibility).
 
+## Control 0.10.0 — 2026-06-23  (Listening history as REST data tools — `top_tracks` / `recently_played` / `liked`)
+- **New response-returning domain services** `podconnect.top_tracks`, `podconnect.recently_played`,
+  `podconnect.liked` — each returns `{tracks: [{name, artist, uri}]}` (`SupportsResponse.ONLY`).
+- **Why:** browse exposes this data but browse is **WebSocket-only** — out of reach for a REST caller
+  like PodVoice's `home_call`. These are **REST** services, so a generic AI assist can *fetch* the
+  user's top/recent/liked, reason over it, then play a chosen URI. Built on the auth Control already
+  has (no Spotify access shared with PodVoice — it just calls an HA service).
+- Complements 0.9.0's `play_from_library` (which plays a collection directly); these *return the list*.
+- Account-wide (domain services, not per-entity). Registered once, idempotently. Errors → `{tracks:[]}`.
+- NOTE: to consume the response generically, PodVoice's `home_call` needs `return_response` support
+  (a small PodVoice-side change) — tracked in that repo.
+
 ## Control 0.9.0 — 2026-06-23  (Taste/history as an AI tool — `play_from_library`)
 - **New entity service `podconnect.play_from_library`** (additive — doesn't touch existing playback).
   Plays one of the user's own collections on a speaker: **`liked`** (Liked Songs), **`top_tracks`**, or

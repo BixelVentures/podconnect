@@ -26,3 +26,19 @@ play_from_library:
       default: false
       selector:
         boolean:
+
+top_tracks:
+  name: Get top tracks
+  description: >-
+    Returns the user's Spotify top tracks as {tracks:[{name,artist,uri}]} (response data). A
+    listening-history "data tool" an AI assist can fetch, then play a chosen URI. Account-wide.
+
+recently_played:
+  name: Get recently played
+  description: >-
+    Returns the user's recently played tracks as {tracks:[{name,artist,uri}]} (response data).
+
+liked:
+  name: Get liked songs
+  description: >-
+    Returns the user's Liked Songs as {tracks:[{name,artist,uri}]} (response data).
