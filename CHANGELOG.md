@@ -8,6 +8,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.1 — 2026-06-26  (Alias selection decode — CLUSTER-PROBE diagnostic)
+- **First-run result:** aliases DO render in Spotify on a non-certified client (multiple rooms show) —
+  the display half works. But picking a room arrives as a `transfer` with **no `target_alias_id`**, and
+  the cluster reports the active device as one go-librespot doesn't recognise (`transferred to
+  <unknown>`) → it stops instead of routing. So the alias id is NOT on the transfer command.
+- **Added `CLUSTER-PROBE` logging** in the connect-state cluster handler: dumps `reason`, our device id,
+  the cluster's `activeDeviceId`, `devicesThatChanged`, and every cluster device's `name` +
+  `selectedAliasId`. One alias-pick now reveals exactly how Spotify encodes the chosen room → lets us
+  map it and route (next iteration).
+- Patch now 298 lines; compiles + runs (Docker, Go 1.25). Volume confirmed working (starts at the
+  never-loud cap by design). Known separate instability: OwnTone mDNS host-name collision loop +
+  panel showing alias rooms as "starting…" (single-engine) — to address next.
+
 ## Speakers 0.24.0 — 2026-06-24  (Device-aliases as a real one-switch feature — fork ships by default)
 - **The fork now ships in the normal image** (publish builds `GL_ALIASES=1` by default; manual dispatch
   with `gl_prebuilt: true` reverts to the prebuilt binary). No more GitHub-Actions dance to test.

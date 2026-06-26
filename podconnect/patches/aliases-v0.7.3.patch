@@ -82,10 +82,34 @@ index d64f19f..85d0cc7 100644
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..5073083 100644
+index c255f83..f9e9663 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -171,6 +171,28 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -147,6 +147,23 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
+ 			return fmt.Errorf("failed unmarshalling ClusterUpdate: %w", err)
+ 		}
+ 
++		// device-aliases probe: dump how Spotify identifies the picked alias so we can route. Logged on
++		// every cluster update while aliases are configured.
++		if len(p.app.cfg.DeviceAliases) > 0 {
++			var devs []string
++			for k, d := range clusterUpdate.Cluster.Device {
++				nm := ""
++				var sa uint32
++				if d != nil {
++					nm = d.Name
++					sa = d.SelectedAliasId
++				}
++				devs = append(devs, fmt.Sprintf("%s{name=%q,selAlias=%d}", k, nm, sa))
++			}
++			p.app.log.Infof("CLUSTER-PROBE: reason=%s ourId=%s activeId=%s changed=%v devices=%v",
++				clusterUpdate.UpdateReason, p.app.deviceId, clusterUpdate.Cluster.ActiveDeviceId, clusterUpdate.DevicesThatChanged, devs)
++		}
++
+ 		stopBeingActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.lastTransferTimestamp
+ 
+ 		// We are still the active device, do not quit
+@@ -171,6 +188,28 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
  
@@ -114,7 +138,7 @@ index c255f83..5073083 100644
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
-@@ -462,10 +484,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -462,10 +501,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			RepeatContext:  p.state.player.Options.RepeatingContext,
  			RepeatTrack:    p.state.player.Options.RepeatingTrack,
  			ShuffleContext: p.state.player.Options.ShufflingContext,
