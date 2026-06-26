@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.3 — 2026-06-26  (Fix: image too big to install — multi-stage slim build)
+- **Bug:** 0.24.x built the device-aliases fork *in the final image stage*, baking the Go toolchain +
+  module/build cache (hundreds of MB) into the published image → on-device update failed ("An unknown
+  error occurred… check Supervisor logs", i.e. pull/extract/disk).
+- **Fix:** compile the fork in a throwaway `gl-fork` builder stage (golang:1.25) and `COPY` only the
+  15 MB stripped binary into the final image; the runtime libs it links (flac/vorbis/ogg/asound) are in
+  the apt block. Verified: the binary runs on a clean bookworm base with just those libs.
+- Dropped the obsolete `GL_ALIASES`/`gl_prebuilt` build plumbing (the fork is always built now; it's
+  behaviourally identical to stock until `experiment_aliases` is on).
+
 ## Speakers 0.24.2 — 2026-06-26  (Stability: avahi host-name collision + panel alias state)
 - **Fix: avahi host-name collision loop.** The container's auto hostname collided on the LAN and avahi
   looped renaming (`…-16, -17, -18` every ~20 s, withdrawing/re-registering the host address record =

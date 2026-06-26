@@ -17,11 +17,6 @@ on:
       - "podconnect/manager/**" # the manager binary is compiled into the image
       - ".github/workflows/publish.yaml"
   workflow_dispatch:
-    inputs:
-      gl_prebuilt:
-        description: "Use the prebuilt go-librespot instead of the device-aliases fork (disables aliases)"
-        type: boolean
-        default: false
 
 jobs:
   publish:
@@ -73,4 +68,3 @@ jobs:
           build-args: |
             BUILD_FROM=${{ matrix.base }}
             BUILD_ARCH=${{ matrix.arch }}
-            GL_ALIASES=${{ github.event.inputs.gl_prebuilt == 'true' && '0' || '1' }}
