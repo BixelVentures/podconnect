@@ -28,4 +28,14 @@ else
   bashio::log.info "mDNS interface restriction: none (advertising on all interfaces)"
 fi
 
+# Pin a STABLE, distinct mDNS host-name. The container's auto hostname (e.g. "<hash>-podconnect")
+# collided on the LAN and avahi looped renaming "...-16, -17, -18…" (withdrawing/re-registering the
+# host address record every ~20s = constant churn). Claiming our own name avoids that conflict, and
+# stays off the HA host's identity. Worst case (name still taken) = same rename behaviour as before.
+if [ -f /etc/avahi/avahi-daemon.conf ]; then
+  sed -i '/^host-name=/d' /etc/avahi/avahi-daemon.conf
+  sed -i "/^\[server\]/a host-name=podconnect" /etc/avahi/avahi-daemon.conf
+  bashio::log.info "mDNS host-name pinned to 'podconnect'"
+fi
+
 bashio::log.info "PodConnect global setup done — manager will render + supervise rooms"

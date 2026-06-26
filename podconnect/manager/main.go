@@ -862,6 +862,7 @@ type roomInfo struct {
 	Released    bool   `json:"released"`
 	NowPlaying  string `json:"now_playing"`
 	Volume      int    `json:"volume"` // 0..100, or -1 if unknown
+	Alias       bool   `json:"alias"`  // alias-mode: this room is an alias on the primary engine (no own engine)
 
 	// Per-room settings (UX-1b): the EFFECTIVE values plus whether each is a per-room override (true)
 	// or inherited from the global add-on default (false), so the panel can prefill + label them.
@@ -1009,12 +1010,20 @@ func main() {
 			return
 		}
 		out := []roomInfo{}
+		aliasMode := experimentAliases()
 		for _, rm := range loadRooms() {
-			_, up := fetchOutputsFrom(rm.OwnTone)
+			isAlias := aliasMode && rm.Idx != 0
 			gl := librespotStatus(rm.Librespot)
+			// In alias mode a non-primary room has no engine of its own — don't probe it (it'd always read
+			// down). It's an alias advertised on the primary; output is routed there on selection.
+			up := isAlias
+			if !isAlias {
+				_, up = fetchOutputsFrom(rm.OwnTone)
+			}
 			info := roomInfo{
 				ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName,
 				OwntoneUp:  up,
+				Alias:      isAlias,
 				Playing:    gl.Active && !gl.Paused && !gl.Stopped,
 				Released:   fileExists(releasedPath(rm)),
 				NowPlaying: nowPlaying(rm.Librespot),
@@ -1781,7 +1790,8 @@ async function loadRooms() {
     top.appendChild(nm);
     if (isPrimary) { var mp = document.createElement('span'); mp.className = 'pill plain pill-main'; mp.textContent = 'main'; top.appendChild(mp); }
     var badge = document.createElement('span'); badge.className = 'pill';
-    if (rm.released) { badge.classList.add('pill-released'); badge.textContent = 'released'; }
+    if (rm.alias) { badge.classList.add('pill-idle'); badge.textContent = 'alias'; badge.title = 'Selectable in Spotify as an alias on the main engine (no own engine).'; }
+    else if (rm.released) { badge.classList.add('pill-released'); badge.textContent = 'released'; }
     else if (rm.playing) { badge.classList.add('pill-playing'); badge.textContent = 'playing'; }
     else if (rm.owntone_up) { badge.classList.add('pill-idle'); badge.textContent = 'idle'; }
     else { badge.classList.add('pill-starting'); badge.textContent = 'starting…'; }

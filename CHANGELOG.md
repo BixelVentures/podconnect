@@ -8,6 +8,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.2 — 2026-06-26  (Stability: avahi host-name collision + panel alias state)
+- **Fix: avahi host-name collision loop.** The container's auto hostname collided on the LAN and avahi
+  looped renaming (`…-16, -17, -18` every ~20 s, withdrawing/re-registering the host address record =
+  constant churn, likely the source of the flakiness). init-podconnect now pins a stable distinct
+  `host-name=podconnect`, off the HA host's identity. Worst case = same as before.
+- **Fix: panel shows alias rooms as `alias`, not a dead `starting…`.** In alias mode the non-primary
+  rooms have no engine of their own (they're aliases on the primary); the panel no longer probes them
+  or shows them as a perpetually-starting engine. New `alias` field on `/api/rooms`.
+- Volume slider: confirmed the actual HomePod output is capped (never-loud works); the Spotify slider
+  showing 100% is a cosmetic artifact of `external_volume` (loudness lives in OwnTone, decoupled from
+  the app slider). Left as-is — forcing the slider would mean abandoning external_volume and risking the
+  double-attenuation/blast we fixed.
+- Manager `go vet`/`go test` green.
+
 ## Speakers 0.24.1 — 2026-06-26  (Alias selection decode — CLUSTER-PROBE diagnostic)
 - **First-run result:** aliases DO render in Spotify on a non-certified client (multiple rooms show) —
   the display half works. But picking a room arrives as a `transfer` with **no `target_alias_id`**, and
