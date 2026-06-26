@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.7 — 2026-06-26  (Harden: reclaim→route + avahi dbus object-leak noise)
+- **Reclaim-vs-route:** after a 3-min grace-release + resume, the bridge re-selected the PRIMARY room's
+  HomePod (Frida) — now, in alias mode, it immediately re-routes to the *selected* alias's HomePod so
+  resume lands on the chosen room, not Frida.
+- **avahi "Too many objects for client" flood:** raised `objects-per-client-max=65536` in
+  avahi-daemon.conf. OwnTone's AirPlay browsing creates many avahi objects (resolvers/browsers per
+  discovered device) and hit the default cap → failed dbus requests + log spam. Lifting the ceiling
+  removes the failures (safe — only raises a limit).
+- Manager `go vet`/`go test` green.
+
 ## Speakers 0.24.6 — 2026-06-26  (BREAKTHROUGH: alias selection decoded → room routing works)
 - The raw dump proved Spotify DOES send the pick — `"target_alias_id": 2` sits at the **payload TOP
   level** (sibling of `message_id`/`command`), not inside `command`/`command.options` where we looked.

@@ -36,6 +36,14 @@ if [ -f /etc/avahi/avahi-daemon.conf ]; then
   sed -i '/^host-name=/d' /etc/avahi/avahi-daemon.conf
   sed -i "/^\[server\]/a host-name=podconnect" /etc/avahi/avahi-daemon.conf
   bashio::log.info "mDNS host-name pinned to 'podconnect'"
+
+  # Raise avahi's per-client object ceiling. OwnTone's AirPlay browsing creates many avahi objects
+  # (resolvers/browsers per discovered device); on a busy LAN it hit the default cap and avahi logged
+  # "dbus: Too many objects for client" + failed requests. Raising the limit removes the failures.
+  # Safe: it only lifts a ceiling. (Unknown key would just be ignored by avahi.)
+  sed -i '/^objects-per-client-max=/d' /etc/avahi/avahi-daemon.conf
+  sed -i "/^\[server\]/a objects-per-client-max=65536" /etc/avahi/avahi-daemon.conf
+  bashio::log.info "mDNS objects-per-client-max raised to 65536"
 fi
 
 bashio::log.info "PodConnect global setup done — manager will render + supervise rooms"

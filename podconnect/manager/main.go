@@ -720,6 +720,14 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					volCanon = restore
 					log.Printf("[%s]: reclaimed HomePod (playback resumed, restored %d%%)", room.Name, restore)
 					released = false
+					// Alias mode: reclaimHomePod re-selected the PRIMARY room's HomePod, but the active alias
+					// may be a different room. Re-route to the selected alias immediately so resume after a
+					// grace-release lands on the chosen room, not Frida. (Reset lastAlias so the routing block
+					// re-asserts even if the id didn't change.)
+					if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 {
+						routeAliasOutput(room.OwnTone, gl.SelAlias)
+						lastAlias = gl.SelAlias
+					}
 				}
 			} else {
 				if idleSince.IsZero() {
