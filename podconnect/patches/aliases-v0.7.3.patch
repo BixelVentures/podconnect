@@ -82,7 +82,7 @@ index d64f19f..85d0cc7 100644
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..45c2c39 100644
+index c255f83..b16249a 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
 @@ -147,6 +147,27 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
@@ -113,7 +113,7 @@ index c255f83..45c2c39 100644
  		stopBeingActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.lastTransferTimestamp
  
  		// We are still the active device, do not quit
-@@ -171,6 +192,28 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -171,6 +192,30 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
  
@@ -122,7 +122,9 @@ index c255f83..45c2c39 100644
 +	// SelectedAliasId on the next put_state closes the loop so the app shows the active room.
 +	if len(p.app.cfg.DeviceAliases) > 0 {
 +		var aliasId *uint32
-+		if req.Command.TargetAliasId != nil {
++		if req.TargetAliasId != nil { // payload TOP level — where Spotify actually puts it (confirmed)
++			aliasId = req.TargetAliasId
++		} else if req.Command.TargetAliasId != nil {
 +			aliasId = req.Command.TargetAliasId
 +		} else if req.Command.Options.TargetAliasId != nil {
 +			aliasId = req.Command.Options.TargetAliasId
@@ -142,19 +144,7 @@ index c255f83..45c2c39 100644
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
-@@ -396,6 +439,11 @@ func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request)
- 
- 	switch req.MessageIdent {
- 	case "hm://connect-state/v1/player/command":
-+		// device-aliases probe: dump the FULL raw command so we can find the alias index wherever
-+		// Spotify puts it (it's not in the modelled target_alias_id fields).
-+		if len(p.app.cfg.DeviceAliases) > 0 && req.Payload.Command.Endpoint == "transfer" {
-+			p.app.log.Infof("ALIAS-RAW transfer: %s", string(req.Raw))
-+		}
- 		return p.handlePlayerCommand(ctx, req.Payload)
- 	default:
- 		p.app.log.Warnf("unknown dealer request: %s", req.MessageIdent)
-@@ -462,10 +510,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -462,10 +507,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			RepeatContext:  p.state.player.Options.RepeatingContext,
  			RepeatTrack:    p.state.player.Options.RepeatingTrack,
  			ShuffleContext: p.state.player.Options.ShufflingContext,
@@ -224,7 +214,7 @@ index 4221671..4ccfcb3 100644
  }
  
 diff --git a/dealer/recv.go b/dealer/recv.go
-index a9cc04d..50417aa 100644
+index a9cc04d..9c53997 100644
 --- a/dealer/recv.go
 +++ b/dealer/recv.go
 @@ -33,6 +33,7 @@ type Request struct {
@@ -235,15 +225,22 @@ index a9cc04d..50417aa 100644
  }
  
  func (req Request) Reply(success bool) {
-@@ -44,6 +45,7 @@ type RequestPayload struct {
- 	SentByDeviceId string `json:"sent_by_device_id"`
+@@ -40,10 +41,12 @@ func (req Request) Reply(success bool) {
+ }
+ 
+ type RequestPayload struct {
+-	MessageId      uint32 `json:"message_id"`
+-	SentByDeviceId string `json:"sent_by_device_id"`
++	MessageId      uint32  `json:"message_id"`
++	TargetAliasId  *uint32 `json:"target_alias_id"` // device-aliases: the picked alias (payload TOP level)
++	SentByDeviceId string  `json:"sent_by_device_id"`
  	Command        struct {
  		Endpoint         string                    `json:"endpoint"`
 +		TargetAliasId    *uint32                   `json:"target_alias_id"`
  		SessionId        string                    `json:"session_id"`
  		Data             []byte                    `json:"data"`
  		Value            interface{}               `json:"value"`
-@@ -82,6 +84,7 @@ type RequestPayload struct {
+@@ -82,6 +85,7 @@ type RequestPayload struct {
  			AudioStream           string                                  `json:"audio_stream"`
  			SessionId             string                                  `json:"session_id"`
  			License               string                                  `json:"license"`
@@ -251,7 +248,7 @@ index a9cc04d..50417aa 100644
  		} `json:"options"`
  		PlayOptions struct {
  			OverrideRestrictions bool   `json:"override_restrictions"`
-@@ -239,6 +242,7 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
+@@ -239,6 +243,7 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
  		resp:         resp,
  		MessageIdent: rawMsg.MessageIdent,
  		Payload:      payload,

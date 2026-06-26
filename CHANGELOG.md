@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.6 — 2026-06-26  (BREAKTHROUGH: alias selection decoded → room routing works)
+- The raw dump proved Spotify DOES send the pick — `"target_alias_id": 2` sits at the **payload TOP
+  level** (sibling of `message_id`/`command`), not inside `command`/`command.options` where we looked.
+  And the device advertises both aliases (`aliases=[1="Frida…",2="Køkkenalrum…"]`). So it was never
+  gated — just the wrong field path.
+- **Fix:** `RequestPayload.TargetAliasId` (top level) is now read → sets `device.SelectedAliasId` →
+  exposed on `/status` → the manager's `routeAliasOutput` moves the single OwnTone output to the chosen
+  room's HomePod. Picking a room in Spotify's Connect menu now routes the audio there.
+- Removed the raw-dump diagnostic (job done). Fork builds (Docker, Go 1.25).
+- Known follow-ups: the dbus/avahi object-leak noise (separate from this), and reclaim-vs-route
+  interaction after a 3-min grace release (re-route on next tick) — to harden once routing is confirmed.
+
 ## Speakers 0.24.5 — 2026-06-26  (Alias selection: raw-capture diagnostic)
 - The alias index isn't in any field we modelled (`target_alias_id` is always absent; the cluster never
   reports `DEVICE_ALIAS_CHANGED`). So this build **logs the FULL raw transfer command** (`ALIAS-RAW
