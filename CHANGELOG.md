@@ -8,6 +8,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.5 — 2026-06-26  (Alias selection: raw-capture diagnostic)
+- The alias index isn't in any field we modelled (`target_alias_id` is always absent; the cluster never
+  reports `DEVICE_ALIAS_CHANGED`). So this build **logs the FULL raw transfer command** (`ALIAS-RAW
+  transfer: {...}`) and the device's **advertised alias map** (`aliases=[1=…,2=…]` in CLUSTER-PROBE) —
+  to find where (or whether) Spotify sends the pick for a non-certified client, and confirm Køkken is
+  even advertised. One clean "tap Køkken" capture on a stable build now reveals it.
+- Carries 0.24.2's avahi host-name fix + 0.24.3's slim image + 0.24.4's sane-volume — so it's the build
+  to get onto (kills the dbus/avahi churn that's destabilising everything on 0.24.1).
+
 ## Speakers 0.24.4 — 2026-06-26  (Fix: Spotify slider starts at 100% — fork advertises initial_volume)
 - **Root cause (found in code):** go-librespot's `initState` hardcodes `device.Volume =
   MaxStateVolume` (100%), and under `external_volume:true` nothing ever lowers the *advertised* value —

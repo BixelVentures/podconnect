@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.24.4"
+version: "0.24.5"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
