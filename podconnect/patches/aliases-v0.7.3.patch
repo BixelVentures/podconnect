@@ -155,7 +155,7 @@ index c255f83..f9e9663 100644
  
  		if p.primaryStream != nil && p.prodInfo != nil {
 diff --git a/daemon/player_state.go b/daemon/player_state.go
-index 4221671..92b5e11 100644
+index 4221671..4ccfcb3 100644
 --- a/daemon/player_state.go
 +++ b/daemon/player_state.go
 @@ -8,6 +8,7 @@ import (
@@ -166,7 +166,27 @@ index 4221671..92b5e11 100644
  	"github.com/devgianlu/go-librespot/tracks"
  )
  
-@@ -153,6 +154,20 @@ func (p *AppPlayer) initState() {
+@@ -114,11 +115,18 @@ func (s *State) playOrigin() string {
+ }
+ 
+ func (p *AppPlayer) initState() {
++	// Advertise initial_volume (not MAX) as the device's starting volume, so the Spotify slider shows a
++	// sane level instead of 100% on a fresh session. Upstream hardcodes MaxStateVolume; under
++	// external_volume nothing ever lowers it, so the device reported 100%. (PodConnect fork.)
++	initVol := uint32(player.MaxStateVolume)
++	if p.app.cfg.VolumeSteps > 0 {
++		initVol = p.app.cfg.InitialVolume * player.MaxStateVolume / p.app.cfg.VolumeSteps
++	}
+ 	p.state = &State{
+ 		lastCommand: nil,
+ 		device: &connectpb.DeviceInfo{
+ 			CanPlay:               true,
+-			Volume:                player.MaxStateVolume,
++			Volume:                initVol,
+ 			Name:                  p.app.cfg.DeviceName,
+ 			DeviceId:              p.app.deviceId,
+ 			DeviceType:            p.app.deviceType,
+@@ -153,6 +161,20 @@ func (p *AppPlayer) initState() {
  			},
  		},
  	}

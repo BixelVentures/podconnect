@@ -8,6 +8,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.4 — 2026-06-26  (Fix: Spotify slider starts at 100% — fork advertises initial_volume)
+- **Root cause (found in code):** go-librespot's `initState` hardcodes `device.Volume =
+  MaxStateVolume` (100%), and under `external_volume:true` nothing ever lowers the *advertised* value —
+  so a fresh session reported 100% and the Spotify slider showed 100% (the actual HomePod output was
+  still capped to 35% — only the slider "lied").
+- **Fix (fork):** `initState` now advertises `initial_volume` (35%) instead of MAX. The Spotify slider
+  starts at ~35% on a fresh session — no 100%.
+- **Why this beats the external_volume:false route we discussed:** it keeps the current architecture, so
+  the physical HomePod button stays fully usable (its scale still matches what you hear) AND the slider
+  is sane. external_volume:false would have made the physical button confusing (HomePod scale decoupled
+  from perceived loudness) — so this fork tweak gives both, no tradeoff. The bidirectional bridge +
+  never-loud cap remain as the backstop.
+
 ## Speakers 0.24.3 — 2026-06-26  (Fix: image too big to install — multi-stage slim build)
 - **Bug:** 0.24.x built the device-aliases fork *in the final image stage*, baking the Go toolchain +
   module/build cache (hundreds of MB) into the published image → on-device update failed ("An unknown
