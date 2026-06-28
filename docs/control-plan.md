@@ -106,8 +106,9 @@ facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTR
 3. **HA Assist — ✅ works:** entities exposed → voice transport/volume + search-and-play. Area/alias setup is
    user-side (documented in `AREAS-AND-ASSIST.md`). Account-agnostic stop/release lives in the **add-on
    panel** (+ Siri) — no extra HA entity (the local-entity attempt was reverted in 0.7.1).
-4. **Multi-account *(optional, deferred)*:** per-family-member config entries; explicit "from
-   <device/account>" routing. Multi-account *playback* already works via Spotify Connect — see
+4. **Multi-account *(deferred / not built)*:** per-family-member config entries; explicit "from
+   <device/account>" routing. NOTE: simultaneous multi-account playback is **not** available under the
+   current single-engine alias architecture (it needed the removed per-room engines) — see
    `MULTI-ACCOUNT.md`.
 5. **Multi-room "Add speaker" UI + manager — ✅ done in the add-on** (Speakers 0.9.0+); needs on-device
    validation.

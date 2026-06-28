@@ -18,6 +18,13 @@ clean audio, switch from the Spotify app." This is now the **only** mode: the pe
 model and the `persistent_connect` / `experiment_aliases` experiments were removed. See
 [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
+**Limits (by design, single-engine):** it's **one stream — one room at a time** (picking a room *moves*
+the music). PodConnect does **not** play two rooms at once, and a second person **cannot** play a
+different room simultaneously via PodConnect (one engine = one account at a time; picking takes over).
+Workaround for simultaneous: a second person AirPlays from their iPhone directly to a free HomePod
+(native iOS, outside PodConnect). Different-music-per-room and synced same-music groups are not features;
+"multi-account via voice" was never built. See [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md).
+
 ---
 
 ## A. Audio bridge — volume

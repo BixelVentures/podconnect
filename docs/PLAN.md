@@ -48,9 +48,9 @@ Assistant, and the HomePod.
                  └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-One OwnTone instance plays one queue to one set of synchronized speakers, so independent
-simultaneous rooms use **one (go-librespot + OwnTone) pair per HomePod**, each with unique
-ports, database, and mDNS name.
+One OwnTone instance plays one queue to one set of synchronized speakers. _(Historical: this once
+implied one (go-librespot + OwnTone) pair per HomePod for independent simultaneous rooms. The shipped
+design is single-engine device-aliases — one pair total, one room at a time — see the banner above.)_
 
 ## Tech stack
 
@@ -135,7 +135,9 @@ podconnect/                          # the HA add-on "PodConnect Speakers" (sing
 2. The Connect device appears in the Spotify app within seconds; play → audio on the HomePod.
 3. Volume from the Spotify app and from HA Assist both move the HomePod and stay in sync.
 4. HA Assist can start playback to a room with the app closed.
-5. A second room plays different music simultaneously (independent instances).
+5. ~~A second room plays different music simultaneously (independent instances).~~ _(Historical
+   acceptance criterion from the per-room model — NOT applicable to the shipped single-engine design:
+   one stream, one room at a time. Instead: picking another room in the Spotify menu moves the audio.)_
 6. Restart the add-on → speakers still paired, HomePods still bound.
 7. Killing a daemon → manager respawns it; killing the manager → s6 restarts it.
 

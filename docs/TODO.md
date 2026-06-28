@@ -34,8 +34,10 @@ AirPlay's switch only). Zero setup. The per-room multi-engine model and the `per
   buffer-flush could help, tuned on the Green to avoid underruns.
 - **Synchronized same-music groups** (one source → many HomePods at once) — separate, not built;
   OwnTone multi-output is the likely path.
-- **Multi-account** (optional) — see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md). Mostly moot now that
-  device-aliases gives multi-room on one account; only adds HA-level cross-account dashboards.
+- **Multi-account / simultaneous different-rooms** — see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md). NOT
+  possible under single-engine (one stream, one room at a time); it needed the removed per-room engines.
+  Workaround today: a 2nd person AirPlays from their iPhone to a free HomePod. A hybrid (alias engine +
+  on-demand per-room engine for a 2nd account) is the only way to bring it back — deliberately deferred.
 - Clean up the recurring `/events` ws reconnect log noise (pre-existing; harmless).
 
 ## 🚫 Investigated dead-ends (don't re-attempt)

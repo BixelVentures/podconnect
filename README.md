@@ -15,9 +15,12 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
   named pipe → `OwnTone` (AirPlay 2 sender) → HomePod.
 - **Multi-room on ONE Spotify account — zero setup.** A single engine advertises **all your rooms as
   separate selectable devices in the Spotify Connect menu, on your one account, with clean audio**.
-  Pick a room in the Spotify app and the audio follows there (~1-2 s, just AirPlay's switch). This uses
+  Pick a room in the Spotify app and the audio **moves** there (~1-2 s, just AirPlay's switch). This uses
   Spotify's own device-aliases (multiroom zones) — see [`docs/ALIASES-PROBE.md`](docs/ALIASES-PROBE.md).
   Add your HomePods in the panel and they each appear as a room; nothing to enable.
+  *It's one stream — one room at a time (picking a room moves the music; PodConnect doesn't play two
+  rooms, or two accounts, at once). Different-music-per-room and synced groups are not PodConnect
+  features — see [`docs/MULTI-ACCOUNT.md`](docs/MULTI-ACCOUNT.md).*
 - The sidebar **panel** is the room manager — **Add / Remove / Rename** speakers and **⚙ per-room
   Settings**, all live with no add-on restart.
 - **Pick your HomePod with no typing:** the panel shows a live network scan — click and save. Each

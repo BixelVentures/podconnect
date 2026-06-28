@@ -7,8 +7,10 @@
 > this doc describes — **different people on different Spotify accounts playing different rooms at the
 > same time** — is **no longer possible**: it relied on the per-room multi-engine model, which was
 > **removed in 0.25.0**. Re-enabling it would mean reverting to per-room engines (and the contention
-> that caused). Account-agnostic *stop* still works via the panel Stop / Siri. The rest below is kept
-> as design history.
+> that caused). **Workaround for simultaneous:** a second person can **AirPlay from their iPhone
+> directly** to a HomePod PodConnect isn't currently using (native iOS, outside PodConnect). Note: a
+> "multi-account *via voice*" router was only ever a deferred plan — it was **never built**.
+> Account-agnostic *stop* still works via the panel Stop / Siri. The rest below is kept as design history.
 
 The trigger: a Spotify **Family plan = N independent accounts**, but the PodConnect speakers
 (HomePods) are **shared hardware**. Each go-librespot Connect device can be played by *any* account on

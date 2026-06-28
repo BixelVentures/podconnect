@@ -41,15 +41,22 @@ Open the **PodConnect Speakers** panel:
   [`gemini-system-prompt.md`](gemini-system-prompt.md) for the assistant prompt).
 
 ## Multi-room — what to expect
-**Multi-room on one account, automatic.** Every HomePod you add in the panel shows up as its **own
+**Switch rooms on one account, automatic.** Every HomePod you add in the panel shows up as its **own
 selectable room in the Spotify Connect menu on your single account** — pick a room and the audio
-follows there (~1–2 s). One stream, clean audio, nothing to enable. See
-[`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6 and [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
+**moves** there (~1–2 s). Nothing to enable. See [`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6
+and [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
-**Different music in different rooms at the same time** is **not** supported — the engine is
-single-stream (one Spotify session for the household), so it plays one room (or one alias) at a time.
-Synchronized *same* music across rooms (groups) is a separate, not-yet-built feature. (Background on the
-old per-room/multi-account model: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md).)
+**It's one stream — one room at a time.** Picking a room *moves* the music; PodConnect does **not** play
+two rooms at once, and a second person **cannot** play a different room simultaneously via PodConnect
+(it's a single engine — whoever picks a room takes it over). Two things that are **not** PodConnect
+features:
+- **Different music in different rooms at the same time** — not supported. Workaround: a second person
+  can **AirPlay from their iPhone directly** to a free HomePod (native iOS, outside PodConnect) while
+  you use PodConnect on another.
+- **Synchronized *same* music across rooms (groups)** — separate, not built.
+
+(Background on the old per-room/multi-account model that once allowed simultaneous accounts — now
+removed: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md).)
 
 ## Updating
 - **Speakers:** the Add-on Store shows **Update** when a new version ships. No reconfig.
