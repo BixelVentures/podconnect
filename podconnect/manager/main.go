@@ -654,7 +654,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Only the primary room runs in alias mode (single-engine), so this is the one router.
 			// Attempt on change; on failure retry on a 3s throttle (NOT every tick — that flooded the log
 			// + hammered OwnTone when the target HomePod was momentarily missing).
-			if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 {
+			if room.Idx == 0 && gl.SelAlias > 0 {
 				if gl.SelAlias != lastAlias || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
 					if routeAliasOutput(room.OwnTone, gl.SelAlias) {
 						lastAlias = gl.SelAlias
@@ -739,7 +739,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					// may be a different room. Re-route to the selected alias immediately so resume after a
 					// grace-release lands on the chosen room, not Frida. (Reset lastAlias so the routing block
 					// re-asserts even if the id didn't change.)
-					if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 {
+					if room.Idx == 0 && gl.SelAlias > 0 {
 						routeAliasOutput(room.OwnTone, gl.SelAlias)
 						lastAlias = gl.SelAlias
 					}
@@ -977,14 +977,11 @@ func main() {
 	store = newRoomStore()
 	mgr = newRoomManager(store)
 
-	// Build rooms (migrating the single-room setup on first boot), then start each one's children +
-	// bridge. The supervise loop owns the children; reconcile == just (re)spawn everything we know of.
-	// Alias mode (single-engine): run ONLY the primary room's engine — the other rooms become aliases
-	// advertised on it (one session = no contention). Output is routed per alias by the primary bridge.
-	aliasMode := experimentAliases()
+	// Single-engine: run ONLY the primary room's engine. The other rooms are Spotify device-aliases
+	// advertised on it (one session = no contention); output is routed per alias by the primary bridge.
 	for _, rm := range loadRooms() {
-		if aliasMode && rm.Idx != 0 {
-			log.Printf("alias mode: room %s runs as an alias on the primary engine (its own engine not started)", rm.ID)
+		if rm.Idx != 0 {
+			log.Printf("room %s runs as an alias on the primary engine (its own engine not started)", rm.ID)
 			continue
 		}
 		mgr.ensureRunning(rm)
@@ -1033,12 +1030,11 @@ func main() {
 			return
 		}
 		out := []roomInfo{}
-		aliasMode := experimentAliases()
 		for _, rm := range loadRooms() {
-			isAlias := aliasMode && rm.Idx != 0
+			isAlias := rm.Idx != 0
 			gl := librespotStatus(rm.Librespot)
-			// In alias mode a non-primary room has no engine of its own — don't probe it (it'd always read
-			// down). It's an alias advertised on the primary; output is routed there on selection.
+			// A non-primary room has no engine of its own — don't probe it (it'd always read down). It's an
+			// alias advertised on the primary; output is routed there on selection.
 			up := isAlias
 			if !isAlias {
 				_, up = fetchOutputsFrom(rm.OwnTone)
@@ -1434,21 +1430,16 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if experimentAliases() {
-			// Alias mode (single-engine): the new room is an ALIAS on the primary engine, NOT its own
-			// engine — starting one here spawned a second go-librespot (contention, destabilised the
-			// primary's OwnTone so it lost HomePods). Instead re-render + restart the primary so it
-			// advertises the updated alias list; routeAliasOutput then sends audio to the new HomePod.
-			if pr := primaryRoom(); pr != nil {
-				_ = renderGLConfig(pr)
-				if rt := mgr.runtime(pr.ID); rt != nil {
-					rt.restartGL()
-				}
-				log.Printf("alias mode: added %q as an alias on the primary engine (re-advertising)", rm.Name)
+		// Single-engine: the new room is an ALIAS on the primary engine, not its own engine (a second
+		// go-librespot would contend on the one account and destabilise the primary's OwnTone). Re-render
+		// + restart the primary so it advertises the updated alias list; routeAliasOutput then sends audio
+		// to the new HomePod when it's picked.
+		if pr := primaryRoom(); pr != nil {
+			_ = renderGLConfig(pr)
+			if rt := mgr.runtime(pr.ID); rt != nil {
+				rt.restartGL()
 			}
-		} else {
-			mgr.ensureRunning(rm)
-			startRoomBridge(rm)
+			log.Printf("added %q as an alias on the primary engine (re-advertising)", rm.Name)
 		}
 		writeJSON(w, map[string]any{"ok": true, "id": rm.ID, "name": rm.Name})
 	case http.MethodDelete:

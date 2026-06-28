@@ -1,10 +1,11 @@
 # Multi-account — scope, what already belongs here, and the fix
 
-> **Mostly superseded (June 2026).** You no longer need multiple accounts for multi-room: the
-> **device-aliases mode** (`experiment_aliases: true`) gives several selectable rooms in the Spotify
+> **Mostly superseded (June 2026).** You no longer need multiple accounts for multi-room: PodConnect's
+> **device-aliases** (now the default, zero setup) gives several selectable rooms in the Spotify
 > Connect menu **on one account**, with clean audio — see [`ALIASES-PROBE.md`](ALIASES-PROBE.md) and
 > [`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6. This doc remains relevant only if you genuinely
-> want **different people on different Spotify accounts** controlling rooms, with HA-level visibility.
+> want **different people on different Spotify accounts** controlling rooms simultaneously (different
+> music in different rooms at once), with HA-level visibility.
 
 The trigger: a Spotify **Family plan = N independent accounts**, but the PodConnect speakers
 (HomePods) are **shared hardware**. Each go-librespot Connect device can be played by *any* account on

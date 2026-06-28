@@ -8,6 +8,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.25.0 — 2026-06-28  (Cleanup: device-aliases is the only mode; experiments removed)
+- **Device-aliases multi-room is now the default and only mode** — no flag to flip. Add HomePods in the
+  panel and each appears as its own selectable room in the Spotify Connect menu on one account.
+- **Removed the dead experiments:** `persistent_connect` (the failed "3 persistent Connect devices on
+  one account" attempt) and the `experiment_aliases` flag — gone from config + code. Also removed the
+  per-room multi-engine startup path and the now-unused `persistentConnect()` / `experimentAliases()`
+  readers. `connect_aliases` stays as an advanced override (auto-derives from rooms by default).
+- Single-engine is unconditional: only the primary room's engine runs; the rest are aliases on it.
+- **Known follow-up:** self-healing-on-rename (`selectHomePod`/`healBinding`) is unwired in alias mode
+  (it would fight the alias router); `routeAliasOutput`'s id-match covers most renames. To be re-wired
+  as a heal-only path.
+- All docs re-synced to "multi-room is automatic, no setting." Manager `go vet`/`go test` green (+ darwin cross-build).
+
 ## Speakers 0.24.11 — 2026-06-28  (Instant room switching — push alias pick over /events)
 - The fork now **emits a `selected_alias` event on its /events ws** the instant a room is picked, and
   the manager handles it in `applyGLEvent` → routes immediately instead of waiting on the (1s) /status

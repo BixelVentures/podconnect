@@ -5,17 +5,17 @@ Single source of truth for **what each feature does** and **whether it works**. 
 
 _Last updated: 2026-06-28 — Speakers add-on **0.24.11**, Control integration **0.10.0**._
 
-**Legend:** ✅ working (verified on-device) · ⚪ should work per code, not re-tested this round ·
-🧪 experiment (works, behind a flag) · ⏳ planned.
+**Legend:** ✅ working (verified on-device) · ⚪ should work per code, not re-tested this round · ⏳ planned.
 
 ---
 
-## Headline (June 2026): multi-room on ONE account works
+## Headline (June 2026): multi-room on ONE account works — and it's the default
 
-Device-aliases mode (`experiment_aliases: true`) makes a **single** go-librespot engine advertise all
-your rooms as **separate selectable devices in the Spotify Connect menu, on one account**. Pick a room
-in the Spotify app → the audio routes to that HomePod (~1–2 s, AirPlay's switch). Proven on-device —
-the long-sought "several rooms, one account, clean audio, switch from the Spotify app." See
+A **single** go-librespot engine advertises all your rooms as **separate selectable devices in the
+Spotify Connect menu, on one account**. Pick a room in the Spotify app → the audio routes to that
+HomePod (~1–2 s, AirPlay's switch). Proven on-device — the long-sought "several rooms, one account,
+clean audio, switch from the Spotify app." This is now the **only** mode: the per-room multi-engine
+model and the `persistent_connect` / `experiment_aliases` experiments were removed. See
 [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
 ---
@@ -39,8 +39,7 @@ the long-sought "several rooms, one account, clean audio, switch from the Spotif
 ## C. Spotify Connect engine (go-librespot — our fork)
 | Feature | Status |
 |---|---|
-| Per-room engine (default): one go-librespot+OwnTone per HomePod, stable device_id | ✅ |
-| **Device-aliases** — one engine advertises N rooms as Connect-menu aliases; selection (`target_alias_id` at payload top level) routes output to that room; pushed instantly over `/events` | 🧪✅ (0.24.6–0.24.11) |
+| **Device-aliases (the only mode)** — one engine advertises N rooms as Connect-menu aliases; selection (`target_alias_id` at payload top level) routes output to that room; pushed instantly over `/events`. Single-engine; stable device_id | ✅ (0.24.6–0.25.0) |
 | Fork built from source (multi-stage slim image); patch `podconnect/patches/aliases-v0.7.3.patch`; CI compile-guard | ✅ |
 | Graceful restart (SIGTERM → withdraws zeroconf cleanly → no duplicate Connect entries) | ✅ (0.24.9) |
 | avahi host-name pinned + `objects-per-client-max` raised (no rename churn / dbus flood) | ✅ (0.22.2 / 0.24.7) |
@@ -65,5 +64,6 @@ the long-sought "several rooms, one account, clean audio, switch from the Spotif
 
 ## Known noise / follow-ups
 - Recurring `/events` ws reconnect log lines (`StatusNoStatusRcvd`) — pre-existing; poll fallback keeps state fresh.
-- Promote device-aliases out of the `experiment_` flag after more mileage; surface alias rooms better in the panel.
+- Self-healing-on-rename (`selectHomePod`/`healBinding`) is currently unwired in alias mode (it would fight the router); routeAliasOutput's id-match handles most renames. Re-wire a heal-only path as a follow-up.
+- Surface the alias rooms more clearly in the panel.
 - Synchronized same-music groups across rooms — not built (OwnTone multi-output is the likely path).

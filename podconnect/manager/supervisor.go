@@ -125,22 +125,12 @@ func (rt *roomRuntime) supervise() {
 	defer warmup.Stop()
 	healthTick := time.NewTicker(30 * time.Second)
 	defer healthTick.Stop()
-	selectTick := time.NewTicker(10 * time.Second)
-	defer selectTick.Stop()
 	warmedUp := false
 	fails := 0
 
-	// Initial selection attempt shortly after start (OwnTone needs a moment to discover outputs).
-	// In alias mode the primary bridge's alias-router owns output selection, so skip the per-room pin.
-	time.AfterFunc(8*time.Second, func() {
-		select {
-		case <-rt.stop:
-		default:
-			if !experimentAliases() {
-				selectHomePod(r)
-			}
-		}
-	})
+	// Output selection is owned by the primary bridge's alias-router (routeAliasOutput): on startup the
+	// engine reports its default selected alias, which the router maps to the right HomePod. (The old
+	// per-room HomePod pin via selectHomePod is not used in alias mode — it would fight the router.)
 
 	for {
 		select {
@@ -165,10 +155,6 @@ func (rt *roomRuntime) supervise() {
 				fails = 0
 				warmup.Reset(60 * time.Second)
 				warmedUp = false
-			}
-		case <-selectTick.C:
-			if !experimentAliases() {
-				selectHomePod(r)
 			}
 		}
 	}

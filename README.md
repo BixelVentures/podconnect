@@ -13,15 +13,11 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 **PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`)
 - Turns a HomePod into a **Spotify Connect speaker**: `go-librespot` (Connect receiver) → a
   named pipe → `OwnTone` (AirPlay 2 sender) → HomePod.
-- **Multi-room, two ways:**
-  - **Default (per-room):** several HomePods, each its own independent Connect speaker (its own
-    go-librespot + OwnTone). One Spotify account plays to one room at a time (switch in Spotify's
-    device list); different music in different rooms needs one account per room.
-  - **Device-aliases mode (`experiment_aliases: true`) — the recommended multi-room path:** ONE engine
-    advertises **all your rooms as separate selectable devices in the Spotify Connect menu, on ONE
-    account, with clean audio**. Pick a room in the Spotify app and the audio follows there (~1-2 s,
-    just AirPlay's switch). This uses Spotify's own device-aliases (multiroom zones) — see
-    [`docs/ALIASES-PROBE.md`](docs/ALIASES-PROBE.md).
+- **Multi-room on ONE Spotify account — zero setup.** A single engine advertises **all your rooms as
+  separate selectable devices in the Spotify Connect menu, on your one account, with clean audio**.
+  Pick a room in the Spotify app and the audio follows there (~1-2 s, just AirPlay's switch). This uses
+  Spotify's own device-aliases (multiroom zones) — see [`docs/ALIASES-PROBE.md`](docs/ALIASES-PROBE.md).
+  Add your HomePods in the panel and they each appear as a room; nothing to enable.
 - The sidebar **panel** is the room manager — **Add / Remove / Rename** speakers and **⚙ per-room
   Settings**, all live with no add-on restart.
 - **Pick your HomePod with no typing:** the panel shows a live network scan — click and save. Each
@@ -86,14 +82,14 @@ they pause whoever is playing, regardless of which Spotify account owns the spea
 
 **Done & working on real hardware (June 2026):**
 - **Device-aliases multi-room** — multiple rooms in the Spotify Connect menu on **one account**, clean
-  audio, instant-ish room routing. Proven on-device. (Enable `experiment_aliases`.)
+  audio, instant room routing. Proven on-device; it's the **default** (the per-room multi-engine model
+  and the `persistent_connect` experiment were removed — aliases are the one way).
 - **Sane-start volume** (slider reads the real level, never 100%) and the never-loud cap.
 - **Slim multi-stage image** + **graceful go-librespot restart** (no duplicate Connect entries) +
   avahi host-name pin (no mDNS rename churn).
 
 **Planned / nice-to-have:**
-- Promote device-aliases out of the `experiment_` flag once it has more mileage (and surface the alias
-  rooms more clearly in the panel).
+- Surface the alias rooms more clearly in the panel; re-wire self-healing-on-rename for alias mode.
 - **Track-change buffer-flush** (sub-second skips) — the floor is AirPlay's ~2 s; `buffer_ms` is the
   current knob.
 - **Synchronized same-music groups** across rooms (one source → many HomePods at once) — a separate,

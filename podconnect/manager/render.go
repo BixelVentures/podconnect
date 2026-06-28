@@ -30,42 +30,10 @@ func readBitrate() string {
 	return o.Bitrate
 }
 
-// persistentConnect is the EXPERIMENTAL opt-in option. When true, a room's go-librespot runs with
-// zeroconf discovery OFF and relies on its persisted credentials to reconnect as a stable, registered
-// Connect device — the model real hardware (Sonos etc.) uses, which avoids the multi-instance
-// same-account discovery race (librespot #793). Default false = today's zeroconf behavior unchanged.
-// NOTE: a room must have been claimed once (so credentials are cached) BEFORE this helps; an
-// unclaimed room with discovery off can't be picked. Toggle off to revert instantly.
-func persistentConnect() bool {
-	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
-	if err != nil {
-		return false
-	}
-	var o struct {
-		PersistentConnect bool `json:"persistent_connect"`
-	}
-	return json.Unmarshal(b, &o) == nil && o.PersistentConnect
-}
-
-// experimentAliases is the PROBE opt-in (Stage A). When true, the PRIMARY room's go-librespot
-// advertises connectAliases() as Spotify device-aliases (multiroom zones) — one session, N selectable
-// devices in the Connect menu. Requires the GL_ALIASES=1 image (the device-aliases fork). Default
-// false = unchanged. See podconnect/patches/aliases-v0.7.3.patch.
-func experimentAliases() bool {
-	b, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
-	if err != nil {
-		return false
-	}
-	var o struct {
-		ExperimentAliases bool `json:"experiment_aliases"`
-	}
-	return json.Unmarshal(b, &o) == nil && o.ExperimentAliases
-}
-
-// connectAliases is the list of room names to advertise as aliases in the Spotify Connect menu when
-// experimentAliases() is on. By DEFAULT it auto-derives from your configured rooms (in rooms.json
-// order) — zero config. The connect_aliases option is an advanced override; if set, its order MUST
-// match the room order, since routeAliasOutput maps alias id N -> loadRooms()[N-1].
+// connectAliases is the list of room names advertised as Spotify device-aliases (multiroom zones) in
+// the Connect menu. By DEFAULT it auto-derives from your configured rooms (in rooms.json order) — zero
+// config. The connect_aliases option is an advanced override; if set, its order MUST match the room
+// order, since routeAliasOutput maps alias id N -> loadRooms()[N-1].
 func connectAliases() []string {
 	if b, err := os.ReadFile(filepath.Join(dataDir, "options.json")); err == nil {
 		var o struct {
@@ -100,21 +68,11 @@ func renderGLConfig(r *Room) error {
 		return err
 	}
 	devID := roomDeviceID(r)
-	// EXPERIMENT (persistent_connect): the documented headless model — discovery OFF + credentials
-	// type "interactive", which REUSES the credentials persisted during the earlier zeroconf claim (no
-	// browser prompt). That makes the room a stable, registered Connect device like real hardware,
-	// avoiding the multi-instance same-account discovery race (librespot #793). Default = zeroconf
-	// discovery ON (unchanged). A room must be claimed once (persist_credentials caches) BEFORE this.
-	zeroconfEnabled := "true"
-	credsBlock := "credentials:\n  type: zeroconf\n  zeroconf:\n    persist_credentials: true"
-	if persistentConnect() {
-		zeroconfEnabled = "false"
-		credsBlock = "credentials:\n  type: interactive"
-	}
-	// PROBE (Stage A): the primary room's engine advertises device-aliases (multiroom zones). Only the
-	// primary room (Idx 0) carries them — one session, N selectable rooms. No-op without the fork image.
+	// The primary room's engine advertises the rooms as Spotify device-aliases (multiroom zones) — one
+	// session, N selectable rooms in the Connect menu on one account. Only the primary (Idx 0) carries
+	// them (it's the single engine); routeAliasOutput sends audio to the picked room's HomePod.
 	aliasesBlock := ""
-	if experimentAliases() && r.Idx == 0 {
+	if r.Idx == 0 {
 		if al := connectAliases(); len(al) > 0 {
 			var b strings.Builder
 			b.WriteString("device_aliases:\n")
@@ -128,9 +86,12 @@ func renderGLConfig(r *Room) error {
 device_id: "%s"
 device_type: speaker
 bitrate: %s
-zeroconf_enabled: %s
+zeroconf_enabled: true
 zeroconf_backend: avahi
-%s
+credentials:
+  type: zeroconf
+  zeroconf:
+    persist_credentials: true
 %saudio_backend: pipe
 audio_output_pipe: %s
 audio_output_pipe_format: s16le
@@ -141,7 +102,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), zeroconfEnabled, credsBlock, aliasesBlock, r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 

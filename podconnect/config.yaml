@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.24.11"
+version: "0.25.0"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -29,16 +29,12 @@ options:
   grace_minutes: 3           # GLOBAL DEFAULT (hold the HomePod this long after playback stops) — overridable per-room
   buffer_ms: 500             # OwnTone start_buffer_ms: LOWER = snappier skips but more dropouts; HIGHER (700-1000) = rock-solid. (The ~2s HomePod skip floor is AirPlay-inherent, not this.)
   attention_token: ""        # optional shared secret for the /api/attention duck API (voice gatekeeper); empty = open on the LAN
-  persistent_connect: false  # EXPERIMENT: run speakers as persistent (discovery-off) Connect devices so 3 can coexist on one account. Claim each room ONCE first, then enable. Toggle off to revert.
-  experiment_aliases: false  # PROBE (Stage A): make the primary go-librespot advertise connect_aliases as Spotify device-aliases (multiroom zones) — ONE session, N selectable devices. Requires the GL_ALIASES=1 image. Toggle off to revert.
-  connect_aliases: []        # PROBE: room names to advertise as aliases in the Spotify Connect menu (e.g. ["Køkken","Stue","Soveværelse"]) when experiment_aliases is on.
+  connect_aliases: []        # ADVANCED override for the Spotify Connect menu room names. Empty (default) = auto-derive one alias per room you add in the panel, in panel order. Set names ONLY to override — order MUST match your rooms.
 schema:
   bitrate: "list(96|160|320)"
   network_interface: "str?"
   grace_minutes: "int(0,120)?"
   buffer_ms: "int(50,2000)?"
   attention_token: "str?"
-  persistent_connect: "bool?"
-  experiment_aliases: "bool?"
   connect_aliases:
     - "str?"

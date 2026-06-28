@@ -1,49 +1,36 @@
-# Device-aliases — one-switch test (and how it works)
+# Device-aliases — how multi-room works (and how it was proven)
 
-Goal: ONE Spotify session that shows **multiple selectable rooms** in the Spotify Connect menu (Spotify
-"device aliases" / multiroom zones), on ONE account, clean audio, no flip-flop — and picking a room
-**moves the audio** to that HomePod. This is the only architecture that keeps multiple PodConnect rooms
-visible in the Connect menu on one account (see memory: device-aliases path).
+PodConnect shows **multiple selectable rooms in the Spotify Connect menu, on ONE account**, with clean
+audio — pick a room and the audio moves to that HomePod. It uses Spotify's own **device aliases**
+(multiroom zones). As of **0.25.0 this is the only mode** — it's on by default, zero config (the old
+per-room multi-engine model and the `persistent_connect` / `experiment_aliases` experiments were
+removed). This file documents how it works and how it was cracked.
 
-As of Speakers 0.24.0 this is a **real feature behind one switch**, not a manual probe. The released
-image already contains the device-aliases fork of go-librespot; it is dormant and behaviourally
-identical to stock until you flip the switch.
+## How it works
+- A **single** go-librespot engine (the primary room) advertises every room as a Spotify device alias.
+  The alias list auto-derives from your panel rooms (advanced override: the `connect_aliases` option,
+  whose order must match your room order).
+- Picking a room in the Spotify app sends a `transfer` whose **`target_alias_id`** sits at the dealer
+  **RequestPayload top level** (not inside `command`/`command.options` — that wrong path is why early
+  probes logged "NO target_alias_id"). The fork reads it → sets `DeviceInfo.SelectedAliasId` → pushes a
+  `selected_alias` event on `/events` (and also exposes it on `/status` as a backstop).
+- The manager's `routeAliasOutput` maps the alias id → that room → selects its HomePod on the single
+  OwnTone output. The other rooms have **no engine of their own** (no contention).
 
-## Turn it on (no GitHub steps)
+## What you should see
+- **Spotify app → Connect menu:** each room appears as its own device.
+- **Add-on log when you pick a room:** `ALIAS-PROBE: ... selected alias id=N name="Stue"` then
+  `alias-route: alias N -> room "Stue" -> HomePod "..."`. Audio follows (~1–2 s, AirPlay's switch).
 
-1. Update the **PodConnect Speakers** add-on to 0.24.0+ → restart.
-2. Configuration tab:
-   ```yaml
-   experiment_aliases: true
-   ```
-   That's it — aliases auto-derive from your configured rooms. (Optional advanced override:
-   `connect_aliases: ["Køkken","Stue"]` — order must match your room order.)
-3. Save → restart the add-on.
+## The key finding (the eSDK question, answered)
+`device_aliases` is documented for Spotify's **certified eSDK**, so it was unknown whether a
+non-certified client (go-librespot) would get the aliases rendered + the selection signal back. **Both
+work** — proven on-device 2026-06-28: the aliases render, and the pick arrives as the payload-level
+`target_alias_id`. It is **not** eSDK-gated. The implementation lives in
+`podconnect/patches/aliases-v0.7.3.patch` (a fork of go-librespot v0.7.3, built into the image; a CI
+job compile-guards the patch).
 
-What happens when it's on:
-- only the **primary** room's engine runs; the other rooms become **aliases** on it (one session, no
-  contention);
-- the per-room HomePod pin is suppressed; the **alias router** moves the single OwnTone output to the
-  chosen room's HomePod;
-- pick a room in Spotify's Connect menu → audio follows.
-
-## What to look for
-
-- **Spotify app → Connect menu:** do your rooms show up as separate devices?
-- **Add-on log when you tap a room:** `ALIAS-PROBE: ... selected alias id=N name="Stue"` then
-  `alias-route: alias N -> room "Stue" -> HomePod "..."`.
-- Pick a different room → audio should move there, and not auto-switch-back within ~60 s.
-
-## The one thing nobody can predict
-
-`device_aliases` is documented for Spotify's **certified eSDK**. Whether a non-certified client
-(go-librespot) gets the aliases rendered + the selection signal is the single unknown — visible the
-moment you open the Connect menu. If the rooms appear and the log shows the route, it works. If they
-never appear, non-certified clients are gated → fall back to architecture A (room switch in our panel /
-voice). Routing maps the selection from `/status selected_alias_id`; if the live log shows the signal
-arriving differently, it's a one-line tweak in `routeAliasOutput`.
-
-## Rollback
-
-Set `experiment_aliases: false` → restart. Back to today's per-room behaviour, identical. (To also drop
-the fork binary: re-run Publish with `gl_prebuilt: true`.)
+## Reverting (if ever needed)
+There's no runtime switch — aliases are the architecture now. To revert you'd `git revert` the
+device-aliases work and ship the prebuilt go-librespot again. See [`../CHANGELOG.md`](../CHANGELOG.md)
+(0.23.0 → 0.25.0) for the full trail.

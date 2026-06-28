@@ -4,10 +4,11 @@ _Updated 2026-06-28. Speakers add-on **0.24.11**, Control integration **0.10.0**
 
 ## ✅ Done (works end-to-end, on real hardware)
 
-**The big one — multi-room on ONE account (device aliases).** A single go-librespot engine advertises
-every room as a separate selectable device in the Spotify Connect menu, on one account; picking a room
-routes the audio to that HomePod (selection pushed over `/events`, ~1–2 s = AirPlay's switch only).
-Enable with `experiment_aliases: true`. Path + findings: [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
+**The big one — multi-room on ONE account (device aliases), now the default.** A single go-librespot
+engine advertises every room as a separate selectable device in the Spotify Connect menu, on one
+account; picking a room routes the audio to that HomePod (selection pushed over `/events`, ~1–2 s =
+AirPlay's switch only). Zero setup. The per-room multi-engine model and the `persistent_connect` /
+`experiment_aliases` experiments were **removed** (cleanup, 0.25.0). Findings: [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
 **Speakers (add-on):**
 - Per-room engines (default) **and** device-aliases mode (above); add-speaker in alias mode
@@ -26,8 +27,9 @@ Enable with `experiment_aliases: true`. Path + findings: [`ALIASES-PROBE.md`](AL
   and response-returning **data services** `top_tracks` / `recently_played` / `liked` for an AI assist.
 
 ## 🎯 Next
-- **Promote device-aliases out of `experiment_`** once it has more mileage; surface the alias rooms
-  more clearly in the panel (they currently show as `alias` cards).
+- **Re-wire self-healing-on-rename for alias mode** (`selectHomePod`/`healBinding` are currently
+  unwired — they'd fight the router; routeAliasOutput's id-match covers most renames). Surface the
+  alias rooms more clearly in the panel.
 - **Sub-second skips** — the floor is AirPlay's ~2 s; `buffer_ms` is the current knob. A track-change
   buffer-flush could help, tuned on the Green to avoid underruns.
 - **Synchronized same-music groups** (one source → many HomePods at once) — separate, not built;
