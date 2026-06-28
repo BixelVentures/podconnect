@@ -275,7 +275,7 @@ func (s *roomStore) setReleased(id string, released bool) {
 }
 
 // setHomePodBinding persists a room's chosen HomePod as an id+name pair (the panel's pick / add).
-// The id is the stable binding the self-healing selectHomePod matches on first; the name is the
+// The id is the stable binding matchOutput (the alias router) matches on first; the name is the
 // human label + fallback match. Either may be ""; both are stored as given (trimmed).
 func (s *roomStore) setHomePodBinding(id, homepodID, homepodName string) {
 	s.mu.Lock()
@@ -312,8 +312,8 @@ func (s *roomStore) setName(id, name string) {
 	}
 }
 
-// setNameManual persists a user-chosen display name AND flips NameManual so the self-healing
-// selectHomePod won't auto-overwrite it when the bound HomePod is later renamed in Apple Home.
+// setNameManual persists a user-chosen display name AND flips NameManual so a future rename-heal
+// (if re-added) won't auto-overwrite it when the bound HomePod is renamed in Apple Home.
 func (s *roomStore) setNameManual(id, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -384,43 +384,6 @@ func roomBitrate(r *Room) string {
 		return r.Bitrate
 	}
 	return readBitrate()
-}
-
-// healBinding persists the drift selectHomePod discovers: the output's current id (self-populating a
-// migrated/stale HomepodID) and, when the HomePod was renamed, its new name — and, unless the user
-// pinned the name, the room's display Name too. Idempotent: only writes when something changed, and
-// returns whether the Name field itself changed (so the caller can re-render + restart go-librespot).
-func (s *roomStore) healBinding(id, newID, newName string, syncName bool) (nameChanged bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rf, err := s.loadLocked()
-	if err != nil {
-		return false
-	}
-	for _, r := range rf.Rooms {
-		if r.ID != id {
-			continue
-		}
-		changed := false
-		if newID != "" && r.HomepodID != newID {
-			r.HomepodID = newID
-			changed = true
-		}
-		if newName != "" && r.HomepodName != newName {
-			r.HomepodName = newName
-			changed = true
-		}
-		if syncName && newName != "" && !r.NameManual && r.Name != newName {
-			r.Name = newName
-			changed = true
-			nameChanged = true
-		}
-		if changed {
-			_ = s.saveLocked(rf)
-		}
-		return nameChanged
-	}
-	return false
 }
 
 // roomDeviceID returns the stable Spotify device_id for a room, seeding it once from

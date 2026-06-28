@@ -152,12 +152,19 @@ func (c *wsConn) ReadMessage() ([]byte, error) {
 		}
 		switch opcode {
 		case wsOpPing:
-			// Reply with PONG echoing the ping payload (§5.5.2/§5.5.3), then keep reading.
+			// Reply with PONG echoing the ping payload (§5.5.2/§5.5.3), then keep reading. A frame from
+			// the peer proves liveness — extend the read deadline (see the PONG note).
 			if err := c.writeControl(wsOpPong, payload); err != nil {
 				return nil, err
 			}
+			_ = c.SetReadDeadline(time.Now().Add(glReadDeadline))
 		case wsOpPong:
-			// Unsolicited/keepalive pong — ignore.
+			// Keepalive pong (the reply to our 20 s Ping): the connection is alive, so extend the read
+			// deadline. Without this, an idle (event-less) /events stream hit the 30 s deadline before the
+			// next ping and forced a needless reconnect — the recurring "websocket connection errored:
+			// StatusNoStatusRcvd" churn. A truly dead peer stops ponging, so the deadline still fires and
+			// we reconnect + fall back to polling.
+			_ = c.SetReadDeadline(time.Now().Add(glReadDeadline))
 		case wsOpClose:
 			// Best-effort echo a close, then signal EOF (§5.5.1).
 			_ = c.writeControl(wsOpClose, nil)

@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.25.2 — 2026-06-28  (Cleanup: dead code removed + ws reconnect-log noise fixed)
+- **Removed dead code:** `selectHomePod` (select.go) and `healBinding` (rooms.go) — the old per-room
+  HomePod pin / self-heal-on-rename, unused since alias mode became the only mode (0.25.0). `matchOutput`
+  stays (used by the alias router + reclaim). Tidied the stale comments that referenced them.
+- **Fixed the recurring `/events` ws reconnect noise** (`websocket connection errored:
+  StatusNoStatusRcvd` every ~31 s): the 20 s keepalive PONG didn't reset the 30 s read deadline, so an
+  idle event stream timed out and reconnected. The ws reader now extends the read deadline on PONG/PING
+  (liveness). A truly dead peer still stops ponging → deadline fires → reconnect + poll fallback.
+- Manager `go vet`/`go test` green (+ darwin cross-build). No fork/patch change.
+
 ## Speakers 0.25.1 — 2026-06-28  (Cleanup: remove leftover probe scaffolding / log spam)
 - Removed `CLUSTER-PROBE` (it logged on **every** cluster update = production log spam) and reverted the
   cluster handler to upstream.
