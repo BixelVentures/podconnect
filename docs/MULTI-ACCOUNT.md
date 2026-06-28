@@ -12,6 +12,60 @@
 > "multi-account *via voice*" router was only ever a deferred plan — it was **never built**.
 > Account-agnostic *stop* still works via the panel Stop / Siri. The rest below is kept as design history.
 
+## THE one viable path to simultaneous multi-account/multi-room (research 2026-06-28)
+
+> Outcome of a deep multi-agent research pass (16 ideas, adversarially verified, web-researched). If
+> simultaneous "different people, different accounts, different rooms, at once" is ever wanted, **this
+> is the only architecture that survives the hard constraints** — and it is gated on exactly ONE
+> unproven thing. Captured so it isn't re-derived from scratch.
+
+**It is structurally POSSIBLE, not blocked.** The physics (Spotify/AirPlay behaviour, branch-independent):
+1. Spotify enforces **one stream per ACCOUNT**, server-side. Two *different* accounts = two independent
+   streams → **no cross-account contention** (it's free).
+2. **librespot #793 (flip-flop) is SAME-account-only.** It killed multiple engines *on one account*.
+   Different-account multi-instance was never the trigger.
+3. **AirPlay PTP port-319 exclusivity is a RECEIVER rule** (shairport-sync), **not a sender rule.**
+   OwnTone-as-sender binds *ephemeral* timing/control ports per session → N OwnTone **senders** don't
+   fight over 319.
+
+**The only viable architecture — hybrid (alias + on-demand guest engine):** keep the shipped
+single-engine **device-aliases** for the PRIMARY account (clean room-switching, as today); when a
+**second account** claims a free HomePod, the manager lazily spawns a **dedicated (go-librespot +
+OwnTone) pair** bound to that room + account (different account ⇒ no #793), and the alias router yields
+that HomePod. Reap on idle; hard slot ceiling (2–3 rooms ≈ 150–350 MB on an HA Green). Arbitration to
+build: one HomePod owned by *either* the alias-route or its guest engine (never both); a
+one-account-per-engine guard so the same account never bids on both an alias and a standalone for one
+room.
+
+**Why this is reachable NOW (and wasn't before):** the three fixes that made the old per-room model
+ugly — **graceful SIGTERM teardown** (no ghost Connect entries), **pinned avahi host-name**, **raised
+dbus objects-per-client-max** — are **already on `main`** (0.24.x). So the churn/duplicate problems that
+killed per-room are already neutralised; the hybrid starts on good ground.
+
+**The ONE load-bearing unknown (everything hangs on it):** does **AirPlay-2 PTP sync hold across 2+
+simultaneous OwnTone senders?** OwnTone's own multi-instance guidance needs **one shared `airptpd` /
+`nqptp` started before any instance** — and it is **not in our image** (confirmed). This is the only
+thing that can kill the hybrid.
+
+**The decisive, cheapest experiment (gates the whole decision — zero manager refactor):** add `airptpd`
+to the image; run **two hand-written OwnTone configs** (unique ws/library/mpd ports + db paths, each
+fed a test tone via pipe); point A → one HomePod, B → another; run 10+ min and check both HomePods play
+their own audio **in sync** with only `airptpd` bound to 319/320 (`ss -ulpn`). **Sync holds → build the
+hybrid. Drift/dropouts → simultaneous multi-account isn't practical with OwnTone senders → iPhone-AirPlay
+stays the answer.**
+
+**Dead-ends (the constraint that kills each):** multiple engines on the *same* account (#793 flip-flop);
+abandoning the alias model (loses clean single-account switching); one Spotify account per room
+(defeats "pick from your own app"); Spotify Jam (shared queue, not different music per room).
+
+**Until that bench is green, the honest status is unchanged:** simultaneous multi-account is a
+*validated-but-unbuilt* option (not a blocked one); the workaround today is native iPhone-AirPlay to a
+free HomePod. _(Note: a prior research pass mis-read a stale 0.14.0 worktree and reported the per-room
+model as "already shipped" — it is not; `main` is alias-only. The physics above were re-verified
+against `main` 0.25.2.)_
+
+---
+
 The trigger: a Spotify **Family plan = N independent accounts**, but the PodConnect speakers
 (HomePods) are **shared hardware**. Each go-librespot Connect device can be played by *any* account on
 the LAN (whoever picks it in their Spotify app authenticates go-librespot with their account). That

@@ -17,6 +17,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   idle event stream timed out and reconnected. The ws reader now extends the read deadline on PONG/PING
   (liveness). A truly dead peer still stops ponging → deadline fires → reconnect + poll fallback.
 - Manager `go vet`/`go test` green (+ darwin cross-build). No fork/patch change.
+- **Research note (the one viable path for simultaneous multi-account/multi-room):** a deep research
+  pass concluded that "different people, different accounts, different rooms, at once" is structurally
+  *reachable* (different accounts ⇒ independent Spotify streams ⇒ no #793, and AirPlay PTP-319 is a
+  receiver- not sender-rule). The ONLY viable architecture is a **hybrid**: keep single-engine
+  device-aliases for the primary account + an on-demand dedicated (go-librespot + OwnTone) guest engine
+  per 2nd account. The churn fixes it needs (graceful SIGTERM, host-name pin, dbus object-cap) are
+  already shipped. It is gated on ONE bench test (does AirPlay-2 PTP sync hold across two simultaneous
+  OwnTone senders — needs a shared `airptpd`, not yet in the image). Full writeup + the decisive
+  experiment: `docs/MULTI-ACCOUNT.md` § "THE one viable path".
 
 ## Speakers 0.25.1 — 2026-06-28  (Cleanup: remove leftover probe scaffolding / log spam)
 - Removed `CLUSTER-PROBE` (it logged on **every** cluster update = production log spam) and reverted the

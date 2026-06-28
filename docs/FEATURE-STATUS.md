@@ -25,6 +25,11 @@ Workaround for simultaneous: a second person AirPlays from their iPhone directly
 (native iOS, outside PodConnect). Different-music-per-room and synced same-music groups are not features;
 "multi-account via voice" was never built. See [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md).
 
+It is **reachable** (not blocked) via a documented **hybrid** (alias for the primary account +
+on-demand guest engine per 2nd account), gated on one bench test — does AirPlay-2 PTP sync hold across
+two simultaneous OwnTone senders (needs a shared `airptpd`, not yet in the image). Full research + the
+one decisive experiment: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md) § "THE one viable path".
+
 ---
 
 ## A. Audio bridge — volume

@@ -34,11 +34,16 @@ AirPlay's switch only). Zero setup. The per-room multi-engine model and the `per
   buffer-flush could help, tuned on the Green to avoid underruns.
 - **Synchronized same-music groups** (one source → many HomePods at once) — separate, not built;
   OwnTone multi-output is the likely path.
-- **Multi-account / simultaneous different-rooms** — see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md). NOT
-  possible under single-engine (one stream, one room at a time); it needed the removed per-room engines.
-  Workaround today: a 2nd person AirPlays from their iPhone to a free HomePod. A hybrid (alias engine +
-  on-demand per-room engine for a 2nd account) is the only way to bring it back — deliberately deferred.
-- Clean up the recurring `/events` ws reconnect log noise (pre-existing; harmless).
+- **Multi-account / simultaneous different-rooms** — see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md) for the
+  full research. NOT possible under single-engine today (one stream, one room at a time). It IS
+  structurally reachable via the **hybrid** (keep alias for the primary account + on-demand dedicated
+  go-librespot+OwnTone guest engine per 2nd account; different account ⇒ no #793). The churn fixes it
+  needs (graceful SIGTERM, host-name pin, dbus object-cap) are already on `main`.
+  - **THE one gating experiment (do this first, zero manager refactor):** add `airptpd` to the image +
+    run two hand-written OwnTone configs to two HomePods with different tones for ~10 min — does
+    AirPlay-2 PTP **sync hold across two simultaneous OwnTone senders**? Sync holds → build the hybrid.
+    Drift → not practical; iPhone-AirPlay stays the workaround.
+- ✅ Recurring `/events` ws reconnect log noise — **fixed (0.25.2)** (PONG/PING now extends the read deadline).
 
 ## 🚫 Investigated dead-ends (don't re-attempt)
 - 3× zeroconf or 3× persistent go-librespot on one account → flip-flop / contention / kaput audio.
