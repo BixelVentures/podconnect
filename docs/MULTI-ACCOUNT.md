@@ -1,11 +1,14 @@
 # Multi-account — scope, what already belongs here, and the fix
 
-> **Mostly superseded (June 2026).** You no longer need multiple accounts for multi-room: PodConnect's
-> **device-aliases** (now the default, zero setup) gives several selectable rooms in the Spotify
-> Connect menu **on one account**, with clean audio — see [`ALIASES-PROBE.md`](ALIASES-PROBE.md) and
-> [`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6. This doc remains relevant only if you genuinely
-> want **different people on different Spotify accounts** controlling rooms simultaneously (different
-> music in different rooms at once), with HA-level visibility.
+> **Superseded + currently not supported (June 2026) — historical.** Multi-room is now PodConnect's
+> **device-aliases** (default, zero setup): several selectable rooms in the Spotify Connect menu **on
+> one account** — see [`ALIASES-PROBE.md`](ALIASES-PROBE.md) and [`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6.
+> That architecture is **single-engine** (one go-librespot for the whole household), so the scenario
+> this doc describes — **different people on different Spotify accounts playing different rooms at the
+> same time** — is **no longer possible**: it relied on the per-room multi-engine model, which was
+> **removed in 0.25.0**. Re-enabling it would mean reverting to per-room engines (and the contention
+> that caused). Account-agnostic *stop* still works via the panel Stop / Siri. The rest below is kept
+> as design history.
 
 The trigger: a Spotify **Family plan = N independent accounts**, but the PodConnect speakers
 (HomePods) are **shared hardware**. Each go-librespot Connect device can be played by *any* account on
@@ -50,12 +53,12 @@ snappy skips) is **general** — it works the same with one account or five.
 - **Don't break single-account:** multiple entries is purely additive — one entry = today's exact
   behavior.
 
-## Reality check: the valuable part already works for free
-**Multi-account *playback* is NOT a feature we need to build — it's inherent to Spotify Connect.**
-Every PodConnect speaker is a zeroconf Connect device, so any family member on the LAN can play to
-any speaker from their own Spotify app, and — because each room is its own independent go-librespot —
-**different people can play different music to different rooms simultaneously, today, with no extra
-setup.** Stopping anyone is the account-neutral panel Stop / Siri.
+## Reality check (HISTORICAL — no longer true under single-engine)
+This section described the **old per-room model**: each room was its own go-librespot, so different
+people could play different music to different rooms simultaneously for free. Under the current
+**single-engine** device-aliases architecture there is **one** go-librespot for the household, so that
+simultaneous multi-account playback is **not** available (everything routes through the one engine /
+one active account). Account-agnostic *stop* still works via the panel Stop / Siri.
 
 So the deferred "multi-account" build (multiple Control entries) adds **only one thing**: letting
 **Home Assistant** see / control / automate *each person's* Spotify (a dashboard of who's playing

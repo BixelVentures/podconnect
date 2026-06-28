@@ -46,9 +46,10 @@ selectable room in the Spotify Connect menu on your single account** — pick a 
 follows there (~1–2 s). One stream, clean audio, nothing to enable. See
 [`../podconnect/DOCS.md`](../podconnect/DOCS.md) §6 and [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
-Want **different music in different rooms at the same time**? That needs one Spotify account per room —
-see [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md). Synchronized *same* music across rooms (groups) is a
-separate, not-yet-built feature.
+**Different music in different rooms at the same time** is **not** supported — the engine is
+single-stream (one Spotify session for the household), so it plays one room (or one alias) at a time.
+Synchronized *same* music across rooms (groups) is a separate, not-yet-built feature. (Background on the
+old per-room/multi-account model: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md).)
 
 ## Updating
 - **Speakers:** the Add-on Store shows **Update** when a new version ships. No reconfig.
