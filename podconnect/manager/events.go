@@ -132,7 +132,7 @@ const (
 	glEventBackoffMax = 5 * time.Second
 	glPollInterval    = 200 * time.Millisecond // fallback poll cadence (matches the old hot loop)
 	glPingInterval    = 20 * time.Second       // client keepalive PING cadence
-	glReseedInterval  = 3 * time.Second        // /status correctness backstop while ws-connected (bounds staleness if events misbehave)
+	glReseedInterval  = 1 * time.Second        // /status backstop while ws-connected. ALSO carries the device-aliases selected_alias_id (no ws event for it), so this bounds room-switch latency — kept at 1s so picking a room in Spotify routes within ~1s (cheap local poll).
 	glReadDeadline    = 30 * time.Second       // bound each read so a dead socket is noticed (>10s server write timeout)
 )
 

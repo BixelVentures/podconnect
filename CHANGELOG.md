@@ -8,6 +8,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.10 — 2026-06-28  (Faster room switching — 1s alias backstop)
+- Room switching works across all rooms! It felt slow because the picked alias only reached the
+  manager via the **3 s `/status` backstop** (ws events don't carry `selected_alias_id`). Lowered
+  `glReseedInterval` 3 s → **1 s**, so a room pick is noticed + routed within ~1 s (plus AirPlay's
+  inherent ~1-2 s output-switch, which can't be removed). Cheap local poll; single engine.
+
 ## Speakers 0.24.9 — 2026-06-28  (Fix: duplicate Connect entries — graceful go-librespot restart)
 - **Duplicates root:** every go-librespot restart (watchdog, name-forward, rename, add, bitrate) killed
   it with SIGKILL → it couldn't withdraw its zeroconf registration → the old alias entries lingered in
