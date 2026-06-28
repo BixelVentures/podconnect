@@ -225,13 +225,15 @@ func (rt *roomRuntime) sleepOrStop(d time.Duration) bool {
 	}
 }
 
-// restartGL kills the running go-librespot child's group; keepAlive respawns it.
+// restartGL gracefully stops the running go-librespot child's group (SIGTERM, hard-kill fallback) so
+// it withdraws its zeroconf registration cleanly — no stale duplicate Connect entries; keepAlive
+// respawns it.
 func (rt *roomRuntime) restartGL() {
 	rt.mu.Lock()
 	cmd := rt.glCmd
 	rt.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		killGroup(cmd)
+		gracefulKillGroup(cmd)
 	}
 }
 

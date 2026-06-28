@@ -5,6 +5,7 @@ package main
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // setProcGroup puts the child in its own process group (so we can signal the whole group on
@@ -29,4 +30,25 @@ func killGroup(cmd *exec.Cmd) {
 		return
 	}
 	_ = cmd.Process.Kill()
+}
+
+// gracefulKillGroup SIGTERMs the group first so go-librespot can withdraw its zeroconf/avahi
+// registration cleanly (mDNS goodbye) — without this, a SIGKILL leaves stale Connect/alias entries
+// lingering in clients' caches until TTL, which shows up as duplicate devices in the Spotify app on
+// every restart. A hard SIGKILL on the SAME (old) group follows after a short grace if it hasn't
+// exited; the respawned child has a new group, so this never touches it.
+func gracefulKillGroup(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	go func(pg int) {
+		time.Sleep(3 * time.Second)
+		_ = syscall.Kill(-pg, syscall.SIGKILL)
+	}(pgid)
 }

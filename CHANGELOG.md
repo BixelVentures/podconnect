@@ -8,6 +8,20 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.9 — 2026-06-28  (Fix: duplicate Connect entries — graceful go-librespot restart)
+- **Duplicates root:** every go-librespot restart (watchdog, name-forward, rename, add, bitrate) killed
+  it with SIGKILL → it couldn't withdraw its zeroconf registration → the old alias entries lingered in
+  clients' mDNS caches (~TTL) → the Spotify app showed duplicate devices, piling up per restart (the
+  rogue 2nd engine in ≤0.24.7 made it much worse).
+- **Fix:** `restartGL` now uses `gracefulKillGroup` — SIGTERM first (go-librespot withdraws its mDNS
+  registration cleanly = goodbye packet), hard SIGKILL only as a 3 s fallback on the *old* group (the
+  respawn has a new group, never touched). Existing stale entries self-expire in ~2 min.
+- Next-track speed: the bulk is AirPlay 2's inherent ~2 s sync buffer to the HomePod (same on any
+  AirPlay path, not removable). The one knob is the `buffer_ms` option — now that single-engine is
+  stable you can try lowering it (e.g. 350) for a snappier start; default left at 500 to protect
+  against dropouts.
+- Manager `go vet`/`go test` green (+ darwin cross-build).
+
 ## Speakers 0.24.8 — 2026-06-28  (Fix: adding a speaker in alias mode + alias-route flood)
 - **Køkken routing confirmed working!** But two follow-on bugs:
 - **Adding a speaker started a second engine** (`rooms/r6/go-librespot`) even in alias mode — the add

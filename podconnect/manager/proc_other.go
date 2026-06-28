@@ -5,6 +5,7 @@ package main
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // setProcGroup (non-linux, e.g. the macOS dev host): own process group only — Pdeathsig is a Linux
@@ -24,4 +25,22 @@ func killGroup(cmd *exec.Cmd) {
 		return
 	}
 	_ = cmd.Process.Kill()
+}
+
+// gracefulKillGroup (non-linux dev stub): SIGTERM then a delayed SIGKILL on the old group, mirroring
+// the linux version so restartGL compiles + behaves on the dev host.
+func gracefulKillGroup(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	go func(pg int) {
+		time.Sleep(3 * time.Second)
+		_ = syscall.Kill(-pg, syscall.SIGKILL)
+	}(pgid)
 }
