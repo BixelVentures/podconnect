@@ -82,73 +82,36 @@ index d64f19f..85d0cc7 100644
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..f33fa70 100644
+index c255f83..acda0fd 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -147,6 +147,27 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
- 			return fmt.Errorf("failed unmarshalling ClusterUpdate: %w", err)
- 		}
- 
-+		// device-aliases probe: dump how Spotify identifies the picked alias so we can route. Logged on
-+		// every cluster update while aliases are configured.
-+		if len(p.app.cfg.DeviceAliases) > 0 {
-+			var devs []string
-+			for k, d := range clusterUpdate.Cluster.Device {
-+				nm := ""
-+				var sa uint32
-+				var aliases []string
-+				if d != nil {
-+					nm = d.Name
-+					sa = d.SelectedAliasId
-+					for aid, a := range d.DeviceAliases {
-+						aliases = append(aliases, fmt.Sprintf("%d=%q", aid, a.GetDisplayName()))
-+					}
-+				}
-+				devs = append(devs, fmt.Sprintf("%s{name=%q,selAlias=%d,aliases=%v}", k, nm, sa, aliases))
-+			}
-+			p.app.log.Infof("CLUSTER-PROBE: reason=%s ourId=%s activeId=%s changed=%v devices=%v",
-+				clusterUpdate.UpdateReason, p.app.deviceId, clusterUpdate.Cluster.ActiveDeviceId, clusterUpdate.DevicesThatChanged, devs)
-+		}
-+
- 		stopBeingActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.lastTransferTimestamp
- 
- 		// We are still the active device, do not quit
-@@ -171,6 +192,34 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -171,6 +171,25 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
  
-+	// device-aliases probe: log + echo which alias the controller selected. The id can arrive at the
-+	// command level or inside options depending on the controller — capture whichever is set. Echoing
-+	// SelectedAliasId on the next put_state closes the loop so the app shows the active room.
++	// device-aliases: when the controller picks a room, the selected alias arrives as target_alias_id at
++	// the dealer payload TOP level (not in command/options). Echo it on the next put_state, and push it
++	// over /events so the manager routes the output immediately (the /status backstop carries it too).
 +	if len(p.app.cfg.DeviceAliases) > 0 {
-+		var aliasId *uint32
-+		if req.TargetAliasId != nil { // payload TOP level — where Spotify actually puts it (confirmed)
-+			aliasId = req.TargetAliasId
-+		} else if req.Command.TargetAliasId != nil {
-+			aliasId = req.Command.TargetAliasId
-+		} else if req.Command.Options.TargetAliasId != nil {
-+			aliasId = req.Command.Options.TargetAliasId
++		aliasId := req.TargetAliasId
++		if aliasId == nil {
++			aliasId = req.Command.TargetAliasId // tolerate other controllers
 +		}
 +		if aliasId != nil {
 +			name := ""
 +			if int(*aliasId) >= 1 && int(*aliasId) <= len(p.app.cfg.DeviceAliases) {
 +				name = p.app.cfg.DeviceAliases[*aliasId-1]
 +			}
-+			p.app.log.Infof("ALIAS-PROBE: endpoint=%s selected alias id=%d name=%q", req.Command.Endpoint, *aliasId, name)
++			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
 +			p.state.device.SelectedAliasId = *aliasId
-+			// Instant path: push the pick over /events so the manager routes immediately instead of
-+			// waiting on its /status backstop. Additive — an unknown event type is ignored downstream,
-+			// and the backstop still carries selected_alias_id if this is missed.
 +			p.app.server.Emit(&ApiEvent{Type: "selected_alias", Data: map[string]any{"id": *aliasId}})
-+		} else {
-+			p.app.log.Infof("ALIAS-PROBE: endpoint=%s command received with NO target_alias_id", req.Command.Endpoint)
 +		}
 +	}
 +
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
-@@ -462,10 +511,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -462,10 +481,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			RepeatContext:  p.state.player.Options.RepeatingContext,
  			RepeatTrack:    p.state.player.Options.RepeatingTrack,
  			ShuffleContext: p.state.player.Options.ShufflingContext,
@@ -218,18 +181,10 @@ index 4221671..4ccfcb3 100644
  }
  
 diff --git a/dealer/recv.go b/dealer/recv.go
-index a9cc04d..9c53997 100644
+index a9cc04d..c236088 100644
 --- a/dealer/recv.go
 +++ b/dealer/recv.go
-@@ -33,6 +33,7 @@ type Request struct {
- 
- 	MessageIdent string
- 	Payload      RequestPayload
-+	Raw          []byte // device-aliases probe: undecoded request JSON, to find fields we don't model
- }
- 
- func (req Request) Reply(success bool) {
-@@ -40,10 +41,12 @@ func (req Request) Reply(success bool) {
+@@ -40,10 +40,12 @@ func (req Request) Reply(success bool) {
  }
  
  type RequestPayload struct {
@@ -244,22 +199,6 @@ index a9cc04d..9c53997 100644
  		SessionId        string                    `json:"session_id"`
  		Data             []byte                    `json:"data"`
  		Value            interface{}               `json:"value"`
-@@ -82,6 +85,7 @@ type RequestPayload struct {
- 			AudioStream           string                                  `json:"audio_stream"`
- 			SessionId             string                                  `json:"session_id"`
- 			License               string                                  `json:"license"`
-+			TargetAliasId         *uint32                                 `json:"target_alias_id"`
- 		} `json:"options"`
- 		PlayOptions struct {
- 			OverrideRestrictions bool   `json:"override_restrictions"`
-@@ -239,6 +243,7 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
- 		resp:         resp,
- 		MessageIdent: rawMsg.MessageIdent,
- 		Payload:      payload,
-+		Raw:          payloadBytes,
- 	}:
- 	case <-d.done:
- 		return
 diff --git a/zeroconf/json.go b/zeroconf/json.go
 index 009136c..a70f198 100644
 --- a/zeroconf/json.go

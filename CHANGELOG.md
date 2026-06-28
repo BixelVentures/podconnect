@@ -8,6 +8,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.25.1 — 2026-06-28  (Cleanup: remove leftover probe scaffolding / log spam)
+- Removed `CLUSTER-PROBE` (it logged on **every** cluster update = production log spam) and reverted the
+  cluster handler to upstream.
+- Trimmed `ALIAS-PROBE` to a single concise `device-alias selected: id=N name="…"` line (dropped the
+  noisy "NO target_alias_id" branch + the verbose variant).
+- Removed the now-unused diagnostic plumbing: `dealer.Request.Raw` (+ its assignment) and the
+  command-options-level `target_alias_id` (selection comes at the payload top level). Patch 351 → 290 lines.
+- Fork builds (Docker, Go 1.25).
+
 ## Speakers 0.25.0 — 2026-06-28  (Cleanup: device-aliases is the only mode; experiments removed)
 - **Device-aliases multi-room is now the default and only mode** — no flag to flip. Add HomePods in the
   panel and each appears as its own selectable room in the Spotify Connect menu on one account.
