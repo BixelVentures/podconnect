@@ -13,22 +13,31 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 **PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`)
 - Turns a HomePod into a **Spotify Connect speaker**: `go-librespot` (Connect receiver) → a
   named pipe → `OwnTone` (AirPlay 2 sender) → HomePod.
-- **Multi-room:** several HomePods, each its own independent Connect speaker. The sidebar **panel**
-  is the room manager — **Add / Remove / Rename** speakers and **⚙ per-room Settings**, all live with
-  no add-on restart. The manager forks & supervises each room's own (go-librespot + OwnTone) pair.
+- **Multi-room, two ways:**
+  - **Default (per-room):** several HomePods, each its own independent Connect speaker (its own
+    go-librespot + OwnTone). One Spotify account plays to one room at a time (switch in Spotify's
+    device list); different music in different rooms needs one account per room.
+  - **Device-aliases mode (`experiment_aliases: true`) — the recommended multi-room path:** ONE engine
+    advertises **all your rooms as separate selectable devices in the Spotify Connect menu, on ONE
+    account, with clean audio**. Pick a room in the Spotify app and the audio follows there (~1-2 s,
+    just AirPlay's switch). This uses Spotify's own device-aliases (multiroom zones) — see
+    [`docs/ALIASES-PROBE.md`](docs/ALIASES-PROBE.md).
+- The sidebar **panel** is the room manager — **Add / Remove / Rename** speakers and **⚙ per-room
+  Settings**, all live with no add-on restart.
 - **Pick your HomePod with no typing:** the panel shows a live network scan — click and save. Each
   speaker **auto-names itself** after its HomePod.
 - **Self-healing naming:** a room is bound to its HomePod by a stable id, so renaming the HomePod in
   Apple Home **syncs everywhere automatically** (Connect device + HA entity) — no re-pick.
 - **Per-room grace + bitrate** in the panel (empty = inherit the global add-on default).
 - **Bidirectional volume sync** — the Spotify/HA slider and the HomePod's hardware buttons move
-  together (per-output AirPlay level), and **no fresh session can start at full blast** (the cap is
-  proactive and re-armed per session, so even a second account's new session stays capped).
+  together (per-output AirPlay level). **No fresh session starts at full blast:** the device advertises
+  a sane `initial_volume` (so the Spotify slider reads ~35%, not 100%, on a fresh claim) and a
+  proactive per-session cap re-arms even across a transfer to another device.
 - **Transport sync** — a Spotify pause stops the HomePod instantly (beating the AirPlay buffer);
   a HomePod top-tap pauses/resumes Spotify. Flicker-free, rapid-tap-safe.
-- **Snappy skips** (`start_buffer_ms = 500`) and **instant push-state** — the bridge reads
-  go-librespot's `/events` websocket (with a `/status` poll fallback), so volume/transport/track
-  changes register as they happen.
+- **Snappy skips** (tunable `buffer_ms`, default 500) and **instant push-state** — the bridge reads
+  go-librespot's `/events` websocket (with a `/status` poll fallback), so volume/transport/track and
+  **room-alias** changes register as they happen.
 - **Sharing ("deling"):** **⏹ Stop** pauses whoever is playing (any account, local); **⏏ Release**
   frees the HomePod for other AirPlay apps (Mofibo, Apple Music). Auto-release after an idle grace
   period, auto-reclaim on resume.
@@ -51,6 +60,11 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
   Played, Liked Songs — so **HA Assist can pick music** ("spil noget afslappende i køkkenet").
   Search includes **audiobooks / shows / episodes** and breaks same-title ties by **popularity**.
 - **One entity per HomePod** (pure Spotify control — no duplicate local-speaker player).
+- **AI / voice music tools:** `media_player.play_media` accepts a free-text name (search + play top
+  result); the `podconnect.play_from_library` service plays your Liked / Top / Recent; and the
+  response-returning services `podconnect.top_tracks` / `recently_played` / `liked` let an assistant
+  **fetch** your listening history as data (`{tracks:[{name,artist,uri}]}`) and choose a track —
+  built on Control's own auth, callable over REST.
 - State via the Spotify Web API, polled ~10s. Installed via **HACS** (custom repository).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what changed.
@@ -68,15 +82,22 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what
 they pause whoever is playing, regardless of which Spotify account owns the speaker. HA Assist's
 "stop music" / "pause the kitchen" already pauses *your own* session via the Spotify entity.
 
-## Roadmap (planned — not yet built)
+## Roadmap
 
-- **On-device validation** of multi-room on real hardware (process spawning / mDNS / two rooms at
-  once) — the code ships; the Green is the proving ground.
-- **Track-change buffer-flush** (sub-second skips) — unblocked by push-state's track-change signal,
-  still tuned on the wired Green to avoid underruns.
-- **Multi-account** (optional): multi-account *playback* already works for free via Spotify Connect;
-  the deferred build only adds HA-level cross-account visibility/control. **Synchronized same-music
-  groups** across rooms are a separate, not-yet-built feature.
+**Done & working on real hardware (June 2026):**
+- **Device-aliases multi-room** — multiple rooms in the Spotify Connect menu on **one account**, clean
+  audio, instant-ish room routing. Proven on-device. (Enable `experiment_aliases`.)
+- **Sane-start volume** (slider reads the real level, never 100%) and the never-loud cap.
+- **Slim multi-stage image** + **graceful go-librespot restart** (no duplicate Connect entries) +
+  avahi host-name pin (no mDNS rename churn).
+
+**Planned / nice-to-have:**
+- Promote device-aliases out of the `experiment_` flag once it has more mileage (and surface the alias
+  rooms more clearly in the panel).
+- **Track-change buffer-flush** (sub-second skips) — the floor is AirPlay's ~2 s; `buffer_ms` is the
+  current knob.
+- **Synchronized same-music groups** across rooms (one source → many HomePods at once) — a separate,
+  not-yet-built feature (OwnTone multi-output is the likely path).
 - Picker visual polish.
 
 See [`docs/TODO.md`](docs/TODO.md) (living roadmap), [`docs/PLAN.md`](docs/PLAN.md) (architecture)

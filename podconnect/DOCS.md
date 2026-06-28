@@ -1,8 +1,9 @@
 # PodConnect Speakers — install on Home Assistant
 
 This add-on makes your Apple **HomePods** appear as **Spotify Connect speakers**, running on your
-Home Assistant Green. It's **multi-room** — add several HomePods from the sidebar panel, each its own
-independent Connect speaker.
+Home Assistant Green. It's **multi-room**: add several HomePods from the sidebar panel — either as
+independent Connect speakers (default), or as selectable rooms in the Spotify menu **on one account**
+via device-aliases mode (§6).
 
 **You need:** Spotify **Premium**, and the HomePod(s) on the same network as the Green.
 
@@ -71,6 +72,9 @@ fallbacks:
 |---|---|
 | `bitrate` | **Default** bitrate (`320`); a per-room ⚙ Settings value overrides it. |
 | `grace_minutes` | **Default** hold time before freeing an idle HomePod (`3`; `0` = free as soon as idle); per-room ⚙ Settings overrides it. |
+| `buffer_ms` | OwnTone start-buffer (`500`). **Lower** = snappier track starts but more dropouts on a weak network; **higher** (700–1000) = rock-solid. The bulk of next-track latency is AirPlay's inherent ~2 s and isn't tunable here. |
+| `experiment_aliases` | **Multi-room on one Spotify account** (see §6). `true` = the primary engine advertises your rooms as separate selectable devices in the Spotify Connect menu; picking one routes the audio there. Default `false` = classic per-room mode. |
+| `connect_aliases` | *(advanced, optional)* override the alias list; leave empty to auto-derive one alias per configured room (in panel order). |
 | `network_interface` | *(advanced)* leave blank to auto-detect your LAN interface. |
 | `attention_token` | *(advanced)* optional shared secret guarding the `/api/attention` **duck API** (for a voice-assistant gatekeeper). When set, those requests must send `X-PodConnect-Token`. Blank = open on the LAN. See [`docs/ATTENTION-API.md`](../docs/ATTENTION-API.md). |
 
@@ -84,13 +88,32 @@ fallbacks:
    HomePod) → **Play**.
 3. 🎉 Audio plays on the HomePod; the Spotify volume slider changes the volume.
 
+## 6. Multi-room on ONE Spotify account (device aliases)
+
+By default each HomePod is its **own** Connect device, so one Spotify account plays to **one room at a
+time**. To get **all your rooms in the Spotify Connect menu on one account** — pick a room and the
+audio follows — turn on **device-aliases mode**:
+
+1. Set up your rooms in the panel as usual (Frida's HomePod, Køkken, Svend…).
+2. **Configuration tab → `experiment_aliases: true`** → **Save** → **Restart** the add-on.
+3. Open the Spotify app → the device picker now lists each room as its own entry.
+4. Pick a room → playback starts there; pick another → the audio **moves** to that HomePod (~1–2 s,
+   just AirPlay's switch). One stream, one account, clean audio.
+
+How it works: only the **primary** engine runs; the other rooms ride on it as Spotify *device aliases*
+(its multiroom-zones feature). When you pick an alias, the add-on routes the single audio output to
+that room's HomePod. The alias list auto-derives from your rooms (override with `connect_aliases`).
+To go back, set `experiment_aliases: false` and restart. Details + the on-device findings:
+[`docs/ALIASES-PROBE.md`](../docs/ALIASES-PROBE.md).
+
 ## How it works
 
-For **each room**, the manager forks & supervises its own pair:
+By default, for **each room** the manager forks & supervises its own pair:
 Spotify Connect → go-librespot → pipe → OwnTone → AirPlay 2 → HomePod — all inside this add-on, with
-the HomePod bound by a stable id. It uses standard **Spotify Connect** (no Spotify developer keys
-needed) and does **not** use the Apple TV integration. Credentials + room config are saved, so
-speakers stay paired across restarts.
+the HomePod bound by a stable id. In **device-aliases mode** (§6) a single go-librespot engine serves
+all rooms as aliases and the output is routed per selection. It uses standard **Spotify Connect** (no
+Spotify developer keys needed) and does **not** use the Apple TV integration. Credentials + room
+config are saved, so speakers stay paired across restarts.
 
 ## Troubleshooting
 
