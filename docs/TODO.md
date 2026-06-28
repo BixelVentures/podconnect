@@ -27,9 +27,9 @@ AirPlay's switch only). Zero setup. The per-room multi-engine model and the `per
   and response-returning **data services** `top_tracks` / `recently_played` / `liked` for an AI assist.
 
 ## 🎯 Next
-- **Re-wire self-healing-on-rename for alias mode** (`selectHomePod`/`healBinding` are currently
-  unwired — they'd fight the router; routeAliasOutput's id-match covers most renames). Surface the
-  alias rooms more clearly in the panel.
+- Surface the alias rooms more clearly in the panel. (Self-healing-on-rename dead code + the `/events`
+  ws reconnect noise were both cleaned up in 0.25.2; re-add a heal-only rename path only if renames
+  ever break routing — id-match covers most.)
 - **Sub-second skips** — the floor is AirPlay's ~2 s; `buffer_ms` is the current knob. A track-change
   buffer-flush could help, tuned on the Green to avoid underruns.
 - **Synchronized same-music groups** (one source → many HomePods at once) — separate, not built;

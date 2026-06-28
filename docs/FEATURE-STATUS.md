@@ -70,7 +70,10 @@ Workaround for simultaneous: a second person AirPlays from their iPhone directly
 | `podconnect.top_tracks` / `recently_played` / `liked` — response-returning data services for an AI assist (0.10.0) | ⚪ |
 
 ## Known noise / follow-ups
-- Recurring `/events` ws reconnect log lines (`StatusNoStatusRcvd`) — pre-existing; poll fallback keeps state fresh.
-- Self-healing-on-rename (`selectHomePod`/`healBinding`) is currently unwired in alias mode (it would fight the router); routeAliasOutput's id-match handles most renames. Re-wire a heal-only path as a follow-up.
+- ✅ `/events` ws reconnect log churn (`StatusNoStatusRcvd` ~every 31 s) — **fixed (0.25.2):** the ws
+  reader now extends its read deadline on keepalive PONG/PING, so an idle stream no longer times out.
+- ✅ Self-healing-on-rename dead code (`selectHomePod`/`healBinding`) — **removed (0.25.2).** `matchOutput`'s
+  id-match survives most Apple-Home renames; if a rename ever breaks routing, re-add a heal-only path
+  (must heal against the PRIMARY OwnTone for all rooms, since only one engine runs).
 - Surface the alias rooms more clearly in the panel.
 - Synchronized same-music groups across rooms — not built (OwnTone multi-output is the likely path).
