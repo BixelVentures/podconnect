@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.8 — 2026-06-28  (Fix: adding a speaker in alias mode + alias-route flood)
+- **Køkken routing confirmed working!** But two follow-on bugs:
+- **Adding a speaker started a second engine** (`rooms/r6/go-librespot`) even in alias mode — the add
+  handler always called `ensureRunning`. That rogue engine = contention that destabilised the primary's
+  OwnTone so it intermittently lost HomePods. Now, in alias mode, adding a room **re-renders + restarts
+  the primary engine** to advertise the new alias (no second engine). (Existing rogue engines stop on
+  the next add-on restart — the startup loop already skips non-primary in alias mode.)
+- **alias-route flooded** (`HomePod … not found` ~10×/sec): on a failed route the bridge never advanced
+  `lastAlias`, so it retried every tick. Now it advances on attempt and **retries on a 3 s throttle**.
+  The failure log also lists the OwnTone outputs it DID see, to pinpoint any miss.
+- Manager `go vet`/`go test` green.
+
 ## Speakers 0.24.7 — 2026-06-26  (Harden: reclaim→route + avahi dbus object-leak noise)
 - **Reclaim-vs-route:** after a 3-min grace-release + resume, the bridge re-selected the PRIMARY room's
   HomePod (Frida) — now, in alias mode, it immediately re-routes to the *selected* alias's HomePod so

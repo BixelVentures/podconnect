@@ -578,7 +578,11 @@ func routeAliasOutput(primaryOwnTone string, aliasId int) bool {
 	}
 	idx, _ := matchOutput(devs, target.HomepodID, target.HomepodName)
 	if idx < 0 {
-		log.Printf("alias-route: alias %d (%s) — HomePod %q not found on primary OwnTone", aliasId, target.Name, target.HomepodName)
+		have := make([]string, 0, len(devs))
+		for _, d := range devs {
+			have = append(have, d.Name)
+		}
+		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
 		return false
 	}
 	selectOnOwntoneAt(primaryOwnTone, devs[idx].ID)
@@ -620,6 +624,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	lastPlayVol := -1        // last canonical volume while actually PLAYING — distinguishes your own
 	                         // pause/resume (same level) from a transfer that brings a remembered/loud one
 	lastAlias := 0           // device-aliases: last alias id we routed output for (0 = none yet)
+	aliasRoutePending := false // a route attempt failed; retry on the throttle (not every tick)
+	aliasRetryAt := time.Now()
 	trans := transState{canon: -1, otTarget: -1}
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
@@ -646,9 +652,18 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Device-aliases routing: when the primary engine reports a newly-selected alias, point THIS
 			// (single) OwnTone at the matching room's HomePod so audio follows the Spotify menu choice.
 			// Only the primary room runs in alias mode (single-engine), so this is the one router.
-			if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 && gl.SelAlias != lastAlias {
-				if routeAliasOutput(room.OwnTone, gl.SelAlias) {
-					lastAlias = gl.SelAlias
+			// Attempt on change; on failure retry on a 3s throttle (NOT every tick — that flooded the log
+			// + hammered OwnTone when the target HomePod was momentarily missing).
+			if room.Idx == 0 && experimentAliases() && gl.SelAlias > 0 {
+				if gl.SelAlias != lastAlias || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
+					if routeAliasOutput(room.OwnTone, gl.SelAlias) {
+						lastAlias = gl.SelAlias
+						aliasRoutePending = false
+					} else {
+						lastAlias = gl.SelAlias // stop the per-tick flood; recover via the throttle below
+						aliasRoutePending = true
+						aliasRetryAt = time.Now().Add(3 * time.Second)
+					}
 				}
 			}
 
@@ -1419,8 +1434,22 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		mgr.ensureRunning(rm)
-		startRoomBridge(rm)
+		if experimentAliases() {
+			// Alias mode (single-engine): the new room is an ALIAS on the primary engine, NOT its own
+			// engine — starting one here spawned a second go-librespot (contention, destabilised the
+			// primary's OwnTone so it lost HomePods). Instead re-render + restart the primary so it
+			// advertises the updated alias list; routeAliasOutput then sends audio to the new HomePod.
+			if pr := primaryRoom(); pr != nil {
+				_ = renderGLConfig(pr)
+				if rt := mgr.runtime(pr.ID); rt != nil {
+					rt.restartGL()
+				}
+				log.Printf("alias mode: added %q as an alias on the primary engine (re-advertising)", rm.Name)
+			}
+		} else {
+			mgr.ensureRunning(rm)
+			startRoomBridge(rm)
+		}
 		writeJSON(w, map[string]any{"ok": true, "id": rm.ID, "name": rm.Name})
 	case http.MethodDelete:
 		id := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
