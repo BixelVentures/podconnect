@@ -82,7 +82,7 @@ index d64f19f..85d0cc7 100644
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..b16249a 100644
+index c255f83..f33fa70 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
 @@ -147,6 +147,27 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
@@ -113,7 +113,7 @@ index c255f83..b16249a 100644
  		stopBeingActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.lastTransferTimestamp
  
  		// We are still the active device, do not quit
-@@ -171,6 +192,30 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -171,6 +192,34 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
  
@@ -136,6 +136,10 @@ index c255f83..b16249a 100644
 +			}
 +			p.app.log.Infof("ALIAS-PROBE: endpoint=%s selected alias id=%d name=%q", req.Command.Endpoint, *aliasId, name)
 +			p.state.device.SelectedAliasId = *aliasId
++			// Instant path: push the pick over /events so the manager routes immediately instead of
++			// waiting on its /status backstop. Additive — an unknown event type is ignored downstream,
++			// and the backstop still carries selected_alias_id if this is missed.
++			p.app.server.Emit(&ApiEvent{Type: "selected_alias", Data: map[string]any{"id": *aliasId}})
 +		} else {
 +			p.app.log.Infof("ALIAS-PROBE: endpoint=%s command received with NO target_alias_id", req.Command.Endpoint)
 +		}
@@ -144,7 +148,7 @@ index c255f83..b16249a 100644
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
-@@ -462,10 +507,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -462,10 +511,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			RepeatContext:  p.state.player.Options.RepeatingContext,
  			RepeatTrack:    p.state.player.Options.RepeatingTrack,
  			ShuffleContext: p.state.player.Options.ShufflingContext,

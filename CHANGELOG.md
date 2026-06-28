@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.24.11 — 2026-06-28  (Instant room switching — push alias pick over /events)
+- The fork now **emits a `selected_alias` event on its /events ws** the instant a room is picked, and
+  the manager handles it in `applyGLEvent` → routes immediately instead of waiting on the (1s) /status
+  backstop. Room switch is now ~AirPlay-floor only (~1-2s output switch), no manager-side wait.
+- **Fully additive / safe:** unknown event types are ignored by anything that doesn't know them, and the
+  /status reseed still re-asserts `selected_alias_id` as a safety net if a push is ever missed.
+- **Next-track (song change):** NOT gated by this path — a skip keeps the same AirPlay session (same
+  HomePod), so there's no output-switch; the only cost is OwnTone's pipe re-buffer, tunable via
+  `buffer_ms`. Left untouched to protect the clean audio; test it and lower `buffer_ms` if it feels slow.
+- Fork builds (Docker, Go 1.25); manager `go vet`/`go test` green.
+
 ## Speakers 0.24.10 — 2026-06-28  (Faster room switching — 1s alias backstop)
 - Room switching works across all rooms! It felt slow because the picked alias only reached the
   manager via the **3 s `/status` backstop** (ws events don't carry `selected_alias_id`). Lowered

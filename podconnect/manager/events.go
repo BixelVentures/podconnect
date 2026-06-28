@@ -105,6 +105,12 @@ func applyGLEvent(prev glStatus, prevURI string, typ string, data map[string]any
 			uri = s
 			changed = true
 		}
+	case "selected_alias":
+		// device-aliases instant path: the fork pushes the picked alias here so room routing fires
+		// without waiting on the /status backstop. (The backstop still re-asserts it as a safety net.)
+		if v, ok := numField(data, "id"); ok {
+			out.SelAlias = int(v)
+		}
 	default:
 		// seek, shuffle_context, repeat_context, repeat_track, … — no transport/volume impact here.
 	}
