@@ -1,9 +1,17 @@
 # PodConnect — Plan
 
+> **Current state (2026-06-28) — kept as design history.** The engine landed differently from the
+> per-room model described below: multi-room is now **device-aliases only** — a SINGLE go-librespot
+> engine advertises every room in the Spotify Connect menu **on one account**, and the audio output is
+> routed per selection. The per-room multi-engine model, `persistent_connect`, and the
+> `experiment_aliases` flag were **removed (0.25.0)**. Current truth:
+> [`FEATURE-STATUS.md`](FEATURE-STATUS.md) · [`ALIASES-PROBE.md`](ALIASES-PROBE.md) ·
+> [`../CHANGELOG.md`](../CHANGELOG.md).
+
 ## Overview
 
-PodConnect is a **Home Assistant add-on** for the **HA Green** (HA OS, ARM64) that turns
-each Apple HomePod into its **own independent Spotify Connect speaker**.
+PodConnect is a **Home Assistant add-on** for the **HA Green** (HA OS, ARM64) that turns your Apple
+HomePods into **Spotify Connect speakers** — multi-room on one account via device-aliases (see banner).
 
 The experience: open the PodConnect panel in Home Assistant, click **"Add speaker"**, name
 it, **pick a HomePod from a dropdown of devices found on your network**, and it appears in

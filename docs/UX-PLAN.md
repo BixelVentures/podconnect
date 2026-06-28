@@ -1,5 +1,10 @@
 # PodConnect — unified UX, install & update plan
 
+> **Current state (2026-06-28).** The 2-part split + panel-owns-setup direction below is still how it
+> works. Two updates: the `speaker_name`/`homepod_name` config seeds were removed, and multi-room is now
+> **device-aliases only** (one engine, rooms in the Spotify Connect menu on one account) — so
+> "multi-account later" is moot for multi-room. Current truth: [`FEATURE-STATUS.md`](FEATURE-STATUS.md).
+
 Goal (user's words): **least effort, one coherent experience, don't break what works.** Decided
 direction: **TWO installable parts** (not three), the **sidebar panel owns all speaker setup**, and
 naming/selection is **zero-typing**.

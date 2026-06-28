@@ -3,8 +3,13 @@
 > **Status (2026-06-20): the wave plan is essentially COMPLETE.** Wave 1 (companion + snappy skips),
 > Wave 2 (multi-room), and **Wave 3 (push-state)** all shipped. The companion integration (WS-A) was
 > later **retired** — the local-speaker entity it provided was folded into Control, then reverted, so
-> account-agnostic stop/release lives only in the add-on panel. This doc is kept as history /
-> rationale; the live remaining work is in [`TODO.md`](TODO.md) (on-device validation, buffer-flush).
+> account-agnostic stop/release lives only in the add-on panel. This doc is kept as history / rationale.
+>
+> **Update (2026-06-28):** Wave 2's "each HomePod its own (go-librespot + OwnTone) pair" model was
+> **superseded** — multi-room is now **device-aliases only** (one engine, N aliases in the Spotify
+> Connect menu, on one account; output routed per selection). `persistent_connect` /
+> `experiment_aliases` were removed (0.25.0). Multi-account is therefore moot for multi-room. Current
+> truth: [`FEATURE-STATUS.md`](FEATURE-STATUS.md) · [`ALIASES-PROBE.md`](ALIASES-PROBE.md).
 
 _Research-validated, decomposed for parallel agents. **Multi-account is deliberately out of scope**
 (deferred). Every design decision below is backed by source-cited research (HA core, go-librespot,

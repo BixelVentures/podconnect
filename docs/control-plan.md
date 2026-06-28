@@ -1,5 +1,13 @@
 # PodConnect — Full Spotify Control (implementation spec)
 
+> **Current state (2026-06-28).** This Control spec is largely as-built (OAuth + Web API + media_player
+> + search/browse). Two notes: the **Speakers** add-on's multi-room is now **device-aliases only** (one
+> engine, rooms in the Spotify Connect menu on one account — not the per-HomePod-engine model implied
+> below), and the AI music tools shipped — `media_player.play_media` (free-text → search+play),
+> `podconnect.play_from_library`, and the data services `top_tracks`/`recently_played`/`liked`. The
+> multi-account Phase 4 stays deferred (now only the different-music-per-room-simultaneously niche).
+> Current truth: [`FEATURE-STATUS.md`](FEATURE-STATUS.md) · [`../CHANGELOG.md`](../CHANGELOG.md).
+
 ## Goal
 Full Spotify cloud control in Home Assistant — search, browse, play, transfer, next/prev,
 volume — using **the user's own Spotify Developer app**. No SpotifyPlus, no HA Spotify
