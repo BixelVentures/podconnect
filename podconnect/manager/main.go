@@ -1087,6 +1087,30 @@ func main() {
 		writeJSON(w, map[string]any{"owntone_up": up, "devices": free})
 	})
 
+	// POST /api/rescan — force a fresh AirPlay/mDNS discovery by restarting the primary OwnTone, which
+	// re-browses the LAN from scratch. Use when a just-powered-on AirPlay device isn't in the picker yet
+	// (discovery is otherwise passive — we only read OwnTone's current mDNS-built output list). Briefly
+	// interrupts any audio OwnTone is currently sending. The panel then re-polls /api/discover.
+	http.HandleFunc("/api/rescan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		pr := primaryRoom()
+		if pr == nil {
+			http.Error(w, "no speaker yet", http.StatusServiceUnavailable)
+			return
+		}
+		rt := mgr.runtime(pr.ID)
+		if rt == nil {
+			http.Error(w, "engine not running", http.StatusServiceUnavailable)
+			return
+		}
+		log.Printf("rescan: restarting OwnTone for room %s — fresh AirPlay/mDNS browse", pr.ID)
+		rt.restartOT()
+		writeJSON(w, map[string]any{"ok": true})
+	})
+
 	// POST /api/rooms {homepod_name, name?} — add a speaker: validate uniqueness, allocate, render,
 	// spawn, select. DELETE /api/rooms/<id> — remove a speaker.
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
@@ -1736,10 +1760,11 @@ const indexHTML = `<!doctype html>
       <button id="addbtn">＋ Add speaker</button>
     </div>
     <div id="addpanel" style="display:none">
-      <div id="addstatus" class="status warn">Scanning for free HomePods…</div>
+      <div id="addstatus" class="status warn">Scanning for free AirPlay devices…</div>
       <div id="addlist" class="list"></div>
       <div class="actions">
         <button id="addsave" disabled>Add this HomePod</button>
+        <button id="addrescan" class="ghost" title="Restart the audio engine to re-scan the network — use if a just-powered-on device is missing">⟳ Rescan</button>
         <button id="addcancel" class="ghost">Cancel</button>
       </div>
       <p id="adderr" class="err"></p>
@@ -1753,6 +1778,13 @@ const indexHTML = `<!doctype html>
 
   <details class="changelog">
     <summary>What's new</summary>
+    <div class="rel">
+      <h3>0.26.0 <span class="when">— 2026-06-29</span></h3>
+      <ul>
+        <li>The <b>＋ Add speaker</b> list now <b>auto-refreshes</b> while it's open — an AirPlay device you power on mid-flow appears on its own, no need to close and reopen (your selection is kept).</li>
+        <li>New <b>⟳ Rescan</b> button forces a fresh network scan (restarts the audio engine) for a device the engine missed entirely — briefly interrupts playback.</li>
+      </ul>
+    </div>
     <div class="rel">
       <h3>0.21.0 <span class="when">— 2026-06-22</span></h3>
       <ul><li>Physically turning the HomePod volume up/down works again (and moves the Spotify/HA slider) — restored without the jumping, by keeping the simple one-shot never-loud cap instead of the old held-window.</li></ul>
@@ -1946,6 +1978,13 @@ async function loadRooms() {
 }
 
 // --- Add-speaker flow (/api/discover + POST /api/rooms) ---
+// Discovery is passive (we read OwnTone's current mDNS-built output list), so while the picker is open
+// we auto-refresh it every few seconds — a device that powers on / announces mid-flow appears without
+// reopening. The selection is preserved across refreshes. "Rescan" forces a fresh browse by restarting
+// OwnTone (for a device OwnTone missed entirely).
+var addPoll = null;
+function startAddPoll() { stopAddPoll(); addPoll = setInterval(loadDiscover, 3000); }
+function stopAddPoll() { if (addPoll) { clearInterval(addPoll); addPoll = null; } }
 async function loadDiscover() {
   var data;
   try { data = await (await fetch('api/discover', {cache:'no-store'})).json(); }
@@ -1953,29 +1992,43 @@ async function loadDiscover() {
   var st = document.getElementById('addstatus');
   var list = document.getElementById('addlist');
   list.innerHTML = '';
-  if (!data.owntone_up) { st.textContent = 'Audio engine starting…'; st.className = 'status warn'; return; }
-  if (!data.devices.length) { st.textContent = 'No free HomePods found (all claimed, or still scanning).'; st.className = 'status warn'; return; }
-  st.textContent = data.devices.length + ' free HomePod(s) — pick one'; st.className = 'status ok';
+  if (!data.owntone_up) { st.textContent = 'Audio engine starting…'; st.className = 'status warn'; document.getElementById('addsave').disabled = true; return; }
+  if (!data.devices.length) { st.textContent = 'No free AirPlay devices found (all claimed, or still scanning)…'; st.className = 'status warn'; document.getElementById('addsave').disabled = true; return; }
+  st.textContent = data.devices.length + ' free AirPlay device(s) — pick one'; st.className = 'status ok';
+  var stillThere = false;
   data.devices.forEach(function (d) {
     var row = document.createElement('label'); row.className = 'row';
     var rb = document.createElement('input'); rb.type = 'radio'; rb.name = 'addhp'; rb.value = d.name;
+    if (addChosen === d.name) { rb.checked = true; addChosenId = d.id; stillThere = true; }
     rb.onchange = function () { addChosen = d.name; addChosenId = d.id; document.getElementById('addsave').disabled = false; };
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
     if (d.needs_auth) { var b = document.createElement('span'); b.className = 'pill plain pill-auth'; b.textContent = 'needs verification'; row.appendChild(b); }
     list.appendChild(row);
   });
+  document.getElementById('addsave').disabled = !(addChosen && stillThere); // selection gone? disable until re-picked
 }
 document.getElementById('addbtn').onclick = function () {
   document.getElementById('addpanel').style.display = '';
   this.disabled = true;
   loadDiscover();
+  startAddPoll();
 };
 document.getElementById('addcancel').onclick = function () {
+  stopAddPoll();
   document.getElementById('addpanel').style.display = 'none';
   document.getElementById('addbtn').disabled = false;
   document.getElementById('adderr').textContent = '';
   addChosen = null; addChosenId = null;
+};
+document.getElementById('addrescan').onclick = async function () {
+  if (!confirm('Rescan restarts the audio engine and briefly interrupts playback. Continue?')) return;
+  var st = document.getElementById('addstatus');
+  this.disabled = true;
+  st.textContent = 'Rescanning — restarting engine (briefly interrupts playback)…'; st.className = 'status warn';
+  try { await fetch('api/rescan', { method:'POST' }); } catch (e) {}
+  var btn = this;
+  setTimeout(function () { btn.disabled = false; }, 8000); // OwnTone needs a few seconds; the auto-poll repopulates the list
 };
 document.getElementById('addsave').onclick = async function () {
   if (addChosen === null) return;
@@ -1985,6 +2038,7 @@ document.getElementById('addsave').onclick = async function () {
     var r = await fetch('api/rooms', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ homepod_name: addChosen, homepod_id: addChosenId || '' }) });
     if (!r.ok) { document.getElementById('adderr').textContent = await r.text(); this.disabled = false; return; }
   } catch (e) { document.getElementById('adderr').textContent = 'Could not add the speaker.'; this.disabled = false; return; }
+  stopAddPoll();
   addChosen = null; addChosenId = null;
   document.getElementById('addpanel').style.display = 'none';
   document.getElementById('addbtn').disabled = false;

@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.0 — 2026-06-29  (Add-speaker picker: auto-refresh + Rescan)
+- **The "Add speaker" picker auto-refreshes** every ~3 s while open. Discovery is passive (the manager
+  reads OwnTone's current mDNS-built AirPlay output list — it doesn't actively scan), so a device that
+  powers on / re-announces mid-flow now appears on its own without closing and reopening. The current
+  selection is preserved across refreshes; the list also reads "free **AirPlay** device(s)" since it
+  legitimately includes any AirPlay receiver (HomePods, Apple TVs, AirPlay TVs, Macs), not only HomePods.
+- **New ⟳ Rescan button** (`POST /api/rescan` → `roomRuntime.restartOT()`): forces a fresh mDNS browse by
+  gracefully restarting the primary OwnTone, for a device OwnTone missed entirely (e.g. powered on long
+  before you opened the picker). Confirms first — it briefly interrupts playback.
+- Manager `go vet`/`go test` green (+ darwin cross-build).
+
 ## Speakers 0.25.2 — 2026-06-28  (Cleanup: dead code removed + ws reconnect-log noise fixed)
 - **Removed dead code:** `selectHomePod` (select.go) and `healBinding` (rooms.go) — the old per-room
   HomePod pin / self-heal-on-rename, unused since alias mode became the only mode (0.25.0). `matchOutput`

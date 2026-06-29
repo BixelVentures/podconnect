@@ -223,6 +223,20 @@ func (rt *roomRuntime) restartGL() {
 	}
 }
 
+// restartOT gracefully restarts the room's OwnTone child so it re-browses mDNS from scratch and
+// rediscovers AirPlay devices that appeared after it started (the panel "Rescan" action — for a device
+// that was powered on after OwnTone last browsed). SIGTERM-first so it withdraws its own
+// AirPlay/mDNS registrations cleanly; keepAlive respawns it. Briefly interrupts any audio OwnTone is
+// currently sending.
+func (rt *roomRuntime) restartOT() {
+	rt.mu.Lock()
+	cmd := rt.otCmd
+	rt.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		gracefulKillGroup(cmd)
+	}
+}
+
 // killAll kills both children's process groups (teardown).
 func (rt *roomRuntime) killAll() {
 	rt.mu.Lock()
