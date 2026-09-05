@@ -1,9 +1,6 @@
 name: Verify device-aliases patch
 
-# Continuous compile-guard for the Stage-A device-aliases fork. The release image (publish.yaml)
-# ships the PREBUILT go-librespot by default (GL_ALIASES=0), so a broken patch would NOT surface
-# there. This job applies podconnect/patches/aliases-v0.7.3.patch to a fresh go-librespot v0.7.3
-# checkout and builds it — proving the patch stays clean + compiles on every change.
+# Test and compile the exact patched engine before merge and release.
 on:
   push:
     branches: [main]
@@ -32,6 +29,8 @@ jobs:
           cd /tmp/gl
           git apply --check "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
           git apply "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
+      - name: Test room alias selection
+        run: cd /tmp/gl && go test ./daemon -run 'Test(ResolveDeviceAlias|DealerAliasSelection)$'
       - name: Build patched fork
         run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
       - name: Smoke-check binary
