@@ -81,11 +81,122 @@ index d64f19f..85d0cc7 100644
  
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
+diff --git a/daemon/device_alias.go b/daemon/device_alias.go
+new file mode 100644
+index 0000000..4f6a16c
+--- /dev/null
++++ b/daemon/device_alias.go
+@@ -0,0 +1,17 @@
++package daemon
++
++// resolveDeviceAlias preserves the selected zone for engine-targeted Web API
++// commands. Explicit valid aliases still switch rooms. Zero is not an advertised
++// room in alias mode; invalid/stale selections fall back to the primary room.
++func resolveDeviceAlias(current, requested uint32, count int) uint32 {
++	if count <= 0 {
++		return requested
++	}
++	if requested >= 1 && uint64(requested) <= uint64(count) {
++		return requested
++	}
++	if current >= 1 && uint64(current) <= uint64(count) {
++		return current
++	}
++	return 1
++}
+diff --git a/daemon/device_alias_handler_test.go b/daemon/device_alias_handler_test.go
+new file mode 100644
+index 0000000..98f96a4
+--- /dev/null
++++ b/daemon/device_alias_handler_test.go
+@@ -0,0 +1,48 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"testing"
++)
++
++type aliasTestServer struct{ events []*ApiEvent }
++
++func (s *aliasTestServer) Emit(e *ApiEvent)           { s.events = append(s.events, e) }
++func (s *aliasTestServer) Receive() <-chan ApiRequest { return nil }
++func (s *aliasTestServer) Close() error               { return nil }
++
++func TestDealerAliasSelection(t *testing.T) {
++	for _, tc := range []struct {
++		name, payload string
++		want          uint32
++	}{
++		{"web api preserves selected child", `{"target_alias_id":0,"command":{"endpoint":"transfer"}}`, 2},
++		{"phone picks primary", `{"target_alias_id":1,"command":{"endpoint":"transfer"}}`, 1},
++		{"nested web api preserves selected child", `{"command":{"target_alias_id":0,"endpoint":"transfer"}}`, 2},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			server := &aliasTestServer{}
++			p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, cfg: &Config{DeviceAliases: []string{"Kitchen", "Bedroom"}}, server: server}, state: &State{device: &connectpb.DeviceInfo{SelectedAliasId: 2}}}
++			var req dealer.RequestPayload
++			if err := json.Unmarshal([]byte(tc.payload), &req); err != nil {
++				t.Fatal(err)
++			}
++			if err := p.handlePlayerCommand(context.Background(), req); err != nil {
++				t.Fatal(err)
++			}
++			if p.state.device.SelectedAliasId != tc.want {
++				t.Fatalf("published device alias=%d want=%d", p.state.device.SelectedAliasId, tc.want)
++			}
++			if len(server.events) == 0 || server.events[0].Type != "selected_alias" {
++				t.Fatalf("no routing event: %+v", server.events)
++			}
++			if got := server.events[0].Data.(map[string]any)["id"]; got != tc.want {
++				t.Fatalf("route id=%v want=%d", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/daemon/device_alias_test.go b/daemon/device_alias_test.go
+new file mode 100644
+index 0000000..45478da
+--- /dev/null
++++ b/daemon/device_alias_test.go
+@@ -0,0 +1,28 @@
++package daemon
++
++import "testing"
++
++func TestResolveDeviceAlias(t *testing.T) {
++	cases := []struct {
++		name               string
++		current, requested uint32
++		count              int
++		want               uint32
++	}{
++		{"voice start primary", 1, 0, 3, 1},
++		{"voice transport preserves child", 3, 0, 3, 3},
++		{"phone selects primary", 3, 1, 3, 1},
++		{"phone selects child", 1, 2, 3, 2},
++		{"repair previous zero", 0, 0, 3, 1},
++		{"removed room", 3, 0, 2, 1},
++		{"invalid request preserves room", 2, 99, 3, 2},
++		{"no aliases unchanged", 0, 0, 0, 0},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := resolveDeviceAlias(c.current, c.requested, c.count); got != c.want {
++				t.Fatalf("got %d, want %d", got, c.want)
++			}
++		})
++	}
++}
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..acda0fd 100644
+index c255f83..fb71efd 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -171,6 +171,25 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -171,6 +171,29 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
  
@@ -98,6 +209,10 @@ index c255f83..acda0fd 100644
 +			aliasId = req.Command.TargetAliasId // tolerate other controllers
 +		}
 +		if aliasId != nil {
++			// Web API commands target the engine and carry alias 0. Keep the
++			// selected room instead of publishing an unnamed active device.
++			resolved := resolveDeviceAlias(p.state.device.SelectedAliasId, *aliasId, len(p.app.cfg.DeviceAliases))
++			aliasId = &resolved
 +			name := ""
 +			if int(*aliasId) >= 1 && int(*aliasId) <= len(p.app.cfg.DeviceAliases) {
 +				name = p.app.cfg.DeviceAliases[*aliasId-1]
@@ -111,7 +226,7 @@ index c255f83..acda0fd 100644
  	switch req.Command.Endpoint {
  	case "transfer":
  		if len(req.Command.Data) == 0 {
-@@ -462,10 +481,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -462,10 +485,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			RepeatContext:  p.state.player.Options.RepeatingContext,
  			RepeatTrack:    p.state.player.Options.RepeatingTrack,
  			ShuffleContext: p.state.player.Options.ShufflingContext,

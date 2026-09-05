@@ -12,6 +12,7 @@ on:
     paths:
       - "podconnect/Dockerfile"
       - "podconnect/build.yaml"
+      - "podconnect/patches/**"
       - "podconnect/config.yaml"
       - "podconnect/rootfs/**"
       - "podconnect/manager/**" # the manager binary is compiled into the image

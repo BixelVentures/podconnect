@@ -8,6 +8,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.1 — 2026-09-05
+- Preserve the selected Connect room when a Spotify Web API command addresses the
+  engine with alias 0. Explicit room selections still switch rooms. Invalid saved
+  aliases fall back to the primary room.
+- Run resolver and real dealer-handler regressions while building the pinned engine.
+- Physical mobile auto-attachment still requires verification after installation.
+
 ## Speakers 0.26.0 — 2026-06-29  (Add-speaker picker: auto-refresh + Rescan)
 - **The "Add speaker" picker auto-refreshes** every ~3 s while open. Discovery is passive (the manager
   reads OwnTone's current mDNS-built AirPlay output list — it doesn't actively scan), so a device that

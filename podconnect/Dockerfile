@@ -21,6 +21,7 @@ COPY patches/ /patches/
 RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/devgianlu/go-librespot.git /gl \
   && cd /gl \
   && git apply "/patches/aliases-${GO_LIBRESPOT_VERSION}.patch" \
+  && go test ./daemon -run "Test(ResolveDeviceAlias|DealerAliasSelection)$" \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
 FROM ${BUILD_FROM}
