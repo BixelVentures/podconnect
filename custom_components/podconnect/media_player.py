@@ -14,6 +14,7 @@ from homeassistant.components.media_player import (
     RepeatMode,
 )
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -279,17 +280,16 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     # --- control (targets this device) ---
     async def _send(self, action) -> None:
-        """Run a player command, tolerating Spotify's "restriction" rejections.
-
-        Spotify returns 403 'Restriction violated' for a command that doesn't match the
-        *current* playback state (e.g. pausing what's already paused) — common when our
-        polled state is a few seconds stale. Honour the restriction: swallow it and resync
-        rather than alarm the user; the end state is almost always what they intended.
-        """
+        """Expose rejected commands and remove optimistic state before resyncing."""
         try:
             await action
         except SpotifyApiError as err:
-            LOGGER.debug("Spotify rejected a command (resyncing): %s", err)
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
+            self._optimistic_repeat = None
+            self.async_write_ha_state()
+            await self.coordinator.async_request_refresh()
+            raise HomeAssistantError(f"Spotify rejected the command: {err}") from err
         await self.coordinator.async_request_refresh()
 
     async def async_media_play(self) -> None:
@@ -333,8 +333,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             query = media_id
             media_id = await self._search_top_uri(query, media_type) or ""
             if not media_id:
-                LOGGER.warning("play_media: no Spotify match for %r", query)
-                return
+                raise HomeAssistantError(f"No Spotify match for {query!r}")
         if media_id.startswith(("spotify:track:", "spotify:episode:")):
             await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
         else:
@@ -353,12 +352,10 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             else:  # "recent"
                 items = await api.recently_played()
         except SpotifyApiError as err:
-            LOGGER.warning("play_from_library(%s) failed (re-auth may be needed): %s", source, err)
-            return
+            raise HomeAssistantError(f"Could not read Spotify library: {err}") from err
         uris = [it["uri"] for it in items if it and it.get("uri")][:50]
         if not uris:
-            LOGGER.warning("play_from_library(%s): nothing to play", source)
-            return
+            raise HomeAssistantError(f"No playable tracks in Spotify library {source!r}")
         if shuffle:
             await self._send(self.coordinator.api.set_shuffle(True, self._device_id))
         await self._send(self.coordinator.api.play(self._device_id, uris=uris))
@@ -376,8 +373,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         try:
             data = await self.coordinator.api.search(query, want)
         except SpotifyApiError as err:
-            LOGGER.warning("play_media search failed for %r: %s", query, err)
-            return None
+            raise HomeAssistantError(f"Spotify search failed: {err}") from err
         q = query.strip().lower()
 
         def relevance(name: str | None) -> int:
@@ -411,7 +407,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             None,
         )
         if device_id is None:
-            return
+            raise HomeAssistantError(f"Spotify device {source!r} is unavailable")
         is_playing = bool(self._playback and self._playback.get("is_playing"))
         await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
 
