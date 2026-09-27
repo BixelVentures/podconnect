@@ -82,3 +82,46 @@ one decisive experiment: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md) § "THE one viab
   (must heal against the PRIMARY OwnTone for all rooms, since only one engine runs).
 - Surface the alias rooms more clearly in the panel.
 - Synchronized same-music groups across rooms — not built (OwnTone multi-output is the likely path).
+
+
+## Active Control 0.10.2 decision — 2026-09-27
+
+Lead approved bounded optimistic-state correction. Observed source defect: successful
+Spotify API acceptance can be followed by dealer rejection or a contradictory poll,
+but optimistic play/shuffle/repeat previously persisted until values matched. This
+candidate must replace intent with a successful poll begun after command completion.
+An already-running poll is not post-command evidence; a failed poll is not confirmation.
+Use monotonic poll-start sequence and command generation, with no timeout tuning.
+Non-goals: Spotify engine/discovery changes, transport replay, and physical playback proof.
+Regression plan: contrary post-command truth, pre-command in-flight response, failed
+poll, device transfer, overlapping commands and rejected commands. Roll back Control
+only if HA integration validation fails. Not installed/released/test-ready yet.
+
+Implemented candidate: poll-start sequence is stamped before network reads; a completed
+command records the latest started poll. A successful later sequence replaces all
+optimistic fields even when Spotify contradicts the command or changes active device.
+Failed/pre-command polls do not confirm anything. Command generation prevents an older
+completion from clearing a newer in-flight intent; network/API errors clear unconfirmed
+intent. Thirteen Python 3.12 unit regressions passed on 2026-09-27, executing the shipped
+methods with mocks (including the actual coordinator fetch method). No running-HA or
+physical playback/discovery proof; independent review and integration checks pending.
+
+Lead additionally approved source-order search repair and truthful library/search
+read errors. Synthetic reproduction: a source-first requested artist's Halo (60)
+was demoted below a different artist's Halo (99) by title-only/popularity reranking.
+Preserve Spotify order within each result type; do not invent new relevance policy.
+Failed library reads must raise service errors, not masquerade as empty tracks.
+No prompt/tool-surface changes; regressions execute the actual service/search methods.
+
+Final local evidence: 17 Python 3.12 tests passed after search/read additions and
+cancelled-command cleanup. Search regressions preserve provider-first requested artist
+against a more popular cover in both direct and Assist paths. Library tests distinguish
+legitimate empty results from provider failure and missing account. These are shipped
+method/service-registration tests with mocked boundaries, not running-HA integration
+or physical audio/discovery evidence. Candidate remains uninstalled; independent review
+pending. Speakers code/version is unchanged in this Control-only candidate.
+
+Independent final review27/9: separate reviewer GO, no P0/P1. Reviewer independently
+ran all17 Python tests and Node Stop-feedback regression successfully. Control0.10.2
+manifest/changelog included in review. These are shipped-method tests with mocked
+HA/provider boundaries, not physical discovery or room-behaviour proof.

@@ -8,6 +8,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Control 0.10.2 — 2026-09-27
+- Replace optimistic playback, shuffle and repeat state with the first successful
+  poll started after command acceptance, including contradictory state and device transfer.
+  Failed or older polls cannot confirm the command; no playback actions are retried.
+- Preserve Spotify search order within each result type instead of re-ranking by
+  title alone and popularity, which could promote the wrong artist or a literal title.
+- Report search and personal-library API failures as errors rather than empty results.
+- Speakers remains 0.26.2; this release does not claim physical discovery or wake improvements.
+
 ## Speakers 0.26.2 / Control 0.10.1 — candidate 2026-09-27
 - Keep the existing output-connection retry pending when OwnTone rejects selection,
   including reclaim after idle release. A failed selection no longer reports success.
