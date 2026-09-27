@@ -278,7 +278,9 @@ func glHealthy(url string) bool {
 		return false
 	}
 	resp.Body.Close()
-	return resp.StatusCode < 500
+	// A healthy authenticated idle player is 200; an unpaired engine is 204.
+	// Errors are not readiness evidence.
+	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent
 }
 
 // boolFlag is a tiny mutex-guarded bool — the per-room test-tone gate (replaces the global

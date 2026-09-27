@@ -1,0 +1,488 @@
+diff --git a/daemon/player.go b/daemon/player.go
+index c255f83..e3b6659 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -692,7 +692,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 	err := p.sess.Dealer().Connect(ctx)
+ 	if err != nil {
+ 		p.app.log.WithError(err).Error("failed connecting to dealer")
+-		p.Close()
++		p.runFailedTransport(apiRecv, mprisRecv)
+ 		return
+ 	}
+ 
+@@ -710,7 +710,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 			return
+ 		case pkt, ok := <-apRecv:
+ 			if !ok {
+-				continue
++				p.app.log.Error("terminal Spotify transport failure: apRecv")
++				p.runFailedTransport(apiRecv, mprisRecv)
++				return
+ 			}
+ 
+ 			if err := p.handleAccesspointPacket(pkt.Type, pkt.Payload); err != nil {
+@@ -718,7 +720,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 			}
+ 		case msg, ok := <-msgRecv:
+ 			if !ok {
+-				continue
++				p.app.log.Error("terminal Spotify transport failure: msgRecv")
++				p.runFailedTransport(apiRecv, mprisRecv)
++				return
+ 			}
+ 
+ 			if err := p.handleDealerMessage(ctx, msg); err != nil {
+@@ -726,7 +730,9 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 			}
+ 		case req, ok := <-reqRecv:
+ 			if !ok {
+-				continue
++				p.app.log.Error("terminal Spotify transport failure: reqRecv")
++				p.runFailedTransport(apiRecv, mprisRecv)
++				return
+ 			}
+ 
+ 			if err := p.handleDealerRequest(ctx, req); err != nil {
+@@ -781,3 +787,27 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 		}
+ 	}
+ }
++
++// Keep the failed generation responsive to teardown and truthful to the watchdog.
++// Closed transport channels mean upstream has exhausted reconnection, not a brief
++// disconnect. Never execute or replay commands against this stranded session.
++func (p *AppPlayer) runFailedTransport(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
++	for {
++		select {
++		case <-p.stop:
++			return
++		case req, ok := <-apiRecv:
++			if !ok {
++				apiRecv = nil
++				continue
++			}
++			req.Reply(nil, fmt.Errorf("Spotify transport exhausted; session recovery required"))
++		case req, ok := <-mprisRecv:
++			if !ok {
++				mprisRecv = nil
++				continue
++			}
++			req.Reply(mpris.MediaPlayer2PlayerCommandResponse{Err: &dbus.Error{Name: "org.mpris.MediaPlayer2.Error.Failed", Body: []interface{}{"Spotify transport exhausted"}}})
++		}
++	}
++}
+diff --git a/zeroconf/backend_avahi.go b/zeroconf/backend_avahi.go
+index 11bbec5..6a95401 100644
+--- a/zeroconf/backend_avahi.go
++++ b/zeroconf/backend_avahi.go
+@@ -1,7 +1,10 @@
+ package zeroconf
+ 
+ import (
++	"context"
+ 	"fmt"
++	"sync"
++	"time"
+ 
+ 	"github.com/godbus/dbus/v5"
+ )
+@@ -17,6 +20,13 @@ const (
+ 	avahiProtoUnspec = int32(-1) // AVAHI_PROTO_UNSPEC - use both IPv4 and IPv6
+ )
+ 
++// Minimal bus boundary used by registration and deterministic recovery tests.
++type avahiConnection interface {
++	Object(string, dbus.ObjectPath) dbus.BusObject
++	Connected() bool
++	Close() error
++}
++
+ // AvahiRegistrar implements ServiceRegistrar using avahi-daemon via D-Bus.
+ // This allows go-librespot to share the mDNS responder with other services
+ // on the system instead of running its own.
+@@ -24,7 +34,11 @@ const (
+ // Compatibility: Requires avahi-daemon 0.6.x or later (uses stable D-Bus API).
+ // Tested with avahi 0.7 and 0.8.
+ type AvahiRegistrar struct {
+-	conn    *dbus.Conn
++	mu      sync.Mutex
++	stop    chan struct{}
++	stopped bool
++	name    string
++	conn    avahiConnection
+ 	version string
+ 
+ 	entryGroup  dbus.BusObject
+@@ -37,7 +51,7 @@ type AvahiRegistrar struct {
+ // NewAvahiRegistrar creates a new avahi-daemon service registrar.
+ // It connects to the system D-Bus and prepares to register services via avahi.
+ func NewAvahiRegistrar() (*AvahiRegistrar, error) {
+-	conn, err := dbus.SystemBus()
++	conn, err := connectAvahiBus()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to connect to system bus: %w", err)
+ 	}
+@@ -45,7 +59,7 @@ func NewAvahiRegistrar() (*AvahiRegistrar, error) {
+ 	// Verify avahi-daemon is available by calling GetHostName (available in all versions)
+ 	server := conn.Object(avahiService, avahiServerPath)
+ 	var hostname string
+-	err = server.Call(avahiServerIface+".GetHostName", 0).Store(&hostname)
++	err = avahiCall(server, avahiServerIface+".GetHostName", 0).Store(&hostname)
+ 	if err != nil {
+ 		_ = conn.Close()
+ 		return nil, fmt.Errorf("failed to connect to avahi-daemon (is it running?): %w", err)
+@@ -54,7 +68,9 @@ func NewAvahiRegistrar() (*AvahiRegistrar, error) {
+ 	// Try to get version for logging (optional, may fail on older versions)
+ 	version := getAvahiVersion(server)
+ 
+-	return &AvahiRegistrar{conn: conn, version: version}, nil
++	a := &AvahiRegistrar{conn: conn, version: version, stop: make(chan struct{})}
++	go a.maintain()
++	return a, nil
+ }
+ 
+ // getAvahiVersion attempts to retrieve the avahi-daemon version.
+@@ -62,13 +78,13 @@ func NewAvahiRegistrar() (*AvahiRegistrar, error) {
+ func getAvahiVersion(server dbus.BusObject) string {
+ 	// Try GetVersionString first (available in avahi 0.8+)
+ 	var versionStr string
+-	if err := server.Call(avahiServerIface+".GetVersionString", 0).Store(&versionStr); err == nil {
++	if err := avahiCall(server, avahiServerIface+".GetVersionString", 0).Store(&versionStr); err == nil {
+ 		return versionStr
+ 	}
+ 
+ 	// Try GetAPIVersion (returns a single uint32)
+ 	var apiVersion uint32
+-	if err := server.Call(avahiServerIface+".GetAPIVersion", 0).Store(&apiVersion); err == nil {
++	if err := avahiCall(server, avahiServerIface+".GetAPIVersion", 0).Store(&apiVersion); err == nil {
+ 		return fmt.Sprintf("API v%d", apiVersion)
+ 	}
+ 
+@@ -82,12 +98,24 @@ func (a *AvahiRegistrar) Version() string {
+ 
+ // Register publishes the service via avahi-daemon.
+ func (a *AvahiRegistrar) Register(name, serviceType, domain string, port int, txt []string) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.stopped {
++		return fmt.Errorf("advertiser stopped")
++	}
++	a.name, a.serviceType, a.domain, a.port, a.txt = name, serviceType, domain, port, append([]string(nil), txt...)
++	return a.register()
++}
++
++func (a *AvahiRegistrar) register() error {
++	name, serviceType, domain, port, txt := a.name, a.serviceType, a.domain, a.port, a.txt
++
+ 	server := a.conn.Object(avahiService, avahiServerPath)
+ 
+ 	// Create a new entry group for our service
+ 	if a.entryGroup == nil {
+ 		var groupPath dbus.ObjectPath
+-		err := server.Call(avahiServerIface+".EntryGroupNew", 0).Store(&groupPath)
++		err := avahiCall(server, avahiServerIface+".EntryGroupNew", 0).Store(&groupPath)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to create entry group: %w", err)
+ 		}
+@@ -111,7 +139,7 @@ func (a *AvahiRegistrar) Register(name, serviceType, domain string, port int, tx
+ 	// host (s): hostname, empty for default
+ 	// port (q): port number (uint16)
+ 	// txt (aay): TXT record data as array of byte arrays
+-	if err := a.entryGroup.Call(avahiEntryGroupIface+".AddService", 0,
++	if err := avahiCall(a.entryGroup, avahiEntryGroupIface+".AddService", 0,
+ 		avahiIfUnspec,    // interface
+ 		avahiProtoUnspec, // protocol
+ 		uint32(0),        // flags
+@@ -131,7 +159,7 @@ func (a *AvahiRegistrar) Register(name, serviceType, domain string, port int, tx
+ 	a.txt = txt
+ 
+ 	// Commit the entry group to publish the service
+-	if err := a.entryGroup.Call(avahiEntryGroupIface+".Commit", 0).Err; err != nil {
++	if err := avahiCall(a.entryGroup, avahiEntryGroupIface+".Commit", 0).Err; err != nil {
+ 		return fmt.Errorf("failed to commit entry group: %w", err)
+ 	}
+ 
+@@ -140,18 +168,31 @@ func (a *AvahiRegistrar) Register(name, serviceType, domain string, port int, tx
+ 
+ // UpdateName updates the advertised instance service name.
+ func (a *AvahiRegistrar) UpdateName(name string) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.stopped {
++		return fmt.Errorf("advertiser stopped")
++	}
++	a.name = name
+ 	if a.entryGroup != nil {
+-		_ = a.entryGroup.Call(avahiEntryGroupIface+".Reset", 0).Err
++		_ = avahiCall(a.entryGroup, avahiEntryGroupIface+".Reset", 0).Err
+ 	}
+ 
+-	return a.Register(name, a.serviceType, a.domain, a.port, a.txt)
++	return a.register()
+ }
+ 
+ // Shutdown removes the service from avahi and releases resources.
+ func (a *AvahiRegistrar) Shutdown() {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.stopped {
++		return
++	}
++	a.stopped = true
++	close(a.stop)
+ 	if a.entryGroup != nil {
+ 		// Free the entry group (this also unpublishes the service)
+-		_ = a.entryGroup.Call(avahiEntryGroupIface+".Free", 0).Err
++		_ = avahiCall(a.entryGroup, avahiEntryGroupIface+".Free", 0).Err
+ 		a.entryGroup = nil
+ 	}
+ 	if a.conn != nil {
+@@ -159,3 +200,84 @@ func (a *AvahiRegistrar) Shutdown() {
+ 		a.conn = nil
+ 	}
+ }
++
++// Use bounded calls so a vanished advertiser cannot wedge teardown or recovery.
++func avahiCall(obj dbus.BusObject, method string, flags dbus.Flags, args ...interface{}) *dbus.Call {
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	return obj.CallWithContext(ctx, method, flags, args...)
++}
++
++func (a *AvahiRegistrar) maintain() {
++	tick := time.NewTicker(5 * time.Second)
++	defer tick.Stop()
++	for {
++		select {
++		case <-a.stop:
++			return
++		case <-tick.C:
++			a.refreshRegistration()
++		}
++	}
++}
++
++func (a *AvahiRegistrar) refreshRegistration() {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.stopped || a.name == "" {
++		return
++	}
++	// A private connection can be replaced after the system bus itself restarts.
++	if !a.conn.Connected() {
++		conn, err := connectAvahiBus()
++		if err != nil {
++			return
++		}
++		a.conn = conn
++		a.entryGroup = nil
++	}
++	if a.entryGroup != nil {
++		var state int32
++		err := avahiCall(a.entryGroup, avahiEntryGroupIface+".GetState", 0).Store(&state)
++		// REGISTERING and ESTABLISHED are legitimate states. Do not churn a healthy
++		// announcement or interrupt playback during a transient registration.
++		if err == nil && (state == 1 || state == 2) {
++			return
++		}
++		_ = avahiCall(a.entryGroup, avahiEntryGroupIface+".Free", 0).Err
++		a.entryGroup = nil
++	}
++	// Retain current identity/port/TXT. Retry next tick on daemon absence/failure;
++	// this restores discovery only and never invokes a playback command.
++	_ = a.register()
++}
++
++// The bus can accept a socket yet stop answering authentication/Hello. Cancel
++// that connection after the same bounded interval as individual DBus calls.
++func connectAvahiBus() (avahiConnection, error) {
++	ctx, cancel := context.WithCancel(context.Background())
++	timer := time.AfterFunc(2*time.Second, cancel)
++	conn, err := dbus.ConnectSystemBus(dbus.WithContext(ctx))
++	if !timer.Stop() || err != nil {
++		cancel()
++		if conn != nil {
++			_ = conn.Close()
++		}
++		if err != nil {
++			return nil, err
++		}
++		return nil, fmt.Errorf("system bus connection timed out")
++	}
++	// The successful connection retains cancellation until its owner closes it.
++	return &ownedAvahiBus{Conn: conn, cancel: cancel}, nil
++}
++
++type ownedAvahiBus struct {
++	*dbus.Conn
++	cancel context.CancelFunc
++}
++
++func (b *ownedAvahiBus) Close() error {
++	b.cancel()
++	return b.Conn.Close()
++}
+diff --git a/daemon/transport_recovery_test.go b/daemon/transport_recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/transport_recovery_test.go
+@@ -0,0 +1,48 @@
++package daemon
++
++import (
++	"context"
++	librespot "github.com/devgianlu/go-librespot"
++	"net/http/httptest"
++	"testing"
++	"time"
++)
++
++func TestFailedTransportRejectsCommandsAndAcceptsTeardown(t *testing.T) {
++	p := &AppPlayer{stop: make(chan struct{})}
++	requests := make(chan ApiRequest)
++	done := make(chan struct{})
++	go func() { p.runFailedTransport(requests, nil); close(done) }()
++	for _, kind := range []ApiRequestType{ApiRequestTypeStatus, ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypeStop} {
++		req, wait := NewApiRequest(kind, nil)
++		requests <- req
++		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++		data, err := wait(ctx)
++		cancel()
++		if err == nil || data != nil {
++			t.Fatalf("%s must fail without executing: %v %v", kind, data, err)
++		}
++	}
++	close(requests) // A closed API channel must not prevent teardown or spin.
++	p.stop <- struct{}{}
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("teardown blocked")
++	}
++}
++
++func TestFailedTransportStatusIsHTTPFailure(t *testing.T) {
++	requests := make(chan ApiRequest)
++	p := &AppPlayer{stop: make(chan struct{})}
++	done := make(chan struct{})
++	go func() { p.runFailedTransport(requests, nil); close(done) }()
++	server := &ConcreteApiServer{requests: requests, log: &librespot.NullLogger{}}
++	response := httptest.NewRecorder()
++	server.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, response)
++	if response.Code != 500 {
++		t.Fatalf("failed session reported HTTP %d", response.Code)
++	}
++	p.stop <- struct{}{}
++	<-done
++}
+diff --git a/zeroconf/backend_avahi_recovery_test.go b/zeroconf/backend_avahi_recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/zeroconf/backend_avahi_recovery_test.go
+@@ -0,0 +1,105 @@
++package zeroconf
++
++import (
++	"context"
++	"fmt"
++	"github.com/godbus/dbus/v5"
++	"testing"
++)
++
++type recoveryObject struct {
++	dbus.BusObject
++	call func(string, []interface{}) *dbus.Call
++}
++
++func (o recoveryObject) CallWithContext(ctx context.Context, method string, flags dbus.Flags, args ...interface{}) *dbus.Call {
++	if _, ok := ctx.Deadline(); !ok {
++		panic("unbounded DBus call")
++	}
++	return o.call(method, args)
++}
++
++type recoveryBus struct {
++	object dbus.BusObject
++	closed bool
++}
++
++func (b *recoveryBus) Object(string, dbus.ObjectPath) dbus.BusObject { return b.object }
++func (b *recoveryBus) Connected() bool                               { return !b.closed }
++func (b *recoveryBus) Close() error                                  { b.closed = true; return nil }
++
++func TestAvahiRecovery(t *testing.T) {
++	for _, state := range []int32{0, 1, 2, 3, 4, -1} {
++		t.Run(fmt.Sprint(state), func(t *testing.T) {
++			registrations := 0
++			obj := recoveryObject{call: func(method string, args []interface{}) *dbus.Call {
++				switch method {
++				case avahiEntryGroupIface + ".GetState":
++					if state == -1 {
++						return &dbus.Call{Err: fmt.Errorf("old Avahi owner disappeared")}
++					}
++					return &dbus.Call{Body: []interface{}{state}}
++				case avahiServerIface + ".EntryGroupNew":
++					return &dbus.Call{Body: []interface{}{dbus.ObjectPath("/fresh")}}
++				case avahiEntryGroupIface + ".AddService":
++					registrations++
++					if args[3] != "Kitchen" || args[7] != uint16(1234) {
++						t.Fatalf("identity changed: %v", args)
++					}
++				}
++				return &dbus.Call{}
++			}}
++			bus := &recoveryBus{object: obj}
++			a := &AvahiRegistrar{conn: bus, entryGroup: obj, stop: make(chan struct{}), name: "Kitchen", serviceType: "_spotify-connect._tcp", domain: "local.", port: 1234, txt: []string{"VERSION=1.0"}}
++			a.refreshRegistration()
++			want := 1
++			if state == 1 || state == 2 {
++				want = 0
++			}
++			if registrations != want {
++				t.Fatalf("registrations=%d want=%d", registrations, want)
++			}
++			a.Shutdown()
++			a.refreshRegistration()
++			a.Shutdown()
++			if registrations != want {
++				t.Fatal("registration after shutdown")
++			}
++		})
++	}
++}
++
++func TestAvahiRecoveryRetriesFailedRegistrationAndKeepsRenamedIdentity(t *testing.T) {
++	fail := true
++	adds := 0
++	obj := recoveryObject{call: func(method string, args []interface{}) *dbus.Call {
++		switch method {
++		case avahiEntryGroupIface + ".GetState":
++			return &dbus.Call{Err: fmt.Errorf("lost group")}
++		case avahiServerIface + ".EntryGroupNew":
++			if fail {
++				return &dbus.Call{Err: fmt.Errorf("daemon absent")}
++			}
++			return &dbus.Call{Body: []interface{}{dbus.ObjectPath("/new")}}
++		case avahiEntryGroupIface + ".AddService":
++			adds++
++			if args[3] != "Renamed" {
++				t.Fatal("stale name restored")
++			}
++		}
++		return &dbus.Call{}
++	}}
++	a := &AvahiRegistrar{conn: &recoveryBus{object: obj}, stop: make(chan struct{}), name: "Old", serviceType: "_spotify-connect._tcp", port: 1234}
++	if err := a.UpdateName("Renamed"); err == nil {
++		t.Fatal("expected unavailable daemon")
++	}
++	a.refreshRegistration()
++	if adds != 0 {
++		t.Fatal("published while unavailable")
++	}
++	fail = false
++	a.refreshRegistration()
++	if adds != 1 {
++		t.Fatal("did not recover")
++	}
++}

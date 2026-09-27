@@ -132,3 +132,101 @@ v0.10.2, then Core restart requested and browser reconnected. Speakers remains0.
 Physical playback/search verification is not yet obtained. Voice PE separately lost
 its native connection at12:33:58 and remained undiscoverable in inspected HA logs;
 this Control update neither explains nor repairs that device/network condition.
+
+
+## Connect disappearance investigation — 2026-09-27
+
+Read-only investigation; no runtime/configuration change and no claimed fix.
+Installed Speakers0.26.2 verified Running in HA; start-on-boot and watchdog both ON.
+Panel retains primary Kitchen + Svend/Frida aliases. Primary released is AirPlay
+idle-release state, not evidence that Spotify Connect was withdrawn.
+
+Fresh HA log evidence (local time): startup11:52:21; Avahi registration11:52:22;
+persisted credentials loaded and AP/Login5 authenticated; alias1 routed11:52:26.
+At15:18:23 AP pong absent120s, connection closed, one AP connection refused,
+then authenticated AP. At15:35:40 and15:45:13 peer reset followed by authenticated
+AP. No manager health-restart is present in this displayed post-install excerpt.
+AP authentication alone does not prove Dealer, Connect state publication or mobile
+visibility. Startup also warns about another IPv4/IPv6 mDNS stack; this is a lead,
+not causal proof. Logs shown cover the displayed interval, not all historical use.
+At17:00:53 local DNS-SD browse sees Kitchen's _spotify-connect._tcp advertisement;
+at17:01:14 resolve returns podconnect.local:37427, matching the startup log port.
+Therefore advertisement is present now. Sibling rooms are cloud aliases of one
+engine, not independent local mDNS advertisements; loss of that engine can affect
+all aliases. Spotify mobile visibility is not independently observed.
+
+Source findings in shipped upstream c191a43 (v0.7.3) + alias patch:
+1. manager/supervisor.go glHealthy only checks local /status HTTP <500. A204
+(no session), or200 from a stranded player, is healthy under that predicate.
+It is a responsiveness watchdog, not a Spotify-session/discovery watchdog.
+2. Dealer/AP reconnect eventually close receiver channels on exhausted retry.
+daemon/player.go Run continues on closed AP/message/request channels instead of
+ending the dead session. This permits a live local event loop without functioning
+remote transport; status handling does not validate Dealer/AP. Code-supported
+failure path, NOT reproduced in the field log above.
+3. zeroconf/backend_avahi.go registers once and has no service-owner/state listener
+to re-register after Avahi/D-Bus restart. A process that stays alive after advertiser
+loss has no demonstrated advertisement recovery. Not observed happening today.
+4. HA watchdog probes OwnTone TCP3689 only. It cannot establish Spotify readiness.
+5. manager child exits are respawned; HTTP hangs trigger restart after warmup and
+three30s checks. These existing protections do not cover every cloud-session failure.
+6. Existing output-selection retry repairs downstream HomePod rejection; it cannot
+repair a missing upstream Connect session. No playback command may be replayed on
+unknown outcome. Whole-addon shutdown still hard-kills children whereas restartGL
+uses graceful termination; review advertisement cleanup in controlled restart tests.
+
+Upstream releases after the pinned version mention Avahi renaming hardening and
+track audio-key failure recovery: https://github.com/devgianlu/go-librespot/releases .
+Neither release note establishes a fix for this user's disappearance. Avoid a blind
+version upgrade of the alias fork. Upstream issue300 describes Connect-state timeout
+and unrecovered playback, but today's log does not show that causal chain.
+
+Next bounded implementation decision: expose actual transport/session/registration
+health, end exhausted sessions through their existing owner, and let supervision
+recover only a confirmed failed generation. Verify healthy idle/no-user states are
+not restarted, short disconnects recover without resets, sustained failure recovers
+without replay, advertiser restart restores same identity, and next room selection
+works. Then same-artifact HA reboot/network recovery and Spotify mobile visibility
+are required before claiming disappearance fixed. No gain/buffer/Wi-Fi tuning is
+justified by the evidence collected here.
+
+## Active decision — exhausted transport and Avahi recovery — 2026-09-27
+
+Owner: PodConnect reliability implementation, reviewed independently before release.
+Code evidence above establishes terminal closed-channel spin and one-shot Avahi
+registration; today's recovered AP resets do not establish either as the field cause.
+Repair the pinned engine at these boundaries: terminal transport failure enters an
+error-only API loop (no command replay), allowing the existing manager watchdog to
+replace that process; ordinary reconnect stays upstream-owned. Periodic bounded Avahi
+registration validation restores the same current name/port/TXT after advertiser loss.
+Preserve healthy idle/no-credential sessions. No Spotify search, audio buffer, output
+selection, alias identity or credential policy changes. Tests must cover failed API
+truth/stop, healthy/no-user HTTP responses, advertisement loss/re-registration and
+shutdown fencing. Independent review and same-artifact reboot/network/mobile discovery
+proof remain required; this is not yet a released or physically proven fix.
+
+Implementation: a separate recovery-v0.7.3.patch applies after the unchanged alias
+patch. Exhausted AP/Dealer channels (and failed initial Dealer connection) enter an
+error-only player loop; API commands fail and owner Stop remains accepted. Actual
+/status maps failure to HTTP500. The existing three-check watchdog then gracefully
+restarts the process; no new retry layer or command replay. Healthy /status200 and
+unpaired204 remain accepted, other HTTP errors no longer count as healthy. Avahi uses
+a private bus connection, serialized current registration state, bounded two-second
+DBus calls/authentication, five-second revalidation, and a shutdown fence. Lost groups
+are replaced with current identity/port/TXT; registering/established groups are retained.
+
+Validation: all manager tests PASS using temporary Go1.25.5 and permitted localhost
+listeners (first sandbox run could not bind, not a product failure). Linux ARM64 pinned
+upstream plus existing alias patch and new recovery patch passed daemon+zeroconf tests,
+including actual HTTP500 mapping, rejected play/resume/stop with no session execution,
+closed API channel teardown, six Avahi entry-group states, daemon absence/retry, renamed
+identity and shutdown fencing. Final Linux ARM64 composed-source rerun after bounded-connect addition PASS:
+go test -race ./daemon ./zeroconf; go vet ./daemon ./zeroconf; go build ./cmd/daemon.
+The manager complete test suite also passed. No release/install/physical proof.
+
+Independent review: separate reviewer GO, no blocking finding in shipped zeroconf
+path; manager tests independently passed and composed recovery source identity checked.
+Speakers0.26.3 metadata prepared; Control remains0.10.2. Recovery watchdog is the
+existing three30-second failed probes after upstream retries have exhausted (upstream
+backoff may itself be lengthy); this does not promise90-second recovery from first drop.
+Physical daemon restart, HA reboot and Spotify mobile rediscovery remain unproved.
