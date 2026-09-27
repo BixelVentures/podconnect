@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.2 / Control 0.10.1 — candidate 2026-09-27
+- Keep the existing output-connection retry pending when OwnTone rejects selection,
+  including reclaim after idle release. A failed selection no longer reports success.
+- Return failed play/stop outcomes and missing Spotify sessions truthfully. Panel Stop
+  displays failures; Control reports search, library and playback errors to Home Assistant.
+- Never replay a playback action automatically after an uncertain result.
+- Regression coverage: rejected selection followed by recovery, disconnected backend,
+  command status codes and panel feedback. Physical reboot/discovery proof remains pending;
+  this candidate does not claim to solve every Spotify-engine disappearance.
+
 ## Speakers 0.26.1 — 2026-09-05
 - Preserve the selected Connect room when a Spotify Web API command addresses the
   engine with alias 0. Explicit room selections still switch rooms. Invalid saved

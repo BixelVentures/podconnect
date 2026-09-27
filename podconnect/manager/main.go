@@ -220,12 +220,15 @@ func asBool(v any) bool { b, _ := v.(bool); return b }
 
 // selectOnOwntoneAt activates exactly one output on a given OwnTone (the proven call select-homepod
 // uses).
-func selectOnOwntoneAt(base, id string) {
+func selectOnOwntoneAt(base, id string) bool {
 	cl := &http.Client{Timeout: 4 * time.Second}
 	req, _ := http.NewRequest(http.MethodPut, base+"/api/outputs/set", bytes.NewBufferString(`{"outputs":["`+id+`"]}`))
-	if resp, err := cl.Do(req); err == nil {
-		resp.Body.Close()
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false
 	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 func clampPct(p int) int {
@@ -386,21 +389,73 @@ func owntonePlayerState(base string) string {
 }
 
 // owntoneTransport issues a player transport command ("play" or "pause").
-func owntoneTransport(base, action string) {
+func owntoneTransport(base, action string) error {
 	cl := &http.Client{Timeout: 3 * time.Second}
-	req, _ := http.NewRequest(http.MethodPut, base+"/api/player/"+action, nil)
-	if r, e := cl.Do(req); e == nil {
-		r.Body.Close()
+	req, err := http.NewRequest(http.MethodPut, base+"/api/player/"+action, nil)
+	if err != nil {
+		return err
 	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("owntone %s returned HTTP %d", action, resp.StatusCode)
+	}
+	return nil
 }
 
 // librespotTransport issues a go-librespot transport command ("pause" or "resume").
-func librespotTransport(base, action string) {
+func librespotTransport(base, action string) error {
 	cl := &http.Client{Timeout: 3 * time.Second}
-	req, _ := http.NewRequest(http.MethodPost, base+"/player/"+action, nil)
-	if r, e := cl.Do(req); e == nil {
-		r.Body.Close()
+	req, err := http.NewRequest(http.MethodPost, base+"/player/"+action, nil)
+	if err != nil {
+		return err
 	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// The pinned engine uses 204 for ErrNoSession; accepted commands return 200.
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("go-librespot %s returned HTTP %d", action, resp.StatusCode)
+	}
+	return nil
+}
+
+// transportRooms reports backend acceptance, not physical playback proof. A failed
+// command is never retried: its side effect may already have reached the player.
+func transportRooms(w http.ResponseWriter, rooms []*Room, action string) {
+	if len(rooms) == 0 {
+		http.Error(w, "no matching speaker", http.StatusNotFound)
+		return
+	}
+	failed := make([]string, 0)
+	for _, rm := range rooms {
+		err := librespotTransport(rm.Librespot, action)
+		if action == "pause" {
+			// Silence AirPlay even if Spotify is unavailable; either failure matters.
+			if airplayErr := owntoneTransport(rm.OwnTone, "pause"); airplayErr != nil {
+				log.Printf("rooms[%s]: AirPlay pause failed: %v", rm.ID, airplayErr)
+				if err == nil {
+					err = airplayErr
+				}
+			}
+		}
+		if err != nil {
+			log.Printf("rooms[%s]: %s failed: %v", rm.ID, action, err)
+			failed = append(failed, rm.ID)
+		}
+	}
+	if len(failed) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		writeJSON(w, map[string]any{"ok": false, "failed_rooms": failed})
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func glConfigPath(r *Room) string { return filepath.Join(r.ConfigDir, "config.yml") }
@@ -585,7 +640,10 @@ func routeAliasOutput(primaryOwnTone string, aliasId int) bool {
 		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
 		return false
 	}
-	selectOnOwntoneAt(primaryOwnTone, devs[idx].ID)
+	if !selectOnOwntoneAt(primaryOwnTone, devs[idx].ID) {
+		log.Printf("alias-route: alias %d output selection failed; recovery remains pending", aliasId)
+		return false
+	}
 	log.Printf("alias-route: alias %d -> room %q -> HomePod %q", aliasId, target.Name, devs[idx].Name)
 	return true
 }
@@ -620,10 +678,10 @@ func reclaimHomePod(room *Room) {
 //
 // Skipped while THIS room's test tone plays, and while a duck holds the room. Per-room.
 func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
-	volCanon := -1           // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
-	lastPlayVol := -1        // last canonical volume while actually PLAYING — distinguishes your own
-	                         // pause/resume (same level) from a transfer that brings a remembered/loud one
-	lastAlias := 0           // device-aliases: last alias id we routed output for (0 = none yet)
+	volCanon := -1    // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
+	lastPlayVol := -1 // last canonical volume while actually PLAYING — distinguishes your own
+	// pause/resume (same level) from a transfer that brings a remembered/loud one
+	lastAlias := 0             // device-aliases: last alias id we routed output for (0 = none yet)
 	aliasRoutePending := false // a route attempt failed; retry on the throttle (not every tick)
 	aliasRetryAt := time.Now()
 	trans := transState{canon: -1, otTarget: -1}
@@ -740,7 +798,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					// grace-release lands on the chosen room, not Frida. (Reset lastAlias so the routing block
 					// re-asserts even if the id didn't change.)
 					if room.Idx == 0 && gl.SelAlias > 0 {
-						routeAliasOutput(room.OwnTone, gl.SelAlias)
+						aliasRoutePending = !routeAliasOutput(room.OwnTone, gl.SelAlias)
+						aliasRetryAt = time.Now().Add(3 * time.Second)
 						lastAlias = gl.SelAlias
 					}
 				}
@@ -1236,12 +1295,7 @@ func main() {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		for _, rm := range targetRooms(r) {
-			librespotTransport(rm.Librespot, "pause") // local pause — stops any account's session
-			owntoneTransport(rm.OwnTone, "pause")     // silence the AirPlay leg immediately
-		}
-		log.Printf("stop requested — paused playback (account-agnostic)")
-		writeJSON(w, map[string]bool{"ok": true})
+		transportRooms(w, targetRooms(r), "pause")
 	})
 
 	// /api/play resumes playback (go-librespot resume). The bridge's transState then mirrors the
@@ -1261,11 +1315,7 @@ func main() {
 			http.Error(w, "play-by-query not supported: /api/play only resumes. Play a track via the Spotify Web API (Control media_player.play_media) on the speaker entity.", http.StatusBadRequest)
 			return
 		}
-		for _, rm := range targetRooms(r) {
-			librespotTransport(rm.Librespot, "resume")
-		}
-		log.Printf("play requested — resumed playback")
-		writeJSON(w, map[string]bool{"ok": true})
+		transportRooms(w, targetRooms(r), "resume")
 	})
 
 	// /api/volume sets the speaker volume (0..100) via go-librespot; the bridge mirrors the change to
@@ -1868,7 +1918,17 @@ async function loadRooms() {
     var t = document.createElement('button'); t.className = 'ghost'; t.textContent = '🔊 Test';
     t.onclick = function () { fetch('api/test', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ room: rm.id }) }); };
     var st = document.createElement('button'); st.className = 'ghost'; st.textContent = '⏹ Stop';
-    st.onclick = function () { fetch('api/stop?room=' + encodeURIComponent(rm.id), { method:'POST' }); };
+    st.onclick = async function () {
+      st.disabled = true;
+      try {
+        var response = await fetch('api/stop?room=' + encodeURIComponent(rm.id), { method:'POST' });
+        if (!response.ok) { alert('Could not confirm that the speaker stopped. Please check the speaker and its connection.'); }
+      } catch (e) {
+        alert('Could not reach the speaker service. Stop was not confirmed.');
+      } finally {
+        st.disabled = false;
+      }
+    };
     var ren = document.createElement('button'); ren.className = 'ghost'; ren.textContent = '✎ Rename';
     ren.onclick = async function () {
       var nv = prompt('Rename this speaker (the Spotify Connect device + HA entity follow):', rm.name);
