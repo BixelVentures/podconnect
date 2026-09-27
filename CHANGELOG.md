@@ -8,6 +8,17 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.3 — 2026-09-27
+- Exhausted Spotify AP/Dealer sessions now return failed health and reject commands,
+  allowing the existing supervisor to restart the engine instead of retaining a
+  responsive but stranded session. Brief upstream reconnects and unpaired idle are preserved.
+- Recheck Avahi registration every five seconds and restore the current name, port
+  and TXT after advertiser loss. Bound DBus calls and reconnect authentication; fence
+  shutdown so late checks cannot re-advertise a stopped process.
+- Recovery never repeats playback commands. This fixes proven source failure paths;
+  same-release reboot/network and Spotify visibility checks remain required before
+  claiming the reported disappearance is resolved.
+
 ## Control 0.10.2 — 2026-09-27
 - Replace optimistic playback, shuffle and repeat state with the first successful
   poll started after command acceptance, including contradictory state and device transfer.
