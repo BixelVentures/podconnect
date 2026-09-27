@@ -57,7 +57,7 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
   *Transfer Playback* handoff).
 - **Search + Browse** your Spotify in HA — search, Playlists, Top Artists, Top Tracks, Recently
   Played, Liked Songs — so **HA Assist can pick music** ("spil noget afslappende i køkkenet").
-  Search includes **audiobooks / shows / episodes** and breaks same-title ties by **popularity**.
+  Search includes **audiobooks / shows / episodes** and preserves Spotify result order within each type.
 - **One entity per HomePod** (pure Spotify control — no duplicate local-speaker player).
 - **AI / voice music tools:** `media_player.play_media` accepts a free-text name (search + play top
   result); the `podconnect.play_from_library` service plays your Liked / Top / Recent; and the

@@ -31,7 +31,7 @@ _Versions live in [`../CHANGELOG.md`](../CHANGELOG.md); this tracks what's built
 - **PodConnect Control** integration (0.7.1) — Application-Credentials OAuth (own dev app);
   device-list-driven `media_player` per Connect device; play/pause/next/prev/seek/volume/**shuffle/
   repeat** + now-playing, **optimistic UI**; **"Connect to a device"** transfer; **search** (incl.
-  audiobooks/shows/episodes, popularity-ranked) **+ browse** (playlists, Top Artists/Tracks, Recently
+  audiobooks/shows/episodes, provider-ordered within each type) **+ browse** (playlists, Top Artists/Tracks, Recently
   Played, Liked Songs) so Assist can pick music; graceful "restriction" handling. **One entity per
   HomePod** (the brief 0.7.0 local-speaker player was reverted in 0.7.1). **Control's own state is
   Web-API polling (~10s)** and stays so — see the note below.
@@ -102,7 +102,7 @@ facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTR
    "Connect to a device" transfer + optimistic UI. **`external_volume: true` + the volume relay — ✅ done.**
    Control's own state stays ~10s Web-API polling (by design; push-state shipped in the add-on bridge).
 2. **Browse & play — ✅ done:** `browse_media` (playlists + Top Artists/Tracks/Recently/Liked) + `search_media`
-   (incl. audiobooks/shows/episodes, popularity-ranked) + `play_media`.
+   (incl. audiobooks/shows/episodes, provider-ordered within each type) + `play_media`.
 3. **HA Assist — ✅ works:** entities exposed → voice transport/volume + search-and-play. Area/alias setup is
    user-side (documented in `AREAS-AND-ASSIST.md`). Account-agnostic stop/release lives in the **add-on
    panel** (+ Siri) — no extra HA entity (the local-entity attempt was reverted in 0.7.1).
