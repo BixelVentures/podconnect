@@ -69,7 +69,7 @@ one decisive experiment: [`MULTI-ACCOUNT.md`](MULTI-ACCOUNT.md) § "THE one viab
 | Feature | Status |
 |---|---|
 | One `media_player` per Web-API Connect device; ~10 s poll; transport/volume/shuffle/repeat/transfer; optimistic UI | ⚪ |
-| Search + Browse (Playlists/Top/Recent/Liked), popularity-ranked, spoken content | ⚪ |
+| Search + Browse (Playlists/Top/Recent/Liked), provider-ordered within each type, spoken content | ⚪ |
 | `media_player.play_media` accepts a free-text name → search + play top result (0.8.0) | ⚪ |
 | `podconnect.play_from_library` (liked/top/recent, action) (0.9.0) | ⚪ |
 | `podconnect.top_tracks` / `recently_played` / `liked` — response-returning data services for an AI assist (0.10.0) | ⚪ |
@@ -125,3 +125,10 @@ Independent final review27/9: separate reviewer GO, no P0/P1. Reviewer independe
 ran all17 Python tests and Node Stop-feedback regression successfully. Control0.10.2
 manifest/changelog included in review. These are shipped-method tests with mocked
 HA/provider boundaries, not physical discovery or room-behaviour proof.
+
+Installation27/9: PR3 merged as43609d8d7300daa96dfb5bbc631472e8da86ba2f;
+GitHub releasev0.10.2 published for that commit. HA update UI confirms installed
+v0.10.2, then Core restart requested and browser reconnected. Speakers remains0.26.2.
+Physical playback/search verification is not yet obtained. Voice PE separately lost
+its native connection at12:33:58 and remained undiscoverable in inspected HA logs;
+this Control update neither explains nor repairs that device/network condition.
