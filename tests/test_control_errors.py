@@ -23,7 +23,7 @@ def load_send(name="_send"):
     tree = ast.parse(SOURCE.read_text())
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
     module = ast.Module(body=[method], type_ignores=[])
-    namespace = dict(SpotifyApiError=SpotifyApiError, HomeAssistantError=HomeAssistantError)
+    namespace = dict(asyncio=asyncio, SpotifyApiError=SpotifyApiError, HomeAssistantError=HomeAssistantError)
     exec(compile(module, str(SOURCE), 'exec'), namespace)
     return namespace[name]
 
@@ -33,6 +33,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
         for status in (401, 403, 404, 429, 500):
             with self.subTest(status=status):
                 entity = Mock()
+                entity._command_generation = 0
+                entity.coordinator.poll_sequence = 0
                 entity._optimistic_playing = True
                 entity._optimistic_shuffle = True
                 entity._optimistic_repeat = 'all'
@@ -49,6 +51,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepted_command_refreshes_once(self):
         entity = Mock()
+        entity._command_generation = 0
+        entity.coordinator.poll_sequence = 0
         entity._optimistic_playing = True
         entity.coordinator.async_request_refresh = AsyncMock()
         action = AsyncMock()
@@ -61,6 +65,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_library_errors_and_empty_results_do_not_play(self):
         for result in (SpotifyApiError('HTTP 403'), []):
             entity = Mock()
+            entity._command_generation = 0
+            entity.coordinator.poll_sequence = 0
             entity.coordinator.api.saved_tracks = AsyncMock()
             if isinstance(result, Exception):
                 entity.coordinator.api.saved_tracks.side_effect = result
@@ -73,6 +79,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_search_errors_propagate(self):
         entity = Mock()
+        entity._command_generation = 0
+        entity.coordinator.poll_sequence = 0
         entity.coordinator.api.search = AsyncMock(side_effect=SpotifyApiError('HTTP 429'))
         with self.assertRaisesRegex(HomeAssistantError, '429'):
             await load_send('_search_top_uri')(entity, 'song', 'music')
@@ -80,6 +88,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_search_match_does_not_play(self):
         entity = Mock()
+        entity._command_generation = 0
+        entity.coordinator.poll_sequence = 0
         entity._search_top_uri = AsyncMock(return_value=None)
         entity._send = AsyncMock()
         with self.assertRaisesRegex(HomeAssistantError, 'No Spotify match'):
@@ -88,6 +98,8 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_device_does_not_transfer(self):
         entity = Mock()
+        entity._command_generation = 0
+        entity.coordinator.poll_sequence = 0
         entity.coordinator.data = {'devices': []}
         entity._send = AsyncMock()
         with self.assertRaisesRegex(HomeAssistantError, 'unavailable'):

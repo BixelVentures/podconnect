@@ -14,7 +14,7 @@ from homeassistant.core import (
     ServiceResponse,
     SupportsResponse,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import HomeAssistantError, ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.config_entry_oauth2_flow import (
     ImplementationUnavailableError,
     OAuth2Session,
@@ -77,12 +77,11 @@ def _register_services(hass: HomeAssistant) -> None:
         async def _handler(call: ServiceCall) -> ServiceResponse:
             api = _api()
             if api is None:
-                return {"tracks": []}
+                raise HomeAssistantError("Spotify account is unavailable")
             try:
                 items = await getattr(api, method_name)()
             except SpotifyApiError as err:
-                LOGGER.warning("%s service failed (re-auth may be needed): %s", method_name, err)
-                return {"tracks": []}
+                raise HomeAssistantError(f"Spotify library request failed: {err}") from err
             return _track_list(items)
 
         return _handler

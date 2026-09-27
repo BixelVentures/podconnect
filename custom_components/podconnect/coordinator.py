@@ -26,15 +26,19 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=POLL_INTERVAL_SECONDS),
         )
         self.api = api
+        self.poll_sequence = 0
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch playback state + the device list."""
+        self.poll_sequence += 1
+        poll_sequence = self.poll_sequence
         try:
             playback = await self.api.playback_state()
             devices = await self.api.devices()
         except SpotifyApiError as err:
             raise UpdateFailed(str(err)) from err
         return {
+            "poll_sequence": poll_sequence,
             "playback": playback,
             "devices": devices,
             "fetched_at": dt_util.utcnow(),

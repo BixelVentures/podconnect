@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import voluptuous as vol
 
 from homeassistant.components.media_player import (
@@ -146,6 +148,8 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         self._optimistic_playing: bool | None = None
         self._optimistic_shuffle: bool | None = None
         self._optimistic_repeat: RepeatMode | None = None
+        self._optimistic_poll_floor: int | None = None
+        self._command_generation = 0
         self._attr_unique_id = f"{entry_id}_{device_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
@@ -185,18 +189,17 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Drop each optimistic guess once the polled state confirms it."""
-        pb = self._playback if self._is_active else None
-        if self._optimistic_playing is not None and pb and pb.get("is_playing") == self._optimistic_playing:
-            self._optimistic_playing = None
-        if self._optimistic_shuffle is not None and pb and pb.get("shuffle_state") == self._optimistic_shuffle:
-            self._optimistic_shuffle = None
+        """Let a successful poll begun after the command replace optimistic intent."""
+        sequence = (self.coordinator.data or {}).get("poll_sequence", 0)
         if (
-            self._optimistic_repeat is not None
-            and pb
-            and _SPOTIFY_TO_HA_REPEAT.get(pb.get("repeat_state")) == self._optimistic_repeat
+            self.coordinator.last_update_success
+            and self._optimistic_poll_floor is not None
+            and sequence > self._optimistic_poll_floor
         ):
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
             self._optimistic_repeat = None
+            self._optimistic_poll_floor = None
         super()._handle_coordinator_update()
 
     @property
@@ -280,16 +283,26 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     # --- control (targets this device) ---
     async def _send(self, action) -> None:
-        """Expose rejected commands and remove optimistic state before resyncing."""
+        """Keep command intent only until newer authoritative playback data arrives."""
+        self._command_generation += 1
+        generation = self._command_generation
+        self._optimistic_poll_floor = None  # command still pending
         try:
             await action
-        except SpotifyApiError as err:
-            self._optimistic_playing = None
-            self._optimistic_shuffle = None
-            self._optimistic_repeat = None
-            self.async_write_ha_state()
+        except (Exception, asyncio.CancelledError) as err:
+            if generation == self._command_generation:
+                self._optimistic_playing = None
+                self._optimistic_shuffle = None
+                self._optimistic_repeat = None
+                self.async_write_ha_state()
+            if isinstance(err, asyncio.CancelledError):
+                raise
             await self.coordinator.async_request_refresh()
-            raise HomeAssistantError(f"Spotify rejected the command: {err}") from err
+            if isinstance(err, SpotifyApiError):
+                raise HomeAssistantError(f"Spotify rejected the command: {err}") from err
+            raise
+        if generation == self._command_generation:
+            self._optimistic_poll_floor = self.coordinator.poll_sequence
         await self.coordinator.async_request_refresh()
 
     async def async_media_play(self) -> None:
@@ -361,9 +374,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         await self._send(self.coordinator.api.play(self._device_id, uris=uris))
 
     async def _search_top_uri(self, query: str, media_type: str | None) -> str | None:
-        """Resolve a free-text query to the best-matching Spotify URI — same ranking as search:
-        name relevance first (exact > prefix > substring), then popularity. media_type narrows the
-        Spotify search (defaults to track); 'music' is treated as track."""
+        """Use the first playable Spotify search result, preserving provider order."""
         type_map = {
             "track": "track", "music": "track", "song": "track",
             "artist": "artist", "album": "album", "playlist": "playlist",
@@ -374,27 +385,10 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             data = await self.coordinator.api.search(query, want)
         except SpotifyApiError as err:
             raise HomeAssistantError(f"Spotify search failed: {err}") from err
-        q = query.strip().lower()
-
-        def relevance(name: str | None) -> int:
-            n = (name or "").lower()
-            if n == q:
-                return 3
-            if n.startswith(q):
-                return 2
-            if q in n:
-                return 1
-            return 0
-
-        best_uri: str | None = None
-        best_key = (-1, -1)
-        # Spotify returns matches under the pluralized key (track -> "tracks", etc.).
         for item in (data.get(want + "s") or {}).get("items", []):
             if item and item.get("uri"):
-                key = (relevance(item.get("name")), item.get("popularity") or 0)
-                if key > best_key:
-                    best_key, best_uri = key, item["uri"]
-        return best_uri
+                return item["uri"]
+        return None
 
     async def async_select_source(self, source: str) -> None:
         """"Connect to a device": transfer the session to `source`, keeping play/pause state."""
@@ -504,11 +498,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         )
 
     async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
-        """Search Spotify so Assist ("play X in the kitchen") and the UI can find music.
-
-        Results are ranked so the best name match is first — the search-and-play intent plays
-        result[0], so an exact title/artist hit must win over an incidental substring match.
-        """
+        """Search Spotify, preserving provider order within each requested result type."""
         # Include spoken content (audiobooks/shows/episodes) so bedtime stories etc. resolve to the
         # real audiobook, not a same-named song.
         types = "track,artist,album,playlist,show,episode,audiobook"
@@ -527,33 +517,11 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         try:
             data = await self.coordinator.api.search(query.search_query, types)
         except SpotifyApiError as err:
-            LOGGER.warning("Spotify search failed: %s", err)
-            return SearchMedia(result=[])
+            raise HomeAssistantError(f"Spotify search failed: {err}") from err
 
-        q = query.search_query.strip().lower()
-
-        def relevance(name: str | None) -> int:
-            n = (name or "").lower()
-            if n == q:
-                return 3
-            if n.startswith(q):
-                return 2
-            if q in n:
-                return 1
-            return 0
-
-        scored: list[tuple[int, int, BrowseMedia]] = []
+        results = []
         for key, (media_class, media_type) in _SEARCH_KINDS.items():
             for item in (data.get(key) or {}).get("items", []):
                 if item and item.get("uri"):
-                    # Tie-break equal name matches by Spotify popularity (0-100; tracks & artists
-                    # carry it). This is why the iconic "Den Danske Sommer" wins over a niche cover:
-                    # many tracks share the exact title, so popularity decides among them.
-                    pop = item.get("popularity") or 0
-                    scored.append(
-                        (relevance(item.get("name")), pop, self._result_item(item, media_class, media_type))
-                    )
-        # Sort by name-match first, then popularity — so result[0] (what the intent auto-plays) is the
-        # version people actually mean, not whichever Spotify happened to return first.
-        scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
-        return SearchMedia(result=[bm for _, _, bm in scored])
+                    results.append(self._result_item(item, media_class, media_type))
+        return SearchMedia(result=results)
