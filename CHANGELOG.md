@@ -14,9 +14,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   tracks; clone only the outgoing resolver request.
 - Pin and test the exact patched Spotify engine, including autoplay-off, existing
   queues and repeat paths. Do not retry playback or change room selection.
-- The installed 0.26.3 Texas Sun log records an empty-context autoplay HTTP 400.
-  Provider acceptance and audible continuation on the same HomePod still require
-  installation and physical verification; this candidate does not close that issue.
+- Single-track requests can have an empty context URI. Provider acceptance and
+  audible continuation still require installation and physical verification;
+  this candidate does not close the reported next-track issue.
 
 ## Speakers 0.26.3 — 2026-09-27
 - Exhausted Spotify AP/Dealer sessions now return failed health and reject commands,
