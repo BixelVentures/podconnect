@@ -20,9 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY patches/ /patches/
 RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/devgianlu/go-librespot.git /gl \
   && cd /gl \
+  && test "${GO_LIBRESPOT_VERSION}" = v0.7.3 \
+  && test "$(git rev-parse HEAD)" = c191a43c548e698c1dfc83590665f455fc54f084 \
+  && git apply --check "/patches/aliases-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply "/patches/aliases-${GO_LIBRESPOT_VERSION}.patch" \
+  && git apply --check "/patches/recovery-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply "/patches/recovery-${GO_LIBRESPOT_VERSION}.patch" \
-  && go test ./daemon ./zeroconf \
+  && git apply --check "/patches/autoplay-${GO_LIBRESPOT_VERSION}.patch" \
+  && git apply "/patches/autoplay-${GO_LIBRESPOT_VERSION}.patch" \
+  && go test ./daemon ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
 FROM ${BUILD_FROM}

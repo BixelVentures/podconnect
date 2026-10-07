@@ -1,0 +1,224 @@
+diff --git a/daemon/controls.go b/daemon/controls.go
+index defc7c1..ef05a02 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -623,6 +623,9 @@ func (p *AppPlayer) skipNext(ctx context.Context, track *connectpb.ContextTrack)
+ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool, error) {
+ 	var uri string
+ 	var hasNextTrack bool
++	// GoStart below rewinds an exhausted context. Retain the track that actually
++	// reached this boundary, rather than inventing a seed from the rewound queue.
++	playedTrackURI := p.state.player.GetTrack().GetUri()
+ 	if p.state.tracks != nil {
+ 		if !forceNext && p.state.player.Options.RepeatingTrack {
+ 			hasNextTrack = true
+@@ -675,7 +678,7 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
+ 		spotCtx, err := p.sess.Spclient().ContextResolveAutoplay(ctx, &playerpb.AutoplayContextRequest{
+ 			ContextUri:     proto.String(p.state.player.ContextUri),
+ 			RecentTrackUri: prevTrackUris,
+-		})
++		}, playedTrackURI)
+ 		if err != nil {
+ 			p.app.log.WithError(err).Warnf("failed resolving station for %s", p.state.player.ContextUri)
+ 			return false, nil
+diff --git a/spclient/spclient.go b/spclient/spclient.go
+index 5760b3d..bae1c66 100644
+--- a/spclient/spclient.go
++++ b/spclient/spclient.go
+@@ -373,7 +373,18 @@ func (c *Spclient) ContextResolve(ctx context.Context, uri string) (*connectpb.C
+ 	return &context, nil
+ }
+ 
+-func (c *Spclient) ContextResolveAutoplay(ctx context.Context, reqProto *playerpb.AutoplayContextRequest) (*connectpb.Context, error) {
++func (c *Spclient) ContextResolveAutoplay(ctx context.Context, reqProto *playerpb.AutoplayContextRequest, playedTrackURI string) (*connectpb.Context, error) {
++	if reqProto.GetContextUri() == "" {
++		playedTrack, err := librespot.SpotifyIdFromUri(playedTrackURI)
++		if err != nil || playedTrack.Type() != librespot.SpotifyIdTypeTrack || len(reqProto.GetRecentTrackUri()) == 0 {
++			return nil, fmt.Errorf("cannot resolve autoplay without a context or played track")
++		}
++		// URI-list playback transfers can have no context. The primary librespot
++		// implementation falls back to the current track for autoplay resolution.
++		// Keep that repair request-local: do not change player state or the caller.
++		reqProto = proto.Clone(reqProto).(*playerpb.AutoplayContextRequest)
++		reqProto.ContextUri = proto.String(playedTrackURI)
++	}
+ 	reqBody, err := proto.Marshal(reqProto)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed marshalling AutoplayContextRequest: %w", err)
+diff --git a/spclient/autoplay_context_test.go b/spclient/autoplay_context_test.go
+new file mode 100644
+index 0000000..92a612a
+--- /dev/null
++++ b/spclient/autoplay_context_test.go
+@@ -0,0 +1,112 @@
++package spclient
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/url"
++	"reflect"
++	"strings"
++	"testing"
++
++	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
++	"google.golang.org/protobuf/proto"
++)
++
++type autoplayTransport func(*http.Request) (*http.Response, error)
++
++func (f autoplayTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++const playedURI = "spotify:track:24ntSW3QVJzR79lHAAOTaY"
++const otherURI = "spotify:track:4cOdK2wGLETKBW3PvgPWqT"
++
++func autoplayClient(t *testing.T, calls *[]*playerpb.AutoplayContextRequest, status int) *Spclient {
++	t.Helper()
++	base, _ := url.Parse("https://autoplay.invalid/")
++	return &Spclient{
++		baseUrl:     base,
++		accessToken: func(context.Context, bool) (string, error) { return "test-token", nil },
++		client: &http.Client{Transport: autoplayTransport(func(r *http.Request) (*http.Response, error) {
++			if r.Method != "POST" || r.URL.Path != "/context-resolve/v1/autoplay" {
++				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
++			}
++			body, err := io.ReadAll(r.Body)
++			if err != nil {
++				t.Fatal(err)
++			}
++			received := &playerpb.AutoplayContextRequest{}
++			if err := proto.Unmarshal(body, received); err != nil {
++				t.Fatal(err)
++			}
++			*calls = append(*calls, received)
++			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"uri":"spotify:station:track:test"}`)), Header: make(http.Header)}, nil
++		})},
++	}
++}
++
++func TestAutoplayActualProtobufUsesPlayedTrackOnlyForEmptyContext(t *testing.T) {
++	recent := []string{otherURI, playedURI, otherURI}
++	for _, existing := range []string{"", "spotify:playlist:original", "spotify:album:original", "spotify:artist:original", "spotify:station:original", "spotify:episode:original"} {
++		t.Run(existing, func(t *testing.T) {
++			var calls []*playerpb.AutoplayContextRequest
++			client := autoplayClient(t, &calls, 200)
++			request := &playerpb.AutoplayContextRequest{ContextUri: proto.String(existing), RecentTrackUri: recent}
++			before := proto.Clone(request)
++			if _, err := client.ContextResolveAutoplay(context.Background(), request, playedURI); err != nil {
++				t.Fatal(err)
++			}
++			expected := existing
++			if expected == "" {
++				expected = playedURI
++			}
++			if len(calls) != 1 || calls[0].GetContextUri() != expected || !reflect.DeepEqual(calls[0].RecentTrackUri, recent) {
++				t.Fatalf("unexpected payload: %v", calls)
++			}
++			if !proto.Equal(request, before) {
++				t.Fatal("resolver mutated caller/player context")
++			}
++		})
++	}
++}
++
++func TestAutoplayEmptyContextDoesNotInventTrackOrEnablePodcastAutoplay(t *testing.T) {
++	for _, played := range []string{"", "invalid", "spotify:episode:24ntSW3QVJzR79lHAAOTaY", "spotify:show:24ntSW3QVJzR79lHAAOTaY"} {
++		t.Run(played, func(t *testing.T) {
++			var calls []*playerpb.AutoplayContextRequest
++			request := &playerpb.AutoplayContextRequest{ContextUri: proto.String(""), RecentTrackUri: []string{playedURI}}
++			if _, err := autoplayClient(t, &calls, 200).ContextResolveAutoplay(context.Background(), request, played); err == nil {
++				t.Fatal("missing/non-track seed accepted")
++			}
++			if len(calls) != 0 || request.GetContextUri() != "" {
++				t.Fatal("invalid seed dispatched or mutated")
++			}
++		})
++	}
++	var calls []*playerpb.AutoplayContextRequest
++	if _, err := autoplayClient(t, &calls, 200).ContextResolveAutoplay(context.Background(), &playerpb.AutoplayContextRequest{}, playedURI); err == nil || len(calls) != 0 {
++		t.Fatal("empty recent-track history accepted")
++	}
++}
++
++func TestAutoplayRequestSeedCannotCrossLaterSessionAndDoesNotRetry400(t *testing.T) {
++	var calls []*playerpb.AutoplayContextRequest
++	client := autoplayClient(t, &calls, 400)
++	// The earlier EOF owns this immutable seed even after a newer session's
++	// request; neither request can borrow or modify the other generation.
++	old := &playerpb.AutoplayContextRequest{ContextUri: proto.String(""), RecentTrackUri: []string{playedURI}}
++	newer := &playerpb.AutoplayContextRequest{ContextUri: proto.String(""), RecentTrackUri: []string{otherURI}}
++	for _, item := range []struct {
++		request *playerpb.AutoplayContextRequest
++		played  string
++	}{{newer, otherURI}, {old, playedURI}} {
++		if _, err := client.ContextResolveAutoplay(context.Background(), item.request, item.played); err == nil {
++			t.Fatal("400 hidden")
++		}
++		if item.request.GetContextUri() != "" {
++			t.Fatal("request context overwritten")
++		}
++	}
++	if len(calls) != 2 || calls[0].GetContextUri() != otherURI || calls[1].GetContextUri() != playedURI {
++		t.Fatalf("retry or cross-session seed: %v", calls)
++	}
++}
+diff --git a/daemon/autoplay_boundary_test.go b/daemon/autoplay_boundary_test.go
+new file mode 100644
+index 0000000..7f8c50b
+--- /dev/null
++++ b/daemon/autoplay_boundary_test.go
+@@ -0,0 +1,53 @@
++package daemon
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++// The invalid stream URI deliberately ends at the next owner boundary. With no
++// Spotify session present, an accidental autoplay dispatch panics instead of
++// reaching that boundary. These tests drive the production advanceNext method.
++func TestAutoplayBoundaryPreservesOffQueueAndRepeat(t *testing.T) {
++	for _, tc := range []struct {
++		name                                  string
++		off, next, trackRepeat, contextRepeat bool
++	}{
++		{name: "disabled", off: true}, {name: "explicit-next-track", next: true},
++		{name: "track-repeat", trackRepeat: true}, {name: "context-repeat", contextRepeat: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx := context.Background()
++			items := []*connectpb.ContextTrack{{Uri: "invalid"}}
++			if tc.next {
++				items = append(items, &connectpb.ContextTrack{Uri: "invalid-next"})
++			}
++			list, err := tracks.NewTrackListFromContext(ctx, &librespot.NullLogger{}, nil,
++				&connectpb.Context{Uri: "", Pages: []*connectpb.ContextPage{{Tracks: items}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := list.TrySeek(ctx, func(track *connectpb.ContextTrack) bool { return track.Uri == "invalid" }); err != nil {
++				t.Fatal(err)
++			}
++			p := &AppPlayer{app: &App{cfg: &Config{DisableAutoplay: tc.off}, log: &librespot.NullLogger{}}, state: &State{
++				tracks: list, player: &connectpb.PlayerState{Track: list.CurrentTrack(), Options: &connectpb.ContextPlayerOptions{RepeatingTrack: tc.trackRepeat, RepeatingContext: tc.contextRepeat}},
++			}}
++			if _, err := p.advanceNext(ctx, false, false); err == nil || !strings.Contains(err.Error(), "failed parsing uri") {
++				t.Fatalf("did not stop at stream boundary: %v", err)
++			}
++		})
++	}
++}
++
++func TestAutoplayBoundaryWithoutPreviousTracksNeverDispatches(t *testing.T) {
++	p := &AppPlayer{app: &App{cfg: &Config{}, log: &librespot.NullLogger{}}, state: &State{player: &connectpb.PlayerState{Options: &connectpb.ContextPlayerOptions{}}}}
++	if next, err := p.advanceNext(context.Background(), false, false); next || err != nil {
++		t.Fatalf("invented previous track: %v %v", next, err)
++	}
++}
