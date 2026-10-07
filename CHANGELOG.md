@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.4 — candidate 2026-10-07
+- Seed Spotify Autoplay from the track that actually finished when a single-track
+  request has no context URI. Preserve existing playlist/album contexts and recent
+  tracks; clone only the outgoing resolver request.
+- Pin and test the exact patched Spotify engine, including autoplay-off, existing
+  queues and repeat paths. Do not retry playback or change room selection.
+- Single-track requests can have an empty context URI. Provider acceptance and
+  audible continuation still require installation and physical verification;
+  this candidate does not close the reported next-track issue.
+
 ## Speakers 0.26.3 — 2026-09-27
 - Exhausted Spotify AP/Dealer sessions now return failed health and reject commands,
   allowing the existing supervisor to restart the engine instead of retaining a
