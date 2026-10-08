@@ -20,10 +20,19 @@ import (
 
 // glLive is the thread-safe latest go-librespot state for one room, plus a track-change signal.
 type glLive struct {
-	mu             sync.Mutex
-	st             glStatus
-	trackURI       string
-	trackChangeSeq uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	mu               sync.Mutex
+	st               glStatus
+	trackURI         string
+	trackChangeSeq   uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	aliasRevision    uint64 // observed alias/source intent; unchanged status polls do not bump it
+	routeDispatchSeq uint64 // mutex-owned command admission, not native acceptance
+	sourceStop       <-chan struct{}
+	sourceRetired    bool
+	runEpoch         uint64
+	phaseEpoch       uint64
+	nextRequest      uint64
+	acceptedRequest  uint64
+	wireRevision     [3]uint64 // transport, volume, selected alias
 }
 
 // Get returns a copy of the latest glStatus (safe to use without holding the lock).
@@ -33,9 +42,47 @@ func (l *glLive) Get() glStatus {
 	return l.st
 }
 
-// set replaces the whole status (used by the /status seed + fallback poll).
+// routeSnapshot binds routing to the same mutex-owned alias intent as the status.
+func (l *glLive) routeSnapshot() (glStatus, uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	return l.st, l.aliasRevision
+}
+
+// admitRoute linearizes an already prepared command against current intent.
+// The caller performs HTTP only after unlocking; later intent cannot unsend this
+// admitted command, but its completion must not clear the newer pending route.
+func (l *glLive) admitRoute(alias int, revision uint64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	if l.sourceRetired || l.st.SelAlias != alias || l.aliasRevision != revision {
+		return false
+	}
+	l.routeDispatchSeq++
+	return true
+}
+
+// Route admission observes an external Stop under the same mutex. A stop cannot
+// retroactively revoke an already admitted command; future claims are refused.
+func (l *glLive) observeStopLocked() {
+	if !l.sourceRetired && sourceStopped(l.sourceStop) {
+		l.sourceRetired = true
+		l.runEpoch++
+		l.phaseEpoch++
+		l.acceptedRequest = 0
+		l.aliasRevision++
+	}
+}
+
+// set remains the direct fixture initialization path. Production status requests
+// use refreshStatus, which fences their producer and intervening wire observations.
 func (l *glLive) set(st glStatus) {
 	l.mu.Lock()
+	if st.SelAlias != l.st.SelAlias {
+		l.aliasRevision++
+	}
 	l.st = st
 	l.mu.Unlock()
 }
@@ -47,16 +94,165 @@ func (l *glLive) trackSeq() uint64 {
 	return l.trackChangeSeq
 }
 
-// applyEvent folds one decoded {type,data} event into the live state via the pure applyGLEvent, and
-// bumps trackChangeSeq when the track changed.
+type glSource struct {
+	run, phase uint64
+	stop       <-chan struct{}
+}
+
+type glStatusRequest struct {
+	source   glSource
+	sequence uint64
+	wire     [3]uint64
+}
+
+func sourceStopped(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *glLive) beginRun(stop <-chan struct{}) glSource {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.runEpoch++
+	l.phaseEpoch++
+	l.acceptedRequest = 0
+	l.aliasRevision++
+	l.sourceStop = stop
+	l.sourceRetired = false
+	return glSource{run: l.runEpoch, stop: stop}
+}
+
+func (l *glLive) beginPhase(run glSource) (glSource, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if run.run != l.runEpoch || sourceStopped(run.stop) {
+		return glSource{}, false
+	}
+	l.phaseEpoch++
+	l.aliasRevision++ // A claim captured during retirement cannot cross into this source.
+	l.acceptedRequest = 0
+	l.sourceRetired = false
+	return glSource{run: run.run, phase: l.phaseEpoch, stop: run.stop}, true
+}
+
+func (l *glLive) sourceCurrent(source glSource) bool {
+	return source.run == l.runEpoch && source.phase == l.phaseEpoch && !sourceStopped(source.stop)
+}
+
+func (l *glLive) retirePhase(source glSource) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if source.run == l.runEpoch && source.phase == l.phaseEpoch {
+		l.sourceRetired = true
+		l.aliasRevision++
+		l.phaseEpoch++
+		l.acceptedRequest = 0
+	}
+}
+
+func (l *glLive) retireRun(run glSource) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if run.run == l.runEpoch {
+		l.aliasRevision++
+		l.sourceRetired = true
+		l.runEpoch++
+		l.phaseEpoch++
+		l.acceptedRequest = 0
+	}
+}
+
+func (l *glLive) beginStatus(source glSource) (glStatusRequest, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.sourceCurrent(source) {
+		return glStatusRequest{}, false
+	}
+	l.nextRequest++
+	return glStatusRequest{source: source, sequence: l.nextRequest, wire: l.wireRevision}, true
+}
+
+// acceptStatus publishes only groups not superseded by wire input since request
+// start. Any accepted group advances response order, not merely request start.
+func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.sourceCurrent(request.source) || request.sequence <= l.acceptedRequest {
+		return false
+	}
+	accepted := false
+	if request.wire[0] == l.wireRevision[0] {
+		l.st.Active, l.st.Paused, l.st.Stopped = st.Active, st.Paused, st.Stopped
+		accepted = true
+	}
+	if request.wire[1] == l.wireRevision[1] {
+		l.st.HasVol, l.st.VolPct = st.HasVol, st.VolPct
+		accepted = true
+	}
+	if request.wire[2] == l.wireRevision[2] {
+		if l.st.SelAlias != st.SelAlias {
+			l.aliasRevision++
+		}
+		l.st.SelAlias = st.SelAlias
+		accepted = true
+	}
+	if accepted {
+		l.acceptedRequest = request.sequence
+	}
+	return accepted
+}
+
+func (l *glLive) refreshStatus(source glSource, base string) bool {
+	request, ok := l.beginStatus(source)
+	if !ok {
+		return false
+	}
+	st := librespotStatus(base) // No mutex is held during HTTP or parsing.
+	l.acceptStatus(request, st)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.sourceCurrent(source)
+}
+
+// applyEvent is retained for direct owner tests; the production reader supplies
+// its source through applySourceEvent so retired readers cannot publish either.
 func (l *glLive) applyEvent(typ string, data map[string]any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.applyEventLocked(typ, data)
+}
+
+func (l *glLive) applySourceEvent(source glSource, typ string, data map[string]any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.sourceCurrent(source) {
+		l.applyEventLocked(typ, data)
+	}
+}
+
+func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 	next, nextURI, changed := applyGLEvent(l.st, l.trackURI, typ, data)
 	l.st = next
 	l.trackURI = nextURI
 	if changed {
 		l.trackChangeSeq++
+	}
+	switch typ {
+	case "playing", "paused", "stopped", "not_playing", "active", "playback_ready", "inactive":
+		l.wireRevision[0]++
+	case "volume":
+		if _, ok := numField(data, "value"); ok {
+			l.wireRevision[1]++
+		}
+	case "selected_alias":
+		if _, ok := numField(data, "id"); ok {
+			l.wireRevision[2]++
+			l.aliasRevision++ // Valid equal-value observations also fence ABA.
+		}
 	}
 }
 
@@ -152,6 +348,8 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 		wsURL = "ws://" + wsURL[7:]
 	}
 	backoff := glEventBackoffMin
+	run := live.beginRun(stop)
+	defer live.retireRun(run)
 	for {
 		select {
 		case <-stop:
@@ -159,12 +357,18 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 		default:
 		}
 
+		phase, current := live.beginPhase(run)
+		if !current {
+			return
+		}
 		conn, err := dialWebsocket(wsURL)
 		if err != nil {
 			// Couldn't connect — poll /status to keep live fresh, then retry with backoff.
-			if pollUntil(room, live, stop, backoff) {
+			if pollUntil(room, live, phase, backoff) {
+				live.retirePhase(phase)
 				return
 			}
+			live.retirePhase(phase)
 			backoff *= 2
 			if backoff > glEventBackoffMax {
 				backoff = glEventBackoffMax
@@ -174,7 +378,11 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 		backoff = glEventBackoffMin // healthy connect resets the backoff
 
 		// Seed truth from /status on (re)connect (no state replay over ws).
-		live.set(librespotStatus(room.Librespot))
+		if !live.refreshStatus(phase, room.Librespot) {
+			live.retirePhase(phase)
+			conn.Close()
+			return
+		}
 
 		// Client keepalive + correctness backstop. PING every ~20s (a write error tears the conn down
 		// so we reconnect). AND re-seed from /status every ~3s while connected: events are a latency
@@ -182,7 +390,7 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 		// connected yet state would freeze at the seed — the periodic re-seed bounds any such staleness
 		// to ~3s instead of forever, while still cutting the old 200ms poll churn ~15x.
 		pingStop := make(chan struct{})
-		go func() {
+		go func(source glSource) {
 			ping := time.NewTicker(glPingInterval)
 			reseed := time.NewTicker(glReseedInterval)
 			defer ping.Stop()
@@ -199,16 +407,19 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 						return
 					}
 				case <-reseed.C:
-					live.set(librespotStatus(room.Librespot)) // /status truth backstop
+					if !live.refreshStatus(source, room.Librespot) {
+						return
+					} // /status truth backstop
 				}
 			}
-		}()
+		}(phase)
 
 		// Read loop: bound each read so a silent dead socket is noticed and we reconnect.
 		readErr := false
 		for {
 			select {
 			case <-stop:
+				live.retirePhase(phase)
 				close(pingStop)
 				conn.Close()
 				return
@@ -227,31 +438,40 @@ func runGLEvents(room *Room, live *glLive, stop <-chan struct{}) {
 			if json.Unmarshal(payload, &ev) != nil || ev.Type == "" {
 				continue // ignore malformed / non-event frames
 			}
-			live.applyEvent(ev.Type, ev.Data)
+			live.applySourceEvent(phase, ev.Type, ev.Data)
 		}
+		live.retirePhase(phase)
 		close(pingStop)
 		conn.Close()
 		_ = readErr
 
 		// Connection dropped — fall back to a short poll burst before reconnecting (keeps live fresh
 		// during the gap), then loop to re-dial.
-		if pollUntil(room, live, stop, backoff) {
+		phase, current = live.beginPhase(run)
+		if !current {
 			return
 		}
+		if pollUntil(room, live, phase, backoff) {
+			live.retirePhase(phase)
+			return
+		}
+		live.retirePhase(phase)
 	}
 }
 
 // pollUntil polls /status every glPollInterval for `d`, writing each reading into live. Returns true
 // if stop fired (caller should exit). This is the fallback that keeps the bridge working whenever the
 // websocket is down.
-func pollUntil(room *Room, live *glLive, stop <-chan struct{}, d time.Duration) bool {
+func pollUntil(room *Room, live *glLive, source glSource, d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	tick := time.NewTicker(glPollInterval)
 	defer tick.Stop()
 	for {
-		live.set(librespotStatus(room.Librespot))
+		if !live.refreshStatus(source, room.Librespot) {
+			return true
+		}
 		select {
-		case <-stop:
+		case <-source.stop:
 			return true
 		case <-tick.C:
 			if time.Now().After(deadline) {

@@ -622,14 +622,32 @@ func releaseHomePod(room *Room) {
 // ids are 1-based and indexed into connectAliases() order (= the room list order). Returns whether it
 // successfully selected an output. Best-effort; matches the HomePod by id then name.
 func routeAliasOutput(primaryOwnTone string, aliasId int) bool {
+	accepted, _ := routeAliasOutputForIntent(primaryOwnTone, aliasId, nil, 0)
+	return accepted
+}
+
+// routeIntentCurrent checks completion currency only. Dispatch authority is the
+// recorded mutex-owned admitRoute claim below, not this observation.
+func routeIntentCurrent(live *glLive, aliasId int, revision uint64) bool {
+	if live == nil {
+		return true // compatibility for the standalone selector's existing tests
+	}
+	status, currentRevision := live.routeSnapshot()
+	return status.SelAlias == aliasId && currentRevision == revision
+}
+
+// One serial bridge owns the admitted command. A later intent cannot unsend an
+// admitted PUT, but its completion cannot publish obsolete bridge bookkeeping.
+// Returns desired-selection acceptance and whether this intent is still current.
+func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64) (bool, bool) {
 	rooms := loadRooms()
 	if aliasId < 1 || aliasId > len(rooms) {
-		return false
+		return false, routeIntentCurrent(live, aliasId, revision)
 	}
 	target := rooms[aliasId-1]
 	devs, ok := fetchOutputsFrom(primaryOwnTone)
 	if !ok || len(devs) == 0 {
-		return false
+		return false, routeIntentCurrent(live, aliasId, revision)
 	}
 	idx, _ := matchOutput(devs, target.HomepodID, target.HomepodName)
 	if idx < 0 {
@@ -638,14 +656,32 @@ func routeAliasOutput(primaryOwnTone string, aliasId int) bool {
 			have = append(have, d.Name)
 		}
 		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
-		return false
+		return false, routeIntentCurrent(live, aliasId, revision)
 	}
-	if !selectOnOwntoneAt(primaryOwnTone, devs[idx].ID) {
+	cl := &http.Client{Timeout: 4 * time.Second}
+	req, err := http.NewRequest(http.MethodPut, primaryOwnTone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":["`+devs[idx].ID+`"]}`))
+	if err != nil {
+		return false, routeIntentCurrent(live, aliasId, revision)
+	}
+	// The claim is command admission, not HTTP sent/native ACK. Never hold the
+	// live mutex across network I/O. No catalog or other work follows admission.
+	if live != nil && !live.admitRoute(aliasId, revision) {
+		return false, false
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false, routeIntentCurrent(live, aliasId, revision)
+	}
+	defer resp.Body.Close()
+	if !routeIntentCurrent(live, aliasId, revision) {
+		return false, false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("alias-route: alias %d output selection failed; recovery remains pending", aliasId)
-		return false
+		return false, true
 	}
 	log.Printf("alias-route: alias %d -> room %q -> HomePod %q", aliasId, target.Name, devs[idx].Name)
-	return true
+	return true, true
 }
 
 // reclaimHomePod takes the HomePod back: clear the room's flag and re-select its target output now,
@@ -705,7 +741,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Wave 3: read the room's live state in-memory (pushed by runGLEvents from the /events
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
-			gl := live.Get()
+			gl, aliasRevision := live.routeSnapshot()
+			aliasRoutedThisTick := false
 
 			// Device-aliases routing: when the primary engine reports a newly-selected alias, point THIS
 			// (single) OwnTone at the matching room's HomePod so audio follows the Spotify menu choice.
@@ -714,7 +751,13 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// + hammered OwnTone when the target HomePod was momentarily missing).
 			if room.Idx == 0 && gl.SelAlias > 0 {
 				if gl.SelAlias != lastAlias || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
-					if routeAliasOutput(room.OwnTone, gl.SelAlias) {
+					accepted, current := routeAliasOutputForIntent(room.OwnTone, gl.SelAlias, live, aliasRevision)
+					if !current {
+						time.Sleep(200 * time.Millisecond)
+						continue // no remaining work may use this obsolete snapshot
+					}
+					if accepted {
+						aliasRoutedThisTick = true
 						lastAlias = gl.SelAlias
 						aliasRoutePending = false
 					} else {
@@ -776,7 +819,34 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			if playing {
 				idleSince = time.Time{}
 				if released {
-					reclaimHomePod(room)
+					if room.Idx == 0 && gl.SelAlias > 0 {
+						if !aliasRoutedThisTick {
+							if aliasRoutePending && !time.Now().After(aliasRetryAt) {
+								time.Sleep(200 * time.Millisecond)
+								continue
+							}
+							accepted, current := routeAliasOutputForIntent(room.OwnTone, gl.SelAlias, live, aliasRevision)
+							if !current {
+								time.Sleep(200 * time.Millisecond)
+								continue
+							}
+							lastAlias = gl.SelAlias
+							aliasRoutePending = !accepted
+							if !accepted {
+								aliasRetryAt = time.Now().Add(3 * time.Second)
+								time.Sleep(200 * time.Millisecond)
+								continue
+							}
+						}
+						if !routeIntentCurrent(live, gl.SelAlias, aliasRevision) {
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						// The current alias is accepted; never first select primary A.
+						_ = os.Remove(releasedPath(room))
+					} else {
+						reclaimHomePod(room)
+					}
 					// Restore YOUR level on reclaim. While the HomePod was freed, another AirPlay sender
 					// (Mofibo/Apple Music/…) can leave its volume loud/100%; without this the bidirectional
 					// reconcile would read that as a "HomePod button move", blast, AND push 100% to Spotify.
@@ -791,17 +861,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						setOwntoneOutputVolume(room.OwnTone, id, restore)
 					}
 					volCanon = restore
-					log.Printf("[%s]: reclaimed HomePod (playback resumed, restored %d%%)", room.Name, restore)
+					log.Printf("[%s]: reclaim requested; restore target %d%%", room.Name, restore)
 					released = false
-					// Alias mode: reclaimHomePod re-selected the PRIMARY room's HomePod, but the active alias
-					// may be a different room. Re-route to the selected alias immediately so resume after a
-					// grace-release lands on the chosen room, not Frida. (Reset lastAlias so the routing block
-					// re-asserts even if the id didn't change.)
-					if room.Idx == 0 && gl.SelAlias > 0 {
-						aliasRoutePending = !routeAliasOutput(room.OwnTone, gl.SelAlias)
-						aliasRetryAt = time.Now().Add(3 * time.Second)
-						lastAlias = gl.SelAlias
-					}
 				}
 			} else {
 				if idleSince.IsZero() {
