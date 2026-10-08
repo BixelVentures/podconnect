@@ -1,5 +1,14 @@
 # PodConnect — Feature Status (canonical)
 
+## Current candidate — Speakers 0.26.5 (2026-10-08)
+
+Delayed manager status/catalog replies and alias reclaim now preserve the latest
+room selection. Normal manager tests, race checks, vet, Linux arm64/amd64 builds
+and eight composed bridge regressions passed on this candidate. Installation and
+physical acceptance are pending. This does not establish prompt Spotify visibility,
+native playback/apply, voice-driven transfer or per-output duck restoration.
+The dated feature claims below are historical evidence, not acceptance for this candidate.
+
 Single source of truth for **what each feature does** and **whether it works**. Keep in sync with
 [`CHANGELOG.md`](../CHANGELOG.md).
 

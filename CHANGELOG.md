@@ -8,6 +8,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.5 — 2026-10-08
+- Preserve the latest Connect room selection across delayed output catalog and status
+  responses, reconnects, and repeated selections. Stale replies cannot overwrite a
+  newer accepted room, transport, or volume observation.
+- Reclaim the current alias after idle release without first selecting the primary
+  room. Keep existing retry and polling intervals.
+- Describe reclaim as a request and target level; desired output acceptance alone
+  does not prove native playback or applied volume.
+- Manager tests, race checks, vet, both Linux builds and eight composed bridge
+  regressions passed. Spotify visibility, physical transfer and duck ownership
+  remain separate open issues.
+
 ## Speakers 0.26.4 — candidate 2026-10-07
 - Seed Spotify Autoplay from the track that actually finished when a single-track
   request has no context URI. Preserve existing playlist/album contexts and recent

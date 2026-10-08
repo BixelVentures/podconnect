@@ -56,6 +56,26 @@ jobs:
           version=$(grep '^version:' podconnect/config.yaml | cut -d'"' -f2)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Refuse an existing release version
+        shell: bash
+        run: |
+          set +e
+          inspect_output="$(docker buildx imagetools inspect \
+            ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }} 2>&1)"
+          inspect_status=$?
+          set -e
+          if [ "$inspect_status" -eq 0 ]; then
+            echo "Release version already exists and is immutable." >&2
+            exit 1
+          fi
+          case "$inspect_output" in
+            *"manifest unknown"*|*"ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }}: not found"*) ;;
+            *)
+              echo "$inspect_output" >&2
+              exit "$inspect_status"
+              ;;
+          esac
+
       - name: Build & push (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
