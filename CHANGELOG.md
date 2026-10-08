@@ -8,6 +8,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.6 — candidate 2026-10-08
+- Resolve a dealer-play context before changing active state, play origin, suppressions,
+  or shuffle/repeat overrides. A rejected context keeps the preceding playback state.
+- Preserve the existing context-loading path after successful resolution and leave
+  alias intent, API playback, autoplay and retry policy unchanged.
+- Add real-handler regressions for rejected contexts and subsequent preparation;
+  apply the same fourth engine patch in Docker and the existing CI checks.
+- Engine checks, publication, installation and physical acceptance are pending.
+  This change does not explain the provider's playlist rejection or prove native playback.
+
 ## Speakers 0.26.5 — 2026-10-08
 - Preserve the latest Connect room selection across delayed output catalog and status
   responses, reconnects, and repeated selections. Stale replies cannot overwrite a

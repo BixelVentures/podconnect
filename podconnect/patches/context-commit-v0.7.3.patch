@@ -1,0 +1,279 @@
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -25,6 +25,7 @@
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/spclient"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ )
+ 
+@@ -305,40 +306,7 @@
+ 
+ 		return nil
+ 	case "play":
+-		p.state.setActive(true)
+-
+-		p.state.player.PlayOrigin = req.Command.PlayOrigin
+-		p.state.player.PlayOrigin.DeviceIdentifier = req.SentByDeviceId
+-		p.state.player.Suppressions = req.Command.Options.Suppressions
+-
+-		// apply overrides
+-		if req.Command.Options.PlayerOptionsOverride != nil {
+-			p.state.player.Options.ShufflingContext = req.Command.Options.PlayerOptionsOverride.ShufflingContext
+-			p.state.player.Options.RepeatingTrack = req.Command.Options.PlayerOptionsOverride.RepeatingTrack
+-			p.state.player.Options.RepeatingContext = req.Command.Options.PlayerOptionsOverride.RepeatingContext
+-		}
+-
+-		var skipTo skipToFunc
+-		if len(req.Command.Options.SkipTo.TrackUri) > 0 || len(req.Command.Options.SkipTo.TrackUid) > 0 || req.Command.Options.SkipTo.TrackIndex > 0 {
+-			index := -1
+-			skipTo = func(track *connectpb.ContextTrack) bool {
+-				if len(req.Command.Options.SkipTo.TrackUid) > 0 && req.Command.Options.SkipTo.TrackUid == track.Uid {
+-					return true
+-				} else if len(req.Command.Options.SkipTo.TrackUri) > 0 && req.Command.Options.SkipTo.TrackUri == track.Uri {
+-					return true
+-					// the following length checks are needed, because the TrackIndex corresponds to an offset relative to the current playlist or album
+-					// If there are multiple albums in the current context (e.g. when starting from an artists page, the TrackIndex would indicate, that
+-					// you started the xth track vom the first album, even if you started the xth track from the second or third album etc.)
+-				} else if req.Command.Options.SkipTo.TrackIndex != 0 && len(req.Command.Options.SkipTo.TrackUri) == 0 && len(req.Command.Options.SkipTo.TrackUid) == 0 {
+-					index += 1
+-					return index == req.Command.Options.SkipTo.TrackIndex
+-				} else {
+-					return false
+-				}
+-			}
+-		}
+-
+-		return p.loadContext(ctx, req.Command.Context, skipTo, req.Command.Options.InitiallyPaused, true)
++		return p.handlePlayCommand(ctx, req, p.sess.Spclient())
+ 	case "pause":
+ 		return p.pause(ctx)
+ 	case "resume":
+@@ -410,6 +378,48 @@
+ 	default:
+ 		return fmt.Errorf("unsupported player command: %s", req.Command.Endpoint)
+ 	}
++}
++
++func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
++	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, req.Command.Context)
++	if err != nil {
++		return fmt.Errorf("failed creating track list: %w", err)
++	}
++
++	p.state.setActive(true)
++
++	p.state.player.PlayOrigin = req.Command.PlayOrigin
++	p.state.player.PlayOrigin.DeviceIdentifier = req.SentByDeviceId
++	p.state.player.Suppressions = req.Command.Options.Suppressions
++
++	// apply overrides
++	if req.Command.Options.PlayerOptionsOverride != nil {
++		p.state.player.Options.ShufflingContext = req.Command.Options.PlayerOptionsOverride.ShufflingContext
++		p.state.player.Options.RepeatingTrack = req.Command.Options.PlayerOptionsOverride.RepeatingTrack
++		p.state.player.Options.RepeatingContext = req.Command.Options.PlayerOptionsOverride.RepeatingContext
++	}
++
++	var skipTo skipToFunc
++	if len(req.Command.Options.SkipTo.TrackUri) > 0 || len(req.Command.Options.SkipTo.TrackUid) > 0 || req.Command.Options.SkipTo.TrackIndex > 0 {
++		index := -1
++		skipTo = func(track *connectpb.ContextTrack) bool {
++			if len(req.Command.Options.SkipTo.TrackUid) > 0 && req.Command.Options.SkipTo.TrackUid == track.Uid {
++				return true
++			} else if len(req.Command.Options.SkipTo.TrackUri) > 0 && req.Command.Options.SkipTo.TrackUri == track.Uri {
++				return true
++				// the following length checks are needed, because the TrackIndex corresponds to an offset relative to the current playlist or album
++				// If there are multiple albums in the current context (e.g. when starting from an artists page, the TrackIndex would indicate, that
++				// you started the xth track vom the first album, even if you started the xth track from the second or third album etc.)
++			} else if req.Command.Options.SkipTo.TrackIndex != 0 && len(req.Command.Options.SkipTo.TrackUri) == 0 && len(req.Command.Options.SkipTo.TrackUid) == 0 {
++				index += 1
++				return index == req.Command.Options.SkipTo.TrackIndex
++			} else {
++				return false
++			}
++		}
++	}
++
++	return p.loadPreparedContext(ctx, req.Command.Context, ctxTracks, skipTo, req.Command.Options.InitiallyPaused, true)
+ }
+ 
+ func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request) error {
+diff --git a/daemon/controls.go b/daemon/controls.go
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -229,6 +229,10 @@
+ 		return fmt.Errorf("failed creating track list: %w", err)
+ 	}
+ 
++	return p.loadPreparedContext(ctx, spotCtx, ctxTracks, skipTo, paused, drop)
++}
++
++func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.Context, ctxTracks *tracks.List, skipTo skipToFunc, paused, drop bool) error {
+ 	p.state.setPaused(paused)
+ 
+ 	sessionId := make([]byte, 16)
+diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/context_commit_test.go
+@@ -0,0 +1,158 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/spclient"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++type pc13RoundTrip func(*http.Request) (*http.Response, error)
++
++func (f pc13RoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++type pc13Body struct {
++	io.Reader
++	closes int
++}
++
++func (b *pc13Body) Close() error { b.closes++; return nil }
++
++const pc13ContextURI = "spotify:playlist:0000000000000000000001"
++
++func pc13Spclient(t *testing.T, transport http.RoundTripper) *spclient.Spclient {
++	t.Helper()
++	sp, err := spclient.NewSpclient(context.Background(), &librespot.NullLogger{}, &http.Client{Transport: transport}, func(context.Context) string { return "pc13.invalid" }, func(context.Context, bool) (string, error) { return "fixture-access-token", nil }, "fixture-device", "fixture-client-token")
++	if err != nil {
++		t.Fatal(err)
++	}
++	return sp
++}
++
++func pc13ExistingPlayer(t *testing.T, active bool) *AppPlayer {
++	t.Helper()
++	log := &librespot.NullLogger{}
++	oldContext := &connectpb.Context{Uri: "spotify:playlist:0000000000000000000002", Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}}}}
++	oldTracks, err := tracks.NewTrackListFromContext(context.Background(), log, nil, oldContext)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = oldTracks.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); err != nil {
++		t.Fatal(err)
++	}
++	return &AppPlayer{app: &App{log: log, cfg: &Config{}, server: &aliasTestServer{}}, state: &State{
++		active: active, activeSince: time.Unix(100, 0), device: &connectpb.DeviceInfo{SelectedAliasId: 2}, tracks: oldTracks, queueID: 7, lastTransferTimestamp: 123,
++		player: &connectpb.PlayerState{SessionId: "previous-session", ContextUri: oldContext.Uri, ContextUrl: "previous-url", PlayOrigin: &connectpb.PlayOrigin{FeatureIdentifier: "previous-origin", DeviceIdentifier: "previous-device"}, Suppressions: &connectpb.Suppressions{}, Options: &connectpb.ContextPlayerOptions{}, Track: oldTracks.CurrentTrack(), Timestamp: 100, PositionAsOfTimestamp: 456, IsPlaying: true, PlaybackSpeed: 1, ContextMetadata: map[string]string{"previous": "retained"}},
++	}}
++}
++
++func pc13PlayRequest(t *testing.T) dealer.RequestPayload {
++	t.Helper()
++	var req dealer.RequestPayload
++	if err := json.Unmarshal([]byte(`{"sent_by_device_id":"request-device","command":{"endpoint":"play","context":{"uri":"spotify:playlist:0000000000000000000001"},"play_origin":{"feature_identifier":"request-origin"},"options":{"initially_paused":true,"player_options_override":{"shuffling_context":true,"repeating_track":true,"repeating_context":true},"suppressions":{}}}}`), &req); err != nil {
++		t.Fatal(err)
++	}
++	return req
++}
++
++func TestDealerPlayContext404PreservesPreviousState(t *testing.T) {
++	for _, active := range []bool{false, true} {
++		t.Run(fmt.Sprintf("active_%t", active), func(t *testing.T) {
++			p := pc13ExistingPlayer(t, active)
++			p.primaryStream = &player.Stream{}
++			p.secondaryStream = &player.Stream{}
++			before := proto.Clone(p.state.player).(*connectpb.PlayerState)
++			oldTracks, oldPrimary, oldSecondary := p.state.tracks, p.primaryStream, p.secondaryStream
++			oldSince := p.state.activeSince
++			body := &pc13Body{Reader: strings.NewReader("not found")}
++			requests := 0
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				requests++
++				if r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/context-resolve/v1/"+pc13ContextURI {
++					return nil, fmt.Errorf("unexpected fixture request: %s %s", r.Method, r.URL)
++				}
++				return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: body, Request: r}, nil
++			}))
++			err := p.handlePlayCommand(context.Background(), pc13PlayRequest(t), sp)
++			if err == nil || !strings.Contains(err.Error(), "invalid status code from context resolve: 404") {
++				t.Fatalf("resolution error=%v", err)
++			}
++			if requests != 1 || body.closes != 1 {
++				t.Fatalf("requests=%d closes=%d", requests, body.closes)
++			}
++			if !proto.Equal(before, p.state.player) {
++				t.Fatal("rejected context mutated previous player state")
++			}
++			if p.state.active != active || !p.state.activeSince.Equal(oldSince) || p.state.tracks != oldTracks || p.primaryStream != oldPrimary || p.secondaryStream != oldSecondary || p.state.queueID != 7 || p.state.lastTransferTimestamp != 123 || p.state.device.SelectedAliasId != 2 {
++				t.Fatal("rejected context changed existing playback ownership")
++			}
++			if len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("rejected context emitted a playback event")
++			}
++		})
++	}
++}
++
++func TestDealerPlay404ThenResolvedContextReachesExistingCommitBoundary(t *testing.T) {
++	p := pc13ExistingPlayer(t, false)
++	oldTracks := p.state.tracks
++	var bodies []*pc13Body
++	requests := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/context-resolve/v1/"+pc13ContextURI {
++			return nil, fmt.Errorf("unexpected fixture request: %s %s", r.Method, r.URL)
++		}
++		status, payload := http.StatusNotFound, "not found"
++		if requests == 2 {
++			status = http.StatusOK
++			// Deliberately invalid media URI ends the real continuation before stream/session I/O.
++			// This proves context preparation/commit, never successful or audible playback.
++			data, err := json.Marshal(&connectpb.Context{Uri: pc13ContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-pc13-post-commit", Metadata: map[string]string{}}}}}})
++			if err != nil {
++				return nil, err
++			}
++			payload = string(data)
++		} else if requests > 2 {
++			return nil, fmt.Errorf("unexpected extra request")
++		}
++		body := &pc13Body{Reader: strings.NewReader(payload)}
++		bodies = append(bodies, body)
++		return &http.Response{StatusCode: status, Header: make(http.Header), Body: body, Request: r}, nil
++	}))
++	req := pc13PlayRequest(t)
++	if err := p.handlePlayCommand(context.Background(), req, sp); err == nil || !strings.Contains(err.Error(), "context resolve: 404") {
++		t.Fatalf("first resolution=%v", err)
++	}
++	if p.state.active || p.state.tracks != oldTracks || p.state.player.Options.ShufflingContext {
++		t.Fatal("first rejection changed preparation state")
++	}
++	err := p.handlePlayCommand(context.Background(), req, sp)
++	if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++		t.Fatalf("expected deliberate post-commit stream boundary, got %v", err)
++	}
++	if requests != 2 || len(bodies) != 2 || bodies[0].closes != 1 || bodies[1].closes != 1 {
++		t.Fatal("unexpected retry or unclosed response")
++	}
++	if !p.state.active || p.state.tracks == oldTracks || p.state.player.ContextUri != pc13ContextURI || p.state.player.Track.Uri != "invalid-pc13-post-commit" {
++		t.Fatal("resolved context did not reach existing commit path")
++	}
++	if !p.state.player.Options.ShufflingContext || !p.state.player.Options.RepeatingTrack || !p.state.player.Options.RepeatingContext || !p.state.player.IsPaused || p.state.player.PlayOrigin != req.Command.PlayOrigin || p.state.player.PlayOrigin.DeviceIdentifier != "request-device" || p.state.player.Suppressions != req.Command.Options.Suppressions {
++		t.Fatal("successful preparation lost existing overrides/order")
++	}
++	if p.primaryStream != nil || p.secondaryStream != nil || len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("continuation unexpectedly entered playback I/O")
++	}
++}

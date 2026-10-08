@@ -1,5 +1,14 @@
 # PodConnect — Feature Status (canonical)
 
+## Next candidate — Speakers 0.26.6 (2026-10-08)
+
+Dealer-play context resolution now precedes active/origin/options changes. Source
+review approved the narrow rejection boundary; actual engine checks and delivery
+are pending. The 404 regression retains previous playback state. The subsequent
+resolved-context control reaches the existing commit boundary and deliberately
+stops before streaming; it does not prove playback or provider recovery.
+Native activation, Spotify visibility and physical transfer remain open.
+
 ## Current candidate — Speakers 0.26.5 (2026-10-08)
 
 Delayed manager status/catalog replies and alias reclaim now preserve the latest
