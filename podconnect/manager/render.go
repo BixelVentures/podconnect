@@ -34,7 +34,9 @@ func readBitrate() string {
 // the Connect menu. By DEFAULT it auto-derives from your configured rooms (in rooms.json order) — zero
 // config. The connect_aliases option is an advanced override; if set, its order MUST match the room
 // order, since routeAliasOutput maps alias id N -> loadRooms()[N-1].
-func connectAliases() []string {
+func connectAliases() []string { return connectAliasesForRooms(loadRooms()) }
+
+func connectAliasesForRooms(rooms []*Room) []string {
 	if b, err := os.ReadFile(filepath.Join(dataDir, "options.json")); err == nil {
 		var o struct {
 			ConnectAliases []string `json:"connect_aliases"`
@@ -53,7 +55,7 @@ func connectAliases() []string {
 	}
 	// Default: one alias per configured room, in room order.
 	var names []string
-	for _, r := range loadRooms() {
+	for _, r := range rooms {
 		if n := strings.TrimSpace(r.Name); n != "" {
 			names = append(names, n)
 		}
@@ -73,11 +75,21 @@ func renderGLConfig(r *Room) error {
 	// them (it's the single engine); routeAliasOutput sends audio to the picked room's HomePod.
 	aliasesBlock := ""
 	if r.Idx == 0 {
-		if al := connectAliases(); len(al) > 0 {
+		aliasesBlock = "device_alias_room_ids: []\n" // generated config is never legacy by omission
+		rooms := loadRooms()
+		if al := connectAliasesForRooms(rooms); len(al) > 0 {
 			var b strings.Builder
 			b.WriteString("device_aliases:\n")
 			for _, name := range al {
 				fmt.Fprintf(&b, "  - %q\n", name)
+			}
+			if entries, ok := aliasEntriesForRooms(rooms, al); ok {
+				b.WriteString("device_alias_room_ids:\n")
+				for _, entry := range entries {
+					fmt.Fprintf(&b, "  - %q\n", entry.RoomID)
+				}
+			} else {
+				b.WriteString("device_alias_room_ids: []\n") // explicitly unavailable, never legacy
 			}
 			aliasesBlock = b.String()
 		}

@@ -1,8 +1,7 @@
 diff --git a/cmd/daemon/cli_config.go b/cmd/daemon/cli_config.go
-index eb8e73f..1e73c3e 100644
 --- a/cmd/daemon/cli_config.go
 +++ b/cmd/daemon/cli_config.go
-@@ -29,10 +29,11 @@ type cliConfig struct {
+@@ -29,10 +29,13 @@
  	LogLevel            log.Level `koanf:"log_level"`
  	LogDisableTimestamp bool      `koanf:"log_disable_timestamp"`
  
@@ -10,15 +9,17 @@ index eb8e73f..1e73c3e 100644
 -	DeviceName  string `koanf:"device_name"`
 -	DeviceType  string `koanf:"device_type"`
 -	ClientToken string `koanf:"client_token"`
-+	DeviceId      string   `koanf:"device_id"`
-+	DeviceName    string   `koanf:"device_name"`
-+	DeviceAliases []string `koanf:"device_aliases"`
-+	DeviceType    string   `koanf:"device_type"`
-+	ClientToken   string   `koanf:"client_token"`
++	DeviceId                     string   `koanf:"device_id"`
++	DeviceName                   string   `koanf:"device_name"`
++	DeviceAliases                []string `koanf:"device_aliases"`
++	DeviceAliasRoomIDs           []string `koanf:"device_alias_room_ids"`
++	DeviceAliasRoomIDsConfigured bool
++	DeviceType                   string `koanf:"device_type"`
++	ClientToken                  string `koanf:"client_token"`
  
  	AudioBackend              string `koanf:"audio_backend"`
  	AudioBackendRuntimeSocket string `koanf:"audio_backend_runtime_socket"`
-@@ -88,10 +89,11 @@ type cliConfig struct {
+@@ -88,10 +91,13 @@
  
  func (c *cliConfig) toDaemonConfig() *daemon.Config {
  	dc := &daemon.Config{
@@ -26,28 +27,129 @@ index eb8e73f..1e73c3e 100644
 -		DeviceName:  c.DeviceName,
 -		DeviceType:  c.DeviceType,
 -		ClientToken: c.ClientToken,
-+		DeviceId:      c.DeviceId,
-+		DeviceName:    c.DeviceName,
-+		DeviceAliases: c.DeviceAliases,
-+		DeviceType:    c.DeviceType,
-+		ClientToken:   c.ClientToken,
++		DeviceId:                     c.DeviceId,
++		DeviceName:                   c.DeviceName,
++		DeviceAliases:                c.DeviceAliases,
++		DeviceAliasRoomIDs:           c.DeviceAliasRoomIDs,
++		DeviceAliasRoomIDsConfigured: c.DeviceAliasRoomIDsConfigured,
++		DeviceType:                   c.DeviceType,
++		ClientToken:                  c.ClientToken,
  
  		AudioBackend:              c.AudioBackend,
  		AudioBackendRuntimeSocket: c.AudioBackendRuntimeSocket,
+@@ -225,6 +231,8 @@
+ 		return fmt.Errorf("failed to unmarshal configuration: %w", err)
+ 	}
+ 
++	cfg.DeviceAliasRoomIDsConfigured = k.Exists("device_alias_room_ids")
++
+ 	if cfg.DeviceName == "" {
+ 		cfg.DeviceName = "go-librespot"
+ 
 diff --git a/daemon/api_server.go b/daemon/api_server.go
-index d830363..06aa6a1 100644
 --- a/daemon/api_server.go
 +++ b/daemon/api_server.go
-@@ -270,6 +270,9 @@ type ApiResponseStatus struct {
+@@ -46,6 +46,7 @@
+ 
+ var (
+ 	ErrNoSession        = errors.New("no session")
++	ErrAliasConflict    = errors.New("alias registry unavailable or changed")
+ 	ErrBadRequest       = errors.New("bad request")
+ 	ErrForbidden        = errors.New("forbidden")
+ 	ErrNotFound         = errors.New("not found")
+@@ -57,6 +58,8 @@
+ 
+ const (
+ 	ApiRequestTypeRoot                ApiRequestType = "root"
++	ApiRequestTypeAliases             ApiRequestType = "aliases"
++	ApiRequestTypeSelectAlias         ApiRequestType = "select_alias"
+ 	ApiRequestTypeWebApi              ApiRequestType = "web_api"
+ 	ApiRequestTypeStatus              ApiRequestType = "status"
+ 	ApiRequestTypeResume              ApiRequestType = "resume"
+@@ -270,6 +273,40 @@
  	RepeatTrack    bool                    `json:"repeat_track"`
  	ShuffleContext bool                    `json:"shuffle_context"`
  	Track          *ApiResponseStatusTrack `json:"track"`
 +	// device-aliases: the alias the controller currently selected (0 = none). Lets an external
 +	// supervisor route output to the matching room.
-+	SelectedAliasId uint32 `json:"selected_alias_id"`
++	SelectedAliasId uint32           `json:"selected_alias_id"`
++	AliasBinding    *ApiAliasBinding `json:"alias_binding,omitempty"`
++}
++
++type ApiAlias struct {
++	ID     uint32 `json:"id"`
++	RoomID string `json:"room_id"`
++	Name   string `json:"name"`
++}
++
++type ApiAliasBinding struct {
++	Incarnation string `json:"incarnation"`
++	Registry    string `json:"registry"`
++	RoomID      string `json:"room_id"`
++	Ready       bool   `json:"ready"`
++}
++
++type ApiResponseAliases struct {
++	Binding *ApiAliasBinding `json:"binding"`
++	Aliases []ApiAlias       `json:"aliases"`
++}
++
++type ApiRequestDataSelectAlias struct {
++	RoomID              string `json:"room_id"`
++	ExpectedIncarnation string `json:"expected_incarnation"`
++	ExpectedRegistry    string `json:"expected_registry"`
++}
++
++type ApiResponseSelectAlias struct {
++	AcceptedLocal bool             `json:"accepted_local"`
++	Binding       *ApiAliasBinding `json:"binding"`
++	ID            uint32           `json:"id"`
  }
  
  type ApiResponseRoot struct {
+@@ -387,6 +424,9 @@
+ 		switch {
+ 		case errors.Is(resp.err, ErrNoSession):
+ 			w.WriteHeader(http.StatusNoContent)
++			return
++		case errors.Is(resp.err, ErrAliasConflict):
++			w.WriteHeader(http.StatusConflict)
+ 			return
+ 		case errors.Is(resp.err, ErrForbidden):
+ 			w.WriteHeader(http.StatusForbidden)
+@@ -431,6 +471,24 @@
+ 	}
+ 
+ 	return json.Unmarshal(data, v)
++}
++
++func (s *ConcreteApiServer) handleAliases(w http.ResponseWriter, r *http.Request) {
++	if r.Method == http.MethodGet {
++		s.handleRequest(ApiRequest{Type: ApiRequestTypeAliases}, w)
++		return
++	}
++	if r.Method != http.MethodPost {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	r.Body = http.MaxBytesReader(w, r.Body, 4096)
++	var data ApiRequestDataSelectAlias
++	if err := jsonDecode(r, &data); err != nil || data.RoomID == "" || data.ExpectedRegistry == "" || data.ExpectedIncarnation == "" {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	s.handleRequest(ApiRequest{Type: ApiRequestTypeSelectAlias, Data: data}, w)
+ }
+ 
+ func (s *ConcreteApiServer) serve() {
+@@ -461,6 +519,7 @@
+ 
+ 		s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
+ 	})
++	m.HandleFunc("/player/aliases", s.handleAliases)
+ 	m.HandleFunc("/player/play", func(w http.ResponseWriter, r *http.Request) {
+ 		if r.Method != "POST" {
+ 			w.WriteHeader(http.StatusMethodNotAllowed)
 diff --git a/daemon/app.go b/daemon/app.go
 index f1e1b53..95a2ffa 100644
 --- a/daemon/app.go
@@ -62,10 +164,9 @@ index f1e1b53..95a2ffa 100644
  		return fmt.Errorf("failed initializing zeroconf: %w", err)
  	}
 diff --git a/daemon/config.go b/daemon/config.go
-index d64f19f..85d0cc7 100644
 --- a/daemon/config.go
 +++ b/daemon/config.go
-@@ -2,10 +2,11 @@ package daemon
+@@ -2,10 +2,13 @@
  
  // Config carries the runtime configuration for a daemon instance.
  type Config struct {
@@ -73,21 +174,29 @@ index d64f19f..85d0cc7 100644
 -	DeviceName  string
 -	DeviceType  string
 -	ClientToken string
-+	DeviceId      string
-+	DeviceName    string
-+	DeviceAliases []string
-+	DeviceType    string
-+	ClientToken   string
++	DeviceId                     string
++	DeviceName                   string
++	DeviceAliases                []string
++	DeviceAliasRoomIDs           []string
++	DeviceAliasRoomIDsConfigured bool
++	DeviceType                   string
++	ClientToken                  string
  
  	AudioBackend              string
  	AudioBackendRuntimeSocket string
 diff --git a/daemon/device_alias.go b/daemon/device_alias.go
 new file mode 100644
-index 0000000..4f6a16c
 --- /dev/null
 +++ b/daemon/device_alias.go
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,133 @@
 +package daemon
++
++import (
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++)
 +
 +// resolveDeviceAlias preserves the selected zone for engine-targeted Web API
 +// commands. Explicit valid aliases still switch rooms. Zero is not an advertised
@@ -103,6 +212,115 @@ index 0000000..4f6a16c
 +		return current
 +	}
 +	return 1
++}
++
++// Registry identity belongs to this actual AppPlayer and its loaded config.
++// Missing stable IDs preserve legacy Spotify behaviour but disable local selection.
++func (p *AppPlayer) initAliasRegistry() {
++	names, ids := p.app.cfg.DeviceAliases, p.app.cfg.DeviceAliasRoomIDs
++	p.aliasConfigured = p.app.cfg.DeviceAliasRoomIDsConfigured || ids != nil
++	if len(names) == 0 || len(names) != len(ids) {
++		return
++	}
++	seen := make(map[string]bool, len(ids))
++	entries := make([]ApiAlias, len(ids))
++	for i, id := range ids {
++		if id == "" || names[i] == "" || seen[id] {
++			return
++		}
++		seen[id] = true
++		entries[i] = ApiAlias{ID: uint32(i + 1), RoomID: id, Name: names[i]}
++	}
++	var nonce [16]byte
++	if _, err := rand.Read(nonce[:]); err != nil {
++		return
++	}
++	raw, err := json.Marshal(entries)
++	if err != nil {
++		return
++	}
++	sum := sha256.Sum256(raw)
++	p.aliasRegistry = entries
++	p.aliasFingerprint = hex.EncodeToString(sum[:])
++	p.aliasIncarnation = hex.EncodeToString(nonce[:])
++}
++
++func (p *AppPlayer) aliasBindingLocked() *ApiAliasBinding {
++	if len(p.aliasRegistry) == 0 {
++		if p.aliasConfigured {
++			return &ApiAliasBinding{}
++		}
++		return nil
++	}
++	b := &ApiAliasBinding{Incarnation: p.aliasIncarnation, Registry: p.aliasFingerprint, Ready: !p.aliasRetired}
++	if b.Ready {
++		for _, a := range p.aliasRegistry {
++			if a.ID == p.state.device.SelectedAliasId {
++				b.RoomID = a.RoomID
++				break
++			}
++		}
++	}
++	return b
++}
++
++func (p *AppPlayer) aliasBinding() *ApiAliasBinding {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	return p.aliasBindingLocked()
++}
++
++func (p *AppPlayer) localAliases() (*ApiResponseAliases, error) {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if len(p.aliasRegistry) == 0 || p.aliasRetired {
++		return nil, ErrAliasConflict
++	}
++	binding := p.aliasBindingLocked()
++	if binding.RoomID == "" {
++		return nil, ErrAliasConflict
++	}
++	return &ApiResponseAliases{Binding: binding, Aliases: append([]ApiAlias(nil), p.aliasRegistry...)}, nil
++}
++
++func (p *AppPlayer) emitSelectedAlias(id uint32, binding *ApiAliasBinding) {
++	data := map[string]any{"id": id}
++	if binding != nil {
++		data["alias_binding"] = binding
++	}
++	p.app.server.Emit(&ApiEvent{Type: "selected_alias", Data: data})
++}
++
++func (p *AppPlayer) selectLocalAlias(data ApiRequestDataSelectAlias) (*ApiResponseSelectAlias, error) {
++	// Close and local commit share only this short admission boundary.
++	p.aliasMu.Lock()
++	if p.aliasRetired || p.aliasFingerprint == "" || data.ExpectedRegistry != p.aliasFingerprint || data.ExpectedIncarnation != p.aliasIncarnation {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	var id uint32
++	for _, a := range p.aliasRegistry {
++		if a.RoomID == data.RoomID {
++			id = a.ID
++			break
++		}
++	}
++	if id == 0 {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	p.state.device.SelectedAliasId = id
++	binding := p.aliasBindingLocked()
++	p.aliasMu.Unlock()
++	// These best-effort observations cannot turn local acceptance into native ACK.
++	p.emitSelectedAlias(id, binding)
++	return &ApiResponseSelectAlias{AcceptedLocal: true, Binding: binding, ID: id}, nil
++}
++
++func (p *AppPlayer) retireAliases() {
++	p.aliasMu.Lock()
++	p.aliasRetired = true
++	p.aliasMu.Unlock()
 +}
 diff --git a/daemon/device_alias_handler_test.go b/daemon/device_alias_handler_test.go
 new file mode 100644
@@ -193,13 +411,27 @@ index 0000000..45478da
 +	}
 +}
 diff --git a/daemon/player.go b/daemon/player.go
-index c255f83..fb71efd 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -171,6 +171,29 @@ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestP
+@@ -55,6 +55,13 @@
+ 	secondaryStream *player.Stream
+ 
+ 	prefetchTimer *time.Timer
++
++	aliasMu          sync.Mutex
++	aliasRegistry    []ApiAlias
++	aliasFingerprint string
++	aliasIncarnation string
++	aliasRetired     bool
++	aliasConfigured  bool
+ }
+ 
+ func (p *AppPlayer) playbackReady() bool {
+@@ -170,6 +177,29 @@
+ 	p.state.lastCommand = &req
  
  	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
- 
++
 +	// device-aliases: when the controller picks a room, the selected alias arrives as target_alias_id at
 +	// the dealer payload TOP level (not in command/options). Echo it on the next put_state, and push it
 +	// over /events so the manager routes the output immediately (the /status backstop carries it too).
@@ -219,34 +451,74 @@ index c255f83..fb71efd 100644
 +			}
 +			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
 +			p.state.device.SelectedAliasId = *aliasId
-+			p.app.server.Emit(&ApiEvent{Type: "selected_alias", Data: map[string]any{"id": *aliasId}})
++			p.emitSelectedAlias(*aliasId, p.aliasBinding())
 +		}
 +	}
-+
+ 
  	switch req.Command.Endpoint {
  	case "transfer":
- 		if len(req.Command.Data) == 0 {
-@@ -462,10 +485,11 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
- 			RepeatContext:  p.state.player.Options.RepeatingContext,
- 			RepeatTrack:    p.state.player.Options.RepeatingTrack,
- 			ShuffleContext: p.state.player.Options.ShufflingContext,
+@@ -409,6 +439,14 @@
+ 	defer cancel()
+ 
+ 	switch req.Type {
++	case ApiRequestTypeAliases:
++		return p.localAliases()
++	case ApiRequestTypeSelectAlias:
++		data, ok := req.Data.(ApiRequestDataSelectAlias)
++		if !ok {
++			return nil, ErrBadRequest
++		}
++		return p.selectLocalAlias(data)
+ 	case ApiRequestTypeRoot:
+ 		return &ApiResponseRoot{PlaybackReady: p.playbackReady()}, nil
+ 	case ApiRequestTypeWebApi:
+@@ -453,19 +491,21 @@
+ 		return respJson, nil
+ 	case ApiRequestTypeStatus:
+ 		resp := &ApiResponseStatus{
+-			Username:       p.sess.Username(),
+-			DeviceId:       p.app.deviceId,
+-			DeviceType:     p.app.deviceType.String(),
+-			DeviceName:     p.app.cfg.DeviceName,
+-			VolumeSteps:    p.app.cfg.VolumeSteps,
+-			Volume:         p.apiVolume(),
+-			RepeatContext:  p.state.player.Options.RepeatingContext,
+-			RepeatTrack:    p.state.player.Options.RepeatingTrack,
+-			ShuffleContext: p.state.player.Options.ShufflingContext,
 -			Stopped:        !p.state.player.IsPlaying,
 -			Paused:         p.state.player.IsPaused,
 -			Buffering:      p.state.player.IsBuffering,
 -			PlayOrigin:     p.state.player.PlayOrigin.FeatureIdentifier,
++			Username:        p.sess.Username(),
++			DeviceId:        p.app.deviceId,
++			DeviceType:      p.app.deviceType.String(),
++			DeviceName:      p.app.cfg.DeviceName,
++			VolumeSteps:     p.app.cfg.VolumeSteps,
++			Volume:          p.apiVolume(),
++			RepeatContext:   p.state.player.Options.RepeatingContext,
++			RepeatTrack:     p.state.player.Options.RepeatingTrack,
++			ShuffleContext:  p.state.player.Options.ShufflingContext,
 +			Stopped:         !p.state.player.IsPlaying,
 +			Paused:          p.state.player.IsPaused,
 +			Buffering:       p.state.player.IsBuffering,
 +			PlayOrigin:      p.state.player.PlayOrigin.FeatureIdentifier,
 +			SelectedAliasId: p.state.device.SelectedAliasId,
++			AliasBinding:    p.aliasBinding(),
  		}
  
  		if p.primaryStream != nil && p.prodInfo != nil {
+@@ -683,6 +723,7 @@
+ }
+ 
+ func (p *AppPlayer) Close() {
++	p.retireAliases()
+ 	p.stop <- struct{}{}
+ 	p.player.Close()
+ 	p.sess.Close()
 diff --git a/daemon/player_state.go b/daemon/player_state.go
-index 4221671..4ccfcb3 100644
 --- a/daemon/player_state.go
 +++ b/daemon/player_state.go
-@@ -8,6 +8,7 @@ import (
+@@ -8,6 +8,7 @@
  	"github.com/devgianlu/go-librespot/dealer"
  	"github.com/devgianlu/go-librespot/player"
  	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
@@ -254,7 +526,7 @@ index 4221671..4ccfcb3 100644
  	"github.com/devgianlu/go-librespot/tracks"
  )
  
-@@ -114,11 +115,18 @@ func (s *State) playOrigin() string {
+@@ -114,11 +115,18 @@
  }
  
  func (p *AppPlayer) initState() {
@@ -274,7 +546,7 @@ index 4221671..4ccfcb3 100644
  			Name:                  p.app.cfg.DeviceName,
  			DeviceId:              p.app.deviceId,
  			DeviceType:            p.app.deviceType,
-@@ -153,6 +161,20 @@ func (p *AppPlayer) initState() {
+@@ -153,7 +161,22 @@
  			},
  		},
  	}
@@ -293,8 +565,10 @@ index 4221671..4ccfcb3 100644
 +	}
 +
  	p.state.reset()
++	p.initAliasRegistry()
  }
  
+ func (p *AppPlayer) updateState(ctx context.Context) {
 diff --git a/dealer/recv.go b/dealer/recv.go
 index a9cc04d..c236088 100644
 --- a/dealer/recv.go
@@ -403,3 +677,284 @@ index c49cf8c..d15f370 100644
  	})
  }
  
+diff --git a/daemon/local_alias_api_test.go b/daemon/local_alias_api_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/local_alias_api_test.go
+@@ -0,0 +1,276 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"sync"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++type heldAliasServer struct {
++	entered chan *ApiEvent
++	release chan struct{}
++	once    sync.Once
++}
++
++func (s *heldAliasServer) Emit(e *ApiEvent)           { s.once.Do(func() { s.entered <- e }); <-s.release }
++func (s *heldAliasServer) Receive() <-chan ApiRequest { return nil }
++func (s *heldAliasServer) Close() error               { return nil }
++
++func TestLocalAliasCommitBeforeRetireKeepsOriginalIdentity(t *testing.T) {
++	p, _ := localAliasPlayer(t)
++	hold := &heldAliasServer{entered: make(chan *ApiEvent, 1), release: make(chan struct{})}
++	p.app.server = hold
++	old := p.aliasBinding()
++	result := make(chan *ApiResponseSelectAlias, 1)
++	errs := make(chan error, 1)
++	done := make(chan struct{})
++	var releaseOnce sync.Once
++	t.Cleanup(func() {
++		releaseOnce.Do(func() { close(hold.release) })
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Error("owned alias operation not joined")
++		}
++	})
++	go func() {
++		defer close(done)
++		reply, err := p.selectLocalAlias(ApiRequestDataSelectAlias{RoomID: "r1", ExpectedRegistry: old.Registry, ExpectedIncarnation: old.Incarnation})
++		result <- reply
++		errs <- err
++	}()
++	var emitted *ApiEvent
++	select {
++	case emitted = <-hold.entered:
++	case <-time.After(time.Second):
++		t.Fatal("actual commit/event boundary not reached")
++	}
++	p.retireAliases() // exact same retirement method called before Close resource I/O
++	status := p.aliasBinding()
++	if status.Ready || status.RoomID != "" {
++		t.Fatal("retired status has reusable route")
++	}
++	if _, err := p.localAliases(); err != ErrAliasConflict {
++		t.Fatal("retired owner registry accepted GET")
++	}
++	releaseOnce.Do(func() { close(hold.release) })
++	select {
++	case reply := <-result:
++		if !reply.AcceptedLocal || reply.Binding.Incarnation != old.Incarnation || !reply.Binding.Ready {
++			t.Fatal("already committed effect was relabelled")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("retained local operation did not finish")
++	}
++	if err := <-errs; err != nil {
++		t.Fatal(err)
++	}
++	binding := emitted.Data.(map[string]any)["alias_binding"].(*ApiAliasBinding)
++	if binding.Incarnation != old.Incarnation || binding.RoomID != "r1" {
++		t.Fatal("old emitted event borrowed replacement identity")
++	}
++}
++
++func localAliasPlayer(t *testing.T) (*AppPlayer, *aliasTestServer) {
++	t.Helper()
++	server := &aliasTestServer{}
++	p := &AppPlayer{app: &App{log: &librespot.NullLogger{}, cfg: &Config{DeviceAliases: []string{"A", "B"}, DeviceAliasRoomIDs: []string{"r0", "r1"}}, server: server}, state: &State{device: &connectpb.DeviceInfo{SelectedAliasId: 1}, player: &connectpb.PlayerState{PositionAsOfTimestamp: 65000, Options: &connectpb.ContextPlayerOptions{RepeatingContext: true, ShufflingContext: true}}, queueID: 37}}
++	p.initAliasRegistry()
++	if p.aliasFingerprint == "" {
++		t.Fatal("actual registry initialization failed")
++	}
++	return p, server
++}
++
++func TestLocalAliasActualHandlerPreservesPlaybackState(t *testing.T) {
++	p, server := localAliasPlayer(t)
++	oldState, oldDevice, oldPlayer := p.state, p.state.device, p.state.player
++	p.state.tracks = &tracks.List{}
++	p.state.lastCommand = &dealer.RequestPayload{MessageId: 77}
++	p.primaryStream = &player.Stream{}
++	p.secondaryStream = &player.Stream{}
++	oldTracks, oldCommand, oldPrimary, oldSecondary := p.state.tracks, p.state.lastCommand, p.primaryStream, p.secondaryStream
++	oldPosition, oldOptions, oldQueue := p.state.player.PositionAsOfTimestamp, *p.state.player.Options, p.state.queueID
++	before, _ := p.localAliases()
++	result, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSelectAlias, Data: ApiRequestDataSelectAlias{RoomID: "r1", ExpectedIncarnation: before.Binding.Incarnation, ExpectedRegistry: before.Binding.Registry}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	reply := result.(*ApiResponseSelectAlias)
++	if !reply.AcceptedLocal || reply.ID != 2 || reply.Binding.RoomID != "r1" {
++		t.Fatalf("wrong local result: %+v", reply)
++	}
++	if p.state != oldState || p.state.device != oldDevice || p.state.player != oldPlayer || p.state.player.PositionAsOfTimestamp != oldPosition || !reflect.DeepEqual(*p.state.player.Options, oldOptions) || p.state.queueID != oldQueue || p.state.tracks != oldTracks || p.primaryStream != oldPrimary || p.secondaryStream != oldSecondary || p.state.lastCommand != oldCommand {
++		t.Fatal("local alias operation mutated playback/context/queue")
++	}
++	if len(server.events) != 1 || server.events[0].Type != "selected_alias" {
++		t.Fatal("local selection did not emit one actual event")
++	}
++	event := server.events[0].Data.(map[string]any)
++	if event["id"] != uint32(2) || event["alias_binding"].(*ApiAliasBinding).Incarnation != before.Binding.Incarnation {
++		t.Fatal("event not bound to actual owner")
++	}
++	// No Session/Player was fabricated: any provider or playback call would fail.
++	if p.sess != nil || p.player != nil {
++		t.Fatal("unexpected competing I/O owner")
++	}
++}
++
++func TestLocalAliasActualHandlerRejectsStaleAndInvalidRegistry(t *testing.T) {
++	for _, kind := range []string{"room", "registry", "incarnation", "retired", "missing-ids", "duplicate-ids", "explicit-empty-ids"} {
++		t.Run(kind, func(t *testing.T) {
++			p, server := localAliasPlayer(t)
++			req := ApiRequestDataSelectAlias{RoomID: "r1", ExpectedIncarnation: p.aliasIncarnation, ExpectedRegistry: p.aliasFingerprint}
++			switch kind {
++			case "room":
++				req.RoomID = "missing"
++			case "registry":
++				req.ExpectedRegistry = "old"
++			case "incarnation":
++				req.ExpectedIncarnation = "old"
++			case "retired":
++				p.aliasMu.Lock()
++				p.aliasRetired = true
++				p.aliasMu.Unlock()
++			case "missing-ids":
++				p.app.cfg.DeviceAliasRoomIDs = nil
++				p.aliasRegistry = nil
++				p.aliasFingerprint = ""
++				p.initAliasRegistry()
++			case "explicit-empty-ids":
++				p.app.cfg.DeviceAliasRoomIDs = nil
++				p.app.cfg.DeviceAliasRoomIDsConfigured = true
++				p.aliasRegistry = nil
++				p.aliasFingerprint = ""
++				p.initAliasRegistry()
++			case "duplicate-ids":
++				p.app.cfg.DeviceAliasRoomIDs = []string{"same", "same"}
++				p.aliasRegistry = nil
++				p.aliasFingerprint = ""
++				p.initAliasRegistry()
++			}
++			if (kind == "duplicate-ids" || kind == "explicit-empty-ids") && p.aliasBinding() == nil {
++				t.Fatal("configured invalid registry masquerades as legacy")
++			}
++			if kind == "missing-ids" && p.aliasBinding() != nil {
++				t.Fatal("legacy config requires unsupported identity")
++			}
++			_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSelectAlias, Data: req})
++			if err != ErrAliasConflict || p.state.device.SelectedAliasId != 1 || len(server.events) != 0 {
++				t.Fatalf("invalid local selection had effect: %v", err)
++			}
++		})
++	}
++}
++
++func TestLocalAliasImmutableSnapshotAndFreshPlayerIncarnation(t *testing.T) {
++	a, _ := localAliasPlayer(t)
++	old, _ := a.localAliases()
++	a.app.cfg.DeviceAliases[1] = "changed"
++	a.app.cfg.DeviceAliasRoomIDs[1] = "replacement"
++	again, _ := a.localAliases()
++	if !reflect.DeepEqual(old, again) {
++		t.Fatal("registry followed mutable config after construction")
++	}
++	old.Aliases[1].RoomID = "tampered"
++	again, _ = a.localAliases()
++	if again.Aliases[1].RoomID != "r1" {
++		t.Fatal("export aliases share registry storage")
++	}
++	b, _ := localAliasPlayer(t)
++	if a.aliasIncarnation == b.aliasIncarnation {
++		t.Fatal("new player reused old owner")
++	}
++	_, err := b.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSelectAlias, Data: ApiRequestDataSelectAlias{RoomID: "r1", ExpectedIncarnation: a.aliasIncarnation, ExpectedRegistry: a.aliasFingerprint}})
++	if err != ErrAliasConflict {
++		t.Fatal("old player claim crossed replacement")
++	}
++	a.state.device.SelectedAliasId = 0
++	if _, err := a.localAliases(); err != ErrAliasConflict {
++		t.Fatal("unselected registry invented primary room")
++	}
++	a.retireAliases()
++	if _, err := a.localAliases(); err != ErrAliasConflict {
++		t.Fatal("retired GET exposed reusable registry")
++	}
++	binding := a.aliasBinding()
++	if binding == nil || binding.Ready || binding.RoomID != "" {
++		t.Fatal("retired status masquerades as old metadata or current owner")
++	}
++}
++
++func TestLocalAliasHTTPUsesActualRequestQueue(t *testing.T) {
++	for _, stale := range []bool{false, true} {
++		name := "accepted-local"
++		if stale {
++			name = "stale-conflict"
++		}
++		t.Run(name, func(t *testing.T) {
++			p, _ := localAliasPlayer(t)
++			server := &ConcreteApiServer{log: &librespot.NullLogger{}, requests: make(chan ApiRequest)}
++			received := make(chan ApiRequest, 1)
++			done := make(chan struct{})
++			ctx, cancel := context.WithCancel(context.Background())
++			t.Cleanup(func() {
++				cancel()
++				select {
++				case <-done:
++				case <-time.After(time.Second):
++					t.Error("retained API fixture owner did not join")
++				}
++			})
++			go func() {
++				defer close(done)
++				select {
++				case req := <-server.Receive():
++					received <- req
++					data, err := p.handleApiRequest(ctx, req)
++					req.Reply(data, err)
++				case <-ctx.Done():
++				}
++			}()
++			incarnation := p.aliasIncarnation
++			if stale {
++				incarnation = "stale"
++			}
++			raw, _ := json.Marshal(ApiRequestDataSelectAlias{RoomID: "r1", ExpectedIncarnation: incarnation, ExpectedRegistry: p.aliasFingerprint})
++			response := httptest.NewRecorder()
++			server.handleAliases(response, httptest.NewRequest(http.MethodPost, "/player/aliases", bytes.NewReader(raw)))
++			if stale {
++				if response.Code != http.StatusConflict || p.state.device.SelectedAliasId != 1 {
++					t.Fatalf("stale HTTP returned %d/alias %d", response.Code, p.state.device.SelectedAliasId)
++				}
++			} else {
++				var reply ApiResponseSelectAlias
++				if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &reply) != nil || !reply.AcceptedLocal || reply.ID != 2 || reply.Binding.RoomID != "r1" || reply.Binding.Incarnation != incarnation {
++					t.Fatalf("wrong actual local HTTP result: %d %s", response.Code, response.Body.String())
++				}
++			}
++			select {
++			case req := <-received:
++				if req.Type != ApiRequestTypeSelectAlias {
++					t.Fatal("wrong API owner")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("request queue not observed")
++			}
++			select {
++			case <-done:
++			case <-time.After(time.Second):
++				t.Fatal("retained API fixture owner did not join")
++			}
++		})
++	}
++}

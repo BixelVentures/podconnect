@@ -296,12 +296,13 @@ func setOwntoneOutputVolume(base, id string, pct int) {
 
 // glStatus is the slice of go-librespot's /status the bridge needs.
 type glStatus struct {
-	Active   bool // a Spotify session is present (status returned data)
-	HasVol   bool
-	VolPct   int // 0-100
-	Paused   bool
-	Stopped  bool
-	SelAlias int // device-aliases: currently selected alias id (0 = none), from the fork's /status
+	Active       bool // a Spotify session is present (status returned data)
+	HasVol       bool
+	VolPct       int // 0-100
+	Paused       bool
+	Stopped      bool
+	SelAlias     int           // device-aliases: currently selected alias id (0 = none), from the fork's /status
+	AliasBinding *aliasBinding // nil preserves the old engine protocol; nonnil must be current
 }
 
 // librespotStatus reads go-librespot's /status once (volume + transport). With external_volume:true
@@ -317,17 +318,18 @@ func librespotStatus(base string) glStatus {
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
 	var st struct {
-		Username      string       `json:"username"`
-		Volume        *json.Number `json:"volume"`
-		VolumeSteps   *json.Number `json:"volume_steps"`
-		Paused        bool         `json:"paused"`
-		Stopped       bool         `json:"stopped"`
-		SelectedAlias *json.Number `json:"selected_alias_id"`
+		Username      string        `json:"username"`
+		Volume        *json.Number  `json:"volume"`
+		VolumeSteps   *json.Number  `json:"volume_steps"`
+		Paused        bool          `json:"paused"`
+		Stopped       bool          `json:"stopped"`
+		SelectedAlias *json.Number  `json:"selected_alias_id"`
+		AliasBinding  *aliasBinding `json:"alias_binding"`
 	}
 	if err := dec.Decode(&st); err != nil {
 		return glStatus{} // empty body / no session
 	}
-	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped}
+	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped, AliasBinding: st.AliasBinding}
 	if st.SelectedAlias != nil {
 		if n, e := st.SelectedAlias.Int64(); e == nil {
 			out.SelAlias = int(n)
@@ -641,10 +643,34 @@ func routeIntentCurrent(live *glLive, aliasId int, revision uint64) bool {
 // Returns desired-selection acceptance and whether this intent is still current.
 func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64) (bool, bool) {
 	rooms := loadRooms()
-	if aliasId < 1 || aliasId > len(rooms) {
-		return false, routeIntentCurrent(live, aliasId, revision)
+	var binding *aliasBinding
+	if live != nil {
+		status, currentRevision := live.routeSnapshot()
+		if status.SelAlias != aliasId || currentRevision != revision {
+			return false, false
+		}
+		binding = status.AliasBinding
 	}
-	target := rooms[aliasId-1]
+	var target *Room
+	if binding != nil {
+		if !binding.valid() {
+			return false, false
+		}
+		for _, room := range rooms {
+			if room.ID == binding.RoomID {
+				target = room
+				break
+			}
+		}
+		if target == nil {
+			return false, false
+		}
+	} else {
+		if aliasId < 1 || aliasId > len(rooms) {
+			return false, routeIntentCurrent(live, aliasId, revision)
+		}
+		target = rooms[aliasId-1]
+	}
 	devs, ok := fetchOutputsFrom(primaryOwnTone)
 	if !ok || len(devs) == 0 {
 		return false, routeIntentCurrent(live, aliasId, revision)
@@ -665,7 +691,7 @@ func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive,
 	}
 	// The claim is command admission, not HTTP sent/native ACK. Never hold the
 	// live mutex across network I/O. No catalog or other work follows admission.
-	if live != nil && !live.admitRoute(aliasId, revision) {
+	if live != nil && !admitRoomAliasRoute(target, binding, live, aliasId, revision) {
 		return false, false
 	}
 	resp, err := cl.Do(req)
@@ -717,6 +743,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	volCanon := -1    // canonical volume % for the bidirectional reconcile (-1 = re-seed from live)
 	lastPlayVol := -1 // last canonical volume while actually PLAYING — distinguishes your own
 	// pause/resume (same level) from a transfer that brings a remembered/loud one
+	var lastAliasBinding *aliasBinding
 	lastAlias := 0             // device-aliases: last alias id we routed output for (0 = none yet)
 	aliasRoutePending := false // a route attempt failed; retry on the throttle (not every tick)
 	aliasRetryAt := time.Now()
@@ -742,6 +769,11 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl, aliasRevision := live.routeSnapshot()
+			if room.Idx == 0 && gl.AliasBinding != nil && !gl.AliasBinding.valid() {
+				att.expire(time.Now()) // retain pending restore until output identity is known
+				time.Sleep(200 * time.Millisecond)
+				continue // unknown bound selection cannot reclaim a positional primary
+			}
 			aliasRoutedThisTick := false
 
 			// Device-aliases routing: when the primary engine reports a newly-selected alias, point THIS
@@ -750,12 +782,13 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Attempt on change; on failure retry on a 3s throttle (NOT every tick — that flooded the log
 			// + hammered OwnTone when the target HomePod was momentarily missing).
 			if room.Idx == 0 && gl.SelAlias > 0 {
-				if gl.SelAlias != lastAlias || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
+				if aliasRouteChanged(gl.SelAlias, lastAlias, gl.AliasBinding, lastAliasBinding) || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
 					accepted, current := routeAliasOutputForIntent(room.OwnTone, gl.SelAlias, live, aliasRevision)
 					if !current {
 						time.Sleep(200 * time.Millisecond)
 						continue // no remaining work may use this obsolete snapshot
 					}
+					lastAliasBinding = copyAliasBinding(gl.AliasBinding)
 					if accepted {
 						aliasRoutedThisTick = true
 						lastAlias = gl.SelAlias
@@ -830,6 +863,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 								time.Sleep(200 * time.Millisecond)
 								continue
 							}
+							lastAliasBinding = copyAliasBinding(gl.AliasBinding)
 							lastAlias = gl.SelAlias
 							aliasRoutePending = !accepted
 							if !accepted {
@@ -1235,6 +1269,7 @@ func main() {
 	// spawn, select. DELETE /api/rooms/<id> — remove a speaker.
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
+	http.HandleFunc("/api/room-switch", roomSwitchHandler)
 	http.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -90,6 +90,21 @@ func (a *attention) release() {
 	}
 }
 
+// Expiry is local bookkeeping. Unknown output identity may retire a lease,
+// but cannot consume its pending restore or issue native effects.
+func (a *attention) expire(now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.expireLocked(now)
+}
+
+func (a *attention) expireLocked(now time.Time) {
+	if a.active && now.After(a.deadline) {
+		a.active = false
+		a.pendingRelease = true
+	}
+}
+
 // tick reports the duck's effect for one bridge cycle at time now, folding in auto-expiry. It's the
 // single point the bridge consults each loop:
 //
@@ -102,10 +117,7 @@ func (a *attention) release() {
 func (a *attention) tick(now time.Time) (hold bool, level int, released bool, restoreTo int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.active && now.After(a.deadline) {
-		a.active = false
-		a.pendingRelease = true
-	}
+	a.expireLocked(now)
 	if a.active {
 		return true, a.level, false, 0
 	}
