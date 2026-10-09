@@ -426,3 +426,183 @@ func TestGeneratedInvalidAliasMappingIsExplicitlyUnavailable(t *testing.T) {
 		t.Fatal("generated invalid mapping silently fell back to legacy")
 	}
 }
+
+// Native command admission fences held observations; an already admitted duck
+// retains its original lease for compensating restore after route retirement.
+// Wire receipts are inert manager fixtures, not AirPlay apply/restore proof.
+func TestLocalAliasRetiredDuringNativeObservationCannotDuck(t *testing.T) {
+	for _, boundary := range []string{"begin_observation", "update_observation", "begin_submitted"} {
+		for _, mutation := range []string{"room_registry", "alias_intent"} {
+			t.Run(boundary+"/"+mutation, func(t *testing.T) {
+				rooms, binding := setupLocalAliasRooms(t)
+				var live glLive
+				live.set(glStatus{SelAlias: 2, AliasBinding: binding})
+				att := &attention{}
+				if !att.engageOwned(testConversationA, att.challenge(), true, 5, "voice", maxAttentionTTL, time.Now()) {
+					t.Fatal("attention admission")
+				}
+				held, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				var once, releaseOnce sync.Once
+				var mu sync.Mutex
+				nativePuts, routePuts, releases := 0, 0, 0
+				armed := false
+				identity := nativeAttentionIdentity{testNativeProcess, "43", "1", "0", "1", "0", "1", "0", 65, 65, false}
+				backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					hold := armed && r.URL.Path == "/api/outputs/43/attention" && ((boundary == "begin_submitted" && r.Method == http.MethodPut) || (boundary != "begin_submitted" && r.Method == http.MethodGet))
+					mu.Unlock()
+					if hold {
+						once.Do(func() {
+							close(held)
+							select {
+							case <-release:
+							case <-r.Context().Done():
+							}
+						})
+					}
+					switch r.URL.Path {
+					case "/api/outputs":
+						w.Write([]byte(`{"outputs":[{"id":"42","name":"A","type":"AirPlay"},{"id":"43","name":"B","type":"AirPlay"}]}`))
+					case "/api/outputs/43/attention":
+						mu.Lock()
+						defer mu.Unlock()
+						if r.Method == http.MethodGet {
+							json.NewEncoder(w).Encode(nativeAttentionObservation{identity, "0"})
+							return
+						}
+						var command nativeAttentionCommand
+						if json.NewDecoder(r.Body).Decode(&command) != nil || command.Expected != identity {
+							t.Error("invalid/stale native command")
+							http.Error(w, "contract", 409)
+							return
+						}
+						nativePuts++
+						identity.Lease, identity.AttentionRevision, identity.Effective = "1", "1", command.Cap
+						if command.Action == "update" {
+							identity.AttentionRevision = "2"
+						}
+						if command.Action == "release" {
+							releases++
+							if identity.Base != 65 {
+								t.Error("restore lost original B base")
+							}
+							identity.AttentionRevision, identity.Effective, identity.Restoring = "3", identity.Base, true
+						}
+						result := nativeAttentionResult{Identity: identity, RequestID: command.RequestID, Operation: "1", Action: command.Action, Outcome: "desired_only", Current: true}
+						if command.Action == "release" {
+							result.Operation = "2"
+							identity.Lease = "0"
+							identity.Restoring = false
+						}
+						json.NewEncoder(w).Encode(result)
+					case "/api/outputs/set":
+						mu.Lock()
+						routePuts++
+						mu.Unlock()
+						w.WriteHeader(http.StatusNoContent)
+					default:
+						http.NotFound(w, r)
+					}
+				}))
+				t.Cleanup(func() {
+					releaseOnce.Do(func() { close(release) })
+					backend.CloseClientConnections()
+					backend.Close()
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						t.Error("route owner not joined")
+					}
+				})
+				if boundary == "update_observation" {
+					if !att.nativeTarget(backend.URL, "43") {
+						t.Fatal("original native lease not admitted")
+					}
+					if !att.engageOwned(testConversationA, att.challenge(), false, 5, "voice", maxAttentionTTL, time.Now()) {
+						t.Fatal("fresh heartbeat refused")
+					}
+				}
+				mu.Lock()
+				before := nativePuts
+				armed = true
+				mu.Unlock()
+				status, revision := live.routeSnapshot()
+				result := make(chan [2]bool, 1)
+				go func() {
+					defer close(done)
+					accepted, current := routeAliasOutputForAttentionIntent(backend.URL, status.SelAlias, &live, revision, att)
+					result <- [2]bool{accepted, current}
+				}()
+				select {
+				case <-held:
+				case <-time.After(5 * time.Second):
+					t.Fatal("native barrier not reached")
+				}
+				if mutation == "room_registry" {
+					store.mu.Lock()
+					err := store.saveLocked(&roomsFile{NextIdx: 2, Rooms: []*Room{rooms[1], rooms[0]}})
+					store.mu.Unlock()
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					fresh := *binding
+					fresh.RoomID = "r0"
+					live.set(glStatus{SelAlias: 1, AliasBinding: &fresh})
+				}
+				releaseOnce.Do(func() { close(release) })
+				select {
+				case got := <-result:
+					if got[0] {
+						t.Fatal("retired route accepted")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("route did not return")
+				}
+				mu.Lock()
+				nativeCount, routeCount := nativePuts-before, routePuts
+				mu.Unlock()
+				wantNative := 0
+				if boundary == "begin_submitted" {
+					wantNative = 1
+				}
+				if nativeCount != wantNative || routeCount != 0 {
+					t.Fatalf("retired route issued native duck=%d output selection=%d", nativeCount, routeCount)
+				}
+				att.mu.Lock()
+				grants := len(att.nativeGrants)
+				att.mu.Unlock()
+				if boundary == "begin_observation" {
+					if grants != 0 {
+						t.Fatal("retired route acquired native lease custody")
+					}
+					return
+				}
+				if grants != 1 {
+					t.Fatal("retirement lost original admitted lease custody")
+				}
+				if !att.nativeReconcile(backend.URL, "", false) {
+					t.Fatal("compensating original lease restore did not settle")
+				}
+				mu.Lock()
+				releaseCount, effective := releases, identity.Effective
+				mu.Unlock()
+				att.mu.Lock()
+				remaining := len(att.nativeGrants)
+				att.mu.Unlock()
+				if releaseCount != 1 || effective != 65 || remaining != 0 {
+					t.Fatalf("restore custody: releases=%d effective=%d grants=%d", releaseCount, effective, remaining)
+				}
+				if !att.nativeReconcile(backend.URL, "", false) {
+					t.Fatal("settled cleanup refused")
+				}
+				mu.Lock()
+				finalPuts := nativePuts
+				mu.Unlock()
+				if finalPuts != before+wantNative+1 {
+					t.Fatal("settled cleanup repeated a native write")
+				}
+			})
+		}
+	}
+}
