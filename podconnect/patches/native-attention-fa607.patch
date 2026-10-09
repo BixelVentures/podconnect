@@ -1,3 +1,5 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index b311abd32abfeb32f39d790673b80bee44a8e58d..f74c0c15d76ab9c1ee7b1683b15eb5684c8a1963 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
 @@ -166,3 +166,82 @@
@@ -83,6 +85,8 @@
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
 +airplay_callback_owner_LDFLAGS = -Wl,--gc-sections
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
+diff --git a/src/conffile.c b/src/conffile.c
+index 47d30a54c14af37a8cb023fe57e2166d8867ef8c..ae1519861028eaf892e9cf39e15844b879a056a9 100644
 --- a/src/conffile.c
 +++ b/src/conffile.c
 @@ -170,6 +170,8 @@
@@ -93,7 +97,309 @@
 +    CFG_STR("user_agent", "AirPlay/999.0.0", CFGF_NONE),
      CFG_END()
    };
-
+ 
+diff --git a/src/db.c b/src/db.c
+index b5c3f9235eda40721527c0b6088c19da6140e5ce..86530a1ab6d1fe9554157ee02ba5f02be96ad70f 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -4790,6 +4790,265 @@
+ }
+ 
+ /* Speakers */
++/* Crash custody uses the existing player-thread SQLite connection. No record is
++ * evicted: absent admission is proof only for a process registered on this DB. */
++static int
++attention_sql(char *sql)
++{
++  int ret = sql ? sqlite3_exec(hdl, sql, NULL, NULL, NULL) : SQLITE_NOMEM;
++  sqlite3_free(sql);
++  return ret == SQLITE_OK ? 0 : -1;
++}
++
++static int
++attention_query(char *sql, sqlite3_stmt **stmt)
++{
++  int ret = sql ? sqlite3_prepare_v2(hdl, sql, -1, stmt, NULL) : SQLITE_NOMEM;
++  sqlite3_free(sql);
++  return ret == SQLITE_OK ? 0 : -1;
++}
++
++static int
++attention_transaction_begin(void)
++{
++  sqlite3_stmt *stmt = NULL;
++  int sync, ret;
++  const char *journal;
++  /* The product never acknowledges custody committed to a volatile journal.
++   * Respect configured durability; do not silently tune unrelated SQLite use. */
++  if (!hdl || !sqlite3_get_autocommit(hdl)
++      || attention_query(sqlite3_mprintf("PRAGMA synchronous"), &stmt) < 0)
++    return -1;
++  ret = sqlite3_step(stmt);
++  sync = ret == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0;
++  sqlite3_finalize(stmt);
++  if (sync < 2 || attention_query(sqlite3_mprintf("PRAGMA journal_mode"), &stmt) < 0)
++    return -1;
++  ret = sqlite3_step(stmt);
++  journal = ret == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
++  ret = journal && strcmp(journal, "off") && strcmp(journal, "memory") ? 0 : -1;
++  sqlite3_finalize(stmt);
++  return ret < 0 ? -1 : attention_sql(sqlite3_mprintf("BEGIN IMMEDIATE"));
++}
++
++static int
++attention_transaction_end(int ret)
++{
++  if (ret < 0 || attention_sql(sqlite3_mprintf("COMMIT")) < 0)
++    {
++      attention_sql(sqlite3_mprintf("ROLLBACK"));
++      return -1;
++    }
++  return 0;
++}
++
++int
++db_attention_schema_init(void)
++{
++  char provenance[37];
++  int ret;
++  outputs_attention_uuid(provenance);
++  if (attention_transaction_begin() < 0) return -1;
++  ret = attention_sql(sqlite3_mprintf(
++    "CREATE TABLE IF NOT EXISTS native_attention_meta_v1 (singleton INTEGER PRIMARY KEY CHECK(singleton=1), provenance TEXT NOT NULL);"
++    "CREATE TABLE IF NOT EXISTS native_attention_process_v1 (process TEXT PRIMARY KEY, database_id TEXT NOT NULL);"
++    "CREATE TABLE IF NOT EXISTS native_attention_base_v1 (device TEXT PRIMARY KEY, volume INTEGER NOT NULL CHECK(volume BETWEEN 0 AND 100));"
++    "CREATE TABLE IF NOT EXISTS native_attention_origin_v1 (process TEXT NOT NULL, request TEXT NOT NULL, device TEXT NOT NULL, lease TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0, terminal_identity TEXT, terminal_request TEXT, terminal_operation TEXT, terminal_action INTEGER, code INTEGER, cseq INTEGER, PRIMARY KEY(process,request));"
++    "CREATE TABLE IF NOT EXISTS native_attention_attempt_v1 (process TEXT NOT NULL, request TEXT NOT NULL, device TEXT NOT NULL, operation TEXT NOT NULL, action INTEGER NOT NULL, outcome INTEGER NOT NULL, code INTEGER NOT NULL, cseq INTEGER NOT NULL, expected TEXT NOT NULL, identity TEXT NOT NULL, cap INTEGER NOT NULL, ttl INTEGER NOT NULL, origin_process TEXT NOT NULL, origin_request TEXT NOT NULL, recovery INTEGER NOT NULL, PRIMARY KEY(process,request));"
++    "INSERT OR IGNORE INTO native_attention_meta_v1 VALUES(1,%Q)", provenance));
++  return attention_transaction_end(ret);
++}
++
++int
++db_attention_process_register(const char *process)
++{
++  int ret;
++  if (!process || strlen(process) != 36 || attention_transaction_begin() < 0) return -1;
++  ret = attention_sql(sqlite3_mprintf("INSERT INTO native_attention_process_v1 SELECT %Q,provenance FROM native_attention_meta_v1 WHERE singleton=1", process));
++  return attention_transaction_end(ret);
++}
++
++int
++db_attention_base_get(uint64_t id, int *volume)
++{
++  sqlite3_stmt *stmt = NULL;
++  int ret;
++  if (attention_query(sqlite3_mprintf("SELECT volume FROM native_attention_base_v1 WHERE device='%" PRIu64 "'", id), &stmt) < 0) return -1;
++  ret = sqlite3_step(stmt);
++  if (ret == SQLITE_ROW) *volume = sqlite3_column_int(stmt, 0);
++  sqlite3_finalize(stmt);
++  return ret == SQLITE_ROW ? 0 : ret == SQLITE_DONE ? 1 : -1;
++}
++
++static int
++attention_base_write(uint64_t id, int volume)
++{
++  return attention_sql(sqlite3_mprintf("INSERT INTO native_attention_base_v1 VALUES('%" PRIu64 "',%d) ON CONFLICT(device) DO UPDATE SET volume=excluded.volume", id, volume));
++}
++
++int
++db_attention_base_save(uint64_t id, int volume)
++{
++  if (volume < 0 || volume > 100 || attention_transaction_begin() < 0) return -1;
++  return attention_transaction_end(attention_base_write(id, volume));
++}
++
++int
++db_attention_begin(uint64_t id, int volume, const struct output_attention_origin *origin, uint64_t lease)
++{
++  int ret;
++  if (attention_transaction_begin() < 0) return -1;
++  ret = attention_base_write(id, volume);
++  if (ret == 0)
++    ret = attention_sql(sqlite3_mprintf("INSERT INTO native_attention_origin_v1(process,request,device,lease) SELECT %Q,%Q,'%" PRIu64 "','%" PRIu64 "' FROM native_attention_process_v1 WHERE process=%Q", origin->process, origin->request_id, id, lease, origin->process));
++  if (ret == 0 && sqlite3_changes(hdl) != 1) ret = -1;
++  return attention_transaction_end(ret);
++}
++
++static void
++attention_state_encode(const struct output_attention_state *s, char text[512])
++{
++  snprintf(text, 512, "%s|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%" PRIu64 "|%d|%d|%d|%" PRIu64,
++    s->process,s->device_id,s->device_incarnation,s->session_epoch,s->base_revision,s->attention_revision,s->route_revision,s->lease,s->base_volume,s->effective_volume,s->restoring,s->last_release_operation);
++}
++
++static bool
++attention_uuid_valid(const char *uuid)
++{
++  int i;
++  if (!uuid || strlen(uuid) != 36) return false;
++  for (i = 0; i < 36; i++)
++    if (i == 8 || i == 13 || i == 18 || i == 23)
++      { if (uuid[i] != '-') return false; }
++    else if (!((uuid[i] >= '0' && uuid[i] <= '9') || (uuid[i] >= 'a' && uuid[i] <= 'f')))
++      return false;
++  return true;
++}
++
++static int
++attention_state_decode(const char *text, struct output_attention_state *s)
++{
++  int restoring, n = 0, fields;
++  memset(s, 0, sizeof(*s));
++  if (!text) return -1;
++  fields = sscanf(text, "%36[0-9a-f-]|%" SCNu64 "|%" SCNu64 "|%" SCNu64 "|%" SCNu64 "|%" SCNu64 "|%" SCNu64 "|%" SCNu64 "|%d|%d|%d|%" SCNu64 "%n",
++    s->process,&s->device_id,&s->device_incarnation,&s->session_epoch,&s->base_revision,&s->attention_revision,&s->route_revision,&s->lease,&s->base_volume,&s->effective_volume,&restoring,&s->last_release_operation,&n);
++  if (fields != 12 || text[n] || !attention_uuid_valid(s->process) || restoring < 0 || restoring > 1
++      || s->base_volume < 0 || s->base_volume > 100 || s->effective_volume < 0 || s->effective_volume > 100) return -1;
++  s->restoring = restoring;
++  return 0;
++}
++
++int
++db_attention_origin_get(uint64_t id, const struct output_attention_origin *origin, enum output_attention_recovery_state *state, struct output_attention_proof *proof)
++{
++  sqlite3_stmt *stmt = NULL;
++  int ret;
++  memset(proof, 0, sizeof(*proof));
++  *state = OUTPUT_RECOVERY_UNKNOWN;
++  if (attention_query(sqlite3_mprintf("SELECT p.database_id FROM native_attention_process_v1 p JOIN native_attention_meta_v1 m ON p.database_id=m.provenance WHERE p.process=%Q", origin->process), &stmt) < 0) return -1;
++  ret = sqlite3_step(stmt);
++  if (ret == SQLITE_ROW) snprintf(proof->database,sizeof(proof->database),"%s",sqlite3_column_text(stmt,0));
++  sqlite3_finalize(stmt);
++  if (ret != SQLITE_ROW) return ret == SQLITE_DONE ? 0 : -1;
++  if (!attention_uuid_valid(proof->database)) return -1;
++  proof->ledger_complete = true;
++  if (attention_query(sqlite3_mprintf("SELECT device,retired,terminal_identity,terminal_request,terminal_operation,terminal_action,code,cseq FROM native_attention_origin_v1 WHERE process=%Q AND request=%Q", origin->process,origin->request_id), &stmt) < 0) return -1;
++  ret = sqlite3_step(stmt);
++  if (ret == SQLITE_DONE) *state = OUTPUT_RECOVERY_NEVER_ADMITTED;
++  else if (ret == SQLITE_ROW)
++    {
++      uint64_t device;
++      if (safe_atou64((const char *)sqlite3_column_text(stmt,0),&device) < 0 || device != id) ret = SQLITE_ERROR;
++      else if (!sqlite3_column_int(stmt,1)) *state = OUTPUT_RECOVERY_PENDING;
++      else if (attention_state_decode((const char *)sqlite3_column_text(stmt,2),&proof->terminal_identity) < 0
++          || safe_atou64((const char *)sqlite3_column_text(stmt,4),&proof->terminal_operation) < 0) ret = SQLITE_ERROR;
++      else
++        {
++          snprintf(proof->terminal_request_id,sizeof(proof->terminal_request_id),"%s",sqlite3_column_text(stmt,3));
++          proof->terminal_action = sqlite3_column_int(stmt,5);
++          proof->terminal_response_code = sqlite3_column_int(stmt,6);
++          proof->terminal_request_cseq = sqlite3_column_int(stmt,7);
++          if (!proof->terminal_operation || !attention_uuid_valid(proof->terminal_request_id)
++              || proof->terminal_identity.device_id != id || proof->terminal_response_code != 200 || proof->terminal_request_cseq <= 0
++              || (proof->terminal_action != OUTPUT_ATTENTION_RELEASE && proof->terminal_action != OUTPUT_ATTENTION_RECOVER)) ret = SQLITE_ERROR;
++          else *state = OUTPUT_RECOVERY_ALREADY_RETIRED;
++        }
++    }
++  sqlite3_finalize(stmt);
++  return ret == SQLITE_ROW || ret == SQLITE_DONE ? 0 : -1;
++}
++
++int
++db_attention_origin_pending(uint64_t id)
++{
++  sqlite3_stmt *stmt = NULL;
++  int ret, pending;
++  if (attention_query(sqlite3_mprintf("SELECT 1 FROM native_attention_origin_v1 WHERE device='%" PRIu64 "' AND retired=0 LIMIT 1", id), &stmt) < 0) return -1;
++  ret = sqlite3_step(stmt);
++  pending = ret == SQLITE_ROW ? 1 : ret == SQLITE_DONE ? 0 : -1;
++  sqlite3_finalize(stmt);
++  return pending;
++}
++
++int
++db_attention_receipt_save(const struct output_attention_result *r, bool retired)
++{
++  char expected[512], identity[512];
++  int ret = 0;
++  if (attention_transaction_begin() < 0) return -1;
++  attention_state_encode(&r->identity,identity);
++  attention_state_encode(&r->command.expected,expected);
++  if (r->command.request_id[0])
++    ret = attention_sql(sqlite3_mprintf("INSERT INTO native_attention_attempt_v1 VALUES(%Q,%Q,'%" PRIu64 "','%" PRIu64 "',%d,%d,%d,%d,%Q,%Q,%d,%u,%Q,%Q,%d) ON CONFLICT(process,request) DO UPDATE SET outcome=excluded.outcome,code=excluded.code,cseq=excluded.cseq,recovery=excluded.recovery",r->identity.process,r->command.request_id,r->identity.device_id,r->operation,r->action,r->outcome,r->response_code,r->request_cseq,expected,identity,r->command.cap_volume,r->command.ttl_ms,r->command.origin.process,r->command.origin.request_id,r->recovery_state));
++  if (ret == 0 && retired)
++    {
++      ret = attention_sql(sqlite3_mprintf("UPDATE native_attention_origin_v1 SET retired=1,terminal_identity=%Q,terminal_request=%Q,terminal_operation='%" PRIu64 "',terminal_action=%d,code=%d,cseq=%d WHERE process=%Q AND request=%Q AND device='%" PRIu64 "' AND retired=0",identity,r->command.request_id,r->operation,r->action,r->response_code,r->request_cseq,r->command.origin.process,r->command.origin.request_id,r->identity.device_id));
++      if (ret == 0 && sqlite3_changes(hdl) != 1) ret = -1;
++    }
++  return attention_transaction_end(ret);
++}
++
++int
++db_attention_receipt_get(const char *process, uint64_t id, const char *request_id, struct output_attention_result *r)
++{
++  sqlite3_stmt *stmt = NULL;
++  enum output_attention_recovery_state origin_state;
++  int ret;
++  if (attention_query(sqlite3_mprintf("SELECT operation,action,outcome,code,cseq,expected,identity,cap,ttl,origin_process,origin_request,recovery FROM native_attention_attempt_v1 WHERE process=%Q AND request=%Q AND device='%" PRIu64 "'",process,request_id,id), &stmt) < 0) return -1;
++  ret = sqlite3_step(stmt);
++  if (ret == SQLITE_ROW)
++    {
++      memset(r,0,sizeof(*r));
++      if (safe_atou64((const char *)sqlite3_column_text(stmt,0),&r->operation) < 0
++          || attention_state_decode((const char *)sqlite3_column_text(stmt,5),&r->command.expected) < 0
++          || attention_state_decode((const char *)sqlite3_column_text(stmt,6),&r->identity) < 0) ret = SQLITE_ERROR;
++      r->action = r->command.action = sqlite3_column_int(stmt,1);
++      r->outcome = sqlite3_column_int(stmt,2);
++      r->response_code = sqlite3_column_int(stmt,3);
++      r->request_cseq = sqlite3_column_int(stmt,4);
++      r->command.cap_volume = sqlite3_column_int(stmt,7);
++      r->command.ttl_ms = sqlite3_column_int(stmt,8);
++      snprintf(r->command.request_id,sizeof(r->command.request_id),"%s",request_id);
++      snprintf(r->command.origin.process,sizeof(r->command.origin.process),"%s",sqlite3_column_text(stmt,9));
++      snprintf(r->command.origin.request_id,sizeof(r->command.origin.request_id),"%s",sqlite3_column_text(stmt,10));
++      r->recovery_state = sqlite3_column_int(stmt,11);
++      if (!r->operation || r->action < OUTPUT_ATTENTION_BEGIN || r->action > OUTPUT_ATTENTION_RECOVER
++          || r->outcome < OUTPUT_ATTENTION_PENDING || r->outcome > OUTPUT_ATTENTION_NO_EFFECT
++          || r->recovery_state < OUTPUT_RECOVERY_NONE || r->recovery_state > OUTPUT_RECOVERY_UNKNOWN
++          || r->command.cap_volume < 0 || r->command.cap_volume > 100 || r->command.ttl_ms > 15000
++          || r->identity.device_id != id || strcmp(r->identity.process, process)
++          || !attention_uuid_valid(r->command.request_id)
++          || ((r->action == OUTPUT_ATTENTION_RECOVER || r->command.origin.process[0] || r->command.origin.request_id[0])
++              && (!attention_uuid_valid(r->command.origin.process) || !attention_uuid_valid(r->command.origin.request_id))))
++        ret = SQLITE_ERROR;
++    }
++  sqlite3_finalize(stmt);
++  if (ret == SQLITE_ROW && r->action == OUTPUT_ATTENTION_RECOVER
++      && db_attention_origin_get(id,&r->command.origin,&origin_state,&r->recovery_proof) < 0) return -1;
++  return ret == SQLITE_ROW ? 0 : ret == SQLITE_DONE ? 1 : -1;
++}
++
+ int
+ db_speaker_save(struct output_device *device)
+ {
+@@ -7449,6 +7708,9 @@
+ 	}
+     }
+ 
++  if (db_attention_schema_init() < 0)
++    { db_perthread_deinit(); goto error; }
++
+   db_set_cfg_names();
+ 
+   CHECK_ERR(L_DB, db_files_get_count(&files, NULL, NULL));
+diff --git a/src/db.h b/src/db.h
+index 38ae5d5d8a5927fcd04e8af36ce908637446c637..01a6cbb40f7ffe180bbaecd403cecbcee5f86bb2 100644
+--- a/src/db.h
++++ b/src/db.h
+@@ -1035,4 +1035,15 @@
+ void
+ db_deinit(void);
+ 
++/* Native crash custody, on the existing thread-local SQLite connection. */
++int db_attention_schema_init(void);
++int db_attention_base_get(uint64_t id, int *volume);
++int db_attention_base_save(uint64_t id, int volume);
++int db_attention_begin(uint64_t id, int volume, const struct output_attention_origin *origin, uint64_t lease);
++int db_attention_origin_get(uint64_t id, const struct output_attention_origin *origin, enum output_attention_recovery_state *state, struct output_attention_proof *proof);
++int db_attention_process_register(const char *process);
++int db_attention_origin_pending(uint64_t id);
++int db_attention_receipt_save(const struct output_attention_result *result, bool retired);
++int db_attention_receipt_get(const char *process, uint64_t id, const char *request_id, struct output_attention_result *result);
++
+ #endif /* !__DB_H__ */
+diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
+index 2d5d0917c46377da1d22f3ba89898dc59681bc8f..6e5bcc4bee7c07858fb8d7390d8e59e10aa48e0d 100644
 --- a/src/evrtsp/evrtsp.h
 +++ b/src/evrtsp/evrtsp.h
 @@ -108,6 +108,10 @@
@@ -121,6 +427,8 @@
  const char *evrtsp_request_uri(struct evrtsp_request *req);
  
  /* Interfaces for dealing with headers */
+diff --git a/src/evrtsp/rtsp-internal.h b/src/evrtsp/rtsp-internal.h
+index f00d58faa1419629680e9503fecbf19ff8190538..685077a1ceefb5f824c1c9df77271d5138589486 100644
 --- a/src/evrtsp/rtsp-internal.h
 +++ b/src/evrtsp/rtsp-internal.h
 @@ -55,7 +55,15 @@
@@ -139,6 +447,8 @@
  	int fd;
  	struct event ev;
  	struct event close_ev;
+diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
+index 4f70d48d6ab1e86241f405214b37f6c3f75e2fb8..00328854cfa2528517dbd19e3f0129df4b6dabe2 100644
 --- a/src/evrtsp/rtsp.c
 +++ b/src/evrtsp/rtsp.c
 @@ -679,6 +679,14 @@
@@ -293,6 +603,8 @@
  }
  
  /*
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index 619dfee0a2f0b3c004db0c3f7b54fe5509c6db4e..f453e5fcdb68719990e701e9ff62d401b0495da3 100644
 --- a/src/httpd_jsonapi.c
 +++ b/src/httpd_jsonapi.c
 @@ -1607,6 +1607,8 @@
@@ -313,7 +625,7 @@
    json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
    json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
    json_object_object_add(output, "supported_formats", supported_formats);
-@@ -1650,6 +1654,200 @@
+@@ -1650,6 +1654,249 @@
  
    output = speaker_to_json(spk);
    json_object_array_add(outputs, output);
@@ -349,8 +661,8 @@
 +static json_object *
 +attention_result_to_json(const struct output_attention_result *result)
 +{
-+  const char *names[] = { "pending", "desired_only", "protocol_accepted", "failed", "unknown" };
-+  const char *actions[] = { "begin", "update", "release", "flush", "manual" };
++  const char *names[] = { "pending", "desired_only", "protocol_accepted", "failed", "unknown", "no_effect" };
++  const char *actions[] = { "begin", "update", "release", "flush", "manual", "recover" };
 +  json_object *object = json_object_new_object();
 +  json_object_object_add(object, "identity", attention_state_to_json(&result->identity));
 +  json_object_object_add(object, "request_id", json_object_new_string(result->command.request_id));
@@ -360,6 +672,29 @@
 +  json_object_object_add(object, "response_code", json_object_new_int(result->response_code));
 +  json_object_object_add(object, "request_cseq", json_object_new_int(result->request_cseq));
 +  json_object_object_add(object, "current", json_object_new_boolean(result->current));
++  if (result->action == OUTPUT_ATTENTION_RECOVER)
++    {
++      const char *states[] = {"none","pending","restored","already_retired","never_admitted","unknown"};
++      json_object *origin = json_object_new_object(), *proof = json_object_new_object();
++      json_object_object_add(origin,"process",json_object_new_string(result->command.origin.process));
++      json_object_object_add(origin,"request_id",json_object_new_string(result->command.origin.request_id));
++      json_object_object_add(object,"origin",origin);
++      json_object_object_add(object,"recovery_state",json_object_new_string(states[result->recovery_state]));
++      json_object_object_add(proof,"database",json_object_new_string(result->recovery_proof.database));
++      json_object_object_add(proof,"ledger_complete",json_object_new_boolean(result->recovery_proof.ledger_complete));
++      if (result->recovery_proof.terminal_operation)
++        {
++          json_object *terminal = json_object_new_object();
++          json_object_object_add(terminal,"identity",attention_state_to_json(&result->recovery_proof.terminal_identity));
++          json_object_object_add(terminal,"request_id",json_object_new_string(result->recovery_proof.terminal_request_id));
++          attention_json_u64(terminal,"operation",result->recovery_proof.terminal_operation);
++          json_object_object_add(terminal,"action",json_object_new_string(actions[result->recovery_proof.terminal_action]));
++          json_object_object_add(terminal,"response_code",json_object_new_int(result->recovery_proof.terminal_response_code));
++          json_object_object_add(terminal,"request_cseq",json_object_new_int(result->recovery_proof.terminal_request_cseq));
++          json_object_object_add(proof,"terminal",terminal);
++        }
++      json_object_object_add(object,"recovery_proof",proof);
++    }
 +  return object;
 +}
 +
@@ -442,6 +777,9 @@
 +    return HTTP_NOTFOUND;
 +  reply = attention_state_to_json(&state);
 +  attention_json_u64(reply, "last_release_operation", state.last_release_operation);
++  json_object_object_add(reply,"recovery_idle",json_object_new_boolean(state.recovery_idle));
++  attention_json_u64(reply,"last_drained_operation",state.last_drained_operation);
++  json_object_object_add(reply,"last_drained_request_id",json_object_new_string(state.last_drained_request_id));
 +  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
 +  jparse_free(reply);
 +  return HTTP_OK;
@@ -457,7 +795,7 @@
 +  const char *action, *request_id;
 +  int i;
 +  int ret = HTTP_BADREQUEST;
-+  if (!body || !json_object_is_type(body, json_type_object) || json_object_object_length(body) != 5
++  if (!body || !json_object_is_type(body, json_type_object) || (json_object_object_length(body) != 5 && json_object_object_length(body) != 6)
 +      || safe_atou64(hreq->path_parts[2], &id) < 0
 +      || !json_object_object_get_ex(body, "expected", &expected)
 +      || attention_parse_state(expected, &request.expected) < 0 || request.expected.device_id != id
@@ -479,7 +817,30 @@
 +  else if (strcmp(action, "update") == 0) request.action = OUTPUT_ATTENTION_UPDATE;
 +  else if (strcmp(action, "release") == 0) request.action = OUTPUT_ATTENTION_RELEASE;
 +  else if (strcmp(action, "manual") == 0) request.action = OUTPUT_ATTENTION_MANUAL;
++  else if (strcmp(action, "recover") == 0) request.action = OUTPUT_ATTENTION_RECOVER;
 +  else goto out; // FLUSH is admitted only by the native selection owner.
++  if (request.action == OUTPUT_ATTENTION_RECOVER)
++    {
++      json_object *origin;
++      const char *keys[] = {"process","request_id"};
++      char *destinations[] = {request.origin.process,request.origin.request_id};
++      int k;
++      if (json_object_object_length(body) != 6 || !json_object_object_get_ex(body,"origin",&origin)
++          || !json_object_is_type(origin,json_type_object) || json_object_object_length(origin) != 2) goto out;
++      for (k=0;k<2;k++)
++        {
++          const char *text;
++          if (!jparse_contains_key(origin,keys[k],json_type_string)) goto out;
++          text = jparse_str_from_obj(origin,keys[k]);
++          if (!text || strlen(text) != 36) goto out;
++          for (i=0;i<36;i++)
++            if (i == 8 || i == 13 || i == 18 || i == 23)
++              { if (text[i] != '-') goto out; }
++            else if (!((text[i]>='0' && text[i]<='9') || (text[i]>='a' && text[i]<='f'))) goto out;
++          memcpy(destinations[k],text,36);
++        }
++    }
++  else if (json_object_object_length(body) != 5) goto out;
 +  json_object_object_get_ex(body, "cap_volume", &field);
 +  if (json_object_get_int64(field) < 0 || json_object_get_int64(field) > 100) goto out;
 +  request.cap_volume = json_object_get_int(field);
@@ -514,7 +875,7 @@
  }
  
  /*
-@@ -1858,6 +2056,7 @@
+@@ -1858,6 +2105,7 @@
    json_object *outputs;
    json_object *output_id;
    int nspk, i, ret;
@@ -522,7 +883,7 @@
    uint64_t *ids;
  
    request = jparse_obj_from_evbuffer(hreq->in_body);
-@@ -1890,7 +2089,7 @@
+@@ -1890,7 +2138,7 @@
  	}
  
        if (ret == 0)
@@ -531,7 +892,7 @@
  
        free(ids);
      }
-@@ -1899,7 +2098,7 @@
+@@ -1899,7 +2147,7 @@
  
    jparse_free(request);
  
@@ -540,7 +901,7 @@
  }
  
  static int
-@@ -4692,6 +4891,9 @@
+@@ -4692,6 +4940,9 @@
      { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
      { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
      { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
@@ -550,706 +911,22 @@
      { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
---- a/src/outputs/airplay.c
-+++ b/src/outputs/airplay.c
-@@ -19,6 +19,7 @@
- #endif
- 
- #include <stdio.h>
-+#include <stddef.h>
- #include <stdbool.h>
- #include <unistd.h>
- #include <stdint.h>
-@@ -218,6 +219,8 @@
-   struct evbuffer *encoded_buffer;
- 
-   struct rtp_session *rtp_session;
-+  uint64_t packet_serial;
-+  uint64_t *packet_serials; // Mirrors existing ring slots; no audio/ring reset.
- 
-   struct rtcp_timestamp cur_stamp;
- 
-@@ -237,10 +240,23 @@
-   struct airplay_master_session *next;
- };
- 
-+struct airplay_attention_request;
-+struct airplay_seq_ctx;
-+
- struct airplay_session
- {
-   uint64_t device_id;
-   int callback_id;
-+  uint64_t callback_revision; // Command binding, distinct from reusable output slot.
-+  bool callback_revision_exhausted;
-+  uint64_t device_incarnation;
-+  uint64_t session_epoch;
-+  struct airplay_attention_request *attention_requests;
-+  struct airplay_seq_ctx *sequence_requests;
-+  bool attention_managed;
-+  bool attention_suspended;
-+  bool attention_retiring;
-+  uint64_t emission_floor;
- 
-   struct airplay_master_session *master_session;
- 
-@@ -310,6 +326,15 @@
-   uint32_t ptpd_slave_id;
- 
-   struct airplay_session *next;
-+};
-+
-+
-+struct airplay_attention_request
-+{
-+  struct output_attention_result operation;
-+  struct airplay_session *session;
-+  int cseq;
-+  struct airplay_attention_request *next;
- };
- 
- struct airplay_metadata
-@@ -371,6 +396,12 @@
-   struct airplay_session *session;
-   void *payload_make_arg;
-   const char *log_caller;
-+  int callback_id;
-+  uint64_t callback_revision;
-+  uint64_t device_incarnation;
-+  uint64_t session_epoch;
-+  bool callback_owned;
-+  struct airplay_seq_ctx *next;
- };
- 
- 
-@@ -491,6 +522,9 @@
- sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
- static void
- sequence_continue(struct airplay_seq_ctx *seq_ctx);
-+static void
-+sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
-+    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent);
- 
- 
- /* ------------------------------- MISC HELPERS ----------------------------- */
-@@ -1091,7 +1125,11 @@
- 	state = OUTPUT_STATE_FAILED;
-     }
- 
--  outputs_cb(session->callback_id, session->device_id, state);
-+  if (session->attention_managed)
-+    outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
-+        session->session_epoch, session, state);
-+  else
-+    outputs_cb(session->callback_id, session->device_id, state);
-   session->callback_id = -1;
- }
- 
-@@ -1103,6 +1141,7 @@
- 
-   outputs_quality_unsubscribe(&ams->rtp_session->quality);
-   rtp_session_free(ams->rtp_session);
-+  free(ams->packet_serials);
- 
-   transcode_encode_cleanup(&ams->encode_ctx);
- 
-@@ -1173,7 +1212,9 @@
-   clock_id = use_ptp ? ptpd_clock_id_get() : 0;
- 
-   ams->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
--  if (!ams->rtp_session)
-+  if (ams->rtp_session)
-+    ams->packet_serials = calloc(ams->rtp_session->pktbuf_size, sizeof(*ams->packet_serials));
-+  if (!ams->rtp_session || !ams->packet_serials)
-     {
-       goto error;
-     }
-@@ -1233,6 +1274,24 @@
-     {
-       evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
-       evrtsp_connection_free(session->ctrl);
-+    }
-+
-+  // The actual connection has retired all queued requests/callback events.
-+  // Executing contexts unlinked before entering handlers; only queue-owned
-+  // contexts remain here, including sequences admitted before PC9 management.
-+  while (session->sequence_requests)
-+    {
-+      struct airplay_seq_ctx *pending = session->sequence_requests;
-+      session->sequence_requests = pending->next;
-+      free(pending);
-+    }
-+
-+  while (session->attention_requests)
-+    {
-+      struct airplay_attention_request *pending = session->attention_requests;
-+      session->attention_requests = pending->next;
-+      outputs_attention_complete(&pending->operation, OUTPUT_ATTENTION_UNKNOWN, 0, pending->cseq);
-+      free(pending);
-     }
- 
-   if (session->deferredev)
-@@ -1264,6 +1323,9 @@
- session_cleanup(struct airplay_session *session)
- {
-   struct airplay_session *s;
-+  bool retiring = session->attention_retiring;
-+  uint64_t id = session->device_id, incarnation = session->device_incarnation, epoch = session->session_epoch;
-+  const void *old_session = session;
- 
-   if (session == airplay_sessions)
-     airplay_sessions = airplay_sessions->next;
-@@ -1278,9 +1340,11 @@
- 	s->next = session->next;
-     }
- 
--  outputs_device_session_remove(session->device_id);
-+  outputs_device_session_remove_exact(session->device_id, session);
- 
-   session_free(session);
-+  if (retiring)
-+    outputs_attention_retirement_finished(id, incarnation, epoch, old_session);
- }
- 
- static void
-@@ -1314,6 +1378,27 @@
- 
-   evutil_timerclear(&tv);
-   evtimer_add(session->deferredev, &tv);
-+}
-+
-+// Numeric output callback slots may be reused. Advance command currency on
-+// every actual binding, even if the callback number happens to be unchanged.
-+static bool
-+session_callback_bind(struct airplay_session *session, int callback_id)
-+{
-+  session->callback_id = callback_id;
-+  if (session->callback_revision == UINT64_MAX)
-+    {
-+      if (session->attention_managed)
-+        {
-+          session->callback_revision_exhausted = true;
-+          session->attention_suspended = true;
-+          deferred_session_failure(session);
-+          return false;
-+        }
-+      return true; // Ordinary sessions do not consult this added currency.
-+    }
-+  session->callback_revision++;
-+  return true;
- }
- 
- static void
-@@ -1594,7 +1679,7 @@
-   CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
- 
-   session->devname = strdup(device->name);
--  session->volume = device->volume;
-+  session->volume = outputs_device_effective_volume(device);
-   session->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
- 
-   session->state = AIRPLAY_STATE_STOPPED;
-@@ -1603,6 +1688,7 @@
- 
-   session->device_id = device->id;
-   session->callback_id = callback_id;
-+  session->callback_revision = 1;
- 
-   session->server_fd = -1;
- 
-@@ -1636,7 +1722,15 @@
-   airplay_sessions = session;
- 
-   // rs is now the official device session
--  outputs_device_session_add(device->id, session);
-+  if (outputs_device_session_add(device->id, session) < 0)
-+    {
-+      session_cleanup(session);
-+      return NULL;
-+    }
-+  session->device_incarnation = device->incarnation;
-+  session->session_epoch = device->session_epoch;
-+  session->attention_managed = device->attention_lease != 0;
-+  session->emission_floor = session->master_session->packet_serial + 1;
- 
-   return session;
- 
-@@ -1879,12 +1973,202 @@
-   if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
-     return 0;
- 
--  session->volume = device->volume;
--  session->callback_id = callback_id;
-+  session->volume = outputs_device_effective_volume(device);
-+  if (!session_callback_bind(session, callback_id))
-+    return 1; // Existing deferred failure retains and resolves this obligation.
- 
-   sequence_start(AIRPLAY_SEQ_SEND_VOLUME, session, NULL, "set_volume_one");
- 
-   return 1;
-+}
-+
-+
-+static void
-+attention_request_remove(struct airplay_attention_request *context)
-+{
-+  struct airplay_attention_request **link = &context->session->attention_requests;
-+
-+  while (*link && *link != context)
-+    link = &(*link)->next;
-+  if (*link)
-+    *link = context->next;
-+}
-+
-+static void
-+attention_response_cb(struct evrtsp_request *request, void *arg)
-+{
-+  struct airplay_attention_request *context = arg;
-+  struct airplay_session *session = context->session;
-+  enum output_attention_outcome outcome;
-+  const char *cseq;
-+  int observed_cseq = 0;
-+  int code = request ? request->response_code : 0;
-+
-+  attention_request_remove(context);
-+  session->reqs_in_flight--;
-+  if (!session->reqs_in_flight)
-+    evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
-+
-+  cseq = request ? evrtsp_find_header(request->input_headers, "CSeq") : NULL;
-+  if (!request || !cseq || safe_atoi32(cseq, &observed_cseq) < 0 || observed_cseq != context->cseq)
-+    outcome = OUTPUT_ATTENTION_UNKNOWN;
-+  else if (code != RTSP_OK)
-+    outcome = OUTPUT_ATTENTION_FAILED;
-+  else
-+    outcome = OUTPUT_ATTENTION_PROTOCOL_ACCEPTED;
-+
-+  outputs_attention_complete(&context->operation, outcome, code, context->cseq);
-+  free(context);
-+}
-+
-+static int
-+attention_dispatch_current(void *arg)
-+{
-+  const struct airplay_attention_request *context = arg;
-+  struct output_attention_result retained;
-+  struct output_device *device = outputs_device_get(context->operation.identity.device_id);
-+
-+  return device && !context->session->attention_retiring && device->session == context->session
-+    && device->incarnation == context->operation.identity.device_incarnation
-+    && device->session_epoch == context->operation.identity.session_epoch
-+    && outputs_attention_result_get(context->operation.identity.process, context->operation.operation, &retained) == 0
-+    && retained.outcome == OUTPUT_ATTENTION_PENDING
-+    && (context->operation.action == OUTPUT_ATTENTION_FLUSH
-+        ? (device->route_revision == context->operation.identity.route_revision)
-+        : retained.current);
-+}
-+
-+static int
-+airplay_attention_set(struct output_device *device, const struct output_attention_result *operation)
-+{
-+  struct airplay_session *session = device->session;
-+  struct airplay_attention_request *context;
-+  struct evrtsp_request *request;
-+  float mapped;
-+  char volume[32];
-+
-+  if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
-+    return 0; // Desired-only, no native request or fabricated acceptance.
-+  if (session->device_incarnation != operation->identity.device_incarnation
-+      || session->session_epoch != operation->identity.session_epoch)
-+    return -1;
-+  context = calloc(1, sizeof(*context));
-+  if (!context)
-+    return -1;
-+  context->operation = *operation;
-+  context->session = session;
-+  context->cseq = session->cseq;
-+  request = evrtsp_request_new(attention_response_cb, context);
-+  if (!request)
-+    { free(context); return -1; }
-+  if (request_headers_add(request, session,
-+      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER) < 0)
-+    goto error;
-+  if (operation->action == OUTPUT_ATTENTION_FLUSH)
-+    {
-+      char info[64];
-+      struct rtp_session *rtp = session->master_session->rtp_session;
-+      snprintf(info, sizeof(info), "seq=%" PRIu16 ";rtptime=%u", rtp->seqnum, rtp->pos);
-+      evrtsp_add_header(request->output_headers, "RTP-Info", info);
-+    }
-+  else
-+    {
-+      evrtsp_add_header(request->output_headers, "Content-Type", "text/parameters");
-+      mapped = airplay_volume_from_pct(operation->identity.effective_volume, session->devname);
-+      snprintf(volume, sizeof(volume), "-%d.%06d", -(int)mapped, -(int)(1000000.0 * (mapped - (int)mapped)));
-+      if (evbuffer_add_printf(request->output_buffer, "volume: %s\r\n", volume) < 0)
-+        goto error;
-+    }
-+  session->attention_managed = true;
-+
-+  // The immutable payload is built before queueing. Existing CSeq/transport,
-+  // cipher and request ownership are reused; no alternate session or mixer.
-+  // Register before guarded enqueue. Veto completion is deferred on the existing
-+  // connection event; connection_free cancels it and the session drains contexts.
-+  context->next = session->attention_requests;
-+  session->attention_requests = context;
-+  evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
-+  session->reqs_in_flight++;
-+  if (evrtsp_make_request_guarded(session->ctrl, request,
-+      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER,
-+      session->session_url, attention_dispatch_current, context) < 0)
-+    {
-+      // Guarded negative return detached only this inserted request; no callback.
-+      attention_request_remove(context);
-+      session->reqs_in_flight--;
-+      if (!session->reqs_in_flight)
-+        evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
-+      goto error;
-+    }
-+  return 1; // The connection now owns the request and its deferred completion.
-+
-+ error:
-+  evrtsp_request_free(request);
-+  free(context);
-+  return -1;
-+}
-+
-+static int
-+airplay_attention_suspend(struct output_device *device, const struct output_attention_result *operation)
-+{
-+  struct airplay_session *session = device->session;
-+  if (!session)
-+    return 0;
-+  session->attention_managed = true;
-+  session->attention_suspended = true;
-+  return airplay_attention_set(device, operation);
-+}
-+
-+static void
-+airplay_attention_resume(struct output_device *device)
-+{
-+  struct airplay_session *session = device->session;
-+  struct output_attention_result barrier;
-+  struct output_attention_state current;
-+  if (!session || session->attention_retiring || !session->attention_managed || session->device_incarnation != device->incarnation
-+      || session->session_epoch != device->session_epoch || !session->attention_suspended)
-+    return;
-+  if (!device->route_operation)
-+    {
-+      // A reselection needs its own real FLUSH; an old route's callback is not permission.
-+      outputs_attention_route_barrier(device);
-+      return;
-+    }
-+  if (outputs_attention_state_get(device->id, &current) < 0
-+      || outputs_attention_result_get(current.process, device->route_operation, &barrier) < 0
-+      || barrier.action != OUTPUT_ATTENTION_FLUSH
-+      || barrier.identity.device_incarnation != device->incarnation
-+      || barrier.identity.session_epoch != device->session_epoch
-+      || barrier.identity.route_revision != device->route_revision
-+      || barrier.outcome != OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)
-+    return; // Failed/unknown/obsolete FLUSH never grants native emission.
-+  session->attention_suspended = false;
-+  session->emission_floor = session->master_session->packet_serial + 1;
-+}
-+
-+static bool
-+attention_emission_current(struct airplay_session *session, const struct rtp_packet *packet)
-+{
-+  struct output_device *device;
-+  struct airplay_master_session *master;
-+  ptrdiff_t slot;
-+
-+  if (session->attention_retiring)
-+    return false;
-+  if (!session->attention_managed)
-+    return true; // Ordinary legacy sessions retain their original contract.
-+  device = outputs_device_get(session->device_id);
-+  if (!device || !device->selected || session->attention_suspended
-+      || device->session != session || device->incarnation != session->device_incarnation
-+      || device->session_epoch != session->session_epoch || device->route_revision == UINT64_MAX)
-+    return false;
-+  if (!packet)
-+    return true; // Control packets have the same destination/session fence.
-+  master = session->master_session;
-+  slot = packet - master->rtp_session->pktbuf;
-+  return slot >= 0 && (size_t)slot < master->rtp_session->pktbuf_size
-+    && master->packet_serial != UINT64_MAX && master->packet_serials[slot]
-+    && master->packet_serials[slot] >= session->emission_floor;
- }
- 
- static void
-@@ -1958,7 +2242,7 @@
-   ssize_t sent;
-   int ret;
- 
--  if (!session)
-+  if (!session || !attention_emission_current(session, pkt))
-     return -1;
- 
-   if (session->supports_encryption)
-@@ -2011,6 +2295,8 @@
-   int fd;
-   int ret;
- 
-+  if (!attention_emission_current(session, NULL))
-+    return;
-   switch (session->family)
-     {
-       case AF_INET:
-@@ -2089,6 +2375,9 @@
-     return -1;
- 
-   pkt = rtp_packet_next(ams->rtp_session, len, ams->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
-+  if (ams->packet_serial != UINT64_MAX)
-+    ams->packet_serial++;
-+  ams->packet_serials[pkt - ams->rtp_session->pktbuf] = ams->packet_serial;
- 
-   evbuffer_remove(ams->encoded_buffer, pkt->payload, pkt->payload_len);
- 
-@@ -3702,13 +3991,46 @@
- 
- 
- static void
-+sequence_context_remove(struct airplay_seq_ctx *context)
-+{
-+  struct airplay_seq_ctx **link = &context->session->sequence_requests;
-+  while (*link && *link != context)
-+    link = &(*link)->next;
-+  if (*link == context)
-+    *link = context->next;
-+  context->next = NULL;
-+}
-+
-+static bool
-+sequence_callback_current(const struct airplay_seq_ctx *context)
-+{
-+  const struct airplay_session *session = context->session;
-+  struct output_device *device;
-+  if (!session->attention_managed || !context->callback_owned)
-+    return true;
-+  device = outputs_device_get(session->device_id);
-+  return device && device->session == session
-+      && device->incarnation == context->device_incarnation
-+      && device->session_epoch == context->session_epoch
-+      && session->device_incarnation == context->device_incarnation
-+      && session->session_epoch == context->session_epoch
-+      && !session->callback_revision_exhausted
-+      && session->callback_revision == context->callback_revision
-+      && session->callback_id == context->callback_id;
-+}
-+
-+static void
- sequence_continue_cb(struct evrtsp_request *req, void *arg)
- {
-   struct airplay_seq_ctx *seq_ctx = arg;
-   struct airplay_seq_request *cur_request = seq_ctx->cur_request;
-   struct airplay_session *session = seq_ctx->session;
-   enum airplay_seq_type seq_type;
--
-+  bool current = sequence_callback_current(seq_ctx);
-+
-+  // Transfer custody to this executing callback before any handler can free
-+  // the session/connection and drain its other queued contexts.
-+  sequence_context_remove(seq_ctx);
-   session->reqs_in_flight--;
-   if (!session->reqs_in_flight)
-     evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
-@@ -3721,13 +4043,23 @@
- 
-   if (req->response_code != RTSP_OK)
-     {
--      if (!cur_request->proceed_on_rtsp_not_ok)
-+      // A superseded startup failure still tears down the real connection; it
-+      // cannot run its obsolete IPv6/auth retry handler under a newer STOP.
-+      if (!current || !cur_request->proceed_on_rtsp_not_ok)
- 	{
- 	  DPRINTF(E_LOG, L_AIRPLAY, "Response to %s from '%s' was negative, aborting (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
- 	  goto error;
- 	}
- 
-       DPRINTF(E_WARN, L_AIRPLAY, "Response to %s from '%s' was negative, proceeding anyway (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
-+    }
-+
-+  if (!current)
-+    {
-+      // Successful old work owns only its context/accounting. In particular it
-+      // cannot parse state, launch pairing, or acknowledge a reused STOP slot.
-+      free(seq_ctx);
-+      return;
-     }
- 
-   // We don't check that the reply CSeq matches the request CSeq, because some
-@@ -3743,7 +4075,7 @@
- 	    goto error;
- 
- 	  // Handler wanted to start a new sequence
--	  sequence_start(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller);
-+	  sequence_start_bound(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller, seq_ctx);
- 	  free(seq_ctx);
- 	  return;
- 	}
-@@ -3757,14 +4089,25 @@
-       return;
-     }
- 
--  if (seq_ctx->on_success)
-+  // Pair completion starts another sequence through the same original command,
-+  // not a fresh ticket sampled from a callback binding that may have changed.
-+  if (session->attention_managed && seq_ctx->callback_owned
-+      && seq_ctx->on_success == session_pair_success && session->next_seq != AIRPLAY_SEQ_CONTINUE)
-+    {
-+      seq_type = session->next_seq;
-+      session->next_seq = AIRPLAY_SEQ_CONTINUE;
-+      sequence_start_bound(seq_type, session, NULL, "pair_success", seq_ctx);
-+    }
-+  else if (seq_ctx->on_success)
-     seq_ctx->on_success(session);
- 
-   free(seq_ctx);
-   return;
- 
-  error:
--  if (seq_ctx->on_error)
-+  if (!current && session->attention_managed && seq_ctx->callback_owned)
-+    session_failure(session); // Real terminal failure, never stale retry/auth mutation.
-+  else if (seq_ctx->on_error)
-     seq_ctx->on_error(session);
- 
-   free(seq_ctx);
-@@ -3778,6 +4121,10 @@
-   struct evrtsp_request *req = NULL;
-   const char *uri;
-   int ret;
-+
-+  // Re-register a continuing context before it becomes queue-owned again.
-+  seq_ctx->next = session->sequence_requests;
-+  session->sequence_requests = seq_ctx;
- 
-   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
-   if (!req)
-@@ -3803,6 +4150,7 @@
- 	    }
- 
- 	  evrtsp_request_free(req);
-+          sequence_context_remove(seq_ctx);
- 	  sequence_continue(seq_ctx);
- 	  return;
-         }
-@@ -3830,6 +4178,8 @@
-   if (req)
-     evrtsp_request_free(req);
- 
-+  sequence_context_remove(seq_ctx);
-+
-   // Sets status to FAILED, gives status to player and frees session. Must be
-   // deferred, otherwise sequence_start() could invalidate the session, meaning
-   // any dereference of the session by the caller after sequence_start() would
-@@ -3841,7 +4191,8 @@
- 
- // All errors that may occur during a sequence are called back async
- static void
--sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
-+sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
-+    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent)
- {
-   struct airplay_seq_ctx *seq_ctx;
- 
-@@ -3853,8 +4204,23 @@
-   seq_ctx->on_error = airplay_seq_definition[seq_type].on_error;
-   seq_ctx->payload_make_arg = arg;
-   seq_ctx->log_caller = log_caller;
-+  seq_ctx->callback_id = parent ? parent->callback_id : session->callback_id;
-+  seq_ctx->callback_revision = parent ? parent->callback_revision : session->callback_revision;
-+  seq_ctx->device_incarnation = parent ? parent->device_incarnation : session->device_incarnation;
-+  seq_ctx->session_epoch = parent ? parent->session_epoch : session->session_epoch;
-+  seq_ctx->callback_owned = parent ? parent->callback_owned
-+      : seq_type == AIRPLAY_SEQ_START || seq_type == AIRPLAY_SEQ_START_PLAYBACK
-+        || seq_type == AIRPLAY_SEQ_SEND_VOLUME || seq_type == AIRPLAY_SEQ_FLUSH
-+        || seq_type == AIRPLAY_SEQ_PAIR_SETUP || seq_type == AIRPLAY_SEQ_PAIR_VERIFY
-+        || seq_type == AIRPLAY_SEQ_PAIR_TRANSIENT;
- 
-   sequence_continue(seq_ctx); // Ownership transferred
-+}
-+
-+static void
-+sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
-+{
-+  sequence_start_bound(seq_type, session, arg, log_caller, NULL);
- }
- 
- 
-@@ -4174,7 +4540,20 @@
- {
-   struct airplay_session *session = device->session;
- 
--  session->callback_id = callback_id;
-+  if (session->attention_managed)
-+    {
-+      if (session->attention_retiring)
-+        return -1;
-+      // Resolve the previous native operation before replacing its callback.
-+      if (session->callback_id >= 0 && session->callback_id != callback_id)
-+        outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
-+            session->session_epoch, session, OUTPUT_STATE_STOPPED);
-+      session->attention_retiring = true;
-+      session->attention_suspended = true;
-+      device->attention_retiring_session = session;
-+    }
-+  if (!session_callback_bind(session, callback_id))
-+    return 1;
- 
-   sequence_start(AIRPLAY_SEQ_STOP, session, NULL, "device_stop");
- 
-@@ -4189,7 +4568,8 @@
-   if (session->state != AIRPLAY_STATE_STREAMING)
-     return 0; // No-op, nothing to flush
- 
--  session->callback_id = callback_id;
-+  if (!session_callback_bind(session, callback_id))
-+    return 1;
- 
-   sequence_start(AIRPLAY_SEQ_FLUSH, session, NULL, "flush");
- 
-@@ -4201,7 +4581,7 @@
- {
-   struct airplay_session *session = device->session;
- 
--  session->callback_id = callback_id;
-+  session_callback_bind(session, callback_id);
- }
- 
- static void
-@@ -4305,7 +4685,7 @@
-
-   CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
-
--  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
-+  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "user_agent");
-   airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
-
-   timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
-@@ -4402,6 +4782,9 @@
-   .device_cb_set = airplay_device_cb_set,
-   .device_free_extra = airplay_device_free_extra,
-   .device_volume_set = airplay_set_volume_one,
-+  .device_attention_set = airplay_attention_set,
-+  .device_attention_suspend = airplay_attention_suspend,
-+  .device_attention_resume = airplay_attention_resume,
-   .device_volume_to_pct = airplay_volume_to_pct,
-   .write = airplay_write,
-   .metadata_prepare = airplay_metadata_prepare,
+diff --git a/src/outputs.c b/src/outputs.c
+index ffa2cb1fd276401df296bf6e9f412cf7e8f7d138..a5ada2228574443e2ce406c28d4fdc9f7a90e6d7 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
-@@ -28,6 +28,7 @@
+@@ -28,8 +28,10 @@
  #include <errno.h>
  #include <stdint.h>
  #include <inttypes.h>
 +#include <time.h>
  
  #include <event2/event.h>
++#include <gcrypt.h>
  
-@@ -97,6 +98,10 @@
+ #include "logger.h"
+ #include "misc.h"
+@@ -97,6 +99,10 @@
  
    // We have received the callback with the result from the backend
    bool ready;
@@ -1260,7 +937,7 @@
  
    // We store a device_id to avoid the risk of dangling device pointer
    uint64_t device_id;
-@@ -115,6 +120,12 @@
+@@ -115,6 +121,12 @@
  
  static struct output_device *outputs_device_list;
  static int outputs_master_volume;
@@ -1273,7 +950,7 @@
  static uint64_t outputs_buffer_duration_ms;
  
  static bool outputs_exclusive_mode;
-@@ -128,6 +139,378 @@
+@@ -128,6 +140,567 @@
  static bool outputs_got_new_subscription;
  
  
@@ -1316,6 +993,17 @@
 +  state->effective_volume = outputs_device_effective_volume(device);
 +  state->restoring = device->attention_restoring;
 +  state->last_release_operation = device->attention_last_release_operation;
++  state->last_drained_operation=device->attention_last_drained_operation;
++  memcpy(state->last_drained_request_id,device->attention_last_drained_request_id,sizeof(state->last_drained_request_id));
++  state->recovery_idle = !device->attention_retiring_session
++    && (!outputs[device->type]->device_attention_recovery_idle || outputs[device->type]->device_attention_recovery_idle(device));
++  {
++    int i;
++    for (i=0;i<ARRAY_SIZE(attention_results);i++)
++      if (attention_results[i].operation && attention_results[i].outcome == OUTPUT_ATTENTION_PENDING
++          && attention_results[i].identity.device_id == device->id)
++        state->recovery_idle=false;
++  }
 +  return 0;
 +}
 +
@@ -1349,6 +1037,8 @@
 +  return NULL;
 +}
 +
++static bool attention_recovery_terminal_current(const struct output_attention_result *result, struct output_attention_state *state);
++
 +int
 +outputs_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result)
 +{
@@ -1367,7 +1057,8 @@
 +      state.lease = result->identity.lease;
 +      state.restoring = result->identity.restoring;
 +    }
-+  result->current = result->current && attention_identity_equal(&result->identity, &state);
++  result->current = result->current && (attention_identity_equal(&result->identity, &state)
++    || ((result->recovery_state == OUTPUT_RECOVERY_RESTORED || (result->action == OUTPUT_ATTENTION_RELEASE && result->outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)) && attention_recovery_terminal_current(result, &state)));
 +  return 0;
 +}
 +
@@ -1382,7 +1073,53 @@
 +        && strncmp(attention_results[i].identity.process, process, sizeof(outputs_process)) == 0
 +        && strcmp(attention_results[i].command.request_id, request_id) == 0)
 +      return outputs_attention_result_get(process, attention_results[i].operation, result);
-+  return -1; // Missing/evicted/process-changed remains UNKNOWN, never re-admission.
++  if (db_attention_receipt_get(process, device_id, request_id, result) != 0) return -1;
++  {
++    struct output_attention_state state;
++    result->current = outputs_attention_state_get(device_id,&state) == 0;
++    if (result->current && result->action == OUTPUT_ATTENTION_RELEASE
++        && result->outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED && state.lease == 0
++        && state.attention_revision == result->identity.attention_revision)
++      { state.lease=result->identity.lease; state.restoring=result->identity.restoring; }
++    result->current = result->current && (attention_identity_equal(&result->identity,&state)
++      || ((result->recovery_state == OUTPUT_RECOVERY_RESTORED || (result->action == OUTPUT_ATTENTION_RELEASE && result->outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED))
++          && attention_recovery_terminal_current(result,&state)));
++  }
++  return 0;
++}
++
++void
++outputs_attention_uuid(char uuid[37])
++{
++  unsigned char bytes[16];
++  const char hex[]="0123456789abcdef";
++  int i, pos=0;
++  gcry_randomize(bytes,sizeof(bytes),GCRY_STRONG_RANDOM);
++  bytes[6]=(bytes[6]&15)|64; bytes[8]=(bytes[8]&63)|128;
++  for (i=0;i<16;i++)
++    {
++      if (i==4 || i==6 || i==8 || i==10) uuid[pos++]='-';
++      uuid[pos++]=hex[bytes[i]>>4]; uuid[pos++]=hex[bytes[i]&15];
++    }
++  uuid[pos]=0;
++}
++
++int
++outputs_attention_startup(void)
++{
++  return db_attention_process_register(outputs_process);
++}
++
++static bool
++attention_recovery_terminal_current(const struct output_attention_result *result, struct output_attention_state *state)
++{
++  struct output_device *device = outputs_device_get(result->identity.device_id);
++  if ((result->action != OUTPUT_ATTENTION_RECOVER && result->action != OUTPUT_ATTENTION_RELEASE) || !device || device->session
++      || result->identity.session_epoch == UINT64_MAX
++      || state->session_epoch != result->identity.session_epoch + 1)
++    return false;
++  state->session_epoch = result->identity.session_epoch;
++  return attention_identity_equal(&result->identity, state);
 +}
 +
 +static void attention_expiry_reconcile(struct output_device *device);
@@ -1404,6 +1141,37 @@
 +  if (!retained || retained->outcome != OUTPUT_ATTENTION_PENDING
 +      || !attention_identity_equal(&retained->identity, &operation->identity))
 +    return;
++  device = outputs_device_get(operation->identity.device_id);
++  if (operation->action != OUTPUT_ATTENTION_FLUSH)
++    {
++      struct output_attention_result durable = *retained;
++      bool current_owner = device && outputs_attention_state_get(device->id, &current) == 0
++        && (attention_identity_equal(&current, &operation->identity)
++            || attention_recovery_terminal_current(operation, &current));
++      bool retired = current_owner && outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED
++        && response_code == 200 && cseq > 0
++        && (operation->action == OUTPUT_ATTENTION_RELEASE || operation->action == OUTPUT_ATTENTION_RECOVER);
++      durable.outcome = outcome;
++      durable.response_code = response_code;
++      durable.request_cseq = cseq;
++      if (operation->action == OUTPUT_ATTENTION_RECOVER)
++        {
++          durable.recovery_state = retired ? OUTPUT_RECOVERY_RESTORED : OUTPUT_RECOVERY_UNKNOWN;
++          if (!retired && outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)
++            durable.outcome = outcome = OUTPUT_ATTENTION_UNKNOWN;
++        }
++      if (db_attention_receipt_save(&durable, retired) < 0)
++        {
++          outcome = OUTPUT_ATTENTION_UNKNOWN; // A socket ACK is not durable custody retirement.
++          durable.recovery_state = OUTPUT_RECOVERY_UNKNOWN;
++        }
++      retained->recovery_state = durable.recovery_state;
++      if (retired && outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)
++        {
++          enum output_attention_recovery_state proof_state;
++          db_attention_origin_get(device->id, &durable.command.origin, &proof_state, &retained->recovery_proof);
++        }
++    }
 +  // One exact operation has one terminal outcome. No last-callback-wins fold.
 +  retained->outcome = outcome;
 +  retained->response_code = response_code;
@@ -1414,7 +1182,7 @@
 +  if (operation->action == OUTPUT_ATTENTION_RELEASE
 +      && (outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED || outcome == OUTPUT_ATTENTION_DESIRED_ONLY)
 +      && outputs_attention_state_get(device->id, &current) == 0
-+      && attention_identity_equal(&current, &operation->identity))
++      && (attention_identity_equal(&current, &operation->identity) || attention_recovery_terminal_current(operation,&current)))
 +    {
 +      device->attention_lease = 0;
 +      device->attention_restoring = false;
@@ -1437,6 +1205,44 @@
 +    outputs[device->type]->device_attention_resume(device);
 +  if (device->attention_expired && !device->attention_expiry_attempted)
 +    attention_expiry_reconcile(device);
++}
++
++void
++outputs_attention_control_drained(const struct output_attention_result *operation)
++{
++  struct output_device *device=outputs_device_get(operation->identity.device_id);
++  if (device && !strcmp(operation->identity.process,outputs_process) && !device->session
++      && device->incarnation==operation->identity.device_incarnation
++      && operation->identity.session_epoch!=UINT64_MAX
++      && device->session_epoch==operation->identity.session_epoch+1)
++    {
++      device->attention_last_drained_operation=operation->operation;
++      memcpy(device->attention_last_drained_request_id,operation->command.request_id,sizeof(device->attention_last_drained_request_id));
++    }
++}
++
++void
++outputs_attention_handoff_drained(const struct output_attention_result *operation)
++{
++  struct output_attention_state state;
++  struct output_device *device=outputs_device_get(operation->identity.device_id);
++  if (device && operation->action == OUTPUT_ATTENTION_RELEASE
++      && outputs_attention_state_get(device->id,&state)==0
++      && !strcmp(operation->identity.process,outputs_process) && !device->session
++      && device->incarnation==operation->identity.device_incarnation
++      && operation->identity.session_epoch!=UINT64_MAX
++      && device->session_epoch==operation->identity.session_epoch+1
++      && device->attention_lease==operation->identity.lease
++      && device->attention_revision==operation->identity.attention_revision)
++    {
++      // Retire only volatile command/control custody. BASE is still UNKNOWN;
++      // the durable original origin continues to fence every fresh BEGIN.
++      device->attention_lease=0;
++      device->attention_restoring=false;
++      device->attention_expired=false;
++      event_del(device->attention_timer);
++    }
++  outputs_attention_complete(operation,OUTPUT_ATTENTION_UNKNOWN,0,0);
 +}
 +
 +int
@@ -1463,15 +1269,30 @@
 +          {
 +            const struct output_attention_request *old = &attention_results[i].command;
 +            if (old->action != request->action || old->cap_volume != request->cap_volume
-+                || old->ttl_ms != request->ttl_ms || !attention_identity_equal(&old->expected, &request->expected))
++                || old->ttl_ms != request->ttl_ms || !attention_identity_equal(&old->expected, &request->expected)
++                || (request->action == OUTPUT_ATTENTION_RECOVER && memcmp(&old->origin,&request->origin,sizeof(request->origin))))
 +              return -1;
 +            return outputs_attention_result_get(attention_results[i].identity.process, attention_results[i].operation, result);
 +          }
 +    }
++  if (request->request_id[0])
++    {
++      struct output_attention_result old;
++      ret = db_attention_receipt_get(request->expected.process, request->expected.device_id, request->request_id, &old);
++      if (ret < 0) return -1;
++      if (ret == 0)
++        {
++          if (old.action != request->action || old.command.cap_volume != request->cap_volume
++              || old.command.ttl_ms != request->ttl_ms || !attention_identity_equal(&old.command.expected, &request->expected)
++              || (request->action == OUTPUT_ATTENTION_RECOVER && memcmp(&old.command.origin,&request->origin,sizeof(request->origin)))) return -1;
++          return outputs_attention_request_get(old.identity.process, old.identity.device_id, old.command.request_id, result);
++        }
++    }
 +  if (!request || !result || outputs_operation == UINT64_MAX
-+      || request->action < OUTPUT_ATTENTION_BEGIN || request->action > OUTPUT_ATTENTION_MANUAL
++      || request->action < OUTPUT_ATTENTION_BEGIN || request->action > OUTPUT_ATTENTION_RECOVER
 +      || request->action == OUTPUT_ATTENTION_FLUSH
-+      || (request->action == OUTPUT_ATTENTION_MANUAL && request->ttl_ms != 0)
++      || ((request->action == OUTPUT_ATTENTION_MANUAL || request->action == OUTPUT_ATTENTION_RECOVER) && request->ttl_ms != 0)
++      || (request->action == OUTPUT_ATTENTION_RECOVER && (request->cap_volume != 0 || !request->request_id[0]))
 +      || request->cap_volume < 0 || request->cap_volume > 100
 +      || request->ttl_ms > 15000
 +      || outputs_attention_state_get(request->expected.device_id, &state) < 0
@@ -1483,7 +1304,9 @@
 +      || device->attention_revision >= UINT64_MAX - 1
 +      || outputs[device->type]->disabled || !outputs[device->type]->device_attention_set
 +      || (request->action != OUTPUT_ATTENTION_MANUAL
-+          && (request->action == OUTPUT_ATTENTION_BEGIN ? device->attention_lease != 0 : device->attention_lease == 0))
++          && ((request->action == OUTPUT_ATTENTION_BEGIN || request->action == OUTPUT_ATTENTION_RECOVER) ? device->attention_lease != 0 : device->attention_lease == 0))
++      || (request->action == OUTPUT_ATTENTION_BEGIN && db_attention_origin_pending(device->id) != 0)
++      || (request->action == OUTPUT_ATTENTION_RECOVER && (!state.recovery_idle || device->attention_restoring || !outputs[device->type]->device_attention_recovery_prepare || !outputs[device->type]->device_attention_recover))
 +      || (request->action == OUTPUT_ATTENTION_UPDATE && device->attention_restoring))
 +    return -1;
 +  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
@@ -1500,6 +1323,34 @@
 +  if (!slot)
 +    return -1;
 +
++  memset(&admitted, 0, sizeof(admitted));
++  if (request->action == OUTPUT_ATTENTION_RECOVER)
++    {
++      if (strlen(request->origin.process) != 36 || strlen(request->origin.request_id) != 36
++          || db_attention_origin_get(device->id,&request->origin,&admitted.recovery_state,&admitted.recovery_proof) < 0)
++        return -1;
++      if (admitted.recovery_state == OUTPUT_RECOVERY_UNKNOWN
++          || (admitted.recovery_state == OUTPUT_RECOVERY_NEVER_ADMITTED && !strcmp(request->origin.process,outputs_process)))
++        return -1; // A still-current process could receive that BEGIN later.
++      if (admitted.recovery_state == OUTPUT_RECOVERY_PENDING
++          && outputs[device->type]->device_attention_recovery_prepare(device) < 0)
++        return -1;
++    }
++  if (request->action == OUTPUT_ATTENTION_RELEASE && !device->session
++      && outputs[device->type]->device_attention_recovery_prepare
++      && outputs[device->type]->device_attention_recovery_prepare(device) < 0) return -1;
++  if (request->action == OUTPUT_ATTENTION_BEGIN)
++    {
++      struct output_attention_origin origin = {0};
++      memcpy(origin.process,outputs_process,sizeof(origin.process));
++      memcpy(origin.request_id,request->request_id,sizeof(origin.request_id));
++      if (!origin.request_id[0] || db_attention_begin(device->id,device->volume,&origin,outputs_operation+1) < 0)
++        return -1; // Durable original custody before timer/overlay/native effect.
++      device->attention_origin = origin;
++    }
++  if (request->action == OUTPUT_ATTENTION_MANUAL
++      && outputs_device_volume_register(device,request->cap_volume,-1) < 0)
++    return -1;
 +  if (request->action == OUTPUT_ATTENTION_BEGIN || request->action == OUTPUT_ATTENTION_UPDATE)
 +    {
 +      unsigned ttl_ms = request->ttl_ms ? request->ttl_ms : 2000;
@@ -1516,8 +1367,6 @@
 +    }
 +  if (request->action != OUTPUT_ATTENTION_MANUAL)
 +    device->attention_revision++;
-+  if (request->action == OUTPUT_ATTENTION_MANUAL)
-+    outputs_device_volume_register(device, request->cap_volume, -1);
 +  if (request->action == OUTPUT_ATTENTION_BEGIN)
 +    device->attention_lease = outputs_operation + 1;
 +  if (request->action == OUTPUT_ATTENTION_RELEASE)
@@ -1526,7 +1375,7 @@
 +      device->attention_restoring = true;
 +      event_del(device->attention_timer);
 +    }
-+  else if (request->action != OUTPUT_ATTENTION_MANUAL)
++  else if (request->action != OUTPUT_ATTENTION_MANUAL && request->action != OUTPUT_ATTENTION_RECOVER)
 +    {
 +      device->attention_cap = request->cap_volume;
 +      device->attention_expired = false;
@@ -1534,16 +1383,32 @@
 +      device->attention_deadline = deadline;
 +    }
 +
-+  memset(slot, 0, sizeof(*slot));
++  *slot = admitted;
 +  slot->operation = ++outputs_operation;
 +  slot->action = request->action;
 +  slot->command = *request;
++  if (request->action != OUTPUT_ATTENTION_RECOVER) slot->command.origin = device->attention_origin;
 +  slot->outcome = OUTPUT_ATTENTION_PENDING;
 +  if (request->action == OUTPUT_ATTENTION_RELEASE) device->attention_last_release_operation = slot->operation;
 +  outputs_attention_state_get(device->id, &slot->identity);
++  if (request->action == OUTPUT_ATTENTION_RECOVER
++      && (slot->recovery_state == OUTPUT_RECOVERY_ALREADY_RETIRED || slot->recovery_state == OUTPUT_RECOVERY_NEVER_ADMITTED))
++    {
++      slot->outcome = OUTPUT_ATTENTION_NO_EFFECT;
++      if (db_attention_receipt_save(slot,false) < 0) { memset(slot,0,sizeof(*slot)); return -1; }
++      return outputs_attention_result_get(slot->identity.process,slot->operation,result);
++    }
++  if (db_attention_receipt_save(slot,false) < 0)
++    {
++      if (outputs[device->type]->device_attention_recovery_abort)
++        outputs[device->type]->device_attention_recovery_abort(device);
++      memset(slot,0,sizeof(*slot)); return -1;
++    }
 +  admitted = *slot;
 +  attention_result_reserved[slot - attention_results] = true;
-+  ret = outputs[device->type]->device_attention_set(device, &admitted);
++  ret = request->action == OUTPUT_ATTENTION_RECOVER
++    ? outputs[device->type]->device_attention_recover(device,&admitted)
++    : outputs[device->type]->device_attention_set(device, &admitted);
 +  if (ret == 0)
 +    outputs_attention_complete(&admitted, OUTPUT_ATTENTION_DESIRED_ONLY, 0, 0);
 +  else if (ret < 0)
@@ -1613,6 +1478,7 @@
 +  if (outputs_attention_state_get(device->id, &request.expected) < 0)
 +    return;
 +  request.action = OUTPUT_ATTENTION_RELEASE;
++  outputs_attention_uuid(request.request_id); // Durable exact terminal identity for native expiry too.
 +  // Set before admission: an immediate desired-only completion cannot recurse.
 +  device->attention_expiry_attempted = true;
 +  if (outputs_attention_admit(&request, &result) < 0)
@@ -1652,7 +1518,7 @@
  /* ------------------------------- MISC HELPERS ----------------------------- */
  
  static output_status_cb
-@@ -154,7 +537,8 @@
+@@ -154,7 +727,8 @@
  
    for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
      {
@@ -1662,7 +1528,7 @@
  	{
  	  DPRINTF(E_DBG, L_PLAYER, "Removing callback to %s, id %d\n", player_pmap(outputs_cb_register[callback_id].cb), callback_id);
  	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
-@@ -209,6 +593,7 @@
+@@ -209,6 +783,7 @@
    output_status_cb cb;
    enum output_device_state state;
    int callback_id;
@@ -1670,7 +1536,7 @@
  
    for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
      {
-@@ -222,7 +607,21 @@
+@@ -222,7 +797,21 @@
  	  // Will be NULL if the device has disappeared
  	  device = outputs_device_get(outputs_cb_register[callback_id].device_id);
  
@@ -1692,7 +1558,7 @@
  
  	  // The device has left the building (stopped/failed), and the backend
  	  // is not using it any more
-@@ -244,6 +643,43 @@
+@@ -244,6 +833,43 @@
      {
        if (outputs_cb_register[i].cb)
  	DPRINTF(E_DBG, L_PLAYER, "%d. Active callback: %s\n", i, player_pmap(outputs_cb_register[i].cb));
@@ -1736,7 +1602,7 @@
      }
  }
  
-@@ -643,6 +1079,9 @@
+@@ -643,6 +1269,9 @@
    if (!device)
      return -1;
  
@@ -1746,7 +1612,7 @@
    device->session = session;
    return 0;
  }
-@@ -654,9 +1093,21 @@
+@@ -654,9 +1283,21 @@
  
    device = outputs_device_get(device_id);
    if (device)
@@ -1769,7 +1635,7 @@
  }
  
  int
-@@ -751,6 +1202,22 @@
+@@ -751,6 +1392,22 @@
    outputs_cb_register[callback_id].device_id = device_id;
    outputs_cb_register[callback_id].state = state;
    event_active(outputs_deferredev, 0, 0);
@@ -1792,7 +1658,7 @@
  }
  
  void
-@@ -805,9 +1272,24 @@
+@@ -805,9 +1462,24 @@
    // New device
    if (!device)
      {
@@ -1817,16 +1683,25 @@
  
        keep_name = strdup(device->name);
        keep_offset_ms = device->offset_ms; // For legacy local audio and Chromecast where offset could come from config file
-@@ -882,6 +1364,8 @@
+@@ -819,6 +1491,8 @@
+ 	  device->volume = (outputs_master_volume >= 0) ? outputs_master_volume : OUTPUTS_DEFAULT_VOLUME;;
+ 	}
+ 
++      ret = db_attention_base_get(device->id,&device->volume);
++      if (ret < 0) { free(keep_name); outputs_device_free(device); return NULL; }
+       free(device->name);
+       device->name = keep_name;
+ 
+@@ -881,6 +1555,8 @@
+   struct output_device *device;
    struct output_device *prev;
    int ret;
- 
-+  attention_restart_cancel(remove);
 +
++  attention_restart_cancel(remove);
+ 
    // Device stop should be able to handle that we invalidate the device, even
    // if it is an async stop. It might call outputs_device_session_remove(), but
-   // that just won't do anything since the id will be unknown.
-@@ -920,7 +1404,14 @@
+@@ -920,7 +1596,14 @@
  void
  outputs_device_select(struct output_device *device, int max_volume)
  {
@@ -1841,7 +1716,7 @@
    device->prevent_playback = 0;
    device->busy = 0;
  
-@@ -932,8 +1423,11 @@
+@@ -932,8 +1615,13 @@
    // We could avoid this by reducing the unselected Office in step 2, but that
    // leads to issue #1077, where volumes of unselected devices go to 0 (e.g. by
    // reducing master to 0 and then increasing again -> unselected stays at 0).
@@ -1849,13 +1724,15 @@
 -    device->volume = max_volume;
 +  if (!device->attention_lease && max_volume >= 0 && device->volume > max_volume)
 +    {
++      if (db_attention_base_save(device->id,max_volume) < 0)
++        { device->selected = 0; vol_adjust(); return; }
 +      device->volume = max_volume;
 +      base_revision_advance(device);
 +    }
  
    vol_adjust();
  }
-@@ -941,7 +1435,13 @@
+@@ -941,7 +1629,13 @@
  void
  outputs_device_deselect(struct output_device *device)
  {
@@ -1870,7 +1747,7 @@
  
    vol_adjust();
  }
-@@ -954,6 +1454,19 @@
+@@ -954,6 +1648,19 @@
    if (outputs[device->type]->disabled || !outputs[device->type]->device_start || !outputs[device->type]->device_probe)
      return -1;
  
@@ -1890,7 +1767,7 @@
    if (device->session)
      return 0; // Device is already running, nothing to do
  
-@@ -965,6 +1478,40 @@
+@@ -965,6 +1672,40 @@
    return device_state_update(device, ret);;
  }
  
@@ -1931,7 +1808,7 @@
  int
  outputs_device_stop(struct output_device *device, output_status_cb cb)
  {
-@@ -975,6 +1522,8 @@
+@@ -975,6 +1716,8 @@
  
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
@@ -1940,15 +1817,29 @@
  
    ret = outputs[device->type]->device_stop(device, callback_add(device, cb));
  
-@@ -1016,6 +1565,7 @@
- void
+@@ -1013,15 +1756,15 @@
+   return ret; // We don't change device state just because of a failed flush
+ }
+ 
+-void
++int
  outputs_device_volume_register(struct output_device *device, int absvol, int relvol)
  {
-+  base_revision_advance(device); // Valid same-value manual intent fences ABA too.
-   if (absvol > -1)
-     device->volume = absvol;
-   else if (relvol > -1)
-@@ -1096,6 +1646,8 @@
+-  if (absvol > -1)
+-    device->volume = absvol;
+-  else if (relvol > -1)
+-    device->volume = rel_to_vol(relvol, outputs_master_volume);
+-
++  int volume = absvol > -1 ? absvol : relvol > -1 ? rel_to_vol(relvol, outputs_master_volume) : device->volume;
++  if (db_attention_base_save(device->id,volume) < 0) return -1;
++  base_revision_advance(device); // Same-value intent fences ABA only after durable admission.
++  device->volume = volume;
+   vol_adjust();
++  return 0;
+ }
+ 
+ int
+@@ -1096,6 +1839,8 @@
    if (!device)
      return;
  
@@ -1957,7 +1848,7 @@
    if (outputs[device->type]->disabled)
      DPRINTF(E_LOG, L_PLAYER, "BUG! Freeing device from a disabled output?\n");
  
-@@ -1107,6 +1659,8 @@
+@@ -1107,6 +1852,8 @@
  
    if (device->stop_timer)
      event_free(device->stop_timer);
@@ -1966,7 +1857,7 @@
  
    free(device->name);
    free(device->auth_key);
-@@ -1130,6 +1684,13 @@
+@@ -1130,6 +1877,13 @@
      {
        if (device->selected)
  	continue;
@@ -1980,7 +1871,7 @@
  
        ret = outputs_device_stop(device, stopped_cb);
        if (ret > 0)
-@@ -1213,7 +1774,12 @@
+@@ -1213,7 +1967,12 @@
    int ret;
  
    if (outputs_master_volume == volume)
@@ -1994,27 +1885,30 @@
  
    outputs_master_volume = volume;
  
-@@ -1222,7 +1788,7 @@
+@@ -1222,7 +1981,8 @@
        if (!device->selected)
  	continue;
  
 -      device->volume = rel_to_vol(device->relvol, outputs_master_volume);
-+      outputs_device_volume_register(device, -1, device->relvol);
++      if (outputs_device_volume_register(device, -1, device->relvol) < 0)
++        { ret = -1; continue; }
  
        ret = outputs_device_volume_set(device, cb);
        if (ret < 0)
-@@ -1321,6 +1887,8 @@
+@@ -1321,6 +2081,8 @@
    int i;
    int j;
  
 +  if (!outputs_process[0])
-+    uuid_make(outputs_process);
++    outputs_attention_uuid(outputs_process);
    outputs_master_volume = -1;
  
    // Number of milliseconds the outputs should buffer before starting playback.
+diff --git a/src/outputs.h b/src/outputs.h
+index e8474c9238e5bb98dc3decdc597c1a3d7262697c..ccc96932a5100c74655e1001dfa603aaa712f29c 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
-@@ -86,6 +86,65 @@
+@@ -86,6 +86,101 @@
    OUTPUT_STATE_PASSWORD  = -2,
  };
  
@@ -2029,6 +1923,7 @@
 +  OUTPUT_ATTENTION_RELEASE,
 +  OUTPUT_ATTENTION_FLUSH, // Internal route handoff only, not a volume request.
 +  OUTPUT_ATTENTION_MANUAL, // Explicit manual base CAS; never an attention renewal.
++  OUTPUT_ATTENTION_RECOVER, // Fresh cleanup of one durable original BEGIN; never adoption.
 +};
 +
 +enum output_attention_outcome
@@ -2038,6 +1933,7 @@
 +  OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,
 +  OUTPUT_ATTENTION_FAILED,
 +  OUTPUT_ATTENTION_UNKNOWN,
++  OUTPUT_ATTENTION_NO_EFFECT,
 +};
 +
 +struct output_attention_state
@@ -2054,15 +1950,47 @@
 +  int effective_volume;
 +  bool restoring;
 +  uint64_t last_release_operation; // Observer only; excluded from expected identity.
++  bool recovery_idle; // Observer only, never supplied as CAS authority.
++  uint64_t last_drained_operation;
++  char last_drained_request_id[37];
++};
++
++struct output_attention_origin
++{
++  char process[37];
++  char request_id[37];
 +};
 +
 +struct output_attention_request
 +{
 +  struct output_attention_state expected;
-+  char request_id[37]; // External idempotency identity; empty only for native expiry.
++  char request_id[37]; // Exact idempotency identity; native expiry also mints its own UUID.
 +  enum output_attention_action action;
 +  int cap_volume;
 +  unsigned ttl_ms; // Same existing attention ceiling: 15000 ms. Zero uses 2000 ms.
++  struct output_attention_origin origin; // RECOVER only; native durable custody is authority.
++};
++
++enum output_attention_recovery_state
++{
++  OUTPUT_RECOVERY_NONE,
++  OUTPUT_RECOVERY_PENDING,
++  OUTPUT_RECOVERY_RESTORED,
++  OUTPUT_RECOVERY_ALREADY_RETIRED,
++  OUTPUT_RECOVERY_NEVER_ADMITTED,
++  OUTPUT_RECOVERY_UNKNOWN,
++};
++
++struct output_attention_proof
++{
++  char database[37]; // Persistent random native DB provenance, never supplied by caller.
++  bool ledger_complete;
++  struct output_attention_state terminal_identity;
++  char terminal_request_id[37];
++  uint64_t terminal_operation;
++  enum output_attention_action terminal_action;
++  int terminal_response_code;
++  int terminal_request_cseq;
 +};
 +
 +struct output_attention_result
@@ -2075,12 +2003,14 @@
 +  int response_code;
 +  int request_cseq;
 +  bool current;
++  enum output_attention_recovery_state recovery_state;
++  struct output_attention_proof recovery_proof;
 +};
 +
  /* Linked list of device info used by the player for each device
   */
  struct output_device
-@@ -126,6 +185,27 @@
+@@ -126,6 +221,30 @@
    int relvol;
    int max_volume;
  
@@ -2089,6 +2019,9 @@
 +  uint64_t session_epoch;
 +  uint64_t base_revision;
 +  uint64_t attention_revision;
++  uint64_t attention_last_drained_operation;
++  char attention_last_drained_request_id[37];
++  struct output_attention_origin attention_origin;
 +  uint64_t attention_lease;
 +  uint64_t route_revision;
 +  uint64_t route_operation;
@@ -2108,19 +2041,23 @@
    // Quality of audio output
    struct media_quality quality;
  
-@@ -241,6 +321,11 @@
+@@ -241,6 +360,15 @@
    // Set the volume and call back
    int (*device_volume_set)(struct output_device *device, int callback_id);
  
 +  // Strict attention uses its own immutable operation, not callback_id.
 +  int (*device_attention_set)(struct output_device *device, const struct output_attention_result *operation);
++  bool (*device_attention_recovery_idle)(struct output_device *device);
++  int (*device_attention_recovery_prepare)(struct output_device *device);
++  void (*device_attention_recovery_abort)(struct output_device *device);
++  int (*device_attention_recover)(struct output_device *device, const struct output_attention_result *operation);
 +  int (*device_attention_suspend)(struct output_device *device, const struct output_attention_result *operation);
 +  void (*device_attention_resume)(struct output_device *device);
 +
    // Convert device internal representation of volume to our pct scale
    int (*device_volume_to_pct)(struct output_device *device, const char *volume);
  
-@@ -290,6 +375,16 @@
+@@ -290,6 +418,16 @@
  void
  outputs_device_session_remove(uint64_t device_id);
  
@@ -2137,7 +2074,7 @@
  int
  outputs_quality_subscribe(struct media_quality *quality);
  
-@@ -307,6 +402,26 @@
+@@ -307,6 +445,38 @@
  
  void
  outputs_buffer_free(struct output_buffer *buffer);
@@ -2150,6 +2087,12 @@
 +outputs_attention_state_get(uint64_t id, struct output_attention_state *state);
 +
 +void outputs_attention_route_barrier(struct output_device *device);
++void
++outputs_attention_uuid(char uuid[37]);
++
++int
++outputs_attention_startup(void);
++
 +int
 +outputs_attention_admit(const struct output_attention_request *request, struct output_attention_result *result);
 +
@@ -2160,10 +2103,904 @@
 +outputs_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result);
 +
 +void
++outputs_attention_control_drained(const struct output_attention_result *operation);
++
++void
++outputs_attention_handoff_drained(const struct output_attention_result *operation);
++
++void
 +outputs_attention_complete(const struct output_attention_result *operation, enum output_attention_outcome outcome, int response_code, int cseq);
  
  /* ---------------------------- Called by player ---------------------------- */
  
+@@ -337,7 +507,7 @@
+ int
+ outputs_device_flush(struct output_device *device, output_status_cb cb);
+ 
+-void
++int
+ outputs_device_volume_register(struct output_device *device, int absvol, int relvol);
+ 
+ int
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 4290b75072b55be19aff705a7d66e3901437034f..8c571473f1fe042ed7c4d144df240105c90953db 100644
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -19,6 +19,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <stddef.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <stdint.h>
+@@ -218,6 +219,8 @@
+   struct evbuffer *encoded_buffer;
+ 
+   struct rtp_session *rtp_session;
++  uint64_t packet_serial;
++  uint64_t *packet_serials; // Mirrors existing ring slots; no audio/ring reset.
+ 
+   struct rtcp_timestamp cur_stamp;
+ 
+@@ -237,10 +240,29 @@
+   struct airplay_master_session *next;
+ };
+ 
++struct airplay_attention_request;
++struct airplay_seq_ctx;
++
+ struct airplay_session
+ {
+   uint64_t device_id;
+   int callback_id;
++  uint64_t callback_revision; // Command binding, distinct from reusable output slot.
++  bool callback_revision_exhausted;
++  uint64_t device_incarnation;
++  uint64_t session_epoch;
++  struct airplay_attention_request *attention_requests;
++  struct airplay_seq_ctx *sequence_requests;
++  bool attention_managed;
++  bool attention_suspended;
++  bool attention_retiring;
++  bool recovery_handoff; // Old nonconnected RELEASE control owner, not a new operation.
++  bool recovery_only; // Existing RAOP lifecycle, permanently no native audio emission.
++  bool recovery_base_accepted;
++  struct output_attention_result recovery_operation;
++  int recovery_code;
++  int recovery_cseq;
++  uint64_t emission_floor;
+ 
+   struct airplay_master_session *master_session;
+ 
+@@ -310,6 +332,15 @@
+   uint32_t ptpd_slave_id;
+ 
+   struct airplay_session *next;
++};
++
++
++struct airplay_attention_request
++{
++  struct output_attention_result operation;
++  struct airplay_session *session;
++  int cseq;
++  struct airplay_attention_request *next;
+ };
+ 
+ struct airplay_metadata
+@@ -371,6 +402,12 @@
+   struct airplay_session *session;
+   void *payload_make_arg;
+   const char *log_caller;
++  int callback_id;
++  uint64_t callback_revision;
++  uint64_t device_incarnation;
++  uint64_t session_epoch;
++  bool callback_owned;
++  struct airplay_seq_ctx *next;
+ };
+ 
+ 
+@@ -489,8 +526,19 @@
+ airplay_device_start(struct output_device *device, int callback_id);
+ static void
+ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
++static bool sequence_callback_current(const struct airplay_seq_ctx *context);
++
++static int
++recovery_sequence_current(void *arg)
++{
++  return sequence_callback_current(arg);
++}
++
+ static void
+ sequence_continue(struct airplay_seq_ctx *seq_ctx);
++static void
++sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
++    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent);
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+@@ -1091,7 +1139,11 @@
+ 	state = OUTPUT_STATE_FAILED;
+     }
+ 
+-  outputs_cb(session->callback_id, session->device_id, state);
++  if (session->attention_managed)
++    outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
++        session->session_epoch, session, state);
++  else
++    outputs_cb(session->callback_id, session->device_id, state);
+   session->callback_id = -1;
+ }
+ 
+@@ -1103,6 +1155,7 @@
+ 
+   outputs_quality_unsubscribe(&ams->rtp_session->quality);
+   rtp_session_free(ams->rtp_session);
++  free(ams->packet_serials);
+ 
+   transcode_encode_cleanup(&ams->encode_ctx);
+ 
+@@ -1173,7 +1226,9 @@
+   clock_id = use_ptp ? ptpd_clock_id_get() : 0;
+ 
+   ams->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
+-  if (!ams->rtp_session)
++  if (ams->rtp_session)
++    ams->packet_serials = calloc(ams->rtp_session->pktbuf_size, sizeof(*ams->packet_serials));
++  if (!ams->rtp_session || !ams->packet_serials)
+     {
+       goto error;
+     }
+@@ -1233,6 +1288,24 @@
+     {
+       evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
+       evrtsp_connection_free(session->ctrl);
++    }
++
++  // The actual connection has retired all queued requests/callback events.
++  // Executing contexts unlinked before entering handlers; only queue-owned
++  // contexts remain here, including sequences admitted before PC9 management.
++  while (session->sequence_requests)
++    {
++      struct airplay_seq_ctx *pending = session->sequence_requests;
++      session->sequence_requests = pending->next;
++      free(pending);
++    }
++
++  while (session->attention_requests)
++    {
++      struct airplay_attention_request *pending = session->attention_requests;
++      session->attention_requests = pending->next;
++      outputs_attention_complete(&pending->operation, OUTPUT_ATTENTION_UNKNOWN, 0, pending->cseq);
++      free(pending);
+     }
+ 
+   if (session->deferredev)
+@@ -1264,6 +1337,14 @@
+ session_cleanup(struct airplay_session *session)
+ {
+   struct airplay_session *s;
++  bool retiring = session->attention_retiring;
++  uint64_t id = session->device_id, incarnation = session->device_incarnation, epoch = session->session_epoch;
++  const void *old_session = session;
++  struct output_attention_result recovery = session->recovery_operation;
++  bool accepted = session->recovery_base_accepted;
++  bool handoff = session->recovery_handoff;
++  int code = session->recovery_code, cseq = session->recovery_cseq;
++  session->recovery_operation.operation = 0;
+ 
+   if (session == airplay_sessions)
+     airplay_sessions = airplay_sessions->next;
+@@ -1278,9 +1359,16 @@
+ 	s->next = session->next;
+     }
+ 
+-  outputs_device_session_remove(session->device_id);
++  outputs_device_session_remove_exact(session->device_id, session);
+ 
+   session_free(session);
++  if (recovery.operation) outputs_attention_control_drained(&recovery);
++  if (recovery.operation && handoff)
++    outputs_attention_handoff_drained(&recovery);
++  else if (recovery.operation)
++    outputs_attention_complete(&recovery,accepted ? OUTPUT_ATTENTION_PROTOCOL_ACCEPTED : OUTPUT_ATTENTION_UNKNOWN,code,cseq);
++  if (retiring)
++    outputs_attention_retirement_finished(id, incarnation, epoch, old_session);
+ }
+ 
+ static void
+@@ -1316,6 +1404,27 @@
+   evtimer_add(session->deferredev, &tv);
+ }
+ 
++// Numeric output callback slots may be reused. Advance command currency on
++// every actual binding, even if the callback number happens to be unchanged.
++static bool
++session_callback_bind(struct airplay_session *session, int callback_id)
++{
++  session->callback_id = callback_id;
++  if (session->callback_revision == UINT64_MAX)
++    {
++      if (session->attention_managed)
++        {
++          session->callback_revision_exhausted = true;
++          session->attention_suspended = true;
++          deferred_session_failure(session);
++          return false;
++        }
++      return true; // Ordinary sessions do not consult this added currency.
++    }
++  session->callback_revision++;
++  return true;
++}
++
+ static void
+ rtsp_close_cb(struct evrtsp_connection *evcon, void *arg)
+ {
+@@ -1334,11 +1443,21 @@
+   session_cleanup(session);
+ }
+ 
++static int airplay_attention_set(struct output_device *device, const struct output_attention_result *operation);
++static int airplay_attention_recover(struct output_device *device, const struct output_attention_result *operation);
++static int airplay_device_stop(struct output_device *device, int callback_id);
++
+ static void
+ session_connected(struct airplay_session *session)
+ {
+   session->state = AIRPLAY_STATE_CONNECTED;
+-
++  if (session->recovery_only)
++    {
++      struct output_device *device = outputs_device_get(session->device_id);
++      if (!device || airplay_attention_set(device,&session->recovery_operation) <= 0)
++        session_failure(session);
++      return; // No player activation, metadata, packet or queue work.
++    }
+   session_status(session);
+ }
+ 
+@@ -1594,7 +1713,7 @@
+   CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
+ 
+   session->devname = strdup(device->name);
+-  session->volume = device->volume;
++  session->volume = outputs_device_effective_volume(device);
+   session->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
+ 
+   session->state = AIRPLAY_STATE_STOPPED;
+@@ -1603,6 +1722,7 @@
+ 
+   session->device_id = device->id;
+   session->callback_id = callback_id;
++  session->callback_revision = 1;
+ 
+   session->server_fd = -1;
+ 
+@@ -1636,7 +1756,15 @@
+   airplay_sessions = session;
+ 
+   // rs is now the official device session
+-  outputs_device_session_add(device->id, session);
++  if (outputs_device_session_add(device->id, session) < 0)
++    {
++      session_cleanup(session);
++      return NULL;
++    }
++  session->device_incarnation = device->incarnation;
++  session->session_epoch = device->session_epoch;
++  session->attention_managed = device->attention_lease != 0;
++  session->emission_floor = session->master_session->packet_serial + 1;
+ 
+   return session;
+ 
+@@ -1879,12 +2007,283 @@
+   if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
+     return 0;
+ 
+-  session->volume = device->volume;
+-  session->callback_id = callback_id;
++  session->volume = outputs_device_effective_volume(device);
++  if (!session_callback_bind(session, callback_id))
++    return 1; // Existing deferred failure retains and resolves this obligation.
+ 
+   sequence_start(AIRPLAY_SEQ_SEND_VOLUME, session, NULL, "set_volume_one");
+ 
+   return 1;
++}
++
++
++static void
++attention_request_remove(struct airplay_attention_request *context)
++{
++  struct airplay_attention_request **link = &context->session->attention_requests;
++
++  while (*link && *link != context)
++    link = &(*link)->next;
++  if (*link)
++    *link = context->next;
++}
++
++static void
++attention_response_cb(struct evrtsp_request *request, void *arg)
++{
++  struct airplay_attention_request *context = arg;
++  struct airplay_session *session = context->session;
++  enum output_attention_outcome outcome;
++  const char *cseq;
++  int observed_cseq = 0;
++  int code = request ? request->response_code : 0;
++
++  attention_request_remove(context);
++  session->reqs_in_flight--;
++  if (!session->reqs_in_flight)
++    evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
++
++  cseq = request ? evrtsp_find_header(request->input_headers, "CSeq") : NULL;
++  if (!request || !cseq || safe_atoi32(cseq, &observed_cseq) < 0 || observed_cseq != context->cseq)
++    outcome = OUTPUT_ATTENTION_UNKNOWN;
++  else if (code != RTSP_OK)
++    outcome = OUTPUT_ATTENTION_FAILED;
++  else
++    outcome = OUTPUT_ATTENTION_PROTOCOL_ACCEPTED;
++
++  if ((context->operation.action == OUTPUT_ATTENTION_RECOVER || context->operation.action == OUTPUT_ATTENTION_RELEASE) && session->recovery_only)
++    {
++      session->recovery_base_accepted = outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED;
++      session->recovery_code = code;
++      session->recovery_cseq = context->cseq;
++      free(context);
++      sequence_start(AIRPLAY_SEQ_STOP,session,NULL,"recovery_cleanup");
++      return; // Exact original control lifecycle, never STOP a different output.
++    }
++  outputs_attention_complete(&context->operation, outcome, code, context->cseq);
++  if (context->operation.action == OUTPUT_ATTENTION_RECOVER)
++    {
++      struct output_attention_result retained;
++      if (outputs_attention_result_get(context->operation.identity.process,
++          context->operation.operation, &retained) == 0
++          && retained.current && retained.recovery_state == OUTPUT_RECOVERY_RESTORED
++          && session->recovery_operation.operation == context->operation.operation)
++        memset(&session->recovery_operation, 0, sizeof(session->recovery_operation));
++      // UNKNOWN retains only its eventual drain correlation. It never owns or
++      // vetoes the regular session's immutable START/FLUSH/STOP sequences.
++    }
++  free(context);
++}
++
++static int
++attention_dispatch_current(void *arg)
++{
++  const struct airplay_attention_request *context = arg;
++  struct output_attention_result retained;
++  struct output_device *device = outputs_device_get(context->operation.identity.device_id);
++
++  return device && !context->session->attention_retiring && device->session == context->session
++    && device->incarnation == context->operation.identity.device_incarnation
++    && device->session_epoch == context->operation.identity.session_epoch
++    && outputs_attention_result_get(context->operation.identity.process, context->operation.operation, &retained) == 0
++    && retained.outcome == OUTPUT_ATTENTION_PENDING
++    && (context->operation.action == OUTPUT_ATTENTION_FLUSH
++        ? (device->route_revision == context->operation.identity.route_revision)
++        : retained.current);
++}
++
++static int
++airplay_attention_set(struct output_device *device, const struct output_attention_result *operation)
++{
++  struct airplay_session *session = device->session;
++  struct airplay_attention_request *context;
++  struct evrtsp_request *request;
++  float mapped;
++  char volume[32];
++
++  if (session && session->recovery_only && session->state == AIRPLAY_STATE_STOPPED
++      && operation->action == OUTPUT_ATTENTION_RELEASE)
++    return airplay_attention_recover(device,operation);
++  if (session && !(session->state & AIRPLAY_STATE_F_CONNECTED)
++      && operation->action == OUTPUT_ATTENTION_RELEASE)
++    {
++      // An already queued START keeps its immutable owner. Drain it first; the
++      // manager must obtain a fresh origin RECOVER, never desired-only credit.
++      session->recovery_handoff=true;
++      session->recovery_operation=*operation;
++      return airplay_device_stop(device,-1);
++    }
++  if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
++    return 0; // Desired-only, no native request or fabricated acceptance.
++  if (session->device_incarnation != operation->identity.device_incarnation
++      || session->session_epoch != operation->identity.session_epoch)
++    return -1;
++  context = calloc(1, sizeof(*context));
++  if (!context)
++    return -1;
++  context->operation = *operation;
++  context->session = session;
++  context->cseq = session->cseq;
++  request = evrtsp_request_new(attention_response_cb, context);
++  if (!request)
++    { free(context); return -1; }
++  if (request_headers_add(request, session,
++      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER) < 0)
++    goto error;
++  if (operation->action == OUTPUT_ATTENTION_FLUSH)
++    {
++      char info[64];
++      struct rtp_session *rtp = session->master_session->rtp_session;
++      snprintf(info, sizeof(info), "seq=%" PRIu16 ";rtptime=%u", rtp->seqnum, rtp->pos);
++      evrtsp_add_header(request->output_headers, "RTP-Info", info);
++    }
++  else
++    {
++      evrtsp_add_header(request->output_headers, "Content-Type", "text/parameters");
++      mapped = airplay_volume_from_pct(operation->identity.effective_volume, session->devname);
++      snprintf(volume, sizeof(volume), "-%d.%06d", -(int)mapped, -(int)(1000000.0 * (mapped - (int)mapped)));
++      if (evbuffer_add_printf(request->output_buffer, "volume: %s\r\n", volume) < 0)
++        goto error;
++    }
++  session->attention_managed = true;
++
++  // The immutable payload is built before queueing. Existing CSeq/transport,
++  // cipher and request ownership are reused; no alternate session or mixer.
++  // Register before guarded enqueue. Veto completion is deferred on the existing
++  // connection event; connection_free cancels it and the session drains contexts.
++  context->next = session->attention_requests;
++  session->attention_requests = context;
++  evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
++  session->reqs_in_flight++;
++  if (evrtsp_make_request_guarded(session->ctrl, request,
++      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER,
++      session->session_url, attention_dispatch_current, context) < 0)
++    {
++      // Guarded negative return detached only this inserted request; no callback.
++      attention_request_remove(context);
++      session->reqs_in_flight--;
++      if (!session->reqs_in_flight)
++        evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
++      goto error;
++    }
++  return 1; // The connection now owns the request and its deferred completion.
++
++ error:
++  evrtsp_request_free(request);
++  free(context);
++  return -1;
++}
++
++static bool
++airplay_attention_recovery_idle(struct output_device *device)
++{
++  struct airplay_session *session;
++  for (session=airplay_sessions;session;session=session->next)
++    if (session->device_id==device->id
++        && (session != device->session || session->attention_retiring
++            || session->sequence_requests || session->attention_requests || session->reqs_in_flight
++            || (session->recovery_only && session->recovery_operation.operation)))
++      return false; // Includes old incarnations still owned by real STOP/connection cleanup.
++  return true;
++}
++
++static int
++airplay_attention_recovery_prepare(struct output_device *device)
++{
++  struct airplay_session *session = device->session;
++  if (!airplay_attention_recovery_idle(device)) return -1;
++  if (session)
++    return !session->attention_retiring && !session->recovery_operation.operation
++      && (session->state & AIRPLAY_STATE_F_CONNECTED) ? 0 : -1;
++  session = session_make(device,-1);
++  if (!session) return -1;
++  session->recovery_only = true;
++  session->attention_managed = true;
++  session->attention_suspended = true;
++  return 0;
++}
++
++static void
++airplay_attention_recovery_abort(struct output_device *device)
++{
++  struct airplay_session *session = device->session;
++  if (session && session->recovery_only && !session->recovery_operation.operation)
++    session_cleanup(session); // Unsent local allocation only; no network effect.
++}
++
++static int
++airplay_attention_recover(struct output_device *device, const struct output_attention_result *operation)
++{
++  struct airplay_session *session = device->session;
++  if (!session || session->attention_retiring) return -1;
++  if (!session->recovery_only)
++    { session->recovery_operation=*operation; return airplay_attention_set(device,operation); }
++  session->recovery_operation = *operation;
++  sequence_start(AIRPLAY_SEQ_START,session,NULL,"recovery_start");
++  return 1;
++}
++
++static int
++airplay_attention_suspend(struct output_device *device, const struct output_attention_result *operation)
++{
++  struct airplay_session *session = device->session;
++  if (!session)
++    return 0;
++  session->attention_managed = true;
++  session->attention_suspended = true;
++  return airplay_attention_set(device, operation);
++}
++
++static void
++airplay_attention_resume(struct output_device *device)
++{
++  struct airplay_session *session = device->session;
++  struct output_attention_result barrier;
++  struct output_attention_state current;
++  if (!session || session->recovery_only || session->attention_retiring || !session->attention_managed || session->device_incarnation != device->incarnation
++      || session->session_epoch != device->session_epoch || !session->attention_suspended)
++    return;
++  if (!device->route_operation)
++    {
++      // A reselection needs its own real FLUSH; an old route's callback is not permission.
++      outputs_attention_route_barrier(device);
++      return;
++    }
++  if (outputs_attention_state_get(device->id, &current) < 0
++      || outputs_attention_result_get(current.process, device->route_operation, &barrier) < 0
++      || barrier.action != OUTPUT_ATTENTION_FLUSH
++      || barrier.identity.device_incarnation != device->incarnation
++      || barrier.identity.session_epoch != device->session_epoch
++      || barrier.identity.route_revision != device->route_revision
++      || barrier.outcome != OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)
++    return; // Failed/unknown/obsolete FLUSH never grants native emission.
++  session->attention_suspended = false;
++  session->emission_floor = session->master_session->packet_serial + 1;
++}
++
++static bool
++attention_emission_current(struct airplay_session *session, const struct rtp_packet *packet)
++{
++  struct output_device *device;
++  struct airplay_master_session *master;
++  ptrdiff_t slot;
++
++  if (session->attention_retiring || session->recovery_only)
++    return false;
++  if (!session->attention_managed)
++    return true; // Ordinary legacy sessions retain their original contract.
++  device = outputs_device_get(session->device_id);
++  if (!device || !device->selected || session->attention_suspended
++      || device->session != session || device->incarnation != session->device_incarnation
++      || device->session_epoch != session->session_epoch || device->route_revision == UINT64_MAX)
++    return false;
++  if (!packet)
++    return true; // Control packets have the same destination/session fence.
++  master = session->master_session;
++  slot = packet - master->rtp_session->pktbuf;
++  return slot >= 0 && (size_t)slot < master->rtp_session->pktbuf_size
++    && master->packet_serial != UINT64_MAX && master->packet_serials[slot]
++    && master->packet_serials[slot] >= session->emission_floor;
+ }
+ 
+ static void
+@@ -1958,7 +2357,7 @@
+   ssize_t sent;
+   int ret;
+ 
+-  if (!session)
++  if (!session || !attention_emission_current(session, pkt))
+     return -1;
+ 
+   if (session->supports_encryption)
+@@ -2011,6 +2410,8 @@
+   int fd;
+   int ret;
+ 
++  if (!attention_emission_current(session, NULL))
++    return;
+   switch (session->family)
+     {
+       case AF_INET:
+@@ -2089,6 +2490,9 @@
+     return -1;
+ 
+   pkt = rtp_packet_next(ams->rtp_session, len, ams->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
++  if (ams->packet_serial != UINT64_MAX)
++    ams->packet_serial++;
++  ams->packet_serials[pkt - ams->rtp_session->pktbuf] = ams->packet_serial;
+ 
+   evbuffer_remove(ams->encoded_buffer, pkt->payload, pkt->payload_len);
+ 
+@@ -2964,6 +3368,7 @@
+ static void
+ start_failure(struct airplay_session *session)
+ {
++  if (session->recovery_only) { session_failure(session); return; }
+   struct output_device *device;
+ 
+   device = outputs_device_get(session->device_id);
+@@ -2990,6 +3395,7 @@
+ static void
+ start_retry(struct airplay_session *session)
+ {
++  if (session->recovery_only) { session_failure(session); return; }
+   struct output_device *device;
+   int callback_id = session->callback_id;
+ 
+@@ -3371,6 +3777,8 @@
+   enum airplay_seq_type seq_type;
+ 
+   seq_type = response_handler_info_generic(req, session);
++  if (session->recovery_only && (seq_type == AIRPLAY_SEQ_PIN_START || seq_type == AIRPLAY_SEQ_PAIR_SETUP))
++    return AIRPLAY_SEQ_ABORT; // Cleanup cannot enroll credentials or begin PIN pairing.
+   if (seq_type != AIRPLAY_SEQ_ABORT && seq_type != AIRPLAY_SEQ_PIN_START)
+     session->next_seq = AIRPLAY_SEQ_START_PLAYBACK; // Pair and then run SEQ_START_PLAYBACK which sets up the playback
+ 
+@@ -3702,13 +4110,52 @@
+ 
+ 
+ static void
++sequence_context_remove(struct airplay_seq_ctx *context)
++{
++  struct airplay_seq_ctx **link = &context->session->sequence_requests;
++  while (*link && *link != context)
++    link = &(*link)->next;
++  if (*link == context)
++    *link = context->next;
++  context->next = NULL;
++}
++
++static bool
++sequence_callback_current(const struct airplay_seq_ctx *context)
++{
++  const struct airplay_session *session = context->session;
++  struct output_device *device;
++  if (session->recovery_only && session->recovery_operation.operation && !session->recovery_handoff)
++    {
++      struct output_attention_result retained;
++      if (outputs_attention_result_get(session->recovery_operation.identity.process,session->recovery_operation.operation,&retained) < 0
++          || !retained.current || retained.outcome != OUTPUT_ATTENTION_PENDING) return false;
++    }
++  if (!session->attention_managed || !context->callback_owned)
++    return true;
++  device = outputs_device_get(session->device_id);
++  return device && device->session == session
++      && device->incarnation == context->device_incarnation
++      && device->session_epoch == context->session_epoch
++      && session->device_incarnation == context->device_incarnation
++      && session->session_epoch == context->session_epoch
++      && !session->callback_revision_exhausted
++      && session->callback_revision == context->callback_revision
++      && session->callback_id == context->callback_id;
++}
++
++static void
+ sequence_continue_cb(struct evrtsp_request *req, void *arg)
+ {
+   struct airplay_seq_ctx *seq_ctx = arg;
+   struct airplay_seq_request *cur_request = seq_ctx->cur_request;
+   struct airplay_session *session = seq_ctx->session;
+   enum airplay_seq_type seq_type;
+-
++  bool current = sequence_callback_current(seq_ctx);
++
++  // Transfer custody to this executing callback before any handler can free
++  // the session/connection and drain its other queued contexts.
++  sequence_context_remove(seq_ctx);
+   session->reqs_in_flight--;
+   if (!session->reqs_in_flight)
+     evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
+@@ -3721,13 +4168,23 @@
+ 
+   if (req->response_code != RTSP_OK)
+     {
+-      if (!cur_request->proceed_on_rtsp_not_ok)
++      // A superseded startup failure still tears down the real connection; it
++      // cannot run its obsolete IPv6/auth retry handler under a newer STOP.
++      if (!current || !cur_request->proceed_on_rtsp_not_ok)
+ 	{
+ 	  DPRINTF(E_LOG, L_AIRPLAY, "Response to %s from '%s' was negative, aborting (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
+ 	  goto error;
+ 	}
+ 
+       DPRINTF(E_WARN, L_AIRPLAY, "Response to %s from '%s' was negative, proceeding anyway (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
++    }
++
++  if (!current)
++    {
++      // Successful old work owns only its context/accounting. In particular it
++      // cannot parse state, launch pairing, or acknowledge a reused STOP slot.
++      free(seq_ctx);
++      return;
+     }
+ 
+   // We don't check that the reply CSeq matches the request CSeq, because some
+@@ -3743,7 +4200,7 @@
+ 	    goto error;
+ 
+ 	  // Handler wanted to start a new sequence
+-	  sequence_start(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller);
++	  sequence_start_bound(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller, seq_ctx);
+ 	  free(seq_ctx);
+ 	  return;
+ 	}
+@@ -3757,14 +4214,25 @@
+       return;
+     }
+ 
+-  if (seq_ctx->on_success)
++  // Pair completion starts another sequence through the same original command,
++  // not a fresh ticket sampled from a callback binding that may have changed.
++  if (session->attention_managed && seq_ctx->callback_owned
++      && seq_ctx->on_success == session_pair_success && session->next_seq != AIRPLAY_SEQ_CONTINUE)
++    {
++      seq_type = session->next_seq;
++      session->next_seq = AIRPLAY_SEQ_CONTINUE;
++      sequence_start_bound(seq_type, session, NULL, "pair_success", seq_ctx);
++    }
++  else if (seq_ctx->on_success)
+     seq_ctx->on_success(session);
+ 
+   free(seq_ctx);
+   return;
+ 
+  error:
+-  if (seq_ctx->on_error)
++  if (!current && session->attention_managed && seq_ctx->callback_owned)
++    session_failure(session); // Real terminal failure, never stale retry/auth mutation.
++  else if (seq_ctx->on_error)
+     seq_ctx->on_error(session);
+ 
+   free(seq_ctx);
+@@ -3778,6 +4246,20 @@
+   struct evrtsp_request *req = NULL;
+   const char *uri;
+   int ret;
++
++  if (session->recovery_only && !sequence_callback_current(seq_ctx)) goto error;
++  if (session->recovery_only && cur_request->payload_make == payload_make_set_volume
++      && cur_request->seq_type == AIRPLAY_SEQ_START_PLAYBACK)
++    {
++      // Suppress the legacy uncorrelated/lax volume write. The same established
++      // RAOP control owner sends exactly one strict immutable recovery request.
++      session_connected(session);
++      free(seq_ctx);
++      return;
++    }
++  // Re-register a continuing context before it becomes queue-owned again.
++  seq_ctx->next = session->sequence_requests;
++  session->sequence_requests = seq_ctx;
+ 
+   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
+   if (!req)
+@@ -3803,6 +4285,7 @@
+ 	    }
+ 
+ 	  evrtsp_request_free(req);
++          sequence_context_remove(seq_ctx);
+ 	  sequence_continue(seq_ctx);
+ 	  return;
+         }
+@@ -3814,7 +4297,9 @@
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
+ 
+-  ret = evrtsp_make_request(session->ctrl, req, cur_request->rtsp_type, uri);
++  ret = session->recovery_only
++    ? evrtsp_make_request_guarded(session->ctrl,req,cur_request->rtsp_type,uri,recovery_sequence_current,seq_ctx)
++    : evrtsp_make_request(session->ctrl, req, cur_request->rtsp_type, uri);
+   if (ret < 0)
+     goto error;
+ 
+@@ -3829,6 +4314,8 @@
+ 
+   if (req)
+     evrtsp_request_free(req);
++
++  sequence_context_remove(seq_ctx);
+ 
+   // Sets status to FAILED, gives status to player and frees session. Must be
+   // deferred, otherwise sequence_start() could invalidate the session, meaning
+@@ -3841,7 +4328,8 @@
+ 
+ // All errors that may occur during a sequence are called back async
+ static void
+-sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
++sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
++    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent)
+ {
+   struct airplay_seq_ctx *seq_ctx;
+ 
+@@ -3853,8 +4341,23 @@
+   seq_ctx->on_error = airplay_seq_definition[seq_type].on_error;
+   seq_ctx->payload_make_arg = arg;
+   seq_ctx->log_caller = log_caller;
++  seq_ctx->callback_id = parent ? parent->callback_id : session->callback_id;
++  seq_ctx->callback_revision = parent ? parent->callback_revision : session->callback_revision;
++  seq_ctx->device_incarnation = parent ? parent->device_incarnation : session->device_incarnation;
++  seq_ctx->session_epoch = parent ? parent->session_epoch : session->session_epoch;
++  seq_ctx->callback_owned = parent ? parent->callback_owned
++      : seq_type == AIRPLAY_SEQ_START || seq_type == AIRPLAY_SEQ_START_PLAYBACK
++        || seq_type == AIRPLAY_SEQ_SEND_VOLUME || seq_type == AIRPLAY_SEQ_FLUSH
++        || seq_type == AIRPLAY_SEQ_PAIR_SETUP || seq_type == AIRPLAY_SEQ_PAIR_VERIFY
++        || seq_type == AIRPLAY_SEQ_PAIR_TRANSIENT;
+ 
+   sequence_continue(seq_ctx); // Ownership transferred
++}
++
++static void
++sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
++{
++  sequence_start_bound(seq_type, session, arg, log_caller, NULL);
+ }
+ 
+ 
+@@ -4174,7 +4677,20 @@
+ {
+   struct airplay_session *session = device->session;
+ 
+-  session->callback_id = callback_id;
++  if (session->attention_managed)
++    {
++      if (session->attention_retiring)
++        return -1;
++      // Resolve the previous native operation before replacing its callback.
++      if (session->callback_id >= 0 && session->callback_id != callback_id)
++        outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
++            session->session_epoch, session, OUTPUT_STATE_STOPPED);
++      session->attention_retiring = true;
++      session->attention_suspended = true;
++      device->attention_retiring_session = session;
++    }
++  if (!session_callback_bind(session, callback_id))
++    return 1;
+ 
+   sequence_start(AIRPLAY_SEQ_STOP, session, NULL, "device_stop");
+ 
+@@ -4189,7 +4705,8 @@
+   if (session->state != AIRPLAY_STATE_STREAMING)
+     return 0; // No-op, nothing to flush
+ 
+-  session->callback_id = callback_id;
++  if (!session_callback_bind(session, callback_id))
++    return 1;
+ 
+   sequence_start(AIRPLAY_SEQ_FLUSH, session, NULL, "flush");
+ 
+@@ -4201,7 +4718,7 @@
+ {
+   struct airplay_session *session = device->session;
+ 
+-  session->callback_id = callback_id;
++  session_callback_bind(session, callback_id);
+ }
+ 
+ static void
+@@ -4305,7 +4822,7 @@
+ 
+   CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
+ 
+-  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
++  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "user_agent");
+   airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
+ 
+   timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
+@@ -4402,6 +4919,13 @@
+   .device_cb_set = airplay_device_cb_set,
+   .device_free_extra = airplay_device_free_extra,
+   .device_volume_set = airplay_set_volume_one,
++  .device_attention_set = airplay_attention_set,
++  .device_attention_recovery_idle = airplay_attention_recovery_idle,
++  .device_attention_recovery_prepare = airplay_attention_recovery_prepare,
++  .device_attention_recovery_abort = airplay_attention_recovery_abort,
++  .device_attention_recover = airplay_attention_recover,
++  .device_attention_suspend = airplay_attention_suspend,
++  .device_attention_resume = airplay_attention_resume,
+   .device_volume_to_pct = airplay_volume_to_pct,
+   .write = airplay_write,
+   .metadata_prepare = airplay_metadata_prepare,
+diff --git a/src/player.c b/src/player.c
+index f9ce6169795b73b0c87f80d34bff776372399079..65d0ed67c24aaa559110e2b7368eb5dcaf1d3c19 100644
 --- a/src/player.c
 +++ b/src/player.c
 @@ -2550,6 +2550,7 @@
@@ -2252,6 +3089,48 @@
  static enum command_state
  volume_set(void *arg, int *retval)
  {
+@@ -3116,7 +3188,8 @@
+       return COMMAND_END;
+     }
+ 
+-  outputs_device_volume_register(device, -1, vol_param->volume);
++  if (outputs_device_volume_register(device, -1, vol_param->volume) < 0)
++    { *retval = -1; return COMMAND_END; }
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+@@ -3140,7 +3213,8 @@
+       return COMMAND_END;
+     }
+ 
+-  outputs_device_volume_register(device, vol_param->volume, -1);
++  if (outputs_device_volume_register(device, vol_param->volume, -1) < 0)
++    { *retval = -1; return COMMAND_END; }
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+@@ -3173,7 +3247,8 @@
+       return COMMAND_END;
+     }
+ 
+-  outputs_device_volume_register(device, volume, -1);
++  if (outputs_device_volume_register(device, volume, -1) < 0)
++    { *retval = -1; return COMMAND_END; }
+ 
+   *retval = outputs_device_volume_set(device, device_volume_cb);
+ 
+@@ -3916,6 +3991,9 @@
+       pthread_exit(NULL);
+     }
+ 
++  if (outputs_attention_startup() < 0)
++    { DPRINTF(E_LOG,L_PLAYER,"Native durable custody init failed\n"); db_perthread_deinit(); pthread_exit(NULL); }
++
+   event_base_dispatch(evbase_player);
+ 
+   if (!player_exit)
+diff --git a/src/player.h b/src/player.h
+index 258d8e15a95bf6634ef85ca652e7679fa7a7c5d4..2c43bdabb077cc1d99cc15f0618c273715dbe984 100644
 --- a/src/player.h
 +++ b/src/player.h
 @@ -7,6 +7,7 @@
@@ -2295,9 +3174,12 @@
  int
  player_get_status(struct player_status *status);
  
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf786d77c6bb86a34284cdd8aeb2f55085b796b1
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,911 @@
 +/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
 + * No discovery, daemon, media input, fabricated connected/session-ready flag,
 + * receiver capability, public-volume acceptance or acoustic proof.
@@ -2555,6 +3437,11 @@
 +  struct timeval bound = {5, 0};
 +  struct airplay_extra *extra;
 +  int i, result;
++  char database_path[]="/tmp/native-airplay-owner-XXXXXX";
++  bool database_ready=false;
++  int database_fd=mkstemp(database_path);
++  if (database_fd < 0) return 1;
++  close(database_fd);
 +  current_fixture = &f; context_allocations = context_frees = 0;
 +  memset(contexts, 0, sizeof(contexts)); fail_request_allocation = false;
 +  f.base = event_base_new(); if (!f.base) return 1;
@@ -2564,6 +3451,10 @@
 +      ? "general { user_agent = General/custom }"
 +      : "general { user_agent = General/custom } airplay_shared { user_agent = AirPlay/123.4.5 }") != CFG_SUCCESS)
 +    { owner_fail(&f, "actual explicit User-Agent configuration rejected"); goto cleanup; }
++  cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database_path);
++  if (db_init("/usr/lib/owntone/owntone-sqlext.so") < 0 || db_perthread_init() < 0)
++    { owner_fail(&f,"actual private native DB startup"); goto cleanup; }
++  database_ready=true;
 +  fixture_service_bind_calls = 0;
 +  /* Run the actual production selector. Refuse its first service bind, so no
 +   * discovery, UDP socket or PTP service starts; the existing failure path
@@ -2579,7 +3470,8 @@
 +   * not outputs_init's discovery/backend sockets, library, bus or daemon. */
 +  outputs_deferredev = evtimer_new(f.base, deferred_cb, NULL);
 +  outputs_buffer_duration_ms = cfg_getint(cfg_getsec(cfg, "general"), "start_buffer_ms");
-+  uuid_make(outputs_process);
++  outputs_attention_uuid(outputs_process);
++  if (outputs_attention_startup() < 0) { owner_fail(&f,"actual durable native process startup"); goto cleanup; }
 +  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 +  if (mode == OLD_START_REFUSED) {
 +    /* Keep the actual ephemeral port bound but never listen. The kernel,
@@ -2643,7 +3535,10 @@
 +  if (outputs_deferredev) event_free(outputs_deferredev);
 +  outputs_deferredev = NULL;
 +  airplay_user_agent = NULL; airplay_client_name = NULL;
-+  if (cfg) cfg_free(cfg); cfg = NULL;
++  if (database_ready) db_perthread_deinit();
++  db_deinit(); unlink(database_path);
++  if (cfg) cfg_free(cfg);
++  cfg = NULL;
 +  result = f.failed; event_base_free(f.base); evbase_player = NULL; current_fixture = NULL;
 +  memset(outputs_cb_register, 0, sizeof(outputs_cb_register));
 +  memset(attention_results, 0, sizeof(attention_results));
@@ -2793,6 +3688,395 @@
 +  return f.failed;
 +}
 +
++/* Actual public native RECOVER through file SQLite, real transient pairing,
++ * cipher, existing RAOP startup and strict SET_PARAMETER/TEARDOWN callbacks.
++ * The receiver is one owned loopback fixture, never a HomePod/physical claim. */
++struct recovery_wire_fixture {
++  struct event_base *base;
++  struct evconnlistener *listener;
++  struct bufferevent *peer;
++  struct evbuffer *plain;
++  struct pair_setup_context *pair;
++  struct pair_cipher_context *cipher;
++  struct event *poll,*deadline;
++  struct output_device *device;
++  struct output_attention_request command;
++  struct output_attention_result result;
++  unsigned short udp_port;
++  int udp_fd,mode,phase,failed,wire,volumes,teardowns,pair_messages,start_callbacks,stop_callbacks;
++  struct output_attention_result handoff;
++};
++
++static struct recovery_wire_fixture *active_recovery_wire;
++static void recovery_wire_connected(struct output_device *, enum output_device_state);
++static void recovery_wire_stopped(struct output_device *, enum output_device_state);
++
++static void recovery_wire_fail(struct recovery_wire_fixture *f,const char *why)
++{ fprintf(stderr,"FAIL native recovery wire mode%d: %s\n",f->mode,why); f->failed=1; event_base_loopbreak(f->base); }
++
++static void recovery_wire_deadline(int fd,short what,void *arg)
++{ (void)fd;(void)what; recovery_wire_fail(arg,"finite existing owner bound"); }
++
++static int recovery_wire_reply(struct recovery_wire_fixture *f,int code,int cseq,const uint8_t *body,size_t length)
++{
++  struct evbuffer *reply=evbuffer_new();
++  uint8_t *encrypted=NULL;
++  size_t encrypted_length=0;
++  int ret;
++  if (!reply) return -1;
++  evbuffer_add_printf(reply,"RTSP/1.0 %d Controlled\r\nCSeq: %d\r\nContent-Length: %zu\r\n\r\n",code,cseq,length);
++  if (length) evbuffer_add(reply,body,length);
++  if (f->cipher) {
++    ret=pair_encrypt(&encrypted,&encrypted_length,evbuffer_pullup(reply,-1),evbuffer_get_length(reply),f->cipher);
++    if (ret<0) {evbuffer_free(reply);return -1;}
++    ret=bufferevent_write(f->peer,encrypted,encrypted_length); free(encrypted);
++  } else ret=bufferevent_write_buffer(f->peer,reply);
++  evbuffer_free(reply); return ret;
++}
++
++static void recovery_wire_read(struct bufferevent *peer,void *arg)
++{
++  struct recovery_wire_fixture *f=arg;
++  struct evbuffer *input=bufferevent_get_input(peer);
++  struct evbuffer_ptr end;
++  uint8_t *decoded=NULL,*body=NULL,*response=NULL;
++  size_t decoded_length=0,response_length=0,length;
++  char header[4096]; int bytes,cseq,code=200;
++  ssize_t consumed;
++  plist_t plist=NULL;
++  bool activate_cipher=false;
++  if (f->cipher) {
++    consumed=pair_decrypt(&decoded,&decoded_length,evbuffer_pullup(input,-1),evbuffer_get_length(input),f->cipher);
++    if (consumed<0) {recovery_wire_fail(f,"actual server control decrypt");return;}
++    evbuffer_drain(input,consumed); if (decoded_length) evbuffer_add(f->plain,decoded,decoded_length); free(decoded);
++  } else evbuffer_add_buffer(f->plain,input);
++  end=evbuffer_search(f->plain,"\r\n\r\n",4,NULL); if(end.pos<0)return;
++  length=end.pos+4; if(length>=sizeof(header)){recovery_wire_fail(f,"bounded header");return;}
++  evbuffer_copyout(f->plain,header,length);header[length]=0;
++  bytes=request_header(header,"Content-Length:"); cseq=request_header(header,"CSeq:");
++  if(bytes<0)bytes=0;
++  if(bytes>65536 || cseq<=0){recovery_wire_fail(f,"real frame/CSeq");return;}
++  if(evbuffer_get_length(f->plain)<length+(size_t)bytes)return;
++  evbuffer_drain(f->plain,length);
++  if(bytes) {body=malloc(bytes);if(!body){recovery_wire_fail(f,"body allocation");return;}evbuffer_remove(f->plain,body,bytes);}
++  f->wire++;
++  if(!strncmp(header,"GET /info ",10)) {
++    if (f->mode == 6 && f->phase == 0)
++      {
++        struct output_device *old = f->device, *replacement = calloc(1, sizeof(*replacement));
++        struct airplay_extra *extra = calloc(1, sizeof(*extra));
++        struct output_attention_state state;
++        struct output_attention_result blocked;
++        uint64_t old_incarnation = old->incarnation;
++        if (!replacement || !extra) { free(replacement); free(extra); recovery_wire_fail(f, "replacement allocation"); goto done; }
++        replacement->id = old->id; replacement->name = strdup(old->name);
++        replacement->type = old->type; replacement->type_name = old->type_name;
++        replacement->advertised = true; replacement->quality = old->quality;
++        replacement->v4_address = strdup(old->v4_address); replacement->v4_port = old->v4_port;
++        replacement->extra_device_info = extra; extra->mdns_name = strdup(old->name);
++        outputs_device_remove(old);
++        f->device = outputs_device_add(replacement, false);
++        if (!f->device || f->device->incarnation == old_incarnation || f->device->session
++            || outputs_attention_state_get(f->device->id, &state) < 0 || state.recovery_idle
++            || !airplay_sessions)
++          { recovery_wire_fail(f, "hot replacement hid draining old native owner"); goto done; }
++        f->command.expected = state;
++        if (outputs_attention_admit(&f->command, &blocked) == 0)
++          { recovery_wire_fail(f, "replacement recovered before actual old-owner drain"); goto done; }
++        f->phase = 1;
++      }
++    if (f->mode == 3 && f->phase == 0)
++      {
++        struct output_attention_request release = { .action = OUTPUT_ATTENTION_RELEASE };
++        struct output_attention_state state;
++        outputs_attention_uuid(release.request_id);
++        outputs_attention_state_get(f->device->id, &release.expected);
++        if (outputs_attention_admit(&release, &f->handoff) < 0
++            || f->handoff.outcome != OUTPUT_ATTENTION_PENDING
++            || outputs_attention_state_get(f->device->id, &state) < 0
++            || state.recovery_idle || !state.lease || !state.restoring)
++          { recovery_wire_fail(f, "old START release fabricated idle/terminal receipt"); goto done; }
++        f->phase = 1;
++      }
++    plist=plist_new_dict();wplist_dict_add_uint(plist,"statusFlags",0);
++  } else if(!strncmp(header,"POST /pair-setup ",17)) {
++    if(!f->pair)f->pair=pair_setup_new(PAIR_SERVER_HOMEKIT,NULL,NULL,NULL,"native-private-receiver");
++    if(!f->pair || pair_setup(&response,&response_length,f->pair,body,bytes)<0)
++      {recovery_wire_fail(f,"real transient server pairing");goto done;}
++    f->pair_messages++;
++    activate_cipher=(f->pair_messages % 2)==0;
++  } else if(!strncmp(header,"SETUP ",6)) {
++    plist=plist_new_dict();
++    plist_t setup = NULL;
++    if (body && bytes) plist_from_bin((const char *)body, bytes, &setup);
++    bool stream_setup = setup && plist_dict_get_item(setup, "streams");
++    if (setup) plist_free(setup);
++    if(stream_setup) {
++      plist_t streams=plist_new_array(),stream=plist_new_dict();
++      wplist_dict_add_uint(stream,"dataPort",f->udp_port);wplist_dict_add_uint(stream,"controlPort",f->udp_port);
++      plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
++    } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
++  } else if(!strncmp(header,"SET_PARAMETER ",14)) {
++    float mapped=airplay_volume_from_pct(60,f->device->name);
++    char expected[64];
++    snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
++    if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
++      {recovery_wire_fail(f,"fresh BASE payload differs from durable manual60");goto done;}
++    f->volumes++;
++    if (!f->device->session || ((f->mode < 4 || f->mode == 6) && (f->volumes != 1 || !((struct airplay_session *)f->device->session)->recovery_only)))
++      {recovery_wire_fail(f,"duplicate lax write or missing real recovery owner");goto done;}
++    if ((f->mode < 4 || f->mode == 6 || f->phase == 3) && attention_emission_current(f->device->session,NULL))
++      {recovery_wire_fail(f,"recovery granted native emission");goto done;}
++    if(f->mode==1 || (f->mode==5 && f->phase==1))cseq++; // Real mismatched server CSeq cannot retire origin.
++    if(f->mode==2)code=503;
++  } else if(!strncmp(header,"TEARDOWN ",9)) {
++    enum output_attention_recovery_state state;struct output_attention_proof proof;
++    f->teardowns++;
++    if(db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING))
++      {recovery_wire_fail(f,"BASE receipt did not preserve exact control custody");goto done;}
++  } else if(strncmp(header,"RECORD ",7) && strncmp(header,"SETPEERS ",9) && strncmp(header,"POST /auth-setup ",17))
++    {recovery_wire_fail(f,"unexpected music/metadata/request");goto done;}
++  if(plist && wplist_to_bin(&response,&response_length,plist)<0){recovery_wire_fail(f,"real plist serialization");goto done;}
++  if(recovery_wire_reply(f,code,cseq,response,response_length)<0){recovery_wire_fail(f,"owned wire reply");goto done;}
++  if(activate_cipher) {
++    struct pair_result *result=NULL;
++    if(pair_setup_result(NULL,&result,f->pair)<0 || !result
++        || !(f->cipher=pair_cipher_new(PAIR_SERVER_HOMEKIT,2,result->shared_secret,result->shared_secret_len)))
++      recovery_wire_fail(f,"actual transient server cipher");
++  }
++ done:
++  if (plist) plist_free(plist);
++  free(body);
++  free(response);
++}
++
++static void recovery_wire_event(struct bufferevent *peer,short what,void *arg)
++{ (void)peer;if(what&BEV_EVENT_ERROR)recovery_wire_fail(arg,"owned peer I/O error"); }
++
++static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
++{
++  struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
++  if(f->peer || length<(int)sizeof(*address) || address->sin_family!=AF_INET || ntohl(address->sin_addr.s_addr)!=INADDR_LOOPBACK)
++    {evutil_closesocket(fd);recovery_wire_fail(f,"unexpected/duplicate receiver connection");return;}
++  f->peer=bufferevent_socket_new(f->base,fd,BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
++  if(!f->peer){evutil_closesocket(fd);recovery_wire_fail(f,"peer owner allocation");return;}
++  bufferevent_setcb(f->peer,recovery_wire_read,NULL,recovery_wire_event,f);bufferevent_enable(f->peer,EV_READ|EV_WRITE);
++}
++
++static void recovery_wire_poll(int fd,short what,void *arg)
++{
++  struct recovery_wire_fixture *f=arg;struct timeval soon={0,1000};(void)fd;(void)what;
++  if (f->mode == 6 && f->phase < 2)
++    {
++      struct output_attention_state state;
++      if (f->phase == 0 || airplay_sessions)
++        { evtimer_add(f->poll, &soon); return; }
++      if (outputs_attention_state_get(f->device->id, &state) < 0 || !state.recovery_idle
++          || state.lease || state.restoring || state.last_drained_operation
++          || db_attention_origin_pending(f->device->id) != 1)
++        { recovery_wire_fail(f, "retired incarnation drain credited/adopted newer output"); return; }
++      bufferevent_free(f->peer); f->peer = NULL;
++      f->command.expected = state;
++      if (outputs_attention_admit(&f->command, &f->result) < 0 || f->result.outcome != OUTPUT_ATTENTION_PENDING)
++        { recovery_wire_fail(f, "fresh stable device cleanup failed after actual old-owner destruction"); return; }
++      f->phase = 2;
++      evtimer_add(f->poll, &soon);
++      return;
++    }
++  if ((f->mode == 4 || f->mode == 5) && f->phase < 3)
++    {
++      struct output_attention_state state;
++      if (f->phase == 0) { evtimer_add(f->poll, &soon); return; }
++      if (f->phase == 1)
++        {
++          if (outputs_attention_result_get(f->result.identity.process, f->result.operation, &f->result) < 0
++              || f->result.outcome == OUTPUT_ATTENTION_PENDING)
++            { evtimer_add(f->poll, &soon); return; }
++          if (!f->device->session || (f->mode == 4 && (f->result.recovery_state != OUTPUT_RECOVERY_RESTORED
++              || ((struct airplay_session *)f->device->session)->recovery_operation.operation
++              || airplay_attention_recovery_prepare(f->device) < 0))
++              || (f->mode == 5 && (f->result.recovery_state != OUTPUT_RECOVERY_UNKNOWN
++                  || !((struct airplay_session *)f->device->session)->recovery_operation.operation)))
++            { recovery_wire_fail(f, "connected recovery terminal custody was not reusable/retained exactly"); return; }
++          f->phase = 2;
++          if (outputs_device_stop(f->device, recovery_wire_stopped) != 1)
++            { recovery_wire_fail(f, "legitimate regular STOP after recovery refused"); return; }
++          evtimer_add(f->poll, &soon);
++          return;
++        }
++      if (f->device->session || airplay_sessions || !f->stop_callbacks)
++        { evtimer_add(f->poll, &soon); return; }
++      if (f->mode == 4) { event_base_loopbreak(f->base); return; }
++      if (outputs_attention_state_get(f->device->id, &state) < 0 || !state.recovery_idle
++          || state.last_drained_operation != f->result.operation
++          || strcmp(state.last_drained_request_id, f->result.command.request_id)
++          || db_attention_origin_pending(f->device->id) != 1)
++        { recovery_wire_fail(f, "failed connected recovery lost positive exact STOP/drain edge"); return; }
++      bufferevent_free(f->peer); f->peer = NULL;
++      pair_cipher_free(f->cipher); f->cipher = NULL;
++      pair_setup_free(f->pair); f->pair = NULL;
++      f->command.expected = state;
++      outputs_attention_uuid(f->command.request_id);
++      if (outputs_attention_admit(&f->command, &f->result) < 0 || f->result.outcome != OUTPUT_ATTENTION_PENDING)
++        { recovery_wire_fail(f, "drained connected UNKNOWN could not reconcile original origin"); return; }
++      f->phase = 3;
++      evtimer_add(f->poll, &soon);
++      return;
++    }
++  if (f->mode == 3 && f->phase < 2)
++    {
++      struct output_attention_state state;
++      struct output_attention_request fresh = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5 };
++      struct output_attention_result blocked;
++      if (f->phase == 0 || outputs_attention_result_get(f->handoff.identity.process, f->handoff.operation, &f->handoff) < 0
++          || f->handoff.outcome == OUTPUT_ATTENTION_PENDING)
++        { evtimer_add(f->poll, &soon); return; }
++      if (f->handoff.outcome != OUTPUT_ATTENTION_UNKNOWN || f->device->session || airplay_sessions
++          || outputs_attention_state_get(f->device->id, &state) < 0 || !state.recovery_idle
++          || state.lease || state.restoring || state.last_drained_operation != f->handoff.operation
++          || strcmp(state.last_drained_request_id, f->handoff.command.request_id)
++          || db_attention_origin_pending(f->device->id) != 1)
++        { recovery_wire_fail(f, "nonconnected RELEASE lacked exact positive drain handoff"); return; }
++      fresh.expected = state;
++      outputs_attention_uuid(fresh.request_id);
++      if (outputs_attention_admit(&fresh, &blocked) == 0)
++        { recovery_wire_fail(f, "pending origin admitted next BEGIN after volatile drain"); return; }
++      bufferevent_free(f->peer); f->peer = NULL;
++      f->command.expected = state;
++      if (outputs_attention_admit(&f->command, &f->result) < 0 || f->result.outcome != OUTPUT_ATTENTION_PENDING)
++        { recovery_wire_fail(f, "exact old origin failed fresh cleanup after drain"); return; }
++      f->phase = 2;
++      evtimer_add(f->poll, &soon);
++      return;
++    }
++  if(outputs_attention_result_get(f->result.identity.process,f->result.operation,&f->result)<0)
++    {recovery_wire_fail(f,"retained exact operation missing");return;}
++  if(f->result.outcome==OUTPUT_ATTENTION_PENDING){evtimer_add(f->poll,&soon);return;}
++  if(f->device->session || airplay_sessions || airplay_master_sessions || context_allocations!=context_frees)
++    {recovery_wire_fail(f,"terminal result hid unjoined control/master/callback owner");return;}
++  event_base_loopbreak(f->base);
++}
++
++static void recovery_wire_connected(struct output_device *device, enum output_device_state state)
++{
++  struct recovery_wire_fixture *f = active_recovery_wire;
++  if (!f || device != f->device || state != OUTPUT_STATE_CONNECTED || ++f->start_callbacks != 1
++      || !device->session || ((struct airplay_session *)device->session)->recovery_only)
++    { if (f) recovery_wire_fail(f, "actual ordinary startup failed exact connected observation"); return; }
++  f->command.expected = (struct output_attention_state){0};
++  outputs_attention_state_get(device->id, &f->command.expected);
++  f->phase = 1;
++  if (outputs_attention_admit(&f->command, &f->result) < 0 || f->result.outcome != OUTPUT_ATTENTION_PENDING)
++    recovery_wire_fail(f, "fresh connected RECOVER not admitted");
++}
++
++static void recovery_wire_stopped(struct output_device *device, enum output_device_state state)
++{
++  struct recovery_wire_fixture *f = active_recovery_wire;
++  if (!f || device != f->device || state != OUTPUT_STATE_STOPPED || ++f->stop_callbacks != 1
++      || device->session || airplay_sessions || airplay_master_sessions)
++    { if (f) recovery_wire_fail(f, "regular STOP terminal before native owner destruction"); }
++}
++
++static void recovery_wire_retired_start(struct output_device *device, enum output_device_state state)
++{
++  struct recovery_wire_fixture *f = active_recovery_wire;
++  if (!f || device != f->device || state != OUTPUT_STATE_STOPPED || ++f->start_callbacks != 1)
++    { if (f) recovery_wire_fail(f, "old START claimed readiness or consumed another owner"); }
++  // Existing callback cancellation says STOPPED. It is not the HA BASE/drain
++  // receipt: the exact native RELEASE remains pending until real cleanup.
++}
++
++static int recovery_wire_case(int mode)
++{
++  struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};
++  struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
++  socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};
++  char database_path[]="/tmp/native-recovery-wire-XXXXXX";
++  struct output_attention_request begin={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5};
++  struct output_attention_result original;enum output_attention_recovery_state origin_state;struct output_attention_proof proof;
++  struct airplay_extra *extra;
++  int file=mkstemp(database_path),i,attempt;
++  bool database_ready=false;
++  if (file < 0) return 1;
++  close(file);
++  active_recovery_wire = &f;
++  f.base=event_base_new();if(!f.base){unlink(database_path);return 1;}evbase_player=f.base;
++  memset(contexts,0,sizeof(contexts));context_allocations=context_frees=0;fail_request_allocation=false;
++  cfg=cfg_init(toplvl_cfg,CFGF_NONE);if(!cfg){f.failed=1;goto cleanup;}
++  cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database_path);
++  if(db_init("/usr/lib/owntone/owntone-sqlext.so")<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
++  if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
++  outputs_deferredev=evtimer_new(f.base,deferred_cb,NULL);
++  outputs_buffer_duration_ms=cfg_getint(cfg_getsec(cfg,"general"),"start_buffer_ms");
++  f.plain=evbuffer_new();f.listener=evconnlistener_new_bind(f.base,recovery_wire_accept,&f,LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE,2,(struct sockaddr *)&address,sizeof(address));
++  if(!f.listener || getsockname(evconnlistener_get_fd(f.listener),(struct sockaddr *)&address,&length)){f.failed=1;goto cleanup;}
++  f.udp_fd=socket(AF_INET,SOCK_DGRAM,0);if(f.udp_fd<0){f.failed=1;goto cleanup;}
++  {struct sockaddr_in udp={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
++    if(bind(f.udp_fd,(struct sockaddr *)&udp,sizeof(udp)) || getsockname(f.udp_fd,(struct sockaddr *)&udp,&length)){f.failed=1;goto cleanup;}f.udp_port=ntohs(udp.sin_port);}
++  for(attempt=0;attempt<((mode == 3 || mode == 6) ? 1 : 2);attempt++) {
++    outputs_attention_uuid(outputs_process);if(outputs_attention_startup()<0){f.failed=1;goto cleanup;}
++    f.device=calloc(1,sizeof(*f.device));extra=calloc(1,sizeof(*extra));if(!f.device || !extra){f.failed=1;goto cleanup;}
++    f.device->id=1;f.device->name=strdup("private-recovery-native");f.device->type=OUTPUT_TYPE_AIRPLAY;f.device->type_name="AirPlay";
++    f.device->advertised=true;f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);
++    f.device->extra_device_info=extra;extra->mdns_name=strdup("private-recovery-native");
++    f.device=outputs_device_add(f.device,false);if(!f.device){f.failed=1;goto cleanup;}
++    if(!attempt) {
++      if(outputs_device_volume_register(f.device,60,-1)<0){f.failed=1;goto cleanup;}
++      outputs_attention_uuid(begin.request_id);outputs_attention_state_get(1,&begin.expected);
++      if(outputs_attention_admit(&begin,&original)<0 || original.outcome!=OUTPUT_ATTENTION_DESIRED_ONLY){f.failed=1;goto cleanup;}
++      f.command.origin=f.device->attention_origin;
++      if (mode != 3 && mode != 6) { outputs_device_remove(f.device);f.device=NULL;memset(attention_results,0,sizeof(attention_results)); }
++    }
++  }
++  f.command.action=OUTPUT_ATTENTION_RECOVER;outputs_attention_uuid(f.command.request_id);outputs_attention_state_get(1,&f.command.expected);
++  if (mode == 4 || mode == 5)
++    {
++      if (outputs_device_start(f.device, recovery_wire_connected, false) != 1)
++        { recovery_wire_fail(&f, "actual ordinary startup refused"); goto cleanup; }
++    }
++  else if (mode == 3 || mode == 6)
++    {
++      if (outputs_device_start(f.device, recovery_wire_retired_start, false) != 1)
++        { recovery_wire_fail(&f, "actual old START was not queued"); goto cleanup; }
++    }
++  else if(outputs_attention_admit(&f.command,&f.result)<0 || f.result.outcome!=OUTPUT_ATTENTION_PENDING){recovery_wire_fail(&f,"public fresh RECOVER not pending");goto cleanup;}
++  f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
++  if(!f.poll || !f.deadline || evtimer_add(f.deadline,&bound) || evtimer_add(f.poll,&soon)){f.failed=1;goto cleanup;}
++  event_base_dispatch(f.base);
++  if(!f.failed && (f.volumes!=(mode == 4 ? 2 : mode == 5 ? 3 : 1)
++      || f.teardowns!=((mode == 3 || mode == 5 || mode == 6) ? 2 : 1) || f.pair_messages!=(mode == 5 ? 4 : 2) || f.wire<8))recovery_wire_fail(&f,"actual bounded handshake/strict-write/teardown count");
++  if(!f.failed && (db_attention_origin_get(1,&f.command.origin,&origin_state,&proof)<0
++      || origin_state!=((mode == 1 || mode == 2) ? OUTPUT_RECOVERY_PENDING : OUTPUT_RECOVERY_ALREADY_RETIRED)))recovery_wire_fail(&f,"durable strict receipt outcome");
++  if(!f.failed && (mode == 0 || mode >= 3) && (f.result.recovery_state!=OUTPUT_RECOVERY_RESTORED || !f.result.current || f.result.response_code!=200
++      || f.result.request_cseq<=0 || strcmp(f.result.recovery_proof.terminal_request_id,f.command.request_id)))recovery_wire_fail(&f,"exact fresh terminal proof");
++  if(!f.failed && (mode == 1 || mode == 2) && f.result.recovery_state!=OUTPUT_RECOVERY_UNKNOWN)recovery_wire_fail(&f,"bad CSeq/non200 got recovery credit");
++  if(!f.failed) {char byte; if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"unexpected recovery audio/data packet");}
++ cleanup:
++  while(airplay_sessions)session_cleanup(airplay_sessions);
++  if(outputs_device_list)outputs_device_remove(outputs_device_list);
++  for(i=0;i<(int)ARRAY_SIZE(contexts);i++)if(contexts[i])f.failed=1;
++  if (f.peer) bufferevent_free(f.peer);
++  if (f.listener) evconnlistener_free(f.listener);
++  if (f.plain) evbuffer_free(f.plain);
++  pair_cipher_free(f.cipher);pair_setup_free(f.pair);
++  if (f.poll) event_free(f.poll);
++  if (f.deadline) event_free(f.deadline);
++  if (f.udp_fd >= 0) close(f.udp_fd);
++  if (outputs_deferredev) event_free(outputs_deferredev);
++  outputs_deferredev = NULL;
++  if (database_ready) db_perthread_deinit();
++  db_deinit();
++  unlink(database_path);
++  if (cfg) cfg_free(cfg);
++  cfg = NULL;
++  airplay_user_agent = NULL;
++  airplay_client_name = NULL;
++  event_base_free(f.base);evbase_player=NULL;memset(attention_results,0,sizeof(attention_results));memset(attention_result_reserved,0,sizeof(attention_result_reserved));
++  active_recovery_wire = NULL;
++  return f.failed;
++}
++
 +int main(void)
 +{
 +  int mode;
@@ -2803,9 +4087,13 @@
 +    if (owner_case(OLD_START_200, mode)) return 1;
 +  for (mode = RAW_FREE; mode <= RAW_NESTED_FREE; mode++)
 +    if (raw_case((enum raw_mode)mode)) return 1;
-+  puts("PASS: actual AirPlay config/default/override/general isolation and RTSP User-Agent; AirPlay/evrtsp callback tickets, refused connect and synchronous queue custody (no AP2/public-volume/physical claim)");
++  for(mode=0;mode<7;mode++) if(recovery_wire_case(mode)) return 1;
++  puts("PASS: existing AirPlay config/queue owners plus seven actual private AP2 recovery/write/drain cases; no HomePod or physical-volume claim");
 +  return 0;
 +}
+diff --git a/tests/evrtsp_guarded_owner_contract.c b/tests/evrtsp_guarded_owner_contract.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d211de80840898cb13e2494b21eee0c5525a8a96
 --- /dev/null
 +++ b/tests/evrtsp_guarded_owner_contract.c
 @@ -0,0 +1,206 @@
@@ -3015,6 +4303,9 @@
 +  puts("PASS actual guarded queue ownership; no AirPlay/native acoustic acceptance");
 +  return EXIT_SUCCESS;
 +}
+diff --git a/tests/evrtsp_owner_contract.c b/tests/evrtsp_owner_contract.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d44510e8724d47c2543c9c971ccacd9f8aed758e
 --- /dev/null
 +++ b/tests/evrtsp_owner_contract.c
 @@ -0,0 +1,390 @@
@@ -3408,9 +4699,12 @@
 +  if (run_case(GRACEFUL_EOF_NO_ACK)) return EXIT_FAILURE;
 +  return EXIT_SUCCESS;
 +}
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7832a2259287e30642cd85ed9a468d19c950423f
 --- /dev/null
 +++ b/tests/outputs_attention_owner.c
-@@ -0,0 +1,661 @@
+@@ -0,0 +1,848 @@
 +/*
 + * Deterministic native OWNER regressions, not receiver or acoustic acceptance.
 + * Compiles the complete candidate outputs.c translation unit with its real
@@ -3425,6 +4719,11 @@
 +#include <string.h>
 +
 +#include "../src/outputs.c"
++#define db_speaker_get actual_db_speaker_get
++#define db_speaker_save actual_db_speaker_save
++#include "../src/db.c"
++#undef db_speaker_get
++#undef db_speaker_save
 +
 +/* PC12 exercises the complete existing JSON API TU. Only the synchronous
 + * player command return is controlled here; parsing and ownership stay real.
@@ -3525,6 +4824,7 @@
 +uid_t runas_uid;
 +gid_t runas_gid;
 +
++static char owner_database_path[]="/tmp/native-attention-owner-XXXXXX";
 +static int transport_return;
 +static int transport_calls;
 +static struct output_attention_result admitted;
@@ -3601,12 +4901,32 @@
 +  return device;
 +}
 +
++static int recovery_prepare_edge(struct output_device *device)
++{ (void)device; return 0; }
++
++static void recover_fixture_origin(struct output_device *device, const struct output_attention_origin *origin)
++{
++  struct output_attention_request command={.action=OUTPUT_ATTENTION_RECOVER};
++  struct output_attention_result result;
++  int previous=transport_return;
++  command.origin=*origin;
++  outputs_attention_uuid(command.request_id);
++  assert(outputs_attention_state_get(device->id,&command.expected)==0);
++  transport_return=1;
++  assert(outputs_attention_admit(&command,&result)==0);
++  outputs_attention_complete(&result,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,41);
++  assert(db_attention_origin_pending(device->id)==0);
++  transport_return=previous;
++}
++
 +static struct output_attention_result request(uint64_t id, enum output_attention_action action)
 +{
 +  struct output_attention_request request = { .action = action, .cap_volume = 5 };
 +  struct output_attention_result result;
++  outputs_attention_uuid(request.request_id);
 +  assert(outputs_attention_state_get(id, &request.expected) == 0);
-+  assert(outputs_attention_admit(&request, &result) == 0);
++  if (outputs_attention_admit(&request,&result) < 0)
++    { fprintf(stderr,"owner admission failed action=%d id=%" PRIu64 " lease=%" PRIu64 " sqlite=%s\n",action,id,request.expected.lease,sqlite3_errmsg(hdl)); abort(); }
 +  return result;
 +}
 +
@@ -3621,6 +4941,7 @@
 +      assert(!attention_result_reserved[i]);
 +    }
 +  memset(attention_results, 0, sizeof(attention_results));
++  assert(sqlite3_exec(hdl,"DELETE FROM native_attention_origin_v1; DELETE FROM native_attention_attempt_v1; DELETE FROM native_attention_base_v1",NULL,NULL,NULL) == SQLITE_OK);
 +  transport_return = 0;
 +  transport_calls = 0;
 +}
@@ -3671,6 +4992,13 @@
 +  assert(a->volume == 40 && outputs_device_effective_volume(a) == 5);
 +  result = request(1, OUTPUT_ATTENTION_RELEASE);
 +  assert(result.identity.effective_volume == 40);
++  {
++    struct output_attention_request blocked={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5};
++    outputs_attention_uuid(blocked.request_id);
++    assert(outputs_attention_state_get(1,&blocked.expected)==0);
++    assert(outputs_attention_admit(&blocked,&result)<0); // Desired-only is no durable retirement.
++    recover_fixture_origin(a,&a->attention_origin);
++  }
 +  result = request(1, OUTPUT_ATTENTION_BEGIN);
 +  assert(outputs_attention_admit(&stale, &result) < 0); /* retired heartbeat */
 +  result = request(1, OUTPUT_ATTENTION_RELEASE);
@@ -3712,6 +5040,18 @@
 +  outputs_device_remove(a);
 +  a = add_device(1);
 +  assert(a->incarnation != old.identity.device_incarnation);
++  {
++    struct output_attention_request blocked={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5};
++    outputs_attention_uuid(blocked.request_id);
++    assert(outputs_attention_state_get(1,&blocked.expected)==0);
++    assert(outputs_attention_admit(&blocked,&result)<0); // Hot reincarnation cannot discard durable old owner.
++    struct output_attention_request cleanup = { .action = OUTPUT_ATTENTION_RECOVER, .origin = old.command.origin };
++    outputs_attention_uuid(cleanup.request_id);
++    cleanup.expected = blocked.expected;
++    assert(outputs_attention_admit(&cleanup,&result)<0); // Old in-flight transport custody still fences fresh cleanup.
++    outputs_attention_complete(&old,OUTPUT_ATTENTION_UNKNOWN,0,0); // Controlled transport owner terminal, not protocol proof.
++    recover_fixture_origin(a,&old.command.origin);
++  }
 +  fresh = request(1, OUTPUT_ATTENTION_BEGIN);
 +  outputs_attention_complete(&old, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 9);
 +  assert(outputs_attention_result_get(old.identity.process, old.operation, &result) == 0 && !result.current);
@@ -3824,6 +5164,7 @@
 +  struct output_attention_request begin = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5 };
 +  int i;
 +  outputs_device_select(a, -1);
++  outputs_attention_uuid(begin.request_id);
 +  assert(outputs_attention_state_get(1, &begin.expected) == 0);
 +  for (i = 1; i < ARRAY_SIZE(attention_results); i++)
 +    {
@@ -4044,6 +5385,133 @@
 +  clear_devices();
 +}
 +
++/* Real file SQLite commit/reopen + actual admission/custody owner. Transport is
++ * a controlled callback edge here; the AirPlay cohort separately owns RTSP. */
++static void cold_restart_preserving_native_database(void)
++{
++  int i;
++  while (outputs_device_list) outputs_device_remove(outputs_device_list);
++  for (i=0;i<ARRAY_SIZE(attention_results);i++)
++    if (attention_results[i].operation && attention_results[i].outcome == OUTPUT_ATTENTION_PENDING)
++      attention_results[i].outcome=OUTPUT_ATTENTION_UNKNOWN; // Destroyed old process, no receipt fabrication.
++  memset(attention_results,0,sizeof(attention_results));
++  memset(attention_result_reserved,0,sizeof(attention_result_reserved));
++  assert(sqlite3_close(hdl)==SQLITE_OK); hdl=NULL;
++  assert(sqlite3_open(owner_database_path,&hdl)==SQLITE_OK);
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup()==0);
++}
++
++static struct output_attention_request recovery_request(uint64_t device, const struct output_attention_origin *origin)
++{
++  struct output_attention_request r={.action=OUTPUT_ATTENTION_RECOVER};
++  outputs_attention_uuid(r.request_id); r.origin=*origin;
++  assert(outputs_attention_state_get(device,&r.expected)==0);
++  return r;
++}
++
++static void durable_crash_origin_all_outputs_and_terminal_proof(void)
++{
++  struct output_device *a=add_device(1), *b=add_device(2);
++  struct output_attention_origin origin_a,origin_b;
++  struct output_attention_request recover,competing,never,begin={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5};
++  struct output_attention_result pending,result,prior;
++  enum output_attention_recovery_state origin_state;
++  struct output_attention_proof proof;
++  int sent;
++  output_airplay.device_attention_recovery_prepare=recovery_prepare_edge;
++  output_airplay.device_attention_recover=inert_attention;
++  transport_return=1;
++  prior=request(1,OUTPUT_ATTENTION_BEGIN); origin_a=a->attention_origin;
++  assert(db_attention_origin_get(1,&origin_a,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  outputs_attention_complete(&prior,OUTPUT_ATTENTION_UNKNOWN,0,0);
++  prior=request(2,OUTPUT_ATTENTION_BEGIN); origin_b=b->attention_origin;
++  outputs_attention_complete(&prior,OUTPUT_ATTENTION_UNKNOWN,0,0);
++  assert(outputs_device_volume_register(a,60,-1)==0); // Latest manual BASE, never cap5.
++  cold_restart_preserving_native_database();
++  a=add_device(1); b=add_device(2);
++  assert(a->volume==60 && b->volume==65 && !a->attention_lease && !b->attention_lease);
++  outputs_attention_uuid(begin.request_id);
++  assert(outputs_attention_state_get(1,&begin.expected)==0);
++  sent=transport_calls;
++  assert(outputs_attention_admit(&begin,&result)<0 && transport_calls==sent);
++  recover=recovery_request(1,&origin_a);
++  assert(outputs_attention_admit(&recover,&pending)==0 && pending.outcome==OUTPUT_ATTENTION_PENDING);
++  assert(pending.identity.base_volume==60 && pending.identity.effective_volume==60 && pending.identity.lease==0);
++  sent=transport_calls;
++  assert(outputs_attention_admit(&recover,&result)==0 && result.operation==pending.operation && transport_calls==sent);
++  competing=recovery_request(1,&origin_a);
++  assert(outputs_attention_admit(&competing,&result)<0 && transport_calls==sent);
++  assert(db_attention_origin_get(2,&origin_b,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,51);
++  assert(outputs_attention_result_get(pending.identity.process,pending.operation,&result)==0);
++  assert(result.current && result.recovery_state==OUTPUT_RECOVERY_RESTORED && result.recovery_proof.ledger_complete);
++  assert(!strcmp(result.recovery_proof.terminal_request_id,recover.request_id));
++  assert(result.recovery_proof.terminal_operation==pending.operation && result.recovery_proof.terminal_request_cseq==51);
++  cold_restart_preserving_native_database();
++  a=add_device(1); b=add_device(2);
++  recover=recovery_request(1,&origin_a); sent=transport_calls;
++  assert(outputs_attention_admit(&recover,&result)==0 && transport_calls==sent);
++  assert(result.current && result.outcome==OUTPUT_ATTENTION_NO_EFFECT && result.recovery_state==OUTPUT_RECOVERY_ALREADY_RETIRED);
++  assert(result.recovery_proof.terminal_response_code==200 && result.recovery_proof.terminal_request_cseq==51);
++  assert(result.recovery_proof.terminal_operation==pending.operation);
++  never=recovery_request(1,&origin_a); outputs_attention_uuid(never.origin.request_id);
++  assert(outputs_attention_admit(&never,&result)==0 && result.recovery_state==OUTPUT_RECOVERY_NEVER_ADMITTED);
++  assert(result.outcome==OUTPUT_ATTENTION_NO_EFFECT && result.recovery_proof.ledger_complete && !result.recovery_proof.terminal_operation);
++  assert(!result.response_code && !result.request_cseq && transport_calls==sent);
++  outputs_attention_uuid(never.request_id); outputs_attention_uuid(never.origin.process);
++  assert(outputs_attention_state_get(1,&never.expected)==0);
++  assert(outputs_attention_admit(&never,&result)<0 && transport_calls==sent); // Foreign DB/process is no absence proof.
++  recover=recovery_request(2,&origin_b);
++  assert(outputs_attention_admit(&recover,&pending)==0);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,52);
++  assert(db_attention_origin_get(2,&origin_b,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_ALREADY_RETIRED);
++  clear_devices();
++}
++
++static void durable_disk_failure_unknown_and_stale_generation(void)
++{
++  struct output_device *a=add_device(1);
++  struct output_attention_origin origin;
++  struct output_attention_request begin={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5},recover;
++  struct output_attention_result pending,result;
++  enum output_attention_recovery_state origin_state;
++  struct output_attention_proof proof;
++  int sent=transport_calls;
++  outputs_attention_uuid(begin.request_id);
++  assert(outputs_attention_state_get(1,&begin.expected)==0);
++  assert(sqlite3_exec(hdl,"PRAGMA query_only=ON",NULL,NULL,NULL)==SQLITE_OK);
++  assert(outputs_attention_admit(&begin,&result)<0 && !a->attention_lease && transport_calls==sent);
++  assert(outputs_device_volume_register(a,65,-1)<0 && a->volume==30 && transport_calls==sent);
++  assert(sqlite3_exec(hdl,"PRAGMA query_only=OFF",NULL,NULL,NULL)==SQLITE_OK);
++  transport_return=1; pending=request(1,OUTPUT_ATTENTION_BEGIN); origin=a->attention_origin;
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_UNKNOWN,0,0);
++  cold_restart_preserving_native_database(); a=add_device(1);
++  recover=recovery_request(1,&origin); assert(outputs_attention_admit(&recover,&pending)==0);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_UNKNOWN,200,70); // No matching-CSeq proof.
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,70); // Late duplicate cannot upgrade UNKNOWN.
++  assert(db_attention_origin_get(1,&origin,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  assert(outputs_attention_result_get(pending.identity.process,pending.operation,&result)==0 && result.recovery_state==OUTPUT_RECOVERY_UNKNOWN);
++  recover=recovery_request(1,&origin); assert(outputs_attention_admit(&recover,&pending)==0);
++  assert(outputs_device_volume_register(a,67,-1)==0);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,71);
++  assert(db_attention_origin_get(1,&origin,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  assert(outputs_attention_result_get(pending.identity.process,pending.operation,&result)==0 && !result.current && result.recovery_state==OUTPUT_RECOVERY_UNKNOWN);
++  recover=recovery_request(1,&origin); assert(outputs_attention_admit(&recover,&pending)==0);
++  assert(sqlite3_exec(hdl,"PRAGMA query_only=ON",NULL,NULL,NULL)==SQLITE_OK);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,72);
++  assert(outputs_attention_result_get(pending.identity.process,pending.operation,&result)==0 && result.recovery_state==OUTPUT_RECOVERY_UNKNOWN);
++  assert(sqlite3_exec(hdl,"PRAGMA query_only=OFF",NULL,NULL,NULL)==SQLITE_OK);
++  assert(db_attention_origin_get(1,&origin,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  cold_restart_preserving_native_database(); a=add_device(1);
++  recover=recovery_request(1,&origin); assert(outputs_attention_admit(&recover,&result)==0 && result.identity.base_volume==67);
++  outputs_attention_complete(&pending,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,72); // Old process callback is inert.
++  assert(db_attention_origin_get(1,&origin,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_PENDING);
++  outputs_attention_complete(&result,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,73);
++  assert(db_attention_origin_get(1,&origin,&origin_state,&proof)==0 && origin_state==OUTPUT_RECOVERY_ALREADY_RETIRED && proof.terminal_request_cseq==73);
++  clear_devices();
++}
++
 +int main(void)
 +{
 +  evbase_player = event_base_new();
@@ -4051,6 +5519,16 @@
 +  outputs_deferredev = evtimer_new(evbase_player, deferred_cb, NULL);
 +  assert(outputs_deferredev);
 +  memcpy(outputs_process, "00000000-0000-0000-0000-000000000001", sizeof(outputs_process));
++  {
++    int fd=mkstemp(owner_database_path);
++    assert(fd>=0); close(fd);
++    assert(sqlite3_open(owner_database_path,&hdl) == SQLITE_OK);
++    assert(db_attention_schema_init() == 0);
++    assert(outputs_attention_startup() == 0);
++
++  }
++  output_airplay.device_attention_recovery_prepare=recovery_prepare_edge;
++  output_airplay.device_attention_recover=inert_attention;
 +  bases_and_legacy_selection();
 +  manual_revision_and_old_lease();
 +  failure_cannot_be_overwritten_or_cross_output();
@@ -4067,8 +5545,11 @@
 +  manual_old_challenge_never_overrides_newer_native_intent();
 +  manual_failed_restore_uses_original_uuid_without_clearing_lease();
 +  selection_api_preserves_failure_and_cleanup();
++  durable_crash_origin_all_outputs_and_terminal_proof();
++  durable_disk_failure_unknown_and_stale_generation();
 +  event_free(outputs_deferredev);
 +  event_base_free(evbase_player);
-+  puts("PASS fifteen deterministic output-owner groups; no native protocol or audio claim");
++  sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);
++  puts("PASS original fifteen output-owner groups plus two actual file-backed crash/custody groups; no native protocol or audio claim");
 +  return 0;
 +}

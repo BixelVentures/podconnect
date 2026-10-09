@@ -48,6 +48,9 @@ func clampAttentionTTL(req time.Duration) time.Duration {
 // unsupervised room). All access is mutex-guarded, like glLive.
 type attention struct {
 	mu                  sync.Mutex
+	custody             *attentionCustody
+	directEffects       int
+	deleting            bool
 	admissionRevision   uint64
 	nativeRevision      uint64
 	restoreRevision     uint64
@@ -68,15 +71,16 @@ type attention struct {
 
 // attSnapshot is a lock-free view of a room's duck state for the HTTP layer.
 type attSnapshot struct {
-	Challenge     attentionChallenge               `json:"challenge"`
-	Outcome       string                           `json:"outcome"`
-	Contract      string                           `json:"contract"`
-	NativeResults map[string]nativeAttentionResult `json:"native_results"`
-	ManualResult  *nativeManualReport              `json:"manual_result,omitempty"`
-	Active        bool                             `json:"active"`
-	Level         int                              `json:"level"`
-	Owner         string                           `json:"owner"`
-	RemainingMS   int                              `json:"remaining_ms"` // ms until auto-release (0 when inactive)
+	RecoveryResults map[string]nativeRecoveryResult  `json:"recovery_results,omitempty"`
+	Challenge       attentionChallenge               `json:"challenge"`
+	Outcome         string                           `json:"outcome"`
+	Contract        string                           `json:"contract"`
+	NativeResults   map[string]nativeAttentionResult `json:"native_results"`
+	ManualResult    *nativeManualReport              `json:"manual_result,omitempty"`
+	Active          bool                             `json:"active"`
+	Level           int                              `json:"level"`
+	Owner           string                           `json:"owner"`
+	RemainingMS     int                              `json:"remaining_ms"` // ms until auto-release (0 when inactive)
 }
 
 // engage sets or refreshes the duck. capturePrev is the current HomePod level to restore later; it's
@@ -85,6 +89,9 @@ type attSnapshot struct {
 func (a *attention) engage(level, capturePrev int, owner string, ttl time.Duration, now time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.custodyBlockedLocked() {
+		return
+	}
 	if !a.active {
 		a.prevLevel = capturePrev
 	}
@@ -157,7 +164,9 @@ func (a *attention) snapshot(now time.Time) attSnapshot {
 		copy := *a.nativeManualReport
 		s.ManualResult = &copy
 	}
-	if a.sessionNonce == "" {
+	if a.custodyBlockedLocked() {
+		s.Contract = "native_attention_v1"
+	} else if a.sessionNonce == "" {
 		s.Contract = "legacy_desired_only"
 		s.Outcome = "desired_only"
 	} else if !a.active && !a.nativePending && !a.nativeBusy && !a.pendingRelease {
