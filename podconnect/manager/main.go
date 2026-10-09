@@ -1472,6 +1472,12 @@ func attentionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Session != "" {
 		if !a.engageOwned(body.Session, body.Expected, body.Begin, body.Level, owner, ttl, time.Now()) {
+			if !body.Begin && a.custodyRetired(rm.ID, body.Session, body.Expected) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				writeJSON(w, map[string]any{"contract": "native_attention_v1", "outcome": "lease_retired", "room": rm.ID, "session": body.Session, "expected": body.Expected})
+				return
+			}
 			http.Error(w, "attention owner stale or restoration pending", http.StatusConflict)
 			return
 		}
