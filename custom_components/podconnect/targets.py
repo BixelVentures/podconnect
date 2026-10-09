@@ -9,6 +9,7 @@ from aiohttp import ClientError
 
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 
 from .api import SpotifyApiError
 from .const import DOMAIN
@@ -52,6 +53,53 @@ async def spotify_transfer_target(api, *, target_id=None, name=None) -> tuple[st
     return matches[0]["id"], playback["is_playing"]
 
 
+def _spotify_ha_context(hass, entry_id: str, target_id: str) -> dict | None:
+    """Current HA language metadata for one exact fresh provider target, never a route."""
+    entities = er.async_get(hass)
+    matches = [
+        entry
+        for entry in er.async_entries_for_config_entry(entities, entry_id)
+        if entry.domain == "media_player"
+        and entry.platform == DOMAIN
+        and entry.unique_id == f"{entry_id}_{target_id}"
+    ]
+    if len(matches) != 1:
+        return None
+    entity = matches[0]
+    if entity.config_entry_id != entry_id or entity.disabled_by is not None or not entity.device_id:
+        return None
+    device = dr.async_get(hass).async_get(entity.device_id)
+    if (
+        device is None
+        or device.config_entry_id != entry_id
+        or device.disabled_by is not None
+        or (DOMAIN, target_id) not in device.identifiers
+    ):
+        return None
+
+    def text(value):
+        return isinstance(value, str) and 1 <= len(value) <= 1024
+
+    def aliases(values):
+        return isinstance(values, list) and len(values) <= 16 and all(text(v) for v in values)
+
+    name = er.async_get_full_entity_name(hass, entity)
+    names = er.async_get_entity_aliases(hass, entity)
+    if not text(entity.entity_id) or not text(name) or not aliases(names):
+        return None
+    context = {"entity_id": entity.entity_id, "name": name, "aliases": names, "area": None}
+    # An explicit entity override remains authoritative even if its area was deleted.
+    area_id = entity.area_id if entity.area_id is not None else device.area_id
+    if area_id is not None:
+        area = ar.async_get(hass).async_get_area(area_id)
+        if area is not None:
+            names = sorted(area.aliases)
+            if not text(area.id) or not text(area.name) or not aliases(names):
+                return None
+            context["area"] = {"id": area.id, "name": area.name, "aliases": names}
+    return context
+
+
 def register_target_services(hass) -> None:
     """Register once; each invocation resolves its explicitly selected live entry."""
 
@@ -64,7 +112,7 @@ def register_target_services(hass) -> None:
             raise HomeAssistantError("PodConnect account entry unavailable")
         return data
 
-    async def get_targets(call):
+    async def catalogue(call, *, with_context=False):
         if "config_entry_id" not in call.data:
             accounts, seen = [], set()
             for entry in hass.config_entries.async_entries(DOMAIN):
@@ -137,11 +185,27 @@ def register_target_services(hass) -> None:
         else:
             errors["configured_alias"] = errors["observed_output"] = "not_configured"
         current(call.data["config_entry_id"], data)
+        if with_context:
+            # Read registry metadata after all backend awaits. No registry entity can
+            # create a target absent from the fresh provider response above.
+            for target in targets:
+                if target["kind"] == "spotify_device":
+                    context = _spotify_ha_context(
+                        hass, call.data["config_entry_id"], target["target_id"]
+                    )
+                    if context is not None:
+                        target["ha_context"] = context
         return {
             "config_entry_id": call.data["config_entry_id"],
             "targets": targets,
             "errors": errors,
         }
+
+    async def get_targets(call):
+        return await catalogue(call)
+
+    async def get_targets_with_context(call):
+        return await catalogue(call, with_context=True)
 
     async def move_playback(call):
         data = current(call.data["config_entry_id"])
@@ -178,6 +242,11 @@ def register_target_services(hass) -> None:
         (
             "get_targets",
             get_targets,
+            {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
+        ),
+        (
+            "get_targets_with_context",
+            get_targets_with_context,
             {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
         ),
         (

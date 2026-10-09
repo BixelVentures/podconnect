@@ -64,6 +64,18 @@ V = SimpleNamespace(
     Length=lambda **kw: kw,
     Schema=lambda schema: schema,
 )
+# Registry boundaries for extracted service bodies; the HA cohort uses real registries.
+ER = SimpleNamespace(
+    async_get=lambda hass: hass.entity_registry,
+    async_entries_for_config_entry=lambda registry, ident: [
+        row for row in registry.values() if row.config_entry_id == ident
+    ],
+    async_get_full_entity_name=lambda hass, entity: entity.full_name,
+    async_get_entity_aliases=lambda hass, entity: list(entity.aliases),
+)
+DR = SimpleNamespace(async_get=lambda hass: SimpleNamespace(async_get=hass.device_registry.get))
+AR = SimpleNamespace(async_get=lambda hass: SimpleNamespace(async_get_area=hass.area_registry.get))
+
 T = load_body(
     "targets.py",
     dict(
@@ -73,6 +85,7 @@ T = load_body(
         SpotifyApiError=SpotifyError,
         SpeakersError=S["SpeakersError"],
         DOMAIN="podconnect",
+        er=ER, dr=DR, ar=AR,
     ),
 )
 
@@ -131,7 +144,8 @@ def services(api=None, speakers=None):
         ),
     )
     hass = SimpleNamespace(
-        services=registry, config_entries=SimpleNamespace(async_entries=lambda domain: entries)
+        services=registry, config_entries=SimpleNamespace(async_entries=lambda domain: entries),
+        entity_registry={}, device_registry={}, area_registry={},
     )
     T["register_target_services"](hass)
     return hass, data, entries, registered
@@ -142,11 +156,143 @@ async def invoke(reg, name, **kw):
 
 
 class TargetTests(unittest.IsolatedAsyncioTestCase):
+    def registry_context(self, hass):
+        entity = SimpleNamespace(
+            domain="media_player",
+            platform="podconnect",
+            config_entry_id="account-A",
+            unique_id="account-A_device-B",
+            entity_id="media_player.room_b",
+            device_id="ha-B",
+            disabled_by=None,
+            area_id=None,
+            full_name="Speaker B",
+            aliases=["Bedside speaker"],
+        )
+        dev = SimpleNamespace(
+            config_entry_id="account-A",
+            disabled_by=None,
+            identifiers={("podconnect", "device-B")},
+            area_id="bedroom",
+        )
+        area = SimpleNamespace(id="bedroom", name="Child's bedroom", aliases={"Child's room"})
+        hass.entity_registry[entity.entity_id] = entity
+        hass.device_registry["ha-B"] = dev
+        hass.area_registry[area.id] = area
+        return entity, dev, area
+
+    async def test_legacy_catalog_shape_is_unchanged_when_context_exists(self):
+        hass, _, _, reg = services()
+        self.registry_context(hass)
+        legacy = await invoke(reg, "get_targets")
+        contextual = await invoke(reg, "get_targets_with_context")
+        self.assertIn("ha_context", contextual["targets"][0])
+        stripped = {**contextual, "targets": [
+            {key: value for key, value in row.items() if key != "ha_context"}
+            for row in contextual["targets"]
+        ]}
+        self.assertEqual(legacy, stripped)
+        self.assertEqual(set(legacy["targets"][0]), {"kind", "target_id", "name", "restricted"})
+        self.assertEqual(reg["get_targets"][1]["schema"], reg["get_targets_with_context"][1]["schema"])
+        self.assertEqual(reg["get_targets"][1]["supports_response"], "only")
+        self.assertEqual(reg["get_targets_with_context"][1]["supports_response"], "only")
+
+    async def test_fresh_provider_target_has_exact_current_ha_metadata_without_move(self):
+        hass, data, _, reg = services()
+        entity, dev, _ = self.registry_context(hass)
+        result = await invoke(reg, "get_targets_with_context")
+        row = result["targets"][0]
+        self.assertEqual(row["target_id"], "device-B")
+        self.assertEqual(
+            row["ha_context"],
+            {
+                "entity_id": entity.entity_id,
+                "name": "Speaker B",
+                "aliases": ["Bedside speaker"],
+                "area": {"id": "bedroom", "name": "Child's bedroom", "aliases": ["Child's room"]},
+            },
+        )
+        entity.area_id = "override"
+        hass.area_registry["override"] = SimpleNamespace(id="override", name="Study", aliases=set())
+        self.assertEqual(
+            (await invoke(reg, "get_targets_with_context"))["targets"][0]["ha_context"]["area"]["id"], "override"
+        )
+        del hass.area_registry["override"]
+        self.assertIsNone((await invoke(reg, "get_targets_with_context"))["targets"][0]["ha_context"]["area"])
+        self.assertEqual(dev.area_id, "bedroom")
+        data.api.transfer.assert_not_awaited()
+        data.api.playback_state.assert_not_awaited()
+
+    async def test_registry_identity_disabled_and_ambiguity_never_invent_context(self):
+        for invalid in (
+            "entity-disabled",
+            "device-disabled",
+            "wrong-entry",
+            "wrong-device-entry",
+            "wrong-identifier",
+            "missing-device",
+            "ambiguous",
+            "wrong-unique-id",
+        ):
+            with self.subTest(invalid=invalid):
+                hass, _, _, reg = services()
+                entity, dev, _ = self.registry_context(hass)
+                if invalid == "entity-disabled":
+                    entity.disabled_by = "user"
+                elif invalid == "device-disabled":
+                    dev.disabled_by = "user"
+                elif invalid == "wrong-entry":
+                    entity.config_entry_id = "account-B"
+                elif invalid == "wrong-device-entry":
+                    dev.config_entry_id = "account-B"
+                elif invalid == "wrong-identifier":
+                    dev.identifiers = {("podconnect", "other")}
+                elif invalid == "missing-device":
+                    hass.device_registry.clear()
+                elif invalid == "ambiguous":
+                    hass.entity_registry["duplicate"] = entity
+                else:
+                    entity.unique_id = "account-B_device-B"
+                row = (await invoke(reg, "get_targets_with_context"))["targets"][0]
+                self.assertNotIn("ha_context", row)
+                self.assertEqual(row["target_id"], "device-B")
+
+    async def test_no_offline_registry_target_and_metadata_reads_after_backend_awaits(self):
+        hass, data, _, reg = services()
+        _, _, area = self.registry_context(hass)
+        data.api.devices.return_value = []
+        self.assertEqual((await invoke(reg, "get_targets_with_context"))["targets"], [])
+
+        async def devices():
+            area.name = "Current room"
+            return [device()]
+
+        data.api.devices.side_effect = devices
+        self.assertEqual(
+            (await invoke(reg, "get_targets_with_context"))["targets"][0]["ha_context"]["area"]["name"],
+            "Current room",
+        )
+        data.api.transfer.assert_not_awaited()
+
+    async def test_oversize_metadata_is_omitted_not_a_new_route_or_catalog_error(self):
+        for invalid in ("name", "entity-aliases", "area-aliases"):
+            hass, _, _, reg = services()
+            entity, _, area = self.registry_context(hass)
+            if invalid == "name":
+                entity.full_name = "x" * 1025
+            elif invalid == "entity-aliases":
+                entity.aliases = ["same"] * 17
+            else:
+                area.aliases = {str(n) for n in range(17)}
+            row = (await invoke(reg, "get_targets_with_context"))["targets"][0]
+            self.assertNotIn("ha_context", row)
+            self.assertEqual(set(row), {"kind", "target_id", "name", "restricted"})
+
     async def test_explicit_entry_and_response_schemas_no_first_account_fallback(self):
         _, data, entries, reg = services()
         other = SimpleNamespace(api=SimpleNamespace(transfer=AsyncMock()), active=True)
         entries.append(SimpleNamespace(entry_id="account-B", runtime_data=other))
-        self.assertEqual(set(reg), {"get_targets", "move_playback"})
+        self.assertEqual(set(reg), {"get_targets", "get_targets_with_context", "move_playback"})
         self.assertEqual(reg["get_targets"][1]["supports_response"], "only")
         self.assertIn("config_entry_id", reg["move_playback"][1]["schema"])
         with self.assertRaises(HAError):

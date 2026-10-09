@@ -7,11 +7,12 @@ PodConnect ships **two cooperating halves from ONE repo** (monorepo):
 ## Principles (agreed by review)
 1. **Independent SemVer per half. No lockstep.** Tie them together for humans with a shared
    label like *"PodConnect 2026.6"* in changelogs only.
-2. **The two halves are fully decoupled.** Control (Spotify cloud control) and Speakers (the local
-   audio engine) are **independent** — Control never talks to the add-on at all (the brief attempt to
-   add local-speaker entities was reverted in 0.7.1). So there's no Speakers↔Control wire contract to
-   stabilize, and no update-order to worry about: either half updates on its own.
-   *(The old "versioned contract / `docs/CONTRACT.md` facade" idea is moot — kept out of scope.)*
+2. **Independent owners and backwards-compatible optional contracts.** Control owns Spotify
+   cloud control and HA entities; Speakers owns the local audio engine. Control can optionally
+   read the configured Speakers catalogue and request an existing local alias through its
+   bounded client. Each half keeps its own version and update path. Preserve legacy service
+   replies/descriptors when adding context; expose new contextual reads separately so older
+   consumers and either update order keep working.
 
 ## How each half updates
 - **Integration (HACS):** HACS reads GitHub **Releases** (not `manifest.json`; tags alone aren't

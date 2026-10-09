@@ -40,8 +40,13 @@ _Versions live in [`../CHANGELOG.md`](../CHANGELOG.md); this tracks what's built
   bridge; it makes the *speaker* react instantly, but it does not change how Control polls the cloud.
 
 **Not yet built:** multi-account (Phase 4, optional); track-change buffer-flush (tune on Green).
-**Decoupled by design:** Control and Speakers are fully independent — there is no Speakers↔Control
-facade to stabilize (the local-entity fold was reverted), so the old `docs/CONTRACT.md` idea is moot.
+**Independent owners and versions:** Control can optionally read the configured Speakers
+catalogue and request an existing local alias. The original `get_targets` reply remains
+compatible with older consumers. `get_targets_with_context` adds verified HA entity names,
+aliases and areas only to current Spotify targets, using exact account/entity/device binding;
+offline registry entries never create targets. Consumers select the contextual service only
+when its descriptor is valid. Playback, registration and local audio remain with their existing
+owners.
 
 ## Account model (Family plan)
 - Spotify **Web API is per-account**; a Family plan = separate independent accounts.

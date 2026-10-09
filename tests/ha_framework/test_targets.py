@@ -31,7 +31,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry
+from homeassistant.helpers import area_registry, device_registry, entity_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.config_entry_oauth2_flow import (
     LocalOAuth2Implementation,
@@ -318,6 +318,87 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._writes()[1], ("PUT", "/spotify/me/player", {
                 "device_ids": ["spotify-one"], "play": False}, True))
             self.assertEqual(len(self._writes()), 2)  # No invented resume/second command.
+
+    async def test_live_registry_metadata_exact_account_aliases_and_entity_area_override(self):
+        async with asyncio.timeout(15):
+            entities = entity_registry.async_get(self.hass)
+            devices = device_registry.async_get(self.hass)
+            areas = area_registry.async_get(self.hass)
+            entity_id = entities.async_get_entity_id("media_player", DOMAIN, "account-beta_spotify-one")
+            self.assertIsNotNone(entity_id)
+            entity = entities.async_get(entity_id)
+            device = devices.async_get(entity.device_id)
+            self.assertEqual(device.config_entry_id, "account-beta")
+            self.assertIn((DOMAIN, "spotify-one"), device.identifiers)
+            room = areas.async_create("Frida's Værelse", aliases={"Fridas værelse"})
+            override = areas.async_create("Study", aliases={"Office"})
+            devices.async_update_device(device.id, area_id=room.id, name_by_user="Bedside")
+            entities.async_update_entity(
+                entity_id, name="Speaker", aliases=[entity_registry.COMPUTED_NAME, "Little speaker"]
+            )
+            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            self.assertEqual(status, 200)
+            rows = body["service_response"]["targets"]
+            target = next(row for row in rows if row["kind"] == "spotify_device")
+            self.assertEqual(target["target_id"], "spotify-one")
+            self.assertEqual(target["name"], "Fixture speaker")
+            legacy_status, legacy_body = await self._service(
+                "get_targets", {"config_entry_id": "account-beta"})
+            self.assertEqual(legacy_status, 200)
+            self.assertEqual(legacy_body["service_response"], {
+                **body["service_response"], "targets": [
+                    {key: value for key, value in row.items() if key != "ha_context"}
+                    for row in rows]})
+            services_page = await self.client.get("/api/services")
+            services = next(row["services"] for row in await services_page.json()
+                if row["domain"] == DOMAIN)
+            self.assertEqual(services["get_targets"]["fields"],
+                services["get_targets_with_context"]["fields"])
+            self.assertEqual(services["get_targets"]["response"], {"optional": False})
+            self.assertEqual(services["get_targets_with_context"]["response"], {"optional": False})
+            context = target["ha_context"]
+            self.assertEqual(context["entity_id"], entity_id)
+            self.assertEqual(
+                context["name"],
+                entity_registry.async_get_full_entity_name(self.hass, entities.async_get(entity_id)),
+            )
+            self.assertEqual(context["aliases"], [context["name"], "Little speaker"])
+            self.assertEqual(
+                context["area"],
+                {"id": room.id, "name": "Frida's Værelse", "aliases": ["Fridas værelse"]},
+            )
+            self.assertTrue(
+                all("ha_context" not in row for row in rows if row["kind"] != "spotify_device")
+            )
+            # The other entry has the same provider device ID, but a different HA owner.
+            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-alpha"})
+            self.assertEqual(status, 200)
+            other = next(
+                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+            )
+            self.assertNotEqual(other["ha_context"]["entity_id"], entity_id)
+            self.assertIsNone(other["ha_context"]["area"])
+            entities.async_update_entity(entity_id, area_id=override.id)
+            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            self.assertEqual(status, 200)
+            target = next(
+                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+            )
+            self.assertEqual(
+                target["ha_context"]["area"],
+                {"id": override.id, "name": "Study", "aliases": ["Office"]},
+            )
+            entities.async_update_entity(
+                entity_id, disabled_by=entity_registry.RegistryEntryDisabler.USER
+            )
+            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            self.assertEqual(status, 200)
+            target = next(
+                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+            )
+            self.assertNotIn("ha_context", target)
+            self.assertEqual(target["target_id"], "spotify-one")
+            self.assertEqual(self._writes(), [])
 
     async def test_unload_retires_held_catalog_and_preserves_other_account(self):
         async with asyncio.timeout(15):
