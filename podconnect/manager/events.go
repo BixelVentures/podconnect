@@ -292,7 +292,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 		l.trackChangeSeq++
 	}
 	switch typ {
-	case "playing", "paused", "stopped", "not_playing", "active", "playback_ready", "inactive":
+	case "playing", "paused", "stopped", "not_playing", "active", "inactive":
 		l.wireRevision[0]++
 	case "volume":
 		if _, ok := numField(data, "value"); ok {
@@ -342,7 +342,7 @@ func applyGLEvent(prev glStatus, prevURI string, typ string, data map[string]any
 	case "not_playing":
 		// Track ended on its own. Not a user pause; leave Active to /status semantics.
 		out.Paused = false
-	case "active", "playback_ready":
+	case "active":
 		out.Active = true
 	case "inactive":
 		out.Active = false

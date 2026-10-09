@@ -9,6 +9,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ---
 
 ## Speakers 0.26.7 / Control 0.10.3 — candidate 2026-10-09
+- Retry missing current-connection registration at the next existing state or
+  volume update; only accepted NEW_DEVICE registration credits readiness.
+- Treat historical playback-ready events as observations, preserving current
+  session status and pending status replies. Spotify visibility remains unproven.
 - Keep configured room IDs and selected aliases aligned across local Connect
   updates; expose compatible Home Assistant target discovery and playback controls.
 - Fence native attention commands and callback lifetimes by exact ownership,
