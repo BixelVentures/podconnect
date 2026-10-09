@@ -1,3 +1,8 @@
+## 0.26.13
+
+- Build native recovery tests against the current SQLite extension before installation; preserve runtime behavior and all owner checks.
+- Print the native test failure log when image checks fail, while keeping installation after successful checks.
+
 # Changelog
 
 All notable changes to PodConnect. Two components version independently:

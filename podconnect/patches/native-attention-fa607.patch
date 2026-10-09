@@ -1,8 +1,7 @@
 diff --git a/src/Makefile.am b/src/Makefile.am
-index b311abd32abfeb32f39d790673b80bee44a8e58d..f74c0c15d76ab9c1ee7b1683b15eb5684c8a1963 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -166,3 +166,82 @@
+@@ -166,3 +166,83 @@
  # flex/bison automake's support leaves something to be desired
  clean-local:
  	rm -f $(LEXER_SRC:.l=.[ch]) $(PARSER_SRC:.y=.[ch])
@@ -81,12 +80,12 @@ index b311abd32abfeb32f39d790673b80bee44a8e58d..f74c0c15d76ab9c1ee7b1683b15eb568
 +	$(LIBWEBSOCKETS_SRC) \
 +	$(GPERF_SRC) \
 +	$(LEXER_SRC) $(PARSER_SRC)
-+airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp
++airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
++	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
 +airplay_callback_owner_LDFLAGS = -Wl,--gc-sections
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
 diff --git a/src/conffile.c b/src/conffile.c
-index 47d30a54c14af37a8cb023fe57e2166d8867ef8c..ae1519861028eaf892e9cf39e15844b879a056a9 100644
 --- a/src/conffile.c
 +++ b/src/conffile.c
 @@ -170,6 +170,8 @@
@@ -99,7 +98,6 @@ index 47d30a54c14af37a8cb023fe57e2166d8867ef8c..ae1519861028eaf892e9cf39e15844b8
    };
  
 diff --git a/src/db.c b/src/db.c
-index b5c3f9235eda40721527c0b6088c19da6140e5ce..86530a1ab6d1fe9554157ee02ba5f02be96ad70f 100644
 --- a/src/db.c
 +++ b/src/db.c
 @@ -4790,6 +4790,265 @@
@@ -379,7 +377,6 @@ index b5c3f9235eda40721527c0b6088c19da6140e5ce..86530a1ab6d1fe9554157ee02ba5f02b
  
    CHECK_ERR(L_DB, db_files_get_count(&files, NULL, NULL));
 diff --git a/src/db.h b/src/db.h
-index 38ae5d5d8a5927fcd04e8af36ce908637446c637..01a6cbb40f7ffe180bbaecd403cecbcee5f86bb2 100644
 --- a/src/db.h
 +++ b/src/db.h
 @@ -1035,4 +1035,15 @@
@@ -399,7 +396,6 @@ index 38ae5d5d8a5927fcd04e8af36ce908637446c637..01a6cbb40f7ffe180bbaecd403cecbce
 +
  #endif /* !__DB_H__ */
 diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
-index 2d5d0917c46377da1d22f3ba89898dc59681bc8f..6e5bcc4bee7c07858fb8d7390d8e59e10aa48e0d 100644
 --- a/src/evrtsp/evrtsp.h
 +++ b/src/evrtsp/evrtsp.h
 @@ -108,6 +108,10 @@
@@ -428,7 +424,6 @@ index 2d5d0917c46377da1d22f3ba89898dc59681bc8f..6e5bcc4bee7c07858fb8d7390d8e59e1
  
  /* Interfaces for dealing with headers */
 diff --git a/src/evrtsp/rtsp-internal.h b/src/evrtsp/rtsp-internal.h
-index f00d58faa1419629680e9503fecbf19ff8190538..685077a1ceefb5f824c1c9df77271d5138589486 100644
 --- a/src/evrtsp/rtsp-internal.h
 +++ b/src/evrtsp/rtsp-internal.h
 @@ -55,7 +55,15 @@
@@ -448,7 +443,6 @@ index f00d58faa1419629680e9503fecbf19ff8190538..685077a1ceefb5f824c1c9df77271d51
  	struct event ev;
  	struct event close_ev;
 diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
-index 4f70d48d6ab1e86241f405214b37f6c3f75e2fb8..00328854cfa2528517dbd19e3f0129df4b6dabe2 100644
 --- a/src/evrtsp/rtsp.c
 +++ b/src/evrtsp/rtsp.c
 @@ -679,6 +679,14 @@
@@ -604,7 +598,6 @@ index 4f70d48d6ab1e86241f405214b37f6c3f75e2fb8..00328854cfa2528517dbd19e3f0129df
  
  /*
 diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
-index 619dfee0a2f0b3c004db0c3f7b54fe5509c6db4e..f453e5fcdb68719990e701e9ff62d401b0495da3 100644
 --- a/src/httpd_jsonapi.c
 +++ b/src/httpd_jsonapi.c
 @@ -1607,6 +1607,8 @@
@@ -912,7 +905,6 @@ index 619dfee0a2f0b3c004db0c3f7b54fe5509c6db4e..f453e5fcdb68719990e701e9ff62d401
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
 diff --git a/src/outputs.c b/src/outputs.c
-index ffa2cb1fd276401df296bf6e9f412cf7e8f7d138..a5ada2228574443e2ce406c28d4fdc9f7a90e6d7 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -28,8 +28,10 @@
@@ -1905,7 +1897,6 @@ index ffa2cb1fd276401df296bf6e9f412cf7e8f7d138..a5ada2228574443e2ce406c28d4fdc9f
  
    // Number of milliseconds the outputs should buffer before starting playback.
 diff --git a/src/outputs.h b/src/outputs.h
-index e8474c9238e5bb98dc3decdc597c1a3d7262697c..ccc96932a5100c74655e1001dfa603aaa712f29c 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
 @@ -86,6 +86,101 @@
@@ -2123,7 +2114,6 @@ index e8474c9238e5bb98dc3decdc597c1a3d7262697c..ccc96932a5100c74655e1001dfa603aa
  
  int
 diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
-index 4290b75072b55be19aff705a7d66e3901437034f..8c571473f1fe042ed7c4d144df240105c90953db 100644
 --- a/src/outputs/airplay.c
 +++ b/src/outputs/airplay.c
 @@ -19,6 +19,7 @@
@@ -3000,7 +2990,6 @@ index 4290b75072b55be19aff705a7d66e3901437034f..8c571473f1fe042ed7c4d144df240105
    .write = airplay_write,
    .metadata_prepare = airplay_metadata_prepare,
 diff --git a/src/player.c b/src/player.c
-index f9ce6169795b73b0c87f80d34bff776372399079..65d0ed67c24aaa559110e2b7368eb5dcaf1d3c19 100644
 --- a/src/player.c
 +++ b/src/player.c
 @@ -2550,6 +2550,7 @@
@@ -3130,7 +3119,6 @@ index f9ce6169795b73b0c87f80d34bff776372399079..65d0ed67c24aaa559110e2b7368eb5dc
  
    if (!player_exit)
 diff --git a/src/player.h b/src/player.h
-index 258d8e15a95bf6634ef85ca652e7679fa7a7c5d4..2c43bdabb077cc1d99cc15f0618c273715dbe984 100644
 --- a/src/player.h
 +++ b/src/player.h
 @@ -7,6 +7,7 @@
@@ -3176,7 +3164,6 @@ index 258d8e15a95bf6634ef85ca652e7679fa7a7c5d4..2c43bdabb077cc1d99cc15f0618c2737
  
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..cf786d77c6bb86a34284cdd8aeb2f55085b796b1
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
 @@ -0,0 +1,911 @@
@@ -3452,7 +3439,7 @@ index 0000000000000000000000000000000000000000..cf786d77c6bb86a34284cdd8aeb2f550
 +      : "general { user_agent = General/custom } airplay_shared { user_agent = AirPlay/123.4.5 }") != CFG_SUCCESS)
 +    { owner_fail(&f, "actual explicit User-Agent configuration rejected"); goto cleanup; }
 +  cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database_path);
-+  if (db_init("/usr/lib/owntone/owntone-sqlext.so") < 0 || db_perthread_init() < 0)
++  if (db_init(ATTENTION_TEST_SQLEXT_PATH) < 0 || db_perthread_init() < 0)
 +    { owner_fail(&f,"actual private native DB startup"); goto cleanup; }
 +  database_ready=true;
 +  fixture_service_bind_calls = 0;
@@ -4005,7 +3992,7 @@ index 0000000000000000000000000000000000000000..cf786d77c6bb86a34284cdd8aeb2f550
 +  memset(contexts,0,sizeof(contexts));context_allocations=context_frees=0;fail_request_allocation=false;
 +  cfg=cfg_init(toplvl_cfg,CFGF_NONE);if(!cfg){f.failed=1;goto cleanup;}
 +  cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database_path);
-+  if(db_init("/usr/lib/owntone/owntone-sqlext.so")<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
++  if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
 +  if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
 +  outputs_deferredev=evtimer_new(f.base,deferred_cb,NULL);
 +  outputs_buffer_duration_ms=cfg_getint(cfg_getsec(cfg,"general"),"start_buffer_ms");
@@ -4093,7 +4080,6 @@ index 0000000000000000000000000000000000000000..cf786d77c6bb86a34284cdd8aeb2f550
 +}
 diff --git a/tests/evrtsp_guarded_owner_contract.c b/tests/evrtsp_guarded_owner_contract.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d211de80840898cb13e2494b21eee0c5525a8a96
 --- /dev/null
 +++ b/tests/evrtsp_guarded_owner_contract.c
 @@ -0,0 +1,206 @@
@@ -4305,7 +4291,6 @@ index 0000000000000000000000000000000000000000..d211de80840898cb13e2494b21eee0c5
 +}
 diff --git a/tests/evrtsp_owner_contract.c b/tests/evrtsp_owner_contract.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d44510e8724d47c2543c9c971ccacd9f8aed758e
 --- /dev/null
 +++ b/tests/evrtsp_owner_contract.c
 @@ -0,0 +1,390 @@
@@ -4701,7 +4686,6 @@ index 0000000000000000000000000000000000000000..d44510e8724d47c2543c9c971ccacd9f
 +}
 diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..7832a2259287e30642cd85ed9a468d19c950423f
 --- /dev/null
 +++ b/tests/outputs_attention_owner.c
 @@ -0,0 +1,848 @@
