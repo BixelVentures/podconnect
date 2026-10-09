@@ -84,7 +84,7 @@ T = load_body(
         HomeAssistantError=HAError,
         SpotifyApiError=SpotifyError,
         SpeakersError=S["SpeakersError"],
-        DOMAIN="podconnect",
+        DOMAIN="podconnect", CONF_ROOM_AREAS="room_areas",
         er=ER, dr=DR, ar=AR,
     ),
 )
@@ -135,7 +135,7 @@ def services(api=None, speakers=None):
         transfer=AsyncMock(),
     )
     data = SimpleNamespace(api=api, speakers=speakers, active=True)
-    entries = [SimpleNamespace(entry_id="account-A", title="Account A", runtime_data=data)]
+    entries = [SimpleNamespace(entry_id="account-A", title="Account A", runtime_data=data, options={})]
     registered = {}
     registry = SimpleNamespace(
         has_service=lambda domain, name: name in registered,
@@ -196,6 +196,64 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reg["get_targets"][1]["schema"], reg["get_targets_with_context"][1]["schema"])
         self.assertEqual(reg["get_targets"][1]["supports_response"], "only")
         self.assertEqual(reg["get_targets_with_context"][1]["supports_response"], "only")
+
+    async def test_room_profile_keeps_legacy_profiles_exact_and_fences_native_identity(self):
+        speakers = SimpleNamespace(
+            aliases=AsyncMock(return_value=catalog()),
+            rooms=AsyncMock(
+                return_value=[
+                    {"id": "A", "homepod_id": "native-A"},
+                    {"id": "B", "homepod_id": "native-B"},
+                ]
+            ),
+            outputs=AsyncMock(return_value={"owntone_up": True, "devices": []}),
+        )
+        hass, _, entries, reg = services(speakers=speakers)
+        entry = entries[0]
+        area = SimpleNamespace(id="frida", name="Frida's Room", aliases={"Fridas værelse"})
+        hass.area_registry[area.id] = area
+        before = {n: await invoke(reg, n) for n in ("get_targets", "get_targets_with_context")}
+        entry.options = {"room_areas": {"B": {"homepod_id": "native-B", "area_id": area.id}}}
+        for n, expected in before.items():
+            self.assertEqual(await invoke(reg, n), expected)
+        profile = await invoke(reg, "get_targets_with_room_context")
+        row = next(t for t in profile["targets"] if t["target_id"] == "B")
+        self.assertEqual(
+            row["ha_area"], {"id": area.id, "name": area.name, "aliases": ["Fridas værelse"]}
+        )
+        self.assertEqual(
+            reg["get_targets_with_room_context"][1], reg["get_targets_with_context"][1]
+        )
+        entries.append(
+            SimpleNamespace(
+                entry_id="account-B", title="Other", runtime_data=entry.runtime_data, options={}
+            )
+        )
+        other = await invoke(reg, "get_targets_with_room_context", config_entry_id="account-B")
+        self.assertFalse(any("ha_area" in t for t in other["targets"]))
+        speakers.rooms.return_value[1]["homepod_id"] = "replacement-B"
+        self.assertFalse(
+            any(
+                "ha_area" in t
+                for t in (await invoke(reg, "get_targets_with_room_context"))["targets"]
+            )
+        )
+        speakers.rooms.return_value[1]["homepod_id"] = "native-B"
+        del hass.area_registry[area.id]
+        self.assertFalse(
+            any(
+                "ha_area" in t
+                for t in (await invoke(reg, "get_targets_with_room_context"))["targets"]
+            )
+        )
+        speakers.aliases.side_effect = S["SpeakersError"]("offline")
+        self.assertFalse(
+            any(
+                t["kind"] == "configured_alias"
+                for t in (await invoke(reg, "get_targets_with_room_context"))["targets"]
+            )
+        )
+
 
     async def test_fresh_provider_target_has_exact_current_ha_metadata_without_move(self):
         hass, data, _, reg = services()
@@ -292,7 +350,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         _, data, entries, reg = services()
         other = SimpleNamespace(api=SimpleNamespace(transfer=AsyncMock()), active=True)
         entries.append(SimpleNamespace(entry_id="account-B", runtime_data=other))
-        self.assertEqual(set(reg), {"get_targets", "get_targets_with_context", "move_playback"})
+        self.assertEqual(set(reg), {"get_targets", "get_targets_with_context", "get_targets_with_room_context", "move_playback"})
         self.assertEqual(reg["get_targets"][1]["supports_response"], "only")
         self.assertIn("config_entry_id", reg["move_playback"][1]["schema"])
         with self.assertRaises(HAError):
@@ -625,6 +683,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         )["PodConnectOptionsFlow"]
         entry = SimpleNamespace(options={"unrelated": 1}, data={"token": "secret"})
         obj = flow(entry)
+        obj._targets_now = AsyncMock(return_value=[])
         result = await obj.async_step_init({"speakers_url": "http://local/"})
         self.assertEqual(result["data"], {"unrelated": 1, "speakers_url": "http://local"})
         self.assertEqual(entry.data, {"token": "secret"})

@@ -30,3 +30,5 @@ SPOTIFY_SCOPES = [
 POLL_INTERVAL_SECONDS = 10
 
 CONF_SPEAKERS_URL = "speakers_url"
+
+CONF_ROOM_AREAS = "room_areas"

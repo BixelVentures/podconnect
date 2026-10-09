@@ -35,10 +35,23 @@
         "data": {
           "speakers_url": "Speakers URL"
         }
+      },
+      "room": {
+        "title": "Room for {speaker}",
+        "description": "Choose the room for this speaker. Leave empty to remove its room association.",
+        "data": {
+          "area_id": "Room"
+        }
       }
     },
     "error": {
-      "invalid_url": "Use an HTTP or HTTPS URL without credentials, query or fragment."
+      "invalid_url": "Use an HTTP or HTTPS URL without credentials, query or fragment.",
+      "speakers_unavailable": "Speakers are unavailable. Try again when they are connected.",
+      "area_unavailable": "This room is no longer available."
+    },
+    "abort": {
+      "speaker_changed": "This speaker changed while settings were open. Open settings again.",
+      "configuration_changed": "Settings changed while this form was open. Open settings again."
     }
   }
 }

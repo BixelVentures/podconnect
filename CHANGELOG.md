@@ -1,3 +1,9 @@
+## Control 0.10.5 - rooms for configured speakers
+
+- Choose a Home Assistant room for each configured speaker in account settings; clear the selection to remove the association.
+- Offer room names and aliases only while the exact configured speaker and selected HA room still exist, through a separate read-only discovery profile.
+- Preserve both existing discovery profiles for independent Control and PodVoice updates. Playback authority is unchanged; room-transfer acceptance remains pending.
+
 ## Control 0.10.4 - contextual music target discovery
 
 - Offer verified Home Assistant entity names, aliases and areas for current Spotify targets through a separate read-only contextual service.
