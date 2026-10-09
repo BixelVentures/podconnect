@@ -1,3 +1,8 @@
+## Speakers 0.26.14 — preserve playback when transfer preparation fails
+
+- Resolve the incoming track in a lazy Spotify context before committing the selected speaker and transfer state. A rejected page lookup preserves the current playback and speaker.
+- Preserve the existing behavior after successful preparation; later media-load failures remain a separate boundary. Physical Spotify Connect attachment acceptance is pending.
+
 ## Control 0.10.5 - rooms for configured speakers
 
 - Choose a Home Assistant room for each configured speaker in account settings; clear the selection to remove the association.
