@@ -1,3 +1,9 @@
+## Control 0.10.4 - contextual music target discovery
+
+- Offer verified Home Assistant entity names, aliases and areas for current Spotify targets through a separate read-only contextual service.
+- Preserve the original target discovery reply and descriptor for older consumers; Control and PodVoice can update in either order.
+- Disabled, ambiguous or offline registry entries do not create playback targets. Playback and Speakers behavior are unchanged.
+
 ## 0.26.13
 
 - Build native recovery tests against the current SQLite extension before installation; preserve runtime behavior and all owner checks.
