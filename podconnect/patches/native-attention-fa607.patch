@@ -9,7 +9,7 @@
 +# They do not claim receiver readiness, RTP audibility or physical restoration.
 +check_PROGRAMS = outputs_attention_owner evrtsp_guarded_owner_contract airplay_callback_owner
 +TESTS = $(check_PROGRAMS)
-+outputs_attention_owner_SOURCES = ../tests/outputs_attention_owner.c misc.c
++outputs_attention_owner_SOURCES = ../tests/outputs_attention_owner.c misc.c misc_json.c
 +outputs_attention_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)
 +outputs_attention_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
 +outputs_attention_owner_LDFLAGS = -Wl,--gc-sections
@@ -503,7 +503,33 @@
  }
  
  /*
-@@ -4692,6 +4890,9 @@
+@@ -1858,6 +2056,7 @@
+   json_object *outputs;
+   json_object *output_id;
+   int nspk, i, ret;
++  int selection_ret = 0;
+   uint64_t *ids;
+ 
+   request = jparse_obj_from_evbuffer(hreq->in_body);
+@@ -1890,7 +2089,7 @@
+ 	}
+ 
+       if (ret == 0)
+-	player_speaker_set(ids);
++	selection_ret = player_speaker_set(ids);
+ 
+       free(ids);
+     }
+@@ -1899,7 +2098,7 @@
+ 
+   jparse_free(request);
+ 
+-  return HTTP_NOCONTENT;
++  return (selection_ret < 0) ? HTTP_INTERNAL : HTTP_NOCONTENT;
+ }
+ 
+ static int
+@@ -4692,6 +4891,9 @@
      { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
      { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
      { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
@@ -3333,7 +3359,7 @@
 +}
 --- /dev/null
 +++ b/tests/outputs_attention_owner.c
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,661 @@
 +/*
 + * Deterministic native OWNER regressions, not receiver or acoustic acceptance.
 + * Compiles the complete candidate outputs.c translation unit with its real
@@ -3348,6 +3374,85 @@
 +#include <string.h>
 +
 +#include "../src/outputs.c"
++
++/* PC12 exercises the complete existing JSON API TU. Only the synchronous
++ * player command return is controlled here; parsing and ownership stay real.
++ * The native 403 -> FAILED -> negative command result is a separate source chain,
++ * not a simulated receiver or physical-activation claim. */
++#include "../src/misc_json.h"
++static int selection_fixture_ret, selection_fixture_calls;
++static int selection_fixture_ids_freed, selection_fixture_request_freed;
++static void *selection_fixture_ids;
++static int selection_fixture_set(uint64_t *ids);
++static void selection_fixture_free(void *pointer);
++static void selection_fixture_json_free(json_object *object);
++#define player_speaker_set selection_fixture_set
++#define free selection_fixture_free
++#define jparse_free selection_fixture_json_free
++#include "../src/httpd_jsonapi.c"
++#undef player_speaker_set
++#undef free
++#undef jparse_free
++
++static int selection_fixture_set(uint64_t *ids)
++{
++  assert(ids && ids[0] == 1 && ids[1] == 42);
++  assert(selection_fixture_ids_freed == 0 && selection_fixture_request_freed == 0);
++  selection_fixture_ids = ids;
++  selection_fixture_calls++;
++  return selection_fixture_ret;
++}
++static void selection_fixture_free(void *pointer)
++{
++  assert(pointer);
++  if (selection_fixture_calls)
++    assert(pointer == selection_fixture_ids && selection_fixture_request_freed == 0);
++  selection_fixture_ids_freed++;
++  free(pointer);
++}
++static void selection_fixture_json_free(json_object *object)
++{
++  assert(object);
++  selection_fixture_request_freed++;
++  jparse_free(object);
++}
++
++static void selection_api_preserves_failure_and_cleanup(void)
++{
++  static const struct {
++    const char *body;
++    int command_ret, status, calls, ids_freed, request_freed;
++  } cases[] = {
++    { "{\"outputs\":[\"42\"]}", -1, HTTP_INTERNAL, 1, 1, 1 },
++    { "{\"outputs\":[\"42\"]}", -2, HTTP_INTERNAL, 1, 1, 1 },
++    { "{\"outputs\":[\"42\"]}", 0, HTTP_NOCONTENT, 1, 1, 1 },
++    { "{\"outputs\":[\"42\"]}", 1, HTTP_NOCONTENT, 1, 1, 1 },
++    { "{", -1, HTTP_BADREQUEST, 0, 0, 0 },
++    { "{}", -1, HTTP_NOCONTENT, 0, 0, 1 },
++    { "{\"outputs\":[\"invalid-id\"]}", -1, HTTP_NOCONTENT, 0, 1, 1 },
++  };
++  size_t i;
++  for (i = 0; i < ARRAY_SIZE(cases); i++)
++    {
++      struct httpd_request request = {0};
++      int status;
++      request.in_body = evbuffer_new();
++      assert(request.in_body);
++      assert(evbuffer_add(request.in_body, cases[i].body, strlen(cases[i].body)) == 0);
++      selection_fixture_ret = cases[i].command_ret;
++      selection_fixture_calls = selection_fixture_ids_freed = selection_fixture_request_freed = 0;
++      selection_fixture_ids = NULL;
++      status = jsonapi_reply_outputs_set(&request);
++      evbuffer_free(request.in_body);
++      if (status != cases[i].status)
++        fprintf(stderr, "PC12 actual selection API case %zu: status=%d expected=%d\n", i, status, cases[i].status);
++      assert(status == cases[i].status);
++      assert(selection_fixture_calls == cases[i].calls);
++      assert(selection_fixture_ids_freed == cases[i].ids_freed);
++      assert(selection_fixture_request_freed == cases[i].request_freed);
++    }
++  puts("PASS seven actual selection API return/cleanup cases; no native protocol or audio claim");
++}
 +
 +struct event_base *evbase_player;
 +struct output_definition output_raop;
@@ -3910,6 +4015,7 @@
 +  manual_cas_preserves_overlay_ttl_and_same_value_aba();
 +  manual_old_challenge_never_overrides_newer_native_intent();
 +  manual_failed_restore_uses_original_uuid_without_clearing_lease();
++  selection_api_preserves_failure_and_cleanup();
 +  event_free(outputs_deferredev);
 +  event_base_free(evbase_player);
 +  puts("PASS fifteen deterministic output-owner groups; no native protocol or audio claim");

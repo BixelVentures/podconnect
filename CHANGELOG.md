@@ -8,6 +8,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.8 — candidate 2026-10-09
+- Validate transfer tracks and contexts before changing playback state; retain the
+  preceding transfer timestamp when context preparation fails.
+- Handle station tracks without metadata safely and preserve valid queues, lazy
+  pages and normal autoplay behavior.
+- Report failed native output activation to the existing routing owner rather than
+  acknowledging the selection as successful. Physical HomePod activation remains
+  a separate acceptance check.
+
 ## Speakers 0.26.7 / Control 0.10.3 — candidate 2026-10-09
 - Retry missing current-connection registration at the next existing state or
   volume update; only accepted NEW_DEVICE registration credits readiness.
