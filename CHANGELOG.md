@@ -8,6 +8,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.10 — candidate 2026-10-09
+- Reject a stale room selection before its native duck command when the room map
+  or Connect selection changes during an output-state read (PC #8/#9).
+- Retain an already admitted duck's original lease for one compensating restore;
+  preserve the existing room-selection and cleanup owners.
+
 ## Speakers 0.26.9 — candidate 2026-10-09
 - Backport OwnTone’s HomePod OS 27 compatibility fix: use the dedicated AirPlay
   User-Agent, while preserving the general User-Agent and allowing an AirPlay

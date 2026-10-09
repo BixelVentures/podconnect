@@ -274,9 +274,15 @@ func (a *attention) observeNative(base, id string, g *nativeAttentionGrant) erro
 	return err
 }
 func (a *attention) nativeTarget(base, id string) bool {
-	return a.nativeReconcile(base, id, true)
+	return a.nativeTargetForRoute(base, id, nil)
+}
+func (a *attention) nativeTargetForRoute(base, id string, admitRoute func() bool) bool {
+	return a.nativeReconcileWithAdmission(base, id, true, admitRoute)
 }
 func (a *attention) nativeReconcile(base, id string, targetOnly bool) bool {
+	return a.nativeReconcileWithAdmission(base, id, targetOnly, nil)
+}
+func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly bool, admitRoute func() bool) bool {
 	a.mu.Lock()
 	a.expireLocked(time.Now())
 	nonce, rev, restoreRev, active, level := a.sessionNonce, a.nativeRevision, a.restoreRevision, a.active, a.level
@@ -316,6 +322,11 @@ func (a *attention) nativeReconcile(base, id string, targetOnly bool) bool {
 			if nativeAttentionHTTP(base, id, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.DeviceID != id || state.Lease != "0" {
 				return false
 			}
+			// Observation may outlive the prepared room/alias. Claim this native
+			// effect before reserving its lease, without holding attention locks.
+			if admitRoute != nil && !admitRoute() {
+				return false
+			}
 			a.mu.Lock()
 			now := time.Now()
 			a.expireLocked(now)
@@ -346,6 +357,11 @@ func (a *attention) nativeReconcile(base, id string, targetOnly bool) bool {
 			}
 			// Claim and replace only while the same conversation/update is still current.
 			// An old state GET has no authority to mint an UPDATE after release/retarget.
+			// Observation may outlive the prepared room/alias. Claim this native
+			// effect before reserving its lease, without holding attention locks.
+			if admitRoute != nil && !admitRoute() {
+				return false
+			}
 			a.mu.Lock()
 			now := time.Now()
 			a.expireLocked(now)

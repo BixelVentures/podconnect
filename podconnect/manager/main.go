@@ -734,7 +734,13 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
 		return false, routeIntentCurrent(live, aliasId, revision)
 	}
-	if att != nil && !att.nativeTarget(primaryOwnTone, devs[idx].ID) {
+	var admitNative func() bool
+	if live != nil {
+		admitNative = func() bool {
+			return admitRoomAliasRoute(target, binding, live, aliasId, revision)
+		}
+	}
+	if att != nil && !att.nativeTargetForRoute(primaryOwnTone, devs[idx].ID, admitNative) {
 		return false, routeIntentCurrent(live, aliasId, revision)
 	}
 	cl := &http.Client{Timeout: 4 * time.Second}
