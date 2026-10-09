@@ -220,7 +220,7 @@ func (l *glLive) claimManual(action nativeManualAction) bool {
 func (a *attention) nativeManualReconcile(base string, live *glLive) bool {
 	action := live.manualSnapshot()
 	a.mu.Lock()
-	if a.nativeBusy {
+	if a.nativeBusy || a.custodyBlockedLocked() {
 		a.mu.Unlock()
 		return false
 	}

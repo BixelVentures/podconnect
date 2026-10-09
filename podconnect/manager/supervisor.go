@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -64,6 +65,7 @@ func (m *roomManager) ensureRunning(r *Room) {
 		return
 	}
 	rt := &roomRuntime{room: r, stop: make(chan struct{}), done: make(chan struct{})}
+	rt.att.loadCustody(filepath.Join(dataDir, "rooms", r.ID, "attention-custody.json"), r.ID)
 	m.runtimes[r.ID] = rt
 	m.mu.Unlock()
 

@@ -65,7 +65,7 @@ func (a *attention) engageOwned(nonce string, expected attentionChallenge, begin
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.expireLocked(now)
-	if !validAttentionNonce(nonce) || expected.Process == "" || expected.Process != attentionManagerProcess() || a.nativeRevision == math.MaxUint64 {
+	if a.custodyBlockedLocked() || !validAttentionNonce(nonce) || expected.Process == "" || expected.Process != attentionManagerProcess() || a.nativeRevision == math.MaxUint64 {
 		return false
 	}
 	if begin {
@@ -74,6 +74,9 @@ func (a *attention) engageOwned(nonce string, expected attentionChallenge, begin
 			return a.admissionRevision > 0 && expected.Revision == strconv.FormatUint(a.admissionRevision-1, 10)
 		}
 		if expected.Revision != strconv.FormatUint(a.admissionRevision, 10) || a.active || a.pendingRelease || a.nativePending || a.nativeBusy || nonce == a.sessionNonce || a.admissionRevision == math.MaxUint64 {
+			return false
+		}
+		if !a.custodyAdmitLocked(nonce) {
 			return false
 		}
 		a.admissionRevision++
@@ -138,6 +141,7 @@ type nativeAttentionResult struct {
 }
 type nativeAttentionGrant struct {
 	// Original native lease/process/device incarnation never replaced by a GET.
+	Origin              nativeAttentionOrigin // Immutable original BEGIN, retained across UPDATE/RELEASE.
 	Identity            nativeAttentionIdentity
 	Command             nativeAttentionCommand
 	Result              nativeAttentionResult
@@ -160,7 +164,7 @@ type nativeAttentionHTTPStatus int
 func (s nativeAttentionHTTPStatus) Error() string {
 	return fmt.Sprintf("native attention HTTP %d", int(s))
 }
-func nativeAttentionHTTP(base, id, tail, method string, command *nativeAttentionCommand, out any) error {
+func nativeAttentionHTTP(base, id, tail, method string, command any, out any) error {
 	if !nativeCurrency(id) {
 		return errors.New("invalid native output identity")
 	}
@@ -251,6 +255,9 @@ func (g *nativeAttentionGrant) foldObserved(id string, observed nativeAttentionR
 }
 func (a *attention) submitNative(base, id string, g *nativeAttentionGrant) error {
 	err := g.submit(base, id)
+	if err != nil || g.Command.Action == "release" && (g.Result.Outcome == "failed" || g.Result.Outcome == "unknown") {
+		a.detectNativeReplacement(base, id, g)
+	}
 	if err == nil {
 		a.mu.Lock()
 		if a.nativeResults == nil {
@@ -263,6 +270,9 @@ func (a *attention) submitNative(base, id string, g *nativeAttentionGrant) error
 }
 func (a *attention) observeNative(base, id string, g *nativeAttentionGrant) error {
 	err := g.observe(base, id)
+	if err != nil || g.Command.Action == "release" && (g.Result.Outcome == "failed" || g.Result.Outcome == "unknown") {
+		a.detectNativeReplacement(base, id, g)
+	}
 	if err == nil {
 		a.mu.Lock()
 		if a.nativeResults == nil {
@@ -286,7 +296,7 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 	a.mu.Lock()
 	a.expireLocked(time.Now())
 	nonce, rev, restoreRev, active, level := a.sessionNonce, a.nativeRevision, a.restoreRevision, a.active, a.level
-	if a.nativeBusy {
+	if a.nativeBusy || a.custodyBlockedLocked() {
 		a.mu.Unlock()
 		return false
 	}
@@ -299,7 +309,7 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 		a.mu.Lock()
 		a.nativeBusy = false
 		a.nativePending = len(a.nativeGrants) > 0
-		if !a.active && !a.nativePending {
+		if !a.active && !a.nativePending && a.custodyFinishLocked() {
 			a.pendingRelease = false
 		}
 		a.mu.Unlock()
@@ -343,6 +353,23 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 			}
 			g = &nativeAttentionGrant{Revision: rev, Uncertain: true}
 			g.Command = nativeAttentionCommand{state.nativeAttentionIdentity, commandID, "begin", level, int(clampAttentionTTL(remaining) / time.Millisecond)}
+			if !a.custodyBeginLocked(base, id, g) {
+				a.mu.Unlock()
+				return false
+			}
+			a.mu.Unlock()
+			// Disk durability may outlive the route or conversation permission.
+			routeCurrent := admitRoute == nil || admitRoute()
+			a.mu.Lock()
+			now = time.Now()
+			a.expireLocked(now)
+			remaining = a.deadline.Sub(now)
+			if !routeCurrent || !a.active || a.sessionNonce != nonce || a.nativeRevision != rev || remaining/time.Millisecond <= 0 {
+				a.custodyRetireLocked(g) // No native call was submitted.
+				a.mu.Unlock()
+				return false
+			}
+			g.Command.TTL = int(clampAttentionTTL(remaining) / time.Millisecond)
 			// Reserve cleanup custody and exact residual TTL in the same admission.
 			a.nativeGrants[id] = g
 			a.nativePending = true
@@ -353,6 +380,7 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 		} else if g.Result.Outcome != "pending" && g.Revision != rev && !g.Identity.Restoring {
 			var state nativeAttentionObservation
 			if nativeAttentionHTTP(base, id, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.Process != g.Identity.Process || state.Incarnation != g.Identity.Incarnation || state.Lease != g.Identity.Lease || state.Restoring {
+				a.detectNativeReplacement(base, id, g)
 				return false
 			}
 			// Claim and replace only while the same conversation/update is still current.
@@ -401,24 +429,34 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 		if g.Uncertain || g.Result.Outcome == "pending" {
 			return false
 		}
-		if g.Command.Action == "release" && (g.Result.Outcome == "protocol_accepted" || g.Result.Outcome == "desired_only") && g.Result.Current {
-			delete(a.nativeGrants, output)
+		if g.Command.Action == "release" && a.nativeReleaseAccepted(g.Result) {
+			if !a.retireNativeGrant(output, g) {
+				return false
+			}
 			continue
 		}
 		var state nativeAttentionObservation
 		if nativeAttentionHTTP(base, output, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.Process != g.Identity.Process || state.Incarnation != g.Identity.Incarnation {
+			a.detectNativeReplacement(base, output, g)
 			return false
 		}
 		if state.Lease == "0" {
+			a.detectNativeReplacement(base, output, g)
+			if a.custodyBlocked() {
+				return false
+			}
 			// Native TTL may have restored this exact lease while manager was blocked.
 			var terminal nativeAttentionResult
-			if !nativeCurrency(state.LastRelease) || state.LastRelease == "0" || nativeAttentionHTTP(base, output, "/"+state.LastRelease+"?process="+url.QueryEscape(g.Identity.Process), http.MethodGet, nil, &terminal) != nil || !terminal.Identity.valid() || terminal.Identity.Process != g.Identity.Process || terminal.Identity.DeviceID != output || terminal.Operation != state.LastRelease || terminal.Identity.Lease != g.Identity.Lease || terminal.Identity.Incarnation != g.Identity.Incarnation || terminal.Action != "release" || !terminal.Current || (terminal.Outcome != "protocol_accepted" && terminal.Outcome != "desired_only") {
+			if !nativeCurrency(state.LastRelease) || state.LastRelease == "0" || nativeAttentionHTTP(base, output, "/"+state.LastRelease+"?process="+url.QueryEscape(g.Identity.Process), http.MethodGet, nil, &terminal) != nil || !terminal.Identity.valid() || terminal.Identity.Process != g.Identity.Process || terminal.Identity.DeviceID != output || terminal.Operation != state.LastRelease || terminal.Identity.Lease != g.Identity.Lease || terminal.Identity.Incarnation != g.Identity.Incarnation || terminal.Action != "release" || !a.nativeReleaseAccepted(terminal) {
 				return false
 			}
 			a.mu.Lock()
 			a.nativeResults[output] = terminal
+			g.Result = terminal
 			a.mu.Unlock()
-			delete(a.nativeGrants, output)
+			if !a.retireNativeGrant(output, g) {
+				return false
+			}
 			continue
 		}
 		if state.Lease != g.Identity.Lease {
@@ -441,8 +479,10 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 		if a.submitNative(base, output, g) != nil {
 			return false
 		}
-		if g.Result.Current && (g.Result.Outcome == "protocol_accepted" || g.Result.Outcome == "desired_only") {
-			delete(a.nativeGrants, output)
+		if a.nativeReleaseAccepted(g.Result) {
+			if !a.retireNativeGrant(output, g) {
+				return false
+			}
 		} else {
 			return false
 		}

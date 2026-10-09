@@ -823,6 +823,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			}
 			graceNext = time.Now().Add(10 * time.Second)
 		}
+		if !att.reconcileCustody() {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
 		if !tone.Load() {
 			// Wave 3: read the room's live state in-memory (pushed by runGLEvents from the /events
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
@@ -1307,142 +1311,18 @@ func main() {
 	// re-browses the LAN from scratch. Use when a just-powered-on AirPlay device isn't in the picker yet
 	// (discovery is otherwise passive — we only read OwnTone's current mDNS-built output list). Briefly
 	// interrupts any audio OwnTone is currently sending. The panel then re-polls /api/discover.
-	http.HandleFunc("/api/rescan", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "POST only", http.StatusMethodNotAllowed)
-			return
-		}
-		pr := primaryRoom()
-		if pr == nil {
-			http.Error(w, "no speaker yet", http.StatusServiceUnavailable)
-			return
-		}
-		rt := mgr.runtime(pr.ID)
-		if rt == nil {
-			http.Error(w, "engine not running", http.StatusServiceUnavailable)
-			return
-		}
-		log.Printf("rescan: restarting OwnTone for room %s — fresh AirPlay/mDNS browse", pr.ID)
-		rt.restartOT()
-		writeJSON(w, map[string]any{"ok": true})
-	})
+	http.HandleFunc("/api/rescan", speakerRescanHandler)
 
 	// POST /api/rooms {homepod_name, name?} — add a speaker: validate uniqueness, allocate, render,
 	// spawn, select. DELETE /api/rooms/<id> — remove a speaker.
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
 	http.HandleFunc("/api/room-switch", roomSwitchHandler)
-	http.HandleFunc("/api/select", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Name string `json:"name"`
-			Room string `json:"room"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		name := strings.TrimSpace(body.Name)
-		rm := primaryRoom()
-		if body.Room != "" {
-			rm = roomByID(body.Room)
-		}
-		if rm == nil {
-			http.Error(w, "no such room", http.StatusNotFound)
-			return
-		}
-		// Capture the chosen output's live id (the stable binding) alongside its name, so a later
-		// Apple-Home rename can't break the match. Apply immediately for instant feedback; the
-		// selection tick also keeps it locked + heals drift.
-		homepodID := ""
-		if name != "" {
-			if devs, _ := fetchOutputsFrom(rm.OwnTone); devs != nil {
-				for _, d := range devs {
-					if strings.EqualFold(d.Name, name) {
-						homepodID = d.ID
-						selectOnOwntoneAt(rm.OwnTone, d.ID)
-						break
-					}
-				}
-			}
-		}
-		// Persist the chosen HomePod (id+name) on the room + keep legacy selected_output.json for r0.
-		store.setHomePodBinding(rm.ID, homepodID, name)
-		if rm.ID == "r0" {
-			_ = writeSaved(name)
-		}
-		rm.HomepodName = name
-		rm.HomepodID = homepodID
-		// Picking a HomePod auto-names the speaker after it — the panel owns naming. The legacy
-		// speaker_name option no longer overrides an explicit pick (it was only the migration seed);
-		// only a user Rename (NameManual) pins a custom name. Rewrite device_name + restart this room.
-		if name != "" && !rm.NameManual && setGLDeviceName(rm, name) {
-			store.setName(rm.ID, name)
-			rm.Name = name
-			log.Printf("name-forward: room %s -> %q (restarting go-librespot)", rm.ID, name)
-			if rt := mgr.runtime(rm.ID); rt != nil {
-				go rt.restartGL()
-			}
-		}
-		log.Printf("selection saved: room=%s %q", rm.ID, name)
-		writeJSON(w, map[string]bool{"ok": true})
-	})
+	http.HandleFunc("/api/select", speakerSelectHandler)
 
-	http.HandleFunc("/api/test", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Room string `json:"room"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		rm := primaryRoom()
-		if body.Room != "" {
-			rm = roomByID(body.Room)
-		}
-		if rm == nil {
-			http.Error(w, "no such room", http.StatusNotFound)
-			return
-		}
-		devs, _ := fetchOutputsFrom(rm.OwnTone)
-		// Resolve the target: the room's HomePod, then the first discovered device — and report the
-		// NAME back so the user can see exactly which HomePod the tone went to.
-		want := rm.HomepodName
-		target, targetName := "", ""
-		for _, d := range devs {
-			if want != "" && strings.EqualFold(d.Name, want) {
-				target, targetName = d.ID, d.Name
-				break
-			}
-		}
-		if target == "" && len(devs) > 0 {
-			target, targetName = devs[0].ID, devs[0].Name // fall back to the first discovered device
-		}
-		if target != "" {
-			selectOnOwntoneAt(rm.OwnTone, target)
-			setOwntoneOutputVolume(rm.OwnTone, target, 13) // gentle, on the specific HomePod
-		}
-		// Also nudge go-librespot down so the reconciler can't bump the test up to a louder level.
-		setLibrespotVolumePctOwned(rm.Librespot, 13)
-		go playTestTone(rm.Pipe, toneFor(rm.ID))
-		log.Printf("test tone requested (room=%s target=%q id=%q)", rm.ID, targetName, target)
-		writeJSON(w, map[string]any{"ok": true, "requested": true, "target": targetName})
-	})
+	http.HandleFunc("/api/test", speakerTestHandler)
 
-	http.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		for _, rm := range targetRooms(r) {
-			librespotTransport(rm.Librespot, "pause") // stop Spotify so the bridge doesn't instantly reclaim
-			releaseHomePod(rm)
-			store.setReleased(rm.ID, true)
-		}
-		log.Printf("HomePod released on request — free for other apps")
-		writeJSON(w, map[string]bool{"ok": true})
-	})
+	http.HandleFunc("/api/release", speakerReleaseHandler)
 
 	// /api/stop pauses whatever is playing on a speaker WITHOUT giving the HomePod away. It talks to
 	// go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the session
@@ -1495,6 +1375,14 @@ func main() {
 				rooms = []*Room{rm}
 			}
 		}
+		if custodyMutationBlocked(w) {
+			return
+		}
+		done, admitted := custodyMutationAdmission(w)
+		if !admitted {
+			return
+		}
+		defer done()
 		for _, rm := range rooms {
 			setLibrespotVolumePct(rm.Librespot, pct)
 		}
@@ -1589,7 +1477,7 @@ func attentionHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		a.mu.Lock()
-		owned := a.sessionNonce != ""
+		owned := a.sessionNonce != "" || a.custodyBlockedLocked()
 		a.mu.Unlock()
 		if owned {
 			http.Error(w, "strict attention owner required", http.StatusConflict)
@@ -1636,13 +1524,17 @@ func attentionReleaseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if a := attentionFor(rm.ID); a != nil {
 		if body.Session != "" {
+			if snap, ok := a.custodyRelease(body.Session, body.Expected); ok {
+				writeJSON(w, snap)
+				return
+			}
 			if !a.releaseOwned(body.Session, body.Expected) {
 				http.Error(w, "attention owner stale", http.StatusConflict)
 				return
 			}
 		} else {
 			a.mu.Lock()
-			owned := a.sessionNonce != ""
+			owned := a.sessionNonce != "" || a.custodyBlockedLocked()
 			a.mu.Unlock()
 			if owned {
 				http.Error(w, "strict attention owner required", http.StatusConflict)
@@ -1732,6 +1624,14 @@ func roomsItemHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "missing room id", http.StatusBadRequest)
 			return
 		}
+		if custodyMutationBlocked(w) {
+			return
+		}
+		done, admitted := custodyDeleteAdmission(w, id)
+		if !admitted {
+			return
+		}
+		defer done()
 		if err := mgr.removeRoom(id); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -2361,3 +2261,186 @@ setInterval(tick, 5000);
 </script>
 </body>
 </html>`
+
+// Direct panel volume/output actions share the bridge's cold-recovery fence.
+func custodyMutationBlocked(w http.ResponseWriter) bool {
+	if room := primaryRoom(); room != nil {
+		if a := attentionFor(room.ID); a != nil && a.custodyBlocked() {
+			http.Error(w, "original attention restoration pending", http.StatusConflict)
+			return true
+		}
+	}
+	return false
+}
+
+func speakerRescanHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if custodyMutationBlocked(w) {
+		return
+	}
+	pr := primaryRoom()
+	if pr == nil {
+		http.Error(w, "no speaker yet", http.StatusServiceUnavailable)
+		return
+	}
+	rt := mgr.runtime(pr.ID)
+	if rt == nil {
+		http.Error(w, "engine not running", http.StatusServiceUnavailable)
+		return
+	}
+	done, admitted := custodyMutationAdmission(w)
+	if !admitted {
+		return
+	}
+	defer done()
+	log.Printf("rescan: restarting OwnTone for room %s — fresh AirPlay/mDNS browse", pr.ID)
+	rt.restartOT()
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func speakerReleaseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if custodyMutationBlocked(w) {
+		return
+	}
+	done, admitted := custodyMutationAdmission(w)
+	if !admitted {
+		return
+	}
+	defer done()
+	for _, rm := range targetRooms(r) {
+		librespotTransport(rm.Librespot, "pause") // stop Spotify so the bridge doesn't instantly reclaim
+		releaseHomePod(rm)
+		store.setReleased(rm.ID, true)
+	}
+	log.Printf("HomePod released on request — free for other apps")
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func speakerSelectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Name string `json:"name"`
+		Room string `json:"room"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	name := strings.TrimSpace(body.Name)
+	rm := primaryRoom()
+	if body.Room != "" {
+		rm = roomByID(body.Room)
+	}
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	if custodyMutationBlocked(w) {
+		return
+	}
+	// Capture the chosen output's live id (the stable binding) alongside its name, so a later
+	// Apple-Home rename can't break the match. Apply immediately for instant feedback; the
+	// selection tick also keeps it locked + heals drift.
+	homepodID := ""
+	if name != "" {
+		if devs, _ := fetchOutputsFrom(rm.OwnTone); devs != nil {
+			for _, d := range devs {
+				if strings.EqualFold(d.Name, name) {
+					homepodID = d.ID
+					break
+				}
+			}
+		}
+	}
+	done, admitted := custodyMutationAdmission(w)
+	if !admitted {
+		return
+	}
+	defer done()
+	if homepodID != "" {
+		selectOnOwntoneAt(rm.OwnTone, homepodID)
+	}
+	// Persist the chosen HomePod (id+name) on the room + keep legacy selected_output.json for r0.
+	store.setHomePodBinding(rm.ID, homepodID, name)
+	if rm.ID == "r0" {
+		_ = writeSaved(name)
+	}
+	rm.HomepodName = name
+	rm.HomepodID = homepodID
+	// Picking a HomePod auto-names the speaker after it — the panel owns naming. The legacy
+	// speaker_name option no longer overrides an explicit pick (it was only the migration seed);
+	// only a user Rename (NameManual) pins a custom name. Rewrite device_name + restart this room.
+	if name != "" && !rm.NameManual && setGLDeviceName(rm, name) {
+		store.setName(rm.ID, name)
+		rm.Name = name
+		log.Printf("name-forward: room %s -> %q (restarting go-librespot)", rm.ID, name)
+		if rt := mgr.runtime(rm.ID); rt != nil {
+			go rt.restartGL()
+		}
+	}
+	log.Printf("selection saved: room=%s %q", rm.ID, name)
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func speakerTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if custodyMutationBlocked(w) {
+		return
+	}
+	var body struct {
+		Room string `json:"room"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	rm := primaryRoom()
+	if body.Room != "" {
+		rm = roomByID(body.Room)
+	}
+	if rm == nil {
+		http.Error(w, "no such room", http.StatusNotFound)
+		return
+	}
+	devs, _ := fetchOutputsFrom(rm.OwnTone)
+	// Resolve the target: the room's HomePod, then the first discovered device — and report the
+	// NAME back so the user can see exactly which HomePod the tone went to.
+	want := rm.HomepodName
+	target, targetName := "", ""
+	for _, d := range devs {
+		if want != "" && strings.EqualFold(d.Name, want) {
+			target, targetName = d.ID, d.Name
+			break
+		}
+	}
+	if target == "" && len(devs) > 0 {
+		target, targetName = devs[0].ID, devs[0].Name // fall back to the first discovered device
+	}
+	done, admitted := custodyMutationAdmission(w)
+	if !admitted {
+		return
+	}
+	transfer := false
+	defer func() {
+		if !transfer {
+			done()
+		}
+	}()
+	if target != "" {
+		selectOnOwntoneAt(rm.OwnTone, target)
+		setOwntoneOutputVolume(rm.OwnTone, target, 13) // gentle, on the specific HomePod
+	}
+	// Also nudge go-librespot down so the reconciler can't bump the test up to a louder level.
+	setLibrespotVolumePctOwned(rm.Librespot, 13)
+	transfer = true
+	go func() { defer done(); playTestTone(rm.Pipe, toneFor(rm.ID)) }()
+	log.Printf("test tone requested (room=%s target=%q id=%q)", rm.ID, targetName, target)
+	writeJSON(w, map[string]any{"ok": true, "requested": true, "target": targetName})
+}

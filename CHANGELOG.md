@@ -8,6 +8,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.12 — candidate 2026-10-09
+- Retain each conversation's original speaker cleanup across manager and audio
+  engine restarts; block a new wake until every original speaker is restored (PV #111).
+- Persist the latest speaker volume and restore it through the exact native
+  cleanup owner, including speaker handoffs and interrupted acknowledgements.
+- Physical crash, reconnect and next-wake acceptance remains pending.
+
 ## Speakers 0.26.11 — candidate 2026-10-09
 - Keep the previous speaker selection and command when Spotify refuses a play or
   transfer context before preparation completes (PC #10/#13).
