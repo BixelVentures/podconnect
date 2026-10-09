@@ -9,16 +9,42 @@ diff --git a/daemon/player.go b/daemon/player.go
  	"github.com/devgianlu/go-librespot/tracks"
  )
  
-@@ -174,6 +175,37 @@
+@@ -174,33 +175,52 @@
  }
  
  func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestPayload) error {
+-	p.state.lastCommand = &req
++	var sp *spclient.Spclient
++	if p.sess != nil {
++		sp = p.sess.Spclient()
++	}
++	return p.handlePlayerCommandWithSpclient(ctx, req, sp)
++}
+ 
+-	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+-
+-	// device-aliases: when the controller picks a room, the selected alias arrives as target_alias_id at
+-	// the dealer payload TOP level (not in command/options). Echo it on the next put_state, and push it
+-	// over /events so the manager routes the output immediately (the /status backstop carries it too).
+-	if len(p.app.cfg.DeviceAliases) > 0 {
+-		aliasId := req.TargetAliasId
+-		if aliasId == nil {
+-			aliasId = req.Command.TargetAliasId // tolerate other controllers
++func (p *AppPlayer) handlePlayerCommandWithSpclient(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
 +	var transferState *connectpb.TransferState
 +	if req.Command.Endpoint == "transfer" && len(req.Command.Data) > 0 {
 +		transferState = &connectpb.TransferState{}
 +		if err := proto.Unmarshal(req.Command.Data, transferState); err != nil {
 +			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
-+		}
+ 		}
+-		if aliasId != nil {
+-			// Web API commands target the engine and carry alias 0. Keep the
+-			// selected room instead of publishing an unnamed active device.
+-			resolved := resolveDeviceAlias(p.state.device.SelectedAliasId, *aliasId, len(p.app.cfg.DeviceAliases))
+-			aliasId = &resolved
+-			name := ""
+-			if int(*aliasId) >= 1 && int(*aliasId) <= len(p.app.cfg.DeviceAliases) {
+-				name = p.app.cfg.DeviceAliases[*aliasId-1]
 +		if transferState.Playback == nil || transferState.Playback.CurrentTrack == nil ||
 +			(transferState.Playback.CurrentTrack.Uri == "" && len(transferState.Playback.CurrentTrack.Gid) != 16) ||
 +			transferState.CurrentSession == nil || transferState.CurrentSession.Context == nil ||
@@ -28,8 +54,11 @@ diff --git a/daemon/player.go b/daemon/player.go
 +		for i, track := range transferState.Queue.Tracks {
 +			if track == nil || (track.Uri == "" && len(track.Gid) != 16) {
 +				return fmt.Errorf("invalid TransferState queue track at index %d", i)
-+			}
-+		}
+ 			}
+-			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
+-			p.state.device.SelectedAliasId = *aliasId
+-			p.emitSelectedAlias(*aliasId, p.aliasBinding())
+ 		}
 +		for i, page := range transferState.CurrentSession.Context.Pages {
 +			if page == nil {
 +				return fmt.Errorf("invalid TransferState context page at index %d", i)
@@ -42,17 +71,22 @@ diff --git a/daemon/player.go b/daemon/player.go
 +				}
 +			}
 +		}
+ 	}
+ 
++	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
++
++	// Preparation failure must retain the previous command and output owner.
++	if req.Command.Endpoint != "play" && (req.Command.Endpoint != "transfer" || len(req.Command.Data) == 0) {
++		p.commitPlayerCommand(req)
 +	}
 +
- 	p.state.lastCommand = &req
- 
- 	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
-@@ -209,143 +241,11 @@
- 			})
- 
+ 	switch req.Command.Endpoint {
+ 	case "transfer":
+ 		if len(req.Command.Data) == 0 {
+@@ -211,141 +231,9 @@
  			return nil
--		}
--
+ 		}
+ 
 -		var transferState connectpb.TransferState
 -		if err := proto.Unmarshal(req.Command.Data, &transferState); err != nil {
 -			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
@@ -97,11 +131,11 @@ diff --git a/daemon/player.go b/daemon/player.go
 -		p.state.player.ContextMetadata = map[string]string{}
 -		for k, v := range transferState.CurrentSession.Context.Metadata {
 -			p.state.player.ContextMetadata[k] = v
- 		}
+-		}
 -		for k, v := range ctxTracks.Metadata() {
 -			p.state.player.ContextMetadata[k] = v
 -		}
- 
+-
 -		contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(p.state.player.ContextUri)
 -		currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
 -		if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
@@ -153,7 +187,7 @@ diff --git a/daemon/player.go b/daemon/player.go
 -		})
 -
 -		return nil
-+		return p.handleTransferCommand(ctx, req, transferState, p.sess.Spclient())
++		return p.handleTransferCommand(ctx, req, transferState, sp)
  	case "play":
 -		p.state.setActive(true)
 -
@@ -189,14 +223,41 @@ diff --git a/daemon/player.go b/daemon/player.go
 -		}
 -
 -		return p.loadContext(ctx, req.Command.Context, skipTo, req.Command.Options.InitiallyPaused, true)
-+		return p.handlePlayCommand(ctx, req, p.sess.Spclient())
++		return p.handlePlayCommand(ctx, req, sp)
  	case "pause":
  		return p.pause(ctx)
  	case "resume":
-@@ -416,7 +316,148 @@
+@@ -416,9 +304,181 @@
  		return nil
  	default:
  		return fmt.Errorf("unsupported player command: %s", req.Command.Endpoint)
++	}
++}
++
++func (p *AppPlayer) commitPlayerCommand(req dealer.RequestPayload) {
++	p.state.lastCommand = &req
++
++	// device-aliases: when the controller picks a room, the selected alias arrives as target_alias_id at
++	// the dealer payload TOP level (not in command/options). Echo it on the next put_state, and push it
++	// over /events so the manager routes the output immediately (the /status backstop carries it too).
++	if len(p.app.cfg.DeviceAliases) > 0 {
++		aliasId := req.TargetAliasId
++		if aliasId == nil {
++			aliasId = req.Command.TargetAliasId // tolerate other controllers
++		}
++		if aliasId != nil {
++			// Web API commands target the engine and carry alias 0. Keep the
++			// selected room instead of publishing an unnamed active device.
++			resolved := resolveDeviceAlias(p.state.device.SelectedAliasId, *aliasId, len(p.app.cfg.DeviceAliases))
++			aliasId = &resolved
++			name := ""
++			if int(*aliasId) >= 1 && int(*aliasId) <= len(p.app.cfg.DeviceAliases) {
++				name = p.app.cfg.DeviceAliases[*aliasId-1]
++			}
++			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
++			p.state.device.SelectedAliasId = *aliasId
++			p.emitSelectedAlias(*aliasId, p.aliasBinding())
++		}
 +	}
 +}
 +
@@ -205,6 +266,8 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	if err != nil {
 +		return fmt.Errorf("failed creating track list: %w", err)
 +	}
++
++	p.commitPlayerCommand(req)
 +
 +	p.state.lastTransferTimestamp = transferState.Playback.Timestamp
 +
@@ -250,7 +313,7 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
 +	if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
 +		return fmt.Errorf("failed seeking to track: %w", err)
-+	}
+ 	}
 +
 +	// shuffle the context if needed
 +	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
@@ -297,13 +360,15 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	})
 +
 +	return nil
-+}
-+
+ }
+ 
 +func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
 +	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, req.Command.Context)
 +	if err != nil {
 +		return fmt.Errorf("failed creating track list: %w", err)
- 	}
++	}
++
++	p.commitPlayerCommand(req)
 +
 +	p.state.setActive(true)
 +
@@ -339,9 +404,11 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	}
 +
 +	return p.loadPreparedContext(ctx, req.Command.Context, ctxTracks, skipTo, req.Command.Options.InitiallyPaused, true)
- }
- 
++}
++
  func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request) error {
+ 	// Limit ourselves to 30 seconds for handling dealer requests
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 diff --git a/daemon/controls.go b/daemon/controls.go
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
@@ -361,7 +428,7 @@ diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
 new file mode 100644
 --- /dev/null
 +++ b/daemon/context_commit_test.go
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,648 @@
 +package daemon
 +
 +import (
@@ -843,10 +910,193 @@ new file mode 100644
 +		t.Fatal("deliberate media failure emitted playback success")
 +	}
 +}
++
++func TestDealerOuterContext404PreservesAliasAndPlayback(t *testing.T) {
++	for _, endpoint := range []string{"transfer", "play"} {
++		for _, selector := range []string{"primary", "zero", "nested"} {
++			t.Run(endpoint+"/"+selector, func(t *testing.T) {
++				p := pc13ExistingPlayer(t, true)
++				p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++				p.app.cfg.DeviceAliasRoomIDs = []string{"room-a", "room-b"}
++				p.initAliasRegistry()
++				binding := *p.aliasBinding()
++				p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
++				previousCommand := &dealer.RequestPayload{}
++				p.state.lastCommand = previousCommand
++				before := proto.Clone(p.state.player)
++				oldTracks, primary, secondary, since := p.state.tracks, p.primaryStream, p.secondaryStream, p.state.activeSince
++				req := pc13PlayRequest(t)
++				req.Command.Endpoint = endpoint
++				req.TargetAliasId = proto.Uint32(1)
++				if selector == "zero" {
++					req.TargetAliasId = proto.Uint32(0)
++				}
++				if selector == "nested" {
++					req.TargetAliasId = nil
++					req.Command.TargetAliasId = proto.Uint32(1)
++				}
++				if endpoint == "transfer" {
++					var err error
++					req.Command.Data, err = proto.Marshal(pc13TransferState())
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				body := &pc13Body{Reader: strings.NewReader("not found")}
++				requests := 0
++				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++					requests++
++					if r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/context-resolve/v1/"+pc13ContextURI {
++						return nil, fmt.Errorf("unexpected request: %s %s", r.Method, r.URL)
++					}
++					return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: body, Request: r}, nil
++				}))
++				err := p.handlePlayerCommandWithSpclient(context.Background(), req, sp)
++				if err == nil || !strings.Contains(err.Error(), "context resolve: 404") || requests != 1 || body.closes != 1 {
++					t.Fatalf("error=%v requests=%d closes=%d", err, requests, body.closes)
++				}
++				if !proto.Equal(before, p.state.player) || !p.state.active || !p.state.activeSince.Equal(since) || p.state.tracks != oldTracks || p.primaryStream != primary || p.secondaryStream != secondary || p.state.queueID != 7 || p.state.lastTransferTimestamp != 123 {
++					t.Fatal("rejected outer request changed retained playback")
++				}
++				if p.state.device.SelectedAliasId != 2 || *p.aliasBinding() != binding || p.state.lastCommand != previousCommand || len(p.app.server.(*aliasTestServer).events) != 0 {
++					t.Fatalf("rejected outer request changed route/receipt: alias=%d command_retained=%t events=%d", p.state.device.SelectedAliasId, p.state.lastCommand == previousCommand, len(p.app.server.(*aliasTestServer).events))
++				}
++			})
++		}
++	}
++}
++
++func TestDealerOuter404ThenPreparedContextCommitsAliasAndNextCommand(t *testing.T) {
++	for _, endpoint := range []string{"transfer", "play"} {
++		for _, supplied := range []bool{false, true} {
++			for _, selector := range []string{"primary", "zero", "nested"} {
++				t.Run(fmt.Sprintf("%s/supplied_%t/%s", endpoint, supplied, selector), func(t *testing.T) {
++					p := pc13ExistingPlayer(t, true)
++					p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++					p.app.cfg.DeviceAliasRoomIDs = []string{"room-a", "room-b"}
++					p.initAliasRegistry()
++					originalBinding := *p.aliasBinding()
++					req := pc13PlayRequest(t)
++					req.Command.Endpoint = endpoint
++					req.TargetAliasId = proto.Uint32(1)
++					wantAlias, wantRoom := uint32(1), "room-a"
++					if selector == "zero" {
++						req.TargetAliasId = proto.Uint32(0)
++						wantAlias, wantRoom = 2, "room-b"
++					}
++					if selector == "nested" {
++						req.TargetAliasId = nil
++						req.Command.TargetAliasId = proto.Uint32(1)
++					}
++					state := pc13TransferState()
++					if endpoint == "transfer" {
++						var err error
++						req.Command.Data, err = proto.Marshal(state)
++						if err != nil {
++							t.Fatal(err)
++						}
++					}
++					resolved := &connectpb.Context{Uri: pc13ContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-pc13-post-commit"}}}}}
++					requests := 0
++					var bodies []*pc13Body
++					sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++						requests++
++						if r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/context-resolve/v1/"+pc13ContextURI {
++							return nil, fmt.Errorf("unexpected request: %s %s", r.Method, r.URL)
++						}
++						status, payload := http.StatusNotFound, "not found"
++						if requests == 2 && !supplied {
++							status = http.StatusOK
++							data, err := json.Marshal(resolved)
++							if err != nil {
++								return nil, err
++							}
++							payload = string(data)
++						} else if requests > 1 {
++							return nil, fmt.Errorf("unexpected extra provider request")
++						}
++						body := &pc13Body{Reader: strings.NewReader(payload)}
++						bodies = append(bodies, body)
++						return &http.Response{StatusCode: status, Header: make(http.Header), Body: body, Request: r}, nil
++					}))
++					if err := p.handlePlayerCommandWithSpclient(context.Background(), req, sp); err == nil || !strings.Contains(err.Error(), "context resolve: 404") {
++						t.Fatalf("first preparation=%v", err)
++					}
++					if p.state.device.SelectedAliasId != 2 || len(p.app.server.(*aliasTestServer).events) != 0 {
++						t.Fatal("first rejected preparation changed output owner")
++					}
++					if supplied {
++						if endpoint == "transfer" {
++							state.CurrentSession.Context = resolved
++							var err error
++							req.Command.Data, err = proto.Marshal(state)
++							if err != nil {
++								t.Fatal(err)
++							}
++						} else {
++							req.Command.Context = resolved
++						}
++					}
++					err := p.handlePlayerCommandWithSpclient(context.Background(), req, sp)
++					if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++						t.Fatalf("expected deliberate post-commit media boundary: %v", err)
++					}
++					wantRequests := 2
++					if supplied {
++						wantRequests = 1
++					}
++					if requests != wantRequests || len(bodies) != wantRequests {
++						t.Fatalf("requests=%d want=%d", requests, wantRequests)
++					}
++					for _, body := range bodies {
++						if body.closes != 1 {
++							t.Fatal("response not closed")
++						}
++					}
++					events := p.app.server.(*aliasTestServer).events
++					binding := p.aliasBinding()
++					if p.state.device.SelectedAliasId != wantAlias || len(events) != 1 || events[0].Type != "selected_alias" || events[0].Data.(map[string]any)["id"] != wantAlias || p.state.player.ContextUri != pc13ContextURI || p.state.player.Track.Uri != "invalid-pc13-post-commit" || p.state.lastCommand == nil || p.state.lastCommand.Command.Endpoint != endpoint {
++						t.Fatal("prepared command did not commit original alias/context semantics")
++					}
++					eventBinding := events[0].Data.(map[string]any)["alias_binding"].(*ApiAliasBinding)
++					if *eventBinding != *binding || binding.Incarnation != originalBinding.Incarnation || binding.Registry != originalBinding.Registry || binding.RoomID != wantRoom || !binding.Ready {
++						t.Fatal("prepared selection lost current room registry binding")
++					}
++					// An ordinary next empty transfer remains supported and alias 0 retains the selected room.
++					next := pc13PlayRequest(t)
++					next.Command.Endpoint, next.Command.Data, next.TargetAliasId = "transfer", nil, proto.Uint32(0)
++					if err := p.handlePlayerCommand(context.Background(), next); err != nil {
++						t.Fatal(err)
++					}
++					events = p.app.server.(*aliasTestServer).events
++					if p.state.device.SelectedAliasId != wantAlias || *p.aliasBinding() != *binding || len(events) != 3 || events[1].Type != "selected_alias" || events[2].Type != ApiEventTypeActive || requests != wantRequests {
++						t.Fatal("next alias0 transfer changed current output owner or made provider request")
++					}
++				})
++			}
++		}
++	}
++}
 diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
 --- a/spclient/context_resolver.go
 +++ b/spclient/context_resolver.go
-@@ -73,6 +73,9 @@
+@@ -52,7 +52,14 @@
+ 	typ := librespot.InferSpotifyIdTypeFromContextUri(spotCtx.Uri)
+ 
+ 	if len(spotCtx.Pages) == 0 || !isTracksComplete(spotCtx) {
+-		newSpotCtx, err := sp.ContextResolve(ctx, spotCtx.Uri)
++		var newSpotCtx *connectpb.Context
++		var err error
++		if strings.HasPrefix(spotCtx.Url, "hm://") {
++			log.WithField("uri", spotCtx.Uri).Debugf("resolving context from its own url %s", spotCtx.Url)
++			newSpotCtx, err = sp.ContextResolveUrl(ctx, spotCtx.Url)
++		} else {
++			newSpotCtx, err = sp.ContextResolve(ctx, spotCtx.Uri)
++		}
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed resolving context %s: %w", spotCtx.Uri, err)
+ 		} else if newSpotCtx.Loading {
+@@ -73,6 +80,9 @@
  	for _, page := range spotCtx.Pages {
  		for _, track := range page.Tracks {
  			if autoplay {
@@ -856,3 +1106,271 @@ diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
  				track.Metadata["autoplay.is_autoplay"] = "true"
  			}
  		}
+@@ -102,10 +112,9 @@
+ 		return nil, fmt.Errorf("invalid page url: %s", url)
+ 	}
+ 
+-	url = strings.TrimPrefix(url, "hm://")
+ 	r.log.WithField("uri", r.Uri()).Tracef("loading context page from %s", url)
+ 
+-	resp, err := r.sp.Request(ctx, "GET", url, nil, nil, nil)
++	resp, err := r.sp.RequestHm(ctx, "GET", url, nil, nil)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed requesting page at %s: %w", url, err)
+ 	}
+diff --git a/spclient/spclient.go b/spclient/spclient.go
+--- a/spclient/spclient.go
++++ b/spclient/spclient.go
+@@ -10,6 +10,7 @@
+ 	"net/http"
+ 	"net/url"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/cenkalti/backoff/v4"
+@@ -129,6 +130,34 @@
+ func (c *Spclient) Request(ctx context.Context, method string, path string, query url.Values, header http.Header, body []byte) (*http.Response, error) {
+ 	reqUrl := c.baseUrl.JoinPath(path)
+ 	return c.innerRequest(ctx, method, reqUrl, query, header, body)
++}
++
++// RequestHm issues a request against an hm:// URL, the form Spotify uses to name
++// spclient endpoints inside payloads.
++//
++// The remainder cannot simply be handed to Request as a path: JoinPath escapes
++// the "?" of a query string. The query is kept verbatim rather than being parsed
++// and re-encoded, so that a contextUri keeps its unescaped colons.
++func (c *Spclient) RequestHm(ctx context.Context, method string, hmUrl string, header http.Header, body []byte) (*http.Response, error) {
++	reqUrl, err := c.hmRequestUrl(hmUrl)
++	if err != nil {
++		return nil, err
++	}
++
++	return c.innerRequest(ctx, method, reqUrl, nil, header, body)
++}
++
++func (c *Spclient) hmRequestUrl(hmUrl string) (*url.URL, error) {
++	if !strings.HasPrefix(hmUrl, "hm://") {
++		return nil, fmt.Errorf("invalid hm url: %s", hmUrl)
++	}
++
++	path, rawQuery, _ := strings.Cut(strings.TrimPrefix(hmUrl, "hm://"), "?")
++
++	reqUrl := c.baseUrl.JoinPath(path)
++	reqUrl.RawQuery = rawQuery
++
++	return reqUrl, nil
+ }
+ 
+ type putStateError struct {
+@@ -373,6 +402,33 @@
+ 	return &context, nil
+ }
+ 
++// ContextResolveUrl resolves a context through the hm:// url the Context carries
++// rather than through /context-resolve/v1.
++func (c *Spclient) ContextResolveUrl(ctx context.Context, hmUrl string) (*connectpb.Context, error) {
++	resp, err := c.RequestHm(ctx, "GET", hmUrl, nil, nil)
++	if err != nil {
++		return nil, err
++	}
++
++	defer func() { _ = resp.Body.Close() }()
++
++	if resp.StatusCode != 200 {
++		return nil, fmt.Errorf("invalid status code from context resolve at %s: %d", hmUrl, resp.StatusCode)
++	}
++
++	respBytes, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed reading response body: %w", err)
++	}
++
++	var context connectpb.Context
++	if err := json.Unmarshal(respBytes, &context); err != nil {
++		return nil, fmt.Errorf("failed json unmarshalling Context: %w", err)
++	}
++
++	return &context, nil
++}
++
+ func (c *Spclient) ContextResolveAutoplay(ctx context.Context, reqProto *playerpb.AutoplayContextRequest, playedTrackURI string) (*connectpb.Context, error) {
+ 	if reqProto.GetContextUri() == "" {
+ 		playedTrack, err := librespot.SpotifyIdFromUri(playedTrackURI)
+diff --git a/spclient/context_resolver_test.go b/spclient/context_resolver_test.go
+new file mode 100644
+--- /dev/null
++++ b/spclient/context_resolver_test.go
+@@ -0,0 +1,171 @@
++package spclient
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++)
++
++const hmTestURI = "spotify:playlist:0000000000000000000001"
++const hmTestPath = "/lexicon-session-provider/context-resolve/v2/session"
++const hmTestQuery = "contextUri=" + hmTestURI + "&reason=state_restore"
++const hmTestURL = "hm:/" + hmTestPath + "?" + hmTestQuery
++
++type hmTestBody struct {
++	io.Reader
++	closes int
++}
++
++func (b *hmTestBody) Close() error { b.closes++; return nil }
++
++func hmTestSpclient(transport http.RoundTripper) *Spclient {
++	base, _ := url.Parse("https://context.invalid/")
++	return &Spclient{log: &librespot.NullLogger{}, baseUrl: base,
++		accessToken: func(context.Context, bool) (string, error) { return "fixture-token", nil },
++		clientToken: "fixture-client-token", client: &http.Client{Transport: transport}}
++}
++
++func TestContextResolverUsesProviderHmURL(t *testing.T) {
++	for _, status := range []int{http.StatusOK, http.StatusNotFound} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			requests := 0
++			var path, query string
++			body := &hmTestBody{Reader: strings.NewReader(`{"uri":"` + hmTestURI + `","metadata":{"provider":"retained","override":"provider"},"pages":[{"tracks":[{"uri":"spotify:track:0000000000000000000002"}]}]}`)}
++			sp := hmTestSpclient(autoplayTransport(func(r *http.Request) (*http.Response, error) {
++				requests++
++				path, query = r.URL.Path, r.URL.RawQuery
++				if r.Method != http.MethodGet || r.URL.Host != "context.invalid" || r.Header.Get("Authorization") != "Bearer fixture-token" || r.Header.Get("Client-Token") != "fixture-client-token" {
++					return nil, fmt.Errorf("unexpected request ownership")
++				}
++				responseStatus := status
++				if path != hmTestPath || query != hmTestQuery {
++					responseStatus = http.StatusNotFound
++				}
++				return &http.Response{StatusCode: responseStatus, Header: make(http.Header), Body: body, Request: r}, nil
++			}))
++			supplied := &connectpb.Context{Uri: hmTestURI, Url: hmTestURL, Metadata: map[string]string{"payload": "retained", "override": "payload"}}
++			resolver, err := NewContextResolver(context.Background(), sp.log, sp, supplied)
++			if path != hmTestPath || query != hmTestQuery || requests != 1 || body.closes != 1 {
++				t.Fatalf("provider URL lost: path=%q query=%q requests=%d closes=%d error=%v", path, query, requests, body.closes, err)
++			}
++			if status == http.StatusNotFound {
++				if err == nil || !strings.Contains(err.Error(), "404") || resolver != nil {
++					t.Fatalf("provider refusal hidden: %v", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if resolver.Uri() != hmTestURI || resolver.Metadata()["provider"] != "retained" || resolver.Metadata()["payload"] != "retained" || resolver.Metadata()["override"] != "payload" {
++				t.Fatal("context metadata merge changed")
++			}
++			tracks, err := resolver.Page(context.Background(), 0)
++			if err != nil || len(tracks) != 1 || requests != 1 {
++				t.Fatalf("prepared page=%v error=%v requests=%d", tracks, err, requests)
++			}
++		})
++	}
++}
++
++func TestContextResolverHmLazyPagePreservesRawQuery(t *testing.T) {
++	for _, next := range []bool{false, true} {
++		t.Run(fmt.Sprintf("next_%t", next), func(t *testing.T) {
++			path := hmTestPath + "/0000"
++			query := "contextUri=" + hmTestURI + "&previousSegmentId=fixture-segment"
++			pageURL := "hm:/" + path + "?" + query
++			page := &connectpb.ContextPage{PageUrl: pageURL}
++			index := 0
++			if next {
++				page = &connectpb.ContextPage{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000002"}}, NextPageUrl: pageURL}
++				index = 1
++			}
++			requests := 0
++			body := &hmTestBody{Reader: strings.NewReader(`{"tracks":[{"uri":"spotify:track:0000000000000000000003"}]}`)}
++			sp := hmTestSpclient(autoplayTransport(func(r *http.Request) (*http.Response, error) {
++				requests++
++				status := http.StatusOK
++				if r.Method != http.MethodGet || r.URL.Host != "context.invalid" || r.URL.Path != path || r.URL.RawQuery != query {
++					status = http.StatusNotFound
++				}
++				return &http.Response{StatusCode: status, Header: make(http.Header), Body: body, Request: r}, nil
++			}))
++			resolver, err := NewContextResolver(context.Background(), sp.log, sp, &connectpb.Context{Uri: hmTestURI, Url: hmTestURL, Pages: []*connectpb.ContextPage{page}})
++			if err != nil || requests != 0 {
++				t.Fatalf("lazy page prematurely resolved: %v requests=%d", err, requests)
++			}
++			tracks, err := resolver.Page(context.Background(), index)
++			if err != nil || len(tracks) != 1 || tracks[0].Uri != "spotify:track:0000000000000000000003" || requests != 1 || body.closes != 1 {
++				t.Fatalf("raw-query page failed: %v tracks=%v requests=%d closes=%d", err, tracks, requests, body.closes)
++			}
++		})
++	}
++}
++
++func TestContextResolverRetainsCompletePagesAndNonHmResolution(t *testing.T) {
++	for _, complete := range []bool{false, true} {
++		for _, contextURL := range []string{"", "context://" + hmTestURI, "https://external.invalid/not-a-provider-route", hmTestURL} {
++			if !complete && contextURL == hmTestURL {
++				continue
++			}
++			t.Run(fmt.Sprintf("complete_%t/%s", complete, contextURL), func(t *testing.T) {
++				requests := 0
++				resolved := &connectpb.Context{Uri: hmTestURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000002"}}}}}
++				encoded, err := json.Marshal(resolved)
++				if err != nil {
++					t.Fatal(err)
++				}
++				body := &hmTestBody{Reader: strings.NewReader(string(encoded))}
++				sp := hmTestSpclient(autoplayTransport(func(r *http.Request) (*http.Response, error) {
++					requests++
++					if complete || r.URL.Host != "context.invalid" || r.URL.Path != "/context-resolve/v1/"+hmTestURI || r.URL.RawQuery != "" {
++						return nil, fmt.Errorf("unexpected extra/provider request: %s", r.URL)
++					}
++					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: r}, nil
++				}))
++				supplied := &connectpb.Context{Uri: hmTestURI, Url: contextURL}
++				if complete {
++					supplied.Pages = resolved.Pages
++					supplied.Metadata = map[string]string{"playlist_number_of_tracks": "1"}
++				}
++				resolver, err := NewContextResolver(context.Background(), sp.log, sp, supplied)
++				if err != nil {
++					t.Fatal(err)
++				}
++				tracks, err := resolver.Page(context.Background(), 0)
++				want := 1
++				if complete {
++					want = 0
++				}
++				if err != nil || len(tracks) != 1 || requests != want || body.closes != want {
++					t.Fatalf("existing path changed: %v requests=%d closes=%d", err, requests, body.closes)
++				}
++			})
++		}
++	}
++}
++
++func TestContextResolverHmLoadingAndMalformedBodyAreClosed(t *testing.T) {
++	for _, payload := range []string{`{"uri":"` + hmTestURI + `","loading":true}`, "not json"} {
++		t.Run(payload, func(t *testing.T) {
++			requests := 0
++			body := &hmTestBody{Reader: strings.NewReader(payload)}
++			sp := hmTestSpclient(autoplayTransport(func(r *http.Request) (*http.Response, error) {
++				requests++
++				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: r}, nil
++			}))
++			resolver, err := NewContextResolver(context.Background(), sp.log, sp, &connectpb.Context{Uri: hmTestURI, Url: hmTestURL})
++			if err == nil || resolver != nil || requests != 1 || body.closes != 1 {
++				t.Fatalf("invalid provider context accepted/leaked: %v requests=%d closes=%d", err, requests, body.closes)
++			}
++		})
++	}
++}
