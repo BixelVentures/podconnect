@@ -8,6 +8,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.11 — candidate 2026-10-09
+- Keep the previous speaker selection and command when Spotify refuses a play or
+  transfer context before preparation completes (PC #10/#13).
+- Backport provider-supplied context URLs and preserve their query parameters for
+  initial resolution and lazy pages, using the existing Spotify connection.
+- Physical Connect transfer and continued playback acceptance remains pending.
+
 ## Speakers 0.26.10 — candidate 2026-10-09
 - Reject a stale room selection before its native duck command when the room map
   or Connect selection changes during an output-state read (PC #8/#9).
