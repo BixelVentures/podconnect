@@ -83,6 +83,17 @@
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
 +airplay_callback_owner_LDFLAGS = -Wl,--gc-sections
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
+--- a/src/conffile.c
++++ b/src/conffile.c
+@@ -170,6 +170,8 @@
+     CFG_INT("control_port", 0, CFGF_NONE),
+     CFG_INT("timing_port", 0, CFGF_NONE),
+     CFG_BOOL("uncompressed_alac", cfg_false, CFGF_NONE),
++    // HomePod OS 27 has user-agent validation, see issue #2042
++    CFG_STR("user_agent", "AirPlay/999.0.0", CFGF_NONE),
+     CFG_END()
+   };
+
 --- a/src/evrtsp/evrtsp.h
 +++ b/src/evrtsp/evrtsp.h
 @@ -108,6 +108,10 @@
@@ -1209,6 +1220,15 @@
  }
  
  static void
+@@ -4305,7 +4685,7 @@
+
+   CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
+
+-  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
++  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "user_agent");
+   airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
+
+   timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
 @@ -4402,6 +4782,9 @@
    .device_cb_set = airplay_device_cb_set,
    .device_free_extra = airplay_device_free_extra,
@@ -2277,14 +2297,15 @@
  
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,508 @@
 +/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
 + * No discovery, daemon, media input, fabricated connected/session-ready flag,
 + * receiver capability, public-volume acceptance or acoustic proof.
 + * START uses the actual device/session/master/codec constructors. SEND_VOLUME
 + * is explicitly the lower existing sequence owner, not the public connected
 + * setter. Real queued wire responses test command tickets and lifetime.
-+ * Root admits compilation/execution separately; these cases have not run. */
++ * AirPlay config is read by actual airplay_init, with service binding refused
++ * before discovery. User-Agent is checked on actual loopback RTSP requests. */
 +#include <assert.h>
 +#include <stdarg.h>
 +#include <stdio.h>
@@ -2302,9 +2323,20 @@
 +static void *fixture_calloc(size_t n, size_t size);
 +static void fixture_free(void *pointer);
 +static void raw_free_observe(void *pointer);
++static int fixture_service_bind_calls;
++static int fixture_service_bind(struct net_socket *socket, unsigned short *port,
++    int type, const char *name)
++{
++  (void)port; (void)name;
++  assert(type == SOCK_DGRAM && socket->fd4 == -1 && socket->fd6 == -1);
++  fixture_service_bind_calls++;
++  return -1;
++}
 +#define calloc fixture_calloc
 +#define free fixture_free
++#define net_bind fixture_service_bind
 +#include "../src/outputs/airplay.c"
++#undef net_bind
 +#include "../src/evrtsp/rtsp.c"
 +#undef calloc
 +#undef free
@@ -2360,6 +2392,7 @@
 +  int refused_fd;
 +  int failed, wire, start_calls, stop_calls;
 +  enum output_device_state terminal;
++  const char *expected_user_agent;
 +  int old_slot;
 +  uint64_t old_revision;
 +};
@@ -2417,7 +2450,7 @@
 +  struct owner_fixture *f = arg;
 +  struct evbuffer *input = bufferevent_get_input(peer);
 +  struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
-+  char header[4096], reply[256];
++  char header[4096], reply[256], expected_agent[128];
 +  size_t length;
 +  int bytes, cseq, code;
 +  struct airplay_session *session;
@@ -2434,6 +2467,9 @@
 +  if (bytes > 65536 || cseq <= 0) { owner_fail(f, "RTSP request framing invalid"); return; }
 +  if (evbuffer_get_length(input) < length + (size_t)bytes) return;
 +  evbuffer_drain(input, length + (size_t)bytes);
++  snprintf(expected_agent, sizeof(expected_agent), "\r\nUser-Agent: %s\r\n", f->expected_user_agent);
++  if (!strstr(header, expected_agent))
++    { owner_fail(f, "actual RTSP User-Agent does not match AirPlay configuration"); return; }
 +  f->wire++;
 +  session = f->device->session;
 +  if (f->wire == 1) {
@@ -2510,9 +2546,10 @@
 +  bufferevent_setcb(f->peer, peer_read, NULL, peer_event, f);
 +  if (bufferevent_enable(f->peer, EV_READ | EV_WRITE) < 0) owner_fail(f, "peer enable");
 +}
-+static int owner_case(enum owner_mode mode)
++static int owner_case(enum owner_mode mode, int agent_case)
 +{
-+  struct owner_fixture f = { .mode = mode, .refused_fd = -1 };
++  struct owner_fixture f = { .mode = mode, .refused_fd = -1,
++    .expected_user_agent = agent_case == 2 ? "AirPlay/123.4.5" : "AirPlay/999.0.0" };
 +  struct sockaddr_in address = { .sin_family = AF_INET };
 +  socklen_t length = sizeof(address);
 +  struct timeval bound = {5, 0};
@@ -2523,9 +2560,21 @@
 +  f.base = event_base_new(); if (!f.base) return 1;
 +  evbase_player = f.base;
 +  cfg = cfg_init(toplvl_cfg, CFGF_NONE); if (!cfg) { f.failed = 1; goto cleanup; }
-+  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
-+  airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
-+  if (!airplay_user_agent || !airplay_client_name) { f.failed = 1; goto cleanup; }
++  if (agent_case && cfg_parse_buf(cfg, agent_case == 1
++      ? "general { user_agent = General/custom }"
++      : "general { user_agent = General/custom } airplay_shared { user_agent = AirPlay/123.4.5 }") != CFG_SUCCESS)
++    { owner_fail(&f, "actual explicit User-Agent configuration rejected"); goto cleanup; }
++  fixture_service_bind_calls = 0;
++  /* Run the actual production selector. Refuse its first service bind, so no
++   * discovery, UDP socket or PTP service starts; the existing failure path
++   * frees the keep-alive timer before the normal loopback START below. */
++  if (airplay_init() != -1 || fixture_service_bind_calls != 1)
++    { owner_fail(&f, "actual AirPlay initialization did not stop at service boundary"); goto cleanup; }
++  keep_alive_timer = NULL;
++  if (!airplay_user_agent || !airplay_client_name
++      || strcmp(cfg_getstr(cfg_getsec(cfg, "general"), "user_agent"),
++          agent_case ? "General/custom" : PACKAGE_NAME "/" PACKAGE_VERSION))
++    { owner_fail(&f, "AirPlay initialization changed general User-Agent"); goto cleanup; }
 +  /* Initialize only the existing passive outputs callback event/default buffer,
 +   * not outputs_init's discovery/backend sockets, library, bus or daemon. */
 +  outputs_deferredev = evtimer_new(f.base, deferred_cb, NULL);
@@ -2749,10 +2798,12 @@
 +  int mode;
 +  if (!gcry_check_version(GCRYPT_VERSION)) return 1;
 +  for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
-+    if (owner_case((enum owner_mode)mode)) return 1;
++    if (owner_case((enum owner_mode)mode, 0)) return 1;
++  for (mode = 1; mode <= 2; mode++)
++    if (owner_case(OLD_START_200, mode)) return 1;
 +  for (mode = RAW_FREE; mode <= RAW_NESTED_FREE; mode++)
 +    if (raw_case((enum raw_mode)mode)) return 1;
-+  puts("PASS: actual AirPlay/evrtsp callback tickets, refused connect and synchronous queue custody (no AP2/public-volume/physical claim)");
++  puts("PASS: actual AirPlay config/default/override/general isolation and RTSP User-Agent; AirPlay/evrtsp callback tickets, refused connect and synchronous queue custody (no AP2/public-volume/physical claim)");
 +  return 0;
 +}
 --- /dev/null
