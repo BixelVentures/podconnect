@@ -38,6 +38,8 @@ jobs:
           git apply "$GITHUB_WORKSPACE/podconnect/patches/autoplay-v0.7.3.patch"
           git apply --check "$GITHUB_WORKSPACE/podconnect/patches/context-commit-v0.7.3.patch"
           git apply "$GITHUB_WORKSPACE/podconnect/patches/context-commit-v0.7.3.patch"
+          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/volume-action-v0.7.3.patch"
+          git apply "$GITHUB_WORKSPACE/podconnect/patches/volume-action-v0.7.3.patch"
       - name: Test aliases, recovery and autoplay
         run: cd /tmp/gl && go test -race ./daemon ./zeroconf ./spclient && go vet ./daemon ./zeroconf ./spclient
       - name: Build patched fork

@@ -1,0 +1,205 @@
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -91,6 +91,7 @@
+ 	ApiEventTypeInactive       ApiEventType = "inactive"
+ 	ApiEventTypeMetadata       ApiEventType = "metadata"
+ 	ApiEventTypeVolume         ApiEventType = "volume"
++	ApiEventTypeVolumeAction   ApiEventType = "volume_action"
+ 	ApiEventTypeSeek           ApiEventType = "seek"
+ 	ApiEventTypeStopped        ApiEventType = "stopped"
+ 	ApiEventTypeRepeatTrack    ApiEventType = "repeat_track"
+@@ -132,8 +133,22 @@
+ }
+ 
+ type ApiRequestDataVolume struct {
+-	Volume   int32 `json:"volume"`
+-	Relative bool  `json:"relative"`
++	Volume         int32  `json:"volume"`
++	Relative       bool   `json:"relative"`
++	ManagerProcess string `json:"manager_process,omitempty"`
++	RequestID      string `json:"request_id,omitempty"`
++}
++
++// Separate from generic, coalesced volume notifications. These fields describe
++// admission by this player, not the time of an unseen remote user action.
++type ApiEventDataVolumeAction struct {
++	Origin         string           `json:"origin"`
++	Ordinal        string           `json:"ordinal"`
++	Value          int              `json:"value"`
++	AliasID        uint32           `json:"alias_id"`
++	AliasBinding   *ApiAliasBinding `json:"alias_binding"`
++	ManagerProcess string           `json:"manager_process,omitempty"`
++	RequestID      string           `json:"request_id,omitempty"`
+ }
+ 
+ type ApiRequestDataWebApi struct {
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -726,6 +726,37 @@
+ }
+ 
+ // Set the player volume to the new volume, also notifies about the change.
++func volumeActionUUID(value string) bool {
++	if len(value) != 36 {
++		return false
++	}
++	for i, c := range value {
++		if i == 8 || i == 13 || i == 18 || i == 23 {
++			if c != '-' {
++				return false
++			}
++		} else if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
++			return false
++		}
++	}
++	return true
++}
++
++// Only the two explicit remote/API admission sites call this. Initial connection
++// restoration and mixer notifications retain their original generic events.
++func (p *AppPlayer) emitVolumeAction(value uint32, origin, managerProcess, requestID string) {
++	if p.volumeActionOrdinal == math.MaxUint64 {
++		return
++	}
++	p.volumeActionOrdinal++ // Equal-value intent is a new action too.
++	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeVolumeAction, Data: ApiEventDataVolumeAction{
++		Origin: origin, Ordinal: strconv.FormatUint(p.volumeActionOrdinal, 10),
++		Value:   int(math.Round(float64(min(value, player.MaxStateVolume)) * 100 / player.MaxStateVolume)),
++		AliasID: p.state.device.SelectedAliasId, AliasBinding: p.aliasBinding(),
++		ManagerProcess: managerProcess, RequestID: requestID,
++	}})
++}
++
+ func (p *AppPlayer) updateVolume(newVal uint32) {
+ 	if newVal > player.MaxStateVolume {
+ 		newVal = player.MaxStateVolume
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -57,12 +57,13 @@
+ 
+ 	prefetchTimer *time.Timer
+ 
+-	aliasMu          sync.Mutex
+-	aliasRegistry    []ApiAlias
+-	aliasFingerprint string
+-	aliasIncarnation string
+-	aliasRetired     bool
+-	aliasConfigured  bool
++	aliasMu             sync.Mutex
++	aliasRegistry       []ApiAlias
++	aliasFingerprint    string
++	aliasIncarnation    string
++	aliasRetired        bool
++	volumeActionOrdinal uint64 // Existing serialized player action owner.
++	aliasConfigured     bool
+ }
+ 
+ func (p *AppPlayer) playbackReady() bool {
+@@ -144,6 +145,7 @@
+ 		}
+ 
+ 		p.updateVolume(uint32(setVolCmd.Volume))
++		p.emitVolumeAction(uint32(setVolCmd.Volume), "spotify_connect", "", "")
+ 	} else if strings.HasPrefix(msg.Uri, "hm://connect-state/v1/connect/logout") {
+ 		// this should happen only with zeroconf enabled
+ 		p.app.log.WithField("username", librespot.ObfuscateUsername(p.sess.Username())).
+@@ -608,6 +610,9 @@
+ 		}, nil
+ 	case ApiRequestTypeSetVolume:
+ 		data := req.Data.(ApiRequestDataVolume)
++		if (data.ManagerProcess != "" || data.RequestID != "") && (!volumeActionUUID(data.ManagerProcess) || !volumeActionUUID(data.RequestID)) {
++			return nil, fmt.Errorf("invalid manager volume action identity")
++		}
+ 
+ 		var volume int32
+ 		if data.Relative {
+@@ -618,7 +623,9 @@
+ 			volume = data.Volume
+ 		}
+ 
+-		p.updateVolume(uint32(volume) * player.MaxStateVolume / p.app.cfg.VolumeSteps)
++		nativeVolume := uint32(volume) * player.MaxStateVolume / p.app.cfg.VolumeSteps
++		p.updateVolume(nativeVolume)
++		p.emitVolumeAction(nativeVolume, "api", data.ManagerProcess, data.RequestID)
+ 		return nil, nil
+ 	case ApiRequestTypeSetRepeatingContext:
+ 		val := req.Data.(bool)
+--- /dev/null
++++ b/daemon/volume_action_test.go
+@@ -0,0 +1,76 @@
++package daemon
++
++import (
++	"context"
++	"math"
++	"testing"
++
++	"github.com/devgianlu/go-librespot/player"
++)
++
++// These exercise the actual serialized action-receipt owner with the existing
++// alias fixture. No player/audio/provider/session readiness is fabricated.
++func TestExplicitVolumeReceiptKeepsOriginSameValueAndImmutablePlayerBinding(t *testing.T) {
++	p, server := localAliasPlayer(t)
++	p.emitVolumeAction(player.MaxStateVolume, "spotify_connect", "", "")
++	p.emitVolumeAction(player.MaxStateVolume, "api", "", "")
++	if len(server.events) != 2 {
++		t.Fatal("coalesced explicit actions")
++	}
++	first := server.events[0].Data.(ApiEventDataVolumeAction)
++	second := server.events[1].Data.(ApiEventDataVolumeAction)
++	if server.events[0].Type != ApiEventTypeVolumeAction || first.Origin != "spotify_connect" || first.Ordinal != "1" || second.Ordinal != "2" || second.Origin != "api" || first.Value != 100 || second.Value != 100 {
++		t.Fatal("explicit origin/same-value currency lost")
++	}
++	original := *first.AliasBinding
++	_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSelectAlias, Data: ApiRequestDataSelectAlias{RoomID: "r1", ExpectedIncarnation: p.aliasIncarnation, ExpectedRegistry: p.aliasFingerprint}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	p.retireAliases()
++	if *first.AliasBinding != original || first.AliasID != 1 || !first.AliasBinding.Ready {
++		t.Fatal("old action followed later alias/retirement")
++	}
++	fresh, _ := localAliasPlayer(t)
++	fresh.emitVolumeAction(0, "spotify_connect", "", "")
++	if fresh.aliasIncarnation == first.AliasBinding.Incarnation {
++		t.Fatal("new player reused action epoch")
++	}
++}
++
++func TestManagerVolumeReceiptCarriesExactAutomationIdentity(t *testing.T) {
++	p, server := localAliasPlayer(t)
++	process := "00000000-0000-4000-8000-000000000301"
++	request := "00000000-0000-4000-8000-000000000302"
++	p.emitVolumeAction(player.MaxStateVolume/2, "api", process, request)
++	event := server.events[0].Data.(ApiEventDataVolumeAction)
++	if event.ManagerProcess != process || event.RequestID != request || event.Origin != "api" || event.Ordinal != "1" {
++		t.Fatal("manager echo identity dropped")
++	}
++	if p.player != nil || p.sess != nil {
++		t.Fatal("receipt fixture created a provider/player owner")
++	}
++}
++
++func TestInvalidManagerIdentityRejectedAtActualAPIAdmissionBeforeEffects(t *testing.T) {
++	for _, data := range []ApiRequestDataVolume{
++		{Volume: 20, ManagerProcess: "bad", RequestID: "00000000-0000-4000-8000-000000000302"},
++		{Volume: 20, ManagerProcess: "00000000-0000-4000-8000-000000000301"},
++		{Volume: 20, RequestID: "00000000-0000-4000-8000-000000000302"},
++	} {
++		p, server := localAliasPlayer(t)
++		_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSetVolume, Data: data})
++		if err == nil || len(server.events) != 0 || p.volumeActionOrdinal != 0 {
++			t.Fatal("bad origin mutated player or emitted authority")
++		}
++	}
++}
++
++func TestExplicitVolumeReceiptSaturationCannotReuseOrdinal(t *testing.T) {
++	p, server := localAliasPlayer(t)
++	p.volumeActionOrdinal = math.MaxUint64
++	p.emitVolumeAction(0, "spotify_connect", "", "")
++	if len(server.events) != 0 || p.volumeActionOrdinal != math.MaxUint64 {
++		t.Fatal("saturated ordinal wrapped/reused")
++	}
++}

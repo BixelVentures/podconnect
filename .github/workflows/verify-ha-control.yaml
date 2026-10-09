@@ -1,0 +1,23 @@
+name: Verify HA service and client boundaries
+on:
+  pull_request:
+    paths:
+      - "custom_components/podconnect/**"
+      - "tests/test_*.py"
+      - ".github/workflows/verify-ha-control.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "custom_components/podconnect/**"
+      - "tests/test_*.py"
+      - ".github/workflows/verify-ha-control.yaml"
+jobs:
+  boundary-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test shipped service and client bodies with inert I/O
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

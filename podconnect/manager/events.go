@@ -21,19 +21,23 @@ import (
 
 // glLive is the thread-safe latest go-librespot state for one room, plus a track-change signal.
 type glLive struct {
-	mu               sync.Mutex
-	st               glStatus
-	trackURI         string
-	trackChangeSeq   uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
-	aliasRevision    uint64 // observed alias/source intent; unchanged status polls do not bump it
-	routeDispatchSeq uint64 // mutex-owned command admission, not native acceptance
-	sourceStop       <-chan struct{}
-	sourceRetired    bool
-	runEpoch         uint64
-	phaseEpoch       uint64
-	nextRequest      uint64
-	acceptedRequest  uint64
-	wireRevision     [3]uint64 // transport, volume, selected alias
+	mu                sync.Mutex
+	st                glStatus
+	trackURI          string
+	trackChangeSeq    uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	aliasRevision     uint64 // observed alias/source intent; unchanged status polls do not bump it
+	routeDispatchSeq  uint64 // mutex-owned command admission, not native acceptance
+	sourceStop        <-chan struct{}
+	sourceRetired     bool
+	runEpoch          uint64
+	phaseEpoch        uint64
+	nextRequest       uint64
+	acceptedRequest   uint64
+	wireRevision      [3]uint64 // transport, volume, selected alias
+	manualOrdinal     uint64
+	manualIncarnation string
+	manualAction      *nativeManualAction
+	manualObservation *nativeManualObservation
 }
 
 // Get returns a copy of the latest glStatus (safe to use without holding the lock).
@@ -243,6 +247,10 @@ func (l *glLive) applySourceEvent(source glSource, typ string, data map[string]a
 }
 
 func (l *glLive) applyEventLocked(typ string, data map[string]any) {
+	if typ == "volume_action" {
+		l.admitManualEventLocked(data)
+		return
+	}
 	if typ == "selected_alias" {
 		_, hasBinding := data["alias_binding"]
 		if l.st.AliasBinding != nil || hasBinding {

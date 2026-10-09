@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import voluptuous as vol
+from aiohttp import ClientError
 
 from homeassistant.components.media_player import (
     BrowseMedia,
@@ -26,6 +27,7 @@ from . import PodConnectConfigEntry
 from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
+from .targets import spotify_transfer_target
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
 # integration still loads on older cores (it just won't advertise search there).
@@ -391,18 +393,27 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         return None
 
     async def async_select_source(self, source: str) -> None:
-        """"Connect to a device": transfer the session to `source`, keeping play/pause state."""
-        device_id = next(
-            (
-                dev["id"]
-                for dev in (self.coordinator.data or {}).get("devices", [])
-                if dev.get("name") == source and dev.get("id")
-            ),
-            None,
-        )
-        if device_id is None:
-            raise HomeAssistantError(f"Spotify device {source!r} is unavailable")
-        is_playing = bool(self._playback and self._playback.get("is_playing"))
+        """ "Connect to a device": transfer the session to `source`, keeping play/pause state."""
+        entry = self.coordinator.config_entry
+        data = getattr(entry, "runtime_data", None)
+        if (
+            data is None
+            or not data.active
+            or data.coordinator is not self.coordinator
+            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
+        ):
+            raise HomeAssistantError("PodConnect account entry unavailable")
+        try:
+            device_id, is_playing = await spotify_transfer_target(self.coordinator.api, name=source)
+        except (SpotifyApiError, ClientError, TimeoutError) as err:
+            raise HomeAssistantError("Spotify target lookup failed") from err
+        if (
+            entry.runtime_data is not data
+            or not data.active
+            or data.coordinator is not self.coordinator
+            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
+        ):
+            raise HomeAssistantError("PodConnect account entry unavailable")
         await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
 
     async def _browse_category(self, category: str) -> list[BrowseMedia]:

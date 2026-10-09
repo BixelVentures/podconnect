@@ -42,10 +42,11 @@ func envOr(k, d string) string {
 }
 
 type device struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Selected  bool   `json:"selected"`
-	NeedsAuth bool   `json:"needs_auth"`
+	ID                string                   `json:"id"`
+	Name              string                   `json:"name"`
+	Selected          bool                     `json:"selected"`
+	NeedsAuth         bool                     `json:"needs_auth"`
+	AttentionIdentity *nativeAttentionIdentity `json:"attention_identity,omitempty"`
 }
 
 type stateResp struct {
@@ -206,11 +207,19 @@ func fetchOutputsFrom(base string) ([]device, bool) {
 			continue
 		}
 		name, _ := o["name"].(string)
+		var native *nativeAttentionIdentity
+		if encoded, err := json.Marshal(o["attention_identity"]); err == nil {
+			var decoded nativeAttentionIdentity
+			if json.Unmarshal(encoded, &decoded) == nil && decoded.valid() && decoded.DeviceID == fmt.Sprint(o["id"]) {
+				native = &decoded
+			}
+		}
 		out = append(out, device{
-			ID:        fmt.Sprint(o["id"]), // works whether id is a JSON string or number
-			Name:      name,
-			Selected:  asBool(o["selected"]),
-			NeedsAuth: asBool(o["needs_auth_key"]) || asBool(o["requires_auth"]),
+			ID:                fmt.Sprint(o["id"]), // works whether id is a JSON string or number
+			Name:              name,
+			Selected:          asBool(o["selected"]),
+			NeedsAuth:         asBool(o["needs_auth_key"]) || asBool(o["requires_auth"]),
+			AttentionIdentity: native,
 		})
 	}
 	return out, true
@@ -252,6 +261,14 @@ func abs(x int) int {
 // SELECTED AirPlay output. ok=false when none is selected. Reading/writing the specific output
 // (not OwnTone's master) is what makes the sync deterministic on multi-output setups.
 func owntoneOutputVolume(base string) (vol int, id string, ok bool) {
+	return owntoneOutputVolumeForIntent(base, nil)
+}
+
+func owntoneOutputVolumeForIntent(base string, live *glLive) (vol int, id string, ok bool) {
+	var nativeRequest *nativeManualObservation
+	if live != nil {
+		nativeRequest = live.nativeCatalogRequest()
+	}
 	cl := &http.Client{Timeout: 3 * time.Second}
 	resp, err := cl.Get(base + "/api/outputs")
 	if err != nil {
@@ -265,6 +282,9 @@ func owntoneOutputVolume(base string) (vol int, id string, ok bool) {
 	}
 	if err := dec.Decode(&raw); err != nil {
 		return 0, "", false
+	}
+	if live != nil {
+		live.observeNativeCatalog(raw.Outputs, nativeRequest)
 	}
 	for _, o := range raw.Outputs {
 		typ, _ := o["type"].(string)
@@ -349,6 +369,12 @@ func librespotStatus(base string) glStatus {
 // volume_steps as the max). Used by the test so the gentle level holds even if a session is active
 // and the syncer would otherwise mirror a louder level.
 func setLibrespotVolumePct(base string, pct int) {
+	setLibrespotVolumePctOrigin(base, pct, false)
+}
+func setLibrespotVolumePctOwned(base string, pct int) {
+	setLibrespotVolumePctOrigin(base, pct, true)
+}
+func setLibrespotVolumePctOrigin(base string, pct int, owned bool) {
 	cl := &http.Client{Timeout: 3 * time.Second}
 	resp, err := cl.Get(base + "/status")
 	if err != nil {
@@ -366,7 +392,20 @@ func setLibrespotVolumePct(base string, pct int) {
 		return
 	}
 	raw := int(math.Round(float64(clampPct(pct)) / 100 * max))
-	req, _ := http.NewRequest(http.MethodPost, base+"/player/volume", bytes.NewBufferString(fmt.Sprintf(`{"volume":%d}`, raw)))
+	body := map[string]any{"volume": raw}
+	if owned {
+		process, id := attentionManagerProcess(), attentionUUID()
+		if process == "" || id == "" {
+			return
+		}
+		body["manager_process"] = process
+		body["request_id"] = id
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return
+	}
+	req, _ := http.NewRequest(http.MethodPost, base+"/player/volume", bytes.NewReader(encoded))
 	req.Header.Set("Content-Type", "application/json")
 	if r, e := cl.Do(req); e == nil {
 		r.Body.Close()
@@ -642,6 +681,10 @@ func routeIntentCurrent(live *glLive, aliasId int, revision uint64) bool {
 // admitted PUT, but its completion cannot publish obsolete bridge bookkeeping.
 // Returns desired-selection acceptance and whether this intent is still current.
 func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64) (bool, bool) {
+	return routeAliasOutputForAttentionIntent(primaryOwnTone, aliasId, live, revision, nil)
+}
+
+func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention) (bool, bool) {
 	rooms := loadRooms()
 	var binding *aliasBinding
 	if live != nil {
@@ -671,9 +714,16 @@ func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive,
 		}
 		target = rooms[aliasId-1]
 	}
+	var nativeRequest *nativeManualObservation
+	if live != nil {
+		nativeRequest = live.nativeCatalogRequest()
+	}
 	devs, ok := fetchOutputsFrom(primaryOwnTone)
 	if !ok || len(devs) == 0 {
 		return false, routeIntentCurrent(live, aliasId, revision)
+	}
+	if live != nil {
+		live.observeNativeDevices(devs, nativeRequest)
 	}
 	idx, _ := matchOutput(devs, target.HomepodID, target.HomepodName)
 	if idx < 0 {
@@ -682,6 +732,9 @@ func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive,
 			have = append(have, d.Name)
 		}
 		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
+		return false, routeIntentCurrent(live, aliasId, revision)
+	}
+	if att != nil && !att.nativeTarget(primaryOwnTone, devs[idx].ID) {
 		return false, routeIntentCurrent(live, aliasId, revision)
 	}
 	cl := &http.Client{Timeout: 4 * time.Second}
@@ -783,7 +836,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// + hammered OwnTone when the target HomePod was momentarily missing).
 			if room.Idx == 0 && gl.SelAlias > 0 {
 				if aliasRouteChanged(gl.SelAlias, lastAlias, gl.AliasBinding, lastAliasBinding) || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
-					accepted, current := routeAliasOutputForIntent(room.OwnTone, gl.SelAlias, live, aliasRevision)
+					accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att)
 					if !current {
 						time.Sleep(200 * time.Millisecond)
 						continue // no remaining work may use this obsolete snapshot
@@ -807,30 +860,32 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				capped = false
 			}
 
-			// Wave 4: attention/duck. An external agent (voice gatekeeper) holds the room quiet. The
-			// duck WINS — hold the HomePod at the target and SKIP the reconcile this tick (so a HomePod
-			// button can't fight it); transport below keeps running so the music plays quietly underneath.
-			// volCanon=-1 re-seeds the reconcile so it re-converges once the duck ends; on the release
-			// edge restore the pre-duck level explicitly (covers an idle room).
-			if hold, lvl, attReleased, restoreTo := att.tick(time.Now()); hold {
-				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v != lvl {
-					setOwntoneOutputVolume(room.OwnTone, id, lvl)
-					log.Printf("attention [%s]: held at %d%%", room.Name, lvl)
+			// Native attention owns effective volume only. Never write its cap or
+			// another output's saved level through the ordinary manual-volume API.
+			att.expire(time.Now())
+			attentionState := att.snapshot(time.Now())
+			selected := ""
+			if attentionState.Active || attentionState.Contract == "native_attention_v1" && attentionState.Outcome != "released" {
+				nativeRequest := live.nativeCatalogRequest()
+				if devs, ok := fetchOutputsFrom(room.OwnTone); ok {
+					live.observeNativeDevices(devs, nativeRequest)
+					for _, d := range devs {
+						if d.Selected {
+							selected = d.ID
+							break
+						}
+					}
 				}
+			}
+			// Each explicit action already retained its earlier catalog challenge.
+			// Observations made above can only authorize a subsequently NEW action.
+			manualSettled := att.nativeManualReconcile(room.OwnTone, live)
+			attentionSettled := att.nativeReconcile(room.OwnTone, selected, false)
+			if attentionState.Active || !attentionSettled || !manualSettled {
 				volCanon = -1
-				// The top-of-loop latch already reset `capped` if a session (re)started during the duck,
-				// so the never-loud cap fires on release — no remembered 100% blasts out from under a duck.
 				prevActive = gl.Active
 				time.Sleep(200 * time.Millisecond)
 				continue
-			} else if attReleased {
-				if restoreTo >= 0 {
-					if _, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" {
-						setOwntoneOutputVolume(room.OwnTone, id, restoreTo)
-						log.Printf("attention [%s]: released — restored to %d%%", room.Name, restoreTo)
-					}
-				}
-				volCanon = -1
 			}
 
 			playing := gl.Active && !gl.Paused && !gl.Stopped
@@ -858,7 +913,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 								time.Sleep(200 * time.Millisecond)
 								continue
 							}
-							accepted, current := routeAliasOutputForIntent(room.OwnTone, gl.SelAlias, live, aliasRevision)
+							accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att)
 							if !current {
 								time.Sleep(200 * time.Millisecond)
 								continue
@@ -927,7 +982,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				// ticks (no edge-miss blast) and a resume of your own session is NOT re-capped.
 				if !capped && gl.HasVol {
 					if gl.VolPct > initialVolumeCap {
-						setLibrespotVolumePct(room.Librespot, initialVolumeCap)
+						setLibrespotVolumePctOwned(room.Librespot, initialVolumeCap)
 						gl.VolPct = initialVolumeCap
 						volCanon = -1 // re-seed the reconcile from the capped level
 						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
@@ -935,7 +990,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						capped = true // settled at/below the ceiling — the user owns volume from here
 					}
 				}
-				otVol, otID, otVolOk := owntoneOutputVolume(room.OwnTone)
+				otVol, otID, otVolOk := owntoneOutputVolumeForIntent(room.OwnTone, live)
 				otState := owntonePlayerState(room.OwnTone)
 
 				// Volume — BIDIRECTIONAL: Spotify/HA slider <-> HomePod hardware buttons (turn it down
@@ -945,10 +1000,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
 				volCanon = vc
 				if vGl {
-					setLibrespotVolumePct(room.Librespot, vc)
+					setLibrespotVolumePctOwned(room.Librespot, vc)
 					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
 				}
-				if vOt && otID != "" {
+				if vOt && otID != "" && !live.nativeManualSupported() {
 					setOwntoneOutputVolume(room.OwnTone, otID, vc)
 					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
 				}
@@ -1034,6 +1089,7 @@ type roomInfo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	HomepodName string `json:"homepod_name"`
+	HomepodID   string `json:"homepod_id"`
 	OwntoneUp   bool   `json:"owntone_up"`
 	Playing     bool   `json:"playing"`
 	Released    bool   `json:"released"`
@@ -1194,7 +1250,7 @@ func main() {
 				_, up = fetchOutputsFrom(rm.OwnTone)
 			}
 			info := roomInfo{
-				ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName,
+				ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName, HomepodID: rm.HomepodID,
 				OwntoneUp:  up,
 				Alias:      isAlias,
 				Playing:    gl.Active && !gl.Paused && !gl.Stopped,
@@ -1362,10 +1418,10 @@ func main() {
 			setOwntoneOutputVolume(rm.OwnTone, target, 13) // gentle, on the specific HomePod
 		}
 		// Also nudge go-librespot down so the reconciler can't bump the test up to a louder level.
-		setLibrespotVolumePct(rm.Librespot, 13)
+		setLibrespotVolumePctOwned(rm.Librespot, 13)
 		go playTestTone(rm.Pipe, toneFor(rm.ID))
 		log.Printf("test tone requested (room=%s target=%q id=%q)", rm.ID, targetName, target)
-		writeJSON(w, map[string]any{"ok": true, "playing": target != "", "target": targetName})
+		writeJSON(w, map[string]any{"ok": true, "requested": true, "target": targetName})
 	})
 
 	http.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
@@ -1486,13 +1542,25 @@ func attentionHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Room   string `json:"room"`
-		Level  int    `json:"level"`
-		Owner  string `json:"owner"`
-		TTLMS  int    `json:"ttl_ms"`
-		FadeMS int    `json:"fade_ms"` // reserved (v1 is instant)
+		Room     string             `json:"room"`
+		Level    int                `json:"level"`
+		Owner    string             `json:"owner"`
+		TTLMS    int                `json:"ttl_ms"`
+		FadeMS   int                `json:"fade_ms"` // reserved (v1 is instant)
+		Session  string             `json:"session"`
+		Begin    bool               `json:"begin"`
+		Expected attentionChallenge `json:"expected"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 65537))
+	if err := decoder.Decode(&body); err != nil {
+		http.Error(w, "invalid attention request", http.StatusBadRequest)
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		http.Error(w, "extra attention request", http.StatusBadRequest)
+		return
+	}
 	rm := roomByID(body.Room)
 	if rm == nil {
 		http.Error(w, "no such room", http.StatusNotFound)
@@ -1508,11 +1576,23 @@ func attentionHandler(w http.ResponseWriter, r *http.Request) {
 	if owner == "" {
 		owner = "external"
 	}
-	prev := -1 // capture the pre-duck HomePod level so the bridge can restore it on release
-	if v, _, ok := owntoneOutputVolume(rm.OwnTone); ok {
-		prev = v
+	if body.Session != "" {
+		if !a.engageOwned(body.Session, body.Expected, body.Begin, body.Level, owner, ttl, time.Now()) {
+			http.Error(w, "attention owner stale or restoration pending", http.StatusConflict)
+			return
+		}
+	} else {
+		a.mu.Lock()
+		owned := a.sessionNonce != ""
+		a.mu.Unlock()
+		if owned {
+			http.Error(w, "strict attention owner required", http.StatusConflict)
+			return
+		}
+		// Compatibility is desired-only; it cannot claim a native result.
+		a.engage(body.Level, -1, owner, ttl, time.Now())
 	}
-	a.engage(body.Level, prev, owner, ttl, time.Now())
+
 	log.Printf("attention [%s]: duck to %d%% (owner=%s ttl=%s)", rm.Name, clampPct(body.Level), owner, ttl)
 	writeJSON(w, a.snapshot(time.Now()))
 }
@@ -1529,17 +1609,44 @@ func attentionReleaseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Room string `json:"room"`
+		Room     string             `json:"room"`
+		Session  string             `json:"session"`
+		Expected attentionChallenge `json:"expected"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 65537))
+	if err := decoder.Decode(&body); err != nil {
+		http.Error(w, "invalid attention request", http.StatusBadRequest)
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		http.Error(w, "extra attention request", http.StatusBadRequest)
+		return
+	}
 	rm := roomByID(body.Room)
 	if rm == nil {
 		http.Error(w, "no such room", http.StatusNotFound)
 		return
 	}
 	if a := attentionFor(rm.ID); a != nil {
-		a.release()
+		if body.Session != "" {
+			if !a.releaseOwned(body.Session, body.Expected) {
+				http.Error(w, "attention owner stale", http.StatusConflict)
+				return
+			}
+		} else {
+			a.mu.Lock()
+			owned := a.sessionNonce != ""
+			a.mu.Unlock()
+			if owned {
+				http.Error(w, "strict attention owner required", http.StatusConflict)
+				return
+			}
+			a.release()
+		}
 		log.Printf("attention [%s]: release requested", rm.Name)
+		writeJSON(w, a.snapshot(time.Now()))
+		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
@@ -1998,7 +2105,7 @@ async function loadRooms() {
     var badge = document.createElement('span'); badge.className = 'pill';
     if (rm.alias) { badge.classList.add('pill-idle'); badge.textContent = 'alias'; badge.title = 'Selectable in Spotify as an alias on the main engine (no own engine).'; }
     else if (rm.released) { badge.classList.add('pill-released'); badge.textContent = 'released'; }
-    else if (rm.playing) { badge.classList.add('pill-playing'); badge.textContent = 'playing'; }
+    else if (rm.playing) { badge.classList.add('pill-playing'); badge.textContent = 'Spotify active'; }
     else if (rm.owntone_up) { badge.classList.add('pill-idle'); badge.textContent = 'idle'; }
     else { badge.classList.add('pill-starting'); badge.textContent = 'starting…'; }
     top.appendChild(badge);
@@ -2230,7 +2337,7 @@ async function load() {
     var nm = document.createElement('span'); nm.className = 'name'; nm.textContent = d.name;
     row.appendChild(rb); row.appendChild(nm);
     if (d.needs_auth) { var b = document.createElement('span'); b.className = 'pill plain pill-auth'; b.textContent = 'needs verification'; row.appendChild(b); }
-    if (d.selected) { var p = document.createElement('span'); p.className = 'pill plain pill-playing'; p.textContent = 'playing here'; row.appendChild(p); }
+    if (d.selected) { var p = document.createElement('span'); p.className = 'pill plain pill-playing'; p.textContent = 'selected'; row.appendChild(p); }
     list.appendChild(row);
   });
   // If the user already picked a HomePod (pending Save), keep the Save button enabled across refreshes.
