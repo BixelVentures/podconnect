@@ -3,7 +3,7 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 
 # --- PodConnect manager (Ingress picker UI) — tiny static Go binary, stdlib only ---
-FROM golang:1.22-bookworm AS manager-build
+FROM golang:1.22-bookworm@sha256:3d699e4d15d0f8f13c9195c0632a16702b8cbdece2955af1c23b37ae5d55a253 AS manager-build
 WORKDIR /src
 COPY manager/ ./
 RUN go vet ./... && go test ./... \
@@ -12,7 +12,7 @@ RUN go vet ./... && go test ./... \
 # --- go-librespot device-aliases fork — compiled in a THROWAWAY builder so the final image stays slim
 # (no Go toolchain / module + build cache baked in — that bloat made the image fail to pull/extract on
 # device). Outputs only the stripped binary, copied into the final image below. ---
-FROM golang:1.25-bookworm AS gl-fork
+FROM golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS gl-fork
 ARG GO_LIBRESPOT_VERSION=v0.7.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config git ca-certificates libflac-dev libvorbis-dev libogg-dev libasound2-dev \
