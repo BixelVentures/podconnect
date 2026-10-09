@@ -883,3 +883,208 @@ func TestCustodyLiveFreshIncarnationRetiresOriginalWithoutAdoption(t *testing.T)
 		})
 	}
 }
+
+// Native replies are inert strict protocol receipts; this proves manager HTTP
+// retirement order, not HomePod audio. Both original handoff outputs must retire.
+func TestAttentionUpdateRetiredOnlyAfterDurableOriginalOutputs(t *testing.T) {
+	setupAttentionRoom(t)
+	writeOptions(t, `{"attention_token":"retirement-fixture"}`)
+	headers := map[string]string{"X-PodConnect-Token": "retirement-fixture"}
+	a := attentionFor("r0")
+	path := filepath.Join(dataDir, "custody.json")
+	a.loadCustody(path, "r0")
+	before := a.challenge()
+	body := func(nonce string, expected attentionChallenge, begin bool) string {
+		data, err := json.Marshal(map[string]any{"room": "r0", "session": nonce, "expected": expected, "begin": begin, "level": 5, "ttl_ms": 15000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	begin := callAttention(attentionHandler, http.MethodPost, "/api/attention", body(testConversationA, before, true), headers)
+	if begin.Code != 200 {
+		t.Fatalf("BEGIN: %d %s", begin.Code, begin.Body.String())
+	}
+	original := a.challenge()
+	updateBody := body(testConversationA, original, false)
+	var mu sync.Mutex
+	states := map[string]nativeAttentionIdentity{}
+	receipts := map[string]nativeAttentionResult{}
+	completed := map[string]bool{}
+	commands := []nativeAttentionCommand{}
+	for _, id := range []string{"1", "2"} {
+		states[id] = nativeAttentionIdentity{testNativeProcess, id, "1", "0", "1", "0", "1", "0", 65, 65, false}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		id := parts[2]
+		if r.Method == http.MethodGet {
+			if len(parts) == 4 {
+				json.NewEncoder(w).Encode(nativeAttentionObservation{states[id], "0"})
+			} else {
+				receipt := receipts[parts[4]]
+				if receipt.Action == "release" && completed[id] {
+					receipt.Outcome, receipt.ResponseCode, receipt.CSeq = "protocol_accepted", 200, 7
+					state := states[id]
+					state.Lease, state.Restoring = "0", false
+					states[id] = state
+				}
+				json.NewEncoder(w).Encode(receipt)
+			}
+			return
+		}
+		var command nativeAttentionCommand
+		if json.NewDecoder(r.Body).Decode(&command) != nil || command.Expected != states[id] {
+			t.Error("unbound native command")
+			http.Error(w, "stale", 409)
+			return
+		}
+		commands = append(commands, command)
+		identity := command.Expected
+		identity.Lease = id
+		outcome := "desired_only"
+		if command.Action == "release" {
+			identity.Restoring = true
+			outcome = "pending"
+		}
+		states[id] = identity
+		receipt := nativeAttentionResult{Identity: identity, RequestID: command.RequestID, Operation: fmt.Sprint(len(commands)), Action: command.Action, Outcome: outcome, Current: true}
+		receipts[receipt.Operation] = receipt
+		json.NewEncoder(w).Encode(receipt)
+	}))
+	defer srv.Close()
+	if !a.nativeTarget(srv.URL, "1") || !a.nativeTarget(srv.URL, "2") {
+		t.Fatal("original handoff outputs not admitted")
+	}
+	a.expire(time.Now().Add(maxAttentionTTL + time.Second))
+	pending := callAttention(attentionHandler, http.MethodPost, "/api/attention", updateBody, headers)
+	if pending.Code != 409 || pending.Header().Get("Content-Type") == "application/json" {
+		t.Fatal("expiry alone claimed durable retirement")
+	}
+	if a.nativeReconcile(srv.URL, "2", false) {
+		t.Fatal("pending restore reported success")
+	}
+	mu.Lock()
+	for id, state := range states {
+		if state.Restoring {
+			completed[id] = true
+		}
+	}
+	mu.Unlock()
+	if a.nativeReconcile(srv.URL, "2", false) {
+		t.Fatal("one restored output credited whole session")
+	}
+	partial := readCustodyTest(t, path)
+	retired := 0
+	for _, output := range partial.Sessions[0].Outputs {
+		if output.Retired {
+			retired++
+		}
+	}
+	// Map traversal can start the other pending release before durably retiring
+	// the first strict receipt. Exactly one original output is confirmed either
+	// in its retained grant or the journal; neither ordering retires the session.
+	confirmed := retired
+	for _, grant := range a.nativeGrants {
+		if grant.Result.Action == "release" && grant.Result.Outcome == "protocol_accepted" {
+			confirmed++
+		}
+	}
+	if confirmed != 1 || partial.Sessions[0].Retired {
+		t.Fatal("partial restore lost original custody")
+	}
+	stillPending := callAttention(attentionHandler, http.MethodPost, "/api/attention", updateBody, headers)
+	if stillPending.Code != 409 || strings.Contains(stillPending.Body.String(), "lease_retired") {
+		t.Fatal("partial restore credited session")
+	}
+	mu.Lock()
+	completed["1"], completed["2"] = true, true
+	mu.Unlock()
+	if !a.nativeReconcile(srv.URL, "2", false) {
+		t.Fatal("all original outputs failed to retire")
+	}
+	if doc := readCustodyTest(t, path); !doc.Sessions[0].Retired || len(doc.Sessions[0].Outputs) != 2 {
+		t.Fatal("missing durable whole-session retirement")
+	}
+	reply := callAttention(attentionHandler, http.MethodPost, "/api/attention", updateBody, headers)
+	var observed map[string]any
+	if reply.Code != 409 || reply.Header().Get("Content-Type") != "application/json" || json.Unmarshal(reply.Body.Bytes(), &observed) != nil {
+		t.Fatalf("typed refusal: %d %s", reply.Code, reply.Body.String())
+	}
+	want := map[string]any{"contract": "native_attention_v1", "outcome": "lease_retired", "room": "r0", "session": testConversationA, "expected": map[string]any{"process": original.Process, "revision": original.Revision}}
+	wantBytes, _ := json.Marshal(want)
+	gotBytes, _ := json.Marshal(observed)
+	if string(gotBytes) != string(wantBytes) {
+		t.Fatalf("wrong original identity: %s", gotBytes)
+	}
+	for name, requestBody := range map[string]string{
+		"begin":     body(testConversationA, original, true),
+		"nonce":     body(testConversationB, original, false),
+		"process":   body(testConversationA, attentionChallenge{testConversationB, original.Revision}, false),
+		"revision":  body(testConversationA, attentionChallenge{original.Process, "99"}, false),
+		"malformed": `{"room":"r0","session":"` + testConversationA + `","expected":{"process":"` + original.Process + `","revision":true}}`,
+	} {
+		w := callAttention(attentionHandler, http.MethodPost, "/api/attention", requestBody, headers)
+		if strings.Contains(w.Body.String(), "lease_retired") || w.Header().Get("Content-Type") == "application/json" {
+			t.Fatalf("%s got typed retirement", name)
+		}
+	}
+	if w := callAttention(attentionHandler, http.MethodPost, "/api/attention", updateBody, nil); w.Code != 401 {
+		t.Fatal("typed retirement bypassed auth")
+	}
+	if a.custodyRetired("different-room", testConversationA, original) {
+		t.Fatal("different room matched custody")
+	}
+	fresh := callAttention(attentionHandler, http.MethodPost, "/api/attention", body(testConversationB, a.challenge(), true), headers)
+	if fresh.Code != 200 {
+		t.Fatal("next admission blocked")
+	}
+	newOwner := a.snapshot(time.Now())
+	duplicate := callAttention(attentionHandler, http.MethodPost, "/api/attention", updateBody, headers)
+	if duplicate.Code != 409 || !strings.Contains(duplicate.Body.String(), "lease_retired") || a.challenge() != newOwner.Challenge || !a.active || a.sessionNonce != testConversationB {
+		t.Fatal("late old update changed newer owner")
+	}
+	if export := os.Getenv("PC_RETIRED_UPDATE_RECEIPT"); export != "" {
+		receipt := map[string]any{"room": "r0", "session": testConversationA, "expected": original, "begin": json.RawMessage(begin.Body.Bytes()), "pending_status": pending.Code, "pending_body": pending.Body.String(), "partial_status": stillPending.Code, "partial_body": stillPending.Body.String(), "retired_status": reply.Code, "retired_body": json.RawMessage(reply.Body.Bytes()), "next_begin": json.RawMessage(fresh.Body.Bytes())}
+		data, err := json.MarshalIndent(receipt, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(export, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(commands) != 4 || commands[0].Action != "begin" || commands[1].Action != "begin" || commands[2].Action != "release" || commands[3].Action != "release" {
+		t.Fatal("HTTP refusal replayed/created effects")
+	}
+}
+
+func TestAttentionUpdateFailedRetirementSaveNeverClaimsRetired(t *testing.T) {
+	setupAttentionRoom(t)
+	a := attentionFor("r0")
+	path := filepath.Join(dataDir, "custody.json")
+	a.loadCustody(path, "r0")
+	if !a.engageOwned(testConversationA, a.challenge(), true, 5, "voice", maxAttentionTTL, time.Now()) {
+		t.Fatal("admission failed")
+	}
+	original := a.challenge()
+	block := filepath.Join(dataDir, "not-directory")
+	if err := os.WriteFile(block, []byte("file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.custody.path = filepath.Join(block, "custody.json")
+	a.expire(time.Now().Add(maxAttentionTTL + time.Second))
+	a.nativeReconcile("", "", false) // The final durable save fails after in-memory Retired.
+	if !a.custody.Sessions[0].Retired || a.custody.fault == nil || readCustodyTest(t, path).Sessions[0].Retired {
+		t.Fatal("failed persistence boundary not exercised")
+	}
+	data, _ := json.Marshal(map[string]any{"room": "r0", "session": testConversationA, "expected": original})
+	w := callAttention(attentionHandler, http.MethodPost, "/api/attention", string(data), nil)
+	if w.Code != 409 || w.Header().Get("Content-Type") == "application/json" || strings.Contains(w.Body.String(), "lease_retired") {
+		t.Fatal("failed retirement save was credited")
+	}
+}

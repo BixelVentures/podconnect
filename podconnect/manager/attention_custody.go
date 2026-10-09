@@ -519,33 +519,46 @@ func (a *attention) reconcileCustody() bool {
 	return true
 }
 
+// Exact original identity selects retained durable custody, never a current
+// manager challenge or an inactive volatile lease. The caller holds a.mu.
+func (a *attention) custodyOriginalLocked(nonce string, expected attentionChallenge) *custodySession {
+	if a.custody == nil || a.custody.fault != nil {
+		return nil
+	}
+	for _, s := range a.custody.Sessions {
+		if s.Nonce == nonce && s.Process == expected.Process && s.Revision == expected.Revision {
+			return s
+		}
+	}
+	return nil
+}
+
+func (a *attention) custodyRetired(room, nonce string, expected attentionChallenge) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.custodyOriginalLocked(nonce, expected)
+	return s != nil && a.custody.Room == room && s.Retired
+}
+
 // Exact old session release is a query of durable retirement, not a claim in the
 // new manager. Its challenge always identifies the actual current manager.
 func (a *attention) custodyRelease(nonce string, expected attentionChallenge) (attSnapshot, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.custody == nil || a.custody.fault != nil {
+	s := a.custodyOriginalLocked(nonce, expected)
+	if s == nil || !a.custody.imported && !s.Retired && s.Process == attentionManagerProcess() && s.Nonce == a.sessionNonce {
 		return attSnapshot{}, false
 	}
-	for _, s := range a.custody.Sessions {
-		if s.Nonce != nonce || s.Process != expected.Process || s.Revision != expected.Revision {
-			continue
-		}
-		if !a.custody.imported && !s.Retired && s.Process == attentionManagerProcess() && s.Nonce == a.sessionNonce {
-			return attSnapshot{}, false
-		}
-		snap := attSnapshot{Challenge: attentionChallenge{attentionManagerProcess(), strconv.FormatUint(a.admissionRevision, 10)}, Contract: "native_attention_v1", Outcome: "pending", NativeResults: map[string]nativeAttentionResult{}, RecoveryResults: map[string]nativeRecoveryResult{}}
-		if s.Retired {
-			snap.Outcome = "released"
-		}
-		for key, o := range s.Outputs {
-			if o.Result != nil {
-				snap.RecoveryResults[key] = *o.Result
-			}
-		}
-		return snap, true
+	snap := attSnapshot{Challenge: attentionChallenge{attentionManagerProcess(), strconv.FormatUint(a.admissionRevision, 10)}, Contract: "native_attention_v1", Outcome: "pending", NativeResults: map[string]nativeAttentionResult{}, RecoveryResults: map[string]nativeRecoveryResult{}}
+	if s.Retired {
+		snap.Outcome = "released"
 	}
-	return attSnapshot{}, false
+	for key, o := range s.Outputs {
+		if o.Result != nil {
+			snap.RecoveryResults[key] = *o.Result
+		}
+	}
+	return snap, true
 }
 
 // Commit admission follows all catalog I/O. Cleanup may start only after already

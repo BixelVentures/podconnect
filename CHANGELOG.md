@@ -1,3 +1,8 @@
+## Speakers 0.26.15 — confirmed attention retirement
+
+- Report an expired voice attention lease as retired only after every original speaker cleanup is durably confirmed. PodVoice can then close the affected conversation without repeatedly renewing that lease.
+- Keep pending or failed restoration retryable; preserve newer speaker ownership and the original release identity. Physical recovery and next-wake acceptance remains pending.
+
 ## Speakers 0.26.14 — preserve playback when transfer preparation fails
 
 - Resolve the incoming track in a lazy Spotify context before committing the selected speaker and transfer state. A rejected page lookup preserves the current playback and speaker.
