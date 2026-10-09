@@ -242,8 +242,8 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response({"accepted_local": True, "binding": {**binding, "room_id": body["room_id"]}})
         if request.path == "/api/rooms":
             return web.json_response({"rooms": [
-                {"id": "room-alpha", "homepod_id": "saved-output-alpha"},
-                {"id": "room-beta", "homepod_id": "saved-output-beta"}]})
+                {"id": "room-alpha", "homepod_id": getattr(self, "alpha_output", "saved-output-alpha")},
+                {"id": "room-beta", "homepod_id": getattr(self, "beta_output", "saved-output-beta")}]})
         if request.path == "/api/state":
             return web.json_response({"owntone_up": True, "devices": [{"id": "output-one",
                 "name": "Observed fixture", "selected": False, "needs_auth": False}]})
@@ -318,6 +318,106 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self._writes()[1], ("PUT", "/spotify/me/player", {
                 "device_ids": ["spotify-one"], "play": False}, True))
             self.assertEqual(len(self._writes()), 2)  # No invented resume/second command.
+
+    async def test_real_room_options_save_clear_and_stale_alias_replacement(self):
+        async with asyncio.timeout(20):
+            area = area_registry.async_get(self.hass).async_create(
+                "Frida's Room", aliases={"Fridas værelse"}
+            )
+            entry = self.entries[1]
+            before = entry.data
+            flow = await self.hass.config_entries.options.async_init(entry.entry_id)
+            self.assertEqual(flow["step_id"], "init")
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"speakers_url": self.base}
+            )
+            self.assertEqual(flow["step_id"], "room")
+            self.assertEqual(flow["description_placeholders"], {"speaker": "Alpha"})
+            # Clearing is absence, not a default that silently reselects the old room.
+            self.assertEqual(
+                flow["data_schema"].schema[next(iter(flow["data_schema"].schema))].selector_type,
+                "area",
+            )
+            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            self.assertEqual(flow["description_placeholders"], {"speaker": "Beta"})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"area_id": area.id}
+            )
+            self.assertEqual(flow["type"], "create_entry")
+            self.assertEqual(entry.data, before)
+            self.assertEqual(
+                entry.options["room_areas"],
+                {"room-beta": {"homepod_id": "saved-output-beta", "area_id": area.id}},
+            )
+            await self.hass.async_block_till_done()
+            _, profile = await self._service(
+                "get_targets_with_room_context", {"config_entry_id": entry.entry_id}
+            )
+            self.assertEqual(
+                next(
+                    t
+                    for t in profile["service_response"]["targets"]
+                    if t["target_id"] == "room-beta"
+                )["ha_area"]["id"],
+                area.id,
+            )
+            for route in ("get_targets", "get_targets_with_context"):
+                _, reply = await self._service(route, {"config_entry_id": entry.entry_id})
+                self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+            _, reply = await self._service(
+                "get_targets_with_room_context", {"config_entry_id": self.entries[0].entry_id}
+            )
+            self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+            # Held form cannot bind its old label to a replacement native device.
+            flow = await self.hass.config_entries.options.async_init(entry.entry_id)
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"speakers_url": self.base}
+            )
+            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            self.beta_output = "replacement-beta"
+            failed = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"area_id": area.id}
+            )
+            self.assertEqual((failed["type"], failed["reason"]), ("abort", "speaker_changed"))
+            self.assertEqual(
+                entry.options["room_areas"]["room-beta"]["homepod_id"], "saved-output-beta"
+            )
+            _, reply = await self._service(
+                "get_targets_with_room_context", {"config_entry_id": entry.entry_id}
+            )
+            self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+            self.beta_output = "saved-output-beta"
+            flow = await self.hass.config_entries.options.async_init(entry.entry_id)
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"speakers_url": self.base}
+            )
+            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            cleared = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            self.assertEqual(cleared["type"], "create_entry")
+            self.assertNotIn("room_areas", entry.options)
+            self.assertEqual(entry.options["speakers_url"], self.base)
+            self.assertEqual(self._writes(), [])
+
+
+    async def test_room_options_deleted_area_and_earlier_target_change_fail_closed(self):
+        async with asyncio.timeout(20):
+            areas = area_registry.async_get(self.hass)
+            area = areas.async_create("Study")
+            entry = self.entries[0]
+            original = dict(entry.options)
+            flow = await self.hass.config_entries.options.async_init(entry.entry_id)
+            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {"speakers_url": self.base})
+            areas.async_delete(area.id)
+            rejected = await self.hass.config_entries.options.async_configure(flow["flow_id"], {"area_id": area.id})
+            self.assertEqual(rejected["errors"], {"area_id": "area_unavailable"})
+            self.assertEqual(dict(entry.options), original)
+            # Earlier speaker can change between its form and the final save.
+            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            self.alpha_output = "replacement-alpha"
+            rejected = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            self.assertEqual((rejected["type"], rejected["reason"]), ("abort", "speaker_changed"))
+            self.assertEqual(dict(entry.options), original)
+            self.assertEqual(self._writes(), [])
 
     async def test_live_registry_metadata_exact_account_aliases_and_entity_area_override(self):
         async with asyncio.timeout(15):

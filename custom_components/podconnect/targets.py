@@ -12,7 +12,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
 
 from .api import SpotifyApiError
-from .const import DOMAIN
+from .const import CONF_ROOM_AREAS, DOMAIN
 from .speakers import SpeakersError
 
 
@@ -100,6 +100,51 @@ def _spotify_ha_context(hass, entry_id: str, target_id: str) -> dict | None:
     return context
 
 
+async def configured_alias_targets(speakers) -> list[dict]:
+    """One fresh alias/native identity observation for services and Options."""
+    catalog = await speakers.aliases()
+    rooms = await speakers.rooms()
+    saved = {r["id"]: r for r in rooms}
+    # Separate GETs are observations, never a write-admission snapshot.
+    if any(r["room_id"] not in saved for r in catalog["aliases"]):
+        raise SpeakersError("Configured room association unavailable")
+    return [
+        {
+            "kind": "configured_alias",
+            "target_id": r["room_id"],
+            "name": r["name"],
+            "homepod_id": saved[r["room_id"]]["homepod_id"],
+            "binding": catalog["binding"],
+        }
+        for r in catalog["aliases"]
+    ]
+
+
+def _configured_ha_area(hass, entry, target) -> dict | None:
+    """Explicit account Options metadata, fenced by the current native target ID."""
+    associations = entry.options.get(CONF_ROOM_AREAS)
+    if not isinstance(associations, dict) or not target["homepod_id"]:
+        return None
+    saved = associations.get(target["target_id"])
+    if (
+        not isinstance(saved, dict)
+        or set(saved) != {"homepod_id", "area_id"}
+        or saved["homepod_id"] != target["homepod_id"]
+        or not isinstance(saved["area_id"], str)
+    ):
+        return None
+    area = ar.async_get(hass).async_get_area(saved["area_id"])
+    if area is None:
+        return None
+    aliases = sorted(area.aliases)
+    if (
+        not all(isinstance(v, str) and 1 <= len(v) <= 1024 for v in (area.id, area.name, *aliases))
+        or len(aliases) > 16
+    ):
+        return None
+    return {"id": area.id, "name": area.name, "aliases": aliases}
+
+
 def register_target_services(hass) -> None:
     """Register once; each invocation resolves its explicitly selected live entry."""
 
@@ -112,7 +157,7 @@ def register_target_services(hass) -> None:
             raise HomeAssistantError("PodConnect account entry unavailable")
         return data
 
-    async def catalogue(call, *, with_context=False):
+    async def catalogue(call, *, with_context=False, with_rooms=False):
         if "config_entry_id" not in call.data:
             accounts, seen = [], set()
             for entry in hass.config_entries.async_entries(DOMAIN):
@@ -150,22 +195,7 @@ def register_target_services(hass) -> None:
             for kind in ("configured_alias", "observed_output"):
                 try:
                     if kind == "configured_alias":
-                        catalog = await data.speakers.aliases()
-                        rooms = await data.speakers.rooms()
-                        saved = {r["id"]: r for r in rooms}
-                        # Separate GETs are observations, never a write-admission snapshot.
-                        if any(r["room_id"] not in saved for r in catalog["aliases"]):
-                            raise SpeakersError("Configured room association unavailable")
-                        targets.extend(
-                            {
-                                "kind": kind,
-                                "target_id": r["room_id"],
-                                "name": r["name"],
-                                "homepod_id": saved[r["room_id"]]["homepod_id"],
-                                "binding": catalog["binding"],
-                            }
-                            for r in catalog["aliases"]
-                        )
+                        targets.extend(await configured_alias_targets(data.speakers))
                     else:
                         state = await data.speakers.outputs()
                         targets.extend(
@@ -195,6 +225,15 @@ def register_target_services(hass) -> None:
                     )
                     if context is not None:
                         target["ha_context"] = context
+                elif with_rooms and target["kind"] == "configured_alias":
+                    entry = next(
+                        e
+                        for e in hass.config_entries.async_entries(DOMAIN)
+                        if e.entry_id == call.data["config_entry_id"]
+                    )
+                    area = _configured_ha_area(hass, entry, target)
+                    if area is not None:
+                        target["ha_area"] = area
         return {
             "config_entry_id": call.data["config_entry_id"],
             "targets": targets,
@@ -206,6 +245,9 @@ def register_target_services(hass) -> None:
 
     async def get_targets_with_context(call):
         return await catalogue(call, with_context=True)
+
+    async def get_targets_with_room_context(call):
+        return await catalogue(call, with_context=True, with_rooms=True)
 
     async def move_playback(call):
         data = current(call.data["config_entry_id"])
@@ -247,6 +289,11 @@ def register_target_services(hass) -> None:
         (
             "get_targets_with_context",
             get_targets_with_context,
+            {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
+        ),
+        (
+            "get_targets_with_room_context",
+            get_targets_with_room_context,
             {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
         ),
         (

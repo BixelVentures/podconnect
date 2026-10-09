@@ -63,6 +63,16 @@ get_targets_with_context:
       selector:
         config_entry:
           integration: podconnect
+get_targets_with_room_context:
+  name: Get playback targets with HA room context
+  description: Same fresh account-scoped catalog as get_targets_with_context, with optional user-selected HA areas for exact configured alias and native output identities. Metadata does not create targets or prove audible playback.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: false
+      selector:
+        config_entry:
+          integration: podconnect
 move_playback:
   name: Move playback
   description: Request an explicit stable-ID target. Local acceptance and Spotify request acceptance are separate from audible output confirmation.
