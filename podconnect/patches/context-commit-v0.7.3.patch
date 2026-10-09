@@ -227,7 +227,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case "pause":
  		return p.pause(ctx)
  	case "resume":
-@@ -416,9 +304,181 @@
+@@ -416,9 +304,182 @@
  		return nil
  	default:
  		return fmt.Errorf("unsupported player command: %s", req.Command.Endpoint)
@@ -265,6 +265,18 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, transferState.CurrentSession.Context)
 +	if err != nil {
 +		return fmt.Errorf("failed creating track list: %w", err)
++	}
++
++	// Lazy context preparation must succeed before changing the command or output owner.
++	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(transferState.CurrentSession.Context.Uri)
++	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
++	if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
++		return fmt.Errorf("failed seeking to track: %w", err)
++	}
++
++	// shuffle the context if needed
++	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
++		return fmt.Errorf("failed shuffling context")
 +	}
 +
 +	p.commitPlayerCommand(req)
@@ -309,17 +321,7 @@ diff --git a/daemon/player.go b/daemon/player.go
 +		p.state.player.ContextMetadata[k] = v
 +	}
 +
-+	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(p.state.player.ContextUri)
-+	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
-+	if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
-+		return fmt.Errorf("failed seeking to track: %w", err)
- 	}
-+
-+	// shuffle the context if needed
-+	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
-+		return fmt.Errorf("failed shuffling context")
-+	}
-+
+-	}
 +	// Set queueID to the highest queue ID found in the queue.
 +	// The UIDs are of the form q0, q1, q2, etc.
 +	// Spotify apps don't seem to do this (they start again at 0 after
@@ -428,7 +430,7 @@ diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
 new file mode 100644
 --- /dev/null
 +++ b/daemon/context_commit_test.go
-@@ -0,0 +1,648 @@
+@@ -0,0 +1,717 @@
 +package daemon
 +
 +import (
@@ -788,22 +790,91 @@ new file mode 100644
 +}
 +
 +func TestDealerTransferRetainsLazyEmptyPage(t *testing.T) {
-+	state := pc13TransferState()
-+	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{PageUrl: "invalid-pc13-page-boundary"}}
-+	data, err := proto.Marshal(state)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	p := pc13ExistingPlayer(t, false)
-+	p.sess = &session.Session{}
-+	req := pc13PlayRequest(t)
-+	req.Command.Endpoint, req.Command.Data = "transfer", data
-+	err = p.handlePlayerCommand(context.Background(), req)
-+	if err == nil || !strings.Contains(err.Error(), "invalid page url: invalid-pc13-page-boundary") {
-+		t.Fatalf("expected accepted lazy page then deliberate page-fetch boundary: %v", err)
-+	}
-+	if p.state.lastTransferTimestamp != 789 || p.state.player.SessionId != "transfer-session" || len(p.app.server.(*aliasTestServer).events) != 0 {
-+		t.Fatal("lazy empty page was rejected at transfer admission")
++	for _, tc := range []struct {
++		name, pageURL, failure string
++		status, requests       int
++		shuffle                bool
++	}{
++		{"invalid page URL", "invalid-pc13-page-boundary", "invalid page url: invalid-pc13-page-boundary", 0, 0, false},
++		{"page 404", "hm://pc10/lazy-page", "invalid status code from page", http.StatusNotFound, 2, false},
++		{"resolved page", "hm://pc10/lazy-page", "", http.StatusOK, 1, false},
++		{"resolved shuffled page", "hm://pc10/lazy-page", "", http.StatusOK, 1, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			state := pc13TransferState()
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{PageUrl: tc.pageURL}}
++			state.Options.ShufflingContext = tc.shuffle
++			data, err := proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			p := pc13ExistingPlayer(t, true)
++			p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++			p.app.cfg.DeviceAliasRoomIDs = []string{"room-a", "room-b"}
++			p.initAliasRegistry()
++			binding := *p.aliasBinding()
++			previousCommand := &dealer.RequestPayload{}
++			p.state.lastCommand = previousCommand
++			if tc.failure != "" {
++				p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
++			}
++			before := proto.Clone(p.state.player)
++			oldTracks, primary, secondary, since := p.state.tracks, p.primaryStream, p.secondaryStream, p.state.activeSince
++			requests := 0
++			var bodies []*pc13Body
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				requests++
++				if r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/pc10/lazy-page" {
++					return nil, fmt.Errorf("unexpected lazy page request: %s %s", r.Method, r.URL)
++				}
++				payload := "not found"
++				if tc.status == http.StatusOK {
++					encoded, err := json.Marshal(&connectpb.ContextPage{Tracks: []*connectpb.ContextTrack{state.Playback.CurrentTrack}})
++					if err != nil {
++						return nil, err
++					}
++					payload = string(encoded)
++				}
++				body := &pc13Body{Reader: strings.NewReader(payload)}
++				bodies = append(bodies, body)
++				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: body, Request: r}, nil
++			}))
++			req := pc13PlayRequest(t)
++			req.Command.Endpoint, req.Command.Data, req.TargetAliasId = "transfer", data, proto.Uint32(1)
++			err = p.handlePlayerCommandWithSpclient(context.Background(), req, sp)
++			if requests != tc.requests || len(bodies) != tc.requests {
++				t.Fatalf("page requests=%d want=%d", requests, tc.requests)
++			}
++			for _, body := range bodies {
++				if body.closes != 1 {
++					t.Fatal("lazy page response not closed")
++				}
++			}
++			events := p.app.server.(*aliasTestServer).events
++			if tc.failure != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.failure) {
++					t.Fatalf("expected lazy page preparation failure: %v", err)
++				}
++				if !proto.Equal(before, p.state.player) || !p.state.active || !p.state.activeSince.Equal(since) || p.state.tracks != oldTracks || p.primaryStream != primary || p.secondaryStream != secondary || p.state.queueID != 7 || p.state.lastTransferTimestamp != 123 || p.state.device.SelectedAliasId != 2 || *p.aliasBinding() != binding || p.state.lastCommand != previousCommand || len(events) != 0 {
++					t.Fatal("failed lazy page preparation changed active playback, alias or stream owner")
++				}
++				return
++			}
++			// Valid lazy preparation commits through the actual caller. The same
++			// deliberate media-URI boundary retains downstream load/error ownership;
++			// no provider, playable stream or physical output is impersonated.
++			if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++				t.Fatalf("expected existing post-commit media boundary: %v", err)
++			}
++			if !p.state.active || p.state.tracks == oldTracks || p.state.lastTransferTimestamp != 789 || p.state.player.SessionId != "transfer-session" || p.state.player.Track.Uri != state.Playback.CurrentTrack.Uri || p.state.player.Options.ShufflingContext != tc.shuffle || p.state.device.SelectedAliasId != 1 || p.state.lastCommand == previousCommand || p.state.lastCommand.Command.Endpoint != "transfer" || len(events) != 1 || events[0].Type != "selected_alias" {
++				t.Fatal("valid lazy page did not retain transfer/alias commit semantics")
++			}
++			current := p.aliasBinding()
++			eventBinding := events[0].Data.(map[string]any)["alias_binding"].(*ApiAliasBinding)
++			if !current.Ready || current.RoomID != "room-a" || current.Incarnation != binding.Incarnation || current.Registry != binding.Registry || *eventBinding != *current {
++				t.Fatal("valid lazy page commit lost registry/event identity")
++			}
++		})
 +	}
 +}
 +
