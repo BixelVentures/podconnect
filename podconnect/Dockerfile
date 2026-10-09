@@ -63,7 +63,7 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
   && make -j"$(nproc)" \
-  && make check \
+  && { make check || { cat src/test-suite.log; exit 1; }; } \
   && make install \
   && cd / && rm -rf /src
 
