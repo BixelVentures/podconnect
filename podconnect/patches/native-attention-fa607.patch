@@ -1,7 +1,7 @@
 diff --git a/src/Makefile.am b/src/Makefile.am
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -166,3 +166,83 @@
+@@ -166,3 +166,84 @@
  # flex/bison automake's support leaves something to be desired
  clean-local:
  	rm -f $(LEXER_SRC:.l=.[ch]) $(PARSER_SRC:.y=.[ch])
@@ -83,7 +83,8 @@ diff --git a/src/Makefile.am b/src/Makefile.am
 +airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
 +	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
-+airplay_callback_owner_LDFLAGS = -Wl,--gc-sections
++airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse
++EXTRA_DIST += ../tests/player_startup_owner.inc.c
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
 diff --git a/src/conffile.c b/src/conffile.c
 --- a/src/conffile.c
@@ -100,7 +101,7 @@ diff --git a/src/conffile.c b/src/conffile.c
 diff --git a/src/db.c b/src/db.c
 --- a/src/db.c
 +++ b/src/db.c
-@@ -4790,6 +4790,265 @@
+@@ -4790,6 +4790,286 @@
  }
  
  /* Speakers */
@@ -109,7 +110,28 @@ diff --git a/src/db.c b/src/db.c
 +static int
 +attention_sql(char *sql)
 +{
-+  int ret = sql ? sqlite3_exec(hdl, sql, NULL, NULL, NULL) : SQLITE_NOMEM;
++  const char *next = sql;
++  sqlite3_stmt *stmt = NULL;
++  int ret = sql ? SQLITE_OK : SQLITE_NOMEM;
++
++  /* sqlite3_exec accepts several statements. Keep every schema statement while
++   * using the same shared-cache unlock owner as ordinary database operations. */
++  while (ret == SQLITE_OK && next && *next)
++    {
++      ret = db_blocking_prepare_v2(next, -1, &stmt, &next);
++      if (ret != SQLITE_OK)
++	break;
++      if (!stmt)
++	continue;
++      while ((ret = db_blocking_step(stmt)) == SQLITE_ROW)
++	; /* EMPTY */
++      sqlite3_finalize(stmt);
++      stmt = NULL;
++      if (ret == SQLITE_DONE)
++	ret = SQLITE_OK;
++    }
++  if (ret != SQLITE_OK)
++    DPRINTF(E_LOG, L_DB, "Native custody SQL failed: %s (%d)\n", sqlite3_errmsg(hdl), ret);
 +  sqlite3_free(sql);
 +  return ret == SQLITE_OK ? 0 : -1;
 +}
@@ -117,7 +139,7 @@ diff --git a/src/db.c b/src/db.c
 +static int
 +attention_query(char *sql, sqlite3_stmt **stmt)
 +{
-+  int ret = sql ? sqlite3_prepare_v2(hdl, sql, -1, stmt, NULL) : SQLITE_NOMEM;
++  int ret = sql ? db_blocking_prepare_v2(sql, -1, stmt, NULL) : SQLITE_NOMEM;
 +  sqlite3_free(sql);
 +  return ret == SQLITE_OK ? 0 : -1;
 +}
@@ -133,12 +155,12 @@ diff --git a/src/db.c b/src/db.c
 +  if (!hdl || !sqlite3_get_autocommit(hdl)
 +      || attention_query(sqlite3_mprintf("PRAGMA synchronous"), &stmt) < 0)
 +    return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  sync = ret == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0;
 +  sqlite3_finalize(stmt);
 +  if (sync < 2 || attention_query(sqlite3_mprintf("PRAGMA journal_mode"), &stmt) < 0)
 +    return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  journal = ret == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
 +  ret = journal && strcmp(journal, "off") && strcmp(journal, "memory") ? 0 : -1;
 +  sqlite3_finalize(stmt);
@@ -188,7 +210,7 @@ diff --git a/src/db.c b/src/db.c
 +  sqlite3_stmt *stmt = NULL;
 +  int ret;
 +  if (attention_query(sqlite3_mprintf("SELECT volume FROM native_attention_base_v1 WHERE device='%" PRIu64 "'", id), &stmt) < 0) return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  if (ret == SQLITE_ROW) *volume = sqlite3_column_int(stmt, 0);
 +  sqlite3_finalize(stmt);
 +  return ret == SQLITE_ROW ? 0 : ret == SQLITE_DONE ? 1 : -1;
@@ -261,14 +283,14 @@ diff --git a/src/db.c b/src/db.c
 +  memset(proof, 0, sizeof(*proof));
 +  *state = OUTPUT_RECOVERY_UNKNOWN;
 +  if (attention_query(sqlite3_mprintf("SELECT p.database_id FROM native_attention_process_v1 p JOIN native_attention_meta_v1 m ON p.database_id=m.provenance WHERE p.process=%Q", origin->process), &stmt) < 0) return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  if (ret == SQLITE_ROW) snprintf(proof->database,sizeof(proof->database),"%s",sqlite3_column_text(stmt,0));
 +  sqlite3_finalize(stmt);
 +  if (ret != SQLITE_ROW) return ret == SQLITE_DONE ? 0 : -1;
 +  if (!attention_uuid_valid(proof->database)) return -1;
 +  proof->ledger_complete = true;
 +  if (attention_query(sqlite3_mprintf("SELECT device,retired,terminal_identity,terminal_request,terminal_operation,terminal_action,code,cseq FROM native_attention_origin_v1 WHERE process=%Q AND request=%Q", origin->process,origin->request_id), &stmt) < 0) return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  if (ret == SQLITE_DONE) *state = OUTPUT_RECOVERY_NEVER_ADMITTED;
 +  else if (ret == SQLITE_ROW)
 +    {
@@ -299,7 +321,7 @@ diff --git a/src/db.c b/src/db.c
 +  sqlite3_stmt *stmt = NULL;
 +  int ret, pending;
 +  if (attention_query(sqlite3_mprintf("SELECT 1 FROM native_attention_origin_v1 WHERE device='%" PRIu64 "' AND retired=0 LIMIT 1", id), &stmt) < 0) return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  pending = ret == SQLITE_ROW ? 1 : ret == SQLITE_DONE ? 0 : -1;
 +  sqlite3_finalize(stmt);
 +  return pending;
@@ -330,7 +352,7 @@ diff --git a/src/db.c b/src/db.c
 +  enum output_attention_recovery_state origin_state;
 +  int ret;
 +  if (attention_query(sqlite3_mprintf("SELECT operation,action,outcome,code,cseq,expected,identity,cap,ttl,origin_process,origin_request,recovery FROM native_attention_attempt_v1 WHERE process=%Q AND request=%Q AND device='%" PRIu64 "'",process,request_id,id), &stmt) < 0) return -1;
-+  ret = sqlite3_step(stmt);
++  ret = db_blocking_step(stmt);
 +  if (ret == SQLITE_ROW)
 +    {
 +      memset(r,0,sizeof(*r));
@@ -366,7 +388,7 @@ diff --git a/src/db.c b/src/db.c
  int
  db_speaker_save(struct output_device *device)
  {
-@@ -7449,6 +7708,9 @@
+@@ -7449,6 +7729,9 @@
  	}
      }
  
@@ -3108,16 +3130,98 @@ diff --git a/src/player.c b/src/player.c
  
    *retval = outputs_device_volume_set(device, device_volume_cb);
  
-@@ -3916,6 +3991,9 @@
+@@ -3900,9 +3975,28 @@
+ 
+ /* ---------------------------- Thread: player ------------------------------ */
+ 
++struct player_startup
++{
++  pthread_mutex_t lock;
++  pthread_cond_t condition;
++  bool ready;
++  int result;
++};
++
++static void
++player_startup_complete(struct player_startup *startup, int result)
++{
++  CHECK_ERR(L_PLAYER, pthread_mutex_lock(&startup->lock));
++  startup->result = result;
++  startup->ready = true;
++  CHECK_ERR(L_PLAYER, pthread_cond_signal(&startup->condition));
++  CHECK_ERR(L_PLAYER, pthread_mutex_unlock(&startup->lock));
++}
++
+ static void *
+ player(void *arg)
+ {
++  struct player_startup *startup = arg;
+   struct output_device *device;
+   int ret;
+ 
+@@ -3912,9 +4006,19 @@
+   if (ret < 0)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Error: DB init failed\n");
+-
++      player_startup_complete(startup, -1);
        pthread_exit(NULL);
      }
- 
-+  if (outputs_attention_startup() < 0)
-+    { DPRINTF(E_LOG,L_PLAYER,"Native durable custody init failed\n"); db_perthread_deinit(); pthread_exit(NULL); }
 +
++  if (outputs_attention_startup() < 0)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Native durable custody init failed\n");
++      db_perthread_deinit();
++      player_startup_complete(startup, -1);
++      pthread_exit(NULL);
++    }
++
++  player_startup_complete(startup, 0);
+ 
    event_base_dispatch(evbase_player);
  
-   if (!player_exit)
+@@ -3939,6 +4043,7 @@
+ int
+ player_init(void)
+ {
++  struct player_startup startup = { .ready = false, .result = -1 };
+   uint64_t interval;
+   int ret;
+ 
+@@ -4016,10 +4121,29 @@
+       goto error_outputs_deinit;
+     }
+ 
+-  ret = pthread_create(&tid_player, NULL, player, NULL);
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
++  CHECK_ERR(L_PLAYER, mutex_init(&startup.lock));
++  CHECK_ERR(L_PLAYER, pthread_cond_init(&startup.condition, NULL));
++  CHECK_ERR(L_PLAYER, pthread_mutex_lock(&startup.lock));
++  ret = pthread_create(&tid_player, NULL, player, &startup);
++  if (ret != 0)
++    {
++      DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(ret));
++      CHECK_ERR(L_PLAYER, pthread_mutex_unlock(&startup.lock));
++      CHECK_ERR(L_PLAYER, pthread_cond_destroy(&startup.condition));
++      CHECK_ERR(L_PLAYER, pthread_mutex_destroy(&startup.lock));
++      goto error_input_deinit;
++    }
++
++  while (!startup.ready)
++    CHECK_ERR(L_PLAYER, pthread_cond_wait(&startup.condition, &startup.lock));
++  CHECK_ERR(L_PLAYER, pthread_mutex_unlock(&startup.lock));
++  CHECK_ERR(L_PLAYER, pthread_cond_destroy(&startup.condition));
++  CHECK_ERR(L_PLAYER, pthread_mutex_destroy(&startup.lock));
++  if (startup.result < 0)
++    {
++      /* The failed thread never admitted its command consumer. Join it before
++       * the existing pre-loop cleanup; never send it a shutdown command. */
++      CHECK_ERR(L_PLAYER, pthread_join(tid_player, NULL));
+       goto error_input_deinit;
+     }
+ 
 diff --git a/src/player.h b/src/player.h
 --- a/src/player.h
 +++ b/src/player.h
@@ -3166,7 +3270,7 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
 new file mode 100644
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
-@@ -0,0 +1,911 @@
+@@ -0,0 +1,914 @@
 +/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
 + * No discovery, daemon, media input, fabricated connected/session-ready flag,
 + * receiver capability, public-volume acceptance or acoustic proof.
@@ -4064,10 +4168,13 @@ new file mode 100644
 +  return f.failed;
 +}
 +
++#include "player_startup_owner.inc.c"
++
 +int main(void)
 +{
 +  int mode;
 +  if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  actual_player_startup_cases();
 +  for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
 +    if (owner_case((enum owner_mode)mode, 0)) return 1;
 +  for (mode = 1; mode <= 2; mode++)
@@ -5536,4 +5643,226 @@ new file mode 100644
 +  sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);
 +  puts("PASS original fifteen output-owner groups plus two actual file-backed crash/custody groups; no native protocol or audio claim");
 +  return 0;
++}
+diff --git a/tests/player_startup_owner.inc.c b/tests/player_startup_owner.inc.c
+new file mode 100644
+--- /dev/null
++++ b/tests/player_startup_owner.inc.c
+@@ -0,0 +1,217 @@
++/* Included by the existing complete native owner fixture. Faults only wrap
++ * SQLite/pthread admission; player, DB, command consumers and cleanup stay real. */
++#include <sys/wait.h>
++#include <sqlite3.h>
++#include <event2/thread.h>
++#include <dlfcn.h>
++#include "../src/worker.h"
++#include "../src/cache.h"
++#include "../src/library.h"
++
++enum startup_fault { START_HEALTHY, START_LOCKED, START_READONLY, START_NONDURABLE, START_SCHEMA, START_SPAWN };
++static enum startup_fault startup_fault;
++static bool startup_active, startup_spawning, startup_have_player;
++static int startup_creates, startup_player_joins, startup_old_callbacks;
++static pthread_t startup_player_thread;
++static __thread sqlite3 *startup_connection;
++static pthread_mutex_t startup_writer_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t startup_writer_condition = PTHREAD_COND_INITIALIZER;
++static bool startup_writer_ready, startup_writer_begin, startup_writer_held, startup_writer_release;
++
++int __real_sqlite3_open(const char *, sqlite3 **);
++int __real_sqlite3_unlock_notify(sqlite3 *, void (*)(void **, int), void *);
++int __real_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
++int __real_pthread_join(pthread_t, void **);
++int __real_net_bind(struct net_socket *, unsigned short *, int, const char *);
++int __real_mdns_browse(char *, mdns_browse_cb, enum mdns_options);
++
++int __wrap_mdns_browse(char *type, mdns_browse_cb callback, enum mdns_options flags)
++{
++  if (startup_active) return -1;
++  return __real_mdns_browse(type, callback, flags);
++}
++
++int __wrap_net_bind(struct net_socket *socket, unsigned short *port, int type, const char *name)
++{
++  /* Same inert service boundary as the existing AirPlay owner fixture. Never
++   * discover a receiver merely to test database/player command admission. */
++  if (startup_active) return -1;
++  return __real_net_bind(socket, port, type, name);
++}
++
++static void startup_old_callback(evutil_socket_t fd, short flags, void *arg)
++{ (void)fd; (void)flags; (void)arg; startup_old_callbacks++; }
++
++int __wrap_sqlite3_open(const char *path, sqlite3 **connection)
++{
++  char name[32] = {0};
++  int ret = __real_sqlite3_open(path, connection);
++  if (!startup_active || ret != SQLITE_OK) return ret;
++  startup_connection = *connection;
++  assert(pthread_getname_np(pthread_self(), name, sizeof(name)) == 0);
++  if (strcmp(name, "player")) return ret;
++  if (startup_fault == START_LOCKED)
++    {
++      assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++      startup_writer_begin = true;
++      assert(pthread_cond_signal(&startup_writer_condition) == 0);
++      while (!startup_writer_held)
++        assert(pthread_cond_wait(&startup_writer_condition, &startup_writer_mutex) == 0);
++      assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
++    }
++  if (startup_fault == START_READONLY || startup_fault == START_NONDURABLE || startup_fault == START_SCHEMA)
++    {
++      const struct timeval immediate = {0, 0};
++      assert(event_base_once(evbase_player, -1, EV_TIMEOUT, startup_old_callback, NULL, &immediate) == 0);
++      assert(sqlite3_exec(*connection, startup_fault == START_READONLY ? "PRAGMA query_only=ON" :
++          startup_fault == START_NONDURABLE ? "PRAGMA synchronous=OFF" :
++          "DROP TABLE native_attention_process_v1", NULL, NULL, NULL) == SQLITE_OK);
++    }
++  return ret;
++}
++
++int __wrap_sqlite3_unlock_notify(sqlite3 *connection, void (*notify)(void **, int), void *arg)
++{
++  if (startup_active && startup_fault == START_LOCKED)
++    {
++      char name[32] = {0};
++      assert(pthread_getname_np(pthread_self(), name, sizeof(name)) == 0);
++      if (!strcmp(name, "player"))
++        {
++          assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++          startup_writer_release = true;
++          assert(pthread_cond_signal(&startup_writer_condition) == 0);
++          assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
++        }
++    }
++  return __real_sqlite3_unlock_notify(connection, notify, arg);
++}
++
++int __wrap_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg)
++{
++  Dl_info caller = {0};
++  bool player_call = startup_active && startup_spawning &&
++    dladdr(__builtin_return_address(0), &caller) && caller.dli_saddr == (void *)player_init;
++  int ret;
++  if (player_call) startup_creates++;
++  if (player_call && startup_fault == START_SPAWN) return EAGAIN;
++  ret = __real_pthread_create(thread, attr, entry, arg);
++  if (player_call && !ret) { startup_player_thread = *thread; startup_have_player = true; }
++  return ret;
++}
++
++int __wrap_pthread_join(pthread_t thread, void **result)
++{
++  int ret = __real_pthread_join(thread, result);
++  if (!ret && startup_active && startup_have_player && pthread_equal(thread, startup_player_thread))
++    startup_player_joins++;
++  return ret;
++}
++
++static void *startup_library_writer(void *arg)
++{
++  (void)arg;
++  thread_setname("pc29-writer");
++  assert(db_perthread_init() == 0);
++  assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++  startup_writer_ready = true;
++  assert(pthread_cond_signal(&startup_writer_condition) == 0);
++  while (!startup_writer_begin)
++    assert(pthread_cond_wait(&startup_writer_condition, &startup_writer_mutex) == 0);
++  assert(sqlite3_exec(startup_connection, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
++  assert(db_admin_setint64(DB_ADMIN_DB_UPDATE, 123) == 0);
++  startup_writer_held = true;
++  assert(pthread_cond_signal(&startup_writer_condition) == 0);
++  while (!startup_writer_release)
++    assert(pthread_cond_wait(&startup_writer_condition, &startup_writer_mutex) == 0);
++  assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
++  assert(sqlite3_exec(startup_connection, "COMMIT", NULL, NULL, NULL) == SQLITE_OK);
++  db_perthread_deinit();
++  return NULL;
++}
++
++static void startup_case(enum startup_fault fault)
++{
++  struct player_status status;
++  struct owner_fixture f = { .refused_fd = -1 };
++  char path[] = "/tmp/pc29-player-owner-XXXXXX";
++  pthread_t writer;
++  int fd = mkstemp(path), ret;
++  assert(fd >= 0); close(fd);
++  alarm(6); // Observer bound, no production deadline change.
++  assert(evthread_use_pthreads() == 0);
++  evbase_main = event_base_new(); assert(evbase_main);
++  current_fixture = &f;
++  cfg = cfg_init(toplvl_cfg, CFGF_NONE); assert(cfg);
++  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", path);
++  cfg_setstr(cfg_getsec(cfg, "audio"), "type", "disabled");
++  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  assert(worker_init() == 0 && cache_init() == 0 && library_init() == 0);
++  startup_fault = fault; startup_active = true;
++  if (fault == START_LOCKED)
++    {
++      assert(pthread_create(&writer, NULL, startup_library_writer, NULL) == 0);
++      assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++      while (!startup_writer_ready)
++        assert(pthread_cond_wait(&startup_writer_condition, &startup_writer_mutex) == 0);
++      assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
++    }
++  startup_spawning = true;
++  fprintf(stderr, "PC29 mode=%d before actual player_init\n", fault);
++  ret = player_init();
++  fprintf(stderr, "PC29 mode=%d after actual player_init ret=%d\n", fault, ret);
++  startup_spawning = false;
++  assert(startup_creates == 1);
++  if (fault == START_LOCKED) assert(pthread_join(writer, NULL) == 0 && startup_writer_release);
++  if (fault == START_HEALTHY || fault == START_LOCKED)
++    {
++      assert(ret == 0 && startup_player_joins == 0);
++      assert(player_get_status(&status) == 0); // Actual admitted command consumer.
++      fprintf(stderr, "PC29 mode=%d status complete\n", fault);
++      player_deinit(); assert(startup_player_joins == 1);
++      fprintf(stderr, "PC29 mode=%d player cleanup complete\n", fault);
++    }
++  else
++    {
++      assert(ret < 0 && startup_old_callbacks == 0);
++      assert(startup_player_joins == (fault == START_SPAWN ? 0 : 1));
++      /* Actual main exits after failed admission. Do not hot-reinitialize
++       * upstream input/output globals in that failed process. */
++    }
++  startup_active = false;
++  fprintf(stderr, "PC29 mode=%d before library/cache/worker cleanup\n", fault);
++  library_deinit(); cache_deinit(); worker_deinit(); db_perthread_deinit(); db_deinit();
++  event_base_free(evbase_main); cfg_free(cfg); cfg = NULL;
++  assert(startup_old_callbacks == 0);
++  assert(unlink(path) == 0);
++  alarm(0);
++  fprintf(stderr, "PC29 mode=%d all cleanup complete\n", fault);
++}
++
++static void actual_player_startup_cases(void)
++{
++  int mode, status;
++  pid_t child;
++  for (mode = START_HEALTHY; mode <= START_SPAWN; mode++)
++    {
++      fprintf(stderr, "PC29 starting mode=%d\n", mode);
++      child = fork(); assert(child >= 0);
++      if (!child) { startup_case((enum startup_fault)mode); _exit(0); }
++      assert(waitpid(child, &status, 0) == child);
++      fprintf(stderr, "PC29 mode=%d child wait status=%d\n", mode, status);
++      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++      if (mode >= START_READONLY)
++        {
++          /* The untouched parent owns no previous child's event base or task.
++           * This models the manager's new process after main EXIT_FAILURE. */
++          assert(startup_old_callbacks == 0 && !startup_active);
++          child = fork(); assert(child >= 0);
++          if (!child) { startup_case(START_HEALTHY); _exit(0); }
++          assert(waitpid(child, &status, 0) == child);
++          assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++          assert(startup_old_callbacks == 0);
++          fprintf(stderr, "PC29 mode=%d fresh process startup/status/join complete\n", mode);
++        }
++    }
++  puts("PASS six actual player admission cases plus four fresh process successors; failed-start callbacks remain inert");
 +}

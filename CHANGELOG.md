@@ -1,3 +1,13 @@
+## Control 0.10.6 - available speaker targets during slow reads
+
+- Read Spotify devices, configured speakers and observed outputs independently within one catalogue response budget. Keep every completed fresh target and report unavailable target types explicitly.
+- Cancel and join unfinished reads before returning; preserve account validation, room metadata, discovery profiles and playback authority. Actual home target-read and transfer acceptance remains pending.
+
+## Speakers 0.26.16 - native player startup admission
+
+- Initialize durable native custody through OwnTone's existing shared-cache database owner and admit the player only after its thread initialization succeeds.
+- Refuse failed startup before serving player requests, joining the failed thread without queueing commands to an absent event loop. Physical startup, playback and recovery acceptance remains pending.
+
 ## Speakers 0.26.15 — confirmed attention retirement
 
 - Report an expired voice attention lease as retired only after every original speaker cleanup is durably confirmed. PodVoice can then close the affected conversation without repeatedly renewing that lease.

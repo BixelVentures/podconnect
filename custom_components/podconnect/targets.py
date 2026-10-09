@@ -6,10 +6,17 @@ import asyncio
 
 import voluptuous as vol
 from aiohttp import ClientError
-
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import area_registry as ar, device_registry as dr, entity_registry as er
+from homeassistant.helpers import (
+    area_registry as ar,
+)
+from homeassistant.helpers import (
+    device_registry as dr,
+)
+from homeassistant.helpers import (
+    entity_registry as er,
+)
 
 from .api import SpotifyApiError
 from .const import CONF_ROOM_AREAS, DOMAIN
@@ -36,7 +43,9 @@ def spotify_devices(rows) -> list:
     return rows
 
 
-async def spotify_transfer_target(api, *, target_id=None, name=None) -> tuple[str, bool]:
+async def spotify_transfer_target(
+    api, *, target_id=None, name=None
+) -> tuple[str, bool]:
     """Resolve current ID/restrictions and preserve only known playback state."""
     async with asyncio.timeout(10):
         rows = spotify_devices(await api.devices())
@@ -66,7 +75,11 @@ def _spotify_ha_context(hass, entry_id: str, target_id: str) -> dict | None:
     if len(matches) != 1:
         return None
     entity = matches[0]
-    if entity.config_entry_id != entry_id or entity.disabled_by is not None or not entity.device_id:
+    if (
+        entity.config_entry_id != entry_id
+        or entity.disabled_by is not None
+        or not entity.device_id
+    ):
         return None
     device = dr.async_get(hass).async_get(entity.device_id)
     if (
@@ -81,13 +94,22 @@ def _spotify_ha_context(hass, entry_id: str, target_id: str) -> dict | None:
         return isinstance(value, str) and 1 <= len(value) <= 1024
 
     def aliases(values):
-        return isinstance(values, list) and len(values) <= 16 and all(text(v) for v in values)
+        return (
+            isinstance(values, list)
+            and len(values) <= 16
+            and all(text(v) for v in values)
+        )
 
     name = er.async_get_full_entity_name(hass, entity)
     names = er.async_get_entity_aliases(hass, entity)
     if not text(entity.entity_id) or not text(name) or not aliases(names):
         return None
-    context = {"entity_id": entity.entity_id, "name": name, "aliases": names, "area": None}
+    context = {
+        "entity_id": entity.entity_id,
+        "name": name,
+        "aliases": names,
+        "area": None,
+    }
     # An explicit entity override remains authoritative even if its area was deleted.
     area_id = entity.area_id if entity.area_id is not None else device.area_id
     if area_id is not None:
@@ -138,7 +160,10 @@ def _configured_ha_area(hass, entry, target) -> dict | None:
         return None
     aliases = sorted(area.aliases)
     if (
-        not all(isinstance(v, str) and 1 <= len(v) <= 1024 for v in (area.id, area.name, *aliases))
+        not all(
+            isinstance(v, str) and 1 <= len(v) <= 1024
+            for v in (area.id, area.name, *aliases)
+        )
         or len(aliases) > 16
     ):
         return None
@@ -149,11 +174,19 @@ def register_target_services(hass) -> None:
     """Register once; each invocation resolves its explicitly selected live entry."""
 
     def current(entry_id, expected=None):
-        entries = [e for e in hass.config_entries.async_entries(DOMAIN) if e.entry_id == entry_id]
+        entries = [
+            e
+            for e in hass.config_entries.async_entries(DOMAIN)
+            if e.entry_id == entry_id
+        ]
         if len(entries) != 1:
             raise HomeAssistantError("PodConnect account entry unavailable")
         data = getattr(entries[0], "runtime_data", None)
-        if data is None or not data.active or (expected is not None and data is not expected):
+        if (
+            data is None
+            or not data.active
+            or (expected is not None and data is not expected)
+        ):
             raise HomeAssistantError("PodConnect account entry unavailable")
         return data
 
@@ -173,47 +206,72 @@ def register_target_services(hass) -> None:
                 ):
                     raise HomeAssistantError("Ambiguous PodConnect account catalog")
                 seen.add(entry.entry_id)
-                accounts.append({"config_entry_id": entry.entry_id, "title": entry.title})
+                accounts.append(
+                    {"config_entry_id": entry.entry_id, "title": entry.title}
+                )
             return {"accounts": accounts}
         data = current(call.data["config_entry_id"])
-        targets, errors = [], {}
-        try:
-            async with asyncio.timeout(10):
-                devices = spotify_devices(await data.api.devices())
-            targets.extend(
-                {
-                    "kind": "spotify_device",
-                    "target_id": r["id"],
-                    "name": r["name"],
-                    "restricted": r["is_restricted"],
-                }
-                for r in devices
-            )
-        except (SpotifyApiError, ClientError, TimeoutError, HomeAssistantError):
-            errors["spotify_device"] = "unavailable"
-        if data.speakers is not None:
-            for kind in ("configured_alias", "observed_output"):
+
+        async def read(kind):
+            if kind == "spotify_device":
                 try:
-                    if kind == "configured_alias":
-                        targets.extend(await configured_alias_targets(data.speakers))
-                    else:
-                        state = await data.speakers.outputs()
-                        targets.extend(
-                            {
-                                "kind": kind,
-                                "target_id": r["id"],
-                                "name": r["name"],
-                                "selected": r["selected"],
-                                "needs_auth": r["needs_auth"],
-                                "query_up": state["owntone_up"],
-                                "read_only": True,
-                            }
-                            for r in state["devices"]
-                        )
-                except SpeakersError:
-                    errors[kind] = "unavailable"
-        else:
-            errors["configured_alias"] = errors["observed_output"] = "not_configured"
+                    async with asyncio.timeout(10):
+                        devices = spotify_devices(await data.api.devices())
+                    return [
+                        {
+                            "kind": kind,
+                            "target_id": r["id"],
+                            "name": r["name"],
+                            "restricted": r["is_restricted"],
+                        }
+                        for r in devices
+                    ], None
+                except (SpotifyApiError, ClientError, TimeoutError, HomeAssistantError):
+                    return [], "unavailable"
+            if data.speakers is None:
+                return [], "not_configured"
+            try:
+                if kind == "configured_alias":
+                    return await configured_alias_targets(data.speakers), None
+                state = await data.speakers.outputs()
+                return [
+                    {
+                        "kind": kind,
+                        "target_id": r["id"],
+                        "name": r["name"],
+                        "selected": r["selected"],
+                        "needs_auth": r["needs_auth"],
+                        "query_up": state["owntone_up"],
+                        "read_only": True,
+                    }
+                    for r in state["devices"]
+                ], None
+            except SpeakersError:
+                return [], "unavailable"
+
+        # Independent read owners share one response deadline, leaving 500ms
+        # for validation/HA response before the unchanged 8s caller read timeout.
+        reads = {
+            kind: asyncio.create_task(read(kind), name="podconnect-catalogue-" + kind)
+            for kind in ("spotify_device", "configured_alias", "observed_output")
+        }
+        try:
+            completed, _ = await asyncio.wait(reads.values(), timeout=7.5)
+        finally:
+            # No read can outlive this call or publish into its later/new owner.
+            for task in reads.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*reads.values(), return_exceptions=True)
+        targets, errors = [], {}
+        for kind, task in reads.items():
+            if task not in completed or task.cancelled():
+                errors[kind] = "unavailable"
+                continue
+            rows, error = task.result()
+            targets.extend(rows)
+            if error is not None:
+                errors[kind] = error
         current(call.data["config_entry_id"], data)
         if with_context:
             # Read registry metadata after all backend awaits. No registry entity can
@@ -284,23 +342,37 @@ def register_target_services(hass) -> None:
         (
             "get_targets",
             get_targets,
-            {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
+            {
+                vol.Optional("config_entry_id"): vol.All(
+                    str, vol.Length(min=1, max=1024)
+                )
+            },
         ),
         (
             "get_targets_with_context",
             get_targets_with_context,
-            {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
+            {
+                vol.Optional("config_entry_id"): vol.All(
+                    str, vol.Length(min=1, max=1024)
+                )
+            },
         ),
         (
             "get_targets_with_room_context",
             get_targets_with_room_context,
-            {vol.Optional("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))},
+            {
+                vol.Optional("config_entry_id"): vol.All(
+                    str, vol.Length(min=1, max=1024)
+                )
+            },
         ),
         (
             "move_playback",
             move_playback,
             {
-                vol.Required("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024)),
+                vol.Required("config_entry_id"): vol.All(
+                    str, vol.Length(min=1, max=1024)
+                ),
                 vol.Required("kind"): vol.In(
                     ("configured_alias", "spotify_device", "observed_output")
                 ),
