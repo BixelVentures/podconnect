@@ -9,9 +9,151 @@ diff --git a/daemon/player.go b/daemon/player.go
  	"github.com/devgianlu/go-librespot/tracks"
  )
  
-@@ -305,40 +306,7 @@
+@@ -174,6 +175,37 @@
+ }
  
- 		return nil
+ func (p *AppPlayer) handlePlayerCommand(ctx context.Context, req dealer.RequestPayload) error {
++	var transferState *connectpb.TransferState
++	if req.Command.Endpoint == "transfer" && len(req.Command.Data) > 0 {
++		transferState = &connectpb.TransferState{}
++		if err := proto.Unmarshal(req.Command.Data, transferState); err != nil {
++			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
++		}
++		if transferState.Playback == nil || transferState.Playback.CurrentTrack == nil ||
++			(transferState.Playback.CurrentTrack.Uri == "" && len(transferState.Playback.CurrentTrack.Gid) != 16) ||
++			transferState.CurrentSession == nil || transferState.CurrentSession.Context == nil ||
++			transferState.CurrentSession.PlayOrigin == nil || transferState.Options == nil || transferState.Queue == nil {
++			return fmt.Errorf("incomplete TransferState: playback, current track, session context, play origin, options and queue are required")
++		}
++		for i, track := range transferState.Queue.Tracks {
++			if track == nil || (track.Uri == "" && len(track.Gid) != 16) {
++				return fmt.Errorf("invalid TransferState queue track at index %d", i)
++			}
++		}
++		for i, page := range transferState.CurrentSession.Context.Pages {
++			if page == nil {
++				return fmt.Errorf("invalid TransferState context page at index %d", i)
++			}
++			for j, track := range page.Tracks {
++				// Context comparators may consume GID even when a nonmatching URI is present.
++				if track == nil || (track.Uri == "" && len(track.Gid) != 16) ||
++					(len(track.Gid) != 0 && len(track.Gid) != 16) {
++					return fmt.Errorf("invalid TransferState context track at page %d index %d", i, j)
++				}
++			}
++		}
++	}
++
+ 	p.state.lastCommand = &req
+ 
+ 	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+@@ -209,143 +241,11 @@
+ 			})
+ 
+ 			return nil
+-		}
+-
+-		var transferState connectpb.TransferState
+-		if err := proto.Unmarshal(req.Command.Data, &transferState); err != nil {
+-			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
+-		}
+-		p.state.lastTransferTimestamp = transferState.Playback.Timestamp
+-
+-		ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, p.sess.Spclient(), transferState.CurrentSession.Context)
+-		if err != nil {
+-			return fmt.Errorf("failed creating track list: %w", err)
+-		}
+-
+-		if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
+-			p.state.player.SessionId = *sessId
+-		} else {
+-			sessionId := make([]byte, 16)
+-			_, _ = rand.Read(sessionId)
+-			p.state.player.SessionId = base64.StdEncoding.EncodeToString(sessionId)
+-		}
+-
+-		p.state.setActive(true)
+-		p.state.player.IsPlaying = false
+-		p.state.player.IsBuffering = false
+-
+-		// options
+-		p.state.player.Options = transferState.Options
+-		pause := transferState.Playback.IsPaused && req.Command.Options.RestorePaused != "resume"
+-		// playback
+-		// Note: this sets playback speed to 0 or 1 because that's all we're
+-		// capable of, depending on whether the playback is paused or not.
+-		p.state.player.Timestamp = transferState.Playback.Timestamp
+-		p.state.player.PositionAsOfTimestamp = int64(transferState.Playback.PositionAsOfTimestamp)
+-		p.state.setPaused(pause)
+-
+-		// current session
+-		p.state.player.PlayOrigin = transferState.CurrentSession.PlayOrigin
+-		p.state.player.PlayOrigin.DeviceIdentifier = req.SentByDeviceId
+-		p.state.player.ContextUri = transferState.CurrentSession.Context.Uri
+-		p.state.player.ContextUrl = transferState.CurrentSession.Context.Url
+-		p.state.player.ContextRestrictions = transferState.CurrentSession.Context.Restrictions
+-		p.state.player.Suppressions = transferState.CurrentSession.Suppressions
+-
+-		p.state.player.ContextMetadata = map[string]string{}
+-		for k, v := range transferState.CurrentSession.Context.Metadata {
+-			p.state.player.ContextMetadata[k] = v
+ 		}
+-		for k, v := range ctxTracks.Metadata() {
+-			p.state.player.ContextMetadata[k] = v
+-		}
+ 
+-		contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(p.state.player.ContextUri)
+-		currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
+-		if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
+-			return fmt.Errorf("failed seeking to track: %w", err)
+-		}
+-
+-		// shuffle the context if needed
+-		if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
+-			return fmt.Errorf("failed shuffling context")
+-		}
+-
+-		// Set queueID to the highest queue ID found in the queue.
+-		// The UIDs are of the form q0, q1, q2, etc.
+-		// Spotify apps don't seem to do this (they start again at 0 after
+-		// transfer), which means that queue IDs get duplicated when tracks are
+-		// added before and after the transfer and reordering will lead to weird
+-		// effects. But we can do better :)
+-		p.state.queueID = 0
+-		for _, track := range transferState.Queue.Tracks {
+-			if track.Uid == "" || track.Uid[0] != 'q' {
+-				continue // not of the "q<number>" format
+-			}
+-			n, err := strconv.ParseUint(track.Uid[1:], 10, 64)
+-			if err != nil {
+-				continue // not of the "q<number>" format
+-			}
+-			p.state.queueID = max(p.state.queueID, n)
+-		}
+-
+-		// add all tracks from queue
+-		for _, track := range transferState.Queue.Tracks {
+-			ctxTracks.AddToQueue(track)
+-		}
+-		ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
+-
+-		p.state.tracks = ctxTracks
+-		p.state.player.Track = ctxTracks.CurrentTrack()
+-		p.state.player.PrevTracks = ctxTracks.PrevTracks()
+-		p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
+-		p.state.player.Index = ctxTracks.Index()
+-
+-		// load current track into stream
+-		if err := p.loadCurrentTrack(ctx, pause, true); err != nil {
+-			return fmt.Errorf("failed loading current track (transfer): %w", err)
+-		}
+-
+-		p.app.server.Emit(&ApiEvent{
+-			Type: ApiEventTypeActive,
+-		})
+-
+-		return nil
++		return p.handleTransferCommand(ctx, req, transferState, p.sess.Spclient())
  	case "play":
 -		p.state.setActive(true)
 -
@@ -51,17 +193,117 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case "pause":
  		return p.pause(ctx)
  	case "resume":
-@@ -410,6 +378,48 @@
+@@ -416,7 +316,148 @@
+ 		return nil
  	default:
  		return fmt.Errorf("unsupported player command: %s", req.Command.Endpoint)
- 	}
++	}
++}
++
++func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.RequestPayload, transferState *connectpb.TransferState, sp *spclient.Spclient) error {
++	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, transferState.CurrentSession.Context)
++	if err != nil {
++		return fmt.Errorf("failed creating track list: %w", err)
++	}
++
++	p.state.lastTransferTimestamp = transferState.Playback.Timestamp
++
++	if sessId := transferState.CurrentSession.OriginalSessionId; sessId != nil {
++		p.state.player.SessionId = *sessId
++	} else {
++		sessionId := make([]byte, 16)
++		_, _ = rand.Read(sessionId)
++		p.state.player.SessionId = base64.StdEncoding.EncodeToString(sessionId)
++	}
++
++	p.state.setActive(true)
++	p.state.player.IsPlaying = false
++	p.state.player.IsBuffering = false
++
++	// options
++	p.state.player.Options = transferState.Options
++	pause := transferState.Playback.IsPaused && req.Command.Options.RestorePaused != "resume"
++	// playback
++	// Note: this sets playback speed to 0 or 1 because that's all we're
++	// capable of, depending on whether the playback is paused or not.
++	p.state.player.Timestamp = transferState.Playback.Timestamp
++	p.state.player.PositionAsOfTimestamp = int64(transferState.Playback.PositionAsOfTimestamp)
++	p.state.setPaused(pause)
++
++	// current session
++	p.state.player.PlayOrigin = transferState.CurrentSession.PlayOrigin
++	p.state.player.PlayOrigin.DeviceIdentifier = req.SentByDeviceId
++	p.state.player.ContextUri = transferState.CurrentSession.Context.Uri
++	p.state.player.ContextUrl = transferState.CurrentSession.Context.Url
++	p.state.player.ContextRestrictions = transferState.CurrentSession.Context.Restrictions
++	p.state.player.Suppressions = transferState.CurrentSession.Suppressions
++
++	p.state.player.ContextMetadata = map[string]string{}
++	for k, v := range transferState.CurrentSession.Context.Metadata {
++		p.state.player.ContextMetadata[k] = v
++	}
++	for k, v := range ctxTracks.Metadata() {
++		p.state.player.ContextMetadata[k] = v
++	}
++
++	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(p.state.player.ContextUri)
++	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
++	if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
++		return fmt.Errorf("failed seeking to track: %w", err)
++	}
++
++	// shuffle the context if needed
++	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
++		return fmt.Errorf("failed shuffling context")
++	}
++
++	// Set queueID to the highest queue ID found in the queue.
++	// The UIDs are of the form q0, q1, q2, etc.
++	// Spotify apps don't seem to do this (they start again at 0 after
++	// transfer), which means that queue IDs get duplicated when tracks are
++	// added before and after the transfer and reordering will lead to weird
++	// effects. But we can do better :)
++	p.state.queueID = 0
++	for _, track := range transferState.Queue.Tracks {
++		if track.Uid == "" || track.Uid[0] != 'q' {
++			continue // not of the "q<number>" format
++		}
++		n, err := strconv.ParseUint(track.Uid[1:], 10, 64)
++		if err != nil {
++			continue // not of the "q<number>" format
++		}
++		p.state.queueID = max(p.state.queueID, n)
++	}
++
++	// add all tracks from queue
++	for _, track := range transferState.Queue.Tracks {
++		ctxTracks.AddToQueue(track)
++	}
++	ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
++
++	p.state.tracks = ctxTracks
++	p.state.player.Track = ctxTracks.CurrentTrack()
++	p.state.player.PrevTracks = ctxTracks.PrevTracks()
++	p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
++	p.state.player.Index = ctxTracks.Index()
++
++	// load current track into stream
++	if err := p.loadCurrentTrack(ctx, pause, true); err != nil {
++		return fmt.Errorf("failed loading current track (transfer): %w", err)
++	}
++
++	p.app.server.Emit(&ApiEvent{
++		Type: ApiEventTypeActive,
++	})
++
++	return nil
 +}
 +
 +func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
 +	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, req.Command.Context)
 +	if err != nil {
 +		return fmt.Errorf("failed creating track list: %w", err)
-+	}
+ 	}
 +
 +	p.state.setActive(true)
 +
@@ -103,13 +345,14 @@ diff --git a/daemon/player.go b/daemon/player.go
 diff --git a/daemon/controls.go b/daemon/controls.go
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -229,6 +229,10 @@
+@@ -228,7 +228,11 @@
+ 	if err != nil {
  		return fmt.Errorf("failed creating track list: %w", err)
  	}
- 
++
 +	return p.loadPreparedContext(ctx, spotCtx, ctxTracks, skipTo, paused, drop)
 +}
-+
+ 
 +func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.Context, ctxTracks *tracks.List, skipTo skipToFunc, paused, drop bool) error {
  	p.state.setPaused(paused)
  
@@ -118,7 +361,7 @@ diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
 new file mode 100644
 --- /dev/null
 +++ b/daemon/context_commit_test.go
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,481 @@
 +package daemon
 +
 +import (
@@ -135,6 +378,7 @@ new file mode 100644
 +	"github.com/devgianlu/go-librespot/dealer"
 +	"github.com/devgianlu/go-librespot/player"
 +	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
 +	"github.com/devgianlu/go-librespot/spclient"
 +	"github.com/devgianlu/go-librespot/tracks"
 +	"google.golang.org/protobuf/proto"
@@ -277,3 +521,338 @@ new file mode 100644
 +		t.Fatal("continuation unexpectedly entered playback I/O")
 +	}
 +}
++
++func pc13TransferState() *connectpb.TransferState {
++	return &connectpb.TransferState{
++		Options:        &connectpb.ContextPlayerOptions{},
++		Playback:       &connectpb.Playback{Timestamp: 789, CurrentTrack: &connectpb.ContextTrack{Uri: "invalid-pc13-post-commit"}},
++		CurrentSession: &connectpb.Session{Context: &connectpb.Context{Uri: pc13ContextURI}, PlayOrigin: &connectpb.PlayOrigin{}, OriginalSessionId: proto.String("transfer-session")},
++		Queue:          &connectpb.Queue{},
++	}
++}
++
++func TestDealerIncompleteTransferRejectsBeforeAnyStateOrAliasMutation(t *testing.T) {
++	for _, missing := range []string{"unknown-only", "playback", "current-track", "current-track-identity", "invalid-gid", "oversized-gid", "queue-empty-track", "queue-nil-track", "queue-invalid-gid", "queue-oversized-gid", "context-empty-track", "context-nil-track", "context-invalid-gid", "context-oversized-gid", "context-uri-invalid-gid", "context-uri-oversized-gid", "session", "context", "origin", "options", "queue", "malformed-wire"} {
++		t.Run(missing, func(t *testing.T) {
++			state := pc13TransferState()
++			switch missing {
++			case "playback":
++				state.Playback = nil
++			case "current-track":
++				state.Playback.CurrentTrack = nil
++			case "current-track-identity":
++				state.Playback.CurrentTrack = &connectpb.ContextTrack{}
++			case "invalid-gid":
++				state.Playback.CurrentTrack = &connectpb.ContextTrack{Gid: []byte{1}}
++			case "oversized-gid":
++				state.Playback.CurrentTrack = &connectpb.ContextTrack{Gid: make([]byte, 17)}
++			case "queue-empty-track":
++				state.Queue.Tracks = []*connectpb.ContextTrack{{}}
++			case "queue-nil-track":
++				// Protobuf encodes a nil repeated message as an empty track.
++				state.Queue.Tracks = []*connectpb.ContextTrack{nil}
++			case "queue-invalid-gid":
++				state.Queue.Tracks = []*connectpb.ContextTrack{{Gid: []byte{1}}}
++			case "queue-oversized-gid":
++				state.Queue.Tracks = []*connectpb.ContextTrack{{Gid: make([]byte, 17)}}
++			case "context-empty-track", "context-nil-track", "context-invalid-gid", "context-oversized-gid", "context-uri-invalid-gid", "context-uri-oversized-gid":
++				track := &connectpb.ContextTrack{}
++				switch missing {
++				case "context-nil-track":
++					track = nil // Decodes as an empty track, as for the queue above.
++				case "context-invalid-gid":
++					track.Gid = []byte{1}
++				case "context-oversized-gid":
++					track.Gid = make([]byte, 17)
++				case "context-uri-invalid-gid":
++					track.Uri, track.Gid = "nonmatching-uri", []byte{1}
++				case "context-uri-oversized-gid":
++					track.Uri, track.Gid = "nonmatching-uri", make([]byte, 17)
++				}
++				state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{track}}}
++			case "session":
++				state.CurrentSession = nil
++			case "context":
++				state.CurrentSession.Context = nil
++			case "origin":
++				state.CurrentSession.PlayOrigin = nil
++			case "options":
++				state.Options = nil
++			case "queue":
++				state.Queue = nil
++			}
++			data, err := proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if missing == "unknown-only" {
++				data = []byte{0xf8, 0x07, 0x01}
++			}
++			if missing == "malformed-wire" {
++				data = []byte{0x12, 0xff}
++			}
++			p := pc13ExistingPlayer(t, true)
++			p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++			previousCommand := &dealer.RequestPayload{}
++			p.state.lastCommand = previousCommand
++			before := proto.Clone(p.state.player)
++			oldTracks, oldSince := p.state.tracks, p.state.activeSince
++			req := pc13PlayRequest(t)
++			req.Command.Endpoint = "transfer"
++			req.Command.Data = data
++			req.TargetAliasId = proto.Uint32(1)
++			// No Session is constructed: entering any provider path fails this test.
++			if err := p.handlePlayerCommand(context.Background(), req); err == nil {
++				t.Fatal("incomplete transfer was accepted")
++			}
++			if !proto.Equal(before, p.state.player) || !p.state.active || !p.state.activeSince.Equal(oldSince) || p.state.tracks != oldTracks || p.state.lastTransferTimestamp != 123 || p.state.queueID != 7 || p.state.lastCommand != previousCommand || p.state.device.SelectedAliasId != 2 {
++				t.Fatal("invalid transfer changed retained playback/command/alias ownership")
++			}
++			if len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("invalid transfer emitted an alias or playback event")
++			}
++		})
++	}
++}
++
++func TestDealerEmptyTransferRetainsAcceptedAliasPath(t *testing.T) {
++	p := pc13ExistingPlayer(t, true)
++	p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint = "transfer"
++	req.Command.Data = nil
++	req.TargetAliasId = proto.Uint32(1)
++	if err := p.handlePlayerCommand(context.Background(), req); err != nil {
++		t.Fatal(err)
++	}
++	events := p.app.server.(*aliasTestServer).events
++	if p.state.device.SelectedAliasId != 1 || p.state.lastTransferTimestamp != 123 || len(events) != 2 || events[0].Type != "selected_alias" || events[1].Type != ApiEventTypeActive {
++		t.Fatal("empty transfer changed existing alias selection/active receipt")
++	}
++}
++
++func TestDealerTransferAcceptsGidAndRetainsUriPrecedence(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		track *connectpb.ContextTrack
++	}{
++		{"sixteen-byte GID", &connectpb.ContextTrack{Gid: make([]byte, 16)}},
++		{"URI takes precedence over malformed GID", &connectpb.ContextTrack{Uri: "invalid-pc13-post-commit", Gid: []byte{1}}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			state := pc13TransferState()
++			state.Playback.CurrentTrack = tc.track
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-pc13-post-commit"}}}}
++			data, err := proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			p := pc13ExistingPlayer(t, false)
++			// Genuine zero-value Session supplies only its nil Spclient getter.
++			// Complete context pages avoid provider I/O; invalid media URI ends before stream I/O.
++			p.sess = &session.Session{}
++			req := pc13PlayRequest(t)
++			req.Command.Endpoint, req.Command.Data = "transfer", data
++			err = p.handlePlayerCommand(context.Background(), req)
++			if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++				t.Fatalf("expected preparation accepted then deliberate media boundary: %v", err)
++			}
++			if p.state.lastTransferTimestamp != 789 || p.state.player.SessionId != "transfer-session" || len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("valid identity did not reach original transfer commit without claiming playback")
++			}
++		})
++	}
++}
++
++func TestDealerTransferAcceptsCompleteContextAndQueueIdentities(t *testing.T) {
++	for _, queueTrack := range []*connectpb.ContextTrack{
++		{Uid: "q12", Gid: make([]byte, 16)},
++		{Uid: "q12", Uri: "spotify:track:0000000000000000000004", Gid: []byte{1}},
++	} {
++		t.Run(fmt.Sprintf("queue_uri_%t", queueTrack.Uri != ""), func(t *testing.T) {
++			state := pc13TransferState()
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{
++				{Uri: "invalid-pc13-post-commit"}, {Gid: make([]byte, 16)},
++			}}}
++			state.Queue.Tracks = []*connectpb.ContextTrack{queueTrack}
++			data, err := proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			p := pc13ExistingPlayer(t, false)
++			p.sess = &session.Session{}
++			req := pc13PlayRequest(t)
++			req.Command.Endpoint, req.Command.Data = "transfer", data
++			err = p.handlePlayerCommand(context.Background(), req)
++			if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++				t.Fatalf("expected accepted context/queue then deliberate media boundary: %v", err)
++			}
++			wantQueueURI := librespot.ContextTrackToProvidedTrack(librespot.SpotifyIdTypeTrack, queueTrack).Uri
++			if p.state.lastTransferTimestamp != 789 || p.state.queueID != 12 || len(p.state.player.NextTracks) != 2 ||
++				p.state.player.NextTracks[0].Uri != wantQueueURI || p.state.player.NextTracks[1].Uri != "spotify:track:0000000000000000000000" ||
++				len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("valid supplied context/queue identity did not retain conversion and queue semantics")
++			}
++		})
++	}
++}
++
++func TestDealerTransferStationWithoutMetadataRetainsAutoplay(t *testing.T) {
++	state := pc13TransferState()
++	state.CurrentSession.Context.Uri = "spotify:station:fixture"
++	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-pc13-post-commit"}}}}
++	data, err := proto.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := pc13ExistingPlayer(t, false)
++	p.sess = &session.Session{}
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint, req.Command.Data = "transfer", data
++	err = p.handlePlayerCommand(context.Background(), req)
++	if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++		t.Fatalf("expected normal station preparation then deliberate media boundary: %v", err)
++	}
++	if p.state.lastTransferTimestamp != 789 || p.state.player.ContextUri != "spotify:station:fixture" ||
++		p.state.player.Track.Metadata["autoplay.is_autoplay"] != "true" || p.state.player.Track.Provider != "autoplay" ||
++		len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("station track without supplied metadata lost existing autoplay semantics")
++	}
++}
++
++func TestDealerTransferRetainsLazyEmptyPage(t *testing.T) {
++	state := pc13TransferState()
++	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{PageUrl: "invalid-pc13-page-boundary"}}
++	data, err := proto.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := pc13ExistingPlayer(t, false)
++	p.sess = &session.Session{}
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint, req.Command.Data = "transfer", data
++	err = p.handlePlayerCommand(context.Background(), req)
++	if err == nil || !strings.Contains(err.Error(), "invalid page url: invalid-pc13-page-boundary") {
++		t.Fatalf("expected accepted lazy page then deliberate page-fetch boundary: %v", err)
++	}
++	if p.state.lastTransferTimestamp != 789 || p.state.player.SessionId != "transfer-session" || len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("lazy empty page was rejected at transfer admission")
++	}
++}
++
++func TestDealerTransferContextValidGidFallbackRetainsSeek(t *testing.T) {
++	state := pc13TransferState()
++	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{
++		{Uri: "nonmatching-uri", Gid: make([]byte, 16)}, {Uri: "invalid-pc13-post-commit"},
++	}}}
++	data, err := proto.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := pc13ExistingPlayer(t, false)
++	p.sess = &session.Session{}
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint, req.Command.Data = "transfer", data
++	err = p.handlePlayerCommand(context.Background(), req)
++	if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++		t.Fatalf("expected safe GID comparator fallback then deliberate media boundary: %v", err)
++	}
++	if p.state.lastTransferTimestamp != 789 || p.state.player.Track.Uri != "invalid-pc13-post-commit" ||
++		len(p.state.player.PrevTracks) != 1 || p.state.player.PrevTracks[0].Uri != "nonmatching-uri" ||
++		len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("valid GID comparator fallback changed existing seek/conversion behavior")
++	}
++}
++
++func TestTransferCurrencyRetainsExistingClusterIgnoreControls(t *testing.T) {
++	for _, tc := range []struct {
++		name, device string
++		timestamp    int64
++	}{
++		{"current device remains active", "fixture-device", 1000},
++		{"older foreign transfer remains ignored", "other-device", 122},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			p := pc13ExistingPlayer(t, true)
++			p.app.deviceId = "fixture-device"
++			before := proto.Clone(p.state.player)
++			payload, err := proto.Marshal(&connectpb.ClusterUpdate{Cluster: &connectpb.Cluster{ActiveDeviceId: tc.device, PlayerState: &connectpb.PlayerState{Timestamp: tc.timestamp}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			// Real cluster handler; taking the stop path would require absent player/Session I/O.
++			if err := p.handleDealerMessage(context.Background(), dealer.Message{Uri: "hm://connect-state/v1/cluster", Payload: payload}); err != nil {
++				t.Fatal(err)
++			}
++			if !p.state.active || p.state.lastTransferTimestamp != 123 || !proto.Equal(before, p.state.player) || len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("existing cluster ignore control changed")
++			}
++		})
++	}
++}
++
++func TestDealerTransferContext404PreservesCurrencyThenFreshPreparationCommits(t *testing.T) {
++	p := pc13ExistingPlayer(t, true)
++	p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
++	oldTracks, oldPrimary, oldSecondary, oldSince := p.state.tracks, p.primaryStream, p.secondaryStream, p.state.activeSince
++	before := proto.Clone(p.state.player)
++	state := pc13TransferState()
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint = "transfer"
++	requests := 0
++	var bodies []*pc13Body
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if requests > 2 || r.Method != http.MethodGet || r.URL.Host != "pc13.invalid" || r.URL.Path != "/context-resolve/v1/"+pc13ContextURI {
++			return nil, fmt.Errorf("unexpected request: %s %s", r.Method, r.URL)
++		}
++		status, payload := http.StatusNotFound, "not found"
++		if requests == 2 {
++			status = http.StatusOK
++			data, err := json.Marshal(&connectpb.Context{Uri: pc13ContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-pc13-post-commit", Metadata: map[string]string{}}}}}})
++			if err != nil {
++				return nil, err
++			}
++			payload = string(data)
++		}
++		body := &pc13Body{Reader: strings.NewReader(payload)}
++		bodies = append(bodies, body)
++		return &http.Response{StatusCode: status, Header: make(http.Header), Body: body, Request: r}, nil
++	}))
++	if err := p.handleTransferCommand(context.Background(), req, state, sp); err == nil || !strings.Contains(err.Error(), "context resolve: 404") {
++		t.Fatalf("rejected preparation=%v", err)
++	}
++	if !proto.Equal(before, p.state.player) || !p.state.active || !p.state.activeSince.Equal(oldSince) || p.state.lastTransferTimestamp != 123 || p.state.queueID != 7 || p.state.tracks != oldTracks || p.primaryStream != oldPrimary || p.secondaryStream != oldSecondary || p.state.device.SelectedAliasId != 2 || len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("failed transfer preparation changed accepted playback/currency")
++	}
++	if requests != 1 || bodies[0].closes != 1 {
++		t.Fatal("failed preparation retried or left response open")
++	}
++	// Observe successful preparation separately with no live streams: real media
++	// unloading/continuity requires Session/player I/O and is not proved here.
++	p.primaryStream, p.secondaryStream = nil, nil
++	// A subsequent explicit request, not a retry, reaches the same existing commit.
++	err := p.handleTransferCommand(context.Background(), req, state, sp)
++	if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
++		t.Fatalf("expected deliberate post-commit media boundary: %v", err)
++	}
++	if requests != 2 || len(bodies) != 2 || bodies[1].closes != 1 || p.state.lastTransferTimestamp != 789 || p.state.tracks == oldTracks || p.state.player.SessionId != "transfer-session" {
++		t.Fatal("successful preparation did not retain transfer currency/commit")
++	}
++	if len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("deliberate media failure emitted playback success")
++	}
++}
+diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
+--- a/spclient/context_resolver.go
++++ b/spclient/context_resolver.go
+@@ -73,6 +73,9 @@
+ 	for _, page := range spotCtx.Pages {
+ 		for _, track := range page.Tracks {
+ 			if autoplay {
++				if track.Metadata == nil {
++					track.Metadata = make(map[string]string)
++				}
+ 				track.Metadata["autoplay.is_autoplay"] = "true"
+ 			}
+ 		}
