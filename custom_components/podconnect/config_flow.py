@@ -6,12 +6,16 @@ from collections.abc import Mapping
 import logging
 from typing import Any
 
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult
+import voluptuous as vol
+
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlowResult, OptionsFlow
+from homeassistant.core import callback
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_NAME, CONF_TOKEN
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, LOGGER, SPOTIFY_API, SPOTIFY_SCOPES
+from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_API, SPOTIFY_SCOPES
+from .speakers import speakers_url
 
 
 class PodConnectFlowHandler(
@@ -21,6 +25,11 @@ class PodConnectFlowHandler(
 
     DOMAIN = DOMAIN
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return PodConnectOptionsFlow(config_entry)
 
     @property
     def logger(self) -> logging.Logger:
@@ -76,4 +85,31 @@ class PodConnectFlowHandler(
             user_input={
                 "implementation": self._get_reauth_entry().data["auth_implementation"]
             }
+        )
+
+
+class PodConnectOptionsFlow(OptionsFlow):
+    """One optional local connection, separate from the account's OAuth data."""
+
+    def __init__(self, entry) -> None:
+        self._entry = entry
+
+    async def async_step_init(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            value = user_input.get(CONF_SPEAKERS_URL, "").strip()
+            try:
+                value = speakers_url(value) if value else ""
+            except ValueError:
+                errors[CONF_SPEAKERS_URL] = "invalid_url"
+            else:
+                options = dict(self._entry.options)
+                options.pop(CONF_SPEAKERS_URL, None)
+                if value:
+                    options[CONF_SPEAKERS_URL] = value
+                return self.async_create_entry(title="", data=options)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({vol.Optional(CONF_SPEAKERS_URL, default=self._entry.options.get(CONF_SPEAKERS_URL, "")): str}),
+            errors=errors,
         )

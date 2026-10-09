@@ -8,6 +8,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## Speakers 0.26.7 / Control 0.10.3 — candidate 2026-10-09
+- Retry missing current-connection registration at the next existing state or
+  volume update; only accepted NEW_DEVICE registration credits readiness.
+- Treat historical playback-ready events as observations, preserving current
+  session status and pending status replies. Spotify visibility remains unproven.
+- Keep configured room IDs and selected aliases aligned across local Connect
+  updates; expose compatible Home Assistant target discovery and playback controls.
+- Fence native attention commands and callback lifetimes by exact ownership,
+  reject expired admission after delayed state reads, and retain the original
+  grant for cleanup. Restore only through the existing native completion path.
+- Describe a selected output, Spotify activity and a requested tone accurately;
+  a request does not prove audible playback. The tone response uses `requested`
+  instead of the unverified `playing` field.
+- Final checks, publication, installation and physical acceptance are pending.
+  Spotify discovery latency, provider acceptance and room behavior remain open.
+
 ## Speakers 0.26.6 — candidate 2026-10-08
 - Resolve a dealer-play context before changing active state, play origin, suppressions,
   or shuffle/repeat overrides. A rejected context keeps the preceding playback state.

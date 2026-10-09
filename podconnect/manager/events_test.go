@@ -203,3 +203,73 @@ func TestWSAcceptKey(t *testing.T) {
 		t.Fatalf("accept got %q", got)
 	}
 }
+
+// A lifetime readiness event from a retired AppPlayer can arrive on the same
+// current WebSocket. Exercise the current phase (not the retired-source veto).
+func TestPC10HistoricalPlaybackReadyCannotOwnCurrentSession(t *testing.T) {
+	cases := []struct {
+		name                    string
+		active, paused, stopped bool
+	}{
+		{"current_B_paused", true, true, false},
+		{"idle", false, false, true},
+		{"active", true, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			live := &glLive{}
+			oldSource, stop := pc11Source(t, live)
+			live.retirePhase(oldSource)
+			current, ok := live.beginPhase(glSource{run: oldSource.run, stop: stop})
+			if !ok {
+				t.Fatal("fresh current phase refused")
+			}
+			binding := &aliasBinding{Incarnation: "player-B", Registry: "registry-B", RoomID: "room-B", Ready: true}
+			initial := glStatus{Active: c.active, Paused: c.paused, Stopped: c.stopped, HasVol: true, VolPct: 65, SelAlias: 2, AliasBinding: binding}
+			if !live.acceptStatus(pc11Request(t, live, current), initial) {
+				t.Fatal("current B status refused")
+			}
+			live.applySourceEvent(current, "metadata", map[string]any{"uri": "spotify:track:B"})
+			held := pc11Request(t, live, current)
+			before := live.Get()
+			beforeBinding := *before.AliasBinding
+			beforeWire, beforeAlias, beforeDispatch := live.wireRevision, live.aliasRevision, live.routeDispatchSeq
+			beforeTrack, beforeURI := live.trackChangeSeq, live.trackURI
+			beforeNext, beforeAccepted := live.nextRequest, live.acceptedRequest
+			beforeRun, beforePhase, beforeRetired := live.runEpoch, live.phaseEpoch, live.sourceRetired
+			beforeManual, beforeIncarnation := live.manualOrdinal, live.manualIncarnation
+			beforeAction, beforeObservation := live.manualAction, live.manualObservation
+			// The old event carries no producer identity. Deliberately dispatch it through
+			// the current source, just as the retained same-server socket reader does.
+			live.applySourceEvent(current, "playback_ready", map[string]any{"uri": "spotify:track:A", "id": 1, "value": 5})
+			if live.Get() != before || *live.Get().AliasBinding != beforeBinding ||
+				live.wireRevision != beforeWire || live.aliasRevision != beforeAlias || live.routeDispatchSeq != beforeDispatch ||
+				live.trackChangeSeq != beforeTrack || live.trackURI != beforeURI ||
+				live.nextRequest != beforeNext || live.acceptedRequest != beforeAccepted ||
+				live.runEpoch != beforeRun || live.phaseEpoch != beforePhase || live.sourceRetired != beforeRetired ||
+				live.manualOrdinal != beforeManual || live.manualIncarnation != beforeIncarnation ||
+				live.manualAction != beforeAction || live.manualObservation != beforeObservation {
+				t.Fatal("historical ready changed current state or an owner ledger")
+			}
+			// Transport must actually be accepted, not merely an unrelated volume group.
+			refreshed := glStatus{Active: !c.active, Paused: !c.paused, Stopped: !c.stopped, HasVol: true, VolPct: 42, SelAlias: 2, AliasBinding: binding}
+			if !live.acceptStatus(held, refreshed) || live.Get() != refreshed || live.acceptedRequest != held.sequence {
+				t.Fatalf("ready vetoed current status groups: got %+v want %+v", live.Get(), refreshed)
+			}
+			if live.wireRevision != beforeWire || live.aliasRevision != beforeAlias || live.trackChangeSeq != beforeTrack || live.trackURI != beforeURI {
+				t.Fatal("status refresh changed unrelated alias intent, wire revisions or track")
+			}
+		})
+	}
+}
+
+func TestPC10PlaybackReadyPureMappingIsOnlyHistorical(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		binding := &aliasBinding{Incarnation: "player-B", Registry: "registry-B", RoomID: "room-B", Ready: true}
+		before := glStatus{Active: active, Paused: true, Stopped: true, HasVol: true, VolPct: 65, SelAlias: 2, AliasBinding: binding}
+		got, uri, changed := applyGLEvent(before, "spotify:track:B", "playback_ready", map[string]any{"id": 1, "value": 5, "uri": "spotify:track:A"})
+		if got != before || uri != "spotify:track:B" || changed {
+			t.Fatalf("historical ready mutated pure mapping: %+v %q %v", got, uri, changed)
+		}
+	}
+}

@@ -15,6 +15,7 @@ from homeassistant.core import (
     SupportsResponse,
 )
 from homeassistant.exceptions import HomeAssistantError, ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.config_entry_oauth2_flow import (
     ImplementationUnavailableError,
     OAuth2Session,
@@ -22,8 +23,10 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 )
 
 from .api import SpotifyApi, SpotifyApiError
-from .const import DOMAIN, LOGGER, SPOTIFY_SCOPES
+from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_SCOPES
 from .coordinator import PodConnectCoordinator
+from .speakers import SpeakersClient
+from .targets import register_target_services
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER]
 
@@ -35,6 +38,8 @@ class PodConnectData:
     api: SpotifyApi
     coordinator: PodConnectCoordinator
     session: OAuth2Session
+    speakers: SpeakersClient | None = None
+    active: bool = False
 
 
 PodConnectConfigEntry = ConfigEntry[PodConnectData]
@@ -112,12 +117,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     coordinator = PodConnectCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()
 
-    entry.runtime_data = PodConnectData(api=api, coordinator=coordinator, session=session)
+    base = entry.options.get(CONF_SPEAKERS_URL)
+    speakers = SpeakersClient(async_get_clientsession(hass), base) if base else None
+    entry.runtime_data = PodConnectData(api=api, coordinator=coordinator, session=session, speakers=speakers)
     _register_services(hass)
+    register_target_services(hass)
+    entry.async_on_unload(entry.add_update_listener(_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.runtime_data.active = True
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    data = entry.runtime_data
+    previously_active = data.active
+    data.active = False  # Retire new admission before the platform unload can yield.
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unloaded:
+        data.active = previously_active
+    return unloaded
+
+
+async def _options_updated(hass: HomeAssistant, entry: PodConnectConfigEntry) -> None:
+    """Replace the entry-owned client through the normal HA unload/setup path."""
+    await hass.config_entries.async_reload(entry.entry_id)

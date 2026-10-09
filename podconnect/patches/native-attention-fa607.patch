@@ -1,0 +1,3917 @@
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -166,3 +166,82 @@
+ # flex/bison automake's support leaves something to be desired
+ clean-local:
+ 	rm -f $(LEXER_SRC:.l=.[ch]) $(PARSER_SRC:.y=.[ch])
++
++# PC9: these checks exercise the exact compiled queue and output owners.
++# They do not claim receiver readiness, RTP audibility or physical restoration.
++check_PROGRAMS = outputs_attention_owner evrtsp_guarded_owner_contract airplay_callback_owner
++TESTS = $(check_PROGRAMS)
++outputs_attention_owner_SOURCES = ../tests/outputs_attention_owner.c misc.c
++outputs_attention_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)
++outputs_attention_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
++outputs_attention_owner_LDFLAGS = -Wl,--gc-sections
++outputs_attention_owner_LDADD = $(owntone_LDADD) -lm
++evrtsp_guarded_owner_contract_SOURCES = ../tests/evrtsp_guarded_owner_contract.c evrtsp/rtsp.c
++evrtsp_guarded_owner_contract_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)/evrtsp
++evrtsp_guarded_owner_contract_LDADD = $(owntone_LDADD)
++EXTRA_DIST += ../tests/evrtsp_owner_contract.c
++
++# Complete actual AirPlay/outputs/RTSP TUs are included by this owner fixture.
++# Remaining production objects/libraries stay real; no daemon startup is called.
++airplay_callback_owner_SOURCES = ../tests/airplay_callback_owner.c \
++	db.c db.h \
++	db_init.c db_init.h \
++	db_upgrade.c db_upgrade.h \
++	logger.c logger.h \
++	conffile.h \
++	cache.c cache.h \
++	library/filescanner.c library/filescanner.h \
++	library/filescanner_ffmpeg.c library/filescanner_playlist.c \
++	library/filescanner_smartpl.c library/filescanner_itunes.c \
++	library/filescanner_mountwatch.c \
++	library/rssscanner.c \
++	library.c library.h \
++	$(MDNS_SRC) mdns.h \
++	remote_pairing.c remote_pairing.h \
++	httpd_libevhttp.c \
++	httpd.c httpd.h httpd_internal.h \
++	httpd_rsp.c \
++	httpd_daap.c httpd_daap.h \
++	httpd_dacp.c \
++	httpd_jsonapi.c \
++	httpd_streaming.c \
++	httpd_oauth.c \
++	httpd_artworkapi.c \
++	http.c http.h \
++	dmap_common.c dmap_common.h \
++	transcode.c transcode.h \
++	artwork.c artwork.h \
++	misc.c misc.h \
++	misc_json.c misc_json.h \
++	misc_xml.c misc_xml.h \
++	rng.c rng.h \
++	smartpl_query.c smartpl_query.h \
++	player.c player.h \
++	worker.c worker.h \
++	settings.c settings.h \
++	input.h input.c \
++	inputs/file.c inputs/http.c inputs/pipe.c inputs/timer.c \
++	outputs.h \
++	outputs/rtp_common.h outputs/rtp_common.c \
++	outputs/raop.c $(PAIR_AP_SRC) \
++	outputs/airplay_events.c outputs/airplay_events.h \
++	outputs/streaming.c \
++	outputs/dummy.c outputs/fifo.c outputs/rcp.c \
++	$(ALSA_SRC) $(PULSEAUDIO_SRC) $(CHROMECAST_SRC) \
++	evrtsp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h \
++	evthr.c evthr.h \
++	$(SPOTIFY_SRC) \
++	$(LASTFM_SRC) \
++	listenbrainz.c listenbrainz.h \
++	$(MPD_SRC) \
++	listener.c listener.h \
++	commands.c commands.h \
++	ptpd.c ptpd.h \
++	outputs/plist_wrap.h \
++	$(LIBWEBSOCKETS_SRC) \
++	$(GPERF_SRC) \
++	$(LEXER_SRC) $(PARSER_SRC)
++airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp
++airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
++airplay_callback_owner_LDFLAGS = -Wl,--gc-sections
++airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
+--- a/src/evrtsp/evrtsp.h
++++ b/src/evrtsp/evrtsp.h
+@@ -108,6 +108,10 @@
+ 	/* Callback */
+ 	void (*cb)(struct evrtsp_request *, void *);
+ 	void *cb_arg;
++	/* Optional strict producer admission, immediately before serialization.
++	 * Ordinary requests leave this NULL. The predicate must be read-only. */
++	int (*dispatch_current)(void *);
++	void *dispatch_current_arg;
+ };
+ 
+ /**
+@@ -167,6 +171,13 @@
+     struct evrtsp_request *req,
+     enum evrtsp_cmd_type type, const char *uri);
+ 
++/* Strict producer variant: negative return leaves this request caller-owned.
++ * A nonnegative return transfers ownership even when dispatch is vetoed; that
++ * veto invokes the registered callback with NULL and frees the request. */
++int evrtsp_make_request_guarded(struct evrtsp_connection *evcon,
++    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri,
++    int (*dispatch_current)(void *), void *arg);
++
+ const char *evrtsp_request_uri(struct evrtsp_request *req);
+ 
+ /* Interfaces for dealing with headers */
+--- a/src/evrtsp/rtsp-internal.h
++++ b/src/evrtsp/rtsp-internal.h
+@@ -55,7 +55,15 @@
+ 
+ struct event_base;
+ 
++/* Stack-owned observations for the async connect-error callback loop only.
++ * Free remains synchronous; no request/session lifetime is deferred. */
++struct evrtsp_connection_free_observer {
++	int freed;
++	struct evrtsp_connection_free_observer *previous;
++};
++
+ struct evrtsp_connection {
++	struct evrtsp_connection_free_observer *free_observer;
+ 	int fd;
+ 	struct event ev;
+ 	struct event close_ev;
+--- a/src/evrtsp/rtsp.c
++++ b/src/evrtsp/rtsp.c
+@@ -679,6 +679,14 @@
+ evrtsp_connection_free(struct evrtsp_connection *evcon)
+ {
+ 	struct evrtsp_request *req;
++	struct evrtsp_connection_free_observer *observer;
++
++	/* A request callback may destroy this connection while a connect-error
++	 * loop is on the stack. Mark every nested observation before callbacks or
++	 * ordinary synchronous destruction. No connection access is then needed
++	 * by those loops, and canceled queued requests receive no callback. */
++	for (observer = evcon->free_observer; observer; observer = observer->previous)
++		observer->freed = 1;
+ 
+ 	/* notify interested parties that this connection is going down */
+ 	if (evcon->fd != -1) {
+@@ -722,6 +730,35 @@
+ 	free(evcon);
+ }
+ 
++/* Guard rejection remains queue-owned until this existing connection event.
++ * Connection free cancels the event and drops the request with ordinary queue
++ * ownership. No synchronous recursive rejection can invoke a later callback
++ * into an earlier context after its session/connection has been freed. */
++static void
++evrtsp_guard_rejected_cb(evutil_socket_t fd, short events, void *arg)
++{
++	struct evrtsp_connection *evcon = arg;
++	struct evrtsp_request *req = TAILQ_FIRST(&evcon->requests);
++	void (*cb)(struct evrtsp_request *, void *);
++	void *cb_arg;
++	(void)fd;
++	(void)events;
++	assert(req != NULL && req->dispatch_current != NULL);
++	cb = req->cb;
++	cb_arg = req->cb_arg;
++	TAILQ_REMOVE(&evcon->requests, req, next);
++	req->evcon = NULL;
++	evrtsp_request_free(req);
++	evcon->state = EVCON_IDLE;
++	if (TAILQ_FIRST(&evcon->requests) != NULL)
++		evrtsp_request_dispatch(evcon);
++	else
++		evrtsp_connection_start_detectclose(evcon);
++	if (cb != NULL)
++		(*cb)(NULL, cb_arg);
++	/* Callback may free the connection: no access after this point. */
++}
++
+ static void
+ evrtsp_request_dispatch(struct evrtsp_connection* evcon)
+ {
+@@ -733,6 +770,16 @@
+ 
+ 	/* delete possible close detection events */
+ 	evrtsp_connection_stop_detectclose(evcon);
++
++	if (req->dispatch_current && !req->dispatch_current(req->dispatch_current_arg)) {
++		struct timeval deferred = {0, 0};
++		evcon->state = EVCON_WRITING; /* head owned; additional requests stay FIFO */
++		event_assign(&evcon->ev, evcon->base, -1, EV_TIMEOUT,
++		    evrtsp_guard_rejected_cb, evcon);
++		if (event_add(&evcon->ev, &deferred) < 0)
++			event_err(1, "%s: failed to schedule guarded rejection", __func__);
++		return;
++	}
+ 	
+ 	/* we assume that the connection is connected already */
+ 	assert(evcon->state == EVCON_IDLE);
+@@ -852,6 +899,12 @@
+  cleanup:
+   evrtsp_connection_reset(evcon);
+ 
++  /* Connect failed while CONNECTING; reset has closed fd and cannot notify
++   * a connected closecb. Observe request-callback destruction locally. */
++  {
++  struct evrtsp_connection_free_observer observer = {0, evcon->free_observer};
++  evcon->free_observer = &observer;
++
+   /* for now, we just signal all requests by executing their callbacks */
+   while (TAILQ_FIRST(&evcon->requests) != NULL) {
+     struct evrtsp_request *request = TAILQ_FIRST(&evcon->requests);
+@@ -861,6 +914,10 @@
+     /* we might want to set an error here */
+     request->cb(request, request->cb_arg);
+     evrtsp_request_free(request);
++    if (observer.freed)
++      return; /* Only the local observer is read after connection destruction. */
++  }
++  evcon->free_observer = observer.previous;
+   }
+ }
+ 
+@@ -1455,11 +1512,12 @@
+  * this will start the connection.
+  */
+ 
+-int
+-evrtsp_make_request(struct evrtsp_connection *evcon,
++static int
++evrtsp_make_request_internal(struct evrtsp_connection *evcon,
+     struct evrtsp_request *req,
+-    enum evrtsp_cmd_type type, const char *uri)
+-{
++    enum evrtsp_cmd_type type, const char *uri, int strict_error_ownership)
++{
++	int ret;
+ event_debug(("%s: TEST", __func__));
+ 
+ 	/* We are making a request */
+@@ -1483,8 +1541,16 @@
+ 	TAILQ_INSERT_TAIL(&evcon->requests, req, next);
+ 
+ 	/* If the connection object is not connected; make it so */
+-	if (!evrtsp_connected(evcon))
+-		return (evrtsp_connection_connect(evcon));
++	if (!evrtsp_connected(evcon)) {
++		ret = evrtsp_connection_connect(evcon);
++		if (ret < 0 && strict_error_ownership) {
++			/* Only the guarded producer retains ownership on error. RAOP's
++			 * ordinary negative-return connection ownership stays intact. */
++			TAILQ_REMOVE(&evcon->requests, req, next);
++			req->evcon = NULL;
++		}
++		return (ret);
++	}
+ 
+ 	/*
+ 	 * If it's connected already and we are the first in the queue,
+@@ -1495,6 +1561,23 @@
+ 		evrtsp_request_dispatch(evcon);
+ 
+ 	return (0);
++}
++
++int
++evrtsp_make_request(struct evrtsp_connection *evcon,
++    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri)
++{
++	return evrtsp_make_request_internal(evcon, req, type, uri, 0);
++}
++
++int
++evrtsp_make_request_guarded(struct evrtsp_connection *evcon,
++    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri,
++    int (*dispatch_current)(void *), void *arg)
++{
++	req->dispatch_current = dispatch_current;
++	req->dispatch_current_arg = arg;
++	return evrtsp_make_request_internal(evcon, req, type, uri, 1);
+ }
+ 
+ /*
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1607,6 +1607,8 @@
+   int output_volume;
+ };
+ 
++static json_object *attention_state_to_json(const struct output_attention_state *state);
++
+ static json_object *
+ speaker_to_json(struct player_speaker_info *spk)
+ {
+@@ -1633,6 +1635,8 @@
+   json_object_object_add(output, "requires_auth", json_object_new_boolean(spk->requires_auth));
+   json_object_object_add(output, "needs_auth_key", json_object_new_boolean(spk->needs_auth_key));
+   json_object_object_add(output, "volume", json_object_new_int(spk->absvol));
++  if (spk->has_attention_identity)
++    json_object_object_add(output, "attention_identity", attention_state_to_json(&spk->attention_identity));
+   json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
+   json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
+   json_object_object_add(output, "supported_formats", supported_formats);
+@@ -1650,6 +1654,200 @@
+ 
+   output = speaker_to_json(spk);
+   json_object_array_add(outputs, output);
++}
++
++// Attention IDs/revisions are decimal strings, never lossy JSON numbers.
++static void
++attention_json_u64(json_object *object, const char *key, uint64_t value)
++{
++  char text[21];
++  snprintf(text, sizeof(text), "%" PRIu64, value);
++  json_object_object_add(object, key, json_object_new_string(text));
++}
++
++static json_object *
++attention_state_to_json(const struct output_attention_state *state)
++{
++  json_object *object = json_object_new_object();
++  json_object_object_add(object, "process", json_object_new_string(state->process));
++  attention_json_u64(object, "device_id", state->device_id);
++  attention_json_u64(object, "device_incarnation", state->device_incarnation);
++  attention_json_u64(object, "session_epoch", state->session_epoch);
++  attention_json_u64(object, "base_revision", state->base_revision);
++  attention_json_u64(object, "attention_revision", state->attention_revision);
++  attention_json_u64(object, "route_revision", state->route_revision);
++  attention_json_u64(object, "lease", state->lease);
++  json_object_object_add(object, "base_volume", json_object_new_int(state->base_volume));
++  json_object_object_add(object, "effective_volume", json_object_new_int(state->effective_volume));
++  json_object_object_add(object, "restoring", json_object_new_boolean(state->restoring));
++  return object;
++}
++
++static json_object *
++attention_result_to_json(const struct output_attention_result *result)
++{
++  const char *names[] = { "pending", "desired_only", "protocol_accepted", "failed", "unknown" };
++  const char *actions[] = { "begin", "update", "release", "flush", "manual" };
++  json_object *object = json_object_new_object();
++  json_object_object_add(object, "identity", attention_state_to_json(&result->identity));
++  json_object_object_add(object, "request_id", json_object_new_string(result->command.request_id));
++  attention_json_u64(object, "operation", result->operation);
++  json_object_object_add(object, "action", json_object_new_string(actions[result->action]));
++  json_object_object_add(object, "outcome", json_object_new_string(names[result->outcome]));
++  json_object_object_add(object, "response_code", json_object_new_int(result->response_code));
++  json_object_object_add(object, "request_cseq", json_object_new_int(result->request_cseq));
++  json_object_object_add(object, "current", json_object_new_boolean(result->current));
++  return object;
++}
++
++static int
++attention_parse_u64(json_object *object, const char *key, uint64_t *value)
++{
++  json_object *field;
++  const char *text, *p;
++  if (!json_object_object_get_ex(object, key, &field) || !json_object_is_type(field, json_type_string))
++    return -1;
++  text = json_object_get_string(field);
++  if (!text || !*text || strlen(text) > 20)
++    return -1;
++  for (p = text; *p; p++)
++    if (*p < '0' || *p > '9') return -1;
++  return safe_atou64(text, value);
++}
++
++static int
++attention_parse_state(json_object *object, struct output_attention_state *state)
++{
++  json_object *field;
++  const char *process;
++  int i;
++  if (!object || !json_object_is_type(object, json_type_object) || json_object_object_length(object) != 11
++      || !jparse_contains_key(object, "process", json_type_string))
++    return -1;
++  memset(state, 0, sizeof(*state));
++  process = jparse_str_from_obj(object, "process");
++  if (!process || strlen(process) != 36) return -1;
++  for (i = 0; i < 36; i++)
++    if (i == 8 || i == 13 || i == 18 || i == 23)
++      { if (process[i] != '-') return -1; }
++    else if (!((process[i] >= '0' && process[i] <= '9') || (process[i] >= 'a' && process[i] <= 'f')))
++      return -1;
++  memcpy(state->process, process, 36);
++  if (attention_parse_u64(object, "device_id", &state->device_id) < 0
++      || attention_parse_u64(object, "device_incarnation", &state->device_incarnation) < 0
++      || attention_parse_u64(object, "session_epoch", &state->session_epoch) < 0
++      || attention_parse_u64(object, "base_revision", &state->base_revision) < 0
++      || attention_parse_u64(object, "attention_revision", &state->attention_revision) < 0
++      || attention_parse_u64(object, "route_revision", &state->route_revision) < 0
++      || attention_parse_u64(object, "lease", &state->lease) < 0
++      || !jparse_contains_key(object, "base_volume", json_type_int)
++      || !jparse_contains_key(object, "effective_volume", json_type_int)
++      || !jparse_contains_key(object, "restoring", json_type_boolean))
++    return -1;
++  // Check the int64 before conversion, so oversized JSON numbers cannot wrap.
++  json_object_object_get_ex(object, "base_volume", &field);
++  if (json_object_get_int64(field) < 0 || json_object_get_int64(field) > 100) return -1;
++  state->base_volume = json_object_get_int(field);
++  json_object_object_get_ex(object, "effective_volume", &field);
++  if (json_object_get_int64(field) < 0 || json_object_get_int64(field) > 100) return -1;
++  state->effective_volume = json_object_get_int(field);
++  state->restoring = jparse_bool_from_obj(object, "restoring");
++  return 0;
++}
++
++static int
++jsonapi_reply_output_attention_get(struct httpd_request *hreq)
++{
++  uint64_t id;
++  struct output_attention_state state;
++  struct output_attention_result result;
++  const char *request_id = httpd_query_value_find(hreq->query, "request_id");
++  const char *process = httpd_query_value_find(hreq->query, "process");
++  json_object *reply;
++  if (request_id)
++    {
++      if (!process || strlen(process) != 36 || strlen(request_id) != 36
++          || safe_atou64(hreq->path_parts[2], &id) < 0
++          || player_attention_request_get(process, id, request_id, &result) < 0)
++        return HTTP_NOTFOUND;
++      reply = attention_result_to_json(&result);
++      CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
++      jparse_free(reply);
++      return HTTP_OK; // Receipt observation only, no write/new admission.
++    }
++  if (safe_atou64(hreq->path_parts[2], &id) < 0 || player_attention_state_get(id, &state) < 0)
++    return HTTP_NOTFOUND;
++  reply = attention_state_to_json(&state);
++  attention_json_u64(reply, "last_release_operation", state.last_release_operation);
++  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
++  jparse_free(reply);
++  return HTTP_OK;
++}
++
++static int
++jsonapi_reply_output_attention_put(struct httpd_request *hreq)
++{
++  struct output_attention_request request = { 0 };
++  struct output_attention_result result;
++  json_object *body = jparse_obj_from_evbuffer(hreq->in_body), *expected, *field, *reply;
++  uint64_t id;
++  const char *action, *request_id;
++  int i;
++  int ret = HTTP_BADREQUEST;
++  if (!body || !json_object_is_type(body, json_type_object) || json_object_object_length(body) != 5
++      || safe_atou64(hreq->path_parts[2], &id) < 0
++      || !json_object_object_get_ex(body, "expected", &expected)
++      || attention_parse_state(expected, &request.expected) < 0 || request.expected.device_id != id
++      || !jparse_contains_key(body, "request_id", json_type_string)
++      || !jparse_contains_key(body, "action", json_type_string)
++      || !jparse_contains_key(body, "cap_volume", json_type_int)
++      || !jparse_contains_key(body, "ttl_ms", json_type_int))
++    goto out;
++  request_id = jparse_str_from_obj(body, "request_id");
++  if (!request_id || strlen(request_id) != 36) goto out;
++  for (i = 0; i < 36; i++)
++    if (i == 8 || i == 13 || i == 18 || i == 23)
++      { if (request_id[i] != '-') goto out; }
++    else if (!((request_id[i] >= '0' && request_id[i] <= '9') || (request_id[i] >= 'a' && request_id[i] <= 'f')))
++      goto out;
++  memcpy(request.request_id, request_id, 36);
++  action = jparse_str_from_obj(body, "action");
++  if (strcmp(action, "begin") == 0) request.action = OUTPUT_ATTENTION_BEGIN;
++  else if (strcmp(action, "update") == 0) request.action = OUTPUT_ATTENTION_UPDATE;
++  else if (strcmp(action, "release") == 0) request.action = OUTPUT_ATTENTION_RELEASE;
++  else if (strcmp(action, "manual") == 0) request.action = OUTPUT_ATTENTION_MANUAL;
++  else goto out; // FLUSH is admitted only by the native selection owner.
++  json_object_object_get_ex(body, "cap_volume", &field);
++  if (json_object_get_int64(field) < 0 || json_object_get_int64(field) > 100) goto out;
++  request.cap_volume = json_object_get_int(field);
++  json_object_object_get_ex(body, "ttl_ms", &field);
++  if (json_object_get_int64(field) < 0 || json_object_get_int64(field) > 15000) goto out;
++  request.ttl_ms = json_object_get_int(field);
++  if (player_attention_admit(&request, &result) < 0) goto out;
++  reply = attention_result_to_json(&result);
++  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
++  jparse_free(reply);
++  ret = HTTP_OK; // Explicit outcome, never an implicit native apply/204 receipt.
++ out:
++  jparse_free(body);
++  return ret;
++}
++
++static int
++jsonapi_reply_output_attention_result(struct httpd_request *hreq)
++{
++  struct output_attention_result result;
++  uint64_t id, operation;
++  const char *process = httpd_query_value_find(hreq->query, "process");
++  json_object *reply;
++  if (!process || strlen(process) != 36 || safe_atou64(hreq->path_parts[2], &id) < 0
++      || safe_atou64(hreq->path_parts[4], &operation) < 0
++      || player_attention_result_get(process, operation, &result) < 0 || result.identity.device_id != id)
++    return HTTP_NOTFOUND;
++  reply = attention_result_to_json(&result);
++  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
++  jparse_free(reply);
++  return HTTP_OK;
+ }
+ 
+ /*
+@@ -4692,6 +4890,9 @@
+     { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_get },
++    { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_put },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention/[[:digit:]]+$", jsonapi_reply_output_attention_result },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -19,6 +19,7 @@
+ #endif
+ 
+ #include <stdio.h>
++#include <stddef.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <stdint.h>
+@@ -218,6 +219,8 @@
+   struct evbuffer *encoded_buffer;
+ 
+   struct rtp_session *rtp_session;
++  uint64_t packet_serial;
++  uint64_t *packet_serials; // Mirrors existing ring slots; no audio/ring reset.
+ 
+   struct rtcp_timestamp cur_stamp;
+ 
+@@ -237,10 +240,23 @@
+   struct airplay_master_session *next;
+ };
+ 
++struct airplay_attention_request;
++struct airplay_seq_ctx;
++
+ struct airplay_session
+ {
+   uint64_t device_id;
+   int callback_id;
++  uint64_t callback_revision; // Command binding, distinct from reusable output slot.
++  bool callback_revision_exhausted;
++  uint64_t device_incarnation;
++  uint64_t session_epoch;
++  struct airplay_attention_request *attention_requests;
++  struct airplay_seq_ctx *sequence_requests;
++  bool attention_managed;
++  bool attention_suspended;
++  bool attention_retiring;
++  uint64_t emission_floor;
+ 
+   struct airplay_master_session *master_session;
+ 
+@@ -310,6 +326,15 @@
+   uint32_t ptpd_slave_id;
+ 
+   struct airplay_session *next;
++};
++
++
++struct airplay_attention_request
++{
++  struct output_attention_result operation;
++  struct airplay_session *session;
++  int cseq;
++  struct airplay_attention_request *next;
+ };
+ 
+ struct airplay_metadata
+@@ -371,6 +396,12 @@
+   struct airplay_session *session;
+   void *payload_make_arg;
+   const char *log_caller;
++  int callback_id;
++  uint64_t callback_revision;
++  uint64_t device_incarnation;
++  uint64_t session_epoch;
++  bool callback_owned;
++  struct airplay_seq_ctx *next;
+ };
+ 
+ 
+@@ -491,6 +522,9 @@
+ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
+ static void
+ sequence_continue(struct airplay_seq_ctx *seq_ctx);
++static void
++sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
++    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent);
+ 
+ 
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+@@ -1091,7 +1125,11 @@
+ 	state = OUTPUT_STATE_FAILED;
+     }
+ 
+-  outputs_cb(session->callback_id, session->device_id, state);
++  if (session->attention_managed)
++    outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
++        session->session_epoch, session, state);
++  else
++    outputs_cb(session->callback_id, session->device_id, state);
+   session->callback_id = -1;
+ }
+ 
+@@ -1103,6 +1141,7 @@
+ 
+   outputs_quality_unsubscribe(&ams->rtp_session->quality);
+   rtp_session_free(ams->rtp_session);
++  free(ams->packet_serials);
+ 
+   transcode_encode_cleanup(&ams->encode_ctx);
+ 
+@@ -1173,7 +1212,9 @@
+   clock_id = use_ptp ? ptpd_clock_id_get() : 0;
+ 
+   ams->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
+-  if (!ams->rtp_session)
++  if (ams->rtp_session)
++    ams->packet_serials = calloc(ams->rtp_session->pktbuf_size, sizeof(*ams->packet_serials));
++  if (!ams->rtp_session || !ams->packet_serials)
+     {
+       goto error;
+     }
+@@ -1233,6 +1274,24 @@
+     {
+       evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
+       evrtsp_connection_free(session->ctrl);
++    }
++
++  // The actual connection has retired all queued requests/callback events.
++  // Executing contexts unlinked before entering handlers; only queue-owned
++  // contexts remain here, including sequences admitted before PC9 management.
++  while (session->sequence_requests)
++    {
++      struct airplay_seq_ctx *pending = session->sequence_requests;
++      session->sequence_requests = pending->next;
++      free(pending);
++    }
++
++  while (session->attention_requests)
++    {
++      struct airplay_attention_request *pending = session->attention_requests;
++      session->attention_requests = pending->next;
++      outputs_attention_complete(&pending->operation, OUTPUT_ATTENTION_UNKNOWN, 0, pending->cseq);
++      free(pending);
+     }
+ 
+   if (session->deferredev)
+@@ -1264,6 +1323,9 @@
+ session_cleanup(struct airplay_session *session)
+ {
+   struct airplay_session *s;
++  bool retiring = session->attention_retiring;
++  uint64_t id = session->device_id, incarnation = session->device_incarnation, epoch = session->session_epoch;
++  const void *old_session = session;
+ 
+   if (session == airplay_sessions)
+     airplay_sessions = airplay_sessions->next;
+@@ -1278,9 +1340,11 @@
+ 	s->next = session->next;
+     }
+ 
+-  outputs_device_session_remove(session->device_id);
++  outputs_device_session_remove_exact(session->device_id, session);
+ 
+   session_free(session);
++  if (retiring)
++    outputs_attention_retirement_finished(id, incarnation, epoch, old_session);
+ }
+ 
+ static void
+@@ -1314,6 +1378,27 @@
+ 
+   evutil_timerclear(&tv);
+   evtimer_add(session->deferredev, &tv);
++}
++
++// Numeric output callback slots may be reused. Advance command currency on
++// every actual binding, even if the callback number happens to be unchanged.
++static bool
++session_callback_bind(struct airplay_session *session, int callback_id)
++{
++  session->callback_id = callback_id;
++  if (session->callback_revision == UINT64_MAX)
++    {
++      if (session->attention_managed)
++        {
++          session->callback_revision_exhausted = true;
++          session->attention_suspended = true;
++          deferred_session_failure(session);
++          return false;
++        }
++      return true; // Ordinary sessions do not consult this added currency.
++    }
++  session->callback_revision++;
++  return true;
+ }
+ 
+ static void
+@@ -1594,7 +1679,7 @@
+   CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
+ 
+   session->devname = strdup(device->name);
+-  session->volume = device->volume;
++  session->volume = outputs_device_effective_volume(device);
+   session->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
+ 
+   session->state = AIRPLAY_STATE_STOPPED;
+@@ -1603,6 +1688,7 @@
+ 
+   session->device_id = device->id;
+   session->callback_id = callback_id;
++  session->callback_revision = 1;
+ 
+   session->server_fd = -1;
+ 
+@@ -1636,7 +1722,15 @@
+   airplay_sessions = session;
+ 
+   // rs is now the official device session
+-  outputs_device_session_add(device->id, session);
++  if (outputs_device_session_add(device->id, session) < 0)
++    {
++      session_cleanup(session);
++      return NULL;
++    }
++  session->device_incarnation = device->incarnation;
++  session->session_epoch = device->session_epoch;
++  session->attention_managed = device->attention_lease != 0;
++  session->emission_floor = session->master_session->packet_serial + 1;
+ 
+   return session;
+ 
+@@ -1879,12 +1973,202 @@
+   if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
+     return 0;
+ 
+-  session->volume = device->volume;
+-  session->callback_id = callback_id;
++  session->volume = outputs_device_effective_volume(device);
++  if (!session_callback_bind(session, callback_id))
++    return 1; // Existing deferred failure retains and resolves this obligation.
+ 
+   sequence_start(AIRPLAY_SEQ_SEND_VOLUME, session, NULL, "set_volume_one");
+ 
+   return 1;
++}
++
++
++static void
++attention_request_remove(struct airplay_attention_request *context)
++{
++  struct airplay_attention_request **link = &context->session->attention_requests;
++
++  while (*link && *link != context)
++    link = &(*link)->next;
++  if (*link)
++    *link = context->next;
++}
++
++static void
++attention_response_cb(struct evrtsp_request *request, void *arg)
++{
++  struct airplay_attention_request *context = arg;
++  struct airplay_session *session = context->session;
++  enum output_attention_outcome outcome;
++  const char *cseq;
++  int observed_cseq = 0;
++  int code = request ? request->response_code : 0;
++
++  attention_request_remove(context);
++  session->reqs_in_flight--;
++  if (!session->reqs_in_flight)
++    evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
++
++  cseq = request ? evrtsp_find_header(request->input_headers, "CSeq") : NULL;
++  if (!request || !cseq || safe_atoi32(cseq, &observed_cseq) < 0 || observed_cseq != context->cseq)
++    outcome = OUTPUT_ATTENTION_UNKNOWN;
++  else if (code != RTSP_OK)
++    outcome = OUTPUT_ATTENTION_FAILED;
++  else
++    outcome = OUTPUT_ATTENTION_PROTOCOL_ACCEPTED;
++
++  outputs_attention_complete(&context->operation, outcome, code, context->cseq);
++  free(context);
++}
++
++static int
++attention_dispatch_current(void *arg)
++{
++  const struct airplay_attention_request *context = arg;
++  struct output_attention_result retained;
++  struct output_device *device = outputs_device_get(context->operation.identity.device_id);
++
++  return device && !context->session->attention_retiring && device->session == context->session
++    && device->incarnation == context->operation.identity.device_incarnation
++    && device->session_epoch == context->operation.identity.session_epoch
++    && outputs_attention_result_get(context->operation.identity.process, context->operation.operation, &retained) == 0
++    && retained.outcome == OUTPUT_ATTENTION_PENDING
++    && (context->operation.action == OUTPUT_ATTENTION_FLUSH
++        ? (device->route_revision == context->operation.identity.route_revision)
++        : retained.current);
++}
++
++static int
++airplay_attention_set(struct output_device *device, const struct output_attention_result *operation)
++{
++  struct airplay_session *session = device->session;
++  struct airplay_attention_request *context;
++  struct evrtsp_request *request;
++  float mapped;
++  char volume[32];
++
++  if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
++    return 0; // Desired-only, no native request or fabricated acceptance.
++  if (session->device_incarnation != operation->identity.device_incarnation
++      || session->session_epoch != operation->identity.session_epoch)
++    return -1;
++  context = calloc(1, sizeof(*context));
++  if (!context)
++    return -1;
++  context->operation = *operation;
++  context->session = session;
++  context->cseq = session->cseq;
++  request = evrtsp_request_new(attention_response_cb, context);
++  if (!request)
++    { free(context); return -1; }
++  if (request_headers_add(request, session,
++      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER) < 0)
++    goto error;
++  if (operation->action == OUTPUT_ATTENTION_FLUSH)
++    {
++      char info[64];
++      struct rtp_session *rtp = session->master_session->rtp_session;
++      snprintf(info, sizeof(info), "seq=%" PRIu16 ";rtptime=%u", rtp->seqnum, rtp->pos);
++      evrtsp_add_header(request->output_headers, "RTP-Info", info);
++    }
++  else
++    {
++      evrtsp_add_header(request->output_headers, "Content-Type", "text/parameters");
++      mapped = airplay_volume_from_pct(operation->identity.effective_volume, session->devname);
++      snprintf(volume, sizeof(volume), "-%d.%06d", -(int)mapped, -(int)(1000000.0 * (mapped - (int)mapped)));
++      if (evbuffer_add_printf(request->output_buffer, "volume: %s\r\n", volume) < 0)
++        goto error;
++    }
++  session->attention_managed = true;
++
++  // The immutable payload is built before queueing. Existing CSeq/transport,
++  // cipher and request ownership are reused; no alternate session or mixer.
++  // Register before guarded enqueue. Veto completion is deferred on the existing
++  // connection event; connection_free cancels it and the session drains contexts.
++  context->next = session->attention_requests;
++  session->attention_requests = context;
++  evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
++  session->reqs_in_flight++;
++  if (evrtsp_make_request_guarded(session->ctrl, request,
++      operation->action == OUTPUT_ATTENTION_FLUSH ? EVRTSP_REQ_FLUSH : EVRTSP_REQ_SET_PARAMETER,
++      session->session_url, attention_dispatch_current, context) < 0)
++    {
++      // Guarded negative return detached only this inserted request; no callback.
++      attention_request_remove(context);
++      session->reqs_in_flight--;
++      if (!session->reqs_in_flight)
++        evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
++      goto error;
++    }
++  return 1; // The connection now owns the request and its deferred completion.
++
++ error:
++  evrtsp_request_free(request);
++  free(context);
++  return -1;
++}
++
++static int
++airplay_attention_suspend(struct output_device *device, const struct output_attention_result *operation)
++{
++  struct airplay_session *session = device->session;
++  if (!session)
++    return 0;
++  session->attention_managed = true;
++  session->attention_suspended = true;
++  return airplay_attention_set(device, operation);
++}
++
++static void
++airplay_attention_resume(struct output_device *device)
++{
++  struct airplay_session *session = device->session;
++  struct output_attention_result barrier;
++  struct output_attention_state current;
++  if (!session || session->attention_retiring || !session->attention_managed || session->device_incarnation != device->incarnation
++      || session->session_epoch != device->session_epoch || !session->attention_suspended)
++    return;
++  if (!device->route_operation)
++    {
++      // A reselection needs its own real FLUSH; an old route's callback is not permission.
++      outputs_attention_route_barrier(device);
++      return;
++    }
++  if (outputs_attention_state_get(device->id, &current) < 0
++      || outputs_attention_result_get(current.process, device->route_operation, &barrier) < 0
++      || barrier.action != OUTPUT_ATTENTION_FLUSH
++      || barrier.identity.device_incarnation != device->incarnation
++      || barrier.identity.session_epoch != device->session_epoch
++      || barrier.identity.route_revision != device->route_revision
++      || barrier.outcome != OUTPUT_ATTENTION_PROTOCOL_ACCEPTED)
++    return; // Failed/unknown/obsolete FLUSH never grants native emission.
++  session->attention_suspended = false;
++  session->emission_floor = session->master_session->packet_serial + 1;
++}
++
++static bool
++attention_emission_current(struct airplay_session *session, const struct rtp_packet *packet)
++{
++  struct output_device *device;
++  struct airplay_master_session *master;
++  ptrdiff_t slot;
++
++  if (session->attention_retiring)
++    return false;
++  if (!session->attention_managed)
++    return true; // Ordinary legacy sessions retain their original contract.
++  device = outputs_device_get(session->device_id);
++  if (!device || !device->selected || session->attention_suspended
++      || device->session != session || device->incarnation != session->device_incarnation
++      || device->session_epoch != session->session_epoch || device->route_revision == UINT64_MAX)
++    return false;
++  if (!packet)
++    return true; // Control packets have the same destination/session fence.
++  master = session->master_session;
++  slot = packet - master->rtp_session->pktbuf;
++  return slot >= 0 && (size_t)slot < master->rtp_session->pktbuf_size
++    && master->packet_serial != UINT64_MAX && master->packet_serials[slot]
++    && master->packet_serials[slot] >= session->emission_floor;
+ }
+ 
+ static void
+@@ -1958,7 +2242,7 @@
+   ssize_t sent;
+   int ret;
+ 
+-  if (!session)
++  if (!session || !attention_emission_current(session, pkt))
+     return -1;
+ 
+   if (session->supports_encryption)
+@@ -2011,6 +2295,8 @@
+   int fd;
+   int ret;
+ 
++  if (!attention_emission_current(session, NULL))
++    return;
+   switch (session->family)
+     {
+       case AF_INET:
+@@ -2089,6 +2375,9 @@
+     return -1;
+ 
+   pkt = rtp_packet_next(ams->rtp_session, len, ams->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
++  if (ams->packet_serial != UINT64_MAX)
++    ams->packet_serial++;
++  ams->packet_serials[pkt - ams->rtp_session->pktbuf] = ams->packet_serial;
+ 
+   evbuffer_remove(ams->encoded_buffer, pkt->payload, pkt->payload_len);
+ 
+@@ -3702,13 +3991,46 @@
+ 
+ 
+ static void
++sequence_context_remove(struct airplay_seq_ctx *context)
++{
++  struct airplay_seq_ctx **link = &context->session->sequence_requests;
++  while (*link && *link != context)
++    link = &(*link)->next;
++  if (*link == context)
++    *link = context->next;
++  context->next = NULL;
++}
++
++static bool
++sequence_callback_current(const struct airplay_seq_ctx *context)
++{
++  const struct airplay_session *session = context->session;
++  struct output_device *device;
++  if (!session->attention_managed || !context->callback_owned)
++    return true;
++  device = outputs_device_get(session->device_id);
++  return device && device->session == session
++      && device->incarnation == context->device_incarnation
++      && device->session_epoch == context->session_epoch
++      && session->device_incarnation == context->device_incarnation
++      && session->session_epoch == context->session_epoch
++      && !session->callback_revision_exhausted
++      && session->callback_revision == context->callback_revision
++      && session->callback_id == context->callback_id;
++}
++
++static void
+ sequence_continue_cb(struct evrtsp_request *req, void *arg)
+ {
+   struct airplay_seq_ctx *seq_ctx = arg;
+   struct airplay_seq_request *cur_request = seq_ctx->cur_request;
+   struct airplay_session *session = seq_ctx->session;
+   enum airplay_seq_type seq_type;
+-
++  bool current = sequence_callback_current(seq_ctx);
++
++  // Transfer custody to this executing callback before any handler can free
++  // the session/connection and drain its other queued contexts.
++  sequence_context_remove(seq_ctx);
+   session->reqs_in_flight--;
+   if (!session->reqs_in_flight)
+     evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
+@@ -3721,13 +4043,23 @@
+ 
+   if (req->response_code != RTSP_OK)
+     {
+-      if (!cur_request->proceed_on_rtsp_not_ok)
++      // A superseded startup failure still tears down the real connection; it
++      // cannot run its obsolete IPv6/auth retry handler under a newer STOP.
++      if (!current || !cur_request->proceed_on_rtsp_not_ok)
+ 	{
+ 	  DPRINTF(E_LOG, L_AIRPLAY, "Response to %s from '%s' was negative, aborting (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
+ 	  goto error;
+ 	}
+ 
+       DPRINTF(E_WARN, L_AIRPLAY, "Response to %s from '%s' was negative, proceeding anyway (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
++    }
++
++  if (!current)
++    {
++      // Successful old work owns only its context/accounting. In particular it
++      // cannot parse state, launch pairing, or acknowledge a reused STOP slot.
++      free(seq_ctx);
++      return;
+     }
+ 
+   // We don't check that the reply CSeq matches the request CSeq, because some
+@@ -3743,7 +4075,7 @@
+ 	    goto error;
+ 
+ 	  // Handler wanted to start a new sequence
+-	  sequence_start(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller);
++	  sequence_start_bound(seq_type, seq_ctx->session, seq_ctx->payload_make_arg, seq_ctx->log_caller, seq_ctx);
+ 	  free(seq_ctx);
+ 	  return;
+ 	}
+@@ -3757,14 +4089,25 @@
+       return;
+     }
+ 
+-  if (seq_ctx->on_success)
++  // Pair completion starts another sequence through the same original command,
++  // not a fresh ticket sampled from a callback binding that may have changed.
++  if (session->attention_managed && seq_ctx->callback_owned
++      && seq_ctx->on_success == session_pair_success && session->next_seq != AIRPLAY_SEQ_CONTINUE)
++    {
++      seq_type = session->next_seq;
++      session->next_seq = AIRPLAY_SEQ_CONTINUE;
++      sequence_start_bound(seq_type, session, NULL, "pair_success", seq_ctx);
++    }
++  else if (seq_ctx->on_success)
+     seq_ctx->on_success(session);
+ 
+   free(seq_ctx);
+   return;
+ 
+  error:
+-  if (seq_ctx->on_error)
++  if (!current && session->attention_managed && seq_ctx->callback_owned)
++    session_failure(session); // Real terminal failure, never stale retry/auth mutation.
++  else if (seq_ctx->on_error)
+     seq_ctx->on_error(session);
+ 
+   free(seq_ctx);
+@@ -3778,6 +4121,10 @@
+   struct evrtsp_request *req = NULL;
+   const char *uri;
+   int ret;
++
++  // Re-register a continuing context before it becomes queue-owned again.
++  seq_ctx->next = session->sequence_requests;
++  session->sequence_requests = seq_ctx;
+ 
+   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
+   if (!req)
+@@ -3803,6 +4150,7 @@
+ 	    }
+ 
+ 	  evrtsp_request_free(req);
++          sequence_context_remove(seq_ctx);
+ 	  sequence_continue(seq_ctx);
+ 	  return;
+         }
+@@ -3830,6 +4178,8 @@
+   if (req)
+     evrtsp_request_free(req);
+ 
++  sequence_context_remove(seq_ctx);
++
+   // Sets status to FAILED, gives status to player and frees session. Must be
+   // deferred, otherwise sequence_start() could invalidate the session, meaning
+   // any dereference of the session by the caller after sequence_start() would
+@@ -3841,7 +4191,8 @@
+ 
+ // All errors that may occur during a sequence are called back async
+ static void
+-sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
++sequence_start_bound(enum airplay_seq_type seq_type, struct airplay_session *session,
++    void *arg, const char *log_caller, const struct airplay_seq_ctx *parent)
+ {
+   struct airplay_seq_ctx *seq_ctx;
+ 
+@@ -3853,8 +4204,23 @@
+   seq_ctx->on_error = airplay_seq_definition[seq_type].on_error;
+   seq_ctx->payload_make_arg = arg;
+   seq_ctx->log_caller = log_caller;
++  seq_ctx->callback_id = parent ? parent->callback_id : session->callback_id;
++  seq_ctx->callback_revision = parent ? parent->callback_revision : session->callback_revision;
++  seq_ctx->device_incarnation = parent ? parent->device_incarnation : session->device_incarnation;
++  seq_ctx->session_epoch = parent ? parent->session_epoch : session->session_epoch;
++  seq_ctx->callback_owned = parent ? parent->callback_owned
++      : seq_type == AIRPLAY_SEQ_START || seq_type == AIRPLAY_SEQ_START_PLAYBACK
++        || seq_type == AIRPLAY_SEQ_SEND_VOLUME || seq_type == AIRPLAY_SEQ_FLUSH
++        || seq_type == AIRPLAY_SEQ_PAIR_SETUP || seq_type == AIRPLAY_SEQ_PAIR_VERIFY
++        || seq_type == AIRPLAY_SEQ_PAIR_TRANSIENT;
+ 
+   sequence_continue(seq_ctx); // Ownership transferred
++}
++
++static void
++sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
++{
++  sequence_start_bound(seq_type, session, arg, log_caller, NULL);
+ }
+ 
+ 
+@@ -4174,7 +4540,20 @@
+ {
+   struct airplay_session *session = device->session;
+ 
+-  session->callback_id = callback_id;
++  if (session->attention_managed)
++    {
++      if (session->attention_retiring)
++        return -1;
++      // Resolve the previous native operation before replacing its callback.
++      if (session->callback_id >= 0 && session->callback_id != callback_id)
++        outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
++            session->session_epoch, session, OUTPUT_STATE_STOPPED);
++      session->attention_retiring = true;
++      session->attention_suspended = true;
++      device->attention_retiring_session = session;
++    }
++  if (!session_callback_bind(session, callback_id))
++    return 1;
+ 
+   sequence_start(AIRPLAY_SEQ_STOP, session, NULL, "device_stop");
+ 
+@@ -4189,7 +4568,8 @@
+   if (session->state != AIRPLAY_STATE_STREAMING)
+     return 0; // No-op, nothing to flush
+ 
+-  session->callback_id = callback_id;
++  if (!session_callback_bind(session, callback_id))
++    return 1;
+ 
+   sequence_start(AIRPLAY_SEQ_FLUSH, session, NULL, "flush");
+ 
+@@ -4201,7 +4581,7 @@
+ {
+   struct airplay_session *session = device->session;
+ 
+-  session->callback_id = callback_id;
++  session_callback_bind(session, callback_id);
+ }
+ 
+ static void
+@@ -4402,6 +4782,9 @@
+   .device_cb_set = airplay_device_cb_set,
+   .device_free_extra = airplay_device_free_extra,
+   .device_volume_set = airplay_set_volume_one,
++  .device_attention_set = airplay_attention_set,
++  .device_attention_suspend = airplay_attention_suspend,
++  .device_attention_resume = airplay_attention_resume,
+   .device_volume_to_pct = airplay_volume_to_pct,
+   .write = airplay_write,
+   .metadata_prepare = airplay_metadata_prepare,
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -28,6 +28,7 @@
+ #include <errno.h>
+ #include <stdint.h>
+ #include <inttypes.h>
++#include <time.h>
+ 
+ #include <event2/event.h>
+ 
+@@ -97,6 +98,10 @@
+ 
+   // We have received the callback with the result from the backend
+   bool ready;
++  bool exact;
++  bool canceled;
++  uint64_t incarnation;
++  uint64_t epoch;
+ 
+   // We store a device_id to avoid the risk of dangling device pointer
+   uint64_t device_id;
+@@ -115,6 +120,12 @@
+ 
+ static struct output_device *outputs_device_list;
+ static int outputs_master_volume;
++static char outputs_process[37];
++static uint64_t outputs_incarnation;
++static uint64_t outputs_operation;
++static struct output_attention_result attention_results[OUTPUTS_MAX_CALLBACKS];
++// A synchronous callback may start another operation before admission returns.
++static bool attention_result_reserved[OUTPUTS_MAX_CALLBACKS];
+ static uint64_t outputs_buffer_duration_ms;
+ 
+ static bool outputs_exclusive_mode;
+@@ -128,6 +139,378 @@
+ static bool outputs_got_new_subscription;
+ 
+ 
++
++int
++outputs_device_effective_volume(const struct output_device *device)
++{
++  if (device->attention_lease && !device->attention_restoring && device->volume > device->attention_cap)
++    return device->attention_cap;
++  return device->volume;
++}
++
++static void
++base_revision_advance(struct output_device *device)
++{
++  // Saturate, never wrap back into an old owner's currency.
++  if (device->base_revision != UINT64_MAX)
++    device->base_revision++;
++}
++
++int
++outputs_attention_state_get(uint64_t id, struct output_attention_state *state)
++{
++  struct output_device *device = outputs_device_get(id);
++
++  if (!state || !device || !outputs_process[0]
++      || device->session_epoch == UINT64_MAX || device->base_revision == UINT64_MAX
++      || device->attention_revision == UINT64_MAX || device->route_revision == UINT64_MAX)
++    return -1;
++  memset(state, 0, sizeof(*state));
++  memcpy(state->process, outputs_process, sizeof(state->process));
++  state->device_id = device->id;
++  state->device_incarnation = device->incarnation;
++  state->session_epoch = device->session_epoch;
++  state->base_revision = device->base_revision;
++  state->attention_revision = device->attention_revision;
++  state->route_revision = device->route_revision;
++  state->lease = device->attention_lease;
++  state->base_volume = device->volume;
++  state->effective_volume = outputs_device_effective_volume(device);
++  state->restoring = device->attention_restoring;
++  state->last_release_operation = device->attention_last_release_operation;
++  return 0;
++}
++
++static bool
++attention_identity_equal(const struct output_attention_state *a, const struct output_attention_state *b)
++{
++  return memcmp(a->process, b->process, sizeof(a->process)) == 0
++    && a->device_id == b->device_id
++    && a->device_incarnation == b->device_incarnation
++    && a->session_epoch == b->session_epoch
++    && a->base_revision == b->base_revision
++    && a->attention_revision == b->attention_revision
++    && a->route_revision == b->route_revision
++    && a->lease == b->lease
++    && a->base_volume == b->base_volume
++    && a->effective_volume == b->effective_volume
++    && a->restoring == b->restoring;
++}
++
++static struct output_attention_result *
++attention_result_find(const char *process, uint64_t operation)
++{
++  int i;
++
++  if (!process || !operation)
++    return NULL;
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    if (attention_results[i].operation == operation
++        && strncmp(attention_results[i].identity.process, process, sizeof(outputs_process)) == 0)
++      return &attention_results[i];
++  return NULL;
++}
++
++int
++outputs_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result)
++{
++  struct output_attention_state state;
++  struct output_attention_result *retained = attention_result_find(process, operation);
++
++  if (!result || !retained)
++    return -1; // Retired/unknown receipt is never credited to a newer operation.
++  *result = *retained;
++  result->current = outputs_attention_state_get(result->identity.device_id, &state) == 0;
++  // A successful exact release retires its own lease, not its immutable receipt.
++  if (result->current && result->action == OUTPUT_ATTENTION_RELEASE
++      && (result->outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED || result->outcome == OUTPUT_ATTENTION_DESIRED_ONLY)
++      && state.lease == 0 && state.attention_revision == result->identity.attention_revision)
++    {
++      state.lease = result->identity.lease;
++      state.restoring = result->identity.restoring;
++    }
++  result->current = result->current && attention_identity_equal(&result->identity, &state);
++  return 0;
++}
++
++int
++outputs_attention_request_get(const char *process, uint64_t device_id, const char *request_id, struct output_attention_result *result)
++{
++  int i;
++  if (!process || !request_id || strlen(request_id) != 36 || !result)
++    return -1;
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    if (attention_results[i].operation && attention_results[i].identity.device_id == device_id
++        && strncmp(attention_results[i].identity.process, process, sizeof(outputs_process)) == 0
++        && strcmp(attention_results[i].command.request_id, request_id) == 0)
++      return outputs_attention_result_get(process, attention_results[i].operation, result);
++  return -1; // Missing/evicted/process-changed remains UNKNOWN, never re-admission.
++}
++
++static void attention_expiry_reconcile(struct output_device *device);
++static void attention_route_suspend(struct output_device *device);
++
++void
++outputs_attention_complete(const struct output_attention_result *operation, enum output_attention_outcome outcome, int response_code, int cseq)
++{
++  struct output_attention_result *retained;
++  struct output_attention_state current;
++  struct output_device *device;
++  struct output_attention_result original;
++
++  if (!operation || outcome == OUTPUT_ATTENTION_PENDING)
++    return;
++  original = *operation;
++  operation = &original;
++  retained = attention_result_find(operation->identity.process, operation->operation);
++  if (!retained || retained->outcome != OUTPUT_ATTENTION_PENDING
++      || !attention_identity_equal(&retained->identity, &operation->identity))
++    return;
++  // One exact operation has one terminal outcome. No last-callback-wins fold.
++  retained->outcome = outcome;
++  retained->response_code = response_code;
++  retained->request_cseq = cseq;
++  device = outputs_device_get(operation->identity.device_id);
++  if (!device || device->incarnation != operation->identity.device_incarnation)
++    return;
++  if (operation->action == OUTPUT_ATTENTION_RELEASE
++      && (outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED || outcome == OUTPUT_ATTENTION_DESIRED_ONLY)
++      && outputs_attention_state_get(device->id, &current) == 0
++      && attention_identity_equal(&current, &operation->identity))
++    {
++      device->attention_lease = 0;
++      device->attention_restoring = false;
++      device->attention_expired = false;
++      event_del(device->attention_timer);
++      if (!device->selected && device->session)
++        {
++          // Restoration no longer needs retained A. Re-enter the original
++          // backend STOP/TEARDOWN owner; no shared B stop or invented deadline.
++          outputs_device_stop(device, NULL);
++          return; // STOP may retire the session; no further retained-session work.
++        }
++    }
++  // A pending duck may settle after its native deadline. Reconcile that exact
++  // still-owned lease once; no periodic volume retry or new lease adoption.
++  if (device->attention_lease && !device->selected && !device->route_operation)
++    attention_route_suspend(device);
++  if (device->selected && device->session_epoch == operation->identity.session_epoch
++      && outputs[device->type]->device_attention_resume)
++    outputs[device->type]->device_attention_resume(device);
++  if (device->attention_expired && !device->attention_expiry_attempted)
++    attention_expiry_reconcile(device);
++}
++
++int
++outputs_attention_admit(const struct output_attention_request *request, struct output_attention_result *result)
++{
++  struct output_device *device;
++  struct output_attention_state state;
++  struct timespec deadline;
++  struct timeval timeout;
++  struct output_attention_result admitted;
++  struct output_attention_result *slot = NULL;
++  int i;
++  int ret;
++
++  if (!request || !result)
++    return -1;
++  if (request->request_id[0])
++    {
++      // A lost HTTP response is resolved by this exact retained command, never
++      // by adopting whichever lease a later GET happens to observe.
++      for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++        if (attention_results[i].operation
++            && memcmp(attention_results[i].command.request_id, request->request_id, sizeof(request->request_id)) == 0)
++          {
++            const struct output_attention_request *old = &attention_results[i].command;
++            if (old->action != request->action || old->cap_volume != request->cap_volume
++                || old->ttl_ms != request->ttl_ms || !attention_identity_equal(&old->expected, &request->expected))
++              return -1;
++            return outputs_attention_result_get(attention_results[i].identity.process, attention_results[i].operation, result);
++          }
++    }
++  if (!request || !result || outputs_operation == UINT64_MAX
++      || request->action < OUTPUT_ATTENTION_BEGIN || request->action > OUTPUT_ATTENTION_MANUAL
++      || request->action == OUTPUT_ATTENTION_FLUSH
++      || (request->action == OUTPUT_ATTENTION_MANUAL && request->ttl_ms != 0)
++      || request->cap_volume < 0 || request->cap_volume > 100
++      || request->ttl_ms > 15000
++      || outputs_attention_state_get(request->expected.device_id, &state) < 0
++      || !attention_identity_equal(&request->expected, &state))
++    return -1;
++  device = outputs_device_get(state.device_id);
++  if (device->base_revision == UINT64_MAX
++      || (request->action == OUTPUT_ATTENTION_MANUAL && device->base_revision >= UINT64_MAX - 1)
++      || device->attention_revision >= UINT64_MAX - 1
++      || outputs[device->type]->disabled || !outputs[device->type]->device_attention_set
++      || (request->action != OUTPUT_ATTENTION_MANUAL
++          && (request->action == OUTPUT_ATTENTION_BEGIN ? device->attention_lease != 0 : device->attention_lease == 0))
++      || (request->action == OUTPUT_ATTENTION_UPDATE && device->attention_restoring))
++    return -1;
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    {
++      if (attention_results[i].operation && attention_results[i].outcome == OUTPUT_ATTENTION_PENDING)
++        {
++          if (attention_results[i].identity.device_id == device->id
++              && attention_results[i].identity.device_incarnation == device->incarnation)
++            return -1; // Do not issue a second strict write while outcome is unresolved.
++        }
++      else if (!attention_result_reserved[i] && (!slot || attention_results[i].operation < slot->operation))
++        slot = &attention_results[i];
++    }
++  if (!slot)
++    return -1;
++
++  if (request->action == OUTPUT_ATTENTION_BEGIN || request->action == OUTPUT_ATTENTION_UPDATE)
++    {
++      unsigned ttl_ms = request->ttl_ms ? request->ttl_ms : 2000;
++      if (!device->attention_timer || clock_gettime(CLOCK_MONOTONIC, &deadline) < 0)
++        return -1;
++      deadline.tv_sec += ttl_ms / 1000;
++      deadline.tv_nsec += (ttl_ms % 1000) * 1000000L;
++      if (deadline.tv_nsec >= 1000000000L)
++        { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
++      timeout.tv_sec = ttl_ms / 1000;
++      timeout.tv_usec = (ttl_ms % 1000) * 1000;
++      if (event_add(device->attention_timer, &timeout) < 0)
++        return -1;
++    }
++  if (request->action != OUTPUT_ATTENTION_MANUAL)
++    device->attention_revision++;
++  if (request->action == OUTPUT_ATTENTION_MANUAL)
++    outputs_device_volume_register(device, request->cap_volume, -1);
++  if (request->action == OUTPUT_ATTENTION_BEGIN)
++    device->attention_lease = outputs_operation + 1;
++  if (request->action == OUTPUT_ATTENTION_RELEASE)
++    {
++      // Retain original restoration authority on failed/unknown native replies.
++      device->attention_restoring = true;
++      event_del(device->attention_timer);
++    }
++  else if (request->action != OUTPUT_ATTENTION_MANUAL)
++    {
++      device->attention_cap = request->cap_volume;
++      device->attention_expired = false;
++      device->attention_expiry_attempted = false;
++      device->attention_deadline = deadline;
++    }
++
++  memset(slot, 0, sizeof(*slot));
++  slot->operation = ++outputs_operation;
++  slot->action = request->action;
++  slot->command = *request;
++  slot->outcome = OUTPUT_ATTENTION_PENDING;
++  if (request->action == OUTPUT_ATTENTION_RELEASE) device->attention_last_release_operation = slot->operation;
++  outputs_attention_state_get(device->id, &slot->identity);
++  admitted = *slot;
++  attention_result_reserved[slot - attention_results] = true;
++  ret = outputs[device->type]->device_attention_set(device, &admitted);
++  if (ret == 0)
++    outputs_attention_complete(&admitted, OUTPUT_ATTENTION_DESIRED_ONLY, 0, 0);
++  else if (ret < 0)
++    outputs_attention_complete(&admitted, OUTPUT_ATTENTION_FAILED, 0, 0);
++  attention_result_reserved[slot - attention_results] = false;
++  return outputs_attention_result_get(admitted.identity.process, admitted.operation, result);
++}
++
++void
++outputs_attention_route_barrier(struct output_device *device)
++{
++  struct output_attention_result *slot = NULL;
++  int i, ret;
++
++  if (device->route_operation
++      || outputs_operation == UINT64_MAX || !outputs[device->type]->device_attention_suspend)
++    return;
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    {
++      if (attention_results[i].operation && attention_results[i].outcome == OUTPUT_ATTENTION_PENDING)
++        {
++          if (attention_results[i].identity.device_id == device->id
++              && attention_results[i].identity.device_incarnation == device->incarnation)
++            return;
++        }
++      else if (!attention_result_reserved[i] && (!slot || attention_results[i].operation < slot->operation))
++        slot = &attention_results[i];
++    }
++  if (!slot || outputs_attention_state_get(device->id, &slot->identity) < 0)
++    return;
++  memset(slot, 0, sizeof(*slot));
++  slot->operation = ++outputs_operation;
++  slot->action = OUTPUT_ATTENTION_FLUSH;
++  slot->outcome = OUTPUT_ATTENTION_PENDING;
++  outputs_attention_state_get(device->id, &slot->identity);
++  device->route_operation = slot->operation;
++  attention_result_reserved[slot - attention_results] = true;
++  ret = outputs[device->type]->device_attention_suspend(device, slot);
++  if (ret == 0)
++    outputs_attention_complete(slot, OUTPUT_ATTENTION_DESIRED_ONLY, 0, 0);
++  else if (ret < 0)
++    outputs_attention_complete(slot, OUTPUT_ATTENTION_FAILED, 0, 0);
++  attention_result_reserved[slot - attention_results] = false;
++}
++
++static void
++attention_route_suspend(struct output_device *device)
++{
++  if (device->attention_lease && !device->selected)
++    outputs_attention_route_barrier(device);
++}
++
++static void
++attention_expiry_reconcile(struct output_device *device)
++{
++  struct output_attention_request request = { 0 };
++  struct output_attention_result result;
++  int i;
++
++  if (!device->attention_lease || !device->attention_expired || device->attention_expiry_attempted)
++    return;
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    if (attention_results[i].outcome == OUTPUT_ATTENTION_PENDING
++        && attention_results[i].operation && attention_results[i].identity.device_id == device->id
++        && attention_results[i].identity.device_incarnation == device->incarnation)
++      return;
++  if (outputs_attention_state_get(device->id, &request.expected) < 0)
++    return;
++  request.action = OUTPUT_ATTENTION_RELEASE;
++  // Set before admission: an immediate desired-only completion cannot recurse.
++  device->attention_expiry_attempted = true;
++  if (outputs_attention_admit(&request, &result) < 0)
++    device->attention_expiry_attempted = false;
++}
++
++static void
++attention_timer_cb(int fd, short what, void *arg)
++{
++  struct output_device *device = arg;
++  struct timespec now;
++  struct timeval remaining;
++  int64_t ns;
++
++  if (!device->attention_lease || device->attention_restoring)
++    return;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++    return; // No guessed deadline or volume write on a failed clock.
++  ns = (int64_t)(device->attention_deadline.tv_sec - now.tv_sec) * 1000000000L
++    + device->attention_deadline.tv_nsec - now.tv_nsec;
++  if (ns > 0)
++    {
++      // A superseded timer cannot expire a refreshed/new lease early.
++      remaining.tv_sec = ns / 1000000000L;
++      remaining.tv_usec = (ns % 1000000000L + 999) / 1000;
++      if (remaining.tv_usec >= 1000000) { remaining.tv_sec++; remaining.tv_usec -= 1000000; }
++      event_add(device->attention_timer, &remaining);
++      return;
++    }
++  device->attention_restoring = true;
++  device->attention_expired = true;
++  if (device->attention_revision != UINT64_MAX)
++    device->attention_revision++;
++  attention_expiry_reconcile(device);
++}
++
+ /* ------------------------------- MISC HELPERS ----------------------------- */
+ 
+ static output_status_cb
+@@ -154,7 +537,8 @@
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+-      if (outputs_cb_register[callback_id].device == device)
++      if (outputs_cb_register[callback_id].device == device
++          && !outputs_cb_register[callback_id].exact)
+ 	{
+ 	  DPRINTF(E_DBG, L_PLAYER, "Removing callback to %s, id %d\n", player_pmap(outputs_cb_register[callback_id].cb), callback_id);
+ 	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
+@@ -209,6 +593,7 @@
+   output_status_cb cb;
+   enum output_device_state state;
+   int callback_id;
++  bool stale;
+ 
+   for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
+     {
+@@ -222,7 +607,21 @@
+ 	  // Will be NULL if the device has disappeared
+ 	  device = outputs_device_get(outputs_cb_register[callback_id].device_id);
+ 
++          stale = outputs_cb_register[callback_id].exact
++            && (outputs_cb_register[callback_id].canceled || !device
++                || device->incarnation != outputs_cb_register[callback_id].incarnation
++                || (device->session_epoch != outputs_cb_register[callback_id].epoch
++                    && !(device->session == NULL
++                        && outputs_cb_register[callback_id].epoch != UINT64_MAX
++                        && device->session_epoch == outputs_cb_register[callback_id].epoch + 1
++                        && (state == OUTPUT_STATE_STOPPED || state == OUTPUT_STATE_FAILED))));
+ 	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
++          if (stale)
++            {
++              // Resolve the original command without mutating/deselecting a replacement.
++              cb(NULL, OUTPUT_STATE_FAILED);
++              continue;
++            }
+ 
+ 	  // The device has left the building (stopped/failed), and the backend
+ 	  // is not using it any more
+@@ -244,6 +643,43 @@
+     {
+       if (outputs_cb_register[i].cb)
+ 	DPRINTF(E_DBG, L_PLAYER, "%d. Active callback: %s\n", i, player_pmap(outputs_cb_register[i].cb));
++    }
++}
++
++static int
++attention_restart_reserve(struct output_device *device, output_status_cb cb)
++{
++  int id;
++  if (!cb)
++    return -1; // No unobservable pending command is created.
++  for (id = 0; id < ARRAY_SIZE(outputs_cb_register); id++)
++    if (!outputs_cb_register[id].cb)
++      break;
++  if (id == ARRAY_SIZE(outputs_cb_register))
++    return -1;
++  outputs_cb_register[id].cb = cb;
++  outputs_cb_register[id].device = device;
++  outputs_cb_register[id].device_id = device->id;
++  outputs_cb_register[id].exact = true;
++  outputs_cb_register[id].incarnation = device->incarnation;
++  outputs_cb_register[id].epoch = device->session_epoch;
++  return id;
++}
++
++static void
++attention_restart_cancel(struct output_device *device)
++{
++  int id;
++  if (!device->attention_restart_pending)
++    return;
++  id = device->attention_restart_callback;
++  device->attention_restart_pending = false;
++  if (id >= 0 && id < ARRAY_SIZE(outputs_cb_register) && outputs_cb_register[id].cb)
++    {
++      outputs_cb_register[id].canceled = true;
++      outputs_cb_register[id].ready = true;
++      outputs_cb_register[id].state = OUTPUT_STATE_FAILED;
++      event_active(outputs_deferredev, 0, 0);
+     }
+ }
+ 
+@@ -643,6 +1079,9 @@
+   if (!device)
+     return -1;
+ 
++  if (device->session_epoch >= UINT64_MAX - 1)
++    return -1;
++  device->session_epoch++;
+   device->session = session;
+   return 0;
+ }
+@@ -654,9 +1093,21 @@
+ 
+   device = outputs_device_get(device_id);
+   if (device)
+-    device->session = NULL;
++    {
++      device->session = NULL;
++      if (device->session_epoch != UINT64_MAX)
++        device->session_epoch++;
++    }
+ 
+   return;
++}
++
++void
++outputs_device_session_remove_exact(uint64_t device_id, const void *session)
++{
++  struct output_device *device = outputs_device_get(device_id);
++  if (device && device->session == session)
++    outputs_device_session_remove(device_id);
+ }
+ 
+ int
+@@ -751,6 +1202,22 @@
+   outputs_cb_register[callback_id].device_id = device_id;
+   outputs_cb_register[callback_id].state = state;
+   event_active(outputs_deferredev, 0, 0);
++}
++
++void
++outputs_cb_exact(int id, uint64_t device_id, uint64_t incarnation, uint64_t epoch, const void *session, enum output_device_state state)
++{
++  struct output_device *device = outputs_device_get(device_id);
++  if (id < 0 || id >= ARRAY_SIZE(outputs_cb_register) || !outputs_cb_register[id].cb)
++    return;
++  // The old backend cannot borrow a replacement's current callback slot.
++  if (!device || device->session != session || device->incarnation != incarnation
++      || device->session_epoch != epoch || outputs_cb_register[id].device != device)
++    return;
++  outputs_cb_register[id].exact = true;
++  outputs_cb_register[id].incarnation = incarnation;
++  outputs_cb_register[id].epoch = epoch;
++  outputs_cb(id, device_id, state);
+ }
+ 
+ void
+@@ -805,9 +1272,24 @@
+   // New device
+   if (!device)
+     {
++      if (outputs_incarnation == UINT64_MAX)
++        {
++          outputs_device_free(add);
++          return NULL;
++        }
+       device = add;
++      device->incarnation = ++outputs_incarnation;
++      device->base_revision = 1;
++      device->session_epoch = 0;
++      device->attention_revision = 0;
++      device->attention_lease = 0;
++      device->route_revision = 0;
++      device->route_operation = 0;
+ 
+       device->stop_timer = evtimer_new(evbase_player, stop_timer_cb, device);
++      device->attention_timer = evtimer_new(evbase_player, attention_timer_cb, device);
++      if (!device->attention_timer)
++        { outputs_device_free(device); return NULL; }
+ 
+       keep_name = strdup(device->name);
+       keep_offset_ms = device->offset_ms; // For legacy local audio and Chromecast where offset could come from config file
+@@ -882,6 +1364,8 @@
+   struct output_device *prev;
+   int ret;
+ 
++  attention_restart_cancel(remove);
++
+   // Device stop should be able to handle that we invalidate the device, even
+   // if it is an async stop. It might call outputs_device_session_remove(), but
+   // that just won't do anything since the id will be unknown.
+@@ -920,7 +1404,14 @@
+ void
+ outputs_device_select(struct output_device *device, int max_volume)
+ {
++  if (!device->selected)
++    {
++      if (device->route_revision != UINT64_MAX) device->route_revision++;
++      device->route_operation = 0;
++    }
+   device->selected = 1;
++  if (outputs[device->type]->device_attention_resume)
++    outputs[device->type]->device_attention_resume(device);
+   device->prevent_playback = 0;
+   device->busy = 0;
+ 
+@@ -932,8 +1423,11 @@
+   // We could avoid this by reducing the unselected Office in step 2, but that
+   // leads to issue #1077, where volumes of unselected devices go to 0 (e.g. by
+   // reducing master to 0 and then increasing again -> unselected stays at 0).
+-  if (max_volume >= 0 && device->volume > max_volume)
+-    device->volume = max_volume;
++  if (!device->attention_lease && max_volume >= 0 && device->volume > max_volume)
++    {
++      device->volume = max_volume;
++      base_revision_advance(device);
++    }
+ 
+   vol_adjust();
+ }
+@@ -941,7 +1435,13 @@
+ void
+ outputs_device_deselect(struct output_device *device)
+ {
+-  device->selected = 0;
++  if (device->selected)
++    {
++      if (device->route_revision != UINT64_MAX) device->route_revision++;
++      device->route_operation = 0;
++    }
++  device->selected = 0; // Original and retransmit checks veto immediately.
++  attention_restart_cancel(device);
+ 
+   vol_adjust();
+ }
+@@ -954,6 +1454,19 @@
+   if (outputs[device->type]->disabled || !outputs[device->type]->device_start || !outputs[device->type]->device_probe)
+     return -1;
+ 
++  if (device->session && device->attention_retiring_session == device->session)
++    {
++      // The first command waits for exact native destruction, never claims running.
++      if (device->attention_restart_pending)
++        return -1; // Duplicate creates no second command obligation.
++      device->attention_restart_callback = attention_restart_reserve(device, cb);
++      if (device->attention_restart_callback < 0)
++        return -1;
++      device->attention_restart_pending = true;
++      device->attention_restart_probe = only_probe;
++      device->attention_restart_route = device->route_revision;
++      return 1;
++    }
+   if (device->session)
+     return 0; // Device is already running, nothing to do
+ 
+@@ -965,6 +1478,40 @@
+   return device_state_update(device, ret);;
+ }
+ 
++void
++outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation, uint64_t epoch, const void *session)
++{
++  struct output_device *device = outputs_device_get(device_id);
++  int id, ret;
++  bool probe;
++  if (!device || device->incarnation != incarnation || device->attention_retiring_session != session)
++    return;
++  device->attention_retiring_session = NULL;
++  if (!device->attention_restart_pending)
++    return;
++  if (device->session || epoch == UINT64_MAX || device->session_epoch != epoch + 1
++      || !device->selected || device->route_revision != device->attention_restart_route
++      || !device->advertised || outputs[device->type]->disabled)
++    {
++      attention_restart_cancel(device);
++      return;
++    }
++  id = device->attention_restart_callback;
++  probe = device->attention_restart_probe;
++  device->attention_restart_pending = false;
++  // The exact old control/master/request owners are gone. Normal start mints
++  // the next native session; reuse only this command's reserved callback slot.
++  ret = probe ? outputs[device->type]->device_probe(device, id)
++              : outputs[device->type]->device_start(device, id);
++  device_state_update(device, ret);
++  if (ret <= 0)
++    {
++      outputs_cb_register[id].canceled = true;
++      outputs_cb_register[id].ready = true;
++      event_active(outputs_deferredev, 0, 0);
++    }
++}
++
+ int
+ outputs_device_stop(struct output_device *device, output_status_cb cb)
+ {
+@@ -975,6 +1522,8 @@
+ 
+   if (!device->session)
+     return 0; // Device is already stopped, nothing to do
++  if (device->attention_retiring_session == device->session)
++    return -1; // Existing STOP owns its callback/cleanup; no duplicate command.
+ 
+   ret = outputs[device->type]->device_stop(device, callback_add(device, cb));
+ 
+@@ -1016,6 +1565,7 @@
+ void
+ outputs_device_volume_register(struct output_device *device, int absvol, int relvol)
+ {
++  base_revision_advance(device); // Valid same-value manual intent fences ABA too.
+   if (absvol > -1)
+     device->volume = absvol;
+   else if (relvol > -1)
+@@ -1096,6 +1646,8 @@
+   if (!device)
+     return;
+ 
++  attention_restart_cancel(device);
++
+   if (outputs[device->type]->disabled)
+     DPRINTF(E_LOG, L_PLAYER, "BUG! Freeing device from a disabled output?\n");
+ 
+@@ -1107,6 +1659,8 @@
+ 
+   if (device->stop_timer)
+     event_free(device->stop_timer);
++  if (device->attention_timer)
++    event_free(device->attention_timer);
+ 
+   free(device->name);
+   free(device->auth_key);
+@@ -1130,6 +1684,13 @@
+     {
+       if (device->selected)
+ 	continue;
++      if (device->attention_lease && outputs[device->type]->device_attention_suspend)
++        {
++          // Retain only a native attention-owned session. Its strict FLUSH has
++          // its own receipt, not the player's unrelated callback/pending count.
++          attention_route_suspend(device);
++          continue;
++        }
+ 
+       ret = outputs_device_stop(device, stopped_cb);
+       if (ret > 0)
+@@ -1213,7 +1774,12 @@
+   int ret;
+ 
+   if (outputs_master_volume == volume)
+-    return 0;
++    {
++      for (device = outputs_device_list; device; device = device->next)
++        if (device->selected)
++          base_revision_advance(device);
++      return 0;
++    }
+ 
+   outputs_master_volume = volume;
+ 
+@@ -1222,7 +1788,7 @@
+       if (!device->selected)
+ 	continue;
+ 
+-      device->volume = rel_to_vol(device->relvol, outputs_master_volume);
++      outputs_device_volume_register(device, -1, device->relvol);
+ 
+       ret = outputs_device_volume_set(device, cb);
+       if (ret < 0)
+@@ -1321,6 +1887,8 @@
+   int i;
+   int j;
+ 
++  if (!outputs_process[0])
++    uuid_make(outputs_process);
+   outputs_master_volume = -1;
+ 
+   // Number of milliseconds the outputs should buffer before starting playback.
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -86,6 +86,65 @@
+   OUTPUT_STATE_PASSWORD  = -2,
+ };
+ 
++
++/* Native attention is an overlay on manual desire, never a replacement base.
++ * All entry points below run on the existing player event loop. A result is a
++ * protocol observation, not an acoustic or hardware readback receipt. */
++enum output_attention_action
++{
++  OUTPUT_ATTENTION_BEGIN,
++  OUTPUT_ATTENTION_UPDATE,
++  OUTPUT_ATTENTION_RELEASE,
++  OUTPUT_ATTENTION_FLUSH, // Internal route handoff only, not a volume request.
++  OUTPUT_ATTENTION_MANUAL, // Explicit manual base CAS; never an attention renewal.
++};
++
++enum output_attention_outcome
++{
++  OUTPUT_ATTENTION_PENDING,
++  OUTPUT_ATTENTION_DESIRED_ONLY,
++  OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,
++  OUTPUT_ATTENTION_FAILED,
++  OUTPUT_ATTENTION_UNKNOWN,
++};
++
++struct output_attention_state
++{
++  char process[37];
++  uint64_t device_id;
++  uint64_t device_incarnation;
++  uint64_t session_epoch;
++  uint64_t base_revision;
++  uint64_t attention_revision;
++  uint64_t route_revision;
++  uint64_t lease;
++  int base_volume;
++  int effective_volume;
++  bool restoring;
++  uint64_t last_release_operation; // Observer only; excluded from expected identity.
++};
++
++struct output_attention_request
++{
++  struct output_attention_state expected;
++  char request_id[37]; // External idempotency identity; empty only for native expiry.
++  enum output_attention_action action;
++  int cap_volume;
++  unsigned ttl_ms; // Same existing attention ceiling: 15000 ms. Zero uses 2000 ms.
++};
++
++struct output_attention_result
++{
++  struct output_attention_state identity;
++  struct output_attention_request command; // Immutable original admission bytes.
++  uint64_t operation;
++  enum output_attention_action action;
++  enum output_attention_outcome outcome;
++  int response_code;
++  int request_cseq;
++  bool current;
++};
++
+ /* Linked list of device info used by the player for each device
+  */
+ struct output_device
+@@ -126,6 +185,27 @@
+   int relvol;
+   int max_volume;
+ 
++  // Process-local identities/revisions cannot be inferred from an output ID.
++  uint64_t incarnation;
++  uint64_t session_epoch;
++  uint64_t base_revision;
++  uint64_t attention_revision;
++  uint64_t attention_lease;
++  uint64_t route_revision;
++  uint64_t route_operation;
++  int attention_cap;
++  uint64_t attention_last_release_operation;
++  const void *attention_retiring_session;
++  int attention_restart_callback;
++  bool attention_restart_pending;
++  bool attention_restart_probe;
++  uint64_t attention_restart_route;
++  bool attention_restoring;
++  bool attention_expired;
++  bool attention_expiry_attempted;
++  struct timespec attention_deadline;
++  struct event *attention_timer;
++
+   // Quality of audio output
+   struct media_quality quality;
+ 
+@@ -241,6 +321,11 @@
+   // Set the volume and call back
+   int (*device_volume_set)(struct output_device *device, int callback_id);
+ 
++  // Strict attention uses its own immutable operation, not callback_id.
++  int (*device_attention_set)(struct output_device *device, const struct output_attention_result *operation);
++  int (*device_attention_suspend)(struct output_device *device, const struct output_attention_result *operation);
++  void (*device_attention_resume)(struct output_device *device);
++
+   // Convert device internal representation of volume to our pct scale
+   int (*device_volume_to_pct)(struct output_device *device, const char *volume);
+ 
+@@ -290,6 +375,16 @@
+ void
+ outputs_device_session_remove(uint64_t device_id);
+ 
++void
++outputs_device_session_remove_exact(uint64_t device_id, const void *session);
++
++// PC9 retirement completes only AFTER the native session resources are freed.
++void
++outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation, uint64_t epoch, const void *session);
++
++void
++outputs_cb_exact(int callback_id, uint64_t device_id, uint64_t incarnation, uint64_t epoch, const void *session, enum output_device_state state);
++
+ int
+ outputs_quality_subscribe(struct media_quality *quality);
+ 
+@@ -307,6 +402,26 @@
+ 
+ void
+ outputs_buffer_free(struct output_buffer *buffer);
++
++
++int
++outputs_device_effective_volume(const struct output_device *device);
++
++int
++outputs_attention_state_get(uint64_t id, struct output_attention_state *state);
++
++void outputs_attention_route_barrier(struct output_device *device);
++int
++outputs_attention_admit(const struct output_attention_request *request, struct output_attention_result *result);
++
++int
++outputs_attention_request_get(const char *process, uint64_t device_id, const char *request_id, struct output_attention_result *result);
++
++int
++outputs_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result);
++
++void
++outputs_attention_complete(const struct output_attention_result *operation, enum output_attention_outcome outcome, int response_code, int cseq);
+ 
+ /* ---------------------------- Called by player ---------------------------- */
+ 
+--- a/src/player.c
++++ b/src/player.c
+@@ -2550,6 +2550,7 @@
+   spk->output_type[sizeof(spk->output_type) - 1] = '\0';
+   spk->relvol = device->relvol;
+   spk->absvol = device->volume;
++  spk->has_attention_identity = outputs_attention_state_get(device->id, &spk->attention_identity) == 0;
+   spk->offset_ms = device->offset_ms;
+ 
+   spk->supported_formats = device->supported_formats;
+@@ -3086,6 +3087,77 @@
+   return COMMAND_END;
+ }
+ 
++
++struct player_attention_command
++{
++  const struct output_attention_request *request;
++  struct output_attention_result *result;
++  struct output_attention_state *state;
++  const char *process;
++  const char *request_id;
++  uint64_t id;
++};
++
++static enum command_state
++attention_admit_command(void *arg, int *retval)
++{
++  struct player_attention_command *command = arg;
++  *retval = outputs_attention_admit(command->request, command->result);
++  return COMMAND_END; // Admission receipt, not an asynchronous apply promise.
++}
++
++static enum command_state
++attention_state_command(void *arg, int *retval)
++{
++  struct player_attention_command *command = arg;
++  *retval = outputs_attention_state_get(command->id, command->state);
++  return COMMAND_END;
++}
++
++static enum command_state
++attention_result_command(void *arg, int *retval)
++{
++  struct player_attention_command *command = arg;
++  *retval = outputs_attention_result_get(command->process, command->id, command->result);
++  return COMMAND_END;
++}
++
++static enum command_state
++attention_request_command(void *arg, int *retval)
++{
++  struct player_attention_command *command = arg;
++  *retval = outputs_attention_request_get(command->process, command->id, command->request_id, command->result);
++  return COMMAND_END;
++}
++
++int
++player_attention_request_get(const char *process, uint64_t device_id, const char *request_id, struct output_attention_result *result)
++{
++  struct player_attention_command command = { .id = device_id, .process = process, .request_id = request_id, .result = result };
++  return commands_exec_sync(cmdbase, attention_request_command, NULL, &command);
++}
++
++int
++player_attention_admit(const struct output_attention_request *request, struct output_attention_result *result)
++{
++  struct player_attention_command command = { .request = request, .result = result };
++  return commands_exec_sync(cmdbase, attention_admit_command, NULL, &command);
++}
++
++int
++player_attention_state_get(uint64_t device_id, struct output_attention_state *state)
++{
++  struct player_attention_command command = { .id = device_id, .state = state };
++  return commands_exec_sync(cmdbase, attention_state_command, NULL, &command);
++}
++
++int
++player_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result)
++{
++  struct player_attention_command command = { .id = operation, .process = process, .result = result };
++  return commands_exec_sync(cmdbase, attention_result_command, NULL, &command);
++}
++
+ static enum command_state
+ volume_set(void *arg, int *retval)
+ {
+--- a/src/player.h
++++ b/src/player.h
+@@ -7,6 +7,7 @@
+ 
+ #include "db.h"
+ #include "misc.h" // for struct media_quality
++#include "outputs.h" // for the same-thread observational attention snapshot
+ 
+ // Maximum number of previously played songs that are remembered
+ #define MAX_HISTORY_COUNT 20
+@@ -36,6 +37,8 @@
+   char output_type[50];
+   int relvol;
+   int absvol;
++  bool has_attention_identity;
++  struct output_attention_state attention_identity;
+   int offset_ms;
+ 
+   enum media_format format;
+@@ -87,6 +90,23 @@
+   uint32_t item_id[MAX_HISTORY_COUNT];
+ };
+ 
++
++struct output_attention_request;
++struct output_attention_result;
++struct output_attention_state;
++
++int
++player_attention_admit(const struct output_attention_request *request, struct output_attention_result *result);
++
++int
++player_attention_state_get(uint64_t device_id, struct output_attention_state *state);
++
++int
++player_attention_request_get(const char *process, uint64_t device_id, const char *request_id, struct output_attention_result *result);
++
++int
++player_attention_result_get(const char *process, uint64_t operation, struct output_attention_result *result);
++
+ int
+ player_get_status(struct player_status *status);
+ 
+--- /dev/null
++++ b/tests/airplay_callback_owner.c
+@@ -0,0 +1,477 @@
++/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
++ * No discovery, daemon, media input, fabricated connected/session-ready flag,
++ * receiver capability, public-volume acceptance or acoustic proof.
++ * START uses the actual device/session/master/codec constructors. SEND_VOLUME
++ * is explicitly the lower existing sequence owner, not the public connected
++ * setter. Real queued wire responses test command tickets and lifetime.
++ * Root admits compilation/execution separately; these cases have not run. */
++#include <assert.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <event2/listener.h>
++#include <event2/bufferevent.h>
++
++/* Inert speaker persistence only. Every state, request, crypto/codec constructor,
++ * queue/callback and session destruction below is the candidate production body. */
++#define db_speaker_get fixture_speaker_get
++#define db_speaker_save fixture_speaker_save
++#include "../src/conffile.c"
++#include "../src/outputs.c"
++static void *fixture_calloc(size_t n, size_t size);
++static void fixture_free(void *pointer);
++static void raw_free_observe(void *pointer);
++#define calloc fixture_calloc
++#define free fixture_free
++#include "../src/outputs/airplay.c"
++#include "../src/evrtsp/rtsp.c"
++#undef calloc
++#undef free
++#undef db_speaker_get
++#undef db_speaker_save
++
++struct event_base *evbase_main;
++static void *contexts[64];
++static int context_allocations, context_frees;
++static bool fail_request_allocation;
++static void *fixture_calloc(size_t n, size_t size)
++{
++  void *p;
++  size_t i;
++  if (fail_request_allocation && n == 1 && size == sizeof(struct evrtsp_request))
++    { fail_request_allocation = false; return NULL; }
++  p = calloc(n, size);
++  if (p && n == 1 && size == sizeof(struct airplay_seq_ctx))
++    {
++      for (i = 0; i < ARRAY_SIZE(contexts) && contexts[i]; i++);
++      assert(i < ARRAY_SIZE(contexts)); contexts[i] = p; context_allocations++;
++    }
++  return p;
++}
++static void fixture_free(void *p)
++{
++  size_t i;
++  raw_free_observe(p);
++  for (i = 0; i < ARRAY_SIZE(contexts); i++)
++    if (p && contexts[i] == p) { contexts[i] = NULL; context_frees++; break; }
++  free(p);
++}
++int fixture_speaker_get(struct output_device *device, uint64_t id)
++{ (void)id; device->volume = 30; device->selected = false; return 0; }
++int fixture_speaker_save(struct output_device *device)
++{ (void)device; return 0; }
++
++enum owner_mode { OLD_START_200, OLD_START_VOLUME_200, OLD_START_503,
++  OLD_START_EOF, STOP_ALLOCATION_FAILURE, CALLBACK_OVERFLOW, OLD_STOP_FRESH_START, OLD_START_REFUSED };
++struct owner_fixture {
++  enum owner_mode mode;
++  struct event_base *base;
++  struct evconnlistener *listener;
++  struct bufferevent *peer;
++  struct bufferevent *old_peer;
++  bool old_peer_eof;
++  bool peer_eof;
++  bool registered;
++  int generation;
++  uint64_t retired_epoch;
++  struct event *deadline;
++  struct output_device *device;
++  int refused_fd;
++  int failed, wire, start_calls, stop_calls;
++  enum output_device_state terminal;
++  int old_slot;
++  uint64_t old_revision;
++};
++static struct owner_fixture *current_fixture;
++static void owner_fail(struct owner_fixture *f, const char *why)
++{
++  fprintf(stderr, "FAIL airplay-owner=%d: %s\n", f->mode, why);
++  f->failed = 1; event_base_loopbreak(f->base);
++}
++static void owner_deadline(evutil_socket_t fd, short what, void *arg)
++{ (void)fd; (void)what; owner_fail(arg, "existing five-second owner bound exhausted"); }
++static void start_done(struct output_device *device, enum output_device_state state)
++{
++  (void)device; (void)state;
++  current_fixture->start_calls++;
++  owner_fail(current_fixture, "old START consumed a current callback slot");
++}
++static void stop_done(struct output_device *device, enum output_device_state state)
++{
++  struct owner_fixture *f = current_fixture;
++  f->stop_calls++; f->terminal = state;
++  if (device != f->device || f->stop_calls != f->generation + 1 || f->start_calls
++      || device->session || airplay_sessions || airplay_master_sessions
++      || context_allocations != context_frees || fail_request_allocation)
++    { owner_fail(f, "terminal callback before actual session/request/master destruction"); return; }
++  if (f->mode == OLD_START_200 || f->mode == OLD_START_VOLUME_200 || f->mode == OLD_STOP_FRESH_START) {
++    if (state != OUTPUT_STATE_STOPPED || f->wire != (f->mode == OLD_START_VOLUME_200 ? 3 : 2))
++      { owner_fail(f, "old success did not preserve exact queued STOP terminal obligation"); return; }
++  } else if ((f->mode == OLD_START_REFUSED && (f->wire || f->peer))
++      || state != OUTPUT_STATE_FAILED || device->requires_auth
++      || device->v6_disabled || !device->auth_key || strcmp(device->auth_key, "fixture-retained-key"))
++    { owner_fail(f, "old failure retried/re-authorized or falsely acknowledged STOP"); return; }
++  if (f->mode == OLD_STOP_FRESH_START && !f->generation) {
++    f->retired_epoch = device->session_epoch;
++    f->generation = 1; f->wire = 0; f->old_peer = f->peer; f->old_peer_eof = f->peer_eof; f->peer_eof = false; f->peer = NULL;
++    outputs_device_select(device, 100); // Actual route transition resets old barrier.
++    if (outputs_device_start(device, start_done, false) != 1 || !device->session
++        || device->session_epoch <= f->retired_epoch)
++      { owner_fail(f, "normal fresh startup did not own a new native epoch"); return; }
++    return;
++  }
++  if (f->generation && !f->old_peer_eof)
++    { owner_fail(f, "old native connection destruction not observed before fresh completion"); return; }
++  event_base_loopbreak(f->base);
++}
++static int request_header(const char *header, const char *name)
++{
++  const char *p = strstr(header, name);
++  int value = -1;
++  if (!p || sscanf(p + strlen(name), "%d", &value) != 1) return -1;
++  return value;
++}
++static void peer_read(struct bufferevent *peer, void *arg)
++{
++  struct owner_fixture *f = arg;
++  struct evbuffer *input = bufferevent_get_input(peer);
++  struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
++  char header[4096], reply[256];
++  size_t length;
++  int bytes, cseq, code;
++  struct airplay_session *session;
++  if (end.pos < 0) {
++    if (evbuffer_get_length(input) > sizeof(header) - 1) owner_fail(f, "bounded RTSP header exceeded");
++    return;
++  }
++  length = (size_t)end.pos + 4;
++  if (length >= sizeof(header)) { owner_fail(f, "RTSP header too large"); return; }
++  evbuffer_copyout(input, header, length); header[length] = 0;
++  bytes = request_header(header, "Content-Length:");
++  cseq = request_header(header, "CSeq:");
++  if (bytes < 0) bytes = 0;
++  if (bytes > 65536 || cseq <= 0) { owner_fail(f, "RTSP request framing invalid"); return; }
++  if (evbuffer_get_length(input) < length + (size_t)bytes) return;
++  evbuffer_drain(input, length + (size_t)bytes);
++  f->wire++;
++  session = f->device->session;
++  if (f->wire == 1) {
++    if (strncmp(header, "GET /info RTSP/1.0", 18) || !session
++        || session->state != AIRPLAY_STATE_STOPPED || !session->sequence_requests
++        || session->reqs_in_flight != 1)
++      { owner_fail(f, "first actual START was not held at real GET/info queue owner"); return; }
++    if (f->generation) {
++      int old_fd = bufferevent_getfd(f->old_peer);
++      const char late[] = "RTSP/1.0 200 Retired\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n";
++      /* Old native fd was destroyed, not adopted by fresh START. This is only
++       * a real late server write attempt; no old client-fold completion claim. */
++      if (old_fd >= 0) (void)send(old_fd, late, sizeof(late) - 1, MSG_NOSIGNAL);
++      if (f->device->session != session || session->session_epoch <= f->retired_epoch
++          || session->callback_revision != 1 || f->stop_calls != 1)
++        { owner_fail(f, "retired wire affected fresh session/callback currency"); return; }
++    }
++    f->old_slot = session->callback_id; f->old_revision = session->callback_revision;
++    /* Actual native route-suspend owner marks the real startup session managed;
++     * it truthfully returns desired_only before connection/SETUP readiness. */
++    outputs_attention_route_barrier(f->device);
++    if (!session->attention_managed || !session->attention_suspended
++        || session->state != AIRPLAY_STATE_STOPPED)
++      { owner_fail(f, "actual route suspension manufactured connection readiness"); return; }
++    if (f->mode == OLD_START_VOLUME_200)
++      sequence_start(AIRPLAY_SEQ_SEND_VOLUME, session, NULL, "lower-sequence-owner-only");
++    if (f->mode == CALLBACK_OVERFLOW) session->callback_revision = UINT64_MAX;
++    if (f->mode == STOP_ALLOCATION_FAILURE) fail_request_allocation = true;
++    if (outputs_device_stop(f->device, stop_done) != 1)
++      { owner_fail(f, "actual STOP was not retained as pending"); return; }
++    if (session->callback_id != f->old_slot
++        || (f->mode != CALLBACK_OVERFLOW && session->callback_revision != f->old_revision + 1))
++      { owner_fail(f, "regression failed to reproduce real same-slot command replacement"); return; }
++    if (f->mode == OLD_START_EOF) {
++      bufferevent_free(f->peer); f->peer = NULL; return;
++    }
++    if (f->mode == STOP_ALLOCATION_FAILURE || f->mode == CALLBACK_OVERFLOW) return;
++    code = f->mode == OLD_START_503 ? 503 : 200;
++  } else {
++    if (!session || session->state != AIRPLAY_STATE_TEARDOWN || f->stop_calls != f->generation
++        || session->callback_id != f->old_slot
++        || session->callback_revision != f->old_revision + 1)
++      { owner_fail(f, "old response changed state/consumed queued STOP before terminal wire"); return; }
++    if (f->mode == OLD_START_VOLUME_200 && f->wire == 2) {
++      if (strncmp(header, "SET_PARAMETER ", 14)) { owner_fail(f, "lower sequence volume absent"); return; }
++    } else if (strncmp(header, "TEARDOWN ", 9)) { owner_fail(f, "exact STOP wire absent"); return; }
++    code = 200;
++  }
++  bytes = snprintf(reply, sizeof(reply), "RTSP/1.0 %d Controlled\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", code, cseq);
++  if (bytes <= 0 || (size_t)bytes >= sizeof(reply) || bufferevent_write(peer, reply, bytes) < 0)
++    owner_fail(f, "controlled wire reply failed");
++}
++static void peer_event(struct bufferevent *peer, short what, void *arg)
++{
++  struct owner_fixture *f = arg;
++  if (what & BEV_EVENT_EOF) {
++    if (peer == f->old_peer) f->old_peer_eof = true;
++    else if (peer == f->peer) f->peer_eof = true;
++  }
++  else if (what & BEV_EVENT_ERROR) owner_fail(f, "unexpected controlled peer I/O error");
++}
++static void peer_accept(struct evconnlistener *listener, evutil_socket_t fd,
++    struct sockaddr *remote, int length, void *arg)
++{
++  struct owner_fixture *f = arg;
++  struct sockaddr_in *a = (struct sockaddr_in *)remote;
++  (void)listener;
++  if (length < (int)sizeof(*a) || a->sin_family != AF_INET
++      || ntohl(a->sin_addr.s_addr) != INADDR_LOOPBACK || f->peer) {
++    evutil_closesocket(fd); owner_fail(f, "unknown/extra fixture socket"); return;
++  }
++  f->peer = bufferevent_socket_new(f->base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
++  if (!f->peer) { evutil_closesocket(fd); owner_fail(f, "accepted socket owner allocation"); return; }
++  bufferevent_setcb(f->peer, peer_read, NULL, peer_event, f);
++  if (bufferevent_enable(f->peer, EV_READ | EV_WRITE) < 0) owner_fail(f, "peer enable");
++}
++static int owner_case(enum owner_mode mode)
++{
++  struct owner_fixture f = { .mode = mode, .refused_fd = -1 };
++  struct sockaddr_in address = { .sin_family = AF_INET };
++  socklen_t length = sizeof(address);
++  struct timeval bound = {5, 0};
++  struct airplay_extra *extra;
++  int i, result;
++  current_fixture = &f; context_allocations = context_frees = 0;
++  memset(contexts, 0, sizeof(contexts)); fail_request_allocation = false;
++  f.base = event_base_new(); if (!f.base) return 1;
++  evbase_player = f.base;
++  cfg = cfg_init(toplvl_cfg, CFGF_NONE); if (!cfg) { f.failed = 1; goto cleanup; }
++  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "general"), "user_agent");
++  airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
++  if (!airplay_user_agent || !airplay_client_name) { f.failed = 1; goto cleanup; }
++  /* Initialize only the existing passive outputs callback event/default buffer,
++   * not outputs_init's discovery/backend sockets, library, bus or daemon. */
++  outputs_deferredev = evtimer_new(f.base, deferred_cb, NULL);
++  outputs_buffer_duration_ms = cfg_getint(cfg_getsec(cfg, "general"), "start_buffer_ms");
++  uuid_make(outputs_process);
++  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  if (mode == OLD_START_REFUSED) {
++    /* Keep the actual ephemeral port bound but never listen. The kernel,
++     * not a fabricated session/response, refuses this owned connection. */
++    f.refused_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (f.refused_fd < 0 || bind(f.refused_fd, (struct sockaddr *)&address, sizeof(address))
++        || getsockname(f.refused_fd, (struct sockaddr *)&address, &length))
++      { owner_fail(&f, "owned nonlistener setup"); goto cleanup; }
++  } else {
++    f.listener = evconnlistener_new_bind(f.base, peer_accept, &f,
++        LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, 2, (struct sockaddr *)&address, sizeof(address));
++    if (!f.listener || getsockname(evconnlistener_get_fd(f.listener), (struct sockaddr *)&address, &length))
++      { owner_fail(&f, "owned loopback setup"); goto cleanup; }
++  }
++  if (!outputs_deferredev) { owner_fail(&f, "callback event setup"); goto cleanup; }
++  f.deadline = evtimer_new(f.base, owner_deadline, &f);
++  if (!f.deadline || evtimer_add(f.deadline, &bound)) { owner_fail(&f, "finite owner deadline"); goto cleanup; }
++  f.device = calloc(1, sizeof(*f.device)); extra = calloc(1, sizeof(*extra));
++  if (!f.device || !extra) { free(f.device); free(extra); f.device = NULL; f.failed = 1; goto cleanup; }
++  f.device->id = 1; f.device->name = strdup("private-native-owner");
++  f.device->type = OUTPUT_TYPE_AIRPLAY; f.device->type_name = "AirPlay";
++  f.device->advertised = true; f.device->quality = (struct media_quality){44100,16,2};
++  f.device->v4_address = strdup("127.0.0.1"); f.device->v4_port = ntohs(address.sin_port);
++  f.device->auth_key = strdup("fixture-retained-key");
++  f.device->extra_device_info = extra; extra->mdns_name = strdup("private-native-owner");
++  if (!f.device->name || !f.device->v4_address || !f.device->auth_key || !extra->mdns_name)
++    { f.failed = 1; goto cleanup; }
++  f.device = outputs_device_add(f.device, false);
++  f.registered = f.device != NULL;
++  if (!f.device || outputs_device_start(f.device, start_done, false) != 1)
++    { owner_fail(&f, "real AirPlay session/master/codec startup refused"); goto cleanup; }
++  if (mode == OLD_START_REFUSED) {
++    struct airplay_session *session = f.device->session;
++    if (!session || session->reqs_in_flight != 1 || !session->sequence_requests
++        || session->ctrl->state != EVCON_CONNECTING)
++      { owner_fail(&f, "actual START did not own a pending kernel connect"); goto cleanup; }
++    f.old_slot = session->callback_id; f.old_revision = session->callback_revision;
++    outputs_attention_route_barrier(f.device);
++    if (outputs_device_stop(f.device, stop_done) != 1
++        || session->reqs_in_flight != 2 || session->callback_id != f.old_slot
++        || session->callback_revision != f.old_revision + 1)
++      { owner_fail(&f, "refused START did not retain actual same-slot queued STOP"); goto cleanup; }
++  }
++  if (event_base_dispatch(f.base) != 0) owner_fail(&f, "native loop exited without terminal owner callback");
++  if (f.stop_calls != f.generation + 1 || f.start_calls || context_allocations != context_frees
++      || airplay_sessions || airplay_master_sessions)
++    owner_fail(&f, "test cleanup would mask an unjoined production sequence owner");
++ cleanup:
++  /* Assertions above precede unconditional exact fixture rescue. No guessed
++   * session state, global task sweep, service or application ACK is supplied. */
++  while (airplay_sessions) session_cleanup(airplay_sessions);
++  for (i = 0; i < (int)ARRAY_SIZE(contexts); i++)
++    if (contexts[i]) { fprintf(stderr, "FAIL: stranded exact sequence context\n"); f.failed = 1; }
++  if (outputs_device_list) outputs_device_remove(outputs_device_list);
++  else if (f.device && !f.registered) outputs_device_free(f.device);
++  if (f.peer) bufferevent_free(f.peer);
++  if (f.old_peer) bufferevent_free(f.old_peer);
++  if (f.listener) evconnlistener_free(f.listener);
++  if (f.refused_fd >= 0) evutil_closesocket(f.refused_fd);
++  if (f.deadline) event_free(f.deadline);
++  if (outputs_deferredev) event_free(outputs_deferredev);
++  outputs_deferredev = NULL;
++  airplay_user_agent = NULL; airplay_client_name = NULL;
++  if (cfg) cfg_free(cfg); cfg = NULL;
++  result = f.failed; event_base_free(f.base); evbase_player = NULL; current_fixture = NULL;
++  memset(outputs_cb_register, 0, sizeof(outputs_cb_register));
++  memset(attention_results, 0, sizeof(attention_results));
++  memset(attention_result_reserved, 0, sizeof(attention_result_reserved));
++  return result;
++}
++
++/* Actual ordinary queue connect-error callbacks: borrowed nonNULL request,
++ * raw status zero and detached ownership remain unchanged. No request/session
++ * result is substituted. A second actual event base permits a nested native
++ * callback to synchronously free both live connections while A's loop is on
++ * the stack, without invoking a fabricated connection callback. */
++enum raw_mode { RAW_FREE, RAW_NONFREE, RAW_NESTED_FREE };
++struct raw_fixture;
++struct raw_operation { struct raw_fixture *fixture; int index; };
++struct raw_fixture {
++  enum raw_mode mode;
++  struct event_base *base[2];
++  struct event *deadline[2];
++  struct evrtsp_connection *connection[2];
++  void *connection_pointer[2];
++  struct evrtsp_request *request[4];
++  struct raw_operation operation[4];
++  int request_frees[4], connection_frees[2], order[4], callbacks;
++  int refused_fd, failed, nested_returned;
++  unsigned short port;
++};
++static struct raw_fixture *current_raw;
++static void raw_free_observe(void *pointer)
++{
++  int i;
++  if (!current_raw || !pointer) return;
++  for (i = 0; i < 4; i++)
++    if (pointer == current_raw->request[i]) current_raw->request_frees[i]++;
++  for (i = 0; i < 2; i++)
++    if (pointer == current_raw->connection_pointer[i]) current_raw->connection_frees[i]++;
++}
++static void raw_fail(struct raw_fixture *f, const char *why)
++{
++  int i;
++  fprintf(stderr, "FAIL raw-connect-owner=%d: %s\n", f->mode, why);
++  f->failed = 1;
++  for (i = 0; i < 2; i++) if (f->base[i]) event_base_loopbreak(f->base[i]);
++}
++static void raw_deadline(evutil_socket_t fd, short what, void *arg)
++{ (void)fd; (void)what; raw_fail(arg, "five-second native owner bound exhausted"); }
++static int raw_enqueue(struct raw_fixture *f, int which);
++static void raw_response(struct evrtsp_request *request, void *arg)
++{
++  struct raw_operation *operation = arg;
++  struct raw_fixture *f = operation->fixture;
++  int index = operation->index;
++  if (f->callbacks >= 4 || request != f->request[index] || !request
++      || request->evcon || request->response_code != 0)
++    { raw_fail(f, "ordinary raw callback request/status/ownership changed"); return; }
++  f->order[f->callbacks++] = index;
++  if (f->mode == RAW_NONFREE) {
++    if (index == 1) event_base_loopbreak(f->base[0]);
++    return;
++  }
++  if (f->mode == RAW_NESTED_FREE && index == 0) {
++    if (raw_enqueue(f, 1) < 0) return;
++    if (event_base_dispatch(f->base[1]) != 0 || f->failed)
++      { raw_fail(f, "actual nested native event owner did not return"); return; }
++    f->nested_returned = 1;
++    event_base_loopbreak(f->base[0]);
++    return;
++  }
++  if ((f->mode == RAW_FREE && index == 0) || (f->mode == RAW_NESTED_FREE && index == 2)) {
++    /* Both queued successors are still library-owned. Synchronous free cancels
++     * them without invoking their callbacks; local loop observers alone survive. */
++    evrtsp_connection_free(f->connection[0]); f->connection[0] = NULL;
++    if (f->mode == RAW_NESTED_FREE) {
++      evrtsp_connection_free(f->connection[1]); f->connection[1] = NULL;
++      event_base_loopbreak(f->base[1]);
++    } else event_base_loopbreak(f->base[0]);
++    return;
++  }
++  raw_fail(f, "canceled queued successor callback ran after synchronous destruction");
++}
++static int raw_enqueue(struct raw_fixture *f, int which)
++{
++  int i, index;
++  struct timeval bound = {5, 0};
++  f->base[which] = event_base_new();
++  if (!f->base[which]) { raw_fail(f, "event-base allocation"); return -1; }
++  f->deadline[which] = evtimer_new(f->base[which], raw_deadline, f);
++  if (!f->deadline[which] || evtimer_add(f->deadline[which], &bound))
++    { raw_fail(f, "bounded timer owner"); return -1; }
++  f->connection[which] = evrtsp_connection_new("127.0.0.1", f->port);
++  if (!f->connection[which]) { raw_fail(f, "actual connection constructor"); return -1; }
++  f->connection_pointer[which] = f->connection[which];
++  evrtsp_connection_set_base(f->connection[which], f->base[which]);
++  for (i = 0; i < 2; i++) {
++    index = which * 2 + i;
++    f->operation[index] = (struct raw_operation){ f, index };
++    f->request[index] = evrtsp_request_new(raw_response, &f->operation[index]);
++    if (!f->request[index]) { raw_fail(f, "actual request allocation"); return -1; }
++    /* The ordinary producer retains connection ownership even on negative.
++     * Cleanup below therefore never separately frees an enqueued request. */
++    if (evrtsp_make_request(f->connection[which], f->request[index], EVRTSP_REQ_OPTIONS, "*") < 0)
++      { raw_fail(f, "request did not reach actual asynchronous connect owner"); return -1; }
++  }
++  if (f->connection[which]->state != EVCON_CONNECTING)
++    { raw_fail(f, "actual kernel connection attempt was not pending"); return -1; }
++  return 0;
++}
++static int raw_case(enum raw_mode mode)
++{
++  struct raw_fixture f = { .mode = mode, .refused_fd = -1 };
++  struct sockaddr_in address = { .sin_family = AF_INET };
++  socklen_t length = sizeof(address);
++  int i, expected = mode == RAW_NESTED_FREE ? 4 : 2;
++  current_raw = &f;
++  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  f.refused_fd = socket(AF_INET, SOCK_STREAM, 0);
++  if (f.refused_fd < 0 || bind(f.refused_fd, (struct sockaddr *)&address, sizeof(address))
++      || getsockname(f.refused_fd, (struct sockaddr *)&address, &length))
++    { raw_fail(&f, "retained bound nonlistener socket"); goto cleanup; }
++  f.port = ntohs(address.sin_port);
++  if (raw_enqueue(&f, 0) < 0) goto cleanup;
++  if (event_base_dispatch(f.base[0]) != 0)
++    { raw_fail(&f, "outer actual native callback owner did not finish"); goto cleanup; }
++  if (mode == RAW_NONFREE) {
++    if (f.callbacks != 2 || f.order[0] != 0 || f.order[1] != 1
++        || !TAILQ_EMPTY(&f.connection[0]->requests) || f.connection[0]->free_observer)
++      { raw_fail(&f, "nonfree raw FIFO/local observer restoration changed"); goto cleanup; }
++    evrtsp_connection_free(f.connection[0]); f.connection[0] = NULL;
++  } else if (f.callbacks != (mode == RAW_FREE ? 1 : 2) || f.order[0] != 0
++      || (mode == RAW_NESTED_FREE && (f.order[1] != 2 || !f.nested_returned)))
++    { raw_fail(&f, "free or nested-free callback order/count changed"); goto cleanup; }
++  for (i = 0; i < expected; i++)
++    if (f.request_frees[i] != 1) raw_fail(&f, "actual request was not freed exactly once before rescue");
++  for (i = 0; i < expected / 2; i++)
++    if (f.connection[i] || f.connection_frees[i] != 1)
++      raw_fail(&f, "actual control connection did not synchronously retire exactly once");
++ cleanup:
++  /* Primary assertions precede exact fixture rescue. No unknown sockets/tasks,
++   * manual native state, response ACK or connection callback are injected. */
++  for (i = 0; i < 2; i++) {
++    if (f.connection[i]) evrtsp_connection_free(f.connection[i]);
++    if (f.deadline[i]) event_free(f.deadline[i]);
++    if (f.base[i]) event_base_free(f.base[i]);
++  }
++  if (f.refused_fd >= 0) evutil_closesocket(f.refused_fd);
++  current_raw = NULL;
++  return f.failed;
++}
++
++int main(void)
++{
++  int mode;
++  if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
++    if (owner_case((enum owner_mode)mode)) return 1;
++  for (mode = RAW_FREE; mode <= RAW_NESTED_FREE; mode++)
++    if (raw_case((enum raw_mode)mode)) return 1;
++  puts("PASS: actual AirPlay/evrtsp callback tickets, refused connect and synchronous queue custody (no AP2/public-volume/physical claim)");
++  return 0;
++}
+--- /dev/null
++++ b/tests/evrtsp_guarded_owner_contract.c
+@@ -0,0 +1,206 @@
++/* Actual candidate evrtsp queue/connection regression. No native session flags,
++ * fake ACK, AirPlay state, audio, LAN or provider. Reuses the established finite
++ * loopback fixture and exact real request ownership, with a five-second bound. */
++#define main original_evrtsp_owner_main
++#include "evrtsp_owner_contract.c"
++#undef main
++
++enum guarded_mode { FIRST_REJECT, QUEUED_REJECT, NESTED_REJECT_FREE };
++struct guarded_fixture;
++struct guarded_op { struct guarded_fixture *owner; int index, calls, null; };
++struct guarded_fixture {
++  enum guarded_mode mode;
++  struct event_base *base;
++  struct evconnlistener *listener;
++  struct bufferevent *peer;
++  struct evrtsp_connection *native;
++  struct event *deadline;
++  struct guarded_op op[3];
++  int wire, failed, retired, cleanup_callback, next_before_prior;
++};
++static void guarded_fail(struct guarded_fixture *s, const char *why)
++{
++  fprintf(stderr, "FAIL guarded=%d: %s\n", s->mode, why);
++  s->failed = 1;
++  event_base_loopbreak(s->base);
++}
++static void guarded_deadline(evutil_socket_t fd, short events, void *arg)
++{
++  (void)fd; (void)events;
++  guarded_fail(arg, "existing five-second fixture bound exhausted");
++}
++static int guarded_current(void *arg)
++{
++  struct guarded_op *op = arg;
++  return op->owner->mode != FIRST_REJECT && (op->index == 0 || !op->owner->retired);
++}
++static void guarded_response(struct evrtsp_request *request, void *arg)
++{
++  struct guarded_op *op = arg;
++  struct guarded_fixture *s = op->owner;
++  op->calls++;
++  op->null = request == NULL;
++  if (op->calls != 1) { guarded_fail(s, "duplicate exact request callback"); return; }
++  if (s->mode == FIRST_REJECT) {
++    if (op->index != 0 || request || s->wire != 0 || queue_count(s->native) != 0)
++      guarded_fail(s, "initial veto emitted wire or lost queue identity");
++    event_base_loopbreak(s->base);
++    return;
++  }
++  if (op->index == 0) {
++    if (!request || request->response_code != 200 || s->wire != 1 || s->op[1].calls)
++      { guarded_fail(s, "queued veto callback ran recursively before prior real response"); return; }
++    /* Real next request remains queue-owned while its rejection event is pending. */
++    s->next_before_prior = queue_count(s->native) == (s->mode == NESTED_REJECT_FREE ? 2 : 1);
++    if (!s->next_before_prior) guarded_fail(s, "next queue stage absent before prior callback");
++    return;
++  }
++  if (request || !s->op[0].calls || s->wire != 1)
++    { guarded_fail(s, "obsolete queued payload escaped serialization veto"); return; }
++  if (s->mode == NESTED_REJECT_FREE) {
++    if (op->index != 1 || s->op[2].calls || queue_count(s->native) != 1)
++      { guarded_fail(s, "nested rejection callback order incorrect"); return; }
++    /* Callback-initiated actual destruction cancels the next existing event and
++     * frees its queued request. No callback into freed connection/session arg. */
++    evrtsp_connection_free(s->native);
++    s->native = NULL;
++    s->cleanup_callback = 1;
++  }
++  event_base_loopbreak(s->base);
++}
++static void guarded_peer_read(struct bufferevent *peer, void *arg)
++{
++  struct guarded_fixture *s = arg;
++  struct evbuffer *input = bufferevent_get_input(peer);
++  struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
++  if (end.pos < 0) {
++    if (evbuffer_get_length(input) > 4096) guarded_fail(s, "wire header exceeds original bound");
++    return;
++  }
++  if (++s->wire != 1 || s->mode == FIRST_REJECT)
++    { guarded_fail(s, "unexpected obsolete guarded request on actual wire"); return; }
++  evbuffer_drain(input, (size_t)end.pos + 4);
++  s->retired = 1; /* Test currency changes while A is held, before A's real response. */
++  {
++    const char reply[] = "RTSP/1.0 200 Fixture\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n";
++    if (bufferevent_write(peer, reply, sizeof(reply) - 1) < 0)
++      guarded_fail(s, "actual inert reply write failed");
++  }
++}
++static void guarded_accept(struct evconnlistener *listener, evutil_socket_t fd,
++    struct sockaddr *remote, int length, void *arg)
++{
++  struct guarded_fixture *s = arg;
++  struct sockaddr_in *address = (struct sockaddr_in *)remote;
++  (void)listener;
++  if (length < (int)sizeof(*address) || address->sin_family != AF_INET
++      || ntohl(address->sin_addr.s_addr) != INADDR_LOOPBACK || s->peer) {
++    evutil_closesocket(fd); guarded_fail(s, "unknown/extra socket admission"); return;
++  }
++  s->peer = bufferevent_socket_new(s->base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
++  if (!s->peer) { evutil_closesocket(fd); guarded_fail(s, "peer allocation failed"); return; }
++  bufferevent_setcb(s->peer, guarded_peer_read, NULL, NULL, s);
++  if (bufferevent_enable(s->peer, EV_READ | EV_WRITE) < 0)
++    guarded_fail(s, "peer enable failed");
++}
++static int guarded_case(enum guarded_mode mode)
++{
++  struct guarded_fixture s = { .mode = mode };
++  struct sockaddr_in address = { .sin_family = AF_INET };
++  socklen_t length = sizeof(address);
++  struct timeval bound = {5, 0};
++  int i, count = mode == FIRST_REJECT ? 1 : mode == QUEUED_REJECT ? 2 : 3;
++  s.base = event_base_new();
++  if (!s.base) return 1;
++  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  s.listener = evconnlistener_new_bind(s.base, guarded_accept, &s,
++      LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, 2, (struct sockaddr *)&address, sizeof(address));
++  if (!s.listener || getsockname(evconnlistener_get_fd(s.listener), (struct sockaddr *)&address, &length) < 0)
++    { guarded_fail(&s, "loopback listener setup failed"); goto cleanup; }
++  s.native = evrtsp_connection_new("127.0.0.1", ntohs(address.sin_port));
++  if (!s.native) { guarded_fail(&s, "actual connection allocation failed"); goto cleanup; }
++  evrtsp_connection_set_base(s.native, s.base);
++  s.deadline = evtimer_new(s.base, guarded_deadline, &s);
++  if (!s.deadline || evtimer_add(s.deadline, &bound) < 0)
++    { guarded_fail(&s, "deadline admission failed"); goto cleanup; }
++  for (i = 0; i < count; i++) {
++    struct evrtsp_request *request;
++    s.op[i].owner = &s; s.op[i].index = i;
++    request = evrtsp_request_new(guarded_response, &s.op[i]);
++    if (!request) { guarded_fail(&s, "request allocation failed"); goto cleanup; }
++    if (evrtsp_add_header(request->output_headers, "CSeq", "1") < 0
++        || evrtsp_add_header(request->output_headers, "Content-Length", "0") < 0) {
++      evrtsp_request_free(request); guarded_fail(&s, "header preparation failed"); goto cleanup;
++    }
++    if (evrtsp_make_request_guarded(s.native, request, EVRTSP_REQ_SET_PARAMETER,
++        "rtsp://127.0.0.1/pc9-guarded", guarded_current, &s.op[i]) < 0) {
++      evrtsp_request_free(request); guarded_fail(&s, "guarded admission failed"); goto cleanup;
++    }
++  }
++  if (event_base_dispatch(s.base) != 0) guarded_fail(&s, "loop exited without callback completion");
++  if (s.op[0].calls != 1 || (mode != FIRST_REJECT && s.op[1].calls != 1)
++      || (mode == NESTED_REJECT_FREE && (!s.cleanup_callback || s.op[2].calls)))
++    guarded_fail(&s, "exact terminal callback/cleanup inventory incomplete");
++cleanup:
++  if (s.deadline) event_free(s.deadline);
++  if (s.native) evrtsp_connection_free(s.native);
++  if (s.peer) bufferevent_free(s.peer);
++  if (s.listener) evconnlistener_free(s.listener);
++  event_base_free(s.base);
++  return s.failed;
++}
++static int negative_enqueue_ownership(void)
++{
++  struct event_base *base = event_base_new();
++  struct evrtsp_connection *connection = NULL;
++  struct evrtsp_request *request = NULL;
++  int failed = 1, guarded;
++  evutil_socket_t bound_fd = -1;
++  struct sockaddr_in reserved = { .sin_family = AF_INET };
++  socklen_t reserved_len = sizeof(reserved);
++  if (!base) return 1;
++  reserved.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  bound_fd = socket(AF_INET, SOCK_STREAM, 0);
++  if (bound_fd < 0 || bind(bound_fd, (struct sockaddr *)&reserved, sizeof(reserved)) < 0
++      || listen(bound_fd, 1) < 0
++      || getsockname(bound_fd, (struct sockaddr *)&reserved, &reserved_len) < 0)
++    goto cleanup;
++  for (guarded = 0; guarded <= 1; guarded++) {
++    connection = evrtsp_connection_new("127.0.0.1", 9);
++    request = evrtsp_request_new(NULL, NULL);
++    if (!connection || !request) goto cleanup;
++    evrtsp_connection_set_base(connection, base);
++    /* Exact actual socket bind failure, without changing connection state or
++     * claiming native readiness. The library owns this allocated bind string. */
++    connection->bind_address = strdup("127.0.0.1");
++    connection->bind_port = ntohs(reserved.sin_port);
++    if (!connection->bind_address) goto cleanup;
++    if ((guarded ? evrtsp_make_request_guarded(connection, request, EVRTSP_REQ_SET_PARAMETER,
++             "rtsp://127.0.0.1/pc9-bind", NULL, NULL)
++        : evrtsp_make_request(connection, request, EVRTSP_REQ_SET_PARAMETER,
++             "rtsp://127.0.0.1/pc9-bind")) >= 0) goto cleanup;
++    if (guarded) {
++      if (queue_count(connection) != 0 || request->evcon != NULL) goto cleanup;
++      evrtsp_request_free(request); request = NULL;
++    } else {
++      if (queue_count(connection) != 1 || request->evcon != connection) goto cleanup;
++      request = NULL; /* Original RAOP connection ownership preserved on negative. */
++    }
++    evrtsp_connection_free(connection); connection = NULL;
++  }
++  failed = 0;
++cleanup:
++  if (request && (!connection || request->evcon != connection)) evrtsp_request_free(request);
++  if (connection) evrtsp_connection_free(connection);
++  if (bound_fd >= 0) evutil_closesocket(bound_fd);
++  event_base_free(base);
++  return failed;
++}
++int main(void)
++{
++  if (original_evrtsp_owner_main()) return EXIT_FAILURE;
++  if (guarded_case(FIRST_REJECT) || guarded_case(QUEUED_REJECT)
++      || guarded_case(NESTED_REJECT_FREE) || negative_enqueue_ownership()) return EXIT_FAILURE;
++  puts("PASS actual guarded queue ownership; no AirPlay/native acoustic acceptance");
++  return EXIT_SUCCESS;
++}
+--- /dev/null
++++ b/tests/evrtsp_owner_contract.c
+@@ -0,0 +1,390 @@
++/*
++ * PC9 TEST-ONLY DRAFT. Links unchanged pinned OwnTone evrtsp/rtsp.c.
++ * No AirPlay/player/HTTP result, user volume, lease or physical claim.
++ * Operation strings are fixture identities, not production operation nonces.
++ */
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/queue.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <event2/event.h>
++#include <event2/buffer.h>
++#include <event2/bufferevent.h>
++#include <event2/listener.h>
++#include <event2/util.h>
++#include <event2/keyvalq_struct.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include "evrtsp.h"
++#include "rtsp-internal.h"
++
++int debug; /* Same extern required by the actual evrtsp TU; no log stubs. */
++enum mode { RAW_NEGATIVE, READ_ERROR_RECONNECT, QUEUED_FREE, GRACEFUL_EOF_NO_ACK };
++struct fixture;
++struct operation {
++  struct fixture *fixture;
++  const char *identity;
++  int calls;
++  int is_null;
++  int raw_status;
++  int raw_cseq;
++  int saw_next_native_stage;
++};
++struct peer {
++  struct fixture *fixture;
++  struct bufferevent *bev;
++  int incarnation; /* Fixture accept order, never PID/FD/native incarnation. */
++};
++struct fixture {
++  enum mode mode;
++  struct event_base *base;
++  struct evconnlistener *listener;
++  struct event *deadline;
++  struct evrtsp_connection *native;
++  struct evrtsp_request *admitted[2]; /* Compare only while native owns them. */
++  struct operation op[2];
++  struct peer peers[2];
++  int accept_count;
++  int request_count;
++  int close_calls;
++  int queued_at_close;
++  int queued_before_free;
++  int freed;
++  int native_fd_before_peer_close;
++  int eof_no_headers;
++  int eof_same_fd;
++  int rst_requested;
++  int failed;
++};
++
++static int check(struct fixture *s, int condition, const char *why)
++{
++  if (!condition) {
++    fprintf(stderr, "FAIL mode=%d: %s\n", s->mode, why);
++    s->failed = 1;
++    if (s->base) event_base_loopbreak(s->base);
++  }
++  return condition;
++}
++static int queue_count(struct evrtsp_connection *native)
++{
++  struct evrtsp_request *r;
++  int count = 0;
++  TAILQ_FOREACH(r, &native->requests, next) count++;
++  return count;
++}
++static void deadline_cb(evutil_socket_t fd, short events, void *arg)
++{
++  (void)fd; (void)events;
++  check(arg, 0, "fixture event deadline expired; native timeouts unchanged");
++}
++static void native_close_cb(struct evrtsp_connection *native, void *arg)
++{
++  struct fixture *s = arg;
++  s->close_calls++;
++  s->queued_at_close = queue_count(native);
++  check(s, native == s->native && s->close_calls == 1,
++        "unexpected or duplicate native close callback");
++}
++static void response_cb(struct evrtsp_request *req, void *arg)
++{
++  struct operation *op = arg;
++  struct fixture *s = op->fixture;
++  const char *identity, *cseq;
++  op->calls++;
++  op->is_null = req == NULL;
++  op->raw_status = req ? req->response_code : 0;
++  if (!check(s, op->calls == 1, "duplicate caller-owned operation callback"))
++    return;
++  if (s->mode == QUEUED_FREE) {
++    check(s, 0, "connection_free unexpectedly notified queued request");
++    return;
++  }
++  if (s->mode == GRACEFUL_EOF_NO_ACK) {
++    /* Observe only the first callback; later B transport outcome is unknown. */
++    if (!check(s, op == &s->op[0] && req == s->admitted[0] &&
++               !op->is_null && op->raw_status == 0 && req->evcon == NULL,
++               "graceful EOF did not return actual A with raw status zero"))
++      return;
++    s->eof_no_headers = req->input_headers &&
++      TAILQ_EMPTY(req->input_headers) && req->response_code_line == NULL &&
++      evbuffer_get_length(req->input_buffer) == 0;
++    s->eof_same_fd = s->native_fd_before_peer_close >= 0 &&
++      s->native->fd == s->native_fd_before_peer_close;
++    op->saw_next_native_stage =
++      TAILQ_FIRST(&s->native->requests) == s->admitted[1] &&
++      s->native->state == EVCON_WRITING;
++    if (!check(s, s->eof_no_headers && s->eof_same_fd &&
++               op->saw_next_native_stage && s->accept_count == 1 &&
++               s->request_count == 1 && s->op[1].calls == 0,
++               "graceful EOF no-ACK/same-fd B-stage witness incomplete"))
++      return;
++    event_base_loopbreak(s->base);
++    return; /* Actual TU frees A after callback; do not retain/dereference it. */
++  }
++  if (op == &s->op[0]) {
++    op->saw_next_native_stage =
++      TAILQ_FIRST(&s->native->requests) == s->admitted[1] &&
++      s->native->state == (s->mode == READ_ERROR_RECONNECT ?
++                           EVCON_CONNECTING : EVCON_WRITING);
++    if (!check(s, op->saw_next_native_stage,
++               "next native request was not staged before first callback"))
++      return;
++  }
++  if (req) {
++    identity = evrtsp_find_header(req->input_headers,
++                                 "X-PC9-Fixture-Operation");
++    if (!check(s, identity && strcmp(identity, op->identity) == 0,
++               "actual parser response bound to wrong fixture identity"))
++      return;
++    cseq = evrtsp_find_header(req->input_headers, "CSeq");
++    if (!check(s, cseq && strcmp(cseq, op == &s->op[0] ? "999" : "2") == 0,
++               "actual parser lost controlled response CSeq")) return;
++    op->raw_cseq = atoi(cseq); /* Validated literal fixture metadata only. */
++  }
++  /* Do not retain/dereference req after returning: actual TU frees it. */
++  if (s->op[0].calls && s->op[1].calls)
++    event_base_loopbreak(s->base);
++}
++static void peer_event_cb(struct bufferevent *bev, short events, void *arg)
++{
++  struct peer *peer = arg;
++  (void)bev;
++  if (events & (BEV_EVENT_ERROR | BEV_EVENT_EOF | BEV_EVENT_TIMEOUT))
++    check(peer->fixture, 0, "unexpected inert peer event before fixture ended");
++}
++static void peer_read_cb(struct bufferevent *bev, void *arg)
++{
++  struct peer *peer = arg;
++  struct fixture *s = peer->fixture;
++  struct evbuffer *input = bufferevent_get_input(bev);
++  struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
++  char header[4097], response[256];
++  const char *identity;
++  int status, cseq, count, n;
++  size_t length;
++  if (end.pos < 0) {
++    check(s, evbuffer_get_length(input) <= 4096, "fixture header exceeded bound");
++    return;
++  }
++  length = (size_t)end.pos + 4;
++  if (!check(s, length < sizeof(header), "fixture request too large")) return;
++  if (!check(s, evbuffer_remove(input, header, length) == (int)length,
++             "fixture header read incomplete")) return;
++  header[length] = '\0';
++  if (!check(s, strncmp(header, "SET_PARAMETER ", 14) == 0,
++             "unexpected actual native request method")) return;
++  count = ++s->request_count;
++  if (!check(s, count <= 2, "duplicate/extra actual native request")) return;
++  identity = s->op[count - 1].identity;
++  if (!check(s, strstr(header, count == 1 ?
++                     "\r\nX-PC9-Fixture-Operation: pc9-A\r\n" :
++                     "\r\nX-PC9-Fixture-Operation: pc9-B\r\n") != NULL,
++             "wire request identity/order differs from admitted fixture"))
++    return;
++  if (!check(s, strstr(header, "\r\nContent-Length: 0\r\n") != NULL,
++             "fixture must carry no audio or volume payload")) return;
++  if (s->mode == QUEUED_FREE) {
++    s->queued_before_free = queue_count(s->native);
++    if (!check(s, count == 1 && s->queued_before_free == 2 &&
++               s->op[0].calls == 0 && s->op[1].calls == 0,
++               "fixture did not hold two admitted native requests")) return;
++    /* Actual destructor on actual live transport, outside request callback. */
++    evrtsp_connection_free(s->native);
++    s->native = NULL;
++    s->freed = 1;
++    check(s, s->op[0].calls == 0 && s->op[1].calls == 0,
++          "queued native requests received callback during free");
++    event_base_loopbreak(s->base);
++    return;
++  }
++  if ((s->mode == READ_ERROR_RECONNECT || s->mode == GRACEFUL_EOF_NO_ACK) &&
++      count == 1) {
++    if (!check(s, peer->incarnation == 1, "first request on wrong peer")) return;
++    s->native_fd_before_peer_close = s->native->fd;
++    if (!check(s, s->native_fd_before_peer_close >= 0,
++               "native first transport descriptor unavailable")) return;
++    if (s->mode == READ_ERROR_RECONNECT) {
++      struct linger reset = {1, 0};
++      evutil_socket_t peer_fd = bufferevent_getfd(peer->bev);
++      /* Actual accepted loopback socket: reset instead of graceful EOF. */
++      if (!check(s, peer_fd >= 0 &&
++                 setsockopt(peer_fd, SOL_SOCKET, SO_LINGER,
++                            &reset, sizeof(reset)) == 0,
++                 "controlled TCP reset setup failed")) return;
++      s->rst_requested = 1;
++    }
++    /* No response bytes; production TU alone handles the transport event. */
++    bufferevent_free(peer->bev);
++    peer->bev = NULL;
++    return;
++  }
++  if (!check(s, peer->incarnation == (s->mode == READ_ERROR_RECONNECT ? 2 : 1),
++             "actual request on wrong fixture accept incarnation")) return;
++  status = s->mode == RAW_NEGATIVE && count == 1 ? 503 : 200;
++  /* Intentional mismatch confirms native parser does not validate CSeq. */
++  cseq = count == 1 ? 999 : 2;
++  n = snprintf(response, sizeof(response),
++               "RTSP/1.0 %d Fixture\r\nCSeq: %d\r\n"
++               "X-PC9-Fixture-Operation: %s\r\nContent-Length: 0\r\n\r\n",
++               status, cseq, identity);
++  if (!check(s, n > 0 && (size_t)n < sizeof(response) &&
++             bufferevent_write(bev, response, (size_t)n) == 0,
++             "inert peer could not queue complete response")) return;
++}
++static void accept_cb(struct evconnlistener *listener, evutil_socket_t fd,
++                      struct sockaddr *address, int length, void *arg)
++{
++  struct fixture *s = arg;
++  struct peer *peer;
++  struct sockaddr_in *remote = (struct sockaddr_in *)address;
++  (void)listener;
++  if (!check(s, length >= (int)sizeof(*remote) && remote->sin_family == AF_INET &&
++             ntohl(remote->sin_addr.s_addr) == INADDR_LOOPBACK &&
++             s->accept_count < 2, "non-loopback or extra peer admission")) {
++    evutil_closesocket(fd);
++    return;
++  }
++  peer = &s->peers[s->accept_count++];
++  peer->fixture = s;
++  peer->incarnation = s->accept_count;
++  peer->bev = bufferevent_socket_new(s->base, fd,
++                      BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
++  if (!check(s, peer->bev != NULL, "inert peer allocation failed")) {
++    evutil_closesocket(fd);
++    return;
++  }
++  bufferevent_setcb(peer->bev, peer_read_cb, NULL, peer_event_cb, peer);
++  check(s, bufferevent_enable(peer->bev, EV_READ | EV_WRITE) == 0,
++        "inert peer event enable failed");
++}
++static void listener_error_cb(struct evconnlistener *listener, void *arg)
++{
++  (void)listener;
++  check(arg, 0, "inert loopback listener error");
++}
++static int run_case(enum mode mode)
++{
++  struct fixture s = {0};
++  struct sockaddr_in address = {0};
++  socklen_t length = sizeof(address);
++  struct timeval bound = {5, 0};
++  int i, result;
++  s.mode = mode;
++  s.base = event_base_new();
++  if (!check(&s, s.base != NULL, "event base allocation failed")) goto cleanup;
++  address.sin_family = AF_INET;
++  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  address.sin_port = 0;
++  s.listener = evconnlistener_new_bind(s.base, accept_cb, &s,
++               LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, 2,
++               (struct sockaddr *)&address, sizeof(address));
++  if (!check(&s, s.listener != NULL, "loopback listener failed")) goto cleanup;
++  evconnlistener_set_error_cb(s.listener, listener_error_cb);
++  if (!check(&s, getsockname(evconnlistener_get_fd(s.listener),
++               (struct sockaddr *)&address, &length) == 0,
++               "loopback ephemeral port unavailable")) goto cleanup;
++  s.native = evrtsp_connection_new("127.0.0.1", ntohs(address.sin_port));
++  if (!check(&s, s.native != NULL, "actual native connection failed"))
++    goto cleanup;
++  evrtsp_connection_set_base(s.native, s.base);
++  if (mode == QUEUED_FREE)
++    evrtsp_connection_set_closecb(s.native, native_close_cb, &s);
++  s.deadline = evtimer_new(s.base, deadline_cb, &s);
++  if (!check(&s, s.deadline && evtimer_add(s.deadline, &bound) == 0,
++             "fixture deadline owner failed")) goto cleanup;
++  for (i = 0; i < 2; i++) {
++    s.op[i].fixture = &s;
++    s.op[i].identity = i == 0 ? "pc9-A" : "pc9-B";
++    s.admitted[i] = evrtsp_request_new(response_cb, &s.op[i]);
++    if (!check(&s, s.admitted[i] != NULL, "actual request allocation failed"))
++      goto cleanup;
++    if (evrtsp_add_header(s.admitted[i]->output_headers,
++          "X-PC9-Fixture-Operation", s.op[i].identity) != 0 ||
++        evrtsp_add_header(s.admitted[i]->output_headers,
++          "CSeq", i == 0 ? "1" : "2") != 0 ||
++        evrtsp_add_header(s.admitted[i]->output_headers,
++          "Content-Length", "0") != 0) {
++      evrtsp_request_free(s.admitted[i]);
++      s.admitted[i] = NULL; /* Not admitted yet; caller still owned it. */
++      check(&s, 0, "fixture header preparation failed");
++      goto cleanup;
++    }
++    /* The pinned API takes ownership; never free an admitted request here. */
++    if (!check(&s, evrtsp_make_request(s.native, s.admitted[i],
++            EVRTSP_REQ_SET_PARAMETER, "rtsp://127.0.0.1/pc9-fixture") == 0,
++            "actual native admission failed")) goto cleanup;
++  }
++  if (!check(&s, queue_count(s.native) == 2,
++             "actual native queue did not admit both requests")) goto cleanup;
++  result = event_base_dispatch(s.base);
++  if (!check(&s, result == 0, "actual event loop ended unexpectedly"))
++    goto cleanup;
++  if (mode == QUEUED_FREE)
++    check(&s, s.freed && s.request_count == 1 && s.accept_count == 1 &&
++          s.queued_before_free == 2 && s.close_calls == 1 &&
++          s.queued_at_close == 2 && s.op[0].calls == 0 && s.op[1].calls == 0,
++          "actual queued-free counterexample not established");
++  else if (mode == GRACEFUL_EOF_NO_ACK)
++    check(&s, s.request_count == 1 && s.accept_count == 1 &&
++          s.op[0].calls == 1 && s.op[1].calls == 0 &&
++          !s.op[0].is_null && s.op[0].raw_status == 0 &&
++          s.op[0].saw_next_native_stage && s.eof_no_headers && s.eof_same_fd &&
++          !s.rst_requested,
++          "actual graceful EOF no-ACK witness incomplete; B outcome unknown");
++  else
++    check(&s, s.request_count == 2 &&
++          s.accept_count == (mode == READ_ERROR_RECONNECT ? 2 : 1) &&
++          s.op[0].calls == 1 && s.op[1].calls == 1 &&
++          s.op[0].is_null == (mode == READ_ERROR_RECONNECT) &&
++          s.op[0].raw_status == (mode == READ_ERROR_RECONNECT ? 0 : 503) &&
++          !s.op[1].is_null && s.op[1].raw_status == 200 &&
++          s.op[0].saw_next_native_stage &&
++          (mode != READ_ERROR_RECONNECT || s.rst_requested),
++          "actual parser/queue/reconnect identity observations incomplete");
++cleanup:
++  if (s.deadline) event_free(s.deadline);
++  if (s.native) {
++    /* Failure cleanup is still actual destructor; suppress test close assertion. */
++    evrtsp_connection_set_closecb(s.native, NULL, NULL);
++    evrtsp_connection_free(s.native);
++  }
++  for (i = 0; i < 2; i++)
++    if (s.peers[i].bev) bufferevent_free(s.peers[i].bev);
++  if (s.listener) evconnlistener_free(s.listener);
++  if (s.base) event_base_free(s.base);
++  if (!s.failed && mode == GRACEFUL_EOF_NO_ACK)
++    printf("{\"facet\":\"evrtsp-only\",\"case\":3,"
++           "\"status\":\"BASELINE_OBSERVED\","
++           "\"observation\":\"GRACEFUL_EOF_NO_ACK\","
++           "\"peer_requests\":%d,\"peer_incarnations\":%d,"
++           "\"callbacks_A\":%d,\"callbacks_B\":%d,"
++           "\"raw_A\":%d,\"A_null\":%d,\"A_response_headers_empty\":%d,"
++           "\"B_staged_WRITING\":%d,\"same_native_fd_at_A\":%d,"
++           "\"B_outcome\":\"UNOBSERVED\"}\n",
++           s.request_count, s.accept_count, s.op[0].calls, s.op[1].calls,
++           s.op[0].raw_status, s.op[0].is_null, s.eof_no_headers,
++           s.op[0].saw_next_native_stage, s.eof_same_fd);
++  else if (!s.failed)
++    printf("{\"facet\":\"evrtsp-only\",\"case\":%d,\"status\":\"BASELINE_OBSERVED\","
++           "\"peer_requests\":%d,\"peer_incarnations\":%d,"
++           "\"callbacks_A\":%d,\"callbacks_B\":%d,"
++           "\"raw_A\":%d,\"raw_B\":%d,\"A_null\":%d,"
++           "\"queued_before_free\":%d,\"close_callbacks\":%d}\n",
++           mode, s.request_count, s.accept_count, s.op[0].calls, s.op[1].calls,
++           s.op[0].raw_status, s.op[1].raw_status, s.op[0].is_null,
++           s.queued_before_free, s.close_calls);
++  return s.failed ? 1 : 0;
++}
++int main(void)
++{
++  /* Separate case owners: no sleeps, device/provider or production state. */
++  if (run_case(RAW_NEGATIVE)) return EXIT_FAILURE;
++  if (run_case(READ_ERROR_RECONNECT)) return EXIT_FAILURE;
++  if (run_case(QUEUED_FREE)) return EXIT_FAILURE;
++  if (run_case(GRACEFUL_EOF_NO_ACK)) return EXIT_FAILURE;
++  return EXIT_SUCCESS;
++}
+--- /dev/null
++++ b/tests/outputs_attention_owner.c
+@@ -0,0 +1,581 @@
++/*
++ * Deterministic native OWNER regressions, not receiver or acoustic acceptance.
++ * Compiles the complete candidate outputs.c translation unit with its real
++ * headers. Only logging, speaker persistence and transport edges are inert.
++ * No fabricated AirPlay session, connected flag, callback ACK or protocol PASS.
++ * Root admits any compilation/execution separately using the existing owner.
++ */
++#include <assert.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../src/outputs.c"
++
++struct event_base *evbase_player;
++struct output_definition output_raop;
++struct output_definition output_streaming;
++struct output_definition output_dummy;
++struct output_definition output_fifo;
++struct output_definition output_rcp;
++#ifdef HAVE_ALSA
++struct output_definition output_alsa;
++#endif
++#ifdef HAVE_LIBPULSE
++struct output_definition output_pulse;
++#endif
++#ifdef CHROMECAST
++struct output_definition output_cast;
++#endif
++cfg_t *cfg;
++uint64_t libhash;
++uid_t runas_uid;
++gid_t runas_gid;
++
++static int transport_return;
++static int transport_calls;
++static struct output_attention_result admitted;
++static bool synchronous_expire;
++
++static int inert_attention(struct output_device *device, const struct output_attention_result *operation)
++{
++  assert(device->id == operation->identity.device_id);
++  admitted = *operation;
++  transport_calls++;
++  if (synchronous_expire)
++    {
++      synchronous_expire = false;
++      assert(clock_gettime(CLOCK_MONOTONIC, &device->attention_deadline) == 0);
++      device->attention_deadline.tv_sec--;
++      attention_timer_cb(-1, EV_TIMEOUT, device);
++      outputs_attention_complete(operation, OUTPUT_ATTENTION_UNKNOWN, 0, 17);
++    }
++  return transport_return;
++}
++
++static int unexpected_legacy_send(struct output_device *device, int callback_id)
++{
++  (void)device;
++  (void)callback_id;
++  assert(!"inactive ordinary volume must not call a backend");
++  return -1;
++}
++
++struct output_definition output_airplay = {
++  .name = "controlled-output-edge",
++  .type = OUTPUT_TYPE_AIRPLAY,
++  .device_attention_set = inert_attention,
++  .device_volume_set = unexpected_legacy_send,
++};
++
++void DPRINTF(int severity, int domain, const char *format, ...)
++{
++  (void)severity;
++  (void)domain;
++  (void)format;
++}
++
++const char *player_pmap(void *pointer)
++{
++  (void)pointer;
++  return "controlled-owner-pointer";
++}
++
++int db_speaker_get(struct output_device *device, uint64_t id)
++{
++  device->volume = id == 1 ? 30 : 65;
++  device->selected = false;
++  return 0;
++}
++
++int db_speaker_save(struct output_device *device)
++{
++  (void)device;
++  return 0;
++}
++
++static struct output_device *add_device(uint64_t id)
++{
++  struct output_device *device = calloc(1, sizeof(*device));
++  assert(device);
++  device->id = id;
++  device->type = OUTPUT_TYPE_AIRPLAY;
++  device->type_name = "controlled-output-edge";
++  device->name = strdup(id == 1 ? "A" : "B");
++  assert(device->name);
++  device = outputs_device_add(device, false);
++  assert(device && device->incarnation && device->base_revision);
++  return device;
++}
++
++static struct output_attention_result request(uint64_t id, enum output_attention_action action)
++{
++  struct output_attention_request request = { .action = action, .cap_volume = 5 };
++  struct output_attention_result result;
++  assert(outputs_attention_state_get(id, &request.expected) == 0);
++  assert(outputs_attention_admit(&request, &result) == 0);
++  return result;
++}
++
++static void clear_devices(void)
++{
++  int i;
++  while (outputs_device_list)
++    outputs_device_remove(outputs_device_list);
++  for (i = 0; i < ARRAY_SIZE(attention_results); i++)
++    {
++      assert(!attention_results[i].operation || attention_results[i].outcome != OUTPUT_ATTENTION_PENDING);
++      assert(!attention_result_reserved[i]);
++    }
++  memset(attention_results, 0, sizeof(attention_results));
++  transport_return = 0;
++  transport_calls = 0;
++}
++
++static void bases_and_legacy_selection(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_device *b = add_device(2);
++  struct output_attention_result result;
++
++  outputs_device_select(a, -1);
++  result = request(1, OUTPUT_ATTENTION_BEGIN);
++  assert(result.outcome == OUTPUT_ATTENTION_DESIRED_ONLY);
++  assert(a->volume == 30 && outputs_device_effective_volume(a) == 5);
++  result = request(2, OUTPUT_ATTENTION_BEGIN);
++  assert(result.identity.base_volume == 65 && result.identity.effective_volume == 5);
++  outputs_device_select(b, outputs_volume_get());
++  outputs_device_deselect(a);
++  assert(a->volume == 30 && b->volume == 65);
++  result = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(result.identity.effective_volume == 30 && b->volume == 65);
++  result = request(2, OUTPUT_ATTENTION_RELEASE);
++  assert(result.identity.effective_volume == 65);
++  assert(outputs_device_volume_set(b, NULL) == 0); /* inactive legacy no-send */
++  clear_devices();
++
++  a = add_device(1);
++  b = add_device(2);
++  outputs_device_select(a, -1);
++  outputs_device_select(b, outputs_volume_get());
++  assert(b->volume == 30); /* normal no-lease cap is preserved */
++  clear_devices();
++}
++
++static void manual_revision_and_old_lease(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_request stale = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5 };
++  struct output_attention_result result;
++  assert(outputs_attention_state_get(1, &stale.expected) == 0);
++  outputs_device_volume_register(a, 30, -1);
++  assert(outputs_attention_admit(&stale, &result) < 0 && transport_calls == 0);
++  result = request(1, OUTPUT_ATTENTION_BEGIN);
++  assert(outputs_attention_state_get(1, &stale.expected) == 0);
++  stale.action = OUTPUT_ATTENTION_UPDATE;
++  outputs_device_volume_register(a, 40, -1);
++  assert(outputs_attention_admit(&stale, &result) < 0);
++  assert(a->volume == 40 && outputs_device_effective_volume(a) == 5);
++  result = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(result.identity.effective_volume == 40);
++  result = request(1, OUTPUT_ATTENTION_BEGIN);
++  assert(outputs_attention_admit(&stale, &result) < 0); /* retired heartbeat */
++  result = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(a->volume == 40);
++  clear_devices();
++}
++
++static void failure_cannot_be_overwritten_or_cross_output(void)
++{
++  struct output_attention_result old, other, result;
++  add_device(1);
++  add_device(2);
++  transport_return = 1; /* Unit transport boundary; not a native ACK. */
++  old = request(1, OUTPUT_ATTENTION_BEGIN);
++  other = request(2, OUTPUT_ATTENTION_BEGIN);
++  assert(old.outcome == OUTPUT_ATTENTION_PENDING && other.outcome == OUTPUT_ATTENTION_PENDING);
++  outputs_attention_complete(&old, OUTPUT_ATTENTION_FAILED, 503, 7);
++  outputs_attention_complete(&other, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 8);
++  outputs_attention_complete(&old, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 7);
++  assert(outputs_attention_result_get(old.identity.process, old.operation, &result) == 0);
++  assert(result.outcome == OUTPUT_ATTENTION_FAILED && result.response_code == 503);
++  assert(outputs_attention_result_get(other.identity.process, other.operation, &result) == 0);
++  assert(result.outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED);
++  clear_devices();
++}
++
++static void remove_readd_and_session_epoch_retire_authority(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_result old, fresh, result;
++  struct output_attention_request request_old = { 0 };
++  int opaque_a, opaque_b; /* Identity tokens only; no native session/ready state. */
++
++  transport_return = 1;
++  old = request(1, OUTPUT_ATTENTION_BEGIN);
++  assert(outputs_attention_state_get(1, &request_old.expected) == 0);
++  request_old.action = OUTPUT_ATTENTION_UPDATE;
++  request_old.cap_volume = 5;
++  outputs_device_remove(a);
++  a = add_device(1);
++  assert(a->incarnation != old.identity.device_incarnation);
++  fresh = request(1, OUTPUT_ATTENTION_BEGIN);
++  outputs_attention_complete(&old, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 9);
++  assert(outputs_attention_result_get(old.identity.process, old.operation, &result) == 0 && !result.current);
++  assert(outputs_attention_result_get(fresh.identity.process, fresh.operation, &result) == 0);
++  assert(result.current && result.outcome == OUTPUT_ATTENTION_PENDING);
++  assert(outputs_attention_admit(&request_old, &result) < 0);
++  outputs_attention_complete(&fresh, OUTPUT_ATTENTION_UNKNOWN, 0, 10);
++
++  assert(outputs_device_session_add(1, &opaque_a) == 0);
++  assert(outputs_attention_state_get(1, &request_old.expected) == 0);
++  assert(outputs_device_session_add(1, &opaque_b) == 0);
++  outputs_device_session_remove_exact(1, &opaque_a);
++  assert(a->session == &opaque_b); /* old cleanup cannot erase fresh handle */
++  assert(outputs_attention_admit(&request_old, &result) < 0);
++  outputs_device_session_remove_exact(1, &opaque_b);
++  assert(a->session == NULL);
++  clear_devices();
++}
++
++static void process_currency_and_unknown_result(void)
++{
++  struct output_attention_request wrong = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5 };
++  struct output_attention_result result;
++  add_device(1);
++  assert(outputs_attention_state_get(1, &wrong.expected) == 0);
++  wrong.expected.process[0] = '9';
++  assert(outputs_attention_admit(&wrong, &result) < 0 && transport_calls == 0);
++  assert(outputs_attention_result_get(wrong.expected.process, 9999, &result) < 0);
++  clear_devices();
++}
++
++static void failed_release_keeps_exact_lease_and_manual_aba(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_result begin, failed, retry, value;
++  uint64_t lease;
++  outputs_device_select(a, -1);
++  begin = request(1, OUTPUT_ATTENTION_BEGIN);
++  lease = begin.identity.lease;
++  transport_return = 1;
++  failed = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(failed.identity.lease == lease && a->attention_restoring);
++  outputs_attention_complete(&failed, OUTPUT_ATTENTION_FAILED, 503, 11);
++  assert(a->attention_lease == lease && a->volume == 30);
++  outputs_device_volume_register(a, 30, -1); /* same value, new manual owner */
++  assert(outputs_attention_result_get(failed.identity.process, failed.operation, &value) == 0);
++  assert(value.outcome == OUTPUT_ATTENTION_FAILED && !value.current);
++  retry = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(retry.identity.lease == lease && retry.identity.base_revision > failed.identity.base_revision);
++  outputs_attention_complete(&failed, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 11);
++  assert(a->attention_lease == lease); /* obsolete success cannot clear current restore */
++  outputs_attention_complete(&retry, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 12);
++  assert(a->attention_lease == 0 && !a->attention_restoring && a->volume == 30);
++  assert(outputs_attention_result_get(retry.identity.process, retry.operation, &value) == 0);
++  assert(value.current && value.outcome == OUTPUT_ATTENTION_PROTOCOL_ACCEPTED);
++  clear_devices();
++}
++
++static void native_deadline_waits_pending_then_restores_same_lease(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_result first, expiry;
++  uint64_t lease;
++  outputs_device_select(a, -1);
++  transport_return = 1;
++  first = request(1, OUTPUT_ATTENTION_BEGIN);
++  lease = a->attention_lease;
++  assert(clock_gettime(CLOCK_MONOTONIC, &a->attention_deadline) == 0);
++  a->attention_deadline.tv_sec--;
++  attention_timer_cb(-1, EV_TIMEOUT, a);
++  assert(a->attention_expired && a->attention_restoring && !a->attention_expiry_attempted);
++  assert(transport_calls == 1 && a->attention_lease == lease);
++  outputs_attention_complete(&first, OUTPUT_ATTENTION_UNKNOWN, 0, 13);
++  expiry = admitted;
++  assert(expiry.action == OUTPUT_ATTENTION_RELEASE && expiry.identity.lease == lease);
++  assert(transport_calls == 2 && a->attention_expiry_attempted);
++  outputs_attention_complete(&expiry, OUTPUT_ATTENTION_UNKNOWN, 0, 14);
++  assert(a->attention_lease == lease && a->attention_restoring && transport_calls == 2);
++  transport_return = 0; /* an explicit exact-owner retry at inactive transport boundary */
++  expiry = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(expiry.outcome == OUTPUT_ATTENTION_DESIRED_ONLY && a->attention_lease == 0);
++  clear_devices();
++}
++
++static void refreshed_deadline_and_saturation_cannot_reuse_authority(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_state current;
++  struct timespec deadline;
++  struct output_attention_result result;
++  int opaque;
++  outputs_device_select(a, -1);
++  result = request(1, OUTPUT_ATTENTION_BEGIN);
++  deadline = a->attention_deadline;
++  attention_timer_cb(-1, EV_TIMEOUT, a); /* superseded timer delivery before actual deadline */
++  assert(!a->attention_restoring && !a->attention_expired);
++  assert(a->attention_deadline.tv_sec == deadline.tv_sec && a->attention_deadline.tv_nsec == deadline.tv_nsec);
++  result = request(1, OUTPUT_ATTENTION_RELEASE);
++  a->session_epoch = UINT64_MAX - 1;
++  assert(outputs_device_session_add(1, &opaque) < 0 && a->session == NULL);
++  a->session_epoch = UINT64_MAX;
++  assert(outputs_attention_state_get(1, &current) < 0);
++  clear_devices();
++}
++
++static void synchronous_expiry_cannot_replace_admitting_ledger_slot(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_result terminal;
++  struct output_attention_request begin = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5 };
++  int i;
++  outputs_device_select(a, -1);
++  assert(outputs_attention_state_get(1, &begin.expected) == 0);
++  for (i = 1; i < ARRAY_SIZE(attention_results); i++)
++    {
++      attention_results[i].operation = ++outputs_operation;
++      attention_results[i].outcome = OUTPUT_ATTENTION_PENDING;
++      attention_results[i].identity.device_id = 1000 + i;
++    }
++  /* The current admission has the sole reusable slot. Expiry followed by a
++   * synchronous UNKNOWN response enters reconciliation before it returns. */
++  synchronous_expire = true;
++  transport_return = 1;
++  assert(outputs_attention_admit(&begin, &terminal) == 0);
++  assert(terminal.action == OUTPUT_ATTENTION_BEGIN && terminal.operation == outputs_operation);
++  assert(terminal.outcome == OUTPUT_ATTENTION_UNKNOWN && terminal.request_cseq == 17);
++  assert(a->attention_lease == terminal.identity.lease && a->attention_expired);
++  assert(!a->attention_expiry_attempted && transport_calls == 1);
++  for (i = 1; i < ARRAY_SIZE(attention_results); i++)
++    attention_results[i].outcome = OUTPUT_ATTENTION_UNKNOWN;
++  transport_return = 0;
++  terminal = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(terminal.outcome == OUTPUT_ATTENTION_DESIRED_ONLY && a->attention_lease == 0);
++  clear_devices();
++}
++
++
++/* Actual outputs owner boundaries only. Opaque tokens are not native sessions,
++ * receiver readiness, protocol ACKs or audio acceptance. */
++static int restart_token, old_token, restart_calls, restart_callback, completions;
++static int inert_start(struct output_device *device, int callback_id)
++{
++  assert(device->session == NULL);
++  assert(device->attention_retiring_session == NULL);
++  restart_calls++;
++  restart_callback = callback_id;
++  assert(outputs_device_session_add(device->id, &restart_token) == 0);
++  return 1;
++}
++static int inert_stop(struct output_device *device, int callback_id)
++{
++  (void)device; (void)callback_id;
++  return 1;
++}
++static void completed_start(struct output_device *device, enum output_device_state state)
++{
++  completions++;
++  if (state == OUTPUT_STATE_CONNECTED)
++    assert(device && device->session == &restart_token);
++  else
++    assert(!device && state == OUTPUT_STATE_FAILED);
++}
++static void retiring_start_waits_destroy_and_fences_old_callback(void)
++{
++  struct output_device *a = add_device(1);
++  uint64_t epoch;
++  int owned;
++  a->advertised = true;
++  outputs_device_select(a, -1);
++  assert(outputs_device_session_add(1, &old_token) == 0);
++  epoch = a->session_epoch;
++  a->attention_retiring_session = &old_token; /* owner-only retirement boundary */
++  output_airplay.device_start = inert_start;
++  output_airplay.device_probe = inert_start;
++  output_airplay.device_stop = inert_stop;
++  restart_calls = completions = 0;
++  assert(outputs_device_start(a, completed_start, false) == 1);
++  owned = a->attention_restart_callback;
++  assert(outputs_device_start(a, completed_start, false) == -1);
++  assert(outputs_device_stop(a, completed_start) == -1);
++  assert(restart_calls == 0 && !outputs_cb_register[owned].ready);
++  /* The native caller invokes finish only after its old resources are freed. */
++  outputs_device_session_remove_exact(1, &old_token);
++  outputs_attention_retirement_finished(1, a->incarnation, epoch, &old_token);
++  assert(restart_calls == 1 && restart_callback == owned && !a->attention_restart_pending);
++  assert(a->session == &restart_token && a->session_epoch == epoch + 2);
++  outputs_cb_exact(owned, 1, a->incarnation, epoch, &old_token, OUTPUT_STATE_STOPPED);
++  assert(!outputs_cb_register[owned].ready && completions == 0);
++  outputs_cb_exact(owned, 1, a->incarnation, a->session_epoch, &restart_token, OUTPUT_STATE_CONNECTED);
++  deferred_cb(-1, 0, NULL);
++  assert(completions == 1 && a->state == OUTPUT_STATE_CONNECTED);
++  outputs_device_session_remove_exact(1, &restart_token);
++  clear_devices();
++}
++static void deselect_and_replacement_resolve_pending_without_restart(void)
++{
++  struct output_device *a = add_device(1), *b;
++  uint64_t incarnation, epoch;
++  int owned;
++  a->advertised = true;
++  outputs_device_select(a, -1);
++  assert(outputs_device_session_add(1, &old_token) == 0);
++  incarnation = a->incarnation; epoch = a->session_epoch;
++  a->attention_retiring_session = &old_token;
++  restart_calls = completions = 0;
++  assert(outputs_device_start(a, completed_start, false) == 1);
++  owned = a->attention_restart_callback;
++  outputs_device_deselect(a);
++  assert(!a->attention_restart_pending && outputs_cb_register[owned].ready);
++  outputs_device_session_remove_exact(1, &old_token);
++  outputs_attention_retirement_finished(1, incarnation, epoch, &old_token);
++  assert(restart_calls == 0);
++  outputs_device_remove(a);
++  b = add_device(1); /* same ID, different device incarnation */
++  b->advertised = true;
++  outputs_attention_retirement_finished(1, incarnation, epoch, &old_token);
++  deferred_cb(-1, 0, NULL);
++  assert(restart_calls == 0 && completions == 1 && b->state != OUTPUT_STATE_CONNECTED);
++  clear_devices();
++}
++static void exact_request_id_replays_receipt_without_reapplying(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_request command = { .action = OUTPUT_ATTENTION_BEGIN, .cap_volume = 5, .ttl_ms = 2000 };
++  struct output_attention_result first, repeated;
++  memcpy(command.request_id, "00000000-0000-4000-8000-000000000101", sizeof(command.request_id));
++  assert(outputs_attention_state_get(1, &command.expected) == 0);
++  transport_return = 1;
++  assert(outputs_attention_admit(&command, &first) == 0);
++  assert(transport_calls == 1 && first.outcome == OUTPUT_ATTENTION_PENDING);
++  /* Receipt resolution is observation-only, including pending operations. */
++  assert(outputs_attention_request_get(command.expected.process, 1, command.request_id, &repeated) == 0);
++  assert(repeated.operation == first.operation && repeated.outcome == OUTPUT_ATTENTION_PENDING && transport_calls == 1);
++  assert(outputs_attention_request_get("00000000-0000-4000-8000-000000000999", 1, command.request_id, &repeated) < 0);
++  assert(outputs_attention_request_get(command.expected.process, 2, command.request_id, &repeated) < 0);
++  assert(outputs_attention_request_get(command.expected.process, 1, "00000000-0000-4000-8000-000000000999", &repeated) < 0);
++  assert(transport_calls == 1);
++  assert(outputs_attention_admit(&command, &repeated) == 0);
++  assert(repeated.operation == first.operation && transport_calls == 1);
++  outputs_attention_complete(&first, OUTPUT_ATTENTION_FAILED, 503, 21);
++  assert(outputs_attention_admit(&command, &repeated) == 0);
++  assert(repeated.outcome == OUTPUT_ATTENTION_FAILED && repeated.operation == first.operation && transport_calls == 1);
++  assert(outputs_attention_request_get(command.expected.process, 1, command.request_id, &repeated) == 0);
++  assert(repeated.outcome == OUTPUT_ATTENTION_FAILED && repeated.operation == first.operation && transport_calls == 1);
++  command.cap_volume = 6;
++  assert(outputs_attention_admit(&command, &repeated) < 0 && transport_calls == 1);
++  command.cap_volume = 5;
++  outputs_device_volume_register(a, 30, -1); /* ABA: replay receipt, not apply */
++  assert(outputs_attention_admit(&command, &repeated) == 0 && !repeated.current && transport_calls == 1);
++  transport_return = 0;
++  repeated = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(a->attention_lease == 0);
++  clear_devices();
++}
++
++
++static void manual_cas_preserves_overlay_ttl_and_same_value_aba(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_request manual = { .action = OUTPUT_ATTENTION_MANUAL, .cap_volume = 65 };
++  struct output_attention_result begin, first, repeated;
++  struct timespec deadline;
++  uint64_t lease, revision;
++  begin = request(1, OUTPUT_ATTENTION_BEGIN);
++  assert(begin.outcome == OUTPUT_ATTENTION_DESIRED_ONLY);
++  lease = a->attention_lease; revision = a->attention_revision; deadline = a->attention_deadline;
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  memcpy(manual.request_id, "00000000-0000-4000-8000-000000000201", sizeof(manual.request_id));
++  assert(outputs_attention_admit(&manual, &first) == 0);
++  assert(first.outcome == OUTPUT_ATTENTION_DESIRED_ONLY && first.action == OUTPUT_ATTENTION_MANUAL);
++  assert(a->volume == 65 && outputs_device_effective_volume(a) == 5);
++  assert(a->base_revision == manual.expected.base_revision + 1);
++  assert(a->attention_lease == lease && a->attention_revision == revision);
++  assert(a->attention_deadline.tv_sec == deadline.tv_sec && a->attention_deadline.tv_nsec == deadline.tv_nsec);
++  assert(outputs_attention_admit(&manual, &repeated) == 0);
++  assert(repeated.operation == first.operation && a->base_revision == first.identity.base_revision);
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  manual.request_id[35] = '2';
++  assert(outputs_attention_admit(&manual, &repeated) == 0);
++  assert(repeated.identity.base_revision == first.identity.base_revision + 1); /* equal intent != echo */
++  repeated = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(repeated.identity.effective_volume == 65 && a->attention_lease == 0);
++  clear_devices();
++}
++
++static void manual_old_challenge_never_overrides_newer_native_intent(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_request manual = { .action = OUTPUT_ATTENTION_MANUAL, .cap_volume = 30 };
++  struct output_attention_result result;
++  uint64_t revision;
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  outputs_device_volume_register(a, 65, -1); /* actual existing HA/hardware base owner */
++  revision = a->base_revision;
++  assert(outputs_attention_admit(&manual, &result) < 0);
++  assert(a->volume == 65 && a->base_revision == revision && transport_calls == 0);
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  manual.ttl_ms = 1;
++  assert(outputs_attention_admit(&manual, &result) < 0); /* MANUAL cannot renew TTL */
++  manual.ttl_ms = 0;
++  a->base_revision = UINT64_MAX - 1;
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  assert(outputs_attention_admit(&manual, &result) < 0 && transport_calls == 0);
++  clear_devices();
++}
++
++static void manual_failed_restore_uses_original_uuid_without_clearing_lease(void)
++{
++  struct output_device *a = add_device(1);
++  struct output_attention_request manual = { .action = OUTPUT_ATTENTION_MANUAL, .cap_volume = 65 };
++  struct output_attention_result first, repeated;
++  uint64_t lease;
++  first = request(1, OUTPUT_ATTENTION_BEGIN); lease = a->attention_lease;
++  transport_return = 1;
++  first = request(1, OUTPUT_ATTENTION_RELEASE);
++  outputs_attention_complete(&first, OUTPUT_ATTENTION_FAILED, 503, 11);
++  assert(a->attention_restoring && a->attention_lease == lease);
++  assert(outputs_attention_state_get(1, &manual.expected) == 0);
++  memcpy(manual.request_id, "00000000-0000-4000-8000-000000000203", sizeof(manual.request_id));
++  assert(outputs_attention_admit(&manual, &first) == 0 && first.outcome == OUTPUT_ATTENTION_PENDING);
++  assert(a->volume == 65 && a->attention_restoring && a->attention_lease == lease);
++  outputs_attention_complete(&first, OUTPUT_ATTENTION_UNKNOWN, 0, 12);
++  outputs_attention_complete(&first, OUTPUT_ATTENTION_PROTOCOL_ACCEPTED, 200, 12);
++  assert(outputs_attention_admit(&manual, &repeated) == 0);
++  assert(repeated.operation == first.operation && repeated.outcome == OUTPUT_ATTENTION_UNKNOWN);
++  assert(a->attention_lease == lease && a->attention_restoring); /* no fake release */
++  transport_return = 0;
++  repeated = request(1, OUTPUT_ATTENTION_RELEASE);
++  assert(a->attention_lease == 0 && repeated.identity.effective_volume == 65);
++  clear_devices();
++}
++
++int main(void)
++{
++  evbase_player = event_base_new();
++  assert(evbase_player);
++  outputs_deferredev = evtimer_new(evbase_player, deferred_cb, NULL);
++  assert(outputs_deferredev);
++  memcpy(outputs_process, "00000000-0000-0000-0000-000000000001", sizeof(outputs_process));
++  bases_and_legacy_selection();
++  manual_revision_and_old_lease();
++  failure_cannot_be_overwritten_or_cross_output();
++  remove_readd_and_session_epoch_retire_authority();
++  process_currency_and_unknown_result();
++  failed_release_keeps_exact_lease_and_manual_aba();
++  native_deadline_waits_pending_then_restores_same_lease();
++  refreshed_deadline_and_saturation_cannot_reuse_authority();
++  synchronous_expiry_cannot_replace_admitting_ledger_slot();
++  exact_request_id_replays_receipt_without_reapplying();
++  retiring_start_waits_destroy_and_fences_old_callback();
++  deselect_and_replacement_resolve_pending_without_restart();
++  manual_cas_preserves_overlay_ttl_and_same_value_aba();
++  manual_old_challenge_never_overrides_newer_native_intent();
++  manual_failed_restore_uses_original_uuid_without_clearing_lease();
++  event_free(outputs_deferredev);
++  event_base_free(evbase_player);
++  puts("PASS fifteen deterministic output-owner groups; no native protocol or audio claim");
++  return 0;
++}

@@ -17,6 +17,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -46,21 +47,36 @@ func clampAttentionTTL(req time.Duration) time.Duration {
 // attention is one room's duck state. The zero value is inactive (the detached fallback for an
 // unsupervised room). All access is mutex-guarded, like glLive.
 type attention struct {
-	mu             sync.Mutex
-	active         bool
-	pendingRelease bool      // a release/expiry the bridge hasn't restored from yet (consumed by tick)
-	level          int       // target % held on the HomePod while active (e.g. 5 = ducked, 35 = lounge)
-	prevLevel      int       // HomePod level captured at first engage; restored on release (-1 = unknown)
-	owner          string    // who holds the duck ("voice"); informational, surfaced in the snapshot
-	deadline       time.Time // auto-release time; extended by every engage (heartbeat)
+	mu                  sync.Mutex
+	admissionRevision   uint64
+	nativeRevision      uint64
+	restoreRevision     uint64
+	sessionNonce        string
+	nativePending       bool
+	nativeBusy          bool
+	nativeGrants        map[string]*nativeAttentionGrant
+	nativeResults       map[string]nativeAttentionResult
+	nativeManualAttempt *nativeManualAttempt // Only the serial bridge mutates this.
+	nativeManualReport  *nativeManualReport  // Mutex-published immutable API snapshot.
+	active              bool
+	pendingRelease      bool      // a release/expiry the bridge hasn't restored from yet (consumed by tick)
+	level               int       // target % held on the HomePod while active (e.g. 5 = ducked, 35 = lounge)
+	prevLevel           int       // HomePod level captured at first engage; restored on release (-1 = unknown)
+	owner               string    // who holds the duck ("voice"); informational, surfaced in the snapshot
+	deadline            time.Time // auto-release time; extended by every engage (heartbeat)
 }
 
 // attSnapshot is a lock-free view of a room's duck state for the HTTP layer.
 type attSnapshot struct {
-	Active      bool   `json:"active"`
-	Level       int    `json:"level"`
-	Owner       string `json:"owner"`
-	RemainingMS int    `json:"remaining_ms"` // ms until auto-release (0 when inactive)
+	Challenge     attentionChallenge               `json:"challenge"`
+	Outcome       string                           `json:"outcome"`
+	Contract      string                           `json:"contract"`
+	NativeResults map[string]nativeAttentionResult `json:"native_results"`
+	ManualResult  *nativeManualReport              `json:"manual_result,omitempty"`
+	Active        bool                             `json:"active"`
+	Level         int                              `json:"level"`
+	Owner         string                           `json:"owner"`
+	RemainingMS   int                              `json:"remaining_ms"` // ms until auto-release (0 when inactive)
 }
 
 // engage sets or refreshes the duck. capturePrev is the current HomePod level to restore later; it's
@@ -90,6 +106,21 @@ func (a *attention) release() {
 	}
 }
 
+// Expiry is local bookkeeping. Unknown output identity may retire a lease,
+// but cannot consume its pending restore or issue native effects.
+func (a *attention) expire(now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.expireLocked(now)
+}
+
+func (a *attention) expireLocked(now time.Time) {
+	if a.active && now.After(a.deadline) {
+		a.active = false
+		a.pendingRelease = true
+	}
+}
+
 // tick reports the duck's effect for one bridge cycle at time now, folding in auto-expiry. It's the
 // single point the bridge consults each loop:
 //
@@ -102,10 +133,7 @@ func (a *attention) release() {
 func (a *attention) tick(now time.Time) (hold bool, level int, released bool, restoreTo int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.active && now.After(a.deadline) {
-		a.active = false
-		a.pendingRelease = true
-	}
+	a.expireLocked(now)
 	if a.active {
 		return true, a.level, false, 0
 	}
@@ -120,7 +148,21 @@ func (a *attention) tick(now time.Time) (hold bool, level int, released bool, re
 func (a *attention) snapshot(now time.Time) attSnapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s := attSnapshot{Active: a.active, Level: a.level, Owner: a.owner}
+	s := attSnapshot{Active: a.active, Level: a.level, Owner: a.owner, Challenge: attentionChallenge{attentionManagerProcess(), fmt.Sprint(a.admissionRevision)}, Contract: "native_attention_v1", Outcome: "pending"}
+	s.NativeResults = make(map[string]nativeAttentionResult, len(a.nativeResults))
+	for output, result := range a.nativeResults {
+		s.NativeResults[output] = result
+	}
+	if a.nativeManualReport != nil {
+		copy := *a.nativeManualReport
+		s.ManualResult = &copy
+	}
+	if a.sessionNonce == "" {
+		s.Contract = "legacy_desired_only"
+		s.Outcome = "desired_only"
+	} else if !a.active && !a.nativePending && !a.nativeBusy && !a.pendingRelease {
+		s.Outcome = "released"
+	}
 	if a.active {
 		if d := a.deadline.Sub(now); d > 0 {
 			s.RemainingMS = int(d / time.Millisecond)

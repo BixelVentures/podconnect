@@ -14,25 +14,30 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 	"time"
 )
 
 // glLive is the thread-safe latest go-librespot state for one room, plus a track-change signal.
 type glLive struct {
-	mu               sync.Mutex
-	st               glStatus
-	trackURI         string
-	trackChangeSeq   uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
-	aliasRevision    uint64 // observed alias/source intent; unchanged status polls do not bump it
-	routeDispatchSeq uint64 // mutex-owned command admission, not native acceptance
-	sourceStop       <-chan struct{}
-	sourceRetired    bool
-	runEpoch         uint64
-	phaseEpoch       uint64
-	nextRequest      uint64
-	acceptedRequest  uint64
-	wireRevision     [3]uint64 // transport, volume, selected alias
+	mu                sync.Mutex
+	st                glStatus
+	trackURI          string
+	trackChangeSeq    uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	aliasRevision     uint64 // observed alias/source intent; unchanged status polls do not bump it
+	routeDispatchSeq  uint64 // mutex-owned command admission, not native acceptance
+	sourceStop        <-chan struct{}
+	sourceRetired     bool
+	runEpoch          uint64
+	phaseEpoch        uint64
+	nextRequest       uint64
+	acceptedRequest   uint64
+	wireRevision      [3]uint64 // transport, volume, selected alias
+	manualOrdinal     uint64
+	manualIncarnation string
+	manualAction      *nativeManualAction
+	manualObservation *nativeManualObservation
 }
 
 // Get returns a copy of the latest glStatus (safe to use without holding the lock).
@@ -57,7 +62,7 @@ func (l *glLive) admitRoute(alias int, revision uint64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.observeStopLocked()
-	if l.sourceRetired || l.st.SelAlias != alias || l.aliasRevision != revision {
+	if l.sourceRetired || l.st.SelAlias != alias || l.aliasRevision != revision || (l.st.AliasBinding != nil && !l.st.AliasBinding.valid()) {
 		return false
 	}
 	l.routeDispatchSeq++
@@ -194,10 +199,17 @@ func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
 		accepted = true
 	}
 	if request.wire[2] == l.wireRevision[2] {
-		if l.st.SelAlias != st.SelAlias {
+		if l.st.AliasBinding != nil && st.AliasBinding == nil {
+			copy := *l.st.AliasBinding
+			copy.Ready = false
+			st.AliasBinding = &copy
+			st.SelAlias = l.st.SelAlias
+		}
+		if l.st.SelAlias != st.SelAlias || !sameAliasBinding(l.st.AliasBinding, st.AliasBinding) {
 			l.aliasRevision++
 		}
 		l.st.SelAlias = st.SelAlias
+		l.st.AliasBinding = st.AliasBinding
 		accepted = true
 	}
 	if accepted {
@@ -235,6 +247,44 @@ func (l *glLive) applySourceEvent(source glSource, typ string, data map[string]a
 }
 
 func (l *glLive) applyEventLocked(typ string, data map[string]any) {
+	if typ == "volume_action" {
+		l.admitManualEventLocked(data)
+		return
+	}
+	if typ == "selected_alias" {
+		_, hasBinding := data["alias_binding"]
+		if l.st.AliasBinding != nil || hasBinding {
+			id, validID := numField(data, "id")
+			if !validID || id < 1 || id > float64(^uint32(0)) || id != math.Trunc(id) {
+				return
+			}
+		}
+		if incoming, present := eventAliasBinding(data); present {
+			current := l.st.AliasBinding
+			// Events cannot mint a new player identity. A differing/invalid owner
+			// only vetoes routing until an authoritative fenced status re-seeds it.
+			if current == nil || !current.valid() || !incoming.valid() || current.Incarnation != incoming.Incarnation || current.Registry != incoming.Registry {
+				if current == nil {
+					l.st.AliasBinding = &aliasBinding{}
+				} else {
+					copy := *current
+					copy.Ready = false
+					l.st.AliasBinding = &copy
+				}
+				l.wireRevision[2]++
+				l.aliasRevision++
+				return
+			}
+			l.st.AliasBinding = incoming
+		} else if l.st.AliasBinding != nil {
+			copy := *l.st.AliasBinding
+			copy.Ready = false
+			l.st.AliasBinding = &copy
+			l.wireRevision[2]++
+			l.aliasRevision++
+			return
+		}
+	}
 	next, nextURI, changed := applyGLEvent(l.st, l.trackURI, typ, data)
 	l.st = next
 	l.trackURI = nextURI
@@ -242,7 +292,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 		l.trackChangeSeq++
 	}
 	switch typ {
-	case "playing", "paused", "stopped", "not_playing", "active", "playback_ready", "inactive":
+	case "playing", "paused", "stopped", "not_playing", "active", "inactive":
 		l.wireRevision[0]++
 	case "volume":
 		if _, ok := numField(data, "value"); ok {
@@ -292,7 +342,7 @@ func applyGLEvent(prev glStatus, prevURI string, typ string, data map[string]any
 	case "not_playing":
 		// Track ended on its own. Not a user pause; leave Active to /status semantics.
 		out.Paused = false
-	case "active", "playback_ready":
+	case "active":
 		out.Active = true
 	case "inactive":
 		out.Active = false

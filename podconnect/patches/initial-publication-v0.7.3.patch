@@ -1,0 +1,596 @@
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -67,6 +67,11 @@
+ }
+ 
+ func (p *AppPlayer) playbackReady() bool {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if p.aliasRetired || !p.hasSpotConnId || !p.hasInitialConnectState {
++		return false
++	}
+ 	select {
+ 	case <-p.playbackReadyCh:
+ 		return true
+@@ -76,14 +81,21 @@
+ }
+ 
+ func (p *AppPlayer) notifyPlaybackReadyIfNeeded() {
+-	if !p.hasSpotConnId || !p.hasInitialConnectState || !p.hasCountryCode {
++	p.aliasMu.Lock()
++	if p.aliasRetired || !p.hasSpotConnId || !p.hasInitialConnectState || !p.hasCountryCode {
++		p.aliasMu.Unlock()
+ 		return
+ 	}
+-
++	emit := false
+ 	p.playbackReadyOnce.Do(func() {
+ 		close(p.playbackReadyCh)
++		emit = true
++	})
++	p.aliasMu.Unlock()
++	// The existing event observes local admission; never hold aliasMu over I/O.
++	if emit {
+ 		p.app.server.Emit(&ApiEvent{Type: ApiEventTypePlaybackReady})
+-	})
++	}
+ }
+ 
+ func (p *AppPlayer) handleAccesspointPacket(pktType ap.PacketType, payload []byte) error {
+@@ -102,12 +114,47 @@
+ 		return nil
+ 	case ap.PacketTypeCountryCode:
+ 		*p.countryCode = string(payload)
++		p.aliasMu.Lock()
+ 		p.hasCountryCode = true
++		p.aliasMu.Unlock()
+ 		p.notifyPlaybackReadyIfNeeded()
+ 		return nil
+ 	default:
+ 		return nil
+ 	}
++}
++
++func (p *AppPlayer) handleConnectionMessage(ctx context.Context, msg dealer.Message, sp *spclient.Spclient) error {
++	id := msg.Headers["Spotify-Connection-Id"]
++	p.aliasMu.Lock()
++	if p.aliasRetired {
++		p.aliasMu.Unlock()
++		return fmt.Errorf("connection owner retired")
++	}
++	if p.spotConnId != id {
++		p.hasInitialConnectState = false
++	}
++	p.spotConnId = id
++	p.hasSpotConnId = id != ""
++	p.aliasMu.Unlock()
++	p.app.log.Debugf("received connection id: %s...%s", id[:16], id[len(id)-16:])
++
++	// put the initial state
++	if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_NEW_DEVICE, sp); err != nil {
++		return fmt.Errorf("failed initial state put: %w", err)
++	}
++
++	if !p.app.cfg.ExternalVolume && len(p.app.cfg.MixerDevice) == 0 {
++		// update initial volume
++		p.initialVolumeOnce.Do(func() {
++			if lastVolume := p.app.state.LastVolume; !p.app.cfg.IgnoreLastVolume && lastVolume != nil {
++				p.updateVolume(*lastVolume)
++			} else {
++				p.updateVolume(p.app.cfg.InitialVolume * player.MaxStateVolume / p.app.cfg.VolumeSteps)
++			}
++		})
++	}
++	return nil
+ }
+ 
+ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message) error {
+@@ -116,28 +163,7 @@
+ 	defer cancel()
+ 
+ 	if strings.HasPrefix(msg.Uri, "hm://pusher/v1/connections/") {
+-		p.spotConnId = msg.Headers["Spotify-Connection-Id"]
+-		p.hasSpotConnId = p.spotConnId != ""
+-		p.app.log.Debugf("received connection id: %s...%s", p.spotConnId[:16], p.spotConnId[len(p.spotConnId)-16:])
+-
+-		// put the initial state
+-		if err := p.putConnectState(ctx, connectpb.PutStateReason_NEW_DEVICE); err != nil {
+-			return fmt.Errorf("failed initial state put: %w", err)
+-		}
+-
+-		p.hasInitialConnectState = true
+-		p.notifyPlaybackReadyIfNeeded()
+-
+-		if !p.app.cfg.ExternalVolume && len(p.app.cfg.MixerDevice) == 0 {
+-			// update initial volume
+-			p.initialVolumeOnce.Do(func() {
+-				if lastVolume := p.app.state.LastVolume; !p.app.cfg.IgnoreLastVolume && lastVolume != nil {
+-					p.updateVolume(*lastVolume)
+-				} else {
+-					p.updateVolume(p.app.cfg.InitialVolume * player.MaxStateVolume / p.app.cfg.VolumeSteps)
+-				}
+-			})
+-		}
++		return p.handleConnectionMessage(ctx, msg, p.sess.Spclient())
+ 	} else if strings.HasPrefix(msg.Uri, "hm://connect-state/v1/connect/volume") {
+ 		var setVolCmd connectpb.SetVolumeCommand
+ 		if err := proto.Unmarshal(msg.Payload, &setVolCmd); err != nil {
+--- a/daemon/player_state.go
++++ b/daemon/player_state.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+@@ -9,6 +10,7 @@
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
++	"github.com/devgianlu/go-librespot/spclient"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ )
+ 
+@@ -189,7 +191,37 @@
+ 	if reason == connectpb.PutStateReason_BECAME_INACTIVE {
+ 		return p.sess.Spclient().PutConnectStateInactive(ctx, p.spotConnId, false)
+ 	}
+-
++	return p.putConnectStateWithClient(ctx, reason, p.sess.Spclient())
++}
++
++func (p *AppPlayer) putConnectStateWithClient(ctx context.Context, reason connectpb.PutStateReason, sp *spclient.Spclient) error {
++	p.aliasMu.Lock()
++	id := p.spotConnId
++	retired := p.aliasRetired
++	missingInitial := !p.hasInitialConnectState
++	p.aliasMu.Unlock()
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if retired || id == "" {
++		return fmt.Errorf("connection owner unavailable")
++	}
++	// Recover only the shipped external-volume owner at an existing publication.
++	// Internal-volume initialisation remains exclusive to handleConnectionMessage.
++	if reason != connectpb.PutStateReason_NEW_DEVICE && missingInitial && p.app.cfg.ExternalVolume {
++		if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_NEW_DEVICE, sp); err != nil {
++			return err
++		}
++		p.aliasMu.Lock()
++		current := !p.aliasRetired && p.spotConnId == id && p.hasInitialConnectState
++		p.aliasMu.Unlock()
++		if !current {
++			return fmt.Errorf("connection owner changed during initial publication")
++		}
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++	}
+ 	putStateReq := &connectpb.PutStateRequest{
+ 		ClientSideTimestamp: uint64(time.Now().UnixMilli()),
+ 		MemberType:          connectpb.MemberType_CONNECT_STATE,
+@@ -215,5 +247,20 @@
+ 	}
+ 
+ 	// finally send the state update
+-	return p.sess.Spclient().PutConnectState(ctx, p.spotConnId, putStateReq)
+-}
++	if err := sp.PutConnectState(ctx, id, putStateReq); err != nil {
++		return err
++	}
++	if reason == connectpb.PutStateReason_NEW_DEVICE {
++		p.aliasMu.Lock()
++		current := ctx.Err() == nil && !p.aliasRetired && p.spotConnId == id && p.hasSpotConnId
++		if current {
++			p.hasInitialConnectState = true
++		}
++		p.aliasMu.Unlock()
++		if !current {
++			return fmt.Errorf("initial publication no longer current")
++		}
++		p.notifyPlaybackReadyIfNeeded()
++	}
++	return nil
++}
+--- /dev/null
++++ b/daemon/initial_publication_boundary_test.go
+@@ -0,0 +1,396 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"google.golang.org/protobuf/proto"
++)
++
++// Actual existing publication-owner regressions, not Spotify visibility/audio proof.
++// Reuse PC13's real Spclient constructor and inert RoundTripper. No Session,
++// provider, AP connection, output backend or readiness flag impersonation.
++func pc10InitialOwner(t *testing.T) (*AppPlayer, *aliasTestServer) {
++	t.Helper()
++	p := pc13ExistingPlayer(t, false)
++	server := &aliasTestServer{}
++	country := ""
++	p.app.server = server
++	p.app.cfg.ExternalVolume = true
++	p.state.device.Volume = 17  // Existing local preference must survive external-volume admission.
++	p.player = &player.Player{} // HasBeenPlayingFor's real zero-state read; no player goroutine.
++	p.countryCode = &country
++	p.playbackReadyCh = make(chan struct{})
++	return p, server
++}
++
++func pc10RootReady(t *testing.T, p *AppPlayer) bool {
++	t.Helper()
++	data, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeRoot})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return data.(*ApiResponseRoot).PlaybackReady
++}
++
++func pc10Connection(id string) dealer.Message {
++	return dealer.Message{Uri: "hm://pusher/v1/connections/fixture", Headers: map[string]string{"Spotify-Connection-Id": id}}
++}
++
++func pc10ReadyEvents(server *aliasTestServer) int {
++	n := 0
++	for _, event := range server.events {
++		if event.Type == ApiEventTypePlaybackReady {
++			n++
++		}
++	}
++	return n
++}
++
++func TestInitialPublicationRecoversBeforeExistingStatePublication(t *testing.T) {
++	p, server := pc10InitialOwner(t)
++	before := proto.Clone(p.state.player).(*connectpb.PlayerState)
++	oldTracks, oldQueue := p.state.tracks, p.state.queueID
++	var reasons []connectpb.PutStateReason
++	rejectInitial := true
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		if r.Method != http.MethodPut || r.URL.Host != "pc13.invalid" || r.URL.Path != "/connect-state/v1/devices/fixture-device" || r.Header.Get("X-Spotify-Connection-Id") != "fixture-current-connection-00000001" {
++			return nil, fmt.Errorf("unexpected inert publication")
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			return nil, err
++		}
++		var request connectpb.PutStateRequest
++		if err := proto.Unmarshal(body, &request); err != nil {
++			return nil, err
++		}
++		reasons = append(reasons, request.PutStateReason)
++		status, payload := http.StatusOK, ""
++		if request.PutStateReason == connectpb.PutStateReason_NEW_DEVICE && rejectInitial {
++			status, payload = http.StatusServiceUnavailable, `{"message":"fixture initial rejection"}`
++		}
++		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload)), Request: r}, nil
++	}))
++	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++	defer cancel()
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err == nil {
++		t.Fatal("initial publication unexpectedly accepted")
++	}
++	if len(reasons) != 3 {
++		t.Fatalf("initial retry count=%d want=3", len(reasons))
++	}
++	for _, reason := range reasons {
++		if reason != connectpb.PutStateReason_NEW_DEVICE {
++			t.Fatal("wrong initial request reason")
++		}
++	}
++	if !p.hasSpotConnId || p.hasInitialConnectState || pc10RootReady(t, p) {
++		t.Fatal("failed initial state advertised ready")
++	}
++	if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if !p.hasCountryCode || pc10RootReady(t, p) {
++		t.Fatal("country code incorrectly replaced initial acceptance")
++	}
++	rejectInitial = false
++	if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED, sp); err != nil {
++		t.Fatal(err)
++	}
++	if len(reasons) != 5 || reasons[3] != connectpb.PutStateReason_NEW_DEVICE || reasons[4] != connectpb.PutStateReason_PLAYER_STATE_CHANGED {
++		t.Fatal("initial recovery did not precede the existing publication")
++	}
++	if !p.hasInitialConnectState || !pc10RootReady(t, p) || pc10ReadyEvents(server) != 1 {
++		t.Fatal("actual initial acceptance did not open readiness")
++	}
++	if p.state.tracks != oldTracks || p.state.queueID != oldQueue || !proto.Equal(before, p.state.player) {
++		t.Fatal("diagnostic path changed queue/context")
++	}
++}
++
++func TestAcceptedInitialPublicationOpensReadinessExactlyOnce(t *testing.T) {
++	p, server := pc10InitialOwner(t)
++	requests := 0
++	var reasons []connectpb.PutStateReason
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if r.Method != http.MethodPut || r.URL.Path != "/connect-state/v1/devices/fixture-device" {
++			return nil, fmt.Errorf("unexpected inert request")
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			return nil, err
++		}
++		var request connectpb.PutStateRequest
++		if err := proto.Unmarshal(body, &request); err != nil {
++			return nil, err
++		}
++		reasons = append(reasons, request.PutStateReason)
++		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
++	}))
++	if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if pc10RootReady(t, p) {
++		t.Fatal("country-only owner is ready")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++	defer cancel()
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err != nil {
++		t.Fatal(err)
++	}
++	if requests != 1 || !p.hasInitialConnectState || !pc10RootReady(t, p) || pc10ReadyEvents(server) != 1 {
++		t.Fatal("accepted initial readiness missing")
++	}
++	if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if pc10ReadyEvents(server) != 1 {
++		t.Fatal("duplicate ready event")
++	}
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err != nil {
++		t.Fatal(err)
++	}
++	if !pc10RootReady(t, p) || pc10ReadyEvents(server) != 1 {
++		t.Fatal("same accepted connection lost its credit")
++	}
++	for _, reason := range []connectpb.PutStateReason{connectpb.PutStateReason_PLAYER_STATE_CHANGED, connectpb.PutStateReason_VOLUME_CHANGED} {
++		if err := p.putConnectStateWithClient(ctx, reason, sp); err != nil {
++			t.Fatal(err)
++		}
++	}
++	want := []connectpb.PutStateReason{connectpb.PutStateReason_NEW_DEVICE, connectpb.PutStateReason_NEW_DEVICE, connectpb.PutStateReason_PLAYER_STATE_CHANGED, connectpb.PutStateReason_VOLUME_CHANGED}
++	if !reflect.DeepEqual(reasons, want) || requests != 4 || pc10ReadyEvents(server) != 1 {
++		t.Fatal("normal/duplicate publication order or count changed")
++	}
++}
++
++func TestNewConnectionRequiresCurrentInitialAcceptance(t *testing.T) {
++	p, server := pc10InitialOwner(t)
++	var connections []string
++	rejectSecond := true
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		id := r.Header.Get("X-Spotify-Connection-Id")
++		connections = append(connections, id)
++		status, payload := http.StatusOK, ""
++		if id == "fixture-second-connection-00000002" && rejectSecond {
++			status, payload = http.StatusServiceUnavailable, `{"message":"fixture reconnect rejection"}`
++		}
++		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload)), Request: r}, nil
++	}))
++	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++	defer cancel()
++	if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err != nil {
++		t.Fatal(err)
++	}
++	if !pc10RootReady(t, p) {
++		t.Fatal("positive control failed")
++	}
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-second-connection-00000002"), sp); err == nil {
++		t.Fatal("reconnect publication unexpectedly accepted")
++	}
++	if len(connections) != 4 || p.spotConnId != "fixture-second-connection-00000002" {
++		t.Fatal("actual reconnect requests missing")
++	}
++	for _, id := range connections[1:] {
++		if id != p.spotConnId {
++			t.Fatal("reconnect retry used old connection")
++		}
++	}
++	if p.hasInitialConnectState || pc10RootReady(t, p) || pc10ReadyEvents(server) != 1 {
++		t.Fatal("old lifetime channel credited a new connection")
++	}
++	rejectSecond = false
++	if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_VOLUME_CHANGED, sp); err != nil {
++		t.Fatal(err)
++	}
++	if !p.hasInitialConnectState || !pc10RootReady(t, p) || pc10ReadyEvents(server) != 1 || len(connections) != 6 {
++		t.Fatal("current connection recovery or one-shot event changed")
++	}
++	fresh, freshServer := pc10InitialOwner(t)
++	if pc10RootReady(t, fresh) || pc10ReadyEvents(freshServer) != 0 {
++		t.Fatal("fresh owner inherited prior readiness")
++	}
++	if err := fresh.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if err := fresh.handleConnectionMessage(ctx, pc10Connection("fixture-fresh-connection-00000003"), sp); err != nil {
++		t.Fatal(err)
++	}
++	if !pc10RootReady(t, fresh) || pc10ReadyEvents(freshServer) != 1 || fresh.spotConnId != "fixture-fresh-connection-00000003" {
++		t.Fatal("fresh owner acceptance missing")
++	}
++}
++
++func TestFailedInitialRetryCannotSendOrdinaryPublication(t *testing.T) {
++	p, server := pc10InitialOwner(t)
++	before := proto.Clone(p.state.player)
++	oldTracks, oldQueue := p.state.tracks, p.state.queueID
++	var reasons []connectpb.PutStateReason
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			return nil, err
++		}
++		var request connectpb.PutStateRequest
++		if err := proto.Unmarshal(body, &request); err != nil {
++			return nil, err
++		}
++		reasons = append(reasons, request.PutStateReason)
++		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"inert rejected"}`)), Request: r}, nil
++	}))
++	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++	defer cancel()
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err == nil {
++		t.Fatal("initial rejection missing")
++	}
++	if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++		t.Fatal(err)
++	}
++	if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_VOLUME_CHANGED, sp); err == nil {
++		t.Fatal("recovery rejection missing")
++	}
++	if len(reasons) != 6 {
++		t.Fatalf("requests=%d want6", len(reasons))
++	}
++	for _, reason := range reasons {
++		if reason != connectpb.PutStateReason_NEW_DEVICE {
++			t.Fatal("ordinary publication bypassed failed initial")
++		}
++	}
++	if p.hasInitialConnectState || pc10RootReady(t, p) || pc10ReadyEvents(server) != 0 {
++		t.Fatal("failed initial credited ready")
++	}
++	if oldTracks != p.state.tracks || oldQueue != p.state.queueID || !proto.Equal(before, p.state.player) {
++		t.Fatal("recovery changed queue/context")
++	}
++}
++
++func TestHeldInitialSuccessCannotCreditRetiredOrCanceledOwner(t *testing.T) {
++	for _, cancelled := range []bool{false, true} {
++		t.Run(fmt.Sprintf("cancelled_%v", cancelled), func(t *testing.T) {
++			p, server := pc10InitialOwner(t)
++			before := proto.Clone(p.state.player)
++			oldTracks, oldQueue := p.state.tracks, p.state.queueID
++			entered, allow := make(chan struct{}), make(chan struct{})
++			calls := 0
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				calls++
++				body, err := io.ReadAll(r.Body)
++				if err != nil {
++					return nil, err
++				}
++				var req connectpb.PutStateRequest
++				if err := proto.Unmarshal(body, &req); err != nil {
++					return nil, err
++				}
++				if req.PutStateReason != connectpb.PutStateReason_NEW_DEVICE {
++					return nil, fmt.Errorf("unexpected ordinary send")
++				}
++				close(entered)
++				<-allow
++				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
++			}))
++			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++			defer cancel()
++			if err := p.handleAccesspointPacket(ap.PacketTypeCountryCode, []byte("DK")); err != nil {
++				t.Fatal(err)
++			}
++			returned := make(chan error, 1)
++			go func() {
++				returned <- p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp)
++			}()
++			// Always release and join the exact request goroutine even on assertion failure.
++			joined := false
++			defer func() {
++				select {
++				case <-allow:
++				default:
++					close(allow)
++				}
++				if !joined {
++					select {
++					case <-returned:
++					case <-time.After(time.Second):
++						t.Error("request owner not joined")
++					}
++				}
++			}()
++			select {
++			case <-entered:
++			case <-ctx.Done():
++				t.Fatal("initial request did not enter")
++			}
++			if cancelled {
++				cancel()
++			} else {
++				p.retireAliases()
++			}
++			close(allow)
++			select {
++			case err := <-returned:
++				joined = true
++				if err == nil {
++					t.Fatal("retired/canceled success accepted")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("request did not finish")
++			}
++			if calls != 1 || p.hasInitialConnectState || pc10RootReady(t, p) || pc10ReadyEvents(server) != 0 {
++				t.Fatal("late success credited ready")
++			}
++			if p.state.device.Volume != 17 || oldTracks != p.state.tracks || oldQueue != p.state.queueID || !proto.Equal(before, p.state.player) {
++				t.Fatal("late initial changed volume/queue/context")
++			}
++		})
++	}
++}
++
++func TestInternalVolumePublicationDoesNotAdmitDelayedInitialRecovery(t *testing.T) {
++	p, server := pc10InitialOwner(t)
++	p.app.cfg.ExternalVolume = false
++	calls := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		calls++
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			return nil, err
++		}
++		var req connectpb.PutStateRequest
++		if err := proto.Unmarshal(body, &req); err != nil {
++			return nil, err
++		}
++		status, payload := http.StatusOK, ""
++		if req.PutStateReason == connectpb.PutStateReason_NEW_DEVICE {
++			status, payload = http.StatusServiceUnavailable, `{"message":"inert initial reject"}`
++		} else if req.PutStateReason != connectpb.PutStateReason_PLAYER_STATE_CHANGED {
++			return nil, fmt.Errorf("unexpected reason")
++		}
++		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(payload)), Request: r}, nil
++	}))
++	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
++	defer cancel()
++	if err := p.handleConnectionMessage(ctx, pc10Connection("fixture-current-connection-00000001"), sp); err == nil {
++		t.Fatal("initial rejection missing")
++	}
++	if err := p.putConnectStateWithClient(ctx, connectpb.PutStateReason_PLAYER_STATE_CHANGED, sp); err != nil {
++		t.Fatal(err)
++	}
++	if calls != 4 || p.hasInitialConnectState || pc10RootReady(t, p) || pc10ReadyEvents(server) != 0 || p.state.device.Volume != 17 {
++		t.Fatal("internal-volume delayed initial path changed")
++	}
++}

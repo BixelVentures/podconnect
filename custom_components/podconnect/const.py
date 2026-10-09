@@ -28,3 +28,5 @@ SPOTIFY_SCOPES = [
 # How often to poll Spotify's Web API for playback state + devices.
 # Gentle on dev-mode rate limits; HomePod push-state (go-librespot events) lands in a later phase.
 POLL_INTERVAL_SECONDS = 10
+
+CONF_SPEAKERS_URL = "speakers_url"

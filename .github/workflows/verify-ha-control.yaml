@@ -1,0 +1,40 @@
+name: Verify HA service and client boundaries
+on:
+  pull_request:
+    paths:
+      - "custom_components/podconnect/**"
+      - "tests/test_*.py"
+      - "tests/ha_framework/**"
+      - ".github/workflows/verify-ha-control.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "custom_components/podconnect/**"
+      - "tests/test_*.py"
+      - "tests/ha_framework/**"
+      - ".github/workflows/verify-ha-control.yaml"
+jobs:
+  boundary-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test shipped service and client bodies with inert I/O
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+  framework-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test complete shipped integration in pinned HA 2026.8.2
+        run: |
+          docker run --rm --platform linux/amd64 --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 \
+            --pids-limit 256 --memory 2g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/repo,readonly" \
+            --workdir /repo --entrypoint python \
+            ghcr.io/home-assistant/home-assistant@sha256:56690a89c79a0de98035e1719f8324a92d5859c1192ff45adb0230ea81cb42a5 \
+            -B -m unittest discover -s tests/ha_framework -p 'test_*.py' -v

@@ -26,5 +26,19 @@
   },
   "application_credentials": {
     "description": "Create an app in the [Spotify developer dashboard]({developer_console_url}) with redirect URI `https://my.home-assistant.io/redirect/oauth`, add your Spotify account under User Management, then enter the Client ID and Client Secret below."
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Speakers connection",
+        "description": "Optional PodConnect Speakers base URL. Leave empty for Spotify devices only. This connection does not use your Spotify credentials.",
+        "data": {
+          "speakers_url": "Speakers URL"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Use an HTTP or HTTPS URL without credentials, query or fragment."
+    }
   }
 }
