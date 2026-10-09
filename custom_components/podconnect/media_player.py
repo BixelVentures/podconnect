@@ -408,7 +408,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         except (SpotifyApiError, ClientError, TimeoutError) as err:
             raise HomeAssistantError("Spotify target lookup failed") from err
         if (
-            entry.runtime_data is not data
+            getattr(entry, "runtime_data", None) is not data
             or not data.active
             or data.coordinator is not self.coordinator
             or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
