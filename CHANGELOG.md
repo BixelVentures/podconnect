@@ -1,3 +1,8 @@
+## Control 0.10.7 - named speaker room settings
+
+- Show each configured speaker name and the room selector through complete Danish and English Home Assistant translations.
+- Keep account options, URL validation, exact speaker identity checks and the final atomic settings save unchanged. Speakers playback is unchanged; installed room and audible transfer acceptance remain separate.
+
 ## Control 0.10.6 - available speaker targets during slow reads
 
 - Read Spotify devices, configured speakers and observed outputs independently within one catalogue response budget. Keep every completed fresh target and report unavailable target types explicitly.
