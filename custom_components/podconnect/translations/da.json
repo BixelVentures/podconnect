@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "pick_implementation": {
+        "title": "Vælg loginmetode"
+      },
+      "reauth_confirm": {
+        "title": "Log ind i PodConnect igen",
+        "description": "PodConnect skal logge ind på din Spotify-konto igen."
+      }
+    },
+    "abort": {
+      "already_configured": "Denne Spotify-konto er allerede tilføjet.",
+      "already_in_progress": "Opsætningen er allerede i gang.",
+      "connection_error": "Kunne ikke oprette forbindelse til Spotify.",
+      "missing_configuration": "Tilføj først Spotify-appens loginoplysninger under applikationsoplysninger.",
+      "authorize_url_timeout": "Det tog for lang tid at oprette loginlinket.",
+      "no_url_available": "Loginlinket er ikke tilgængeligt. Se dokumentationen.",
+      "oauth_error": "Spotify returnerede ugyldige loginoplysninger.",
+      "reauth_account_mismatch": "Du har valgt en anden Spotify-konto. Log ind med den oprindelige konto.",
+      "user_not_premium": "Spotify Premium kræves for at styre afspilningen."
+    },
+    "create_entry": {
+      "default": "Du er nu logget ind på Spotify."
+    }
+  },
+  "application_credentials": {
+    "description": "Opret en app i [Spotifys udviklerportal]({developer_console_url}) med redirect URI `https://my.home-assistant.io/redirect/oauth`. Tilføj din Spotify-konto under User Management, og indtast Client ID og Client Secret nedenfor."
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Forbindelse til Speakers",
+        "description": "Valgfri URL til PodConnect Speakers. Lad feltet være tomt for kun at bruge Spotify-enheder. Forbindelsen bruger ikke dine Spotify-loginoplysninger.",
+        "data": {
+          "speakers_url": "Speakers-URL"
+        }
+      },
+      "room": {
+        "title": "Område for {speaker}",
+        "description": "Vælg højttalerens område. Lad feltet være tomt for at fjerne tilknytningen.",
+        "data": {
+          "area_id": "Område"
+        }
+      }
+    },
+    "error": {
+      "invalid_url": "Brug en adresse, der begynder med http:// eller https://, uden loginoplysninger eller ekstra parametre.",
+      "speakers_unavailable": "Højttalerne er ikke tilgængelige. Prøv igen, når de er forbundet.",
+      "area_unavailable": "Området findes ikke længere."
+    },
+    "abort": {
+      "speaker_changed": "Højttaleren er ændret. Åbn indstillingerne igen.",
+      "configuration_changed": "Indstillingerne er ændret. Åbn dem igen."
+    }
+  }
+}
