@@ -807,6 +807,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	aliasRoutePending := false // a route attempt failed; retry on the throttle (not every tick)
 	aliasRetryAt := time.Now()
 	trans := transState{canon: -1, otTarget: -1}
+	var transIntent glTransportIntent
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
 	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
@@ -831,7 +832,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Wave 3: read the room's live state in-memory (pushed by runGLEvents from the /events
 			// websocket, seeded + falling back to /status polling) instead of hitting /status each tick.
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
-			gl, aliasRevision := live.routeSnapshot()
+			gl, intent := live.transportSnapshot()
+			aliasRevision := intent.aliasRevision
 			if room.Idx == 0 && gl.AliasBinding != nil && !gl.AliasBinding.valid() {
 				att.expire(time.Now()) // retain pending restore until output identity is known
 				time.Sleep(200 * time.Millisecond)
@@ -1024,7 +1026,18 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				}
 
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
-				sg, so := trans.decide(!gl.Paused && !gl.Stopped, otState == "play", otState != "")
+				nextTrans := trans
+				if transIntent.run != intent.run || transIntent.phase != intent.phase || transIntent.aliasRevision != intent.aliasRevision {
+					nextTrans = transState{canon: -1, otTarget: -1}
+				}
+				sg, so := nextTrans.decide(!gl.Paused && !gl.Stopped, otState == "play", otState != "")
+				if !live.admitTransport(intent, &trans, nextTrans) {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				// decide selects at most one effect. This admission commits that
+				// effect (or a no-command tick); no await precedes its HTTP.
+				transIntent = intent
 				if sg >= 0 {
 					if sg == 1 {
 						librespotTransport(room.Librespot, "resume")
@@ -1032,8 +1045,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						librespotTransport(room.Librespot, "pause")
 					}
 					log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(sg))
-				}
-				if so >= 0 {
+				} else if so >= 0 {
 					owntoneTransport(room.OwnTone, playWord(so))
 					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(so))
 				}
