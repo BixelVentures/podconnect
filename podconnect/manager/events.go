@@ -26,6 +26,7 @@ type glLive struct {
 	trackURI          string
 	trackChangeSeq    uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
 	aliasRevision     uint64 // observed alias/source intent; unchanged status polls do not bump it
+	transportRevision uint64 // transport observations, including accepted polling changes
 	routeDispatchSeq  uint64 // mutex-owned command admission, not native acceptance
 	sourceStop        <-chan struct{}
 	sourceRetired     bool
@@ -53,6 +54,35 @@ func (l *glLive) routeSnapshot() (glStatus, uint64) {
 	defer l.mu.Unlock()
 	l.observeStopLocked()
 	return l.st, l.aliasRevision
+}
+
+// glTransportIntent binds one bridge reading to its source, alias and transport
+// observation. Polling changes and repeated wire events both invalidate old work.
+type glTransportIntent struct {
+	run, phase, aliasRevision, transportRevision uint64
+	alias                                        int
+}
+
+func (l *glLive) transportSnapshot() (glStatus, glTransportIntent) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	return l.st, glTransportIntent{l.runEpoch, l.phaseEpoch, l.aliasRevision, l.transportRevision, l.st.SelAlias}
+}
+
+// admitTransport commits only the copied decision whose observations are still
+// current. HTTP follows after unlocking; its completion never commits state.
+func (l *glLive) admitTransport(intent glTransportIntent, current *transState, next transState) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	if l.sourceRetired || intent.run != l.runEpoch || intent.phase != l.phaseEpoch ||
+		intent.aliasRevision != l.aliasRevision || intent.transportRevision != l.transportRevision ||
+		intent.alias != l.st.SelAlias || (l.st.AliasBinding != nil && !l.st.AliasBinding.valid()) {
+		return false
+	}
+	*current = next
+	return true
 }
 
 // admitRoute linearizes an already prepared command against current intent.
@@ -85,6 +115,9 @@ func (l *glLive) observeStopLocked() {
 // use refreshStatus, which fences their producer and intervening wire observations.
 func (l *glLive) set(st glStatus) {
 	l.mu.Lock()
+	if st.Active != l.st.Active || st.Paused != l.st.Paused || st.Stopped != l.st.Stopped {
+		l.transportRevision++
+	}
 	if st.SelAlias != l.st.SelAlias {
 		l.aliasRevision++
 	}
@@ -191,6 +224,9 @@ func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
 	}
 	accepted := false
 	if request.wire[0] == l.wireRevision[0] {
+		if st.Active != l.st.Active || st.Paused != l.st.Paused || st.Stopped != l.st.Stopped {
+			l.transportRevision++
+		}
 		l.st.Active, l.st.Paused, l.st.Stopped = st.Active, st.Paused, st.Stopped
 		accepted = true
 	}
@@ -294,6 +330,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 	switch typ {
 	case "playing", "paused", "stopped", "not_playing", "active", "inactive":
 		l.wireRevision[0]++
+		l.transportRevision++
 	case "volume":
 		if _, ok := numField(data, "value"); ok {
 			l.wireRevision[1]++

@@ -1,3 +1,8 @@
+## Speakers 0.26.17 - preserve current Connect transport
+
+- Reject obsolete Play/Pause decisions when Spotify playback state, the selected speaker or the engine source changes during pending native reads.
+- Preserve rapid playback controls and already admitted commands; late completions cannot overwrite newer transport decisions. Physical Connect playback acceptance remains pending.
+
 ## Control 0.10.7 - named speaker room settings
 
 - Show each configured speaker name and the room selector through complete Danish and English Home Assistant translations.
