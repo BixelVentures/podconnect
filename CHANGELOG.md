@@ -1,3 +1,8 @@
+## Speakers 0.26.18 - keep RSS metadata outside the native writer
+
+- Prepare RSS stream metadata before the atomic playlist/database update, so a slow metadata read does not hold the database writer needed by the native player.
+- Preserve playlist ordering, rescan behavior and rollback on failed updates. This addresses the remaining RSS writer boundary; it does not establish the cause of a previous home Connect failure or a general startup deadline. Physical playback acceptance remains pending.
+
 ## Speakers 0.26.17 - preserve current Connect transport
 
 - Reject obsolete Play/Pause decisions when Spotify playback state, the selected speaker or the engine source changes during pending native reads.
