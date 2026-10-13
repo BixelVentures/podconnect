@@ -1,7 +1,8 @@
 diff --git a/src/Makefile.am b/src/Makefile.am
+index b311abd..f0b2da2 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -166,3 +166,84 @@
+@@ -166,3 +166,84 @@ $(LEXER_SRC:.l=.h): $(LEXER_SRC)
  # flex/bison automake's support leaves something to be desired
  clean-local:
  	rm -f $(LEXER_SRC:.l=.[ch]) $(PARSER_SRC:.y=.[ch])
@@ -83,13 +84,14 @@ diff --git a/src/Makefile.am b/src/Makefile.am
 +airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
 +	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
-+airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse
-+EXTRA_DIST += ../tests/player_startup_owner.inc.c
++airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=free_mfi
++EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
 diff --git a/src/conffile.c b/src/conffile.c
+index 47d30a5..ae15198 100644
 --- a/src/conffile.c
 +++ b/src/conffile.c
-@@ -170,6 +170,8 @@
+@@ -170,6 +170,8 @@ static cfg_opt_t sec_airplay_shared[] =
      CFG_INT("control_port", 0, CFGF_NONE),
      CFG_INT("timing_port", 0, CFGF_NONE),
      CFG_BOOL("uncompressed_alac", cfg_false, CFGF_NONE),
@@ -99,9 +101,10 @@ diff --git a/src/conffile.c b/src/conffile.c
    };
  
 diff --git a/src/db.c b/src/db.c
+index b5c3f92..ac99163 100644
 --- a/src/db.c
 +++ b/src/db.c
-@@ -4790,6 +4790,286 @@
+@@ -4790,6 +4790,286 @@ db_admin_delete(const char *key)
  }
  
  /* Speakers */
@@ -388,7 +391,7 @@ diff --git a/src/db.c b/src/db.c
  int
  db_speaker_save(struct output_device *device)
  {
-@@ -7449,6 +7729,9 @@
+@@ -7449,6 +7729,9 @@ db_init(char *sqlite_ext_path)
  	}
      }
  
@@ -399,9 +402,10 @@ diff --git a/src/db.c b/src/db.c
  
    CHECK_ERR(L_DB, db_files_get_count(&files, NULL, NULL));
 diff --git a/src/db.h b/src/db.h
+index 38ae5d5..01a6cbb 100644
 --- a/src/db.h
 +++ b/src/db.h
-@@ -1035,4 +1035,15 @@
+@@ -1035,4 +1035,15 @@ db_init(char *sqlite_ext_path);
  void
  db_deinit(void);
  
@@ -418,9 +422,10 @@ diff --git a/src/db.h b/src/db.h
 +
  #endif /* !__DB_H__ */
 diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
+index 2d5d091..6e5bcc4 100644
 --- a/src/evrtsp/evrtsp.h
 +++ b/src/evrtsp/evrtsp.h
-@@ -108,6 +108,10 @@
+@@ -108,6 +108,10 @@ struct {
  	/* Callback */
  	void (*cb)(struct evrtsp_request *, void *);
  	void *cb_arg;
@@ -431,7 +436,7 @@ diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
  };
  
  /**
-@@ -167,6 +171,13 @@
+@@ -167,6 +171,13 @@ int evrtsp_make_request(struct evrtsp_connection *evcon,
      struct evrtsp_request *req,
      enum evrtsp_cmd_type type, const char *uri);
  
@@ -446,9 +451,10 @@ diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
  
  /* Interfaces for dealing with headers */
 diff --git a/src/evrtsp/rtsp-internal.h b/src/evrtsp/rtsp-internal.h
+index f00d58f..685077a 100644
 --- a/src/evrtsp/rtsp-internal.h
 +++ b/src/evrtsp/rtsp-internal.h
-@@ -55,7 +55,15 @@
+@@ -55,7 +55,15 @@ enum evrtsp_connection_state {
  
  struct event_base;
  
@@ -465,9 +471,10 @@ diff --git a/src/evrtsp/rtsp-internal.h b/src/evrtsp/rtsp-internal.h
  	struct event ev;
  	struct event close_ev;
 diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
+index 4f70d48..0032885 100644
 --- a/src/evrtsp/rtsp.c
 +++ b/src/evrtsp/rtsp.c
-@@ -679,6 +679,14 @@
+@@ -679,6 +679,14 @@ void
  evrtsp_connection_free(struct evrtsp_connection *evcon)
  {
  	struct evrtsp_request *req;
@@ -482,7 +489,7 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
  
  	/* notify interested parties that this connection is going down */
  	if (evcon->fd != -1) {
-@@ -722,6 +730,35 @@
+@@ -722,6 +730,35 @@ evrtsp_connection_free(struct evrtsp_connection *evcon)
  	free(evcon);
  }
  
@@ -518,7 +525,7 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
  static void
  evrtsp_request_dispatch(struct evrtsp_connection* evcon)
  {
-@@ -733,6 +770,16 @@
+@@ -733,6 +770,16 @@ evrtsp_request_dispatch(struct evrtsp_connection* evcon)
  
  	/* delete possible close detection events */
  	evrtsp_connection_stop_detectclose(evcon);
@@ -535,7 +542,7 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
  	
  	/* we assume that the connection is connected already */
  	assert(evcon->state == EVCON_IDLE);
-@@ -852,6 +899,12 @@
+@@ -852,6 +899,12 @@ evrtsp_connectioncb(int fd, short what, void *arg)
   cleanup:
    evrtsp_connection_reset(evcon);
  
@@ -548,7 +555,7 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
    /* for now, we just signal all requests by executing their callbacks */
    while (TAILQ_FIRST(&evcon->requests) != NULL) {
      struct evrtsp_request *request = TAILQ_FIRST(&evcon->requests);
-@@ -861,6 +914,10 @@
+@@ -861,6 +914,10 @@ evrtsp_connectioncb(int fd, short what, void *arg)
      /* we might want to set an error here */
      request->cb(request, request->cb_arg);
      evrtsp_request_free(request);
@@ -559,7 +566,7 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
    }
  }
  
-@@ -1455,11 +1512,12 @@
+@@ -1455,11 +1512,12 @@ evrtsp_connection_connect(struct evrtsp_connection *evcon)
   * this will start the connection.
   */
  
@@ -569,14 +576,13 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
 +evrtsp_make_request_internal(struct evrtsp_connection *evcon,
      struct evrtsp_request *req,
 -    enum evrtsp_cmd_type type, const char *uri)
--{
 +    enum evrtsp_cmd_type type, const char *uri, int strict_error_ownership)
-+{
+ {
 +	int ret;
  event_debug(("%s: TEST", __func__));
  
  	/* We are making a request */
-@@ -1483,8 +1541,16 @@
+@@ -1483,8 +1541,16 @@ event_debug(("%s: TEST", __func__));
  	TAILQ_INSERT_TAIL(&evcon->requests, req, next);
  
  	/* If the connection object is not connected; make it so */
@@ -595,12 +601,10 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
  
  	/*
  	 * If it's connected already and we are the first in the queue,
-@@ -1495,6 +1561,23 @@
- 		evrtsp_request_dispatch(evcon);
- 
+@@ -1497,6 +1563,23 @@ event_debug(("%s: TEST", __func__));
  	return (0);
-+}
-+
+ }
+ 
 +int
 +evrtsp_make_request(struct evrtsp_connection *evcon,
 +    struct evrtsp_request *req, enum evrtsp_cmd_type type, const char *uri)
@@ -616,13 +620,16 @@ diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
 +	req->dispatch_current = dispatch_current;
 +	req->dispatch_current_arg = arg;
 +	return evrtsp_make_request_internal(evcon, req, type, uri, 1);
- }
- 
++}
++
  /*
+  * Reads data from file descriptor into request structure
+  * Request structure needs to be set up correctly.
 diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index 619dfee..f453e5f 100644
 --- a/src/httpd_jsonapi.c
 +++ b/src/httpd_jsonapi.c
-@@ -1607,6 +1607,8 @@
+@@ -1607,6 +1607,8 @@ struct outputs_param
    int output_volume;
  };
  
@@ -631,7 +638,7 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
  static json_object *
  speaker_to_json(struct player_speaker_info *spk)
  {
-@@ -1633,6 +1635,8 @@
+@@ -1633,6 +1635,8 @@ speaker_to_json(struct player_speaker_info *spk)
    json_object_object_add(output, "requires_auth", json_object_new_boolean(spk->requires_auth));
    json_object_object_add(output, "needs_auth_key", json_object_new_boolean(spk->needs_auth_key));
    json_object_object_add(output, "volume", json_object_new_int(spk->absvol));
@@ -640,12 +647,10 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
    json_object_object_add(output, "offset_ms", json_object_new_int(spk->offset_ms));
    json_object_object_add(output, "format", json_object_new_string(media_format_to_string(spk->format)));
    json_object_object_add(output, "supported_formats", supported_formats);
-@@ -1650,6 +1654,249 @@
- 
-   output = speaker_to_json(spk);
+@@ -1652,6 +1656,249 @@ speaker_enum_cb(struct player_speaker_info *spk, void *arg)
    json_object_array_add(outputs, output);
-+}
-+
+ }
+ 
 +// Attention IDs/revisions are decimal strings, never lossy JSON numbers.
 +static void
 +attention_json_u64(json_object *object, const char *key, uint64_t value)
@@ -887,10 +892,12 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
 +  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(reply)));
 +  jparse_free(reply);
 +  return HTTP_OK;
- }
- 
++}
++
  /*
-@@ -1858,6 +2105,7 @@
+  * GET /api/outputs/[output_id]
+  */
+@@ -1858,6 +2105,7 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
    json_object *outputs;
    json_object *output_id;
    int nspk, i, ret;
@@ -898,7 +905,7 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
    uint64_t *ids;
  
    request = jparse_obj_from_evbuffer(hreq->in_body);
-@@ -1890,7 +2138,7 @@
+@@ -1890,7 +2138,7 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
  	}
  
        if (ret == 0)
@@ -907,7 +914,7 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
  
        free(ids);
      }
-@@ -1899,7 +2147,7 @@
+@@ -1899,7 +2147,7 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
  
    jparse_free(request);
  
@@ -916,7 +923,7 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
  }
  
  static int
-@@ -4692,6 +4940,9 @@
+@@ -4692,6 +4940,9 @@ static struct httpd_uri_map adm_handlers[] =
      { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
      { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
      { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
@@ -926,7 +933,182 @@ diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
      { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
      { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
+diff --git a/src/library/rssscanner.c b/src/library/rssscanner.c
+index 8191c7c..92882a8 100644
+--- a/src/library/rssscanner.c
++++ b/src/library/rssscanner.c
+@@ -361,6 +361,29 @@ mfi_metadata_fixup(struct media_file_info *mfi, struct rss_item_info *ri, const
+   mfi->time_added = time_added;
+ }
+ 
++/* Own the prepared metadata until the whole playlist transaction finishes.
++ * RSS strings borrow the XML, which remains alive through preparation/apply. */
++struct rss_prepared_item {
++  struct rss_item_info info;
++  struct media_file_info media;
++  bool known;
++  struct rss_prepared_item *next;
++};
++
++static void
++rss_prepared_free(struct rss_prepared_item *items)
++{
++  struct rss_prepared_item *next;
++
++  while (items)
++    {
++      next = items->next;
++      free_mfi(&items->media, 1);
++      free(items);
++      items = next;
++    }
++}
++
+ static int
+ rss_save(struct playlist_info *pli, int *count, enum rss_scan_type scan_type)
+ {
+@@ -369,9 +392,12 @@ rss_save(struct playlist_info *pli, int *count, enum rss_scan_type scan_type)
+   const char *feed_title;
+   const char *feed_author;
+   const char *feed_artwork;
+-  struct media_file_info mfi = { 0 };
++  struct rss_prepared_item *prepared = NULL;
++  struct rss_prepared_item **tail = &prepared;
++  struct rss_prepared_item *entry;
+   struct rss_item_info ri;
+   uint32_t time_added;
++  uint32_t nprepared = 0;
+   int ret;
+ 
+   xml = rss_xml_get(pli->path);
+@@ -398,66 +424,84 @@ rss_save(struct playlist_info *pli, int *count, enum rss_scan_type scan_type)
+   free(pli->virtual_path);
+   pli->virtual_path = safe_asprintf("/%s", pli->path);
+ 
+-  // Fake the time - useful when we are adding a new stream - since the
+-  // newest podcasts are added first (the stream is most recent first)
+-  // having time_added date which is older on the most recent episodes
+-  // makes no sense so make all the dates the same for a singleu update
++  // Keep one added-time for this refresh, as in the existing apply loop.
+   time_added = (uint32_t)time(NULL);
+ 
+-  // Walk through the xml, saving each item
+-  *count = 0;
+-  db_transaction_begin();
+-  db_pl_clear_items(pli->id);
+-  for (item = xml_get_node(xml, "rss/channel/item"); item && (*count < pli->query_limit); item = xml_get_next(xml, item))
++  // External metadata I/O must never own the shared-cache write transaction.
++  for (item = xml_get_node(xml, "rss/channel/item"); item && (nprepared < pli->query_limit); item = xml_get_next(xml, item))
+     {
+       if (library_is_exiting())
+-	{
+-	  db_transaction_rollback();
+-	  xml_free(xml);
+-	  return -1;
+-	}
++        goto error;
+ 
+       ri_from_item(&ri, item);
+       if (!ri.url)
+-	{
+-	  DPRINTF(E_WARN, L_LIB, "Missing URL for item '%s' (date %s) in RSS feed '%s'\n", ri.title, ri.pubdate, feed_title);
+-	  continue;
+-	}
++        {
++          DPRINTF(E_WARN, L_LIB, "Missing URL for item '%s' (date %s) in RSS feed '%s'\n", ri.title, ri.pubdate, feed_title);
++          continue;
++        }
++
++      entry = calloc(1, sizeof(*entry));
++      if (!entry)
++        goto error;
++      entry->info = ri;
++      entry->known = scan_type == RSS_SCAN_RESCAN && db_file_id_bypath(ri.url) > 0;
++      *tail = entry;
++      tail = &entry->next;
++      nprepared++;
++
++      if (!entry->known)
++        scan_metadata_stream(&entry->media, ri.url);
++    }
++
++  *count = 0;
++  db_transaction_begin();
++  db_pl_clear_items(pli->id);
++  for (entry = prepared; entry; entry = entry->next)
++    {
++      if (library_is_exiting())
++        goto rollback;
+ 
++      ri = entry->info;
+       DPRINTF(E_DBG, L_LIB, "RSS/xml item: title '%s' pubdate: '%s' link: '%s' url: '%s' type: '%s'\n", ri.title, ri.pubdate, ri.link, ri.url, ri.type);
+ 
+-      db_pl_add_item_bypath(pli->id, ri.url);
++      if (db_pl_add_item_bypath(pli->id, ri.url) < 0)
++        goto rollback;
+       (*count)++;
+ 
+-      // Try to just ping if already in library
+       if (scan_type == RSS_SCAN_RESCAN)
+-	{
+-	  ret = db_file_ping_bypath(ri.url, 0);
+-	  if (ret > 0)
+-	    continue;
+-	}
++        {
++          ret = db_file_ping_bypath(ri.url, 0);
++          if (ret > 0)
++            continue;
++          // A known row may disappear during preparation. Fail atomically;
++          // never re-enter external metadata I/O under this write owner.
++          if (ret < 0 || entry->known)
++            goto rollback;
++        }
+       else if (scan_type == RSS_SCAN_META)
+-	{
+-	  // Using existing file id if already in library, resulting in update but preserving play_count etc
+-	  mfi.id = db_file_id_bypath(ri.url);
+-	  if (mfi.id > 0)
+-	    time_added = 0;
+-	}
+-
+-      scan_metadata_stream(&mfi, ri.url);
+-      mfi.scan_kind = SCAN_KIND_RSS;
+-
+-      mfi_metadata_fixup(&mfi, &ri, feed_title, feed_author, time_added);
+-
+-      library_media_save(&mfi);
+-
+-      free_mfi(&mfi, 1);
++        {
++          entry->media.id = db_file_id_bypath(ri.url);
++          if (entry->media.id > 0)
++            time_added = 0;
++        }
++
++      entry->media.scan_kind = SCAN_KIND_RSS;
++      mfi_metadata_fixup(&entry->media, &ri, feed_title, feed_author, time_added);
++      if (library_media_save(&entry->media) < 0)
++        goto rollback;
+     }
+ 
+   db_transaction_end();
++  rss_prepared_free(prepared);
+   xml_free(xml);
+-
+   return 0;
++
++ rollback:
++  db_transaction_rollback();
++ error:
++  rss_prepared_free(prepared);
++  xml_free(xml);
++  return -1;
+ }
+ 
+ static int
 diff --git a/src/outputs.c b/src/outputs.c
+index ffa2cb1..a5ada22 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -28,8 +28,10 @@
@@ -940,7 +1122,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
  #include "logger.h"
  #include "misc.h"
-@@ -97,6 +99,10 @@
+@@ -97,6 +99,10 @@ struct outputs_callback_register
  
    // We have received the callback with the result from the backend
    bool ready;
@@ -951,7 +1133,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    // We store a device_id to avoid the risk of dangling device pointer
    uint64_t device_id;
-@@ -115,6 +121,12 @@
+@@ -115,6 +121,12 @@ static struct output_buffer output_buffer;
  
  static struct output_device *outputs_device_list;
  static int outputs_master_volume;
@@ -964,7 +1146,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  static uint64_t outputs_buffer_duration_ms;
  
  static bool outputs_exclusive_mode;
-@@ -128,6 +140,567 @@
+@@ -128,6 +140,567 @@ static struct output_quality_subscription output_quality_subscriptions[OUTPUTS_M
  static bool outputs_got_new_subscription;
  
  
@@ -1532,7 +1714,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  /* ------------------------------- MISC HELPERS ----------------------------- */
  
  static output_status_cb
-@@ -154,7 +727,8 @@
+@@ -154,7 +727,8 @@ callback_remove(struct output_device *device)
  
    for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
      {
@@ -1542,7 +1724,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  	{
  	  DPRINTF(E_DBG, L_PLAYER, "Removing callback to %s, id %d\n", player_pmap(outputs_cb_register[callback_id].cb), callback_id);
  	  memset(&outputs_cb_register[callback_id], 0, sizeof(struct outputs_callback_register));
-@@ -209,6 +783,7 @@
+@@ -209,6 +783,7 @@ deferred_cb(int fd, short what, void *arg)
    output_status_cb cb;
    enum output_device_state state;
    int callback_id;
@@ -1550,7 +1732,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    for (callback_id = 0; callback_id < ARRAY_SIZE(outputs_cb_register); callback_id++)
      {
-@@ -222,7 +797,21 @@
+@@ -222,7 +797,21 @@ deferred_cb(int fd, short what, void *arg)
  	  // Will be NULL if the device has disappeared
  	  device = outputs_device_get(outputs_cb_register[callback_id].device_id);
  
@@ -1572,13 +1754,10 @@ diff --git a/src/outputs.c b/src/outputs.c
  
  	  // The device has left the building (stopped/failed), and the backend
  	  // is not using it any more
-@@ -244,6 +833,43 @@
-     {
-       if (outputs_cb_register[i].cb)
- 	DPRINTF(E_DBG, L_PLAYER, "%d. Active callback: %s\n", i, player_pmap(outputs_cb_register[i].cb));
-+    }
-+}
-+
+@@ -247,6 +836,43 @@ deferred_cb(int fd, short what, void *arg)
+     }
+ }
+ 
 +static int
 +attention_restart_reserve(struct output_device *device, output_status_cb cb)
 +{
@@ -1613,10 +1792,13 @@ diff --git a/src/outputs.c b/src/outputs.c
 +      outputs_cb_register[id].ready = true;
 +      outputs_cb_register[id].state = OUTPUT_STATE_FAILED;
 +      event_active(outputs_deferredev, 0, 0);
-     }
- }
- 
-@@ -643,6 +1269,9 @@
++    }
++}
++
+ static void
+ stop_timer_cb(int fd, short what, void *arg)
+ {
+@@ -643,6 +1269,9 @@ outputs_device_session_add(uint64_t device_id, void *session)
    if (!device)
      return -1;
  
@@ -1626,7 +1808,7 @@ diff --git a/src/outputs.c b/src/outputs.c
    device->session = session;
    return 0;
  }
-@@ -654,9 +1283,21 @@
+@@ -654,11 +1283,23 @@ outputs_device_session_remove(uint64_t device_id)
  
    device = outputs_device_get(device_id);
    if (device)
@@ -1638,23 +1820,23 @@ diff --git a/src/outputs.c b/src/outputs.c
 +    }
  
    return;
-+}
-+
+ }
+ 
 +void
 +outputs_device_session_remove_exact(uint64_t device_id, const void *session)
 +{
 +  struct output_device *device = outputs_device_get(device_id);
 +  if (device && device->session == session)
 +    outputs_device_session_remove(device_id);
- }
- 
- int
-@@ -751,6 +1392,22 @@
-   outputs_cb_register[callback_id].device_id = device_id;
-   outputs_cb_register[callback_id].state = state;
-   event_active(outputs_deferredev, 0, 0);
 +}
 +
+ int
+ outputs_quality_subscribe(struct media_quality *quality)
+ {
+@@ -753,6 +1394,22 @@ outputs_cb(int callback_id, uint64_t device_id, enum output_device_state state)
+   event_active(outputs_deferredev, 0, 0);
+ }
+ 
 +void
 +outputs_cb_exact(int id, uint64_t device_id, uint64_t incarnation, uint64_t epoch, const void *session, enum output_device_state state)
 +{
@@ -1669,10 +1851,12 @@ diff --git a/src/outputs.c b/src/outputs.c
 +  outputs_cb_register[id].incarnation = incarnation;
 +  outputs_cb_register[id].epoch = epoch;
 +  outputs_cb(id, device_id, state);
- }
- 
++}
++
  void
-@@ -805,9 +1462,24 @@
+ outputs_metadata_free(struct output_metadata *metadata)
+ {
+@@ -805,9 +1462,24 @@ outputs_device_add(struct output_device *add, bool new_deselect)
    // New device
    if (!device)
      {
@@ -1697,7 +1881,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
        keep_name = strdup(device->name);
        keep_offset_ms = device->offset_ms; // For legacy local audio and Chromecast where offset could come from config file
-@@ -819,6 +1491,8 @@
+@@ -819,6 +1491,8 @@ outputs_device_add(struct output_device *add, bool new_deselect)
  	  device->volume = (outputs_master_volume >= 0) ? outputs_master_volume : OUTPUTS_DEFAULT_VOLUME;;
  	}
  
@@ -1706,16 +1890,16 @@ diff --git a/src/outputs.c b/src/outputs.c
        free(device->name);
        device->name = keep_name;
  
-@@ -881,6 +1555,8 @@
-   struct output_device *device;
+@@ -882,6 +1556,8 @@ outputs_device_remove(struct output_device *remove)
    struct output_device *prev;
    int ret;
-+
-+  attention_restart_cancel(remove);
  
++  attention_restart_cancel(remove);
++
    // Device stop should be able to handle that we invalidate the device, even
    // if it is an async stop. It might call outputs_device_session_remove(), but
-@@ -920,7 +1596,14 @@
+   // that just won't do anything since the id will be unknown.
+@@ -920,7 +1596,14 @@ outputs_device_remove(struct output_device *remove)
  void
  outputs_device_select(struct output_device *device, int max_volume)
  {
@@ -1730,7 +1914,7 @@ diff --git a/src/outputs.c b/src/outputs.c
    device->prevent_playback = 0;
    device->busy = 0;
  
-@@ -932,8 +1615,13 @@
+@@ -932,8 +1615,13 @@ outputs_device_select(struct output_device *device, int max_volume)
    // We could avoid this by reducing the unselected Office in step 2, but that
    // leads to issue #1077, where volumes of unselected devices go to 0 (e.g. by
    // reducing master to 0 and then increasing again -> unselected stays at 0).
@@ -1746,7 +1930,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    vol_adjust();
  }
-@@ -941,7 +1629,13 @@
+@@ -941,7 +1629,13 @@ outputs_device_select(struct output_device *device, int max_volume)
  void
  outputs_device_deselect(struct output_device *device)
  {
@@ -1761,7 +1945,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    vol_adjust();
  }
-@@ -954,6 +1648,19 @@
+@@ -954,6 +1648,19 @@ outputs_device_start(struct output_device *device, output_status_cb cb, bool onl
    if (outputs[device->type]->disabled || !outputs[device->type]->device_start || !outputs[device->type]->device_probe)
      return -1;
  
@@ -1781,7 +1965,7 @@ diff --git a/src/outputs.c b/src/outputs.c
    if (device->session)
      return 0; // Device is already running, nothing to do
  
-@@ -965,6 +1672,40 @@
+@@ -965,6 +1672,40 @@ outputs_device_start(struct output_device *device, output_status_cb cb, bool onl
    return device_state_update(device, ret);;
  }
  
@@ -1822,7 +2006,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  int
  outputs_device_stop(struct output_device *device, output_status_cb cb)
  {
-@@ -975,6 +1716,8 @@
+@@ -975,6 +1716,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
  
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
@@ -1831,7 +2015,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    ret = outputs[device->type]->device_stop(device, callback_add(device, cb));
  
-@@ -1013,15 +1756,15 @@
+@@ -1013,15 +1756,15 @@ outputs_device_flush(struct output_device *device, output_status_cb cb)
    return ret; // We don't change device state just because of a failed flush
  }
  
@@ -1853,7 +2037,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  }
  
  int
-@@ -1096,6 +1839,8 @@
+@@ -1096,6 +1839,8 @@ outputs_device_free(struct output_device *device)
    if (!device)
      return;
  
@@ -1862,7 +2046,7 @@ diff --git a/src/outputs.c b/src/outputs.c
    if (outputs[device->type]->disabled)
      DPRINTF(E_LOG, L_PLAYER, "BUG! Freeing device from a disabled output?\n");
  
-@@ -1107,6 +1852,8 @@
+@@ -1107,6 +1852,8 @@ outputs_device_free(struct output_device *device)
  
    if (device->stop_timer)
      event_free(device->stop_timer);
@@ -1871,7 +2055,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    free(device->name);
    free(device->auth_key);
-@@ -1130,6 +1877,13 @@
+@@ -1130,6 +1877,13 @@ outputs_start(output_status_cb started_cb, output_status_cb stopped_cb, bool onl
      {
        if (device->selected)
  	continue;
@@ -1885,7 +2069,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
        ret = outputs_device_stop(device, stopped_cb);
        if (ret > 0)
-@@ -1213,7 +1967,12 @@
+@@ -1213,7 +1967,12 @@ outputs_volume_set(int volume, output_status_cb cb)
    int ret;
  
    if (outputs_master_volume == volume)
@@ -1899,7 +2083,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    outputs_master_volume = volume;
  
-@@ -1222,7 +1981,8 @@
+@@ -1222,7 +1981,8 @@ outputs_volume_set(int volume, output_status_cb cb)
        if (!device->selected)
  	continue;
  
@@ -1909,7 +2093,7 @@ diff --git a/src/outputs.c b/src/outputs.c
  
        ret = outputs_device_volume_set(device, cb);
        if (ret < 0)
-@@ -1321,6 +2081,8 @@
+@@ -1321,6 +2081,8 @@ outputs_init(void)
    int i;
    int j;
  
@@ -1919,9 +2103,10 @@ diff --git a/src/outputs.c b/src/outputs.c
  
    // Number of milliseconds the outputs should buffer before starting playback.
 diff --git a/src/outputs.h b/src/outputs.h
+index e8474c9..ccc9693 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
-@@ -86,6 +86,101 @@
+@@ -86,6 +86,101 @@ enum output_device_state
    OUTPUT_STATE_PASSWORD  = -2,
  };
  
@@ -2023,7 +2208,7 @@ diff --git a/src/outputs.h b/src/outputs.h
  /* Linked list of device info used by the player for each device
   */
  struct output_device
-@@ -126,6 +221,30 @@
+@@ -126,6 +221,30 @@ struct output_device
    int relvol;
    int max_volume;
  
@@ -2054,7 +2239,7 @@ diff --git a/src/outputs.h b/src/outputs.h
    // Quality of audio output
    struct media_quality quality;
  
-@@ -241,6 +360,15 @@
+@@ -241,6 +360,15 @@ struct output_definition
    // Set the volume and call back
    int (*device_volume_set)(struct output_device *device, int callback_id);
  
@@ -2070,7 +2255,7 @@ diff --git a/src/outputs.h b/src/outputs.h
    // Convert device internal representation of volume to our pct scale
    int (*device_volume_to_pct)(struct output_device *device, const char *volume);
  
-@@ -290,6 +418,16 @@
+@@ -290,6 +418,16 @@ outputs_device_session_add(uint64_t device_id, void *session);
  void
  outputs_device_session_remove(uint64_t device_id);
  
@@ -2087,11 +2272,10 @@ diff --git a/src/outputs.h b/src/outputs.h
  int
  outputs_quality_subscribe(struct media_quality *quality);
  
-@@ -307,6 +445,38 @@
- 
+@@ -308,6 +446,38 @@ outputs_buffer_copy(struct output_buffer *buffer);
  void
  outputs_buffer_free(struct output_buffer *buffer);
-+
+ 
 +
 +int
 +outputs_device_effective_volume(const struct output_device *device);
@@ -2123,10 +2307,11 @@ diff --git a/src/outputs.h b/src/outputs.h
 +
 +void
 +outputs_attention_complete(const struct output_attention_result *operation, enum output_attention_outcome outcome, int response_code, int cseq);
- 
++
  /* ---------------------------- Called by player ---------------------------- */
  
-@@ -337,7 +507,7 @@
+ // Ownership of *add is transferred, so don't address after calling. Instead you
+@@ -337,7 +507,7 @@ outputs_device_stop_delayed(struct output_device *device, output_status_cb cb);
  int
  outputs_device_flush(struct output_device *device, output_status_cb cb);
  
@@ -2136,6 +2321,7 @@ diff --git a/src/outputs.h b/src/outputs.h
  
  int
 diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 4290b75..8c57147 100644
 --- a/src/outputs/airplay.c
 +++ b/src/outputs/airplay.c
 @@ -19,6 +19,7 @@
@@ -2146,7 +2332,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  #include <stdbool.h>
  #include <unistd.h>
  #include <stdint.h>
-@@ -218,6 +219,8 @@
+@@ -218,6 +219,8 @@ struct airplay_master_session
    struct evbuffer *encoded_buffer;
  
    struct rtp_session *rtp_session;
@@ -2155,7 +2341,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    struct rtcp_timestamp cur_stamp;
  
-@@ -237,10 +240,29 @@
+@@ -237,10 +240,29 @@ struct airplay_master_session
    struct airplay_master_session *next;
  };
  
@@ -2185,12 +2371,10 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    struct airplay_master_session *master_session;
  
-@@ -310,6 +332,15 @@
-   uint32_t ptpd_slave_id;
- 
+@@ -312,6 +334,15 @@ struct airplay_session
    struct airplay_session *next;
-+};
-+
+ };
+ 
 +
 +struct airplay_attention_request
 +{
@@ -2198,10 +2382,12 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +  struct airplay_session *session;
 +  int cseq;
 +  struct airplay_attention_request *next;
- };
- 
++};
++
  struct airplay_metadata
-@@ -371,6 +402,12 @@
+ {
+   struct evbuffer *metadata;
+@@ -371,6 +402,12 @@ struct airplay_seq_ctx
    struct airplay_session *session;
    void *payload_make_arg;
    const char *log_caller;
@@ -2214,7 +2400,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  };
  
  
-@@ -489,8 +526,19 @@
+@@ -489,8 +526,19 @@ static int
  airplay_device_start(struct output_device *device, int callback_id);
  static void
  sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
@@ -2234,7 +2420,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
  
  /* ------------------------------- MISC HELPERS ----------------------------- */
-@@ -1091,7 +1139,11 @@
+@@ -1091,7 +1139,11 @@ session_status(struct airplay_session *session)
  	state = OUTPUT_STATE_FAILED;
      }
  
@@ -2247,7 +2433,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    session->callback_id = -1;
  }
  
-@@ -1103,6 +1155,7 @@
+@@ -1103,6 +1155,7 @@ master_session_free(struct airplay_master_session *ams)
  
    outputs_quality_unsubscribe(&ams->rtp_session->quality);
    rtp_session_free(ams->rtp_session);
@@ -2255,7 +2441,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    transcode_encode_cleanup(&ams->encode_ctx);
  
-@@ -1173,7 +1226,9 @@
+@@ -1173,7 +1226,9 @@ master_session_make(struct media_quality *quality, bool use_ptp)
    clock_id = use_ptp ? ptpd_clock_id_get() : 0;
  
    ams->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
@@ -2266,12 +2452,10 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
      {
        goto error;
      }
-@@ -1233,6 +1288,24 @@
-     {
-       evrtsp_connection_set_closecb(session->ctrl, NULL, NULL);
+@@ -1235,6 +1290,24 @@ session_free(struct airplay_session *session)
        evrtsp_connection_free(session->ctrl);
-+    }
-+
+     }
+ 
 +  // The actual connection has retired all queued requests/callback events.
 +  // Executing contexts unlinked before entering handlers; only queue-owned
 +  // contexts remain here, including sequences admitted before PC9 management.
@@ -2288,10 +2472,12 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +      session->attention_requests = pending->next;
 +      outputs_attention_complete(&pending->operation, OUTPUT_ATTENTION_UNKNOWN, 0, pending->cseq);
 +      free(pending);
-     }
- 
++    }
++
    if (session->deferredev)
-@@ -1264,6 +1337,14 @@
+     event_free(session->deferredev);
+ 
+@@ -1264,6 +1337,14 @@ static void
  session_cleanup(struct airplay_session *session)
  {
    struct airplay_session *s;
@@ -2306,7 +2492,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    if (session == airplay_sessions)
      airplay_sessions = airplay_sessions->next;
-@@ -1278,9 +1359,16 @@
+@@ -1278,9 +1359,16 @@ session_cleanup(struct airplay_session *session)
  	s->next = session->next;
      }
  
@@ -2324,7 +2510,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  }
  
  static void
-@@ -1316,6 +1404,27 @@
+@@ -1316,6 +1404,27 @@ deferred_session_failure(struct airplay_session *session)
    evtimer_add(session->deferredev, &tv);
  }
  
@@ -2352,7 +2538,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  static void
  rtsp_close_cb(struct evrtsp_connection *evcon, void *arg)
  {
-@@ -1334,11 +1443,21 @@
+@@ -1334,11 +1443,21 @@ session_success(struct airplay_session *session)
    session_cleanup(session);
  }
  
@@ -2375,7 +2561,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    session_status(session);
  }
  
-@@ -1594,7 +1713,7 @@
+@@ -1594,7 +1713,7 @@ session_make(struct output_device *device, int callback_id)
    CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
  
    session->devname = strdup(device->name);
@@ -2384,7 +2570,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    session->offset_samples = device->offset_ms * device->quality.sample_rate / 1000;
  
    session->state = AIRPLAY_STATE_STOPPED;
-@@ -1603,6 +1722,7 @@
+@@ -1603,6 +1722,7 @@ session_make(struct output_device *device, int callback_id)
  
    session->device_id = device->id;
    session->callback_id = callback_id;
@@ -2392,7 +2578,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    session->server_fd = -1;
  
-@@ -1636,7 +1756,15 @@
+@@ -1636,7 +1756,15 @@ session_make(struct output_device *device, int callback_id)
    airplay_sessions = session;
  
    // rs is now the official device session
@@ -2409,7 +2595,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    return session;
  
-@@ -1879,12 +2007,283 @@
+@@ -1879,14 +2007,285 @@ airplay_set_volume_one(struct output_device *device, int callback_id)
    if (!session || !(session->state & AIRPLAY_STATE_F_CONNECTED))
      return 0;
  
@@ -2422,8 +2608,8 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    sequence_start(AIRPLAY_SEQ_SEND_VOLUME, session, NULL, "set_volume_one");
  
    return 1;
-+}
-+
+ }
+ 
 +
 +static void
 +attention_request_remove(struct airplay_attention_request *context)
@@ -2692,10 +2878,12 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +  return slot >= 0 && (size_t)slot < master->rtp_session->pktbuf_size
 +    && master->packet_serial != UINT64_MAX && master->packet_serials[slot]
 +    && master->packet_serials[slot] >= session->emission_floor;
- }
- 
++}
++
  static void
-@@ -1958,7 +2357,7 @@
+ airplay_keep_alive_timer_cb(int fd, short what, void *arg)
+ {
+@@ -1958,7 +2357,7 @@ packet_send(struct airplay_session *session, struct rtp_packet *pkt)
    ssize_t sent;
    int ret;
  
@@ -2704,7 +2892,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
      return -1;
  
    if (session->supports_encryption)
-@@ -2011,6 +2410,8 @@
+@@ -2011,6 +2410,8 @@ control_packet_send(struct airplay_session *session, struct rtp_packet *pkt)
    int fd;
    int ret;
  
@@ -2713,7 +2901,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    switch (session->family)
      {
        case AF_INET:
-@@ -2089,6 +2490,9 @@
+@@ -2089,6 +2490,9 @@ packets_send(struct airplay_master_session *ams)
      return -1;
  
    pkt = rtp_packet_next(ams->rtp_session, len, ams->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
@@ -2723,7 +2911,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    evbuffer_remove(ams->encoded_buffer, pkt->payload, pkt->payload_len);
  
-@@ -2964,6 +3368,7 @@
+@@ -2964,6 +3368,7 @@ payload_make_pair_verify2(struct evrtsp_request *req, struct airplay_session *se
  static void
  start_failure(struct airplay_session *session)
  {
@@ -2731,7 +2919,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    struct output_device *device;
  
    device = outputs_device_get(session->device_id);
-@@ -2990,6 +3395,7 @@
+@@ -2990,6 +3395,7 @@ start_failure(struct airplay_session *session)
  static void
  start_retry(struct airplay_session *session)
  {
@@ -2739,7 +2927,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    struct output_device *device;
    int callback_id = session->callback_id;
  
-@@ -3371,6 +3777,8 @@
+@@ -3371,6 +3777,8 @@ response_handler_info_start(struct evrtsp_request *req, struct airplay_session *
    enum airplay_seq_type seq_type;
  
    seq_type = response_handler_info_generic(req, session);
@@ -2748,10 +2936,11 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    if (seq_type != AIRPLAY_SEQ_ABORT && seq_type != AIRPLAY_SEQ_PIN_START)
      session->next_seq = AIRPLAY_SEQ_START_PLAYBACK; // Pair and then run SEQ_START_PLAYBACK which sets up the playback
  
-@@ -3702,13 +4110,52 @@
+@@ -3701,6 +4109,41 @@ static struct airplay_seq_request airplay_seq_request[][7] =
+ };
  
  
- static void
++static void
 +sequence_context_remove(struct airplay_seq_ctx *context)
 +{
 +  struct airplay_seq_ctx **link = &context->session->sequence_requests;
@@ -2786,23 +2975,22 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +      && session->callback_id == context->callback_id;
 +}
 +
-+static void
+ static void
  sequence_continue_cb(struct evrtsp_request *req, void *arg)
  {
-   struct airplay_seq_ctx *seq_ctx = arg;
+@@ -3708,7 +4151,11 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
    struct airplay_seq_request *cur_request = seq_ctx->cur_request;
    struct airplay_session *session = seq_ctx->session;
    enum airplay_seq_type seq_type;
--
 +  bool current = sequence_callback_current(seq_ctx);
-+
+ 
 +  // Transfer custody to this executing callback before any handler can free
 +  // the session/connection and drain its other queued contexts.
 +  sequence_context_remove(seq_ctx);
    session->reqs_in_flight--;
    if (!session->reqs_in_flight)
      evrtsp_connection_set_closecb(session->ctrl, rtsp_close_cb, session);
-@@ -3721,13 +4168,23 @@
+@@ -3721,7 +4168,9 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
  
    if (req->response_code != RTSP_OK)
      {
@@ -2813,21 +3001,22 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  	{
  	  DPRINTF(E_LOG, L_AIRPLAY, "Response to %s from '%s' was negative, aborting (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
  	  goto error;
- 	}
- 
+@@ -3730,6 +4179,14 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
        DPRINTF(E_WARN, L_AIRPLAY, "Response to %s from '%s' was negative, proceeding anyway (%d %s)\n", cur_request->name, session->devname, req->response_code, req->response_code_line);
-+    }
-+
+     }
+ 
 +  if (!current)
 +    {
 +      // Successful old work owns only its context/accounting. In particular it
 +      // cannot parse state, launch pairing, or acknowledge a reused STOP slot.
 +      free(seq_ctx);
 +      return;
-     }
- 
++    }
++
    // We don't check that the reply CSeq matches the request CSeq, because some
-@@ -3743,7 +4200,7 @@
+   // targets like Reflector and AirFoil don't return the CSeq according to the
+   // rtsp spec. And the CSeq is not really important anyway.
+@@ -3743,7 +4200,7 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
  	    goto error;
  
  	  // Handler wanted to start a new sequence
@@ -2836,7 +3025,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  	  free(seq_ctx);
  	  return;
  	}
-@@ -3757,14 +4214,25 @@
+@@ -3757,14 +4214,25 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
        return;
      }
  
@@ -2864,11 +3053,10 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
      seq_ctx->on_error(session);
  
    free(seq_ctx);
-@@ -3778,6 +4246,20 @@
-   struct evrtsp_request *req = NULL;
+@@ -3779,6 +4247,20 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
    const char *uri;
    int ret;
-+
+ 
 +  if (session->recovery_only && !sequence_callback_current(seq_ctx)) goto error;
 +  if (session->recovery_only && cur_request->payload_make == payload_make_set_volume
 +      && cur_request->seq_type == AIRPLAY_SEQ_START_PLAYBACK)
@@ -2882,10 +3070,11 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +  // Re-register a continuing context before it becomes queue-owned again.
 +  seq_ctx->next = session->sequence_requests;
 +  session->sequence_requests = seq_ctx;
- 
++
    req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
    if (!req)
-@@ -3803,6 +4285,7 @@
+     goto error;
+@@ -3803,6 +4285,7 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
  	    }
  
  	  evrtsp_request_free(req);
@@ -2893,7 +3082,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  	  sequence_continue(seq_ctx);
  	  return;
          }
-@@ -3814,7 +4297,9 @@
+@@ -3814,7 +4297,9 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
  
    DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
  
@@ -2904,16 +3093,16 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    if (ret < 0)
      goto error;
  
-@@ -3829,6 +4314,8 @@
- 
+@@ -3830,6 +4315,8 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
    if (req)
      evrtsp_request_free(req);
-+
-+  sequence_context_remove(seq_ctx);
  
++  sequence_context_remove(seq_ctx);
++
    // Sets status to FAILED, gives status to player and frees session. Must be
    // deferred, otherwise sequence_start() could invalidate the session, meaning
-@@ -3841,7 +4328,8 @@
+   // any dereference of the session by the caller after sequence_start() would
+@@ -3841,7 +4328,8 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
  
  // All errors that may occur during a sequence are called back async
  static void
@@ -2923,7 +3112,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  {
    struct airplay_seq_ctx *seq_ctx;
  
-@@ -3853,8 +4341,23 @@
+@@ -3853,10 +4341,25 @@ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session,
    seq_ctx->on_error = airplay_seq_definition[seq_type].on_error;
    seq_ctx->payload_make_arg = arg;
    seq_ctx->log_caller = log_caller;
@@ -2938,16 +3127,18 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
 +        || seq_type == AIRPLAY_SEQ_PAIR_TRANSIENT;
  
    sequence_continue(seq_ctx); // Ownership transferred
-+}
-+
+ }
+ 
 +static void
 +sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller)
 +{
 +  sequence_start_bound(seq_type, session, arg, log_caller, NULL);
- }
++}
++
  
- 
-@@ -4174,7 +4677,20 @@
+ /* ---------------- Airplay devices discovery - mDNS callback --------------- */
+ /*                              Thread: main (mdns)                           */
+@@ -4174,7 +4677,20 @@ airplay_device_stop(struct output_device *device, int callback_id)
  {
    struct airplay_session *session = device->session;
  
@@ -2969,7 +3160,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    sequence_start(AIRPLAY_SEQ_STOP, session, NULL, "device_stop");
  
-@@ -4189,7 +4705,8 @@
+@@ -4189,7 +4705,8 @@ airplay_device_flush(struct output_device *device, int callback_id)
    if (session->state != AIRPLAY_STATE_STREAMING)
      return 0; // No-op, nothing to flush
  
@@ -2979,7 +3170,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  
    sequence_start(AIRPLAY_SEQ_FLUSH, session, NULL, "flush");
  
-@@ -4201,7 +4718,7 @@
+@@ -4201,7 +4718,7 @@ airplay_device_cb_set(struct output_device *device, int callback_id)
  {
    struct airplay_session *session = device->session;
  
@@ -2988,7 +3179,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
  }
  
  static void
-@@ -4305,7 +4822,7 @@
+@@ -4305,7 +4822,7 @@ airplay_init(void)
  
    CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
  
@@ -2997,7 +3188,7 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
  
    timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
-@@ -4402,6 +4919,13 @@
+@@ -4402,6 +4919,13 @@ struct output_definition output_airplay =
    .device_cb_set = airplay_device_cb_set,
    .device_free_extra = airplay_device_free_extra,
    .device_volume_set = airplay_set_volume_one,
@@ -3012,9 +3203,10 @@ diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
    .write = airplay_write,
    .metadata_prepare = airplay_metadata_prepare,
 diff --git a/src/player.c b/src/player.c
+index f9ce616..a12086d 100644
 --- a/src/player.c
 +++ b/src/player.c
-@@ -2550,6 +2550,7 @@
+@@ -2550,6 +2550,7 @@ device_to_speaker_info(struct player_speaker_info *spk, struct output_device *de
    spk->output_type[sizeof(spk->output_type) - 1] = '\0';
    spk->relvol = device->relvol;
    spk->absvol = device->volume;
@@ -3022,7 +3214,7 @@ diff --git a/src/player.c b/src/player.c
    spk->offset_ms = device->offset_ms;
  
    spk->supported_formats = device->supported_formats;
-@@ -3086,6 +3087,77 @@
+@@ -3086,6 +3087,77 @@ streaming_deregister(void *arg, int *retval)
    return COMMAND_END;
  }
  
@@ -3100,7 +3292,7 @@ diff --git a/src/player.c b/src/player.c
  static enum command_state
  volume_set(void *arg, int *retval)
  {
-@@ -3116,7 +3188,8 @@
+@@ -3116,7 +3188,8 @@ volume_setrel_speaker(void *arg, int *retval)
        return COMMAND_END;
      }
  
@@ -3110,7 +3302,7 @@ diff --git a/src/player.c b/src/player.c
  
    *retval = outputs_device_volume_set(device, device_volume_cb);
  
-@@ -3140,7 +3213,8 @@
+@@ -3140,7 +3213,8 @@ volume_setabs_speaker(void *arg, int *retval)
        return COMMAND_END;
      }
  
@@ -3120,7 +3312,7 @@ diff --git a/src/player.c b/src/player.c
  
    *retval = outputs_device_volume_set(device, device_volume_cb);
  
-@@ -3173,7 +3247,8 @@
+@@ -3173,7 +3247,8 @@ volume_setraw_speaker(void *arg, int *retval)
        return COMMAND_END;
      }
  
@@ -3130,7 +3322,7 @@ diff --git a/src/player.c b/src/player.c
  
    *retval = outputs_device_volume_set(device, device_volume_cb);
  
-@@ -3900,9 +3975,28 @@
+@@ -3900,9 +3975,28 @@ player_raop_verification_kickoff(char **arglist)
  
  /* ---------------------------- Thread: player ------------------------------ */
  
@@ -3159,28 +3351,28 @@ diff --git a/src/player.c b/src/player.c
    struct output_device *device;
    int ret;
  
-@@ -3912,9 +4006,19 @@
+@@ -3912,10 +4006,20 @@ player(void *arg)
    if (ret < 0)
      {
        DPRINTF(E_LOG, L_PLAYER, "Error: DB init failed\n");
--
 +      player_startup_complete(startup, -1);
-       pthread_exit(NULL);
-     }
-+
++      pthread_exit(NULL);
++    }
+ 
 +  if (outputs_attention_startup() < 0)
 +    {
 +      DPRINTF(E_LOG, L_PLAYER, "Native durable custody init failed\n");
 +      db_perthread_deinit();
 +      player_startup_complete(startup, -1);
-+      pthread_exit(NULL);
-+    }
-+
-+  player_startup_complete(startup, 0);
+       pthread_exit(NULL);
+     }
  
++  player_startup_complete(startup, 0);
++
    event_base_dispatch(evbase_player);
  
-@@ -3939,6 +4043,7 @@
+   if (!player_exit)
+@@ -3939,6 +4043,7 @@ player(void *arg)
  int
  player_init(void)
  {
@@ -3188,14 +3380,12 @@ diff --git a/src/player.c b/src/player.c
    uint64_t interval;
    int ret;
  
-@@ -4016,10 +4121,29 @@
+@@ -4016,10 +4121,29 @@ player_init(void)
        goto error_outputs_deinit;
      }
  
 -  ret = pthread_create(&tid_player, NULL, player, NULL);
 -  if (ret < 0)
--    {
--      DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
 +  CHECK_ERR(L_PLAYER, mutex_init(&startup.lock));
 +  CHECK_ERR(L_PLAYER, pthread_cond_init(&startup.condition, NULL));
 +  CHECK_ERR(L_PLAYER, pthread_mutex_lock(&startup.lock));
@@ -3215,7 +3405,8 @@ diff --git a/src/player.c b/src/player.c
 +  CHECK_ERR(L_PLAYER, pthread_cond_destroy(&startup.condition));
 +  CHECK_ERR(L_PLAYER, pthread_mutex_destroy(&startup.lock));
 +  if (startup.result < 0)
-+    {
+     {
+-      DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
 +      /* The failed thread never admitted its command consumer. Join it before
 +       * the existing pre-loop cleanup; never send it a shutdown command. */
 +      CHECK_ERR(L_PLAYER, pthread_join(tid_player, NULL));
@@ -3223,6 +3414,7 @@ diff --git a/src/player.c b/src/player.c
      }
  
 diff --git a/src/player.h b/src/player.h
+index 258d8e1..2c43bda 100644
 --- a/src/player.h
 +++ b/src/player.h
 @@ -7,6 +7,7 @@
@@ -3233,7 +3425,7 @@ diff --git a/src/player.h b/src/player.h
  
  // Maximum number of previously played songs that are remembered
  #define MAX_HISTORY_COUNT 20
-@@ -36,6 +37,8 @@
+@@ -36,6 +37,8 @@ struct player_speaker_info {
    char output_type[50];
    int relvol;
    int absvol;
@@ -3242,7 +3434,7 @@ diff --git a/src/player.h b/src/player.h
    int offset_ms;
  
    enum media_format format;
-@@ -87,6 +90,23 @@
+@@ -87,6 +90,23 @@ struct player_history
    uint32_t item_id[MAX_HISTORY_COUNT];
  };
  
@@ -3268,9 +3460,10 @@ diff --git a/src/player.h b/src/player.h
  
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
 new file mode 100644
+index 0000000..45cd6d7
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,920 @@
 +/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
 + * No discovery, daemon, media input, fabricated connected/session-ready flag,
 + * receiver capability, public-volume acceptance or acoustic proof.
@@ -4168,12 +4361,18 @@ new file mode 100644
 +  return f.failed;
 +}
 +
++#include <sched.h>
++static void rss_unlock_notify_observe(void);
 +#include "player_startup_owner.inc.c"
++#include "rss_probe_transaction_owner.inc.c"
 +
-+int main(void)
++int main(int argc, char **argv)
 +{
 +  int mode;
 +  if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  if (argc == 2 && !strcmp(argv[1], "--rss-owner-red")) return rss_owner_cases(true);
++  if (argc == 2 && !strcmp(argv[1], "--rss-owner")) return rss_owner_cases(false);
++  if (rss_owner_cases(false)) return 1;
 +  actual_player_startup_cases();
 +  for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
 +    if (owner_case((enum owner_mode)mode, 0)) return 1;
@@ -4187,6 +4386,7 @@ new file mode 100644
 +}
 diff --git a/tests/evrtsp_guarded_owner_contract.c b/tests/evrtsp_guarded_owner_contract.c
 new file mode 100644
+index 0000000..d211de8
 --- /dev/null
 +++ b/tests/evrtsp_guarded_owner_contract.c
 @@ -0,0 +1,206 @@
@@ -4398,6 +4598,7 @@ new file mode 100644
 +}
 diff --git a/tests/evrtsp_owner_contract.c b/tests/evrtsp_owner_contract.c
 new file mode 100644
+index 0000000..d44510e
 --- /dev/null
 +++ b/tests/evrtsp_owner_contract.c
 @@ -0,0 +1,390 @@
@@ -4793,6 +4994,7 @@ new file mode 100644
 +}
 diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
 new file mode 100644
+index 0000000..7832a22
 --- /dev/null
 +++ b/tests/outputs_attention_owner.c
 @@ -0,0 +1,848 @@
@@ -5646,9 +5848,10 @@ new file mode 100644
 +}
 diff --git a/tests/player_startup_owner.inc.c b/tests/player_startup_owner.inc.c
 new file mode 100644
+index 0000000..7d32889
 --- /dev/null
 +++ b/tests/player_startup_owner.inc.c
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,218 @@
 +/* Included by the existing complete native owner fixture. Faults only wrap
 + * SQLite/pthread admission; player, DB, command consumers and cleanup stay real. */
 +#include <sys/wait.h>
@@ -5723,6 +5926,7 @@ new file mode 100644
 +
 +int __wrap_sqlite3_unlock_notify(sqlite3 *connection, void (*notify)(void **, int), void *arg)
 +{
++  rss_unlock_notify_observe();
 +  if (startup_active && startup_fault == START_LOCKED)
 +    {
 +      char name[32] = {0};
@@ -5865,4 +6069,395 @@ new file mode 100644
 +        }
 +    }
 +  puts("PASS six actual player admission cases plus four fresh process successors; failed-start callbacks remain inert");
++}
+diff --git a/tests/rss_probe_transaction_owner.inc.c b/tests/rss_probe_transaction_owner.inc.c
+new file mode 100644
+index 0000000..670a85d
+--- /dev/null
++++ b/tests/rss_probe_transaction_owner.inc.c
+@@ -0,0 +1,385 @@
++/* Actual RSS/library, shared-cache DB and player owners. External feed fetch and
++ * metadata probing are substituted; no real FFmpeg/network acceptance is claimed. */
++#include "../src/http.h"
++#include "../src/library/filescanner.h"
++#include <sys/socket.h>
++
++enum rss_owner_mode { RSS_FRESH, RSS_KNOWN, RSS_META, RSS_DELETE, RSS_PROBE_FAILURE, RSS_EXIT };
++static enum rss_owner_mode rss_mode;
++static pthread_mutex_t rss_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t rss_condition = PTHREAD_COND_INITIALIZER;
++static bool rss_active, rss_library_ready, rss_probe_entered, rss_probe_release;
++static bool rss_player_complete, rss_player_waiting, rss_apply_complete, rss_cleanup_complete;
++static int rss_player_result, rss_probe_calls, rss_feed_calls, rss_network_socket_calls;
++static int rss_probe_transaction, rss_commit_calls, rss_rollback_calls, rss_add_result;
++static struct media_file_info *rss_owned_metadata[4];
++static bool rss_metadata_freed[4];
++static int rss_metadata_allocations, rss_metadata_releases;
++static const char *rss_feed = "http://fixture.invalid/feed.xml";
++static const char *rss_first = "http://fixture.invalid/first.mp3";
++static const char *rss_second = "http://fixture.invalid/second.mp3";
++
++static void
++rss_wait(bool *flag)
++{
++  struct timespec deadline;
++  int ret;
++
++  assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
++  deadline.tv_sec += 4; /* Observer bound, never a production timeout. */
++  while (!*flag)
++    {
++      ret = pthread_cond_timedwait(&rss_condition, &rss_mutex, &deadline);
++      assert(ret == 0);
++    }
++}
++
++static void
++rss_unlock_notify_observe(void)
++{
++  char name[32] = {0};
++
++  if (!rss_active)
++    return;
++  assert(pthread_getname_np(pthread_self(), name, sizeof(name)) == 0);
++  if (strcmp(name, "player"))
++    return;
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_player_waiting = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++}
++
++int
++__wrap_socket(int domain, int type, int protocol)
++{
++  extern int __real_socket(int, int, int);
++
++  if (rss_active && (domain == AF_INET || domain == AF_INET6))
++    {
++      rss_network_socket_calls++;
++      errno = EPERM;
++      return -1;
++    }
++  return __real_socket(domain, type, protocol);
++}
++
++int
++__wrap_http_client_request(struct http_client_ctx *ctx, struct http_client_session *session)
++{
++  static const char feed[] =
++    "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Owner feed</title>"
++    "<item><title>First episode</title><pubDate>Tue, 13 Oct 2026 12:00:00 GMT</pubDate>"
++    "<enclosure url=\"http://fixture.invalid/first.mp3\" type=\"audio/mpeg\"/></item>"
++    "<item><title>Second episode</title><pubDate>Tue, 13 Oct 2026 11:00:00 GMT</pubDate>"
++    "<enclosure url=\"http://fixture.invalid/second.mp3\" type=\"audio/mpeg\"/></item>"
++    "</channel></rss>";
++
++  extern int __real_http_client_request(struct http_client_ctx *, struct http_client_session *);
++
++  if (!rss_active)
++    return __real_http_client_request(ctx, session);
++  assert(rss_active && !strcmp(ctx->url, rss_feed) && ctx->input_body);
++  rss_feed_calls++;
++  ctx->response_code = HTTP_OK;
++  assert(evbuffer_add(ctx->input_body, feed, strlen(feed)) == 0);
++  return 0;
++}
++
++int
++__wrap_scan_metadata_ffmpeg(struct media_file_info *mfi, const char *path)
++{
++  extern int __real_scan_metadata_ffmpeg(struct media_file_info *, const char *);
++  bool pause;
++
++  if (!rss_active)
++    return __real_scan_metadata_ffmpeg(mfi, path);
++  assert(rss_active && (!strcmp(path, rss_first) || !strcmp(path, rss_second)));
++  rss_probe_calls++;
++  assert(rss_metadata_allocations < (int)ARRAY_SIZE(rss_owned_metadata));
++  rss_owned_metadata[rss_metadata_allocations++] = mfi;
++  pause = rss_mode != RSS_KNOWN || !strcmp(path, rss_second);
++  if (pause && !rss_probe_entered)
++    {
++      assert(pthread_mutex_lock(&rss_mutex) == 0);
++      assert(startup_connection);
++      rss_probe_transaction = sqlite3_txn_state(startup_connection, NULL);
++      rss_probe_entered = true;
++      fprintf(stderr, "RSS substituted metadata edge: txn_state=%d path=%s\n", rss_probe_transaction, path);
++      assert(pthread_cond_broadcast(&rss_condition) == 0);
++      rss_wait(&rss_probe_release);
++      assert(pthread_mutex_unlock(&rss_mutex) == 0);
++    }
++  if (rss_mode == RSS_PROBE_FAILURE)
++    return -1; /* Real scan_metadata_stream retains its existing MP3 fallback. */
++  mfi->type = strdup("mp3");
++  mfi->codectype = strdup("mpeg");
++  mfi->description = strdup("Substituted metadata edge");
++  mfi->song_length = 1234;
++  return 0;
++}
++
++void
++__wrap_free_mfi(struct media_file_info *mfi, int content_only)
++{
++  extern void __real_free_mfi(struct media_file_info *, int);
++  int i;
++
++  if (rss_active)
++    for (i = 0; i < rss_metadata_allocations; i++)
++      if (rss_owned_metadata[i] == mfi && !rss_metadata_freed[i])
++        {
++          assert(content_only == 1);
++          rss_metadata_freed[i] = true;
++          rss_metadata_releases++;
++          break;
++        }
++  __real_free_mfi(mfi, content_only);
++}
++
++void
++__wrap_db_transaction_end(void)
++{
++  extern void __real_db_transaction_end(void);
++
++  __real_db_transaction_end();
++  if (!rss_active || !rss_probe_entered || rss_apply_complete)
++    return;
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_commit_calls++;
++  rss_apply_complete = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++}
++
++void
++__wrap_db_transaction_rollback(void)
++{
++  extern void __real_db_transaction_rollback(void);
++
++  __real_db_transaction_rollback();
++  if (!rss_active || !rss_probe_entered || rss_apply_complete)
++    return;
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_rollback_calls++;
++  rss_apply_complete = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++}
++
++static void
++rss_library_ready_callback(evutil_socket_t fd, short flags, void *arg)
++{
++  (void)fd; (void)flags; (void)arg;
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_library_ready = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++}
++
++static void *
++rss_start_player(void *arg)
++{
++  int result;
++
++  (void)arg;
++  result = player_init();
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_player_result = result;
++  rss_player_complete = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++  return NULL;
++}
++
++static void *
++rss_add_feed(void *arg)
++{
++  (void)arg;
++  rss_add_result = library_item_add(rss_feed);
++  return NULL;
++}
++
++static void *
++rss_stop_library(void *arg)
++{
++  (void)arg;
++  library_deinit();
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_cleanup_complete = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++  return NULL;
++}
++
++static void
++rss_seed_known(void)
++{
++  const char *sql =
++    "INSERT INTO files (id,path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,"
++    "title,time_added,scan_kind,data_kind,media_kind,directory_id,virtual_path,db_timestamp) "
++    "VALUES (777,'http://fixture.invalid/first.mp3','first.mp3','Old feed','Old author',0,0,0,"
++    "'Old title',123,3,1,4,3,'/http://fixture.invalid/first.mp3',2147483000)";
++
++  assert(sqlite3_exec(startup_connection, sql, NULL, NULL, NULL) == SQLITE_OK);
++}
++
++static void
++rss_assert_items(uint32_t id, bool original)
++{
++  sqlite3_stmt *stmt = NULL;
++  char *query = sqlite3_mprintf("SELECT filepath FROM playlistitems WHERE playlistid=%u ORDER BY id", id);
++
++  assert(sqlite3_prepare_v2(startup_connection, query, -1, &stmt, NULL) == SQLITE_OK);
++  sqlite3_free(query);
++  assert(sqlite3_step(stmt) == SQLITE_ROW);
++  assert(!strcmp((const char *)sqlite3_column_text(stmt, 0), original ? "original-sentinel" : rss_first));
++  if (!original)
++    {
++      assert(sqlite3_step(stmt) == SQLITE_ROW);
++      assert(!strcmp((const char *)sqlite3_column_text(stmt, 0), rss_second));
++    }
++  assert(sqlite3_step(stmt) == SQLITE_DONE);
++  assert(sqlite3_finalize(stmt) == SQLITE_OK);
++}
++
++static int
++rss_writer_case(enum rss_owner_mode mode)
++{
++  extern struct event_base *evbase_lib;
++  const struct timeval immediate = {0, 0};
++  struct owner_fixture f = { .refused_fd = -1 };
++  struct playlist_info pli = { .title = "Owner feed", .type = PL_RSS, .path = (char *)rss_feed,
++    .virtual_path = "/rss-owner", .directory_id = DIR_HTTP, .scan_kind = SCAN_KIND_RSS, .query_limit = 2 };
++  struct player_status status;
++  struct media_file_info *known;
++  char path[] = "/tmp/pc29-rss-owner-XXXXXX", cache[] = "/tmp/pc29-rss-cache-XXXXXX";
++  pthread_t player_actor, cleanup_actor, add_actor;
++  int fd = mkstemp(path), id, red, ret;
++  char *sql;
++
++  assert(fd >= 0); close(fd);
++  assert(mkdtemp(cache));
++  alarm(20); /* Last-resort observer only; successful runs join every owner. */
++  assert(evthread_use_pthreads() == 0);
++  evbase_main = event_base_new(); assert(evbase_main);
++  current_fixture = &f;
++  cfg = cfg_init(toplvl_cfg, CFGF_NONE); assert(cfg);
++  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", path);
++  cfg_setstr(cfg_getsec(cfg, "general"), "cache_dir", cache);
++  cfg_setstr(cfg_getsec(cfg, "audio"), "type", "disabled");
++  startup_active = true; rss_active = true; rss_mode = mode;
++  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  assert(worker_init() == 0 && cache_init() == 0 && library_init() == 0);
++  assert(event_base_once(evbase_lib, -1, EV_TIMEOUT, rss_library_ready_callback, NULL, &immediate) == 0);
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_wait(&rss_library_ready);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++  if (mode == RSS_KNOWN || mode == RSS_META || mode == RSS_DELETE)
++    rss_seed_known();
++  pli.title = strdup(pli.title); pli.path = strdup(pli.path); pli.virtual_path = strdup(pli.virtual_path);
++  id = db_pl_add(&pli); assert(id > 0);
++  free_pli(&pli, 1);
++  sql = sqlite3_mprintf("INSERT INTO playlistitems(playlistid,filepath) VALUES(%d,'original-sentinel')", id);
++  assert(sqlite3_exec(startup_connection, sql, NULL, NULL, NULL) == SQLITE_OK);
++  sqlite3_free(sql);
++  if (mode == RSS_DELETE)
++    assert(pthread_create(&add_actor, NULL, rss_add_feed, NULL) == 0);
++  else if (mode == RSS_META)
++    library_metarescan(SCAN_KIND_RSS);
++  else
++    library_rescan(SCAN_KIND_RSS);
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  rss_wait(&rss_probe_entered);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++  if (mode == RSS_DELETE)
++    {
++      assert(rss_probe_transaction != SQLITE_TXN_WRITE);
++      assert(sqlite3_exec(startup_connection, "DELETE FROM files WHERE id=777", NULL, NULL, NULL) == SQLITE_OK);
++    }
++  startup_spawning = true;
++  assert(pthread_create(&player_actor, NULL, rss_start_player, NULL) == 0);
++  assert(pthread_mutex_lock(&rss_mutex) == 0);
++  {
++    struct timespec deadline;
++    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0); deadline.tv_sec += 4;
++    while (!rss_player_complete && !rss_player_waiting)
++      assert(pthread_cond_timedwait(&rss_condition, &rss_mutex, &deadline) == 0);
++  }
++  red = rss_probe_transaction == SQLITE_TXN_WRITE && rss_player_waiting && !rss_player_complete;
++  fprintf(stderr, "%s actual RSS writer/custody: mode=%d txn=%d waiting=%d admitted=%d\n",
++    red ? "RED" : "OBSERVED", mode, rss_probe_transaction, rss_player_waiting, rss_player_complete);
++  if (!red)
++    assert(rss_probe_transaction != SQLITE_TXN_WRITE && rss_player_complete && rss_player_result == 0);
++  if (mode == RSS_EXIT)
++    {
++      assert(pthread_create(&cleanup_actor, NULL, rss_stop_library, NULL) == 0);
++      /* library_deinit publishes scan_exit before waiting on its real owner. */
++      while (!library_is_exiting())
++        sched_yield();
++    }
++  rss_probe_release = true;
++  assert(pthread_cond_broadcast(&rss_condition) == 0);
++  if (mode != RSS_EXIT)
++    rss_wait(&rss_apply_complete);
++  assert(pthread_mutex_unlock(&rss_mutex) == 0);
++  assert(pthread_join(player_actor, NULL) == 0);
++  startup_spawning = false;
++  if (mode == RSS_DELETE)
++    assert(pthread_join(add_actor, NULL) == 0 && rss_add_result < 0);
++  assert(rss_player_result == 0 && startup_creates == 1);
++  assert(player_get_status(&status) == 0);
++  player_deinit();
++  assert(startup_player_joins == 1);
++  if (mode == RSS_EXIT)
++    {
++      assert(pthread_join(cleanup_actor, NULL) == 0 && rss_cleanup_complete);
++    }
++  else
++    library_deinit();
++  rss_assert_items((uint32_t)id, mode == RSS_DELETE || mode == RSS_EXIT);
++  assert(rss_probe_calls == (mode == RSS_KNOWN || mode == RSS_DELETE || mode == RSS_EXIT ? 1 : 2));
++  if (mode == RSS_KNOWN || mode == RSS_META)
++    {
++      known = db_file_fetch_byid(777); assert(known && known->id == 777 && known->time_added == 123);
++      assert(!strcmp(known->title, mode == RSS_KNOWN ? "Old title" : "First episode"));
++      free_mfi(known, 0);
++    }
++  assert(rss_feed_calls == 1 && rss_network_socket_calls == 0);
++  assert(rss_metadata_allocations == rss_probe_calls && rss_metadata_releases == rss_probe_calls);
++  if (mode == RSS_DELETE || mode == RSS_EXIT)
++    assert(rss_commit_calls == 0 && (rss_rollback_calls == (mode == RSS_DELETE ? 1 : 0)));
++  else
++    assert(rss_commit_calls == 1 && rss_rollback_calls == 0);
++  rss_active = false; startup_active = false;
++  cache_deinit(); worker_deinit(); db_perthread_deinit(); db_deinit();
++  event_base_free(evbase_main); cfg_free(cfg); cfg = NULL;
++  assert(unlink(path) == 0);
++  alarm(0);
++  ret = red ? 1 : 0;
++  fprintf(stderr, "%s RSS mode=%d cleanup joined; substituted external edges only\n", red ? "RED" : "PASS", mode);
++  return ret;
++}
++
++static int
++rss_owner_cases(bool baseline)
++{
++  int mode, status;
++  pid_t child;
++
++  for (mode = RSS_FRESH; mode <= (baseline ? RSS_FRESH : RSS_EXIT); mode++)
++    {
++      child = fork(); assert(child >= 0);
++      if (!child)
++        _exit(rss_writer_case((enum rss_owner_mode)mode));
++      assert(waitpid(child, &status, 0) == child);
++      fprintf(stderr, "RSS owned child=%ld terminal status=%d\n", (long)child, status);
++      assert(WIFEXITED(status));
++      if (WEXITSTATUS(status))
++        return WEXITSTATUS(status);
++      /* Each subsequent child forks from the untouched parent, retaining no
++       * old XML, staged metadata, DB connection, event base or thread. */
++      assert(!rss_active && !startup_active && !rss_probe_entered);
++    }
++  return 0;
 +}
