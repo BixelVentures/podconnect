@@ -6,6 +6,7 @@ token handling, talks to the Web API with the shared aiohttp client session.
 
 from __future__ import annotations
 
+import json as json_module
 from typing import Any
 
 from aiohttp import ClientSession
@@ -20,6 +21,11 @@ from .const import SPOTIFY_API
 
 class SpotifyApiError(Exception):
     """Raised when a Spotify Web API request fails."""
+
+    def __init__(self, message: str, *, status: int | None = None, retry_after: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 class SpotifyApi:
@@ -37,6 +43,7 @@ class SpotifyApi:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        max_bytes: int | None = None,
     ) -> Any:
         """Make an authenticated request; returns parsed JSON or None."""
         await self._session.async_ensure_token_valid()
@@ -51,6 +58,21 @@ class SpotifyApi:
             params=params or None,
             json=json,
         ) as resp:
+            if max_bytes is not None:
+                if resp.status != 200:
+                    retry_after = None
+                    if resp.status == 429:
+                        header = resp.headers.get("Retry-After", "")
+                        retry_after = max(10, min(3600, int(header))) if header.isascii() and header.isdigit() and len(header) <= 6 else 60
+                    raise SpotifyApiError("Spotify queue read failed", status=resp.status, retry_after=retry_after)
+                if resp.content_type != "application/json":
+                    raise SpotifyApiError("Invalid queue content type")
+                raw = bytearray()
+                async for chunk in resp.content.iter_chunked(8192):
+                    raw.extend(chunk)
+                    if len(raw) > max_bytes:
+                        raise SpotifyApiError("Queue response exceeds budget")
+                return json_module.loads(raw)
             if resp.status == 204:
                 return None
             if resp.status == 429:
@@ -71,6 +93,10 @@ class SpotifyApi:
     async def playback_state(self) -> dict[str, Any] | None:
         """GET /me/player (None when nothing is playing)."""
         return await self._request("GET", "/me/player")
+
+    async def queue(self) -> dict[str, Any]:
+        """Bounded account-wide queue read; credentials never leave this owner."""
+        return await self._request("GET", "/me/player/queue", max_bytes=262144)
 
     async def devices(self) -> list[dict[str, Any]]:
         """GET /me/player/devices."""

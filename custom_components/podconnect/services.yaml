@@ -96,3 +96,33 @@ move_playback:
       required: true
       selector:
         text:
+
+get_playback_snapshot:
+  name: Get observed playback
+  description: Account-scoped successful Spotify poll, with owner generation and freshness. Never optimistic HA entity state or audible proof. Does not request a new poll.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+get_queue:
+  name: Get observed queue
+  description: Read the selected account's Spotify queue. Preserves source order and duplicates; each occurrence ID belongs to this observation only. Not an atomic speaker/playback snapshot.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    limit:
+      name: Maximum items
+      required: false
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box

@@ -64,6 +64,9 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
   response-returning services `podconnect.top_tracks` / `recently_played` / `liked` let an assistant
   **fetch** your listening history as data (`{tracks:[{name,artist,uri}]}`) and choose a track —
   built on Control's own auth, callable over REST.
+- **Read-only observations:** `podconnect.get_playback_snapshot` exposes the last successful
+  provider poll, and `podconnect.get_queue` reads a bounded account queue through existing auth.
+  Both require an exact account entry. See [`docs/OBSERVATIONS.md`](docs/OBSERVATIONS.md).
 - State via the Spotify Web API, polled ~10s. Installed via **HACS** (custom repository).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what changed.

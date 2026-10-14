@@ -1,5 +1,6 @@
 """Execute shipped coordination methods; unit boundaries, not a running HA instance."""
 import ast
+import time
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,7 +95,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
     async def test_coordinator_sequence_is_allocated_before_fetch(self):
         tree = ast.parse((ROOT / 'custom_components/podconnect/coordinator.py').read_text())
         method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == '_async_update_data')
-        ns = {'SpotifyApiError':SpotifyApiError, 'UpdateFailed':RuntimeError, 'Any':object, 'dt_util':SimpleNamespace(utcnow=lambda:0)}
+        ns = {'SpotifyApiError':SpotifyApiError, 'UpdateFailed':RuntimeError, 'Any':object, 'dt_util':SimpleNamespace(utcnow=lambda:0), 'time':time}
         exec(compile(ast.Module(body=[method], type_ignores=[]), '<shipped coordinator>', 'exec'), ns)
         gate = asyncio.Event()
         async def playback():
