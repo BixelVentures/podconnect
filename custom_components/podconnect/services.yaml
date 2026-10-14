@@ -126,3 +126,75 @@ get_queue:
           min: 1
           max: 20
           mode: box
+
+get_playback_controls:
+  name: Get direct playback controls
+  description: Exact account and direct Spotify device only. Observed capabilities and volume, never optimistic entity state, alias selection or physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+
+control_playback:
+  name: Control direct Spotify playback
+  description: One bounded command on the exact observed account/device/owner/poll. Unknown outcomes must not be retried. No aliases, default account, transfer or physical confirmation.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    command_sequence:
+      name: Command sequence
+      description: Exact next sequence from get_playback_controls, within this owner epoch.
+      required: true
+      example: 1
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      description: Exact owner_epoch:command_sequence identity, never a browser UUID.
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [pause, resume, next, previous, volume]
+    args:
+      required: true
+      selector:
+        object:

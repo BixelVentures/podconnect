@@ -1,3 +1,9 @@
+## Control 0.10.9 - scoped direct playback commands
+
+- Add exact-account, exact Spotify device playback controls through the existing provider owner, with current capabilities, fresh observation and guarded OAuth/send admission.
+- Preserve bounded command receipts and monotonic replay protection across response eviction. Uncertain sends are not retried; provider acceptance remains separate from observed or audible playback.
+- No configured-speaker alias controls, automatic transfer, new credentials or Speakers update. PodVoice pairing and administrator scope remain separate requirements.
+
 ## Control 0.10.8 - observed playback and account queue
 
 - Expose read-only, exact-account playback and queue services for PodVoice/PodView. Playback comes from a successful provider poll with explicit freshness, not optimistic entity state.
