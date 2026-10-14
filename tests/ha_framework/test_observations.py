@@ -4,6 +4,7 @@ import asyncio
 import copy
 import importlib
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web
 from homeassistant.exceptions import HomeAssistantError
@@ -15,7 +16,15 @@ observations = importlib.import_module('custom_components.podconnect.observation
 
 def track(uri='spotify:track:duplicate'):
     return {'type': 'track', 'uri': uri, 'name': 'Song', 'artists': [{'name': 'Artist'}],
-            'duration_ms': 123000, 'access_token': 'NEVER_PUBLIC'}
+            'duration_ms': 123000, 'access_token': 'NEVER_PUBLIC',
+            'album': {'images': [{'url': 'https://i.scdn.co/image/ab67616d0000b2730123456789abcdef',
+                                  'height': 640, 'width': 640, 'access_token': 'NEVER_PUBLIC'}]}}
+
+
+def search_track(index):
+    value = track(f"spotify:track:{index:022d}")
+    value['type'] = 'track'
+    return value
 
 
 class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
@@ -31,11 +40,25 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.queue_held = False
         self.queue_calls = 0
         self.playback_override = None
+        self.search_payload = {'tracks': {'items': [search_track(index) for index in range(4)], 'total': 12}}
+        self.search_queries = []
+        self.search_entered = asyncio.Event()
+        self.search_release = asyncio.Event()
+        self.search_held = False
         await fixture.TargetFrameworkTests.asyncSetUp(self)
         self.holds.append(self.queue_release)
+        self.holds.append(self.search_release)
         self.calls.clear()
 
     async def _backend(self, request):
+        if request.path == '/spotify/search':
+            self.assertEqual(request.method, 'GET')
+            self.assertEqual(request.headers['Authorization'], 'Bearer inert-fixture-only')
+            self.search_queries.append(dict(request.query))
+            self.search_entered.set()
+            if self.search_held:
+                await self.search_release.wait()
+            return web.json_response(self.search_payload)
         if request.path == '/spotify/me/player/queue':
             self.assertEqual(request.method, 'GET')
             self.assertEqual(request.headers['Authorization'], 'Bearer inert-fixture-only')
@@ -55,6 +78,119 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
     async def service(self, name, account='account-alpha', **kwargs):
         return await self.hass.services.async_call('podconnect', name,
             {'config_entry_id': account, **kwargs}, blocking=True, return_response=True)
+
+    async def test_library_reads_exact_account_and_preserves_single_account_omission(self):
+        alpha, beta = self.entries
+        alpha_read = AsyncMock(return_value=[track('spotify:track:alpha')])
+        beta_read = AsyncMock(return_value=[track('spotify:track:beta')])
+        with patch.object(alpha.runtime_data.api, 'top_tracks', alpha_read), \
+             patch.object(beta.runtime_data.api, 'top_tracks', beta_read):
+            selected = await self.hass.services.async_call('podconnect', 'top_tracks',
+                {'config_entry_id':'account-beta'}, blocking=True, return_response=True)
+            self.assertEqual(selected['config_entry_id'], 'account-beta')
+            self.assertEqual(selected['tracks'][0]['uri'], 'spotify:track:beta')
+            self.assertEqual(selected['tracks'][0]['artwork'], {
+                'kind':'album_cover', 'provider':'spotify',
+                'url':'https://i.scdn.co/image/ab67616d0000b2730123456789abcdef'})
+            beta_read.assert_awaited_once()
+            alpha_read.assert_not_awaited()
+            with self.assertRaises(HomeAssistantError):
+                await self.hass.services.async_call('podconnect', 'top_tracks', {},
+                    blocking=True, return_response=True)
+
+            self.assertTrue(await self.hass.config_entries.async_unload(beta.entry_id))
+            legacy = await self.hass.services.async_call('podconnect', 'top_tracks', {},
+                blocking=True, return_response=True)
+            self.assertEqual(legacy['config_entry_id'], 'account-alpha')
+            self.assertEqual(legacy['tracks'][0]['uri'], 'spotify:track:alpha')
+            alpha_read.assert_awaited_once()
+
+    async def test_library_read_replacement_during_await_cannot_publish(self):
+        alpha = self.entries[0]
+        original = alpha.runtime_data
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def held_read():
+            entered.set()
+            await release.wait()
+            return [track('spotify:track:stale')]
+
+        with patch.object(original.api, 'top_tracks', held_read):
+            call = self._task(self.hass.services.async_call('podconnect', 'top_tracks',
+                {'config_entry_id':alpha.entry_id}, blocking=True, return_response=True))
+            await asyncio.wait_for(entered.wait(), 2)
+            alpha.runtime_data = copy.copy(original)
+            release.set()
+            with self.assertRaises(HomeAssistantError):
+                await call
+            alpha.runtime_data = original
+
+    async def test_search_uses_exact_account_actual_query_and_closed_sample(self):
+        alpha, beta = self.entries
+        with patch.object(alpha.runtime_data.api, 'search', side_effect=AssertionError('wrong account')):
+            result = await self.hass.services.async_call('podconnect', 'search_tracks',
+                {'config_entry_id':beta.entry_id,'query':'  jazz guitar  ','limit':2},
+                blocking=True, return_response=True)
+        self.assertEqual(result['config_entry_id'], beta.entry_id)
+        self.assertEqual(result['query'], 'jazz guitar')
+        self.assertEqual(result['source'], 'spotify_web_api')
+        self.assertEqual(result['coverage'], 'spotify_search_sample')
+        self.assertEqual((result['source_sample_count'],result['returned_count'],result['source_has_more']), (2,2,True))
+        self.assertEqual(result['tracks'][0]['uri'], 'spotify:track:0000000000000000000000')
+        self.assertEqual(result['tracks'][0]['artwork']['provider'], 'spotify')
+        self.assertNotIn('NEVER_PUBLIC', str(result))
+        self.assertEqual(self.search_queries[-1], {'q':'jazz guitar','type':'track','limit':'2'})
+        self.assertEqual(self._writes(), [])
+
+    async def test_search_schema_bounds_owner_and_query_rejections_do_not_call_spotify(self):
+        for body in (
+            {'query':'song'},
+            {'config_entry_id':'account-alpha','query':' '},
+            {'config_entry_id':'account-alpha','query':'x'*161},
+            {'config_entry_id':'account-alpha','query':7},
+            {'config_entry_id':'account-alpha','query':'song','limit':True},
+            {'config_entry_id':'account-alpha','query':'song','limit':0},
+            {'config_entry_id':'account-alpha','query':'song','limit':21},
+            {'config_entry_id':'account-alpha','query':'song','limit':'3'},
+        ):
+            response = await self.client.post('/api/services/podconnect/search_tracks?return_response', json=body)
+            self.assertEqual(response.status, 400, body)
+        with self.assertRaises(HomeAssistantError):
+            await self.service('search_tracks', 'unknown', query='song')
+        self.assertEqual(self.search_queries, [])
+        self.assertEqual(self._writes(), [])
+
+    async def test_search_result_bounds_wrong_types_and_actual_empty_sample(self):
+        self.search_payload = {'tracks':{'items':[],'total':0}}
+        empty = await self.service('search_tracks', query='no match')
+        self.assertEqual((empty['source_sample_count'],empty['returned_count'],empty['tracks']), (0,0,[]))
+        self.search_payload = {'tracks':{'items':[{'type':'episode','uri':'spotify:episode:wrong'}], 'total':1}}
+        with self.assertRaises(HomeAssistantError):
+            await self.service('search_tracks', query='mismatch')
+        self.search_payload = {'tracks':{'items':[search_track(index) for index in range(30)], 'total':100}}
+        bounded = await self.service('search_tracks', limit=20, query='large sample')
+        self.assertEqual((bounded['source_sample_count'],bounded['returned_count'],len(bounded['tracks'])), (20,20,20))
+        self.assertTrue(bounded['source_has_more'])
+        self.assertLess(len(str(bounded).encode()), 65536)
+        self.search_payload = {'tracks':{'items':[{'type':'track','uri':'spotify:track:'+'1'*22,
+            'name':'x'*257,'artists':[{'name':'artist'}]}], 'total':1}}
+        with self.assertRaises(HomeAssistantError):
+            await self.service('search_tracks', query='oversized result')
+        self.assertNotIn('NEVER_PUBLIC', str(bounded))
+        self.assertEqual(self._writes(), [])
+
+    async def test_search_owner_replacement_during_provider_wait_cannot_publish(self):
+        entry = self.entries[0]
+        original = entry.runtime_data
+        self.search_held = True
+        call = self._task(self.service('search_tracks', query='held search'))
+        await asyncio.wait_for(self.search_entered.wait(), 2)
+        entry.runtime_data = copy.copy(original)
+        self.search_release.set()
+        with self.assertRaises(HomeAssistantError):
+            await call
+        entry.runtime_data = original
+        self.assertEqual(self._writes(), [])
 
     async def test_playback_uses_successful_poll_not_optimistic_entity_or_viewer_poll(self):
         data = self.entries[0].runtime_data
@@ -100,6 +236,8 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(fresh['poll_sequence'], original['poll_sequence'])
         self.assertEqual(fresh['playback']['target']['target_id'], 'spotify-new')
         self.assertEqual(fresh['playback']['provider_changed_at_ms'], 1234)
+        self.assertEqual(fresh['playback']['item']['artwork']['url'],
+            'https://i.scdn.co/image/ab67616d0000b2730123456789abcdef')
         self.assertNotIn('NEVER_PUBLIC', str(fresh))
         self.assertEqual(self._writes(), [])
 
@@ -113,6 +251,8 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue_calls, 1)
         self.assertEqual(first['snapshot_id'], second['snapshot_id'])
         self.assertEqual(len(second['items']), 2)
+        self.assertEqual(second['items'][0]['artwork']['kind'], 'album_cover')
+        self.assertEqual(second['currently_playing']['artwork']['provider'], 'spotify')
         self.assertEqual(second['items'][0]['uri'], second['items'][1]['uri'])
         self.assertNotEqual(second['items'][0]['option_id'], second['items'][1]['option_id'])
         self.assertEqual(second['relation_to_playback'], 'not_atomic')
