@@ -38,7 +38,7 @@ observation older than 15 seconds returns `stale`. It does not refresh on demand
   "playback": {
     "state": "playing",
     "target": {"kind":"spotify_device","target_id":"provider-id","name":"Kitchen"},
-    "item": {"type":"track","uri":"spotify:track:example","name":"Song","artists":["Artist"],"duration_ms":123000},
+    "item": {"type":"track","uri":"spotify:track:example","name":"Song","artists":["Artist"],"duration_ms":123000,"artwork":{"kind":"album_cover","provider":"spotify","url":"https://i.scdn.co/image/ab67616d0000b2730123456789abcdef"}},
     "progress_ms": 1000,
     "provider_changed_at_ms": 1791979200000,
     "shuffle": false,
@@ -52,9 +52,13 @@ observation older than 15 seconds returns `stale`. It does not refresh on demand
 `playback` contains only `state`, null `target` and null `item`. With an active
 response, missing device ID produces null `target`; item, progress, provider
 change time, shuffle and repeat can be null. Repeat is `off`, `track` or `context`.
-Track and episode items have the same closed shape; episode `artists` contains
-the show name when provided. Unsupported or malformed items return
-`malformed_response` instead of optimistic data.
+Track and episode items have the same closed base shape; episode `artists`
+contains the show name when provided. A track may include optional `artwork`
+when Spotify returned a valid album image: `{kind:"album_cover",provider:"spotify",url:"https://i.scdn.co/image/<id>"}`.
+The URL is limited to the exact HTTPS Spotify image host and path; query strings,
+fragments, credentials, other hosts and malformed values are omitted. Episode art
+is not inferred. Unsupported or malformed items return `malformed_response`
+instead of optimistic data.
 
 `owner_epoch` changes whenever the account coordinator is recreated. A successful
 poll's sequence can skip numbers after failed attempts; compare sequences only
@@ -80,7 +84,7 @@ Request: `{"config_entry_id":"account-entry-id","limit":20}`. Limit defaults to
   "relation_to_playback": "not_atomic",
   "currently_playing": null,
   "items": [
-    {"option_id":"opaque-owner-incarnation:queue:1:0","type":"track","uri":"spotify:track:example","name":"Song","artists":["Artist"],"duration_ms":123000}
+    {"option_id":"opaque-owner-incarnation:queue:1:0","type":"track","uri":"spotify:track:example","name":"Song","artists":["Artist"],"duration_ms":123000,"artwork":{"kind":"album_cover","provider":"spotify","url":"https://i.scdn.co/image/ab67616d0000b2730123456789abcdef"}}
   ],
   "returned_count": 1,
   "truncated": false
@@ -114,6 +118,33 @@ original `observed_at`; consumers must not replace it with retrieval time.
 Provider contracts:
 [playback state](https://developer.spotify.com/documentation/web-api/reference/get-information-about-the-users-current-playback),
 [queue](https://developer.spotify.com/documentation/web-api/reference/get-queue).
+
+## Library reads: `top_tracks`, `recently_played`, `liked`
+
+These response-only services accept an optional `config_entry_id`. Supplying it
+binds the read to that exact loaded PodConnect account. For backwards
+compatibility, omission is accepted when exactly one active PodConnect account
+exists; with zero or multiple active accounts it fails and asks the caller to
+select one. The owner identity is checked again after the Spotify request so an
+unloaded or replaced account cannot publish a late result. The response echoes
+the actual selected `config_entry_id`. Returned tracks have the closed
+`{name,artist,uri}` projection and may add the same validated optional
+`artwork` object used in playback and queue. No provider image metadata or
+credential fields are forwarded.
+
+## `search_tracks`
+
+`search_tracks` is a separate read-only Spotify catalog query. It requires an
+exact `config_entry_id`, a non-empty trimmed query of at most 160 characters,
+and an exact integer `limit` from 1 through 20 (default 3; booleans and numeric
+strings are rejected). It calls the existing Spotify Web API search with the
+`track` type only; it does not use media-player search/play helpers. Its closed
+response echoes the selected account and normalized query, identifies
+`source: "spotify_web_api"` and `coverage: "spotify_search_sample"`, and includes
+`source_sample_count`, `returned_count`, `source_has_more`, and at most `limit`
+tracks. A track contains only `name`, `artist`, `uri`, and optional validated
+Spotify artwork. The response is limited to 64 KiB. These are search candidates,
+not a complete catalog, recommendation, or permission to play.
 
 ## Verification and release boundary
 

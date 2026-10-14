@@ -1,3 +1,9 @@
+## Control 0.10.10 - bounded PodView Spotify reads
+
+- Add optional validated Spotify artwork to playback, queue and library track reads, while keeping account ownership exact and preserving one-account compatibility for library reads.
+- Add the read-only `search_tracks` service for bounded Spotify track-catalogue results, bound to an exact configured account and with validated optional artwork.
+- No playback command is added by search. Independent source review and official CI remain release gates; no release or installation is included in this candidate.
+
 ## Control 0.10.9 - scoped direct playback commands
 
 - Add exact-account, exact Spotify device playback controls through the existing provider owner, with current capabilities, fresh observation and guarded OAuth/send admission.

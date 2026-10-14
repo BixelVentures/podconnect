@@ -30,18 +30,75 @@ play_from_library:
 top_tracks:
   name: Get top tracks
   description: >-
-    Returns the user's Spotify top tracks as {tracks:[{name,artist,uri}]} (response data). A
-    listening-history "data tool" an AI assist can fetch, then play a chosen URI. Account-wide.
+    Returns the selected account's Spotify top tracks as response data, including the selected
+    config_entry_id. Each track has name, artist, uri and optional validated Spotify artwork. Omit
+    the account only when exactly one PodConnect account is active.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: false
+      selector:
+        config_entry:
+          integration: podconnect
 
 recently_played:
   name: Get recently played
   description: >-
-    Returns the user's recently played tracks as {tracks:[{name,artist,uri}]} (response data).
+    Returns the selected account's recently played tracks as response data, including the selected
+    config_entry_id. Each track has name, artist, uri and optional validated Spotify artwork. Omit
+    the account only when exactly one PodConnect account is active.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: false
+      selector:
+        config_entry:
+          integration: podconnect
 
 liked:
   name: Get liked songs
   description: >-
-    Returns the user's Liked Songs as {tracks:[{name,artist,uri}]} (response data).
+    Returns the selected account's Liked Songs as response data, including the selected
+    config_entry_id. Each track has name, artist, uri and optional validated Spotify artwork. Omit
+    the account only when exactly one PodConnect account is active.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: false
+      selector:
+        config_entry:
+          integration: podconnect
+
+search_tracks:
+  name: Search Spotify tracks
+  description: >-
+    Read-only search of Spotify's actual track results for a non-empty query. Returns at most 20
+    source rows (default 3) with account/source/sample provenance and optional validated artwork.
+    Search results do not grant playback authority.
+  fields:
+    config_entry_id:
+      name: Account entry
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    query:
+      name: Search query
+      description: A query for Spotify's track search endpoint, up to 160 characters.
+      required: true
+      example: "jazz guitar"
+      selector:
+        text:
+    limit:
+      name: Maximum results
+      description: An exact integer from 1 to 20; defaults to 3.
+      required: false
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
 
 get_targets:
   name: Get playback targets

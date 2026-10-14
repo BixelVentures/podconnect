@@ -15,6 +15,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
 from .api import SpotifyApiError
+from .artwork import spotify_album_artwork
 from .const import DOMAIN
 
 PLAYBACK_MAX_AGE_S = 15.0
@@ -60,13 +61,17 @@ def _item(value):
     else:
         show = value.get("show")
         labels = [_text(show["name"])] if isinstance(show, dict) and show.get("name") else []
-    return {
+    projected = {
         "type": kind,
         "uri": uri,
         "name": _text(value.get("name")),
         "artists": labels,
         "duration_ms": _number(value.get("duration_ms")),
     }
+    artwork = spotify_album_artwork(value) if kind == "track" else None
+    if artwork is not None:
+        projected["artwork"] = artwork
+    return projected
 
 
 def _bounded(value):
