@@ -1,0 +1,342 @@
+"""Exact direct-device commands through the existing account-owned Spotify client."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import json
+
+import voluptuous as vol
+from homeassistant.core import SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
+
+from .const import DOMAIN
+from .observations import current
+from .targets import spotify_devices
+
+COMMAND_TIMEOUT_S = 6
+MAX_RECEIPTS = 128
+_ACTIONS = ("pause", "resume", "next", "previous", "volume")
+_DISALLOWED = {
+    "pause": "pausing",
+    "resume": "resuming",
+    "next": "skipping_next",
+    "previous": "skipping_prev",
+}
+
+
+class CommandRejected(Exception):
+    """An admission failed before the provider send boundary."""
+
+
+def _integer(value):
+    if type(value) is not int or not 0 <= value <= 100:
+        raise vol.Invalid("expected integer percent from 0 to 100")
+    return value
+
+
+def _sequence(value):
+    if type(value) is not int or not 1 <= value < 2**53:
+        raise vol.Invalid("expected positive integer poll sequence")
+    return value
+
+
+def _arguments(action, args):
+    if not isinstance(args, dict) or set(args) != (
+        {"percent"} if action == "volume" else set()
+    ):
+        raise CommandRejected("invalid_arguments")
+    if action == "volume":
+        try:
+            _integer(args["percent"])
+        except vol.Invalid as exc:
+            raise CommandRejected("invalid_arguments") from exc
+
+
+class PlaybackCommands:
+    """No poller, optimistic state or second provider client; one bounded command owner."""
+
+    def __init__(self, data):
+        if data.commands is not None:
+            raise ValueError("Command namespace requires a fresh integration runtime")
+        self.data = data
+        self.owner_epoch = data.coordinator.owner_epoch
+        self.binding = (
+            data.api,
+            data.coordinator,
+            data.session,
+            data.observations,
+            data.api._session,
+            data.api._web,
+        )
+        self.busy = False
+        self.receipts = {}
+        self.poll_floor = 0
+        self.command_sequence = 0
+
+    def controls(self, entry_id, target_id, *, for_command=False):
+        data = self.data
+        binding = (
+            data.api,
+            data.coordinator,
+            data.session,
+            data.observations,
+            data.api._session,
+            data.api._web,
+        )
+        if data.coordinator.owner_epoch != self.owner_epoch:
+            raise CommandRejected("owner_replaced")
+        if data.commands is not self or any(
+            now is not expected for now, expected in zip(binding, self.binding)
+        ):
+            raise CommandRejected("owner_replaced")
+        if data.api._web.closed:
+            raise CommandRejected("unavailable")
+        observed = data.observations.playback(entry_id)
+        if not observed.get("ok"):
+            raise CommandRejected(observed.get("error_kind", "unavailable"))
+        playback = observed["playback"]
+        if playback["target"] is None or playback["target"]["target_id"] != target_id:
+            raise CommandRejected("target_not_current")
+        raw = data.coordinator.data
+        try:
+            matches = [
+                row
+                for row in spotify_devices(raw.get("devices"))
+                if row["id"] == target_id
+            ]
+        except HomeAssistantError as exc:
+            raise CommandRejected("invalid_target") from exc
+        if len(matches) != 1 or matches[0]["is_restricted"]:
+            raise CommandRejected("invalid_target")
+        provider = raw["playback"]
+        device = provider["device"]
+        if device.get("is_restricted") is not False:
+            raise CommandRejected("invalid_target")
+        disallows = (
+            provider.get("actions", {}).get("disallows")
+            if isinstance(provider.get("actions"), dict)
+            else None
+        )
+        if not isinstance(disallows, dict) or any(
+            type(flag) is not bool for flag in disallows.values()
+        ):
+            raise CommandRejected("capabilities_unavailable")
+        actions = [
+            action
+            for action, key in _DISALLOWED.items()
+            if not disallows.get(key, False)
+        ]
+        actions = [
+            action
+            for action in actions
+            if not (
+                action == "pause"
+                and playback["state"] != "playing"
+                or action == "resume"
+                and playback["state"] != "paused"
+            )
+        ]
+        volume = device.get("volume_percent")
+        volume = volume if type(volume) is int and 0 <= volume <= 100 else None
+        if device.get("supports_volume") is True and volume is not None:
+            actions.append("volume")
+        capacity = for_command or self.command_sequence < 2**53 - 1
+        ready = (
+            capacity
+            and (for_command or not self.busy)
+            and observed["poll_sequence"] > self.poll_floor
+        )
+        return {
+            "ok": True,
+            "schema": "podconnect.controls.v1",
+            "config_entry_id": entry_id,
+            "owner_epoch": observed["owner_epoch"],
+            "poll_sequence": observed["poll_sequence"],
+            "next_command_sequence": self.command_sequence + 1 if capacity else None,
+            "observation": observed["observation"],
+            "target": playback["target"],
+            "actions": actions if ready else [],
+            "volume_percent": volume,
+            "status": "ready"
+            if ready
+            else "awaiting_observation"
+            if capacity
+            else "sequence_exhausted",
+            "physical_result_verified": False,
+        }
+
+    async def execute(self, hass, request):
+        entry_id, target_id = request["config_entry_id"], request["target_id"]
+        epoch, sequence = request["owner_epoch"], request["expected_poll_sequence"]
+        request_id, action = request["request_id"], request["action"]
+        command_sequence = request["command_sequence"]
+        receipt = {
+            "ok": False,
+            "schema": "podconnect.command.v1",
+            "config_entry_id": entry_id,
+            "owner_epoch": epoch,
+            "request_id": request_id,
+            "command_sequence": command_sequence,
+            "action": action,
+            "target": {"kind": "spotify_device", "target_id": target_id},
+            "outcome": "rejected",
+            "provider_request_accepted": False,
+            "retry_allowed": False,
+            "physical_result_verified": False,
+        }
+
+        def rejected(kind):
+            return {**receipt, "error_kind": kind}
+
+        if epoch != self.owner_epoch:
+            return rejected("stale_owner")
+        if request_id != f"{epoch}:{command_sequence}":
+            return rejected("invalid_request_identity")
+        try:
+            _arguments(action, request["args"])
+        except CommandRejected as exc:
+            return rejected(str(exc))
+        fingerprint = hashlib.sha256(
+            json.dumps(request, sort_keys=True, allow_nan=False).encode()
+        ).hexdigest()
+        old = self.receipts.get(command_sequence)
+        if old:
+            return (
+                copy.deepcopy(old[1])
+                if old[0] == fingerprint
+                else rejected("request_reused")
+            )
+        if command_sequence <= self.command_sequence:
+            return rejected("stale_command")
+        if command_sequence != self.command_sequence + 1:
+            return rejected("command_sequence_gap")
+        if self.busy:
+            return rejected("busy")
+
+        def guard():
+            try:
+                current(hass, entry_id, self.data)
+                observed = self.controls(entry_id, target_id, for_command=True)
+                if (
+                    observed["owner_epoch"] != epoch
+                    or observed["poll_sequence"] != sequence
+                ):
+                    raise CommandRejected("stale_observation")
+                # busy belongs to this exact in-flight request; the prior terminal
+                # command's floor still prevents acting on pre-command observations.
+                if sequence <= self.poll_floor:
+                    raise CommandRejected("awaiting_observation")
+                if action not in observed["actions"]:
+                    raise CommandRejected("unsupported_action")
+            except HomeAssistantError as exc:
+                raise CommandRejected("owner_replaced") from exc
+            return True
+
+        possible_send = False
+
+        def sending():
+            nonlocal possible_send
+            possible_send = True
+
+        self.busy = True
+        # Monotonic admission is the permanent replay fence, even after eviction.
+        self.command_sequence = command_sequence
+        self.receipts[command_sequence] = (
+            fingerprint,
+            {**receipt, "outcome": "unknown"},
+        )
+        while len(self.receipts) > MAX_RECEIPTS:
+            del self.receipts[next(iter(self.receipts))]
+        try:
+            guard()
+            methods = {
+                "pause": self.data.api.pause,
+                "resume": self.data.api.play,
+                "next": self.data.api.next,
+                "previous": self.data.api.previous,
+                "volume": self.data.api.set_volume,
+            }
+            kwargs = {"execution_guard": guard, "on_send": sending}
+            async with asyncio.timeout(COMMAND_TIMEOUT_S):
+                if action == "volume":
+                    await methods[action](
+                        request["args"]["percent"], target_id, **kwargs
+                    )
+                else:
+                    await methods[action](target_id, **kwargs)
+            receipt = {
+                **receipt,
+                "ok": True,
+                "outcome": "accepted",
+                "provider_request_accepted": True,
+            }
+        except CommandRejected as exc:
+            receipt = rejected(str(exc))
+        except asyncio.CancelledError:
+            receipt = {
+                **receipt,
+                "outcome": "unknown" if possible_send else "rejected",
+                "error_kind": "outcome_unknown" if possible_send else "unavailable",
+            }
+            raise
+        except Exception:  # noqa: BLE001 - any possible send must retain an unknown receipt
+            receipt = {
+                **receipt,
+                "outcome": "unknown" if possible_send else "rejected",
+                "error_kind": "outcome_unknown" if possible_send else "unavailable",
+            }
+        finally:
+            if possible_send:
+                self.poll_floor = max(
+                    self.poll_floor, self.data.coordinator.poll_sequence
+                )
+            receipt["observe_after_poll_sequence"] = self.poll_floor
+            self.receipts[command_sequence] = (fingerprint, receipt)
+            self.busy = False
+        return copy.deepcopy(receipt)
+
+
+def register_command_services(hass):
+    text = vol.All(str, vol.Length(min=1, max=128))
+    target = vol.All(str, vol.Length(min=1, max=1024))
+    identity = {
+        vol.Required("config_entry_id"): target,
+        vol.Required("kind"): vol.In(("spotify_device",)),
+        vol.Required("target_id"): target,
+    }
+
+    async def controls(call):
+        entry_id = call.data["config_entry_id"]
+        data = current(hass, entry_id)
+        try:
+            return data.commands.controls(entry_id, call.data["target_id"])
+        except CommandRejected as exc:
+            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+
+    async def command(call):
+        data = current(hass, call.data["config_entry_id"])
+        return await data.commands.execute(hass, dict(call.data))
+
+    command_schema = {
+        **identity,
+        vol.Required("owner_epoch"): text,
+        vol.Required("expected_poll_sequence"): _sequence,
+        vol.Required("request_id"): vol.All(str, vol.Length(min=1, max=145)),
+        vol.Required("command_sequence"): _sequence,
+        vol.Required("action"): vol.In(_ACTIONS),
+        vol.Required("args"): dict,
+    }
+    for name, handler, schema in (
+        ("get_playback_controls", controls, identity),
+        ("control_playback", command, command_schema),
+    ):
+        if not hass.services.has_service(DOMAIN, name):
+            hass.services.async_register(
+                DOMAIN,
+                name,
+                handler,
+                schema=vol.Schema(schema),
+                supports_response=SupportsResponse.ONLY,
+            )

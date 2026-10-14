@@ -23,6 +23,7 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 )
 
 from .api import SpotifyApi, SpotifyApiError
+from .commands import PlaybackCommands, register_command_services
 from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_SCOPES
 from .coordinator import PodConnectCoordinator
 from .observations import ObservationReader, register_observation_services
@@ -42,6 +43,7 @@ class PodConnectData:
     speakers: SpeakersClient | None = None
     active: bool = False
     observations: ObservationReader | None = None
+    commands: PlaybackCommands | None = None
 
 
 PodConnectConfigEntry = ConfigEntry[PodConnectData]
@@ -123,7 +125,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     speakers = SpeakersClient(async_get_clientsession(hass), base) if base else None
     entry.runtime_data = PodConnectData(api=api, coordinator=coordinator, session=session, speakers=speakers)
     entry.runtime_data.observations = ObservationReader(coordinator, api)
+    entry.runtime_data.commands = PlaybackCommands(entry.runtime_data)
     _register_services(hass)
+    register_command_services(hass)
     register_observation_services(hass)
     register_target_services(hass)
     entry.async_on_unload(entry.add_update_listener(_options_updated))

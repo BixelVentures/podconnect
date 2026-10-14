@@ -7,6 +7,7 @@ token handling, talks to the Web API with the shared aiohttp client session.
 from __future__ import annotations
 
 import json as json_module
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import ClientSession
@@ -44,6 +45,8 @@ class SpotifyApi:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         max_bytes: int | None = None,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> Any:
         """Make an authenticated request; returns parsed JSON or None."""
         await self._session.async_ensure_token_valid()
@@ -51,13 +54,22 @@ class SpotifyApi:
         # Drop None-valued query params (Spotify rejects empty device_id).
         if params:
             params = {k: v for k, v in params.items() if v is not None}
+        if execution_guard is not None and not execution_guard():
+            raise SpotifyApiError("Command admission expired")
+        if on_send is not None:
+            on_send()
         async with self._web.request(
             method,
             f"{SPOTIFY_API}{path}",
             headers={"Authorization": f"Bearer {token}"},
             params=params or None,
             json=json,
+            **({"allow_redirects": False} if execution_guard is not None else {}),
         ) as resp:
+            if execution_guard is not None and resp.status != 204:
+                raise SpotifyApiError(
+                    "Spotify command did not return acceptance", status=resp.status
+                )
             if max_bytes is not None:
                 if resp.status != 200:
                     retry_after = None
@@ -157,6 +169,8 @@ class SpotifyApi:
         context_uri: str | None = None,
         uris: list[str] | None = None,
         position_ms: int | None = None,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
     ) -> None:
         """PUT /me/player/play (resume, or start a context/uris)."""
         body: dict[str, Any] = {}
@@ -167,20 +181,73 @@ class SpotifyApi:
         if position_ms is not None:
             body["position_ms"] = position_ms
         await self._request(
-            "PUT", "/me/player/play", params={"device_id": device_id}, json=body or None
+            "PUT",
+            "/me/player/play",
+            params={"device_id": device_id},
+            json=body or None,
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
         )
 
-    async def pause(self, device_id: str | None = None) -> None:
+    async def pause(
+        self,
+        device_id: str | None = None,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
         """PUT /me/player/pause."""
-        await self._request("PUT", "/me/player/pause", params={"device_id": device_id})
+        await self._request(
+            "PUT",
+            "/me/player/pause",
+            params={"device_id": device_id},
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
+        )
 
-    async def next(self, device_id: str | None = None) -> None:
+    async def next(
+        self,
+        device_id: str | None = None,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
         """POST /me/player/next."""
-        await self._request("POST", "/me/player/next", params={"device_id": device_id})
+        await self._request(
+            "POST",
+            "/me/player/next",
+            params={"device_id": device_id},
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
+        )
 
-    async def previous(self, device_id: str | None = None) -> None:
+    async def previous(
+        self,
+        device_id: str | None = None,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
         """POST /me/player/previous."""
-        await self._request("POST", "/me/player/previous", params={"device_id": device_id})
+        await self._request(
+            "POST",
+            "/me/player/previous",
+            params={"device_id": device_id},
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
+        )
 
     async def seek(self, position_ms: int, device_id: str | None = None) -> None:
         """PUT /me/player/seek."""
@@ -190,12 +257,24 @@ class SpotifyApi:
             params={"position_ms": int(position_ms), "device_id": device_id},
         )
 
-    async def set_volume(self, volume_percent: int, device_id: str | None = None) -> None:
+    async def set_volume(
+        self,
+        volume_percent: int,
+        device_id: str | None = None,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
         """PUT /me/player/volume (0-100)."""
         await self._request(
             "PUT",
             "/me/player/volume",
             params={"volume_percent": int(volume_percent), "device_id": device_id},
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
         )
 
     async def set_repeat(self, state: str, device_id: str | None = None) -> None:
