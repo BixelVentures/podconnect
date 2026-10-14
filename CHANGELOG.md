@@ -1,3 +1,8 @@
+## Control 0.10.8 - observed playback and account queue
+
+- Expose read-only, exact-account playback and queue services for PodVoice/PodView. Playback comes from a successful provider poll with explicit freshness, not optimistic entity state.
+- Preserve ordered queue duplicates with snapshot-scoped IDs, bounded reads/cache/rate limits and account replacement fencing. No playback commands or new credentials. Installation and audible playback verification remain separate.
+
 ## Speakers 0.26.18 - keep RSS metadata outside the native writer
 
 - Prepare RSS stream metadata before the atomic playlist/database update, so a slow metadata read does not hold the database writer needed by the native player.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -27,6 +29,7 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.api = api
         self.poll_sequence = 0
+        self.owner_epoch = secrets.token_hex(16)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch playback state + the device list."""
@@ -34,12 +37,16 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         poll_sequence = self.poll_sequence
         try:
             playback = await self.api.playback_state()
+            playback_observed_at = dt_util.utcnow()
+            playback_observed_monotonic = time.monotonic()
             devices = await self.api.devices()
         except SpotifyApiError as err:
             raise UpdateFailed(str(err)) from err
         return {
             "poll_sequence": poll_sequence,
             "playback": playback,
+            "playback_observed_at": playback_observed_at,
+            "playback_observed_monotonic": playback_observed_monotonic,
             "devices": devices,
             "fetched_at": dt_util.utcnow(),
         }
