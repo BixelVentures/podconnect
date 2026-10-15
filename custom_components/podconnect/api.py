@@ -7,11 +7,10 @@ token handling, talks to the Web API with the shared aiohttp client session.
 from __future__ import annotations
 
 import json as json_module
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiohttp import ClientSession
-
 from homeassistant.const import CONF_ACCESS_TOKEN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -46,6 +45,7 @@ class SpotifyApi:
         json: dict[str, Any] | None = None,
         max_bytes: int | None = None,
         execution_guard: Callable[[], bool] | None = None,
+        async_execution_guard: Callable[[], Awaitable[None]] | None = None,
         on_send: Callable[[], None] | None = None,
     ) -> Any:
         """Make an authenticated request; returns parsed JSON or None."""
@@ -54,6 +54,10 @@ class SpotifyApi:
         # Drop None-valued query params (Spotify rejects empty device_id).
         if params:
             params = {k: v for k, v in params.items() if v is not None}
+        if execution_guard is not None and not execution_guard():
+            raise SpotifyApiError("Command admission expired")
+        if async_execution_guard is not None:
+            await async_execution_guard()
         if execution_guard is not None and not execution_guard():
             raise SpotifyApiError("Command admission expired")
         if on_send is not None:
@@ -170,6 +174,7 @@ class SpotifyApi:
         uris: list[str] | None = None,
         position_ms: int | None = None,
         execution_guard: Callable[[], bool] | None = None,
+        async_execution_guard: Callable[[], Awaitable[None]] | None = None,
         on_send: Callable[[], None] | None = None,
     ) -> None:
         """PUT /me/player/play (resume, or start a context/uris)."""
@@ -186,7 +191,7 @@ class SpotifyApi:
             params={"device_id": device_id},
             json=body or None,
             **(
-                {"execution_guard": execution_guard, "on_send": on_send}
+                {"execution_guard": execution_guard, "async_execution_guard": async_execution_guard, "on_send": on_send}
                 if execution_guard is not None
                 else {}
             ),
@@ -291,8 +296,17 @@ class SpotifyApi:
             params={"state": "true" if state else "false", "device_id": device_id},
         )
 
-    async def transfer(self, device_id: str, play: bool = True) -> None:
+    async def transfer(
+        self,
+        device_id: str,
+        play: bool = True,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        async_execution_guard: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """PUT /me/player — move playback to a device."""
         await self._request(
-            "PUT", "/me/player", json={"device_ids": [device_id], "play": play}
+            "PUT", "/me/player", json={"device_ids": [device_id], "play": play},
+            **({"execution_guard": execution_guard, "async_execution_guard": async_execution_guard}
+               if execution_guard is not None else {}),
         )

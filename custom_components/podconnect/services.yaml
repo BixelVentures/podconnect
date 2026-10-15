@@ -205,7 +205,7 @@ get_playback_controls:
 
 get_track_play_controls:
   name: Get selected-track play controls
-  description: Exact account and fresh Spotify device, including an inactive device, with known observed volume. This is a source observation, not permission to play a browser-provided URI or proof of audible output.
+  description: Exact account, fresh Spotify device and native Speakers room/output/start policy. The source observation is not permission to play a browser-provided URI or proof of audible output.
   fields:
     config_entry_id:
       required: true
@@ -221,10 +221,14 @@ get_track_play_controls:
       required: true
       selector:
         text:
+    room_id:
+      required: true
+      selector:
+        text:
 
 control_playback:
   name: Control direct Spotify playback
-  description: One bounded command on the exact observed account/device/owner/poll. play_track requires an exact Spotify track URI and an explicit approved max_volume in args; the current device volume must be known and no higher. A caller must separately authorize the selected source. Unknown outcomes must not be retried. No aliases, default account, transfer or physical confirmation.
+  description: One bounded command on the exact observed account/device/owner/poll. play_track also requires the native room, output, start policy revision and alias incarnation returned by get_track_play_controls; max_volume must be at least the fixed native start level. A caller must separately authorize the selected source. Unknown outcomes must not be retried. No physical confirmation.
   fields:
     config_entry_id:
       required: true

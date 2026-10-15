@@ -54,6 +54,11 @@ func TestPC10BridgeRejectsStaleTransport(t *testing.T) {
 		case "/api/outputs":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"outputs":[{"id":"42","name":"Kitchen HomePod","type":"AirPlay","selected":true,"volume":35}]}`)
+		case "/api/player/volume":
+			if r.Method != http.MethodPut || r.URL.Query().Get("output_id") != "42" || r.URL.Query().Get("volume") != "35" {
+				t.Error("fresh-start primer lost the fixture's exact output and level")
+			}
+			w.WriteHeader(http.StatusNoContent)
 		case "/api/player":
 			if playerReads.Add(1) == 1 && mode != "admitted_completion" {
 				close(held)

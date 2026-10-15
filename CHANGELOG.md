@@ -1,3 +1,10 @@
+## Control 0.10.12 / Speakers 0.26.19 — candidate, unpublished
+
+- Use one Speakers-owned fixed start level for fresh native starts, transfers and reclaimed output; retain manual volume changes during a held session.
+- Bind Control native starts to the exact engine, room, output, policy revision and alias incarnation. Native preparation issues a short-lived one-use lease; stale ownership and unknown outcomes fail closed without replay.
+- Keep native autoplay and normal transport ownership. No PodView-specific volume policy. PodVoice consumers must supply the native contract before selected-track starts can be admitted.
+- Release gate: build immutable Speakers images before advertising the add-on version on main; release Control under the exact manifest tag after required checks. No installation or audible acceptance is implied.
+
 ## Control 0.10.11 - bounded selected-track playback
 
 - Offer `get_track_play_controls` for one exact configured account and Spotify device, including an inactive device only when the current provider observation identifies it, it is unrestricted, and its volume is known.

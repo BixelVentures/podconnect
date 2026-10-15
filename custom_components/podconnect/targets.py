@@ -20,6 +20,7 @@ from homeassistant.helpers import (
 
 from .api import SpotifyApiError
 from .const import CONF_ROOM_AREAS, DOMAIN
+from .native_start import start_guards
 from .speakers import SpeakersError
 
 
@@ -328,7 +329,11 @@ def register_target_services(hass) -> None:
             device, playing = await spotify_transfer_target(data.api, target_id=target)
             current(call.data["config_entry_id"], data)
             async with asyncio.timeout(10):
-                await data.api.transfer(device, play=playing)
+                if playing:
+                    guard, native_ready = start_guards(hass, call.data["config_entry_id"], data, device)
+                    await data.api.transfer(device, play=True, execution_guard=guard, async_execution_guard=native_ready)
+                else:
+                    await data.api.transfer(device, play=False)
             return {
                 "kind": kind,
                 "target_id": device,
