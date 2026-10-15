@@ -1,8 +1,7 @@
 diff --git a/src/Makefile.am b/src/Makefile.am
-index b311abd..f0b2da2 100644
 --- a/src/Makefile.am
 +++ b/src/Makefile.am
-@@ -166,3 +166,84 @@ $(LEXER_SRC:.l=.h): $(LEXER_SRC)
+@@ -166,3 +166,84 @@
  # flex/bison automake's support leaves something to be desired
  clean-local:
  	rm -f $(LEXER_SRC:.l=.[ch]) $(PARSER_SRC:.y=.[ch])
@@ -84,7 +83,7 @@ index b311abd..f0b2da2 100644
 +airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
 +	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
 +airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
-+airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=free_mfi
++airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
 +EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
 +airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
 diff --git a/src/conffile.c b/src/conffile.c
@@ -3460,10 +3459,9 @@ index 258d8e1..2c43bda 100644
  
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
 new file mode 100644
-index 0000000..45cd6d7
 --- /dev/null
 +++ b/tests/airplay_callback_owner.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,976 @@
 +/* Actual AirPlay, outputs and evrtsp translation units. Private loopback only.
 + * No discovery, daemon, media input, fabricated connected/session-ready flag,
 + * receiver capability, public-volume acceptance or acoustic proof.
@@ -3479,6 +3477,7 @@ index 0000000..45cd6d7
 +#include <string.h>
 +#include <event2/listener.h>
 +#include <event2/bufferevent.h>
++#include "../src/pair_ap/pair-tlv.h"
 +
 +/* Inert speaker persistence only. Every state, request, crypto/codec constructor,
 + * queue/callback and session destruction below is the candidate production body. */
@@ -3988,10 +3987,57 @@ index 0000000..45cd6d7
 +  struct output_attention_result result;
 +  unsigned short udp_port;
 +  int udp_fd,mode,phase,failed,wire,volumes,teardowns,pair_messages,start_callbacks,stop_callbacks;
++  int short_salts,padded_salts;
 +  struct output_attention_result handoff;
 +};
 +
 +static struct recovery_wire_fixture *active_recovery_wire;
++static bool recovery_receiver_entropy, recovery_salt_red;
++void __real_gcry_mpi_randomize(gcry_mpi_t, unsigned int, enum gcry_random_level);
++void __wrap_gcry_mpi_randomize(gcry_mpi_t value, unsigned int bits, enum gcry_random_level level)
++{
++  if (recovery_receiver_entropy && bits == 128 && active_recovery_wire)
++    {
++      /* Test receiver only: deterministically exercise the pinned server's
++       * minimum-integer-width encoding of a leading-zero 16-byte salt. No
++       * client entropy or installed production binary is interposed. */
++      __real_gcry_mpi_randomize(value, 120, level);
++      gcry_mpi_set_bit(value, 119);
++      active_recovery_wire->short_salts++;
++      return;
++    }
++  __real_gcry_mpi_randomize(value, bits, level);
++}
++
++static int recovery_receiver_salt(struct recovery_wire_fixture *f, uint8_t **message, size_t *length)
++{
++  pair_tlv_values_t *values = pair_tlv_new();
++  pair_tlv_t *salt, *state;
++  uint8_t *padded = NULL, *wire = NULL;
++  size_t capacity = *length + 16;
++  int ret = -1;
++  if (!values || pair_tlv_parse(*message, *length, values) < 0) goto done;
++  state = pair_tlv_get_value(values, TLVType_State);
++  if (!state || state->size != 1 || state->value[0] != 2) { ret = 0; goto done; }
++  salt = pair_tlv_get_value(values, TLVType_Salt);
++  if (!salt || !salt->size || salt->size > 16) goto done;
++  if (salt->size == 16 || recovery_salt_red) { ret = 0; goto done; }
++  padded = calloc(16, 1);
++  wire = malloc(capacity);
++  if (!padded || !wire) goto done;
++  /* Salt is a big-endian SRP integer on both real peers. Leading-zero padding
++   * retains that integer and its real proof; only the owned receiver's wire
++   * representation is brought to its documented fixed sixteen-byte contract. */
++  memcpy(padded + 16 - salt->size, salt->value, salt->size);
++  free(salt->value); salt->value = padded; padded = NULL; salt->size = 16;
++  if (pair_tlv_format(values, wire, &capacity) < 0) goto done;
++  free(*message); *message = wire; wire = NULL; *length = capacity;
++  f->padded_salts++; ret = 0;
++ done:
++  free(padded); free(wire); pair_tlv_free(values);
++  return ret;
++}
++
 +static void recovery_wire_connected(struct output_device *, enum output_device_state);
 +static void recovery_wire_stopped(struct output_device *, enum output_device_state);
 +
@@ -4085,7 +4131,11 @@ index 0000000..45cd6d7
 +    plist=plist_new_dict();wplist_dict_add_uint(plist,"statusFlags",0);
 +  } else if(!strncmp(header,"POST /pair-setup ",17)) {
 +    if(!f->pair)f->pair=pair_setup_new(PAIR_SERVER_HOMEKIT,NULL,NULL,NULL,"native-private-receiver");
-+    if(!f->pair || pair_setup(&response,&response_length,f->pair,body,bytes)<0)
++    if (!f->pair) {recovery_wire_fail(f,"real transient server pairing allocation");goto done;}
++    recovery_receiver_entropy = true;
++    int pair_ret = pair_setup(&response,&response_length,f->pair,body,bytes);
++    recovery_receiver_entropy = false;
++    if (pair_ret < 0 || recovery_receiver_salt(f,&response,&response_length) < 0)
 +      {recovery_wire_fail(f,"real transient server pairing");goto done;}
 +    f->pair_messages++;
 +    activate_cipher=(f->pair_messages % 2)==0;
@@ -4328,6 +4378,8 @@ index 0000000..45cd6d7
 +  f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
 +  if(!f.poll || !f.deadline || evtimer_add(f.deadline,&bound) || evtimer_add(f.poll,&soon)){f.failed=1;goto cleanup;}
 +  event_base_dispatch(f.base);
++  if(!f.failed && !recovery_salt_red && (f.short_salts != (mode == 5 ? 2 : 1)
++      || f.padded_salts != (mode == 5 ? 2 : 1))) recovery_wire_fail(&f,"deterministic short-salt receiver contract not exercised");
 +  if(!f.failed && (f.volumes!=(mode == 4 ? 2 : mode == 5 ? 3 : 1)
 +      || f.teardowns!=((mode == 3 || mode == 5 || mode == 6) ? 2 : 1) || f.pair_messages!=(mode == 5 ? 4 : 2) || f.wire<8))recovery_wire_fail(&f,"actual bounded handshake/strict-write/teardown count");
 +  if(!f.failed && (db_attention_origin_get(1,&f.command.origin,&origin_state,&proof)<0
@@ -4370,6 +4422,8 @@ index 0000000..45cd6d7
 +{
 +  int mode;
 +  if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
++    { recovery_salt_red = true; return recovery_wire_case(0); }
 +  if (argc == 2 && !strcmp(argv[1], "--rss-owner-red")) return rss_owner_cases(true);
 +  if (argc == 2 && !strcmp(argv[1], "--rss-owner")) return rss_owner_cases(false);
 +  if (rss_owner_cases(false)) return 1;
@@ -5848,10 +5902,9 @@ index 0000000..7832a22
 +}
 diff --git a/tests/player_startup_owner.inc.c b/tests/player_startup_owner.inc.c
 new file mode 100644
-index 0000000..7d32889
 --- /dev/null
 +++ b/tests/player_startup_owner.inc.c
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,228 @@
 +/* Included by the existing complete native owner fixture. Faults only wrap
 + * SQLite/pthread admission; player, DB, command consumers and cleanup stay real. */
 +#include <sys/wait.h>
@@ -5917,9 +5970,9 @@ index 0000000..7d32889
 +    {
 +      const struct timeval immediate = {0, 0};
 +      assert(event_base_once(evbase_player, -1, EV_TIMEOUT, startup_old_callback, NULL, &immediate) == 0);
-+      assert(sqlite3_exec(*connection, startup_fault == START_READONLY ? "PRAGMA query_only=ON" :
-+          startup_fault == START_NONDURABLE ? "PRAGMA synchronous=OFF" :
-+          "DROP TABLE native_attention_process_v1", NULL, NULL, NULL) == SQLITE_OK);
++      if (startup_fault != START_SCHEMA)
++        assert(sqlite3_exec(*connection, startup_fault == START_READONLY ? "PRAGMA query_only=ON" :
++            "PRAGMA synchronous=OFF", NULL, NULL, NULL) == SQLITE_OK);
 +    }
 +  return ret;
 +}
@@ -6001,6 +6054,16 @@ index 0000000..7d32889
 +  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", path);
 +  cfg_setstr(cfg_getsec(cfg, "audio"), "type", "disabled");
 +  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  if (fault == START_SCHEMA)
++    {
++      sqlite3 *schema = NULL;
++      /* Establish the global missing-table fault before the real library starts
++       * its independent admin/queue writer. The player still opens its actual
++       * connection, queues its old callback and rejects bootstrap normally. */
++      assert(__real_sqlite3_open(path, &schema) == SQLITE_OK);
++      assert(sqlite3_exec(schema, "DROP TABLE native_attention_process_v1", NULL, NULL, NULL) == SQLITE_OK);
++      assert(sqlite3_close(schema) == SQLITE_OK);
++    }
 +  assert(worker_init() == 0 && cache_init() == 0 && library_init() == 0);
 +  startup_fault = fault; startup_active = true;
 +  if (fault == START_LOCKED)
