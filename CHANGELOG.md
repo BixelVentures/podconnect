@@ -1,3 +1,9 @@
+## Speakers 0.26.20 — released paused URI-start candidate, unpublished
+
+- Recognize an exact current-alias logged-in paused engine with a released output as a fresh native start claim. Ordinary selected pause/resume retains manual volume; unselected state alone grants no readiness.
+- Prime the shared configured start volume before selecting the exact output; preserve source/alias/readback and one-use lease guards. Keep the release marker until actual observed-playing reclaim.
+- Source candidate only. Independent review, native checks, immutable image publication, installation and physical volume acceptance remain separate. Control 0.10.13 playlist work below is retained.
+
 ## Control 0.10.13 — playlist context candidate, unpublished
 
 - Add bounded `search_playlists` through the existing exact-account Spotify API owner, returning actual playlist URI/name and current owner epoch. Search adds no playback authority.

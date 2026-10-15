@@ -40,10 +40,11 @@ type startProof struct {
 }
 
 type startClaim struct {
-	Proof  startProof
-	Intent glTransportIntent
-	Room   *Room
-	RT     *roomRuntime
+	Proof    startProof
+	Intent   glTransportIntent
+	Room     *Room
+	RT       *roomRuntime
+	Released bool
 }
 
 type startLease struct {
@@ -207,6 +208,7 @@ func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, target
 	if selected == nil || !currentRoomValid || (status.Active && status.AliasBinding.RoomID != roomID) {
 		return startClaim{}, false
 	}
+	released := fileExists(releasedPath(primary))
 	volume, outputSelected, ok := knownStartOutput(primary.OwnTone, selected.HomepodID)
 	if !ok {
 		return startClaim{}, false
@@ -216,12 +218,22 @@ func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, target
 	latest := roomByID(roomID)
 	if next != intent || !rt.live.startIntentCurrent(intent) || !sameAliasBinding(check.AliasBinding, status.AliasBinding) ||
 		latest == nil || latest.HomepodID != selected.HomepodID ||
-		configuredEngineID(primary) != targetID {
+		configuredEngineID(primary) != targetID || fileExists(releasedPath(primary)) != released {
 		return startClaim{}, false
 	}
 	mode := "fresh_start"
 	if status.Active {
-		mode = "same_session"
+		// Login/volume makes Active true even after the native route was
+		// released. Only an explicitly paused, exact-current-alias route may
+		// reclaim as a fresh URI start. Unselected alone is not permission.
+		if released && status.Paused && status.AliasBinding.RoomID == roomID {
+			mode = "fresh_start"
+		} else {
+			mode = "same_session"
+		}
+	}
+	if status.Active && released && !status.Paused {
+		return startClaim{}, false
 	}
 	if mode == "same_session" && (!outputSelected || fileExists(releasedPath(primary))) &&
 		(len(allowReleased) == 0 || !allowReleased[0]) {
@@ -231,7 +243,7 @@ func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, target
 		RoomID: roomID, HomepodID: selected.HomepodID, PolicyRevision: startRevision(targetID, selected, status.AliasBinding),
 		StartVolumePercent: startVolumePercent, AliasBinding: copyAliasBinding(status.AliasBinding), Mode: mode,
 		OutputVolume: volume, OutputSelected: outputSelected, Ready: true}
-	return startClaim{Proof: proof, Intent: intent, Room: selected, RT: rt}, true
+	return startClaim{Proof: proof, Intent: intent, Room: selected, RT: rt, Released: released}, true
 }
 
 // A local resume has no Spotify URI and preserves manual volume in an ordinary
@@ -382,14 +394,14 @@ func startRequest(w http.ResponseWriter, r *http.Request) {
 			// Prime the future output while the old alias is idle, then recheck
 			// source ownership before the one local alias write.
 			latest, valid := currentStartClaim(body.RoomID, body.TargetID)
-			if !valid || latest.Proof.Mode != "fresh_start" || latest.Intent != claim.Intent ||
+			if !valid || latest.Proof.Mode != "fresh_start" || latest.Intent != claim.Intent || latest.Released != claim.Released ||
 				latest.Proof.PolicyRevision != body.PolicyRevision || !sameAliasBinding(latest.Proof.AliasBinding, claim.Proof.AliasBinding) ||
 				!primeConfiguredStartVolume(claim.RT.room.OwnTone, claim.Proof.HomepodID, false) {
 				w.WriteHeader(http.StatusConflict)
 				return
 			}
 			latest, valid = currentStartClaim(body.RoomID, body.TargetID)
-			if !valid || latest.Proof.Mode != "fresh_start" || latest.Intent != claim.Intent ||
+			if !valid || latest.Proof.Mode != "fresh_start" || latest.Intent != claim.Intent || latest.Released != claim.Released ||
 				latest.Proof.PolicyRevision != body.PolicyRevision || !sameAliasBinding(latest.Proof.AliasBinding, claim.Proof.AliasBinding) ||
 				!selectIdleStartAlias(claim.RT.room.Librespot, body.RoomID, claim.Proof.AliasBinding) {
 				w.WriteHeader(http.StatusConflict)
@@ -410,6 +422,19 @@ func startRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !claim.Proof.OutputSelected {
+			// A saved output may have been left loud by another sender. Seat
+			// its own start level before selection can trigger pipe autostart.
+			if !primeConfiguredStartVolume(claim.RT.room.OwnTone, claim.Proof.HomepodID, false) {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			latest, valid := currentStartClaim(body.RoomID, body.TargetID)
+			if !valid || latest.Intent != claim.Intent || latest.Released != claim.Released ||
+				latest.Proof.Mode != claim.Proof.Mode || latest.Proof.PolicyRevision != claim.Proof.PolicyRevision ||
+				!sameAliasBinding(latest.Proof.AliasBinding, claim.Proof.AliasBinding) {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			if !selectOnOwntoneAt(claim.RT.room.OwnTone, claim.Proof.HomepodID) {
 				w.WriteHeader(http.StatusConflict)
 				return
@@ -423,12 +448,14 @@ func startRequest(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
-		if err := os.Remove(releasedPath(claim.RT.room)); err != nil && !os.IsNotExist(err) {
-			w.WriteHeader(http.StatusConflict)
-			return
-		}
+		// Keep a release marker through prepare/commit. The existing bridge
+		// clears it only after observing playing and completing protected
+		// reclaim; rejected or unknown provider sends never bypass reclaim.
+		before := claim
 		claim, ok = currentStartClaim(body.RoomID, body.TargetID)
-		if !ok || claim.Proof.Mode != "fresh_start" || !claim.Proof.OutputSelected || claim.Proof.PolicyRevision != body.PolicyRevision ||
+		if !ok || claim.Intent != before.Intent || claim.Released != before.Released ||
+			!sameAliasBinding(claim.Proof.AliasBinding, before.Proof.AliasBinding) ||
+			claim.Proof.Mode != "fresh_start" || !claim.Proof.OutputSelected || claim.Proof.PolicyRevision != body.PolicyRevision ||
 			claim.Proof.AliasBinding.Incarnation != body.AliasIncarnation ||
 			claim.Proof.OutputVolume > startVolumePercent || claim.Proof.OutputVolume < startVolumePercent-volTol {
 			w.WriteHeader(http.StatusConflict)
@@ -507,7 +534,7 @@ func commitStartRequest(w http.ResponseWriter, r *http.Request) {
 	lease.Committed = true // one use, including unknown/rejected downstream results
 	startLeases.Unlock()
 	claim, ok := currentStartClaim(lease.Claim.Proof.RoomID, lease.Claim.Proof.EngineDeviceID)
-	if !ok || claim.Intent != lease.Claim.Intent || claim.Proof.PolicyRevision != lease.Claim.Proof.PolicyRevision ||
+	if !ok || !claim.Proof.OutputSelected || claim.Intent != lease.Claim.Intent || claim.Released != lease.Claim.Released || claim.Proof.PolicyRevision != lease.Claim.Proof.PolicyRevision ||
 		!sameAliasBinding(claim.Proof.AliasBinding, lease.Claim.Proof.AliasBinding) || claim.Proof.Mode != lease.Claim.Proof.Mode ||
 		(claim.Proof.Mode == "fresh_start" &&
 			(claim.Proof.OutputVolume > startVolumePercent || claim.Proof.OutputVolume < startVolumePercent-volTol)) ||

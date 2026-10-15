@@ -104,3 +104,18 @@ GitHub Release. Keep the image build separate from an installation claim.
    cannot reproduce the recorded prior state.
 
 This sequence does not authorize installation, grant changes or physical playback.
+
+
+### Current follow-on candidate: Speakers 0.26.20 / Control 0.10.13
+
+The released-paused URI-start repair changes the native subtree. Build new
+0.26.20 architecture images with the exact source-tree labels before merging
+that add-on version; never reuse or overwrite 0.26.19. Existing Control 0.10.13
+playlist source remains a separately reviewed integration release. Wire proof
+and lease schemas are unchanged, but coupled consumer tests and independent
+native review are still required. This source record is not an installation.
+Use the same backup, quiet maintenance, immutable digest verification, Speakers
+then Control then PodVoice order and coupled rollback procedure above, with the
+actual reviewed versions substituted in the operator receipt. Green writes
+remain with the single installation owner; local native tests send no device
+commands. Physical first-audio volume and autoplay still require actual checks.

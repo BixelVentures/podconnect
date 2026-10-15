@@ -1,3 +1,40 @@
+# Active decision: released paused URI start — Speakers 0.26.20 candidate
+
+Source implementation in progress, unpublished and uninstalled. Actual released
+Speakers 0.26.19 can identify its supervised engine but rejects exact-room URI
+start readiness after idle release when /status still reports a logged-in paused
+session. Active derives from username/volume, not a selected native output. A
+read-only intercepted-handler reproducer confirms this causal source defect; the
+currently observed Spotify device is a MacBook, not evidence of Kitchen readiness.
+
+Decision: admit only exact-current-alias Active + Paused + release marker as a
+fresh output claim. Preserve ordinary selected paused same-session manual volume;
+reject unselected alone, playing released routes, unknown owners and cross-room
+active starts. Prime the exact configured start level before output selection,
+recheck source intent/binding and readback, retain release marker through the
+one-use native lease until existing observed-playing reclaim clears it. No new
+provider endpoint, schema, room fallback or PodView-specific volume rule.
+
+Change only native start barrier/tests and Speakers version to 0.26.20; retain
+Control 0.10.13 playlist candidate below. Required evidence: causal positive and
+negative/race/order/replay tests, existing native race/vet checks, independent
+review, coupled contract checks, immutable architecture prebuilds, then coordinated
+installation and physical acceptance. None are implied by this decision record.
+Validation of the current native repair: all manager tests pass with the race
+detector (17.608s); go vet and diff checks pass under Go 1.25 with dependency
+network access disabled. Full native tests used scoped local loopback permission;
+new causal tests intercept HTTP and require no listening sockets. They cover
+released selected/unselected starts, pre-prime/select order, ordinary manual 64%
+pause, rejected unselected-without-release and playing-with-release, changed
+marker/owner, native failures, stale or deselected-output commit and one-use consumption. Existing
+idle alias and local resume tests also pass. No provider/device action performed.
+Independent review identified a deselected-output commit gap; commit now explicitly requires the exact prepared output still selected, and a rejection consumes its lease. Independent rereview, composed consumer tests, images and Green acceptance remain.
+
+Rollback before publication is this native candidate; device rollback follows
+existing docs/releasing.md. Unknown starts are never automatically retried.
+
+---
+
 # Active decision: bounded native playlist context — Control0.10.13 candidate
 
 Implemented source candidate; unpublished and uninstalled. Base is actual merged
