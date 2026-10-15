@@ -20,7 +20,7 @@ from .targets import spotify_devices
 COMMAND_TIMEOUT_S = 6
 MAX_RECEIPTS = 128
 _ACTIONS = ("pause", "resume", "next", "previous", "volume")
-_COMMAND_ACTIONS = (*_ACTIONS, "play_track")
+_COMMAND_ACTIONS = (*_ACTIONS, "play_track", "play_context")
 _TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
@@ -50,8 +50,8 @@ def _arguments(action, args):
     if not isinstance(args, dict) or set(args) != (
         {"percent"}
         if action == "volume"
-        else {"track_uri", "max_volume", "room_id", "homepod_id", "start_policy_revision", "alias_incarnation"}
-        if action == "play_track"
+        else {"context_uri" if action == "play_context" else "track_uri", "max_volume", "room_id", "homepod_id", "start_policy_revision", "alias_incarnation"}
+        if action in {"play_track", "play_context"}
         else set()
     ):
         raise CommandRejected("invalid_arguments")
@@ -60,12 +60,12 @@ def _arguments(action, args):
             _integer(args["percent"])
         except vol.Invalid as exc:
             raise CommandRejected("invalid_arguments") from exc
-    if action == "play_track" and (
-        not isinstance(args["track_uri"], str)
-        or _TRACK_URI.fullmatch(args["track_uri"]) is None
+    if action in {"play_track", "play_context"} and (
+        not isinstance(args.get("context_uri" if action == "play_context" else "track_uri"), str)
+        or re.fullmatch(r"spotify:playlist:[A-Za-z0-9]{22}" if action == "play_context" else r"spotify:track:[A-Za-z0-9]{22}", args["context_uri" if action == "play_context" else "track_uri"]) is None
     ):
         raise CommandRejected("invalid_arguments")
-    if action == "play_track":
+    if action in {"play_track", "play_context"}:
         try:
             _integer(args["max_volume"])
         except vol.Invalid as exc:
@@ -344,7 +344,7 @@ class PlaybackCommands:
                 current(hass, entry_id, self.data)
                 observed = (
                     self.track_controls(entry_id, target_id, for_command=True)
-                    if action == "play_track"
+                    if action in {"play_track", "play_context"}
                     else self.controls(entry_id, target_id, for_command=True)
                 )
                 if (
@@ -356,10 +356,10 @@ class PlaybackCommands:
                 # command's floor still prevents acting on pre-command observations.
                 if sequence <= self.poll_floor:
                     raise CommandRejected("awaiting_observation")
-                if action not in observed["actions"]:
+                if ("play_track" if action == "play_context" else action) not in observed["actions"]:
                     raise CommandRejected("unsupported_action")
                 if (
-                    action == "play_track"
+                    action in {"play_track", "play_context"}
                     and observed["volume_percent"] > request["args"]["max_volume"]
                 ):
                     raise CommandRejected("volume_above_approved_limit")
@@ -385,7 +385,7 @@ class PlaybackCommands:
         try:
             guard()
             lease = None
-            if action == "play_track":
+            if action in {"play_track", "play_context"}:
                 if self.data.speakers is None:
                     raise CommandRejected("native_start_unavailable")
                 args = request["args"]
@@ -431,12 +431,13 @@ class PlaybackCommands:
                 "previous": self.data.api.previous,
                 "volume": self.data.api.set_volume,
                 "play_track": self.data.api.play,
+                "play_context": self.data.api.play,
             }
             kwargs = {"execution_guard": guard, "on_send": sending}
-            async with asyncio.timeout(14 if action == "play_track" else COMMAND_TIMEOUT_S):
-                if action == "play_track":
+            async with asyncio.timeout(14 if action in {"play_track", "play_context"} else COMMAND_TIMEOUT_S):
+                if action in {"play_track", "play_context"}:
                     await methods[action](
-                        target_id, uris=[request["args"]["track_uri"]],
+                        target_id, **({"context_uri": request["args"]["context_uri"]} if action == "play_context" else {"uris": [request["args"]["track_uri"]]}),
                         async_execution_guard=native_commit, **kwargs
                     )
                 elif action == "volume":
@@ -502,6 +503,13 @@ def register_command_services(hass):
         except CommandRejected as exc:
             return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
 
+    async def context_controls(call):
+        result = await track_controls(call)
+        if result.get("ok") is True:
+            result["actions"] = ["play_context"] if result["status"] == "ready" else []
+            result["context_play_supported"] = True
+        return result
+
     async def command(call):
         data = current(hass, call.data["config_entry_id"])
         return await data.commands.execute(hass, dict(call.data))
@@ -518,6 +526,7 @@ def register_command_services(hass):
     for name, handler, schema in (
         ("get_playback_controls", controls, identity),
         ("get_track_play_controls", track_controls, {**identity, vol.Required("room_id"): target}),
+        ("get_context_play_controls", context_controls, {**identity, vol.Required("room_id"): target}),
         ("control_playback", command, command_schema),
     ):
         if not hass.services.has_service(DOMAIN, name):

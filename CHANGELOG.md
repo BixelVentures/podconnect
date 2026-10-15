@@ -1,4 +1,11 @@
-## Control 0.10.12 / Speakers 0.26.19 — candidate, unpublished
+## Control 0.10.13 — playlist context candidate, unpublished
+
+- Add bounded `search_playlists` through the existing exact-account Spotify API owner, returning actual playlist URI/name and current owner epoch. Search adds no playback authority.
+- Add `get_context_play_controls` and the explicit `play_context` command to the existing native command owner. Context starts reuse the same exact device/room/output/start-policy proof, native prepare/commit and one-use command receipt, then send Spotify's existing `context_uri` form.
+- Preserve native autoplay and the single Speakers-owned start-volume policy. Changed/stale native proof and uncertain commit fail closed; duplicate requests do not repeat playback. Caller-owned exact source selection and grants remain required.
+- Speakers remains0.26.19 with no engine/add-on/configuration changes. This is source preparation only; no new model budget, grant, release, installation or audible acceptance is implied.
+
+## Control 0.10.12 / Speakers 0.26.19 — native start policy
 
 - Use one Speakers-owned fixed start level for fresh native starts, transfers and reclaimed output; retain manual volume changes during a held session.
 - Bind Control native starts to the exact engine, room, output, policy revision and alias incarnation. Native preparation issues a short-lived one-use lease; stale ownership and unknown outcomes fail closed without replay.

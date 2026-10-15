@@ -32,6 +32,7 @@ from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_SCOPES
 from .coordinator import PodConnectCoordinator
 from .observations import ObservationReader, current, register_observation_services
 from .speakers import SpeakersClient
+from .playlist_catalogue import register_playlist_search
 from .targets import register_target_services
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER]
@@ -275,6 +276,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     entry.runtime_data.observations = ObservationReader(coordinator, api)
     entry.runtime_data.commands = PlaybackCommands(entry.runtime_data)
     _register_services(hass)
+    register_playlist_search(hass, _library_owner, _search_query, _search_limit)
     register_command_services(hass)
     register_observation_services(hass)
     register_target_services(hass)

@@ -278,3 +278,44 @@ control_playback:
       required: true
       selector:
         object:
+
+search_playlists:
+  name: Search exact-account Spotify playlists
+  description: Bounded real playlist contexts from one configured account and owner epoch; no playback authority.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    query:
+      required: true
+      selector:
+        text:
+    limit:
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
+get_context_play_controls:
+  name: Read native playlist-context start controls
+  description: Exact account, device and native room start proof; does not play a context or grant authority.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:

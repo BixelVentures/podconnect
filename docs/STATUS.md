@@ -1,4 +1,39 @@
-# Active decision: one fixed music start volume (2026-10-15)
+# Active decision: bounded native playlist context — Control0.10.13 candidate
+
+Implemented source candidate; unpublished and uninstalled. Base is actual merged
+Control0.10.12/native source commit `d4d914e80cd0047286d196bb5012f77664330f99`,
+exact tree `05be2aec21fe1f7906a4ea2f78e74c3a9d5694d1`. The independently scoped
+playlist patch from the separate PodView follow-on applies cleanly to those bytes.
+
+Existing evidence: the original owner accepted only exact track starts; SpotifyApi
+already has the native `context_uri` form. Hypothesis: extending that same command
+owner and source read contract can start real selected playlist contexts without
+new playback, autoplay or volume policy. Changed chain: exact-account search read
+→ owner epoch/source-bound selection in PodVoice → explicit context grant/native
+readiness → existing prepare/commit → guarded Spotify context_uri send → existing
+observation/no-replay receipt. Wrong account/epoch/source and stale native proof,
+commit failure and duplicate commands are the relevant rejection boundaries.
+
+Changes: bounded exact-account/epoch playlist catalogue service; context-specific
+native proof read; `play_context` in the existing PlaybackCommands namespace;
+Control manifest0.10.13 only. No Speakers files/version, provider credentials,
+room policy, grants or model allowance changed. Existing native autoplay and
+same-session/fresh-start volume semantics are retained.
+
+Validation on this actual composed0.10.13 source:61 pinned HA2026.8.2 framework
+tests pass in19.870s, with network disabled, no image pull and read-only source.
+They include five playlist search/context/native-guard regressions.59 boundary
+tests pass; changed Control modules pass syntax checks, versions are bounded to
+Control0.10.13/Speakers0.26.19 and diff checks pass. The playlist runtime delta is
+unchanged from separately reviewed patchdca0e3e0; final exact-tree review and CI
+remain. Source tests do not establish provider or physical proof.
+Rollback is this Control delta and prior integration files; deployment remains the
+coupled explicit rollout/rollback process in docs/releasing.md, not an automatic
+replay or installation. No publication or device action is performed here.
+
+---
+
+# Historical native-start preparation record (2026-10-15)
 
 Status: candidate implementation in an isolated checkout. Released Speakers 0.26.18 and Control 0.10.11 remain unchanged; no Home Assistant installation or physical acceptance is implied.
 
