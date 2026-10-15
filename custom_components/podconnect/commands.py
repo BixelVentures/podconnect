@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 
 import voluptuous as vol
 from homeassistant.core import SupportsResponse
@@ -18,6 +19,8 @@ from .targets import spotify_devices
 COMMAND_TIMEOUT_S = 6
 MAX_RECEIPTS = 128
 _ACTIONS = ("pause", "resume", "next", "previous", "volume")
+_COMMAND_ACTIONS = (*_ACTIONS, "play_track")
+_TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
     "resume": "resuming",
@@ -44,12 +47,26 @@ def _sequence(value):
 
 def _arguments(action, args):
     if not isinstance(args, dict) or set(args) != (
-        {"percent"} if action == "volume" else set()
+        {"percent"}
+        if action == "volume"
+        else {"track_uri", "max_volume"}
+        if action == "play_track"
+        else set()
     ):
         raise CommandRejected("invalid_arguments")
     if action == "volume":
         try:
             _integer(args["percent"])
+        except vol.Invalid as exc:
+            raise CommandRejected("invalid_arguments") from exc
+    if action == "play_track" and (
+        not isinstance(args["track_uri"], str)
+        or _TRACK_URI.fullmatch(args["track_uri"]) is None
+    ):
+        raise CommandRejected("invalid_arguments")
+    if action == "play_track":
+        try:
+            _integer(args["max_volume"])
         except vol.Invalid as exc:
             raise CommandRejected("invalid_arguments") from exc
 
@@ -159,6 +176,81 @@ class PlaybackCommands:
             "target": playback["target"],
             "actions": actions if ready else [],
             "volume_percent": volume,
+            "track_play_supported": True,
+            "status": "ready"
+            if ready
+            else "awaiting_observation"
+            if capacity
+            else "sequence_exhausted",
+            "physical_result_verified": False,
+        }
+
+    def track_controls(self, entry_id, target_id, *, for_command=False):
+        """Offer one exact fresh device, including an inactive selected output."""
+        data = self.data
+        if (
+            data.coordinator.owner_epoch != self.owner_epoch
+            or data.commands is not self
+        ):
+            raise CommandRejected("owner_replaced")
+        binding = (
+            data.api,
+            data.coordinator,
+            data.session,
+            data.observations,
+            data.api._session,
+            data.api._web,
+        )
+        if (
+            any(now is not expected for now, expected in zip(binding, self.binding))
+            or data.api._web.closed
+        ):
+            raise CommandRejected("owner_replaced")
+        observed = data.observations.playback(entry_id)
+        if not observed.get("ok"):
+            raise CommandRejected(observed.get("error_kind", "unavailable"))
+        raw = data.coordinator.data
+        try:
+            matches = [
+                row
+                for row in spotify_devices(raw.get("devices"))
+                if row["id"] == target_id
+            ]
+        except HomeAssistantError as exc:
+            raise CommandRejected("invalid_target") from exc
+        if (
+            len(matches) != 1
+            or matches[0]["is_restricted"]
+            or type(matches[0].get("is_active")) is not bool
+            or len(matches[0]["name"]) > 1024
+        ):
+            raise CommandRejected("invalid_target")
+        volume = matches[0].get("volume_percent")
+        if type(volume) is not int or not 0 <= volume <= 100:
+            raise CommandRejected("capabilities_unavailable")
+        capacity = for_command or self.command_sequence < 2**53 - 1
+        ready = (
+            capacity
+            and (for_command or not self.busy)
+            and observed["poll_sequence"] > self.poll_floor
+        )
+        return {
+            "ok": True,
+            "schema": "podconnect.controls.v1",
+            "config_entry_id": entry_id,
+            "owner_epoch": observed["owner_epoch"],
+            "poll_sequence": observed["poll_sequence"],
+            "next_command_sequence": self.command_sequence + 1 if capacity else None,
+            "observation": observed["observation"],
+            "target": {
+                "kind": "spotify_device",
+                "target_id": target_id,
+                "name": matches[0]["name"],
+            },
+            "target_is_active": matches[0]["is_active"],
+            "actions": ["play_track"] if ready else [],
+            "volume_percent": volume,
+            "track_play_supported": True,
             "status": "ready"
             if ready
             else "awaiting_observation"
@@ -218,7 +310,11 @@ class PlaybackCommands:
         def guard():
             try:
                 current(hass, entry_id, self.data)
-                observed = self.controls(entry_id, target_id, for_command=True)
+                observed = (
+                    self.track_controls(entry_id, target_id, for_command=True)
+                    if action == "play_track"
+                    else self.controls(entry_id, target_id, for_command=True)
+                )
                 if (
                     observed["owner_epoch"] != epoch
                     or observed["poll_sequence"] != sequence
@@ -230,6 +326,11 @@ class PlaybackCommands:
                     raise CommandRejected("awaiting_observation")
                 if action not in observed["actions"]:
                     raise CommandRejected("unsupported_action")
+                if (
+                    action == "play_track"
+                    and observed["volume_percent"] > request["args"]["max_volume"]
+                ):
+                    raise CommandRejected("volume_above_approved_limit")
             except HomeAssistantError as exc:
                 raise CommandRejected("owner_replaced") from exc
             return True
@@ -257,10 +358,15 @@ class PlaybackCommands:
                 "next": self.data.api.next,
                 "previous": self.data.api.previous,
                 "volume": self.data.api.set_volume,
+                "play_track": self.data.api.play,
             }
             kwargs = {"execution_guard": guard, "on_send": sending}
             async with asyncio.timeout(COMMAND_TIMEOUT_S):
-                if action == "volume":
+                if action == "play_track":
+                    await methods[action](
+                        target_id, uris=[request["args"]["track_uri"]], **kwargs
+                    )
+                elif action == "volume":
                     await methods[action](
                         request["args"]["percent"], target_id, **kwargs
                     )
@@ -315,6 +421,14 @@ def register_command_services(hass):
         except CommandRejected as exc:
             return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
 
+    async def track_controls(call):
+        entry_id = call.data["config_entry_id"]
+        data = current(hass, entry_id)
+        try:
+            return data.commands.track_controls(entry_id, call.data["target_id"])
+        except CommandRejected as exc:
+            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+
     async def command(call):
         data = current(hass, call.data["config_entry_id"])
         return await data.commands.execute(hass, dict(call.data))
@@ -325,11 +439,12 @@ def register_command_services(hass):
         vol.Required("expected_poll_sequence"): _sequence,
         vol.Required("request_id"): vol.All(str, vol.Length(min=1, max=145)),
         vol.Required("command_sequence"): _sequence,
-        vol.Required("action"): vol.In(_ACTIONS),
+        vol.Required("action"): vol.In(_COMMAND_ACTIONS),
         vol.Required("args"): dict,
     }
     for name, handler, schema in (
         ("get_playback_controls", controls, identity),
+        ("get_track_play_controls", track_controls, identity),
         ("control_playback", command, command_schema),
     ):
         if not hass.services.has_service(DOMAIN, name):

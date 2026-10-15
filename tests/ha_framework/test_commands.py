@@ -28,6 +28,7 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.command_release = asyncio.Event()
         self.command_queries = []
         self.playing = False
+        self.no_playback = False
         await fixture.TargetFrameworkTests.asyncSetUp(self)
         self.holds.append(self.command_release)
         self.calls.clear()
@@ -35,6 +36,8 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
     async def _backend(self, request):
         if request.path == "/spotify/me/player" and request.method == "GET":
             self.calls.append((request.method, request.path, None, True))
+            if self.no_playback:
+                return web.Response(status=204)
             return web.json_response(
                 {
                     "is_playing": self.playing,
@@ -158,6 +161,93 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.controls())["status"], "awaiting_observation")
         self.assertEqual(len(self._writes()), 5)
         self.assertEqual(self.command_queries[-1]["volume_percent"], "42")
+
+    async def test_selected_track_uses_exact_device_and_one_provider_send(self):
+        uri = "spotify:track:" + "A" * 22
+        request = self.request("play_track", args={"track_uri": uri, "max_volume": 40})
+        controls = await self.hass.services.async_call(
+            "podconnect",
+            "get_track_play_controls",
+            {
+                "config_entry_id": "account-alpha",
+                "kind": "spotify_device",
+                "target_id": "spotify-one",
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(controls["actions"], ["play_track"])
+        self.assertEqual(controls["volume_percent"], 30)
+        receipt = await self.invoke(request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.assertEqual(receipt["target"]["target_id"], "spotify-one")
+        self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
+        self.assertEqual(json.loads(self._writes()[0][2]), {"uris": [uri]})
+        self.assertEqual(await self.invoke(request), receipt)
+        self.assertEqual(len(self._writes()), 1)
+
+    async def test_selected_track_rejects_raw_query_and_wrong_uri_before_send(self):
+        for uri in ("jazz", "spotify:album:" + "A" * 22, "spotify:track:short"):
+            result = await self.invoke(
+                self.request("play_track", args={"track_uri": uri, "max_volume": 40})
+            )
+            self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(self._writes(), [])
+
+    async def test_selected_track_rechecks_approved_volume_and_does_not_send(self):
+        uri = "spotify:track:" + "A" * 22
+        result = await self.invoke(
+            self.request("play_track", args={"track_uri": uri, "max_volume": 20})
+        )
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["error_kind"], "volume_above_approved_limit")
+        self.assertEqual(self._writes(), [])
+
+    async def test_selected_track_can_start_on_exact_inactive_idle_device(self):
+        self.no_playback = True
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        self.entries[0].runtime_data.coordinator.data["devices"][0]["is_active"] = False
+        uri = "spotify:track:" + "A" * 22
+        controls = await self.hass.services.async_call(
+            "podconnect",
+            "get_track_play_controls",
+            {
+                "config_entry_id": "account-alpha",
+                "kind": "spotify_device",
+                "target_id": "spotify-one",
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(controls["actions"], ["play_track"])
+        self.assertIs(controls["target_is_active"], False)
+        result = await self.invoke(
+            self.request("play_track", args={"track_uri": uri, "max_volume": 40})
+        )
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
+        self.assertEqual(len(self._writes()), 1)
+
+    async def test_selected_track_rejects_unknown_device_state_or_volume(self):
+        data = self.entries[0].runtime_data.coordinator.data
+        for change in (
+            {"is_active": None},
+            {"volume_percent": None},
+            {"is_restricted": True},
+            {"name": "A" * 1025},
+        ):
+            original = dict(data["devices"][0])
+            data["devices"][0].update(change)
+            result = await self.invoke(
+                self.request(
+                    "play_track",
+                    args={"track_uri": "spotify:track:" + "A" * 22, "max_volume": 40},
+                )
+            )
+            self.assertEqual(result["outcome"], "rejected")
+            data["devices"][0].clear()
+            data["devices"][0].update(original)
+        self.assertEqual(self._writes(), [])
 
     async def test_duplicate_reuse_and_no_second_command_before_new_poll(self):
         request = self.request()

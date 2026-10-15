@@ -1,8 +1,14 @@
+## Control 0.10.11 - bounded selected-track playback
+
+- Offer `get_track_play_controls` for one exact configured account and Spotify device, including an inactive device only when the current provider observation identifies it, it is unrestricted, and its volume is known.
+- Add `play_track` to the existing direct-device command owner. It requires an exact Spotify track URI and an explicit approved maximum volume; owner, poll, device and current volume are rechecked before one provider send. Uncertain outcomes are not retried.
+- The caller must independently authorize the selected song and controller scope. This release adds no configured-speaker alias command or physical playback confirmation. Speakers is unchanged; installation and audible acceptance remain separate.
+
 ## Control 0.10.10 - bounded PodView Spotify reads
 
 - Add optional validated Spotify artwork to playback, queue and library track reads, while keeping account ownership exact and preserving one-account compatibility for library reads.
 - Add the read-only `search_tracks` service for bounded Spotify track-catalogue results, bound to an exact configured account and with validated optional artwork.
-- No playback command is added by search. Independent source review and official CI remain release gates; no release or installation is included in this candidate.
+- Search adds no playback command. Installation and physical playback verification remain separate from the released integration.
 
 ## Control 0.10.9 - scoped direct playback commands
 

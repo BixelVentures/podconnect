@@ -67,6 +67,11 @@ Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe �
 - **Read-only observations:** `podconnect.get_playback_snapshot` exposes the last successful
   provider poll, and `podconnect.get_queue` reads a bounded account queue through existing auth.
   Both require an exact account entry. See [`docs/OBSERVATIONS.md`](docs/OBSERVATIONS.md).
+- **PodView selection boundary:** `podconnect.search_tracks` returns a bounded exact-account
+  track sample. `get_track_play_controls` offers a source-known direct Spotify device with
+  observed volume; `control_playback` can send one `play_track` command only with the current
+  owner/poll and an explicit approved maximum volume. The caller separately authorizes the
+  song and controller; provider acceptance does not prove audible playback.
 - State via the Spotify Web API, polled ~10s. Installed via **HACS** (custom repository).
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the current version of each half and what changed.
