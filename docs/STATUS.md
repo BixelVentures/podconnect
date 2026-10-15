@@ -1,4 +1,76 @@
-# Active decision: one fixed music start volume (2026-10-15)
+# Active decision: released paused URI start — Speakers 0.26.20 candidate
+
+Source implementation in progress, unpublished and uninstalled. Actual released
+Speakers 0.26.19 can identify its supervised engine but rejects exact-room URI
+start readiness after idle release when /status still reports a logged-in paused
+session. Active derives from username/volume, not a selected native output. A
+read-only intercepted-handler reproducer confirms this causal source defect; the
+currently observed Spotify device is a MacBook, not evidence of Kitchen readiness.
+
+Decision: admit only exact-current-alias Active + Paused + release marker as a
+fresh output claim. Preserve ordinary selected paused same-session manual volume;
+reject unselected alone, playing released routes, unknown owners and cross-room
+active starts. Prime the exact configured start level before output selection,
+recheck source intent/binding and readback, retain release marker through the
+one-use native lease until existing observed-playing reclaim clears it. No new
+provider endpoint, schema, room fallback or PodView-specific volume rule.
+
+Change only native start barrier/tests and Speakers version to 0.26.20; retain
+Control 0.10.13 playlist candidate below. Required evidence: causal positive and
+negative/race/order/replay tests, existing native race/vet checks, independent
+review, coupled contract checks, immutable architecture prebuilds, then coordinated
+installation and physical acceptance. None are implied by this decision record.
+Validation of the current native repair: all manager tests pass with the race
+detector (17.608s); go vet and diff checks pass under Go 1.25 with dependency
+network access disabled. Full native tests used scoped local loopback permission;
+new causal tests intercept HTTP and require no listening sockets. They cover
+released selected/unselected starts, pre-prime/select order, ordinary manual 64%
+pause, rejected unselected-without-release and playing-with-release, changed
+marker/owner, native failures, stale or deselected-output commit and one-use consumption. Existing
+idle alias and local resume tests also pass. No provider/device action performed.
+Independent review identified a deselected-output commit gap; commit now explicitly requires the exact prepared output still selected, and a rejection consumes its lease. Independent rereview, composed consumer tests, images and Green acceptance remain.
+
+Rollback before publication is this native candidate; device rollback follows
+existing docs/releasing.md. Unknown starts are never automatically retried.
+
+---
+
+# Active decision: bounded native playlist context — Control0.10.13 candidate
+
+Implemented source candidate; unpublished and uninstalled. Base is actual merged
+Control0.10.12/native source commit `d4d914e80cd0047286d196bb5012f77664330f99`,
+exact tree `05be2aec21fe1f7906a4ea2f78e74c3a9d5694d1`. The independently scoped
+playlist patch from the separate PodView follow-on applies cleanly to those bytes.
+
+Existing evidence: the original owner accepted only exact track starts; SpotifyApi
+already has the native `context_uri` form. Hypothesis: extending that same command
+owner and source read contract can start real selected playlist contexts without
+new playback, autoplay or volume policy. Changed chain: exact-account search read
+→ owner epoch/source-bound selection in PodVoice → explicit context grant/native
+readiness → existing prepare/commit → guarded Spotify context_uri send → existing
+observation/no-replay receipt. Wrong account/epoch/source and stale native proof,
+commit failure and duplicate commands are the relevant rejection boundaries.
+
+Changes: bounded exact-account/epoch playlist catalogue service; context-specific
+native proof read; `play_context` in the existing PlaybackCommands namespace;
+Control manifest0.10.13 only. No Speakers files/version, provider credentials,
+room policy, grants or model allowance changed. Existing native autoplay and
+same-session/fresh-start volume semantics are retained.
+
+Validation on this actual composed0.10.13 source:61 pinned HA2026.8.2 framework
+tests pass in19.870s, with network disabled, no image pull and read-only source.
+They include five playlist search/context/native-guard regressions.59 boundary
+tests pass; changed Control modules pass syntax checks, versions are bounded to
+Control0.10.13/Speakers0.26.19 and diff checks pass. The playlist runtime delta is
+unchanged from separately reviewed patchdca0e3e0; final exact-tree review and CI
+remain. Source tests do not establish provider or physical proof.
+Rollback is this Control delta and prior integration files; deployment remains the
+coupled explicit rollout/rollback process in docs/releasing.md, not an automatic
+replay or installation. No publication or device action is performed here.
+
+---
+
+# Historical native-start preparation record (2026-10-15)
 
 Status: candidate implementation in an isolated checkout. Released Speakers 0.26.18 and Control 0.10.11 remain unchanged; no Home Assistant installation or physical acceptance is implied.
 

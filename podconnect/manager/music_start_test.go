@@ -213,7 +213,7 @@ func TestNativeReleasedOutputPrepareAndOneUseCommit(t *testing.T) {
 		LeaseID string     `json:"lease_id"`
 		Proof   startProof `json:"proof"`
 	}
-	if prepare.Code != http.StatusOK || json.Unmarshal(prepare.Body.Bytes(), &lease) != nil || len(lease.LeaseID) != 32 || !lease.Proof.OutputSelected || volume != startVolumePercent || len(effects) != 2 || effects[0] != "select" || effects[1] != "volume" {
+	if prepare.Code != http.StatusOK || json.Unmarshal(prepare.Body.Bytes(), &lease) != nil || len(lease.LeaseID) != 32 || !lease.Proof.OutputSelected || volume != startVolumePercent || len(effects) != 3 || effects[0] != "volume" || effects[1] != "select" || effects[2] != "volume" {
 		t.Fatalf("released output was not selected and primed before lease: %d %s %v", prepare.Code, prepare.Body.String(), effects)
 	}
 	commitBody, _ := json.Marshal(map[string]any{"lease_id": lease.LeaseID})
@@ -348,7 +348,7 @@ func TestIdleDifferentRoomPrimesBeforeAliasSwitchAndProviderLease(t *testing.T) 
 	body, _ := json.Marshal(map[string]any{"room_id": "r1", "target_id": id, "policy_revision": proof.PolicyRevision, "alias_incarnation": proof.AliasBinding.Incarnation})
 	prepare := httptest.NewRecorder()
 	startRequest(prepare, httptest.NewRequest(http.MethodPost, "/api/start-volume", bytes.NewReader(body)))
-	if prepare.Code != http.StatusOK || len(effects) != 4 || effects[0] != "prime" || effects[1] != "alias" || effects[2] != "select" || effects[3] != "prime" {
+	if prepare.Code != http.StatusOK || len(effects) != 5 || effects[0] != "prime" || effects[1] != "alias" || effects[2] != "prime" || effects[3] != "select" || effects[4] != "prime" {
 		t.Fatalf("idle transfer did not prime before route and again before lease: %d %s %v", prepare.Code, prepare.Body.String(), effects)
 	}
 }

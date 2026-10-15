@@ -751,3 +751,41 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.controls())["next_command_sequence"], 1)
         self.assertEqual((await self.invoke(self.request()))["outcome"], "accepted")
         self.assertEqual(len(self._writes()), 2)
+
+    async def test_playlist_context_keeps_native_prepare_commit_and_existing_context_uri(self):
+        uri = 'spotify:playlist:' + 'P' * 22
+        args = self.track_args(uri)
+        args['context_uri'] = args.pop('track_uri')
+        controls = await self.hass.services.async_call('podconnect', 'get_context_play_controls',
+            {'config_entry_id': 'account-alpha', 'kind': 'spotify_device',
+             'target_id': 'spotify-one', 'room_id': 'room-alpha'}, blocking=True, return_response=True)
+        self.assertEqual(controls['actions'], ['play_context'])
+        self.assertTrue(controls['context_play_supported'])
+        request = self.request('play_context', args=args)
+        result = await self.invoke(request)
+        self.assertEqual(result['outcome'], 'accepted')
+        self.assertEqual(json.loads(self._writes()[0][2]), {'context_uri': uri})
+        self.assertEqual((self.native_prepares, self.native_commits), (1, 1))
+        self.assertEqual(await self.invoke(request), result)
+        self.assertEqual(len(self._writes()), 1)
+        self.assertEqual(self.command_queries[-1]['device_id'], 'spotify-one')
+
+    async def test_playlist_context_rejects_track_uri_and_stale_native_proof(self):
+        args = self.track_args('spotify:track:' + 'A' * 22)
+        args['context_uri'] = args.pop('track_uri')
+        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
+        args['context_uri'] = 'spotify:playlist:' + 'P' * 22
+        args['start_policy_revision'] = 'c' * 64
+        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
+        self.assertEqual(self._writes(), [])
+
+    async def test_playlist_context_unknown_native_commit_never_sends_or_retries(self):
+        self.native_commit_status = 500
+        args = self.track_args('spotify:playlist:' + 'P' * 22)
+        args['context_uri'] = args.pop('track_uri')
+        request = self.request('play_context', args=args)
+        first = await self.invoke(request)
+        self.assertEqual(first['outcome'], 'rejected')
+        self.assertEqual(await self.invoke(request), first)
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.native_commits, 1)

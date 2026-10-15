@@ -358,3 +358,26 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue_calls, 1)
         self.assertEqual(await self.service('get_queue'), result)
         self.assertEqual(self.queue_calls, 1)
+
+    async def test_playlist_search_exact_account_epoch_and_closed_real_context(self):
+        self.search_payload = {'playlists': {'items': [{'type': 'playlist',
+            'uri': 'spotify:playlist:' + 'P' * 22, 'name': 'Real cooking', 'secret': 'NEVER_PUBLIC'}]}}
+        alpha, beta = self.entries
+        with patch.object(alpha.runtime_data.api, 'search', side_effect=AssertionError('wrong account')):
+            result = await self.hass.services.async_call('podconnect', 'search_playlists',
+                {'config_entry_id': beta.entry_id, 'query': 'cooking', 'limit': 3},
+                blocking=True, return_response=True)
+        self.assertEqual(result['owner_epoch'], beta.runtime_data.coordinator.owner_epoch)
+        self.assertEqual(result['config_entry_id'], beta.entry_id)
+        self.assertEqual(result['playlists'], [{'uri': 'spotify:playlist:' + 'P' * 22, 'name': 'Real cooking'}])
+        self.assertEqual(self.search_queries[-1], {'q': 'cooking', 'type': 'playlist', 'limit': '3'})
+        self.assertNotIn('NEVER_PUBLIC', str(result))
+        self.assertEqual(self._writes(), [])
+
+    async def test_playlist_search_does_not_promote_track_or_missing_owner(self):
+        self.search_payload = {'playlists': {'items': [search_track(0)]}}
+        with self.assertRaises(HomeAssistantError):
+            await self.service('search_playlists', query='cooking')
+        with self.assertRaises(HomeAssistantError):
+            await self.service('search_playlists', 'unknown-account', query='cooking')
+        self.assertEqual(self._writes(), [])

@@ -768,6 +768,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     async_get_clientsession=lambda h: Web([]),
                     PodConnectData=lambda **kw: SimpleNamespace(**kw, active=False),
                     _register_services=lambda h: None,
+                    register_playlist_search=lambda *args: None,
+                    _library_owner=object(), _search_query=object(), _search_limit=object(),
                     register_target_services=lambda h: None,
                     register_observation_services=lambda h: None,
                     _options_updated=object(),
