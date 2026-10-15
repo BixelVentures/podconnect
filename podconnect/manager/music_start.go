@@ -494,7 +494,19 @@ func startIdentityRequest(w http.ResponseWriter, r *http.Request) {
 		status, intent := rt.live.transportSnapshot()
 		if intent.run != 0 && rt.live.startIntentCurrent(intent) &&
 			status.AliasBinding != nil && status.AliasBinding.valid() {
-			writeJSON(w, map[string]any{"schema": "podconnect.start_identity.v1", "engine_device_id": id})
+			reply := map[string]any{"schema": "podconnect.start_identity.v1", "engine_device_id": id}
+			// Explicit diagnostic opt-in keeps existing start-path reads unchanged.
+			if r.URL.Query().Get("account") == "1" {
+				w.Header().Set("Cache-Control", "no-store")
+				account := rt.live.observeAccountIdentity(rt.room.Librespot, id)
+				// A local read cannot carry an obsolete engine/route into the response.
+				if configuredEngineID(room) != id || mgr.runtime(room.ID) != rt || !rt.live.startIntentCurrent(intent) {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				reply["account_observation"] = account
+			}
+			writeJSON(w, reply)
 			return
 		}
 		break

@@ -721,6 +721,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             registered = []
             command_owners = []
             command_registrations = []
+            diagnostic_registrations = []
 
             def command_owner(runtime):
                 owner = SimpleNamespace(runtime=runtime)
@@ -763,6 +764,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     ObservationReader=lambda c, a: SimpleNamespace(coordinator=c, api=a),
                     PlaybackCommands=command_owner,
                     register_command_services=lambda h: command_registrations.append(h),
+                    register_account_diagnostic_service=lambda h: diagnostic_registrations.append(h),
                     CONF_SPEAKERS_URL="speakers_url",
                     SpeakersClient=S["SpeakersClient"],
                     async_get_clientsession=lambda h: Web([]),
@@ -788,6 +790,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(entry.runtime_data.commands, command_owners[0])
             self.assertIs(command_owners[0].runtime, entry.runtime_data)
             self.assertEqual(command_registrations, [hass])
+            self.assertEqual(diagnostic_registrations, [hass])
             self.assertEqual(len(registered), 1)
             self.assertEqual(registered[0][0], "listener")
 

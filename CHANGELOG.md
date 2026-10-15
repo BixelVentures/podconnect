@@ -1,3 +1,10 @@
+## Speakers 0.26.21 / Control 0.10.14 — combined candidate, unpublished
+
+- Add an explicit read-only account-identifier diagnostic for the current native engine. Ordinary identity reads remain unchanged; optional account observation is bounded to the actual engine and current connection, and reveals no raw username or credential.
+- Control compares only with the existing configured account identifier. Identifier equality/difference is diagnostic and does not admit playback or bypass Spotify device/account/currentness guards.
+- Add current native queue observations and one-use occurrence selection through the serialized player, bounded manager and existing exact-account Control command owner. Preserve duplicate songs and manual queue order; changed/cancelled/consumed source rejects without URI/index/Next fallback or automatic replay.
+- Preserve native autoplay and fixed start-volume ownership. Source reviews/tests, immutable images, publication, installation and physical acceptance remain separate.
+
 ## Speakers 0.26.20 — released paused URI-start candidate, unpublished
 
 - Recognize an exact current-alias logged-in paused engine with a released output as a fresh native start claim. Ordinary selected pause/resume retains manual volume; unselected state alone grants no readiness.

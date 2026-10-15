@@ -27,6 +27,7 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
 
 from .api import SpotifyApi, SpotifyApiError
 from .artwork import spotify_album_artwork
+from .account_diagnostic_service import register_account_diagnostic_service
 from .commands import PlaybackCommands, register_command_services
 from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_SCOPES
 from .coordinator import PodConnectCoordinator
@@ -279,6 +280,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     register_playlist_search(hass, _library_owner, _search_query, _search_limit)
     register_command_services(hass)
     register_observation_services(hass)
+    register_account_diagnostic_service(hass)
     register_target_services(hass)
     entry.async_on_unload(entry.add_update_listener(_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

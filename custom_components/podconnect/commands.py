@@ -20,7 +20,7 @@ from .targets import spotify_devices
 COMMAND_TIMEOUT_S = 6
 MAX_RECEIPTS = 128
 _ACTIONS = ("pause", "resume", "next", "previous", "volume")
-_COMMAND_ACTIONS = (*_ACTIONS, "play_track", "play_context")
+_COMMAND_ACTIONS = (*_ACTIONS, "play_track", "play_context", "play_queue_occurrence")
 _TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
@@ -47,6 +47,11 @@ def _sequence(value):
 
 
 def _arguments(action, args):
+    if action == "play_queue_occurrence":
+        from .queue_controls import valid_arguments
+        if not valid_arguments(args):
+            raise CommandRejected("invalid_arguments")
+        return
     if not isinstance(args, dict) or set(args) != (
         {"percent"}
         if action == "volume"
@@ -98,6 +103,7 @@ class PlaybackCommands:
         self.receipts = {}
         self.poll_floor = 0
         self.command_sequence = 0
+        self.queue_controls = None
 
     def controls(self, entry_id, target_id, *, for_command=False):
         data = self.data
@@ -291,6 +297,12 @@ class PlaybackCommands:
         result["native_start"] = proof
         return result
 
+    async def queue_start_controls(self, hass, entry_id, target_id, room_id):
+        from .queue_controls import QueueControls
+        if self.queue_controls is None:
+            self.queue_controls = QueueControls(self)
+        return await self.queue_controls.read(hass, entry_id, target_id, room_id)
+
     async def execute(self, hass, request):
         entry_id, target_id = request["config_entry_id"], request["target_id"]
         epoch, sequence = request["owner_epoch"], request["expected_poll_sequence"]
@@ -356,7 +368,7 @@ class PlaybackCommands:
                 # command's floor still prevents acting on pre-command observations.
                 if sequence <= self.poll_floor:
                     raise CommandRejected("awaiting_observation")
-                if ("play_track" if action == "play_context" else action) not in observed["actions"]:
+                if ("play_track" if action == "play_context" else "next" if action == "play_queue_occurrence" else action) not in observed["actions"]:
                     raise CommandRejected("unsupported_action")
                 if (
                     action in {"play_track", "play_context"}
@@ -434,8 +446,12 @@ class PlaybackCommands:
                 "play_context": self.data.api.play,
             }
             kwargs = {"execution_guard": guard, "on_send": sending}
-            async with asyncio.timeout(14 if action in {"play_track", "play_context"} else COMMAND_TIMEOUT_S):
-                if action in {"play_track", "play_context"}:
+            async with asyncio.timeout(14 if action in {"play_track", "play_context"} else 8 if action == "play_queue_occurrence" else COMMAND_TIMEOUT_S):
+                if action == "play_queue_occurrence":
+                    if self.queue_controls is None:
+                        raise CommandRejected("native_queue_stale")
+                    await self.queue_controls.commit(hass, entry_id, target_id, request["args"], guard, sending)
+                elif action in {"play_track", "play_context"}:
                     await methods[action](
                         target_id, **({"context_uri": request["args"]["context_uri"]} if action == "play_context" else {"uris": [request["args"]["track_uri"]]}),
                         async_execution_guard=native_commit, **kwargs
@@ -510,6 +526,14 @@ def register_command_services(hass):
             result["context_play_supported"] = True
         return result
 
+    async def queue_controls(call):
+        entry_id = call.data["config_entry_id"]
+        data = current(hass, entry_id)
+        try:
+            return await data.commands.queue_start_controls(hass, entry_id, call.data["target_id"], call.data["room_id"])
+        except CommandRejected as exc:
+            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+
     async def command(call):
         data = current(hass, call.data["config_entry_id"])
         return await data.commands.execute(hass, dict(call.data))
@@ -527,6 +551,7 @@ def register_command_services(hass):
         ("get_playback_controls", controls, identity),
         ("get_track_play_controls", track_controls, {**identity, vol.Required("room_id"): target}),
         ("get_context_play_controls", context_controls, {**identity, vol.Required("room_id"): target}),
+        ("get_queue_controls", queue_controls, {vol.Required("config_entry_id"): target, vol.Required("target_id"): target, vol.Required("room_id"): target}),
         ("control_playback", command, command_schema),
     ):
         if not hass.services.has_service(DOMAIN, name):
