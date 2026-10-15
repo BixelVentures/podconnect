@@ -1,0 +1,834 @@
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -13,7 +13,9 @@
+ )
+ 
+ type List struct {
+-	log librespot.Logger
++	queueRevision          uint64
++	queueRevisionExhausted bool
++	log                    librespot.Logger
+ 
+ 	ctx *spclient.ContextResolver
+ 
+@@ -59,6 +61,7 @@
+ }
+ 
+ func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) error {
++	tl.invalidateQueueObservation()
+ 	iter := tl.tracks.iterStart()
+ 	for iter.next(ctx) {
+ 		curr := iter.get()
+@@ -190,6 +193,7 @@
+ }
+ 
+ func (tl *List) GoStart(ctx context.Context) bool {
++	tl.invalidateQueueObservation()
+ 	if err := tl.tracks.moveStart(ctx); err != nil {
+ 		tl.log.WithError(err).Error("failed going to start")
+ 		return false
+@@ -214,6 +218,7 @@
+ }
+ 
+ func (tl *List) GoNext(ctx context.Context) bool {
++	tl.invalidateQueueObservation()
+ 	if tl.playingQueue {
+ 		tl.queue = tl.queue[1:]
+ 	}
+@@ -239,6 +244,7 @@
+ }
+ 
+ func (tl *List) GoPrev() bool {
++	tl.invalidateQueueObservation()
+ 	if tl.playingQueue {
+ 		tl.playingQueue = false
+ 	}
+@@ -257,6 +263,7 @@
+ }
+ 
+ func (tl *List) AddToQueue(track *connectpb.ContextTrack) {
++	tl.invalidateQueueObservation()
+ 	if track.Metadata == nil {
+ 		track.Metadata = make(map[string]string)
+ 	}
+@@ -266,6 +273,7 @@
+ }
+ 
+ func (tl *List) SetQueue(_ []*connectpb.ContextTrack, next []*connectpb.ContextTrack) {
++	tl.invalidateQueueObservation()
+ 	if tl.playingQueue {
+ 		tl.queue = tl.queue[:1]
+ 	} else {
+@@ -285,6 +293,7 @@
+ }
+ 
+ func (tl *List) SetPlayingQueue(val bool) {
++	tl.invalidateQueueObservation()
+ 	tl.playingQueue = len(tl.queue) > 0 && val
+ }
+ 
+@@ -293,6 +302,7 @@
+ 		return nil
+ 	}
+ 
++	tl.invalidateQueueObservation()
+ 	if shuffle {
+ 		// fetch all tracks
+ 		iter := tl.tracks.iterStart()
+--- /dev/null
++++ b/tracks/queue_occurrence.go
+@@ -0,0 +1,129 @@
++package tracks
++
++import (
++	"context"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"math"
++)
++
++const MaxQueueOccurrences = 20
++
++type QueueOccurrence struct {
++	Position int    `json:"position"`
++	URI      string `json:"uri"`
++	UID      string `json:"uid"`
++	Queued   bool   `json:"queued"`
++}
++
++type QueueObservation struct {
++	Revision  uint64            `json:"queue_revision"`
++	Items     []QueueOccurrence `json:"items"`
++	Truncated bool              `json:"truncated"`
++}
++
++func (tl *List) invalidateQueueObservation() {
++	if tl.queueRevision == math.MaxUint64 {
++		tl.queueRevisionExhausted = true
++		return
++	}
++	tl.queueRevision++
++}
++
++// ObserveUpcoming is called only by the existing serialized native player owner.
++// It exposes the same upcoming order GoNext consumes, never the REST account queue.
++func (tl *List) ObserveUpcoming(ctx context.Context) (QueueObservation, error) {
++	result := QueueObservation{Revision: tl.queueRevision, Items: []QueueOccurrence{}}
++	if tl.queueRevisionExhausted || tl.tracks == nil || tl.tracks.pos < 0 || tl.ctx == nil {
++		return result, fmt.Errorf("queue occurrence owner unavailable")
++	}
++	appendTrack := func(track *connectpb.ContextTrack, queued bool) error {
++		if track == nil || (track.Uri == "" && len(track.Gid) != 16) {
++			return fmt.Errorf("unidentified upcoming occurrence")
++		}
++		provided := librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), track)
++		if provided.Uri == "" {
++			return fmt.Errorf("unidentified upcoming occurrence")
++		}
++		result.Items = append(result.Items, QueueOccurrence{Position: len(result.Items), URI: provided.Uri, UID: track.Uid, Queued: queued})
++		return nil
++	}
++	start := 0
++	if tl.playingQueue {
++		start = 1
++	}
++	if start > len(tl.queue) {
++		return result, fmt.Errorf("invalid playing queue cursor")
++	}
++	for _, track := range tl.queue[start:] {
++		if len(result.Items) == MaxQueueOccurrences {
++			break
++		}
++		if err := appendTrack(track, true); err != nil {
++			return QueueObservation{}, err
++		}
++	}
++	iter := tl.tracks.iterHere()
++	for len(result.Items) < MaxQueueOccurrences && iter.next(ctx) {
++		if err := appendTrack(iter.get().item, false); err != nil {
++			return QueueObservation{}, err
++		}
++	}
++	if len(result.Items) == MaxQueueOccurrences {
++		result.Truncated = len(tl.queue)-start > MaxQueueOccurrences || iter.next(ctx)
++	}
++	if err := ctx.Err(); err != nil {
++		return QueueObservation{}, err
++	}
++	if err := iter.error(); err != nil {
++		return QueueObservation{}, err
++	}
++	return result, nil
++}
++
++// SelectUpcoming never falls back to another track and loads no audio. Its caller
++// must compare process/List/session/connection/alias and consume its opaque token
++// before calling; a bare revision is not cross-session authority.
++func (tl *List) SelectUpcoming(ctx context.Context, revision uint64, position int) error {
++	if tl.queueRevisionExhausted || revision != tl.queueRevision || position < 0 || position >= MaxQueueOccurrences {
++		return fmt.Errorf("stale or invalid queue occurrence")
++	}
++	observation, err := tl.ObserveUpcoming(ctx)
++	if err != nil {
++		return err
++	}
++	if position >= len(observation.Items) {
++		return fmt.Errorf("queue occurrence missing")
++	}
++	start := 0
++	if tl.playingQueue {
++		start = 1
++	}
++	manual := len(tl.queue) - start
++	if position < manual {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		tl.invalidateQueueObservation()
++		tl.queue = tl.queue[start+position:]
++		tl.playingQueue = true
++		return nil
++	}
++	// Locate first, then commit once. Failed/cancelled page reads cannot trim
++	// the manual queue, rewind the context, or move the audible player.
++	iter := tl.tracks.iterHere()
++	for remaining := position - manual; remaining >= 0; remaining-- {
++		if !iter.next(ctx) {
++			return fmt.Errorf("queue occurrence disappeared: %v", iter.error())
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	tl.invalidateQueueObservation()
++	tl.tracks.move(iter)
++	tl.queue = nil
++	tl.playingQueue = false
++	return nil
++}
+--- /dev/null
++++ b/tracks/queue_occurrence_test.go
+@@ -0,0 +1,141 @@
++package tracks
++
++import (
++	"context"
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"reflect"
++	"testing"
++)
++
++func occurrenceFixture(t *testing.T) *List {
++	t.Helper()
++	rows := []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000000", Uid: "current"}, {Uri: "spotify:track:1111111111111111111111", Uid: "duplicate"}, {Uri: "spotify:track:1111111111111111111111", Uid: "duplicate"}, {Uri: "spotify:track:2222222222222222222222", Uid: "last"}}
++	tl, err := NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000000", Pages: []*connectpb.ContextPage{{Tracks: rows}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := tl.Seek(context.Background(), func(track *connectpb.ContextTrack) bool { return track.Uid == "current" }); err != nil {
++		t.Fatal(err)
++	}
++	return tl
++}
++
++func TestUpcomingDuplicateContextOccurrenceAndSingleUseRevision(t *testing.T) {
++	tl := occurrenceFixture(t)
++	o, err := tl.ObserveUpcoming(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(o.Items) != 3 || o.Items[0].URI != o.Items[1].URI {
++		t.Fatal("fixture did not retain duplicate upcoming occurrences")
++	}
++	if err := tl.SelectUpcoming(context.Background(), o.Revision, 1); err != nil {
++		t.Fatal(err)
++	}
++	if tl.Index().Track != 2 {
++		t.Fatal("URI or duplicate UID matched first occurrence rather than exact second position")
++	}
++	if err := tl.SelectUpcoming(context.Background(), o.Revision, 0); err == nil {
++		t.Fatal("replayed observation mutated queue")
++	}
++	if tl.Index().Track != 2 {
++		t.Fatal("replay rewound context")
++	}
++}
++
++func TestUpcomingManualQueueKeepsContextAndFollowingQueue(t *testing.T) {
++	tl := occurrenceFixture(t)
++	first := &connectpb.ContextTrack{Uri: "spotify:track:1111111111111111111111", Uid: "duplicate"}
++	second := &connectpb.ContextTrack{Uri: first.Uri, Uid: first.Uid}
++	last := &connectpb.ContextTrack{Uri: "spotify:track:3333333333333333333333", Uid: "last-manual"}
++	tl.AddToQueue(first)
++	tl.AddToQueue(second)
++	tl.AddToQueue(last)
++	o, err := tl.ObserveUpcoming(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !o.Items[0].Queued || !o.Items[1].Queued || o.Items[3].Queued {
++		t.Fatal("manual/context order changed")
++	}
++	if err := tl.SelectUpcoming(context.Background(), o.Revision, 1); err != nil {
++		t.Fatal(err)
++	}
++	if !tl.playingQueue || len(tl.queue) != 2 || tl.queue[0] != second || tl.queue[1] != last || tl.tracks.pos != 0 {
++		t.Fatal("manual duplicate selection lost cursor or remaining manual queue")
++	}
++	n, err := tl.ObserveUpcoming(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n.Items[0].UID != "last-manual" {
++		t.Fatal("playing manual item was offered as its own next occurrence")
++	}
++}
++
++func TestUpcomingContextJumpPastManualQueueDoesNotReplacePlaylist(t *testing.T) {
++	tl := occurrenceFixture(t)
++	cursor := tl.tracks
++	tl.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:3333333333333333333333", Uid: "manual"})
++	o, err := tl.ObserveUpcoming(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := tl.SelectUpcoming(context.Background(), o.Revision, 2); err != nil {
++		t.Fatal(err)
++	}
++	if tl.tracks != cursor || tl.tracks.pos != 2 || tl.playingQueue || len(tl.queue) != 0 {
++		t.Fatal("context occurrence did not move existing cursor once past manual queue")
++	}
++}
++
++func TestUpcomingStaleABACancelAndInvalidNeverFallback(t *testing.T) {
++	for _, kind := range []string{"mutation", "aba", "cancel", "missing", "negative"} {
++		t.Run(kind, func(t *testing.T) {
++			tl := occurrenceFixture(t)
++			o, err := tl.ObserveUpcoming(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			ctx := context.Background()
++			position := 1
++			switch kind {
++			case "mutation":
++				tl.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:3333333333333333333333"})
++			case "aba":
++				tl.SetPlayingQueue(false)
++				tl.SetPlayingQueue(false)
++			case "cancel":
++				var cancel context.CancelFunc
++				ctx, cancel = context.WithCancel(ctx)
++				cancel()
++			case "missing":
++				position = 19
++			case "negative":
++				position = -1
++			}
++			beforePos, beforePlaying, beforeQueue := tl.tracks.pos, tl.playingQueue, append([]*connectpb.ContextTrack(nil), tl.queue...)
++			if err := tl.SelectUpcoming(ctx, o.Revision, position); err == nil {
++				t.Fatal("invalid/stale jump accepted")
++			}
++			if tl.tracks.pos != beforePos || tl.playingQueue != beforePlaying || !reflect.DeepEqual(tl.queue, beforeQueue) {
++				t.Fatal("rejected jump changed queue/cursor")
++			}
++		})
++	}
++}
++
++func TestUpcomingMalformedIdentityRejectsWithoutPanicOrCursorMutation(t *testing.T) {
++	for _, track := range []*connectpb.ContextTrack{nil, {}, {Gid: []byte{1}}, {Gid: make([]byte, 17)}} {
++		tl := occurrenceFixture(t)
++		tl.queue = []*connectpb.ContextTrack{track}
++		before := tl.tracks.pos
++		if _, err := tl.ObserveUpcoming(context.Background()); err == nil {
++			t.Fatal("malformed queue identity accepted")
++		}
++		if tl.tracks.pos != before || len(tl.queue) != 1 || tl.queue[0] != track {
++			t.Fatal("malformed read changed queue/cursor")
++		}
++	}
++}
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,8 +30,9 @@
+ )
+ 
+ type AppPlayer struct {
+-	app  *App
+-	sess *session.Session
++	queueOccurrenceOffer *nativeQueueOffer
++	app                  *App
++	sess                 *session.Session
+ 
+ 	stop   chan struct{}
+ 	logout chan *AppPlayer
+@@ -528,6 +529,10 @@
+ 	defer cancel()
+ 
+ 	switch req.Type {
++	case ApiRequestTypeQueueOccurrences:
++		return p.observeQueueOccurrences(ctx, req.Data.(queueReadRequest))
++	case ApiRequestTypeQueueOccurrence:
++		return p.commitQueueOccurrence(ctx, req.Data.(queueJumpRequest))
+ 	case ApiRequestTypeAliases:
+ 		return p.localAliases()
+ 	case ApiRequestTypeSelectAlias:
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -58,6 +58,8 @@
+ 
+ const (
+ 	ApiRequestTypeRoot                ApiRequestType = "root"
++	ApiRequestTypeQueueOccurrences    ApiRequestType = "queue_occurrences"
++	ApiRequestTypeQueueOccurrence     ApiRequestType = "queue_occurrence"
+ 	ApiRequestTypeAliases             ApiRequestType = "aliases"
+ 	ApiRequestTypeSelectAlias         ApiRequestType = "select_alias"
+ 	ApiRequestTypeWebApi              ApiRequestType = "web_api"
+@@ -694,6 +696,8 @@
+ 
+ 		s.handleRequest(ApiRequest{Type: ApiRequestTypeSetShufflingContext, Data: data.Shuffle}, w)
+ 	})
++	m.HandleFunc("/player/queue_occurrences", s.handleQueueOccurrences)
++	m.HandleFunc("/player/queue_occurrence", s.handleQueueOccurrence)
+ 	m.HandleFunc("/player/add_to_queue", func(w http.ResponseWriter, r *http.Request) {
+ 		if r.Method != "POST" {
+ 			w.WriteHeader(http.StatusMethodNotAllowed)
+--- /dev/null
++++ b/daemon/queue_occurrence.go
+@@ -0,0 +1,327 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"reflect"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++const queueOfferLifetime = 10 * time.Second
++
++var queueIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
++var queueOccurrenceIDPattern = regexp.MustCompile(`^[a-f0-9]{24}$`)
++
++type queueReadRequest struct {
++	AccountUserID string
++	RoomID        string
++	Context       context.Context
++}
++type queueJumpRequest struct {
++	AccountUserID string          `json:"account_user_id"`
++	RoomID        string          `json:"room_id"`
++	ObservationID string          `json:"observation_id"`
++	SessionID     string          `json:"session_id"`
++	QueueRevision uint64          `json:"queue_revision"`
++	OccurrenceID  string          `json:"occurrence_id"`
++	Context       context.Context `json:"-"`
++}
++type nativeQueueItem struct {
++	ID       string `json:"id"`
++	Position int    `json:"position"`
++	URI      string `json:"uri"`
++	Queued   bool   `json:"queued"`
++}
++type nativeQueueSnapshot struct {
++	Schema           string            `json:"schema"`
++	TargetID         string            `json:"target_id"`
++	RoomID           string            `json:"room_id"`
++	AccountUserID    string            `json:"account_user_id"`
++	ConnectionID     string            `json:"connection_id"`
++	SessionID        string            `json:"session_id"`
++	AliasIncarnation string            `json:"alias_incarnation"`
++	ObservationID    string            `json:"observation_id"`
++	QueueRevision    uint64            `json:"queue_revision"`
++	ExpiresAfterMS   int               `json:"expires_after_ms"`
++	Items            []nativeQueueItem `json:"items"`
++	Truncated        bool              `json:"truncated"`
++}
++type nativeQueueOffer struct {
++	Snapshot nativeQueueSnapshot
++	State    *State
++	Tracks   *tracks.List
++	Alias    ApiAliasBinding
++	Expires  time.Time
++}
++
++func randomQueueID(bytes int) (string, error) {
++	raw := make([]byte, bytes)
++	if _, err := rand.Read(raw); err != nil {
++		return "", err
++	}
++	return hex.EncodeToString(raw), nil
++}
++func queueOperationContext(parent, request context.Context) (context.Context, context.CancelFunc) {
++	if request == nil {
++		request = context.Background()
++	}
++	ctx, cancel := context.WithTimeout(request, 3*time.Second)
++	stop := context.AfterFunc(parent, cancel)
++	// HTTP cancellation is the direct parent: cancellation before mutation
++	// cannot wait for an AfterFunc goroutine. Actor shutdown is checked again
++	// synchronously at the native effect admission boundary.
++	if parent.Err() != nil {
++		cancel()
++	}
++	return ctx, func() { stop(); cancel() }
++}
++func (p *AppPlayer) queueBinding(account, room string) (*ApiAliasBinding, error) {
++	if p.sess == nil || p.state == nil || p.state.player == nil || p.state.tracks == nil || !p.state.active || !p.playbackReady() || p.state.player.SessionId == "" || account == "" || len(account) > 160 || p.sess.Username() != account || p.spotConnId == "" {
++		return nil, ErrAliasConflict
++	}
++	binding := p.aliasBinding()
++	if binding == nil || !binding.Ready || binding.RoomID != room || binding.Incarnation == "" || room == "" {
++		return nil, ErrAliasConflict
++	}
++	return binding, nil
++}
++func (p *AppPlayer) observeQueueOccurrences(parent context.Context, request queueReadRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	binding, err := p.queueBinding(request.AccountUserID, request.RoomID)
++	if err != nil {
++		return nil, err
++	}
++	state, list, connection, session := p.state, p.state.tracks, p.spotConnId, p.state.player.SessionId
++	observed, err := list.ObserveUpcoming(ctx)
++	if err != nil {
++		return nil, ErrAliasConflict
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err := parent.Err(); err != nil {
++		return nil, err
++	}
++	latest, bindingErr := p.queueBinding(request.AccountUserID, request.RoomID)
++	if bindingErr != nil || latest == nil || *latest != *binding || p.state != state || p.state.tracks != list || p.spotConnId != connection || p.state.player.SessionId != session {
++		return nil, ErrAliasConflict
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	result := nativeQueueSnapshot{Schema: "podconnect.native_queue.v1", TargetID: p.app.deviceId, RoomID: request.RoomID, AccountUserID: request.AccountUserID, ConnectionID: p.spotConnId, SessionID: p.state.player.SessionId, AliasIncarnation: binding.Incarnation, ObservationID: id, QueueRevision: observed.Revision, ExpiresAfterMS: 10000, Items: []nativeQueueItem{}, Truncated: observed.Truncated}
++	for _, row := range observed.Items {
++		occurrence, err := randomQueueID(12)
++		if err != nil {
++			return nil, err
++		}
++		result.Items = append(result.Items, nativeQueueItem{occurrence, row.Position, row.URI, row.Queued})
++	}
++	p.queueOccurrenceOffer = &nativeQueueOffer{result, p.state, p.state.tracks, *binding, time.Now().Add(queueOfferLifetime)}
++	return result, nil
++}
++func (p *AppPlayer) commitQueueOccurrence(parent context.Context, request queueJumpRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	offer := p.queueOccurrenceOffer
++	// Every attempted token consumption retires that exact offer before selection,
++	// including failures/unknown outcomes. Invalid foreign tokens do not erase a new offer.
++	if offer == nil || request.ObservationID != offer.Snapshot.ObservationID {
++		return nil, ErrAliasConflict
++	}
++	p.queueOccurrenceOffer = nil
++	binding, err := p.queueBinding(request.AccountUserID, request.RoomID)
++	if err != nil || ctx.Err() != nil || !time.Now().Before(offer.Expires) || p.state != offer.State || p.state.tracks != offer.Tracks || binding == nil || *binding != offer.Alias || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || request.SessionID != offer.Snapshot.SessionID || request.QueueRevision != offer.Snapshot.QueueRevision || request.AccountUserID != offer.Snapshot.AccountUserID || request.RoomID != offer.Snapshot.RoomID {
++		return nil, ErrAliasConflict
++	}
++	position := -1
++	for _, row := range offer.Snapshot.Items {
++		if row.ID == request.OccurrenceID {
++			position = row.Position
++			break
++		}
++	}
++	if position < 0 {
++		return nil, ErrBadRequest
++	}
++	p.aliasMu.Lock()
++	latest := p.aliasBindingLocked()
++	if latest == nil || *latest != offer.Alias || p.aliasRetired || ctx.Err() != nil || parent.Err() != nil {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	selectionErr := p.state.tracks.SelectUpcoming(ctx, request.QueueRevision, position)
++	p.aliasMu.Unlock()
++	if selectionErr != nil {
++		return nil, ErrAliasConflict
++	}
++	// Selection has crossed its native mutation boundary. Media load failure is
++	// unknown to clients; never fallback, retry, alter volume, or replace context.
++	p.state.player.Track = p.state.tracks.CurrentTrack()
++	p.state.player.PrevTracks = p.state.tracks.PrevTracks()
++	p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
++	p.state.player.Index = p.state.tracks.Index()
++	p.state.player.Timestamp = time.Now().UnixMilli()
++	p.state.player.PositionAsOfTimestamp = 0
++	if err := p.loadCurrentTrack(ctx, false, true); err != nil {
++		return nil, err
++	}
++	return map[string]any{"ok": true, "schema": "podconnect.native_queue_commit.v1", "observation_id": request.ObservationID, "occurrence_id": request.OccurrenceID, "physical_result_verified": false}, nil
++}
++
++func (s *ConcreteApiServer) serveQueueRequest(w http.ResponseWriter, r *http.Request, typ ApiRequestType, data any, ctx context.Context) {
++	req, wait := NewApiRequest(typ, data)
++	select {
++	case s.requests <- req:
++	case <-ctx.Done():
++		w.WriteHeader(http.StatusGatewayTimeout)
++		return
++	}
++	result, err := wait(ctx)
++	if err != nil {
++		if errors.Is(err, ErrBadRequest) {
++			w.WriteHeader(http.StatusBadRequest)
++		} else if errors.Is(err, ErrAliasConflict) || errors.Is(err, ErrNoSession) {
++			w.WriteHeader(http.StatusConflict)
++		} else {
++			w.WriteHeader(http.StatusGatewayTimeout)
++		}
++		return
++	}
++	raw, err := json.Marshal(result)
++	if err != nil || len(raw) > 65536 {
++		w.WriteHeader(http.StatusInternalServerError)
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	_, _ = w.Write(raw)
++}
++func (s *ConcreteApiServer) handleQueueOccurrences(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 2 || len(q["account_user_id"]) != 1 || len(q["room_id"]) != 1 || q.Get("account_user_id") == "" || len(q.Get("account_user_id")) > 160 || q.Get("room_id") == "" || len(q.Get("room_id")) > 128 {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	s.serveQueueRequest(w, r, ApiRequestTypeQueueOccurrences, queueReadRequest{q.Get("account_user_id"), q.Get("room_id"), ctx}, ctx)
++}
++func decodeQueueJSON(raw []byte, out any) error {
++	if !queueRequiredJSON(raw, reflect.TypeOf(out).Elem()) {
++		return errors.New("missing or null field")
++	}
++
++	scan := json.NewDecoder(bytes.NewReader(raw))
++	token, err := scan.Token()
++	if err != nil || token != json.Delim('{') {
++		return ErrBadRequest
++	}
++	seen := map[string]bool{}
++	for scan.More() {
++		key, err := scan.Token()
++		name, ok := key.(string)
++		if err != nil || !ok || seen[name] {
++			return ErrBadRequest
++		}
++		seen[name] = true
++		var v json.RawMessage
++		if scan.Decode(&v) != nil {
++			return ErrBadRequest
++		}
++	}
++	if token, err = scan.Token(); err != nil || token != json.Delim('}') {
++		return ErrBadRequest
++	}
++	if scan.Decode(new(any)) != io.EOF {
++		return ErrBadRequest
++	}
++	decode := json.NewDecoder(bytes.NewReader(raw))
++	decode.DisallowUnknownFields()
++	return decode.Decode(out)
++}
++func (s *ConcreteApiServer) handleQueueOccurrence(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	if len(r.URL.RawQuery) > 0 {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 2049))
++	if err != nil || len(raw) > 2048 {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	defer r.Body.Close()
++	var data queueJumpRequest
++	if decodeQueueJSON(raw, &data) != nil || !queueIDPattern.MatchString(data.ObservationID) || !queueOccurrenceIDPattern.MatchString(data.OccurrenceID) || data.SessionID == "" || len(data.SessionID) > 160 || data.AccountUserID == "" || len(data.AccountUserID) > 160 || data.RoomID == "" || len(data.RoomID) > 128 || data.QueueRevision >= 1<<53 {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	data.Context = ctx
++	s.serveQueueRequest(w, r, ApiRequestTypeQueueOccurrence, data, ctx)
++}
++
++// Presence is part of the protocol: absent/null false, zero or empty collections
++// must not become apparently verified defaults during typed JSON decoding.
++func queueRequiredJSON(raw []byte, typ reflect.Type) bool {
++	if string(raw) == "null" {
++		return false
++	}
++	switch typ.Kind() {
++	case reflect.Struct:
++		var fields map[string]json.RawMessage
++		if json.Unmarshal(raw, &fields) != nil || fields == nil {
++			return false
++		}
++		for i := 0; i < typ.NumField(); i++ {
++			f := typ.Field(i)
++			tag := strings.Split(f.Tag.Get("json"), ",")
++			if len(tag) == 0 || tag[0] == "-" || tag[0] == "" {
++				continue
++			}
++			value, exists := fields[tag[0]]
++			optional := len(tag) > 1 && tag[1] == "omitempty"
++			if !exists {
++				if optional {
++					continue
++				}
++				return false
++			}
++			if !queueRequiredJSON(value, f.Type) {
++				return false
++			}
++		}
++	case reflect.Slice:
++		var items []json.RawMessage
++		if json.Unmarshal(raw, &items) != nil || items == nil {
++			return false
++		}
++		for _, item := range items {
++			if !queueRequiredJSON(item, typ.Elem()) {
++				return false
++			}
++		}
++	}
++	return true
++}
+--- /dev/null
++++ b/daemon/queue_occurrence_test.go
+@@ -0,0 +1,103 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestQueueHTTPRejectsUnboundedOpenAndURIScopeBeforeActor(t *testing.T) {
++	server := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
++	good := `{"account_user_id":"u","room_id":"r0","observation_id":"` + strings.Repeat("a", 32) + `","session_id":"s","queue_revision":7,"occurrence_id":"` + strings.Repeat("b", 24) + `"}`
++	for _, raw := range []string{`{}`, strings.Replace(good, `"queue_revision":7`, `"queue_revision":null`, 1), strings.Replace(good, `"room_id":"r0"`, `"room_id":"r0","room_id":"r1"`, 1), strings.Replace(good, `"session_id":"s"`, `"uri":"spotify:track:AAAAAAAAAAAAAAAAAAAAAA","session_id":"s"`, 1), good + ` {}`, strings.Repeat("x", 2049)} {
++		out := httptest.NewRecorder()
++		server.handleQueueOccurrence(out, httptest.NewRequest("POST", "/player/queue_occurrence", strings.NewReader(raw)))
++		if out.Code != 400 {
++			t.Fatalf("bad protocol reached actor %d", out.Code)
++		}
++		select {
++		case <-server.requests:
++			t.Fatal("invalid message dispatched")
++		default:
++		}
++	}
++}
++func TestQueueHTTPActualActorQueueCancellationCannotMutate(t *testing.T) {
++	server := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
++	p := &AppPlayer{}
++	ctx, cancel := context.WithCancel(context.Background())
++	request := httptest.NewRequest("GET", "/player/queue_occurrences?account_user_id=u&room_id=r0", nil).WithContext(ctx)
++	done := make(chan struct{})
++	out := httptest.NewRecorder()
++	go func() { defer close(done); server.handleQueueOccurrences(out, request) }()
++	var req ApiRequest
++	select {
++	case req = <-server.requests:
++	case <-time.After(time.Second):
++		t.Fatal("actor queue not reached")
++	}
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("cancel did not end HTTP request")
++	}
++	result, err := p.handleApiRequest(context.Background(), req)
++	req.Reply(result, err)
++	if err == nil || p.queueOccurrenceOffer != nil || out.Code != http.StatusGatewayTimeout {
++		t.Fatal("cancelled owner minted offer")
++	}
++}
++func TestQueueExactOfferConsumedOnMissingSessionForeignOfferPreserved(t *testing.T) {
++	p := &AppPlayer{queueOccurrenceOffer: &nativeQueueOffer{Snapshot: nativeQueueSnapshot{ObservationID: strings.Repeat("a", 32)}}}
++	if _, err := p.commitQueueOccurrence(context.Background(), queueJumpRequest{ObservationID: strings.Repeat("c", 32)}); err == nil || p.queueOccurrenceOffer == nil {
++		t.Fatal("foreign token erased live offer")
++	}
++	if _, err := p.commitQueueOccurrence(context.Background(), queueJumpRequest{ObservationID: strings.Repeat("a", 32)}); err == nil || p.queueOccurrenceOffer != nil {
++		t.Fatal("attempt not consumed before missing owner")
++	}
++}
++func TestQueueRequiredACKFalseIsNotMissing(t *testing.T) {
++	var value struct {
++		OK       bool `json:"ok"`
++		Physical bool `json:"physical_result_verified"`
++	}
++	if decodeQueueJSON([]byte(`{"ok":true}`), &value) == nil || decodeQueueJSON([]byte(`{"ok":true,"physical_result_verified":null}`), &value) == nil {
++		t.Fatal("missing fact became false")
++	}
++	raw, _ := json.Marshal(map[string]any{"ok": true, "physical_result_verified": false})
++	if decodeQueueJSON(bytes.TrimSpace(raw), &value) != nil || !value.OK || value.Physical {
++		t.Fatal("explicit false rejected")
++	}
++}
++
++func TestQueueAlreadyCancelledRequestIsSynchronouslyDeadAtActorAdmission(t *testing.T) {
++	request, cancelRequest := context.WithCancel(context.Background())
++	cancelRequest()
++	for i := 0; i < 1000; i++ {
++		ctx, cancel := queueOperationContext(context.Background(), request)
++		if ctx.Err() != context.Canceled {
++			cancel()
++			t.Fatal("already cancelled request entered live mutation context")
++		}
++		cancel()
++	}
++}
++
++func TestQueueRequestCancellationAfterHelperIsSynchronousBeforeEffect(t *testing.T) {
++	for i := 0; i < 1000; i++ {
++		request, cancelRequest := context.WithCancel(context.Background())
++		ctx, cancel := queueOperationContext(context.Background(), request)
++		cancelRequest()
++		if ctx.Err() != context.Canceled {
++			cancel()
++			t.Fatal("request cancellation waited for asynchronous callback before effect")
++		}
++		cancel()
++	}
++}

@@ -177,6 +177,10 @@ class SpeakersClient:
             raise SpeakersError("Native start owner unavailable")
         return proof
 
+    async def account_identity(self) -> dict:
+        """One explicit bounded native diagnostic read; never forwards OAuth."""
+        return await self._request("GET", "/api/start-volume/identity?account=1", budget=5)
+
     async def start_identity(self) -> str:
         """The configured native Spotify ID, independent of a browser/device name."""
         reply = await self._request("GET", "/api/start-volume/identity")
@@ -236,6 +240,14 @@ class SpeakersClient:
             raise SpeakersError("Native start lease outcome unknown")
 
 
+    async def queue_occurrences(self, room_id, target_id, account_user_id):
+        query = urlencode({"room_id": room_id, "target_id": target_id, "account_user_id": account_user_id})
+        return await self._request("GET", "/api/queue-occurrences?" + query, budget=13)
+
+    async def play_queue_occurrence(self, target_id, account_user_id, args):
+        return await self._request("POST", "/api/queue-occurrence", {**args, "target_id": target_id, "account_user_id": account_user_id}, budget=7)
+
+
 def _start_proof(value, room_id, target_id) -> bool:
     if not isinstance(value, dict) or value.get("schema") != "podconnect.start_volume.v1":
         return False
@@ -260,3 +272,4 @@ def _start_proof(value, room_id, target_id) -> bool:
         and (value["mode"] != "same_session" or binding["room_id"] == room_id)
         and all(_text(binding.get(key)) for key in ("incarnation", "registry"))
     )
+

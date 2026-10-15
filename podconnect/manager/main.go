@@ -1394,6 +1394,8 @@ func main() {
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
 	http.HandleFunc("/api/room-switch", roomSwitchHandler)
+	http.HandleFunc("/api/queue-occurrences", queueReadHandler)
+	http.HandleFunc("/api/queue-occurrence", queueJumpHandler)
 	http.HandleFunc("/api/start-volume", startRequest)
 	http.HandleFunc("/api/start-volume/identity", startIdentityRequest)
 	http.HandleFunc("/api/start-volume/commit", commitStartRequest)

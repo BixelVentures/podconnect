@@ -273,7 +273,7 @@ control_playback:
       required: true
       selector:
         select:
-          options: [pause, resume, next, previous, volume, play_track]
+          options: [pause, resume, next, previous, volume, play_track, play_context, play_queue_occurrence]
     args:
       required: true
       selector:
@@ -298,6 +298,18 @@ search_playlists:
           min: 1
           max: 20
           mode: box
+get_account_identifier_diagnostic:
+  name: Compare account identifiers
+  description: Explicit read-only native identifier diagnostic. Unknown identity relation; never grants playback or account authority.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    engine_device_id:
+      required: true
+      selector:
+        text:
 get_context_play_controls:
   name: Read native playlist-context start controls
   description: Exact account, device and native room start proof; does not play a context or grant authority.
@@ -311,6 +323,24 @@ get_context_play_controls:
       selector:
         select:
           options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+
+get_queue_controls:
+  name: Read exact native queue occurrences
+  description: Read at most twenty opaque one-use occurrences from the active native session in this account, room and selected output. Does not play or grant task authority. Legacy account REST queue rows stay read-only.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
     target_id:
       required: true
       selector:

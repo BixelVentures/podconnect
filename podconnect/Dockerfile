@@ -34,7 +34,9 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/volume-action-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply --check "/patches/initial-publication-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply "/patches/initial-publication-${GO_LIBRESPOT_VERSION}.patch" \
-  && go test ./daemon ./zeroconf ./spclient \
+  && git apply --check "/patches/queue-occurrence-${GO_LIBRESPOT_VERSION}.patch" \
+  && git apply "/patches/queue-occurrence-${GO_LIBRESPOT_VERSION}.patch" \
+  && go test ./tracks ./daemon ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
 FROM ${BUILD_FROM}

@@ -8,6 +8,24 @@ halves**, both installed from this one repo.
 Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe ─► OwnTone ─► AirPlay 2 ─► HomePod
 ```
 
+## Optional exact-source control contracts (Speakers 0.26.21 / Control 0.10.14 candidate)
+
+The optional account-identifier diagnostic observes the current native connection and compares
+its identifier hash with the selected Control account's existing identifier. It never returns
+raw usernames or credentials. Equality or difference is diagnostic only: the identifier
+namespace relation remains unknown and cannot admit a target or replace Spotify's account/device guards.
+
+Queue controls use short-lived, one-use opaque occurrence identifiers from the current native
+player. Duplicate songs remain separate occurrences; manual queue order is retained. Selection
+requires the exact account, native engine, selected room/output, session and current source.
+Expired, replaced, cancelled or consumed offers reject without URI/index fallback, repeated
+Next commands or automatic replay. A caller such as PodView must independently grant the
+queue action and bind its current task. Existing autoplay and the single native start-volume
+owner are unchanged. A source acknowledgement does not establish audible playback.
+
+These versions are an unpublished combined candidate. Source review, immutable images,
+installation and physical acceptance are tracked separately in [STATUS](docs/STATUS.md).
+
 ## What works today
 
 **PodConnect Speakers** — the Home Assistant **add-on** (`podconnect/`)

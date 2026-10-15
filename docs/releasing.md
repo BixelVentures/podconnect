@@ -119,3 +119,18 @@ then Control then PodVoice order and coupled rollback procedure above, with the
 actual reviewed versions substituted in the operator receipt. Green writes
 remain with the single installation owner; local native tests send no device
 commands. Physical first-audio volume and autoplay still require actual checks.
+
+### Combined candidate: Speakers 0.26.21 / Control 0.10.14
+
+The opt-in account diagnostic and exact queue-occurrence endpoints require a new Speakers
+subtree and Control integration. Use the same immutable two-architecture prebuild, exact
+source-tree/digest checks and coupled sequence above, substituting the final reviewed versions
+21/14 and PodVoice32. Ordinary identity reads remain compatible. The new diagnostic is
+read-only and cannot authorize an engine absent from the selected Spotify account's current
+device observation. Existing entities or a ready HomePod output are insufficient.
+
+Preserve the actual account binding and credentials. If first-use onboarding is needed, use
+the normal Spotify Connect selection on the same account; do not substitute a Mac device,
+AirPlay selection, guessed name or diagnostic equality. Queue scopes remain explicit and
+read-only until current native/account/output proof and the caller's grant are valid.
+No music, output transfer or volume command is part of image publication or installation.
