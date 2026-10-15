@@ -109,12 +109,12 @@ audio_output_pipe: %s
 audio_output_pipe_format: s16le
 external_volume: true
 volume_steps: 100
-initial_volume: 35
+initial_volume: %d
 server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, r.GLPort)
+`, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, startVolumePercent, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 

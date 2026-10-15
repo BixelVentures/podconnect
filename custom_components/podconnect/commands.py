@@ -14,6 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .const import DOMAIN
 from .observations import current
+from .speakers import SpeakersError
 from .targets import spotify_devices
 
 COMMAND_TIMEOUT_S = 6
@@ -49,7 +50,7 @@ def _arguments(action, args):
     if not isinstance(args, dict) or set(args) != (
         {"percent"}
         if action == "volume"
-        else {"track_uri", "max_volume"}
+        else {"track_uri", "max_volume", "room_id", "homepod_id", "start_policy_revision", "alias_incarnation"}
         if action == "play_track"
         else set()
     ):
@@ -69,6 +70,11 @@ def _arguments(action, args):
             _integer(args["max_volume"])
         except vol.Invalid as exc:
             raise CommandRejected("invalid_arguments") from exc
+        if any(
+            not isinstance(args[key], str) or not 1 <= len(args[key]) <= 128
+            for key in ("room_id", "homepod_id", "alias_incarnation")
+        ) or not isinstance(args["start_policy_revision"], str) or len(args["start_policy_revision"]) != 64:
+            raise CommandRejected("invalid_arguments")
 
 
 class PlaybackCommands:
@@ -84,6 +90,7 @@ class PlaybackCommands:
             data.coordinator,
             data.session,
             data.observations,
+            data.speakers,
             data.api._session,
             data.api._web,
         )
@@ -99,6 +106,7 @@ class PlaybackCommands:
             data.coordinator,
             data.session,
             data.observations,
+            data.speakers,
             data.api._session,
             data.api._web,
         )
@@ -198,6 +206,7 @@ class PlaybackCommands:
             data.coordinator,
             data.session,
             data.observations,
+            data.speakers,
             data.api._session,
             data.api._web,
         )
@@ -258,6 +267,29 @@ class PlaybackCommands:
             else "sequence_exhausted",
             "physical_result_verified": False,
         }
+
+    async def track_start_controls(self, entry_id, target_id, room_id):
+        """A track offer needs the native room/output join, never a name match."""
+        result = self.track_controls(entry_id, target_id)
+        if self.data.speakers is None:
+            raise CommandRejected("native_start_unavailable")
+        try:
+            proof = await self.data.speakers.start_readiness(room_id, target_id)
+        except SpeakersError as exc:
+            raise CommandRejected("native_start_unavailable") from exc
+        current_result = self.track_controls(entry_id, target_id)
+        if (
+            current_result["owner_epoch"] != result["owner_epoch"]
+            or current_result["poll_sequence"] != result["poll_sequence"]
+        ):
+            raise CommandRejected("stale_observation")
+        if proof["mode"] == "same_session":
+            playback = self.data.observations.playback(entry_id)
+            target = playback.get("playback", {}).get("target") if playback.get("ok") else None
+            if not isinstance(target, dict) or target.get("target_id") != target_id:
+                raise CommandRejected("native_account_unproven")
+        result["native_start"] = proof
+        return result
 
     async def execute(self, hass, request):
         entry_id, target_id = request["config_entry_id"], request["target_id"]
@@ -352,6 +384,46 @@ class PlaybackCommands:
             del self.receipts[next(iter(self.receipts))]
         try:
             guard()
+            lease = None
+            if action == "play_track":
+                if self.data.speakers is None:
+                    raise CommandRejected("native_start_unavailable")
+                args = request["args"]
+                try:
+                    proof = await self.data.speakers.start_readiness(args["room_id"], target_id)
+                except SpeakersError as exc:
+                    raise CommandRejected("native_start_unavailable") from exc
+                if (
+                    proof["homepod_id"] != args["homepod_id"]
+                    or proof["policy_revision"] != args["start_policy_revision"]
+                    or proof["alias_binding"]["incarnation"] != args["alias_incarnation"]
+                    or args["max_volume"] < proof["start_volume_percent"]
+                    or (
+                        proof["mode"] == "same_session"
+                        and proof["output_volume_percent"] > args["max_volume"]
+                    )
+                ):
+                    raise CommandRejected("native_start_policy_changed")
+                if proof["mode"] == "same_session":
+                    playback = self.data.observations.playback(entry_id)
+                    current_target = playback.get("playback", {}).get("target") if playback.get("ok") else None
+                    if not isinstance(current_target, dict) or current_target.get("target_id") != target_id:
+                        raise CommandRejected("native_account_unproven")
+                guard()
+                try:
+                    lease = await self.data.speakers.prepare_start(proof)
+                except SpeakersError as exc:
+                    raise CommandRejected("native_start_unavailable") from exc
+
+            async def native_commit():
+                guard()
+                if lease is None:
+                    raise CommandRejected("native_start_unavailable")
+                try:
+                    await self.data.speakers.commit_start(lease["lease_id"], lease["proof"]["policy_revision"], request["args"]["max_volume"])
+                except SpeakersError as exc:
+                    raise CommandRejected("native_start_unavailable") from exc
+
             methods = {
                 "pause": self.data.api.pause,
                 "resume": self.data.api.play,
@@ -361,10 +433,11 @@ class PlaybackCommands:
                 "play_track": self.data.api.play,
             }
             kwargs = {"execution_guard": guard, "on_send": sending}
-            async with asyncio.timeout(COMMAND_TIMEOUT_S):
+            async with asyncio.timeout(14 if action == "play_track" else COMMAND_TIMEOUT_S):
                 if action == "play_track":
                     await methods[action](
-                        target_id, uris=[request["args"]["track_uri"]], **kwargs
+                        target_id, uris=[request["args"]["track_uri"]],
+                        async_execution_guard=native_commit, **kwargs
                     )
                 elif action == "volume":
                     await methods[action](
@@ -425,7 +498,7 @@ def register_command_services(hass):
         entry_id = call.data["config_entry_id"]
         data = current(hass, entry_id)
         try:
-            return data.commands.track_controls(entry_id, call.data["target_id"])
+            return await data.commands.track_start_controls(entry_id, call.data["target_id"], call.data["room_id"])
         except CommandRejected as exc:
             return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
 
@@ -444,7 +517,7 @@ def register_command_services(hass):
     }
     for name, handler, schema in (
         ("get_playback_controls", controls, identity),
-        ("get_track_play_controls", track_controls, identity),
+        ("get_track_play_controls", track_controls, {**identity, vol.Required("room_id"): target}),
         ("control_playback", command, command_schema),
     ):
         if not hass.services.has_service(DOMAIN, name):

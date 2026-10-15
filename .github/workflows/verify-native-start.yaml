@@ -1,0 +1,22 @@
+name: Verify native start policy
+on:
+  pull_request:
+    paths:
+      - 'podconnect/manager/**'
+      - '.github/workflows/verify-native-start.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'podconnect/manager/**'
+      - '.github/workflows/verify-native-start.yaml'
+jobs:
+  manager:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Test native start and retained transport without provider access
+        working-directory: podconnect/manager
+        run: go test -race ./... && go vet ./...

@@ -6,7 +6,6 @@ import asyncio
 
 import voluptuous as vol
 from aiohttp import ClientError
-
 from homeassistant.components.media_player import (
     BrowseMedia,
     MediaClass,
@@ -18,7 +17,8 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv, entity_platform
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -27,6 +27,7 @@ from . import PodConnectConfigEntry
 from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
+from .native_start import start_guards
 from .targets import spotify_transfer_target
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
@@ -143,6 +144,7 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
     ) -> None:
         """Initialise the entity."""
         super().__init__(coordinator)
+        self._entry_id = entry_id
         self._device_id = device_id
         # Optimistic play/pause: HA's state comes from a 10s Spotify poll, so the card's
         # play/pause icon lags the (instant) audio. Show the user's intent immediately, then let
@@ -310,7 +312,8 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
     async def async_media_play(self) -> None:
         self._optimistic_playing = True
         self.async_write_ha_state()
-        await self._send(self.coordinator.api.play(self._device_id))
+        guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
+        await self._send(self.coordinator.api.play(self._device_id, execution_guard=guard, async_execution_guard=native_ready))
 
     async def async_media_pause(self) -> None:
         self._optimistic_playing = False
@@ -350,9 +353,11 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             if not media_id:
                 raise HomeAssistantError(f"No Spotify match for {query!r}")
         if media_id.startswith(("spotify:track:", "spotify:episode:")):
-            await self._send(self.coordinator.api.play(self._device_id, uris=[media_id]))
+            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
+            await self._send(self.coordinator.api.play(self._device_id, uris=[media_id], execution_guard=guard, async_execution_guard=native_ready))
         else:
-            await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id))
+            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
+            await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id, execution_guard=guard, async_execution_guard=native_ready))
 
     async def async_play_from_library(self, source: str, shuffle: bool = False) -> None:
         """Play one of the user's own collections on THIS device — the AI tool for "play something
@@ -373,7 +378,8 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             raise HomeAssistantError(f"No playable tracks in Spotify library {source!r}")
         if shuffle:
             await self._send(self.coordinator.api.set_shuffle(True, self._device_id))
-        await self._send(self.coordinator.api.play(self._device_id, uris=uris))
+        guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
+        await self._send(self.coordinator.api.play(self._device_id, uris=uris, execution_guard=guard, async_execution_guard=native_ready))
 
     async def _search_top_uri(self, query: str, media_type: str | None) -> str | None:
         """Use the first playable Spotify search result, preserving provider order."""
@@ -414,7 +420,11 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
             or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
         ):
             raise HomeAssistantError("PodConnect account entry unavailable")
-        await self._send(self.coordinator.api.transfer(device_id, play=is_playing))
+        if is_playing:
+            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, data, device_id, expected_api=self.coordinator.api)
+            await self._send(self.coordinator.api.transfer(device_id, play=True, execution_guard=guard, async_execution_guard=native_ready))
+        else:
+            await self._send(self.coordinator.api.transfer(device_id, play=False))
 
     async def _browse_category(self, category: str) -> list[BrowseMedia]:
         """Fetch one profile category as playable leaves."""

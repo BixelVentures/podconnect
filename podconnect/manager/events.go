@@ -70,6 +70,17 @@ func (l *glLive) transportSnapshot() (glStatus, glTransportIntent) {
 	return l.st, glTransportIntent{l.runEpoch, l.phaseEpoch, l.aliasRevision, l.transportRevision, l.st.SelAlias}
 }
 
+// A native start lease cannot use a retired event source or an older route,
+// even when the last published status still resembles the current selection.
+func (l *glLive) startIntentCurrent(intent glTransportIntent) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	return !l.sourceRetired && intent.run == l.runEpoch && intent.phase == l.phaseEpoch &&
+		intent.aliasRevision == l.aliasRevision && intent.transportRevision == l.transportRevision &&
+		intent.alias == l.st.SelAlias && l.st.AliasBinding != nil && l.st.AliasBinding.valid()
+}
+
 // admitTransport commits only the copied decision whose observations are still
 // current. HTTP follows after unlocking; its completion never commits state.
 func (l *glLive) admitTransport(intent glTransportIntent, current *transState, next transState) bool {

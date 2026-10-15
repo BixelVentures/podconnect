@@ -17,12 +17,16 @@ on:
       - "podconnect/rootfs/**"
       - "podconnect/manager/**" # the manager binary is compiled into the image
       - ".github/workflows/publish.yaml"
+      - "scripts/native_image_promotion.py"
   workflow_dispatch:
 
 jobs:
   publish:
     name: publish-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: podconnect-speakers-${{ matrix.arch }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -60,27 +64,16 @@ jobs:
           version=$(grep '^version:' podconnect/config.yaml | cut -d'"' -f2)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse an existing release version
-        shell: bash
-        run: |
-          set +e
-          inspect_output="$(docker buildx imagetools inspect \
-            ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }} 2>&1)"
-          inspect_status=$?
-          set -e
-          if [ "$inspect_status" -eq 0 ]; then
-            echo "Release version already exists and is immutable." >&2
-            exit 1
-          fi
-          case "$inspect_output" in
-            *"manifest unknown"*|*"ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }}: not found"*) ;;
-            *)
-              echo "$inspect_output" >&2
-              exit "$inspect_status"
-              ;;
-          esac
+      - name: Admit first build or exact-source immutable promotion
+        id: promotion
+        run: >-
+          python3 scripts/native_image_promotion.py
+          --arch '${{ matrix.arch }}'
+          --version '${{ steps.ver.outputs.version }}'
+          --output "$GITHUB_OUTPUT"
 
       - name: Build & push (${{ matrix.arch }})
+        if: steps.promotion.outputs.action == 'build'
         uses: docker/build-push-action@v6
         with:
           context: ./podconnect
@@ -90,6 +83,9 @@ jobs:
           provenance: false
           sbom: false
           tags: ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }}
+          labels: |
+            io.bixelventures.podconnect.source-tree=${{ steps.promotion.outputs.source_tree }}
+            io.bixelventures.podconnect.arch=${{ matrix.arch }}
           build-args: |
             BUILD_FROM=${{ matrix.base }}
             BUILD_ARCH=${{ matrix.arch }}

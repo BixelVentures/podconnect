@@ -475,6 +475,10 @@ func transportRooms(w http.ResponseWriter, rooms []*Room, action string) {
 	}
 	failed := make([]string, 0)
 	for _, rm := range rooms {
+		if action == "resume" && fileExists(releasedPath(rm)) && !preflightReleasedResume(rm) {
+			failed = append(failed, rm.ID)
+			continue
+		}
 		err := librespotTransport(rm.Librespot, action)
 		if action == "pause" {
 			// Silence AirPlay even if Spotify is unavailable; either failure matters.
@@ -628,7 +632,11 @@ func (ts *transState) decide(glPlaying, otPlaying, otValid bool) (setGl, setOt i
 	return
 }
 
-const initialVolumeCap = 35 // "never full blast": cap for a brand-new session's first volume
+// The rendered engine configuration and the native bridge share one start policy.
+// A fresh session begins here; later same-session user volume remains theirs.
+const startVolumePercent = 35
+
+const initialVolumeCap = startVolumePercent // compatibility with existing bridge tests
 
 func playWord(c int) string {
 	if c == 1 {
@@ -684,7 +692,7 @@ func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive,
 	return routeAliasOutputForAttentionIntent(primaryOwnTone, aliasId, live, revision, nil)
 }
 
-func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention) (bool, bool) {
+func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, protectStart ...bool) (bool, bool) {
 	rooms := loadRooms()
 	var binding *aliasBinding
 	if live != nil {
@@ -740,6 +748,15 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 			return admitRoomAliasRoute(target, binding, live, aliasId, revision)
 		}
 	}
+	if len(protectStart) > 0 && protectStart[0] {
+		// The bridge is the audible route owner. Prime the *saved exact output*
+		// before native attention or selection; pipe_autostart can start at selection.
+		if target.HomepodID == "" || devs[idx].ID != target.HomepodID ||
+			!routeIntentCurrent(live, aliasId, revision) ||
+			!primeConfiguredStartVolume(primaryOwnTone, target.HomepodID, false) {
+			return false, routeIntentCurrent(live, aliasId, revision)
+		}
+	}
 	if att != nil && !att.nativeTargetForRoute(primaryOwnTone, devs[idx].ID, admitNative) {
 		return false, routeIntentCurrent(live, aliasId, revision)
 	}
@@ -765,24 +782,22 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 		log.Printf("alias-route: alias %d output selection failed; recovery remains pending", aliasId)
 		return false, true
 	}
+	if len(protectStart) > 0 && protectStart[0] {
+		attentionActive := att != nil && att.snapshot(time.Now()).Active
+		if attentionActive {
+			volume, selected := selectedStartOutput(primaryOwnTone, target.HomepodID)
+			if !selected || volume > startVolumePercent {
+				return false, routeIntentCurrent(live, aliasId, revision)
+			}
+		} else if !checkedStartVolume(primaryOwnTone, target.HomepodID) {
+			return false, routeIntentCurrent(live, aliasId, revision)
+		}
+		if !routeIntentCurrent(live, aliasId, revision) {
+			return false, false
+		}
+	}
 	log.Printf("alias-route: alias %d -> room %q -> HomePod %q", aliasId, target.Name, devs[idx].Name)
 	return true, true
-}
-
-// reclaimHomePod takes the HomePod back: clear the room's flag and re-select its target output now,
-// for a snappy resume instead of waiting on the selection tick.
-func reclaimHomePod(room *Room) {
-	_ = os.Remove(releasedPath(room))
-	devs, _ := fetchOutputsFrom(room.OwnTone)
-	target := ""
-	if idx, _ := matchOutput(devs, room.HomepodID, room.HomepodName); idx >= 0 {
-		target = devs[idx].ID
-	} else if len(devs) > 0 {
-		target = devs[0].ID
-	}
-	if target != "" {
-		selectOnOwntoneAt(room.OwnTone, target)
-	}
 }
 
 // roomBridge keeps one room's HomePod and go-librespot in step, BIDIRECTIONALLY:
@@ -848,7 +863,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// + hammered OwnTone when the target HomePod was momentarily missing).
 			if room.Idx == 0 && gl.SelAlias > 0 {
 				if aliasRouteChanged(gl.SelAlias, lastAlias, gl.AliasBinding, lastAliasBinding) || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
-					accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att)
+					accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att, true)
 					if !current {
 						time.Sleep(200 * time.Millisecond)
 						continue // no remaining work may use this obsolete snapshot
@@ -858,6 +873,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						aliasRoutedThisTick = true
 						lastAlias = gl.SelAlias
 						aliasRoutePending = false
+						// A newly routed output is a fresh claim, even while the
+						// Spotify session remains active across an alias transfer.
+						capped = false
+						volCanon = -1
 					} else {
 						lastAlias = gl.SelAlias // stop the per-tick flood; recover via the throttle below
 						aliasRoutePending = true
@@ -919,13 +938,30 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			if playing {
 				idleSince = time.Time{}
 				if released {
+					// Pre-prime the configured output while still released. Pipe
+					// autostart may run before the next bridge tick once it is selected.
+					preprimeID := room.HomepodID
+					if gl.AliasBinding != nil {
+						targetRoom := roomByID(gl.AliasBinding.RoomID)
+						if targetRoom == nil || targetRoom.HomepodID == "" {
+							prevActive = gl.Active
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						preprimeID = targetRoom.HomepodID
+					}
+					if preprimeID == "" || !primeConfiguredStartVolume(room.OwnTone, preprimeID, false) {
+						prevActive = gl.Active
+						time.Sleep(200 * time.Millisecond)
+						continue
+					}
 					if room.Idx == 0 && gl.SelAlias > 0 {
 						if !aliasRoutedThisTick {
 							if aliasRoutePending && !time.Now().After(aliasRetryAt) {
 								time.Sleep(200 * time.Millisecond)
 								continue
 							}
-							accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att)
+							accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att, true)
 							if !current {
 								time.Sleep(200 * time.Millisecond)
 								continue
@@ -946,22 +982,28 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						// The current alias is accepted; never first select primary A.
 						_ = os.Remove(releasedPath(room))
 					} else {
-						reclaimHomePod(room)
+						if !selectOnOwntoneAt(room.OwnTone, preprimeID) {
+							prevActive = gl.Active
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						if _, ok := selectedStartOutput(room.OwnTone, preprimeID); !ok {
+							prevActive = gl.Active
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						_ = os.Remove(releasedPath(room))
 					}
-					// Restore YOUR level on reclaim. While the HomePod was freed, another AirPlay sender
-					// (Mofibo/Apple Music/…) can leave its volume loud/100%; without this the bidirectional
-					// reconcile would read that as a "HomePod button move", blast, AND push 100% to Spotify.
-					// Re-seat the output + canon at your last playing level (or the ceiling if unknown) so
-					// the reconcile starts safe. gl.Active stayed true across grace, so `capped` is untouched
-					// and your own volume is preserved on resume (no never-loud nerf).
-					restore := lastPlayVol
-					if restore < 0 {
-						restore = initialVolumeCap
-					}
-					if _, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" {
-						setOwntoneOutputVolume(room.OwnTone, id, restore)
+					// Reclaim is a fresh output claim. An intervening AirPlay sender may have
+					// left it loud; seat the one native start level before reconciling.
+					restore := startVolumePercent
+					if !checkedStartVolume(room.OwnTone, preprimeID) {
+						prevActive = gl.Active
+						time.Sleep(200 * time.Millisecond)
+						continue
 					}
 					volCanon = restore
+					capped = false // re-arm both engine and output before the reclaimed first audio
 					log.Printf("[%s]: reclaim requested; restore target %d%%", room.Name, restore)
 					released = false
 				}
@@ -980,27 +1022,49 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// slider <-> HomePod hardware buttons, on one canonical value. Here we only handle the IDLE
 			// case: while no session is active, hold the output at/under the cap so the first audio of any
 			// new session can't blast (the active branch's one-shot never-loud cap takes over from there).
-			if !gl.Active && time.Now().After(prearmNext) {
+			if !gl.Active && !released && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
-				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && v > initialVolumeCap {
-					setOwntoneOutputVolume(room.OwnTone, id, initialVolumeCap)
+				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startVolumePercent) > volTol {
+					setOwntoneOutputVolume(room.OwnTone, id, startVolumePercent)
 				}
 			}
 
 			if gl.Active && !released {
-				// Never-loud (one-shot, edge-safe): cap a brand-NEW session's go-librespot volume to the
-				// ceiling until it reports <= the ceiling, then hand control to the user. `capped` resets
-				// ONLY on a fresh inactive->active session (top latch), so it survives paused/released
-				// ticks (no edge-miss blast) and a resume of your own session is NOT re-capped.
-				if !capped && gl.HasVol {
-					if gl.VolPct > initialVolumeCap {
-						setLibrespotVolumePctOwned(room.Librespot, initialVolumeCap)
-						gl.VolPct = initialVolumeCap
-						volCanon = -1 // re-seed the reconcile from the capped level
-						log.Printf("volume [%s]: capped fresh session to %d%%", room.Name, initialVolumeCap)
-					} else {
-						capped = true // settled at/below the ceiling — the user owns volume from here
+				// A fresh session starts at the single native level. The AirPlay output
+				// (actual loudness) must acknowledge that level before transport; the
+				// engine's quantized report may differ by the bridge tolerance. Once
+				// settled, the ordinary bidirectional reconcile returns volume to the user.
+				if !capped {
+					outputID := room.HomepodID
+					if gl.AliasBinding != nil {
+						selectedRoom := roomByID(gl.AliasBinding.RoomID)
+						if selectedRoom == nil || selectedRoom.HomepodID == "" {
+							prevActive = gl.Active
+							time.Sleep(200 * time.Millisecond)
+							continue
+						}
+						outputID = selectedRoom.HomepodID
 					}
+					if outputID == "" || !checkedStartVolume(room.OwnTone, outputID) {
+						prevActive = gl.Active
+						time.Sleep(200 * time.Millisecond)
+						continue // no first transport command with an unproved output level
+					}
+					if !gl.HasVol {
+						prevActive = gl.Active
+						time.Sleep(200 * time.Millisecond)
+						continue // the engine's starting level is still unknown
+					}
+					if abs(gl.VolPct-startVolumePercent) > volTol {
+						setLibrespotVolumePctOwned(room.Librespot, startVolumePercent)
+						volCanon = -1
+						prevActive = gl.Active
+						time.Sleep(200 * time.Millisecond)
+						continue // await the actual engine observation, not a best-effort write
+					}
+					capped = true
+					volCanon = startVolumePercent
+					log.Printf("volume [%s]: fresh start primed to %d%%", room.Name, startVolumePercent)
 				}
 				otVol, otID, otVolOk := owntoneOutputVolumeForIntent(room.OwnTone, live)
 				otState := owntonePlayerState(room.OwnTone)
@@ -1330,6 +1394,9 @@ func main() {
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
 	http.HandleFunc("/api/room-switch", roomSwitchHandler)
+	http.HandleFunc("/api/start-volume", startRequest)
+	http.HandleFunc("/api/start-volume/identity", startIdentityRequest)
+	http.HandleFunc("/api/start-volume/commit", commitStartRequest)
 	http.HandleFunc("/api/select", speakerSelectHandler)
 
 	http.HandleFunc("/api/test", speakerTestHandler)

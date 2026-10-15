@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientTimeout
 
@@ -43,16 +43,16 @@ class SpeakersClient:
         self._web = web
         self._base = speakers_url(base)
 
-    async def _request(self, method: str, path: str, body=None):
+    async def _request(self, method: str, path: str, body=None, *, budget: int = 5):
         try:
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(budget):
                 async with self._web.request(
                     method,
                     self._base + path,
                     json=body,
                     headers={"Accept": "application/json"},
                     allow_redirects=False,
-                    timeout=ClientTimeout(total=4),
+                    timeout=ClientTimeout(total=budget - 1),
                 ) as response:
                     if response.status != 200:
                         raise SpeakersError(f"Speakers returned HTTP {response.status}")
@@ -166,3 +166,97 @@ class SpeakersClient:
                 raise SpeakersError("Ambiguous observed outputs")
             seen.add(row["id"])
         return data
+
+    async def start_readiness(self, room_id: str, target_id: str) -> dict:
+        """Read the native owner's exact engine, room, output and start policy."""
+        if not _text(room_id) or not _text(target_id):
+            raise SpeakersError("Invalid native start identity")
+        path = "/api/start-volume?" + urlencode({"room_id": room_id, "target_id": target_id})
+        proof = await self._request("GET", path)
+        if not _start_proof(proof, room_id, target_id):
+            raise SpeakersError("Native start owner unavailable")
+        return proof
+
+    async def start_identity(self) -> str:
+        """The configured native Spotify ID, independent of a browser/device name."""
+        reply = await self._request("GET", "/api/start-volume/identity")
+        if (
+            not isinstance(reply, dict)
+            or reply.get("schema") != "podconnect.start_identity.v1"
+            or not isinstance(reply.get("engine_device_id"), str)
+            or len(reply["engine_device_id"]) != 40
+            or any(ch not in "0123456789abcdef" for ch in reply["engine_device_id"])
+        ):
+            raise SpeakersError("Native engine identity unavailable")
+        return reply["engine_device_id"]
+
+    async def prepare_start(self, proof: dict) -> dict:
+        """Prime the exact output; the owner issues a short one-use lease."""
+        if not isinstance(proof, dict) or not _start_proof(proof, proof.get("room_id"), proof.get("engine_device_id")):
+            raise SpeakersError("Invalid native start proof")
+        reply = await self._request("POST", "/api/start-volume", {
+            "room_id": proof["room_id"],
+            "target_id": proof["engine_device_id"],
+            "policy_revision": proof["policy_revision"],
+            "alias_incarnation": proof["alias_binding"]["incarnation"],
+        }, budget=10)
+        if (
+            not isinstance(reply, dict)
+            or reply.get("schema") != "podconnect.start_lease.v1"
+            or not isinstance(reply.get("lease_id"), str)
+            or len(reply["lease_id"]) != 32
+            or reply.get("expires_in_ms") != 5000
+            or not _start_proof(reply.get("proof"), proof["room_id"], proof["engine_device_id"])
+            or any(reply["proof"].get(key) != proof.get(key) for key in (
+                "engine_device_id", "room_id", "homepod_id", "policy_revision", "start_volume_percent", "mode"
+            ))
+            or any(reply["proof"]["alias_binding"].get(key) != proof["alias_binding"].get(key)
+                   for key in ("incarnation", "registry"))
+            or reply["proof"]["alias_binding"]["room_id"] != proof["room_id"]
+        ):
+            raise SpeakersError("Native start lease outcome unknown")
+        return reply
+
+    async def commit_start(self, lease_id: str, policy_revision: str, max_volume: int | None = None) -> None:
+        """Consume readiness immediately before the one provider send."""
+        if not isinstance(lease_id, str) or len(lease_id) != 32:
+            raise SpeakersError("Invalid native start lease")
+        if max_volume is not None and (type(max_volume) is not int or not 0 <= max_volume <= 100):
+            raise SpeakersError("Invalid approved volume limit")
+        body = {"lease_id": lease_id}
+        if max_volume is not None:
+            body["max_volume"] = max_volume
+        reply = await self._request("POST", "/api/start-volume/commit", body)
+        if (
+            not isinstance(reply, dict)
+            or reply.get("ok") is not True
+            or reply.get("schema") != "podconnect.start_commit.v1"
+            or reply.get("policy_revision") != policy_revision
+        ):
+            raise SpeakersError("Native start lease outcome unknown")
+
+
+def _start_proof(value, room_id, target_id) -> bool:
+    if not isinstance(value, dict) or value.get("schema") != "podconnect.start_volume.v1":
+        return False
+    binding = value.get("alias_binding")
+    return (
+        value.get("ready") is True
+        and value.get("engine_device_id") == target_id
+        and value.get("room_id") == room_id
+        and _text(value.get("homepod_id"))
+        and isinstance(value.get("policy_revision"), str)
+        and len(value["policy_revision"]) == 64
+        and type(value.get("start_volume_percent")) is int
+        and 0 <= value["start_volume_percent"] <= 100
+        and value.get("mode") in ("fresh_start", "same_session")
+        and type(value.get("output_volume_percent")) is int
+        and 0 <= value["output_volume_percent"] <= 100
+        and type(value.get("output_selected")) is bool
+        and (value["mode"] != "same_session" or value["output_selected"])
+        and isinstance(binding, dict)
+        and binding.get("ready") is True
+        and _text(binding.get("room_id"))
+        and (value["mode"] != "same_session" or binding["room_id"] == room_id)
+        and all(_text(binding.get(key)) for key in ("incarnation", "registry"))
+    )
