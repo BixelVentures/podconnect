@@ -203,9 +203,28 @@ get_playback_controls:
       selector:
         text:
 
+get_track_play_controls:
+  name: Get selected-track play controls
+  description: Exact account and fresh Spotify device, including an inactive device, with known observed volume. This is a source observation, not permission to play a browser-provided URI or proof of audible output.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+
 control_playback:
   name: Control direct Spotify playback
-  description: One bounded command on the exact observed account/device/owner/poll. Unknown outcomes must not be retried. No aliases, default account, transfer or physical confirmation.
+  description: One bounded command on the exact observed account/device/owner/poll. play_track requires an exact Spotify track URI and an explicit approved max_volume in args; the current device volume must be known and no higher. A caller must separately authorize the selected source. Unknown outcomes must not be retried. No aliases, default account, transfer or physical confirmation.
   fields:
     config_entry_id:
       required: true
@@ -250,7 +269,7 @@ control_playback:
       required: true
       selector:
         select:
-          options: [pause, resume, next, previous, volume]
+          options: [pause, resume, next, previous, volume, play_track]
     args:
       required: true
       selector:
