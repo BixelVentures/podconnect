@@ -437,6 +437,22 @@ class SpeakersClient:
             budget=7,
         )
 
+    async def room_queue_state(self, scope):
+        return await self._request("GET", "/api/room-queue/state?" + urlencode(scope))
+
+    async def prepare_room_queue(self, scope, native, route, queue):
+        return await self._request(
+            "POST",
+            "/api/room-queue/prepare",
+            {"scope": scope, "native": native, "route": route, "queue": queue},
+            budget=13,
+        )
+
+    async def commit_room_queue(self, prepare_id):
+        return await self._request(
+            "POST", "/api/room-queue/commit", {"prepare_id": prepare_id}, budget=8
+        )
+
 
 def _start_proof(value, room_id, target_id) -> bool:
     if (

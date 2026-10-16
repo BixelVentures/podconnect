@@ -8,7 +8,7 @@ halves**, both installed from this one repo.
 Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe ─► OwnTone ─► AirPlay 2 ─► HomePod
 ```
 
-## Optional exact-source control contracts (Speakers 0.26.22 / Control 0.10.15 candidate)
+## Optional exact-source control contracts (Speakers 0.26.23 / Control 0.10.16 candidate)
 
 The optional account-identifier diagnostic observes the current native connection and compares
 its identifier hash with the selected Control account's existing identifier. It never returns
@@ -22,6 +22,11 @@ Expired, replaced, cancelled or consumed offers reject without URI/index fallbac
 Next commands or automatic replay. A caller such as PodView must independently grant the
 queue action and bind its current task. Existing autoplay and the single native start-volume
 owner are unchanged. A source acknowledgement does not establish audible playback.
+
+The new room queue path uses `get_room_queue_controls`, `prepare_room_queue` and
+`control_room_queue`. A read joins the current native writer with the selected OwnTone
+reader; preparation stages one chosen occurrence without audio publication, so the caller
+can recheck its grant before the one-use commit. The older queue service remains separate.
 
 These versions are an unpublished combined candidate. Source review, immutable images,
 installation and physical acceptance are tracked separately in [STATUS](docs/STATUS.md).

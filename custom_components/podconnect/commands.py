@@ -136,13 +136,16 @@ class PlaybackCommands:
         from .room_move import RoomMove
 
         self.room_move = RoomMove(self)
+        from .room_queue import RoomQueue
+
+        self.room_queue = RoomQueue(self)
         coordinator = data.coordinator
         coordinator.command_owner_guard = lambda: self._refresh_owner_current(
             coordinator.hass, coordinator.config_entry.entry_id
         )
 
     def retire_preparations_before(self, hass, sequence):
-        for preparation in (self.room_content, self.room_move):
+        for preparation in (self.room_content, self.room_move, self.room_queue):
             preparation.retire_before(hass, sequence)
 
     def _refresh_owner_current(self, hass, entry_id):
@@ -370,7 +373,9 @@ class PlaybackCommands:
             self.queue_controls = QueueControls(self)
         return await self.queue_controls.read(hass, entry_id, target_id, room_id)
 
-    async def execute(self, hass, request, *, room_transport=None, room_volume=None):
+    async def execute(
+        self, hass, request, *, room_transport=None, room_volume=None, room_queue=None
+    ):
         entry_id, target_id = request["config_entry_id"], request["target_id"]
         epoch, sequence = request["owner_epoch"], request["expected_poll_sequence"]
         request_id, action = request["request_id"], request["action"]
@@ -390,7 +395,7 @@ class PlaybackCommands:
             "physical_result_verified": False,
         }
 
-        if room_transport is not None:
+        if room_transport is not None or room_queue is not None:
             receipt["accepted_native"] = False
         if room_volume is not None:
             receipt.update(
@@ -407,7 +412,21 @@ class PlaybackCommands:
         if request_id != f"{epoch}:{command_sequence}":
             return rejected("invalid_request_identity")
         try:
-            _arguments(action, request["args"])
+            if room_queue is not None:
+                from .room_queue import ACTION as QUEUE_ACTION
+                from .room_queue import context as queue_context
+
+                if (
+                    room_transport is not None
+                    or room_volume is not None
+                    or action != QUEUE_ACTION
+                    or not queue_context(
+                        room_queue, target_id, request["args"], prepared=True
+                    )
+                ):
+                    return rejected("invalid_arguments")
+            else:
+                _arguments(action, request["args"])
         except CommandRejected as exc:
             return rejected(str(exc))
         if room_volume is not None:
@@ -438,7 +457,9 @@ class PlaybackCommands:
                 return rejected("invalid_room_identity")
         fingerprint = hashlib.sha256(
             json.dumps(
-                {"request": request, "room_volume": room_volume}
+                {"request": request, "room_queue": room_queue}
+                if room_queue is not None
+                else {"request": request, "room_volume": room_volume}
                 if room_volume is not None
                 else {"request": request, "room_transport": room_transport}
                 if room_transport is not None
@@ -480,6 +501,7 @@ class PlaybackCommands:
                     raise CommandRejected("awaiting_observation")
                 if (
                     room_volume is None
+                    and room_queue is None
                     and (
                         "play_track"
                         if action == "play_context"
@@ -519,7 +541,13 @@ class PlaybackCommands:
             del self.receipts[next(iter(self.receipts))]
         try:
             guard()
-            if room_volume is not None:
+            if room_queue is not None:
+                async with asyncio.timeout(8):
+                    await self.room_queue.commit(
+                        hass, request, room_queue, guard, sending
+                    )
+                receipt.update(ok=True, outcome="accepted", accepted_native=True)
+            elif room_volume is not None:
                 async with asyncio.timeout(8):
                     ack = await self.room_volume.commit(
                         hass,
@@ -663,7 +691,11 @@ class PlaybackCommands:
         except CommandRejected as exc:
             receipt = (
                 {**receipt, "outcome": "unknown", "error_kind": "outcome_unknown"}
-                if (room_transport is not None or room_volume is not None)
+                if (
+                    room_transport is not None
+                    or room_volume is not None
+                    or room_queue is not None
+                )
                 and possible_send
                 else rejected(str(exc))
             )
@@ -764,6 +796,44 @@ def register_command_services(hass):
             k: request.pop(k) for k in ("room_id", "homepod_id", "native", "route")
         }
         return await data.commands.execute(hass, request, room_transport=context)
+
+    async def room_queue_controls(call):
+        data = current(hass, call.data["config_entry_id"])
+        try:
+            return await data.commands.room_queue.read(
+                hass,
+                call.data["config_entry_id"],
+                call.data["target_id"],
+                call.data["room_id"],
+                call.data["homepod_id"],
+            )
+        except (CommandRejected, SpeakersError):
+            return {
+                "ok": False,
+                "error_kind": "room_queue_unavailable",
+                "retry_allowed": False,
+                "physical_result_verified": False,
+            }
+
+    async def room_queue_prepare(call):
+        data = current(hass, call.data["config_entry_id"])
+        return await data.commands.room_queue.prepare(hass, dict(call.data))
+
+    async def room_queue_command(call):
+        data = current(hass, call.data["config_entry_id"])
+        request = dict(call.data)
+        context = {
+            k: request.pop(k)
+            for k in (
+                "room_id",
+                "homepod_id",
+                "native",
+                "route",
+                "purpose",
+                "prepare_id",
+            )
+        }
+        return await data.commands.execute(hass, request, room_queue=context)
 
     async def volume_controls(call):
         entry_id = call.data["config_entry_id"]
@@ -883,6 +953,14 @@ def register_command_services(hass):
         vol.Required("route"): dict,
         vol.Required("volume_state"): dict,
     }
+    queue_command_schema = {
+        **command_schema,
+        **room_identity,
+        vol.Required("action"): vol.In(("play_queue_occurrence",)),
+        vol.Required("purpose"): vol.In(("queue_occurrence_v1",)),
+        vol.Required("native"): dict,
+        vol.Required("route"): dict,
+    }
     content_command_schema = {
         **command_schema,
         **room_identity,
@@ -904,6 +982,13 @@ def register_command_services(hass):
         vol.Required("move_offer"): dict,
     }
     for name, handler, schema in (
+        ("get_room_queue_controls", room_queue_controls, room_identity),
+        ("prepare_room_queue", room_queue_prepare, queue_command_schema),
+        (
+            "control_room_queue",
+            room_queue_command,
+            {**queue_command_schema, vol.Required("prepare_id"): text},
+        ),
         ("get_playback_controls", controls, identity),
         ("get_room_move_controls", move_controls, room_identity),
         ("prepare_room_move_playback", move_prepare, move_command_schema),

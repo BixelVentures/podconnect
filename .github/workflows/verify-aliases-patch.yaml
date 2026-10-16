@@ -1,6 +1,6 @@
-name: Verify device-aliases patch
+name: Verify pinned Native and OwnTone stacks
 
-# Test and compile the exact patched engine before merge and release.
+# Test and compile the exact patched engine and OwnTone queue purpose before merge.
 on:
   push:
     branches: [main]
@@ -17,6 +17,7 @@ on:
 jobs:
   build-fork:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -26,25 +27,82 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libflac-dev libasound2-dev libvorbis-dev libogg-dev
       - name: Clone go-librespot v0.7.3
         run: git clone --depth 1 --branch v0.7.3 https://github.com/devgianlu/go-librespot.git /tmp/gl
-      - name: Apply patch (must be clean)
+      - name: Verify and apply the complete pinned Native patch stack
         run: |
           cd /tmp/gl
           test "$(git rev-parse HEAD)" = c191a43c548e698c1dfc83590665f455fc54f084
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/aliases-v0.7.3.patch"
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/recovery-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/recovery-v0.7.3.patch"
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/autoplay-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/autoplay-v0.7.3.patch"
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/context-commit-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/context-commit-v0.7.3.patch"
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/volume-action-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/volume-action-v0.7.3.patch"
-          git apply --check "$GITHUB_WORKSPACE/podconnect/patches/initial-publication-v0.7.3.patch"
-          git apply "$GITHUB_WORKSPACE/podconnect/patches/initial-publication-v0.7.3.patch"
-      - name: Test aliases, recovery and autoplay
-        run: cd /tmp/gl && go test -race ./daemon ./zeroconf ./spclient && go vet ./daemon ./zeroconf ./spclient
+          patch_dir="$GITHUB_WORKSPACE/podconnect/patches"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/native-stack.sha256" | sha256sum -c -
+          for patch in aliases-v0.7.3.patch recovery-v0.7.3.patch autoplay-v0.7.3.patch context-commit-v0.7.3.patch volume-action-v0.7.3.patch initial-publication-v0.7.3.patch queue-occurrence-v0.7.3.patch room-transport-native.patch room-volume-native.patch room-burst-native.patch room-start35-native.patch room-start35-native-amendment.patch room-move-native.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
+          git apply --check -p2 "$patch_dir/room-retirement-native.patch"
+          git apply -p2 "$patch_dir/room-retirement-native.patch"
+          for patch in room-startcredit-handoff-native.patch room-startcredit-reviewfix-native.patch room-queue-native.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
+      - name: Test Native queue, transport, output and retained packages
+        run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient
       - name: Build patched fork
         run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
       - name: Smoke-check binary
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
+
+  build-owntone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned OwnTone build dependencies
+        run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          build-essential git autoconf automake libtool gettext gawk gperf bison flex pkg-config
+          libsqlite3-dev libavcodec-dev libavformat-dev libavfilter-dev libswscale-dev libavutil-dev
+          libasound2-dev libgcrypt20-dev libavahi-client-dev zlib1g-dev libevent-dev libplist-dev
+          libsodium-dev libjson-c-dev libwebsockets-dev libcurl4-openssl-dev libprotobuf-c-dev
+          libunistring-dev libgnutls28-dev libconfuse-dev libxml2-dev nodejs npm ca-certificates
+          libflac-dev libvorbis-dev libogg-dev
+      - name: Verify and apply the complete pinned OwnTone patch stack
+        run: |
+          git clone --depth 1 --branch 29.2 https://github.com/owntone/owntone-server.git /tmp/owntone
+          cd /tmp/owntone
+          test "$(git rev-parse HEAD)" = fa607a02768d9e29cd87065ac30ac66ea673f1ae
+          patch_dir="$GITHUB_WORKSPACE/podconnect/patches"
+          for patch in native-attention-fa607.patch room-transport-owntone.patch room-volume-owntone.patch room-burst-owntone.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/owntone-move.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/room-move-owntone.patch"
+          git apply "$patch_dir/room-move-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/owntone-queue.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/room-queue-owntone.patch"
+          git apply "$patch_dir/room-queue-owntone.patch"
+      - name: Compile and run actual queue C owner modes
+        run: |
+          set -Eeuo pipefail
+          cd /tmp/owntone
+          dump_owner_logs() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              for log in src/test-suite.log src/outputs_attention_owner.log src/airplay_callback_owner.log; do
+                if [ -f "$log" ]; then
+                  printf '\n=== %s ===\n' "$log"
+                  sudo -n cat "$log" || true
+                else
+                  printf '\n=== %s missing ===\n' "$log"
+                fi
+              done
+            fi
+            exit "$status"
+          }
+          trap dump_owner_logs EXIT
+          autoreconf -fi
+          ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
+          make -j"$(nproc)"
+          sudo -n make check
+          sudo -n src/outputs_attention_owner --deployed-uid-proc
+          sudo -n src/airplay_callback_owner --queue-wire
+          sudo -n src/airplay_callback_owner --queue-connect-wire

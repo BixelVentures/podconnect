@@ -1,3 +1,9 @@
+## Speakers 0.26.23 / Control 0.10.16 — queue occurrence candidate, unpublished
+
+- Add a distinct room queue purpose on the existing Native and OwnTone output owners. A read joins the current Native writer and C reader without staging a track; a selected opaque occurrence is staged on a detached list, pinned to the same route, then committed once through the guarded Native player. Duplicate songs retain separate occurrence IDs and manual queue order.
+- Add `get_room_queue_controls`, `prepare_room_queue`, and `control_room_queue` to the existing exact-account Control owner. Prepare is effect-free so the caller can recheck its current grant before commit. A stale owner, route, writer, occurrence or deadline rejects; an uncertain commit is consumed without retry. Existing queue and transport services retain their prior contracts.
+- This draft has source and patch replay reviews. Linux Native/OwnTone execution, Home Assistant framework tests, immutable images, publication, installation and audible acceptance remain separate gates.
+
 ## Speakers 0.26.22 / Control 0.10.15 — combined candidate, unpublished
 
 - Candidate bundle for the reviewed native room-content and room-move contracts, with independent Speakers and Control versions. Existing account, room, source, grant, queue, volume and one-use ownership checks remain part of the contract.
