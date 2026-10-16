@@ -82,10 +82,27 @@ jobs:
           git apply "$patch_dir/room-queue-owntone.patch"
       - name: Compile and run actual queue C owner modes
         run: |
+          set -Eeuo pipefail
           cd /tmp/owntone
+          dump_owner_logs() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              for log in src/test-suite.log src/outputs_attention_owner.log src/airplay_callback_owner.log; do
+                if [ -f "$log" ]; then
+                  printf '\n=== %s ===\n' "$log"
+                  sudo -n cat "$log" || true
+                else
+                  printf '\n=== %s missing ===\n' "$log"
+                fi
+              done
+            fi
+            exit "$status"
+          }
+          trap dump_owner_logs EXIT
           autoreconf -fi
           ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
           make -j"$(nproc)"
-          make check
-          src/airplay_callback_owner --queue-wire
-          src/airplay_callback_owner --queue-connect-wire
+          sudo -n make check
+          sudo -n src/outputs_attention_owner --deployed-uid-proc
+          sudo -n src/airplay_callback_owner --queue-wire
+          sudo -n src/airplay_callback_owner --queue-connect-wire

@@ -624,7 +624,7 @@
 +	p, offer := roomTransportAdmittedFixture(t)
 +	process := contentProcess{"11111111-1111-1111-1111-111111111111", "123", "1"}
 +	// Private actor/receipt fixture, not a real authenticated provider or kernel proof.
-+	writer := &queueWriterProof{Wire: queueWriterWire{process, "0", output.PipeIdentity{"1", "2", "fifo"}, "0", "1", strings.Repeat("a", 64)}}
++	writer := &queueWriterProof{Wire: queueWriterWire{process, "0", output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, "0", "1", strings.Repeat("a", 64)}}
 +	owner := offer.Snapshot.roomTransportIdentity
 +	observation := &nativeQueueOffer{Snapshot: nativeQueueSnapshot{ObservationID: strings.Repeat("c", 32), QueueRevision: offer.QueueRevision}, Expires: time.Now().Add(time.Second), BoundOwner: &owner, Writer: writer}
 +	offer.Bound = true

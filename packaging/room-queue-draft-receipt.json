@@ -13,10 +13,10 @@
     "custom_components/podconnect/speakers.py": "a97fd039b4dd9ad4c6e3290a7d43eb7efe71b24956342b96568b150d82d78b5e",
     "custom_components/podconnect/services.yaml": "dc2387302b619d84fecdc6ece5f10c5692d8a250451bd8b336d95e2eab761fd0",
     "custom_components/podconnect/room_queue.py": "792f6e7e2aac4a2a96ff6adc58b3cf4cc2fb60be2426ec4cb6a5cc797346dc25",
-    "tests/ha_framework/test_room_queue.py": "c0db9d7cb8390a188171e417ee0d3ea8325a0281ee04444e15722a3927a2279e"
+    "tests/ha_framework/test_room_queue.py": "a4eb20707ed4d80e9f8e902568961ad4b3ba53861ca898241ee5e50a71dafaf6"
   },
   "new_patch_bytes": {
-    "podconnect/patches/room-queue-native.patch": "29cabcb74969c8a2e605c3eec166141ad812732037fadd1a94d581ee0af63d72",
+    "podconnect/patches/room-queue-native.patch": "24604cbc9c106b5d84989f0f7550df5c94fad6efe306476a21e5ed7cfac3c1c1",
     "podconnect/patches/room-queue-owntone.patch": "5015a42d0ca6cab0fc535944c794094e45024332a43b0600fa2b15d5bdd96d9a"
   },
   "patch_replay_evidence": {
@@ -25,7 +25,7 @@
     "c_changed_files": 12,
     "c_files_compared": 563,
     "mismatches": 0,
-    "source": "PodView/integration/queue-occurrence-next/combined-patch-application.json"
+    "source": "Initial combined-patch-application.json plus actual successor Native replay: 274 files/14 changed/zero mismatches, /private/tmp/pc43-native-vet-patch-replay.json"
   },
   "local_checks": {
     "source_copy_exact": "8/8 PASS",
@@ -39,12 +39,21 @@
     "manager_focused_go_tests": "PASS on byte-identical isolated source; not repeated in this clone"
   },
   "pending": [
-    "Linux Native CGO/race execution",
-    "OwnTone C build and queue wire modes",
-    "Home Assistant framework execution",
+    "successor Native vet/build",
+    "successor Home Assistant framework tests",
+    "C owner suite and queue wire modes",
     "composed end-to-end custody review",
     "immutable image publication",
     "installation",
     "provider and audible acceptance"
-  ]
+  ],
+  "ci_followup": {
+    "prior_head": "3bc342bda866b754c84a2c5e0931f1a8b9851527",
+    "manager": "actual official CI PASS",
+    "native": "six actual Linux race packages PASS; go vet failed on one unkeyed external test literal; keyed-only repair independently reviewed f0437729b1e594b6efcf85954a0ff2c23a34ada43473a38aa1b7e0166955c145",
+    "ha": "actual framework 242 cases:241 pass, one stale test owner error after integration unload; capture original owner, preserve no effects and sequence, independently reviewed 76a571760ab356144267c4f5dc75bc867d10dab969bb29562e40d5a49c1f0728",
+    "c": "actual production and three test binaries compiled/linked; make check failed before queue modes; existing proc fixtures require root. CI-only sudo/log-capture change independently reviewed 676d1c58b45edf30800a61f77c2a5e52fcf1447204aedf47b2895e9b3fb59b6e",
+    "workflow_sha256": "66237b591268fbeeed4de7227ff54b6d662cc573202af2ac65e8779e0feb3c8b",
+    "execution": "successor Linux Native vet/build, HA framework and C owner/queue modes PENDING; no source-runtime change or Green claim"
+  }
 }

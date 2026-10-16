@@ -388,6 +388,9 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertFalse(self.entries[0].runtime_data.commands.busy)
 
     async def test_queue_stage_account_replacement_denied_before_commit(self):
+        # HA may unload this entry after unique_id changes. Keep the original
+        # in-flight owner so cleanup is checked even after runtime_data is removed.
+        owner = self.entries[0].runtime_data.commands
         self.queue_hold = True
         await self.queue_read()
         running = self._task(
@@ -400,7 +403,9 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.queue_release.set()
         self.assertFalse((await running)["ok"])
         self.assertEqual(len(self.queue_posts), 1)
-        self.assertFalse(self.entries[0].runtime_data.commands.busy)
+        self.assertFalse(owner.busy)
+        self.assertEqual(owner.command_sequence, 0)
+        self.assertEqual(self._writes(), [])
 
 
 if __name__ == "__main__":
