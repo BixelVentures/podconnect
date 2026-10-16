@@ -36,6 +36,12 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/initial-publication-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply --check "/patches/queue-occurrence-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply "/patches/queue-occurrence-${GO_LIBRESPOT_VERSION}.patch" \
+  && git apply --check "/patches/room-transport-native.patch" \
+  && git apply "/patches/room-transport-native.patch" \
+  && git apply --check "/patches/room-volume-native.patch" \
+  && git apply "/patches/room-volume-native.patch" \
+  && git apply --check "/patches/room-burst-native.patch" \
+  && git apply "/patches/room-burst-native.patch" \
   && go test ./tracks ./daemon ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -56,11 +62,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --- OwnTone (AirPlay 2 sender) — built from source (no ARM64 package exists) ---
 ARG OWNTONE_REF=29.2
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
+COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
+COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
+COPY patches/room-burst-owntone.patch /patches/room-burst-owntone.patch
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
   && test "$(git rev-parse HEAD)" = fa607a02768d9e29cd87065ac30ac66ea673f1ae \
   && git apply --check /patches/native-attention-fa607.patch \
   && git apply /patches/native-attention-fa607.patch \
+  && git apply --check /patches/room-transport-owntone.patch \
+  && git apply /patches/room-transport-owntone.patch \
+  && git apply --check /patches/room-volume-owntone.patch \
+  && git apply /patches/room-volume-owntone.patch \
+  && git apply --check /patches/room-burst-owntone.patch \
+  && git apply /patches/room-burst-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

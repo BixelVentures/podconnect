@@ -1,0 +1,1077 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -750,6 +750,14 @@
+ 
+ 		s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+ 	})
++	m.HandleFunc("/player/room_transport/bound-state", s.handleRoomTransportState)
++	m.HandleFunc("/player/room_transport/bound-prepare", s.handleRoomTransportPrepare)
++	m.HandleFunc("/player/room_transport/bound-commit", s.handleRoomTransportCommit)
++	m.HandleFunc("/player/room_volume/bound-state", s.handleRoomVolumeState)
++	m.HandleFunc("/player/room_volume/bound-prepare", s.handleRoomVolumePrepare)
++	m.HandleFunc("/player/room_volume/bound-commit", s.handleRoomVolumeCommit)
++	m.HandleFunc("/player/room_volume/bound-cancel", s.handleRoomVolumeCancel)
++	m.HandleFunc("/player/room_volume/bound-result", s.handleRoomVolumeResult)
+ 	m.HandleFunc("/player/room_volume/state", s.handleRoomVolumeState)
+ 	m.HandleFunc("/player/room_volume/prepare", s.handleRoomVolumePrepare)
+ 	m.HandleFunc("/player/room_volume/commit", s.handleRoomVolumeCommit)
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,6 +30,7 @@
+ )
+ 
+ type AppPlayer struct {
++	roomNativeIntent                 uint64
+ 	roomVolumeReservation            *nativeRoomVolumeReservation
+ 	roomVolumeClosing                bool
+ 	roomCloseMu                      sync.Mutex
+@@ -549,7 +550,7 @@
+ 
+ 	if p.roomVolumeBusy() {
+ 		switch req.Type {
+-		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort:
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort:
+ 		default:
+ 			return nil, ErrAliasConflict
+ 		}
+@@ -559,14 +560,14 @@
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
+-	case apiRoomVolumeState:
++	case apiRoomVolumeState, apiRoomVolumeBoundState:
+ 		request := req.Data.(roomTransportStateRequest)
+ 		if (request.Context != nil && request.Context.Err() != nil) || ctx.Err() != nil {
+ 			return nil, ErrAliasConflict
+ 		}
+ 		identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
+-		if err != nil {
+-			return nil, err
++		if err != nil || (req.Type == apiRoomVolumeBoundState && !nativeBoundOwnerValid(identity)) {
++			return nil, ErrAliasConflict
+ 		}
+ 		actions := []string{"volume"}
+ 		if p.roomVolumeBusy() {
+@@ -578,13 +579,21 @@
+ 			Identity roomTransportIdentity `json:"identity"`
+ 			Actions  []string              `json:"actions"`
+ 			Physical bool                  `json:"physical_result_verified"`
+-		}{"podconnect.native_room_volume_state.v1", true, identity, actions, false}, nil
++		}{boundSchema("podconnect.native_room_volume_state.v1", req.Type == apiRoomVolumeBoundState), true, identity, actions, false}, nil
++	case apiRoomVolumeBoundPrepare:
++		return p.prepareRoomVolumeVersion(ctx, req.Data.(roomVolumePrepareActorRequest), true)
+ 	case apiRoomVolumePrepare:
+ 		return p.prepareRoomVolume(ctx, req.Data.(roomVolumePrepareActorRequest))
+ 	case apiRoomVolumeClaim:
+ 		return p.claimRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
+ 	case apiRoomVolumeConsume:
+ 		return p.consumeRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
++	case apiRoomBoundState:
++		return p.roomTransportStateVersion(ctx, req.Data.(roomTransportStateRequest), true)
++	case apiRoomBoundPrepare:
++		return p.prepareRoomTransportVersion(ctx, req.Data.(roomTransportPrepareRequest), true)
++	case apiRoomBoundConsume:
++		return p.consumeRoomTransportVersion(ctx, req.Data.(roomTransportConsumeRequest), true)
+ 	case apiRoomTransportState:
+ 		return p.roomTransportState(ctx, req.Data.(roomTransportStateRequest))
+ 	case apiRoomTransportPrepare:
+@@ -985,9 +994,7 @@
+ 				continue
+ 			}
+ 
+-			data, err := p.handleApiRequest(ctx, req)
+-			req.Reply(data, err)
+-			if !p.waitRoomVolumeReservation(ctx) {
++			if !p.dispatchAPIAndPark(ctx, req) {
+ 				return
+ 			}
+ 		case mprisReq, ok := <-mprisRecv:
+@@ -1053,3 +1060,9 @@
+ 		}
+ 	}
+ }
++
++func (p *AppPlayer) dispatchAPIAndPark(ctx context.Context, req ApiRequest) bool {
++	data, err := p.handleApiRequest(ctx, req)
++	req.Reply(data, err)
++	return p.waitRoomVolumeReservation(ctx)
++}
+diff --git a/daemon/room_burst.go b/daemon/room_burst.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_burst.go
+@@ -0,0 +1,107 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"strconv"
++	"strings"
++)
++
++const (
++	apiRoomBoundState         ApiRequestType = "room_bound_state"
++	apiRoomBoundPrepare       ApiRequestType = "room_bound_prepare"
++	apiRoomBoundConsume       ApiRequestType = "room_bound_consume"
++	apiRoomVolumeBoundState   ApiRequestType = "room_volume_bound_state"
++	apiRoomVolumeBoundPrepare ApiRequestType = "room_volume_bound_prepare"
++)
++
++func roomBoundRequest(r *http.Request) bool { return strings.Contains(r.URL.Path, "/bound-") }
++func boundSchema(schema string, bound bool) string {
++	if bound {
++		return strings.TrimSuffix(schema, ".v1") + ".v2"
++	}
++	return schema
++}
++func nativeOwnerASCII(value string, limit int) bool {
++	if len(value) == 0 || len(value) > limit {
++		return false
++	}
++	for _, c := range []byte(value) {
++		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' {
++			return false
++		}
++	}
++	return true
++}
++func nativeBoundOwnerValid(owner roomTransportIdentity) bool {
++	if owner.AliasRevision >= 1<<53 || !nativeOwnerASCII(owner.AccountUserID, 160) {
++		return false
++	}
++	for _, s := range []string{owner.TargetID, owner.RoomID, owner.HomePodID, owner.ConnectionID, owner.SessionID, owner.AliasIncarnation, owner.AliasRegistry} {
++		if !nativeOwnerASCII(s, 255) {
++			return false
++		}
++	}
++	return volumeCounter(owner.HomePodID) && owner.HomePodID != "0" && volumeHex32.MatchString(owner.AliasIncarnation) && volumeHex64.MatchString(owner.AliasRegistry)
++}
++func (p *AppPlayer) nextNativeIntent() (string, error) {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if p.roomNativeIntent == ^uint64(0) {
++		return "", ErrAliasConflict
++	}
++	p.roomNativeIntent++
++	return strconv.FormatUint(p.roomNativeIntent, 10), nil
++}
++func (p *AppPlayer) boundIntentCurrentLocked(offer *nativeTransportOffer) bool {
++	return !offer.Bound || (offer.NativeRevision != "" && offer.NativeRevision == strconv.FormatUint(p.roomNativeIntent, 10))
++}
++
++// The v2 envelope is decoded separately so the frozen v1 closed schemas remain
++// closed. The actual owner/revision comes only from the consumed native offer.
++func boundOwnerPayload(base any, owner roomTransportIdentity, revision string) any {
++	raw, _ := json.Marshal(base)
++	var fields map[string]any
++	_ = json.Unmarshal(raw, &fields)
++	fields["native_owner"] = owner
++	fields["native_revision"] = revision
++	return fields
++}
++func decodeBoundOwner(raw []byte, base any, owner roomTransportIdentity, revision string) error {
++	var fields map[string]json.RawMessage
++	if strictVolumeJSON(raw, &fields) != nil {
++		return ErrAliasConflict
++	}
++	var got roomTransportIdentity
++	var gotRevision string
++	if strictVolumeJSON(fields["native_owner"], &got) != nil || json.Unmarshal(fields["native_revision"], &gotRevision) != nil || got != owner || gotRevision != revision || !nativeBoundOwnerValid(got) || !volumeCounter(gotRevision) || gotRevision == "0" {
++		return ErrAliasConflict
++	}
++	delete(fields, "native_owner")
++	delete(fields, "native_revision")
++	remaining, _ := json.Marshal(fields)
++	return strictVolumeJSON(remaining, base)
++}
++func roomBoundHTTP(ctx context.Context, method, endpoint string, payload any, out any, owner roomTransportIdentity, revision string) error {
++	// Use the same fixed local-only client and bounded body, retaining exact bytes
++	// for envelope validation before a receipt can signal native retirement.
++	var raw boundReceiptBytes
++	if err := roomVolumeHTTP(ctx, method, endpoint, payload, &raw); err != nil {
++		return err
++	}
++	if err := decodeBoundOwner(raw.Raw, out, owner, revision); err != nil {
++		return errors.New("bound owner receipt mismatch")
++	}
++	return nil
++}
++
++type boundReceiptBytes struct {
++	Raw []byte `json:"-"`
++}
++
++func (raw *boundReceiptBytes) UnmarshalJSON(data []byte) error {
++	raw.Raw = append(raw.Raw[:0], data...)
++	return nil
++}
+diff --git a/daemon/room_burst_test.go b/daemon/room_burst_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_burst_test.go
+@@ -0,0 +1,268 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func burstVolumeFixture(t *testing.T) (*AppPlayer, *roomVolumeOperation) {
++	p, op := roomVolumeFixture(t)
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		t.Fatal(err)
++	}
++	op.Bound = true
++	op.NativeRevision = revision
++	op.Actor.Bound = true
++	op.Actor.NativeRevision = revision
++	op.TerminalProof = make(chan struct{})
++	return p, op
++}
++func TestRoomBurstActorOwnedIntentSupersedesActualFinalGuard(t *testing.T) {
++	p, offer := roomTransportAdmittedFixture(t)
++	first, err := p.nextNativeIntent()
++	if err != nil {
++		t.Fatal(err)
++	}
++	offer.Bound = true
++	offer.NativeRevision = first
++	offer.Snapshot.NativeRevision = first
++	if _, err = p.consumeRoomTransportVersion(context.Background(), roomTransportConsumeRequest{offer.Snapshot.PrepareID, context.Background()}, true); err != nil {
++		t.Fatal(err)
++	}
++	second, err := p.nextNativeIntent()
++	if err != nil || second == first {
++		t.Fatal("new actor prepare did not advance actual intent")
++	}
++	// This is exactly the final actor guard invoked after the actual pipe/source
++	// locks. Those lock positions are exercised by retained player guard tests.
++	p.aliasMu.Lock()
++	admitted := p.transportOfferCurrentLocked(offer, context.Background(), context.Background())
++	p.aliasMu.Unlock()
++	if admitted {
++		t.Fatal("superseded intent passed actual final actor mutator guard")
++	}
++	p.roomNativeIntent = ^uint64(0)
++	if _, err = p.nextNativeIntent(); err == nil {
++		t.Fatal("native revision wrapped into old authority")
++	}
++}
++func TestRoomBurstBoundEnvelopeCannotDowngradeOrAdoptForeignOwner(t *testing.T) {
++	_, op := burstVolumeFixture(t)
++	base := roomVolumePrepareACK{"podconnect.output_room_volume_prepare.v2", true, strings.Repeat("c", 32), op.ID, op.ArgsDigest, 45, op.Binding.Route, op.Binding.VolumeState, 1000, false}
++	good, _ := json.Marshal(boundOwnerPayload(base, op.Binding.Native, op.NativeRevision))
++	var got roomVolumePrepareACK
++	if decodeBoundOwner(good, &got, op.Binding.Native, op.NativeRevision) != nil {
++		t.Fatal("matching closed bound proof denied")
++	}
++	for _, raw := range [][]byte{[]byte(strings.Replace(string(good), `"native_revision":"1"`, `"native_revision":"2"`, 1)), []byte(strings.Replace(string(good), `"account_user_id":"account"`, `"account_user_id":"other"`, 1)), []byte(strings.Replace(string(good), `"native_revision":"1"`, `"native_revision":"1","native_revision":"1"`, 1))} {
++		if decodeBoundOwner(raw, &got, op.Binding.Native, op.NativeRevision) == nil {
++			t.Fatal("foreign or ambiguous bound owner accepted")
++		}
++	}
++	unbound, _ := json.Marshal(base)
++	if decodeBoundOwner(unbound, &got, op.Binding.Native, op.NativeRevision) == nil {
++		t.Fatal("legacy receipt silently upgraded")
++	}
++}
++func TestRoomBurstVerifiedTerminalReleasesProductionActorPark(t *testing.T) {
++	p, op := burstVolumeFixture(t)
++	var commits atomic.Int32
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	server.roomVolumes.put(op)
++	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var fields map[string]json.RawMessage
++		if r.Method == "POST" && json.NewDecoder(r.Body).Decode(&fields) != nil {
++			t.Error("request")
++		}
++		switch r.URL.Path {
++		case "/api/outputs/101/volume/bound-prepare":
++			if len(fields) != 8 {
++				t.Error("bound prepare not closed8")
++			}
++			var request roomVolumeCPrepareRequest
++			raw, _ := json.Marshal(fields)
++			if decodeBoundOwner(raw, &request, op.Binding.Native, op.NativeRevision) != nil {
++				t.Error("prepare actual owner/revision mismatch")
++			}
++			ack := roomVolumePrepareACK{"podconnect.output_room_volume_prepare.v2", true, strings.Repeat("c", 32), op.ID, op.ArgsDigest, 45, op.Binding.Route, op.Binding.VolumeState, 1000, false}
++			_ = json.NewEncoder(w).Encode(boundOwnerPayload(ack, op.Binding.Native, op.NativeRevision))
++		case "/api/outputs/101/volume/bound-commit":
++			if len(fields) != 8 {
++				t.Error("bound commit not closed8")
++			}
++			var request roomVolumeCCommitRequest
++			raw, _ := json.Marshal(fields)
++			if decodeBoundOwner(raw, &request, op.Binding.Native, op.NativeRevision) != nil {
++				t.Error("commit actual owner/revision mismatch")
++			}
++			commits.Add(1)
++			ack := volumeOwnerAck(op, "commit", "protocol_accepted", true)
++			ack.Schema = boundSchema(ack.Schema, true)
++			_ = json.NewEncoder(w).Encode(boundOwnerPayload(ack, op.Binding.Native, op.NativeRevision))
++		default:
++			t.Error("unexpected route", r.URL.Path)
++			w.WriteHeader(404)
++		}
++	}))
++	defer owner.Close()
++	op.OwnToneURL = owner.URL
++	op.Actor.OwnToneURL = owner.URL
++	p.app.cfg.RoomTransportOwnToneURL = owner.URL
++	actorDone := make(chan struct{})
++	go func() {
++		defer close(actorDone)
++		for req := range server.requests {
++			if !p.dispatchAPIAndPark(context.Background(), req) {
++				return
++			}
++		}
++	}()
++	defer func() { close(server.requests); <-actorDone }()
++	out := httptest.NewRecorder()
++	server.handleRoomVolumeCommit(out, httptest.NewRequest("POST", "/player/room_volume/bound-commit", strings.NewReader(`{"native_prepare_id":"`+op.ID+`"}`)))
++	var receipt roomVolumeReceipt
++	if strictVolumeJSON(out.Body.Bytes(), &receipt) != nil || receipt.Schema != "podconnect.native_room_volume_commit.v2" || !receipt.ProtocolAccepted || commits.Load() != 1 {
++		t.Fatal("actual bound protocol proof absent", out.Body.String())
++	}
++	// Production dispatch must have replied to CONSUME before parking, permitting
++	// the C HTTP call; exact trusted terminal proof now permits a queued operation.
++	req, wait := NewApiRequest(ApiRequestTypeAliases, nil)
++	select {
++	case server.requests <- req:
++	case <-time.After(400 * time.Millisecond):
++		t.Fatal("verified drained protocol proof did not release actor promptly")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
++	defer cancel()
++	if _, err := wait(ctx); err != nil {
++		t.Fatal("queued same-owner read stalled", err)
++	}
++	p.aliasMu.Lock()
++	stillReserved := p.roomVolumeReservation != nil
++	p.aliasMu.Unlock()
++	if stillReserved || !time.Now().Before(op.ReservationUntil) {
++		t.Fatal("early exact terminal release not exercised")
++	}
++}
++func TestRoomBurstUnknownForeignAndUndrainedProofKeepOriginalPark(t *testing.T) {
++	for _, mode := range []string{"unknown", "undrained", "foreign-owner", "timeout"} {
++		t.Run(mode, func(t *testing.T) {
++			p, op := burstVolumeFixture(t)
++			op.CPrepare = &roomVolumePrepareACK{Token: strings.Repeat("c", 32)}
++			op.ReservationID = strings.Repeat("d", 32)
++			until := time.Now().Add(65 * time.Millisecond)
++			reservation := &nativeRoomVolumeReservation{op, until}
++			p.roomVolumeReservation = reservation
++			done := make(chan struct{})
++			go func() { p.waitReservedOwner(context.Background(), reservation); close(done) }()
++			ack := volumeOwnerAck(op, "result", "protocol_accepted", true)
++			ack.Schema = boundSchema(ack.Schema, true)
++			switch mode {
++			case "unknown":
++				ack.Outcome = "unknown"
++			case "undrained":
++				ack.ContextsDrained = false
++			case "foreign-owner":
++				ack.Identity.Process = "00000000-0000-0000-0000-000000000002"
++			}
++			if mode != "timeout" && op.validOwnerReceipt(ack, "result") {
++				op.recordOwnerReceipt(ack)
++			}
++			select {
++			case <-done:
++				t.Fatal("unproven receipt shortened native owner quarantine")
++			case <-time.After(10 * time.Millisecond):
++			}
++			select {
++			case <-done:
++				if time.Now().Before(until) {
++					t.Fatal("native absolute deadline renewed or shortened")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("bounded park failed to retire")
++			}
++		})
++	}
++}
++
++func TestRoomBurstAudioHTTPRequiresActualExactBoundProof(t *testing.T) {
++	for _, mode := range []string{"accepted", "foreign-revision", "foreign-owner", "downgrade", "old-endpoint"} {
++		t.Run(mode, func(t *testing.T) {
++			p, offer := roomTransportAdmittedFixture(t)
++			revision, err := p.nextNativeIntent()
++			if err != nil {
++				t.Fatal(err)
++			}
++			offer.Bound = true
++			offer.NativeRevision = revision
++			offer.Snapshot.NativeRevision = revision
++			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path != "/api/outputs/101/transport/bound-commit" {
++					t.Error("unbound fallback", r.URL.Path)
++				}
++				raw := map[string]json.RawMessage{}
++				_ = json.NewDecoder(r.Body).Decode(&raw)
++				if len(raw) != 7 {
++					t.Error("audio Ccommit not closed7")
++				}
++				var got roomTransportIdentity
++				var gotRevision string
++				if strictVolumeJSON(raw["native_owner"], &got) != nil || got != offer.Snapshot.roomTransportIdentity || json.Unmarshal(raw["native_revision"], &gotRevision) != nil || gotRevision != revision {
++					t.Error("audio Ccommit actual actor binding absent")
++				}
++				ack := roomTransportOutputACK{"podconnect.output_transport_commit.v2", true, strings.Repeat("c", 32), offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, 10000, "accepted", false}
++				boundOwner := offer.Snapshot.roomTransportIdentity
++				boundRevision := revision
++				if mode == "foreign-owner" {
++					boundOwner.ConnectionID = "foreign"
++				}
++				if mode == "foreign-revision" {
++					boundRevision = "2"
++				}
++				var reply any = boundOwnerPayload(ack, boundOwner, boundRevision)
++				if mode == "downgrade" {
++					ack.Schema = "podconnect.output_transport_commit.v1"
++					reply = ack
++				}
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer owner.Close()
++			offer.OwnToneURL = owner.URL
++			p.app.cfg.RoomTransportOwnToneURL = owner.URL
++			server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++			var effects atomic.Int32
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for req := range server.requests {
++					switch req.Type {
++					case apiRoomTransportEffect:
++						effects.Add(1)
++						req.Reply(map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": true, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}, nil)
++					default:
++						data, err := p.handleApiRequest(context.Background(), req)
++						req.Reply(data, err)
++					}
++				}
++			}()
++			path := "/player/room_transport/bound-commit"
++			if mode == "old-endpoint" {
++				path = "/player/room_transport/commit"
++			}
++			out := httptest.NewRecorder()
++			server.handleRoomTransportCommit(out, httptest.NewRequest("POST", path, strings.NewReader(`{"prepare_id":"`+offer.Snapshot.PrepareID+`","own_tone_token":"`+strings.Repeat("c", 32)+`"}`)))
++			close(server.requests)
++			<-done
++			if (mode == "accepted") != (out.Code == 200 && effects.Load() == 1) {
++				t.Fatal("wrong bound proof reached private effect", mode, out.Code, out.Body.String(), effects.Load())
++			}
++		})
++	}
++}
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -69,8 +69,11 @@
+ 	VolumePercent  int    `json:"volume_percent"`
+ 	ArgsDigest     string `json:"args_digest"`
+ 	ExpiresAfterMS int    `json:"expires_after_ms"`
++	NativeRevision string `json:"native_revision,omitempty"`
+ }
+ type nativeTransportOffer struct {
++	Bound               bool
++	NativeRevision      string
+ 	Published           bool
+ 	Disposed            bool
+ 	Generation          uint64
+@@ -202,14 +205,17 @@
+ 	return zero, ErrAliasConflict
+ }
+ func (p *AppPlayer) roomTransportState(parent context.Context, request roomTransportStateRequest) (any, error) {
++	return p.roomTransportStateVersion(parent, request, false)
++}
++func (p *AppPlayer) roomTransportStateVersion(parent context.Context, request roomTransportStateRequest, bound bool) (any, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	if ctx.Err() != nil || parent.Err() != nil {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
+-	if err != nil {
+-		return nil, err
++	if err != nil || (bound && !nativeBoundOwnerValid(identity)) {
++		return nil, ErrAliasConflict
+ 	}
+ 	return struct {
+ 		Schema   string                `json:"schema"`
+@@ -217,9 +223,12 @@
+ 		Identity roomTransportIdentity `json:"identity"`
+ 		Actions  []string              `json:"actions"`
+ 		Physical bool                  `json:"physical_result_verified"`
+-	}{"podconnect.native_room_transport_state.v1", true, identity, slices.Clone(roomTransportActions), false}, nil
++	}{boundSchema("podconnect.native_room_transport_state.v1", bound), true, identity, slices.Clone(roomTransportActions), false}, nil
+ }
+ func (p *AppPlayer) prepareRoomTransport(parent context.Context, request roomTransportPrepareRequest) (any, error) {
++	return p.prepareRoomTransportVersion(parent, request, false)
++}
++func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request roomTransportPrepareRequest, bound bool) (any, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	if !slices.Contains(roomTransportActions, request.Action) || request.VolumePercent != 0 || ctx.Err() != nil || parent.Err() != nil {
+@@ -229,14 +238,26 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if bound && !nativeBoundOwnerValid(identity) {
++		return nil, ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return nil, err
++	}
+ 	offer := &nativeTransportOffer{Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe}
++	offer.Bound = bound
++	offer.NativeRevision = revision
+ 	stagedOwned := true
+ 	defer func() {
+ 		if stagedOwned {
+ 			offer.discardPrepared()
+ 		}
+ 	}()
+-	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: "podconnect.native_room_transport.v1", Action: request.Action, VolumePercent: 0, ExpiresAfterMS: 5000}
++	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: boundSchema("podconnect.native_room_transport.v1", bound), Action: request.Action, VolumePercent: 0, ExpiresAfterMS: 5000}
++	if bound {
++		offer.Snapshot.NativeRevision = revision
++	}
+ 	if request.Action == "next" || request.Action == "previous" {
+ 		staged, err := p.state.tracks.PrepareTransport(ctx, request.Action == "previous", p.state.trackPosition())
+ 		if err != nil {
+@@ -279,7 +300,8 @@
+ 		Identity roomTransportIdentity `json:"identity"`
+ 		Action   string                `json:"action"`
+ 		Percent  int                   `json:"volume_percent"`
+-	}{identity, request.Action, 0})
++		Revision string                `json:"native_revision,omitempty"`
++	}{identity, request.Action, 0, offer.Snapshot.NativeRevision})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -292,7 +314,7 @@
+ 	return offer.Snapshot, nil
+ }
+ func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, parent, request context.Context) bool {
+-	if offer == nil || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
++	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
+ 		return false
+ 	}
+ 	binding := p.aliasBindingLocked()
+@@ -307,8 +329,11 @@
+ 	return false
+ }
+ func (p *AppPlayer) consumeRoomTransport(parent context.Context, request roomTransportConsumeRequest) (any, error) {
++	return p.consumeRoomTransportVersion(parent, request, false)
++}
++func (p *AppPlayer) consumeRoomTransportVersion(parent context.Context, request roomTransportConsumeRequest, bound bool) (any, error) {
+ 	offer := p.roomTransportOffer
+-	if offer == nil || request.PrepareID != offer.Snapshot.PrepareID {
++	if offer == nil || offer.Bound != bound || request.PrepareID != offer.Snapshot.PrepareID {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	p.roomTransportOffer = nil
+@@ -319,7 +344,7 @@
+ 		offer.discardPrepared()
+ 		return nil, ErrAliasConflict
+ 	}
+-	if p.roomTransportPending != nil && time.Now().Before(p.roomTransportPending.Expires) {
++	if p.roomTransportPending != nil && time.Now().Before(p.roomTransportPending.Expires) && (!bound || !p.roomTransportPending.Bound || p.roomTransportPending.NativeRevision == offer.NativeRevision) {
+ 		offer.discardPrepared()
+ 		return nil, ErrAliasConflict
+ 	}
+@@ -398,5 +423,5 @@
+ 		AcceptedNative bool   `json:"accepted_native"`
+ 		PrepareID      string `json:"prepare_id"`
+ 		Physical       bool   `json:"physical_result_verified"`
+-	}{"podconnect.native_room_transport_commit.v1", true, offer.Snapshot.PrepareID, false}, nil
+-}
++	}{boundSchema("podconnect.native_room_transport_commit.v1", offer.Bound), true, offer.Snapshot.PrepareID, false}, nil
++}
+diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -87,7 +87,11 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+ 	defer cancel()
+-	data, err := s.roomTransportAsk(ctx, apiRoomTransportState, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	typ := apiRoomTransportState
++	if roomBoundRequest(r) {
++		typ = apiRoomBoundState
++	}
++	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
+ 	roomTransportResponse(w, data, err)
+ }
+ func (s *ConcreteApiServer) handleRoomTransportPrepare(w http.ResponseWriter, r *http.Request) {
+@@ -102,7 +106,11 @@
+ 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+ 	defer cancel()
+ 	request.Context = ctx
+-	data, err := s.roomTransportAsk(ctx, apiRoomTransportPrepare, request)
++	typ := apiRoomTransportPrepare
++	if roomBoundRequest(r) {
++		typ = apiRoomBoundPrepare
++	}
++	data, err := s.roomTransportAsk(ctx, typ, request)
+ 	roomTransportResponse(w, data, err)
+ }
+ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *http.Request) {
+@@ -118,7 +126,11 @@
+ 	defer cancel()
+ 	// First actor consumption occurs before the only OwnTone await. The actor is
+ 	// available to process retirement/alias/session updates during this HTTP call.
+-	value, err := s.roomTransportAsk(ctx, apiRoomTransportConsume, roomTransportConsumeRequest{request.PrepareID, ctx})
++	typ := apiRoomTransportConsume
++	if roomBoundRequest(r) {
++		typ = apiRoomBoundConsume
++	}
++	value, err := s.roomTransportAsk(ctx, typ, roomTransportConsumeRequest{request.PrepareID, ctx})
+ 	if err != nil {
+ 		roomTransportResponse(w, nil, err)
+ 		return
+@@ -134,14 +146,23 @@
+ 		_, _ = s.roomTransportAsk(cleanup, apiRoomTransportAbort, offer)
+ 	}()
+ 	inputDigest := sha256.Sum256([]byte(offer.InputPath))
+-	body, _ := json.Marshal(struct {
++	payload := struct {
+ 		Token                   string `json:"token"`
+ 		NativePrepareID         string `json:"native_prepare_id"`
+ 		Action                  string `json:"action"`
+ 		ArgsDigest              string `json:"args_digest"`
+ 		ExpectedInputPathDigest string `json:"expected_input_path_digest"`
+-	}{request.OwnToneToken, offer.Snapshot.PrepareID, offer.Snapshot.Action, offer.Snapshot.ArgsDigest, hex.EncodeToString(inputDigest[:])})
+-	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/commit"
++	}{request.OwnToneToken, offer.Snapshot.PrepareID, offer.Snapshot.Action, offer.Snapshot.ArgsDigest, hex.EncodeToString(inputDigest[:])}
++	var envelope any = payload
++	if offer.Bound {
++		envelope = boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
++	}
++	body, _ := json.Marshal(envelope)
++	suffix := "commit"
++	if offer.Bound {
++		suffix = "bound-commit"
++	}
++	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/" + suffix
+ 	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+ 	if err != nil {
+ 		roomTransportResponse(w, nil, err)
+@@ -154,10 +175,18 @@
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+-	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 2049))
++	limit := int64(2048)
++	if offer.Bound {
++		limit = 8192
++	}
++	raw, readErr := io.ReadAll(io.LimitReader(response.Body, limit+1))
+ 	_ = response.Body.Close()
+ 	var ack roomTransportOutputACK
+-	if response.StatusCode != 200 || readErr != nil || len(raw) > 2048 || decodeQueueJSON(raw, &ack) != nil || ack.Schema != "podconnect.output_transport_commit.v1" || !ack.OK || ack.Token != request.OwnToneToken || ack.NativePrepareID != offer.Snapshot.PrepareID || ack.ArgsDigest != offer.Snapshot.ArgsDigest || ack.PinRemainingMS < 1 || ack.PinRemainingMS > 10000 || ack.Outcome != "accepted" || ack.Physical {
++	decodeErr := decodeQueueJSON(raw, &ack)
++	if offer.Bound {
++		decodeErr = decodeBoundOwner(raw, &ack, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
++	}
++	if response.StatusCode != 200 || readErr != nil || int64(len(raw)) > limit || decodeErr != nil || ack.Schema != boundSchema("podconnect.output_transport_commit.v1", offer.Bound) || !ack.OK || ack.Token != request.OwnToneToken || ack.NativePrepareID != offer.Snapshot.PrepareID || ack.ArgsDigest != offer.Snapshot.ArgsDigest || ack.PinRemainingMS < 1 || ack.PinRemainingMS > 10000 || ack.Outcome != "accepted" || ack.Physical {
+ 		roomTransportResponse(w, nil, ErrAliasConflict)
+ 		return
+ 	}
+diff --git a/daemon/room_volume.go b/daemon/room_volume.go
+--- a/daemon/room_volume.go
++++ b/daemon/room_volume.go
+@@ -117,27 +117,31 @@
+ 	PinRemainingMS      int             `json:"pin_remaining_ms"`
+ }
+ type roomVolumeOperation struct {
+-	mu               sync.Mutex
+-	Owner            *AppPlayer
+-	Binding          roomVolumeBinding
+-	Actor            *nativeTransportOffer
+-	ID               string
+-	ArgsDigest       string
+-	OwnToneURL       string
+-	InputDigest      string
+-	Expires          time.Time
+-	RetainUntil      time.Time
+-	Claimed          bool
+-	Cancelled        bool
+-	CPrepare         *roomVolumePrepareACK
+-	ReservationID    string
+-	ReservationUntil time.Time
+-	ReservedAt       time.Time
+-	PreparedSeenAt   time.Time
+-	CommitDispatched bool
+-	CancelDispatched bool
+-	CommitReceipt    *roomVolumeReceipt
+-	Latest           roomVolumeReceipt
++	mu                sync.Mutex
++	Bound             bool
++	NativeRevision    string
++	TerminalProof     chan struct{}
++	TerminalSignalled bool
++	Owner             *AppPlayer
++	Binding           roomVolumeBinding
++	Actor             *nativeTransportOffer
++	ID                string
++	ArgsDigest        string
++	OwnToneURL        string
++	InputDigest       string
++	Expires           time.Time
++	RetainUntil       time.Time
++	Claimed           bool
++	Cancelled         bool
++	CPrepare          *roomVolumePrepareACK
++	ReservationID     string
++	ReservationUntil  time.Time
++	ReservedAt        time.Time
++	PreparedSeenAt    time.Time
++	CommitDispatched  bool
++	CancelDispatched  bool
++	CommitReceipt     *roomVolumeReceipt
++	Latest            roomVolumeReceipt
+ }
+ type nativeRoomVolumeReservation struct {
+ 	Operation *roomVolumeOperation
+@@ -282,6 +286,9 @@
+ 	return p.roomVolumeClosing || p.roomVolumeReservedLocked()
+ }
+ func (p *AppPlayer) prepareRoomVolume(parent context.Context, request roomVolumePrepareActorRequest) (any, error) {
++	return p.prepareRoomVolumeVersion(parent, request, false)
++}
++func (p *AppPlayer) prepareRoomVolumeVersion(parent context.Context, request roomVolumePrepareActorRequest, bound bool) (any, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	binding := request.Binding
+@@ -291,8 +298,12 @@
+ 	identity, err := p.roomTransportIdentity(binding.Scope.AccountUserID, binding.Scope.TargetID, binding.Scope.RoomID, binding.Scope.HomePodID)
+ 	digest := sha256.Sum256([]byte(p.app.cfg.AudioOutputPipe))
+ 	inputDigest := hex.EncodeToString(digest[:])
+-	if err != nil || identity != binding.Native || inputDigest != binding.Route.InputPathDigest {
+-		return nil, ErrAliasConflict
++	if err != nil || identity != binding.Native || inputDigest != binding.Route.InputPathDigest || (bound && !nativeBoundOwnerValid(identity)) {
++		return nil, ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return nil, err
+ 	}
+ 	id, err := randomQueueID(16)
+ 	if err != nil {
+@@ -301,10 +312,18 @@
+ 	raw, err := json.Marshal(binding)
+ 	if err != nil {
+ 		return nil, err
++	}
++	if bound {
++		raw, _ = json.Marshal(struct {
++			Binding  roomVolumeBinding `json:"binding"`
++			Revision string            `json:"native_revision"`
++		}{binding, revision})
+ 	}
+ 	sum := sha256.Sum256(raw)
+ 	actor := &nativeTransportOffer{Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Expires: time.Now().Add(roomVolumeOfferLifetime), Snapshot: roomTransportSnapshot{roomTransportIdentity: identity, PrepareID: id, Action: "volume", VolumePercent: binding.VolumePercent, ArgsDigest: hex.EncodeToString(sum[:])}}
+-	op := &roomVolumeOperation{Owner: p, Binding: binding, Actor: actor, ID: id, ArgsDigest: actor.Snapshot.ArgsDigest, OwnToneURL: actor.OwnToneURL, InputDigest: inputDigest, Expires: actor.Expires, RetainUntil: actor.Expires.Add(15 * time.Second), Latest: roomVolumeReceipt{NativePrepareID: id, State: "prepared"}}
++	actor.Bound = bound
++	actor.NativeRevision = revision
++	op := &roomVolumeOperation{Bound: bound, NativeRevision: revision, TerminalProof: make(chan struct{}), Owner: p, Binding: binding, Actor: actor, ID: id, ArgsDigest: actor.Snapshot.ArgsDigest, OwnToneURL: actor.OwnToneURL, InputDigest: inputDigest, Expires: actor.Expires, RetainUntil: actor.Expires.Add(15 * time.Second), Latest: roomVolumeReceipt{NativePrepareID: id, State: "prepared"}}
+ 	return op, nil
+ }
+ func (p *AppPlayer) claimRoomVolume(parent context.Context, request roomVolumeActorRequest) (any, error) {
+@@ -355,17 +374,7 @@
+ 	closing := p.roomVolumeClosing
+ 	p.aliasMu.Unlock()
+ 	if reservation != nil {
+-		remaining := time.Until(reservation.Until)
+-		if remaining > 0 {
+-			timer := time.NewTimer(remaining)
+-			select {
+-			case <-timer.C:
+-			case <-ctx.Done():
+-				go p.Close()
+-				<-timer.C
+-			}
+-			timer.Stop()
+-		}
++		p.waitReservedOwner(ctx, reservation)
+ 		p.aliasMu.Lock()
+ 		if p.roomVolumeReservation == reservation {
+ 			p.roomVolumeReservation = nil
+@@ -385,11 +394,7 @@
+ 	p.aliasMu.Unlock()
+ 	if reservation != nil {
+ 		reservation.Operation.cancelAtOwner()
+-		if remaining := time.Until(reservation.Until); remaining > 0 {
+-			timer := time.NewTimer(remaining)
+-			<-timer.C
+-			timer.Stop()
+-		}
++		p.waitReservedOwner(context.Background(), reservation)
+ 	}
+ 	p.aliasMu.Lock()
+ 	p.aliasRetired = true
+@@ -423,3 +428,33 @@
+ 	}
+ 	return strictVolumeJSON(raw, out)
+ }
++
++// A private one-use signal is created by this operation only after strict actual
++// C owner validation. Unknown and HTTP/caller cancellation cannot signal it.
++func (p *AppPlayer) waitReservedOwner(ctx context.Context, reservation *nativeRoomVolumeReservation) {
++	remaining := time.Until(reservation.Until)
++	if remaining <= 0 {
++		return
++	}
++	var proof <-chan struct{}
++	op := reservation.Operation
++	if op != nil {
++		op.mu.Lock()
++		if op.Bound {
++			proof = op.TerminalProof
++		}
++		op.mu.Unlock()
++	}
++	timer := time.NewTimer(remaining)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++	case <-proof:
++	case <-ctx.Done():
++		go p.Close()
++		select {
++		case <-timer.C:
++		case <-proof:
++		}
++	}
++}
+diff --git a/daemon/room_volume_http.go b/daemon/room_volume_http.go
+--- a/daemon/room_volume_http.go
++++ b/daemon/room_volume_http.go
+@@ -35,18 +35,23 @@
+ }
+ 
+ func (op *roomVolumeOperation) endpoint(suffix string) string {
+-	return strings.TrimSuffix(op.OwnToneURL, "/") + "/api/outputs/" + op.Binding.Scope.HomePodID + "/volume/" + suffix
++	return strings.TrimSuffix(op.OwnToneURL, "/") + "/api/outputs/" + op.Binding.Scope.HomePodID + "/volume/" + func() string {
++		if op.Bound {
++			return "bound-" + suffix
++		}
++		return suffix
++	}()
+ }
+ func (op *roomVolumeOperation) prepareResponse() roomVolumePrepareResponse {
+-	return roomVolumePrepareResponse{"podconnect.native_room_volume_prepare.v1", op.ID, 5000, op.Binding.Scope, op.Binding.Native, op.Binding.Route, op.Binding.VolumeState, "volume", op.Binding.VolumePercent, false}
++	return roomVolumePrepareResponse{boundSchema("podconnect.native_room_volume_prepare.v1", op.Bound), op.ID, 5000, op.Binding.Scope, op.Binding.Native, op.Binding.Route, op.Binding.VolumeState, "volume", op.Binding.VolumePercent, false}
+ }
+ func (op *roomVolumeOperation) prepareOwner(ctx context.Context) error {
+ 	request := roomVolumeCPrepareRequest{op.ID, op.ArgsDigest, op.Binding.VolumePercent, op.InputDigest, op.Binding.Route, op.Binding.VolumeState}
+ 	var ack roomVolumePrepareACK
+-	if err := roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("prepare"), request, &ack); err != nil {
++	if err := op.ownerCall(ctx, http.MethodPost, "prepare", request, &ack); err != nil {
+ 		return err
+ 	}
+-	if ack.Schema != "podconnect.output_room_volume_prepare.v1" || !ack.OK || !volumeHex32.MatchString(ack.Token) || ack.NativePrepareID != op.ID || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || ack.VolumeState != op.Binding.VolumeState || ack.ExpiresAfterMS != 1000 || ack.Physical {
++	if ack.Schema != boundSchema("podconnect.output_room_volume_prepare.v1", op.Bound) || !ack.OK || !volumeHex32.MatchString(ack.Token) || ack.NativePrepareID != op.ID || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || ack.VolumeState != op.Binding.VolumeState || ack.ExpiresAfterMS != 1000 || ack.Physical {
+ 		return ErrAliasConflict
+ 	}
+ 	op.mu.Lock()
+@@ -63,7 +68,7 @@
+ 	prepared := op.CPrepare
+ 	reservation := op.ReservationID
+ 	op.mu.Unlock()
+-	if prepared == nil || ack.Schema != "podconnect.output_room_volume_"+suffix+".v1" || !ack.OK || ack.Token != prepared.Token || ack.NativePrepareID != op.ID || ack.NativeReservationID != reservation || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || !ack.VolumeState.valid() || ack.Physical || ack.PinRemainingMS < 0 || ack.PinRemainingMS > 10000 {
++	if prepared == nil || ack.Schema != boundSchema("podconnect.output_room_volume_"+suffix+".v1", op.Bound) || !ack.OK || ack.Token != prepared.Token || ack.NativePrepareID != op.ID || ack.NativeReservationID != reservation || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || !ack.VolumeState.valid() || ack.Physical || ack.PinRemainingMS < 0 || ack.PinRemainingMS > 10000 {
+ 		return false
+ 	}
+ 	switch ack.Outcome {
+@@ -113,6 +118,10 @@
+ 		return op.Latest
+ 	}
+ 	op.Latest = receipt
++	if op.Bound && terminal && ack.Outcome != "unknown" && op.ReservationID != "" && op.TerminalProof != nil && !op.TerminalSignalled {
++		op.TerminalSignalled = true
++		close(op.TerminalProof)
++	}
+ 	return receipt
+ }
+ func (op *roomVolumeOperation) noCommitFailure(cancelled bool) roomVolumeReceipt {
+@@ -165,7 +174,7 @@
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+ 	defer cancel()
+ 	var ack roomVolumeOwnerReceipt
+-	if roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("cancel"), payload, &ack) == nil && op.validOwnerReceipt(ack, "cancel") {
++	if op.ownerCall(ctx, http.MethodPost, "cancel", payload, &ack) == nil && op.validOwnerReceipt(ack, "cancel") {
+ 		op.recordOwnerReceipt(ack)
+ 	}
+ }
+@@ -185,7 +194,7 @@
+ 	op.Latest = nativeVolumeUnknown(op.ID, true)
+ 	op.mu.Unlock()
+ 	var ack roomVolumeOwnerReceipt
+-	if err := roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("commit"), payload, &ack); err != nil || !op.validOwnerReceipt(ack, "commit") {
++	if err := op.ownerCall(ctx, http.MethodPost, "commit", payload, &ack); err != nil || !op.validOwnerReceipt(ack, "commit") {
+ 		return op.receipt("")
+ 	}
+ 	receipt := op.recordOwnerReceipt(ack)
+@@ -213,7 +222,7 @@
+ 		return op.receipt("")
+ 	}
+ 	var ack roomVolumeOwnerReceipt
+-	if roomVolumeHTTP(ctx, http.MethodGet, op.endpoint("result/"+prepared.Token), nil, &ack) != nil || !op.validOwnerReceipt(ack, "result") {
++	if op.ownerCall(ctx, http.MethodGet, "result/"+prepared.Token, nil, &ack) != nil || !op.validOwnerReceipt(ack, "result") {
+ 		return op.receipt("")
+ 	}
+ 	return op.recordOwnerReceipt(ack)
+@@ -235,8 +244,8 @@
+ 	}
+ 	return true
+ }
+-func volumeWrite(w http.ResponseWriter, receipt roomVolumeReceipt, suffix string) {
+-	receipt.Schema = "podconnect.native_room_volume_" + suffix + ".v1"
++func volumeWrite(w http.ResponseWriter, receipt roomVolumeReceipt, suffix string, bound ...bool) {
++	receipt.Schema = boundSchema("podconnect.native_room_volume_"+suffix+".v1", len(bound) > 0 && bound[0])
+ 	w.Header().Set("Content-Type", "application/json")
+ 	w.Header().Set("Cache-Control", "no-store")
+ 	_ = json.NewEncoder(w).Encode(receipt)
+@@ -259,7 +268,11 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+ 	defer cancel()
+-	data, err := s.roomTransportAsk(ctx, apiRoomVolumeState, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	typ := apiRoomVolumeState
++	if roomBoundRequest(r) {
++		typ = apiRoomVolumeBoundState
++	}
++	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
+ 	roomTransportResponse(w, data, err)
+ }
+ func (s *ConcreteApiServer) handleRoomVolumePrepare(w http.ResponseWriter, r *http.Request) {
+@@ -273,7 +286,11 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+ 	defer cancel()
+-	value, err := s.roomTransportAsk(ctx, apiRoomVolumePrepare, roomVolumePrepareActorRequest{binding, ctx})
++	typ := apiRoomVolumePrepare
++	if roomBoundRequest(r) {
++		typ = apiRoomVolumeBoundPrepare
++	}
++	value, err := s.roomTransportAsk(ctx, typ, roomVolumePrepareActorRequest{binding, ctx})
+ 	if err != nil {
+ 		roomTransportResponse(w, nil, err)
+ 		return
+@@ -302,8 +319,8 @@
+ 		return
+ 	}
+ 	op := s.roomVolumes.get(request.NativePrepareID)
+-	if op == nil {
+-		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "commit")
++	if op == nil || op.Bound != roomBoundRequest(r) {
++		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "commit", roomBoundRequest(r))
+ 		return
+ 	}
+ 	op.mu.Lock()
+@@ -313,7 +330,7 @@
+ 			receipt = *op.CommitReceipt
+ 		}
+ 		op.mu.Unlock()
+-		volumeWrite(w, receipt, "commit")
++		volumeWrite(w, receipt, "commit", roomBoundRequest(r))
+ 		return
+ 	}
+ 	op.mu.Unlock()
+@@ -329,9 +346,9 @@
+ 		}
+ 		op.mu.Unlock()
+ 		if claimed {
+-			volumeWrite(w, receipt, "commit")
++			volumeWrite(w, receipt, "commit", roomBoundRequest(r))
+ 		} else {
+-			volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++			volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit", roomBoundRequest(r))
+ 		}
+ 		return
+ 	}
+@@ -341,16 +358,16 @@
+ 		}
+ 	}()
+ 	if op.prepareOwner(ctx) != nil {
+-		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit", roomBoundRequest(r))
+ 		return
+ 	}
+ 	_, err = s.roomTransportAsk(ctx, apiRoomVolumeConsume, roomVolumeActorRequest{op, ctx})
+ 	if err != nil {
+-		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit", roomBoundRequest(r))
+ 		return
+ 	}
+ 	receipt := op.commitOwner(ctx)
+-	volumeWrite(w, op.freezeCommit(receipt), "commit")
++	volumeWrite(w, op.freezeCommit(receipt), "commit", roomBoundRequest(r))
+ }
+ func (s *ConcreteApiServer) handleRoomVolumeCancel(w http.ResponseWriter, r *http.Request) {
+ 	var request roomVolumeIDRequest
+@@ -362,12 +379,12 @@
+ 		return
+ 	}
+ 	op := s.roomVolumes.get(request.NativePrepareID)
+-	if op == nil {
+-		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "cancel")
++	if op == nil || op.Bound != roomBoundRequest(r) {
++		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "cancel", roomBoundRequest(r))
+ 		return
+ 	}
+ 	op.cancelAtOwner()
+-	volumeWrite(w, op.receipt(""), "cancel")
++	volumeWrite(w, op.receipt(""), "cancel", roomBoundRequest(r))
+ }
+ func (s *ConcreteApiServer) handleRoomVolumeResult(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodGet {
+@@ -380,11 +397,21 @@
+ 		return
+ 	}
+ 	op := s.roomVolumes.get(q.Get("native_prepare_id"))
+-	if op == nil {
+-		volumeWrite(w, nativeVolumeUnknown(q.Get("native_prepare_id"), false), "result")
++	if op == nil || op.Bound != roomBoundRequest(r) {
++		volumeWrite(w, nativeVolumeUnknown(q.Get("native_prepare_id"), false), "result", roomBoundRequest(r))
+ 		return
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+ 	defer cancel()
+-	volumeWrite(w, op.resultOwner(ctx), "result")
+-}
++	volumeWrite(w, op.resultOwner(ctx), "result", roomBoundRequest(r))
++}
++
++func (op *roomVolumeOperation) ownerCall(ctx context.Context, method, suffix string, payload any, out any) error {
++	if !op.Bound {
++		return roomVolumeHTTP(ctx, method, op.endpoint(suffix), payload, out)
++	}
++	if suffix == "prepare" || suffix == "commit" {
++		payload = boundOwnerPayload(payload, op.Binding.Native, op.NativeRevision)
++	}
++	return roomBoundHTTP(ctx, method, op.endpoint(suffix), payload, out, op.Binding.Native, op.NativeRevision)
++}

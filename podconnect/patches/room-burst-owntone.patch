@@ -1,0 +1,1040 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index ddc1a10..1652f39 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -249,4 +249,6 @@ airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wr
+ EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
+ airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
+ 
+-EXTRA_DIST += outputs_room_volume.inc.c httpd_jsonapi_room_volume.inc.c outputs/airplay_room_volume.inc.c
++EXTRA_DIST += outputs_transport_custody.inc.c \
++	outputs_room_volume.inc.c httpd_jsonapi_transport_bound.inc.c \
++	httpd_jsonapi_room_volume.inc.c outputs/airplay_room_volume.inc.c
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index ec6cdaf..8b83f93 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1891,14 +1891,14 @@ static size_t transport_json_key_count(json_object *object,unsigned depth)
+  * colons against parsed keys rejects json-c's duplicate-key collapse without
+  * inventing another general JSON parser; strict parse_end rejects suffix data. */
+ static json_object *
+-transport_parse_body(struct evbuffer *buffer)
++transport_parse_body_limit(struct evbuffer *buffer,size_t maximum)
+ {
+   size_t length=evbuffer_get_length(buffer), i, end, colons=0;
+   const unsigned char *text=evbuffer_pullup(buffer,-1);
+   bool quoted=false;
+   struct json_tokener *tokener;
+   json_object *body;
+-  if (!text || !length || length>1024) return NULL;
++  if (!text || !length || length>maximum) return NULL;
+   for (i=0;i<length;i++)
+     {
+       if (!text[i] || text[i]=='\\' || text[i]>=128) return NULL;
+@@ -1921,13 +1921,20 @@ transport_parse_body(struct evbuffer *buffer)
+   return body;
+ }
+ 
++static json_object *transport_parse_body(struct evbuffer *buffer)
++{ return transport_parse_body_limit(buffer,1024); }
++
++#include "httpd_jsonapi_transport_bound.inc.c"
++
+ static int
+ jsonapi_reply_transport_write(struct httpd_request *hreq)
+ {
+   struct output_transport_request request={.percent=-1};
+   struct output_transport_result result;
+-  json_object *body=transport_parse_body(hreq->in_body), *reply, *percent;
+-  bool commit=!strcmp(hreq->path_parts[4],"commit"), volume;
++  bool bound=!strncmp(hreq->path_parts[4],"bound-",6);
++  const char *phase=hreq->path_parts[4]+(bound?6:0);
++  json_object *body=(bound ? transport_parse_body_limit(hreq->in_body,8192) : transport_parse_body(hreq->in_body)), *reply, *percent;
++  bool commit=!strcmp(phase,"commit"), volume;
+   int expected, ret=HTTP_BADREQUEST;
+   if (!body || !json_object_is_type(body,json_type_object)
+       || safe_atou64(hreq->path_parts[2],&request.device_id)<0
+@@ -1935,7 +1942,9 @@ jsonapi_reply_transport_write(struct httpd_request *hreq)
+       || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
+       || !transport_json_string(body,"action",request.action,sizeof(request.action))) goto out;
+   volume=!strcmp(request.action,"volume");
+-  expected=3+(commit?2:0)+(volume?1:0);
++  request.bound=bound;
++  expected=3+(commit?2:0)+(volume?1:0)+(bound?2:0);
++  if (bound && transport_native_parse(body,&request.native_owner,&request.native_revision)<0) goto out;
+   if (json_object_object_length(body)!=expected) goto out;
+   if (commit && (!transport_json_string(body,"token",request.token,sizeof(request.token))
+       || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest)))) goto out;
+@@ -1948,9 +1957,10 @@ jsonapi_reply_transport_write(struct httpd_request *hreq)
+   ret=409;
+   if ((commit ? player_transport_commit(&request,&result) : player_transport_prepare(&request,&result))<0) goto out;
+   reply=json_object_new_object();
+-  json_object_object_add(reply,"schema",json_object_new_string(commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1"));
++  json_object_object_add(reply,"schema",json_object_new_string(bound ? (commit ? "podconnect.output_transport_commit.v2" : "podconnect.output_transport_prepare.v2") : (commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1")));
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+   json_object_object_add(reply,"token",json_object_new_string(result.command.token));
++  if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
+   if (!commit) json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
+   if (commit)
+     {
+@@ -1972,10 +1982,12 @@ jsonapi_reply_transport_result(struct httpd_request *hreq)
+   struct output_transport_result result;
+   uint64_t id;
+   json_object *reply;
++  bool bound=!strcmp(hreq->path_parts[4],"bound-result");
+   if (safe_atou64(hreq->path_parts[2],&id)<0
+-      || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id) return HTTP_NOTFOUND;
++      || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id || bound!=result.command.bound) return HTTP_NOTFOUND;
+   reply=json_object_new_object();
+-  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_result.v1"));
++  json_object_object_add(reply,"schema",json_object_new_string(bound ? "podconnect.output_transport_result.v2" : "podconnect.output_transport_result.v1"));
++  if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+   json_object_object_add(reply,"token",json_object_new_string(result.command.token));
+   json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
+@@ -5117,6 +5129,12 @@ static struct httpd_uri_map adm_handlers[] =
+     { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-state$", jsonapi_reply_transport_bound_state },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-(prepare|commit)$", jsonapi_reply_transport_write },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/bound-result/[a-f0-9]+$", jsonapi_reply_transport_result },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/bound-state$", jsonapi_reply_room_volume_state },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/bound-(prepare|commit|cancel)$", jsonapi_reply_room_volume_write },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/bound-result/[a-f0-9]+$", jsonapi_reply_room_volume_result },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/state$", jsonapi_reply_room_volume_state },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/(prepare|commit|cancel)$", jsonapi_reply_room_volume_write },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/result/[a-f0-9]+$", jsonapi_reply_room_volume_result },
+diff --git a/src/httpd_jsonapi_room_volume.inc.c b/src/httpd_jsonapi_room_volume.inc.c
+index b75ba5d..7e34bb4 100644
+--- a/src/httpd_jsonapi_room_volume.inc.c
++++ b/src/httpd_jsonapi_room_volume.inc.c
+@@ -49,7 +49,12 @@ static const char *room_volume_outcome_name(enum output_room_volume_outcome outc
+ static json_object *room_volume_result_json(const char *schema,const struct output_room_volume_result *r)
+ {
+   json_object *o=json_object_new_object();
+-  json_object_object_add(o,"schema",json_object_new_string(schema)); json_object_object_add(o,"ok",json_object_new_boolean(true));
++  if (r->command.bound) {
++    char versioned[96]; snprintf(versioned,sizeof(versioned),"%.*s2",(int)strlen(schema)-1,schema);
++    json_object_object_add(o,"schema",json_object_new_string(versioned));
++    transport_native_binding_json(o,&r->command.native_owner,r->command.native_revision);
++  } else json_object_object_add(o,"schema",json_object_new_string(schema));
++  json_object_object_add(o,"ok",json_object_new_boolean(true));
+   json_object_object_add(o,"token",json_object_new_string(r->command.token));
+   json_object_object_add(o,"native_prepare_id",json_object_new_string(r->command.native_prepare_id));
+   json_object_object_add(o,"native_reservation_id",json_object_new_string(r->command.native_reservation_id));
+@@ -68,10 +73,17 @@ static int jsonapi_reply_room_volume_state(struct httpd_request *hreq)
+ {
+   uint64_t id; bool busy;
+   struct output_transport_identity identity; struct output_room_volume_state state;
+-  json_object *o,*actions;
+-  if (safe_atou64(hreq->path_parts[2],&id)<0 || player_room_volume_state_get(id,&identity,&state,&busy)<0) return 409;
++  struct output_native_owner owner={0};
++  bool bound=!strcmp(hreq->path_parts[4],"bound-state");
++  json_object *o,*actions,*body=NULL;
++  if (bound) {
++    body=transport_parse_body_limit(hreq->in_body,8192);
++    if (!body || json_object_object_length(body)!=1 || transport_native_parse(body,&owner,NULL)<0) { jparse_free(body); return HTTP_BADREQUEST; }
++    jparse_free(body);
++  }
++  if (safe_atou64(hreq->path_parts[2],&id)<0 || (bound ? player_room_volume_bound_state_get(id,&owner,&identity,&state,&busy) : player_room_volume_state_get(id,&identity,&state,&busy))<0) return 409;
+   o=json_object_new_object(); actions=json_object_new_array();
+-  json_object_object_add(o,"schema",json_object_new_string("podconnect.output_room_volume_state.v1"));
++  json_object_object_add(o,"schema",json_object_new_string(bound ? "podconnect.output_room_volume_state.v2" : "podconnect.output_room_volume_state.v1"));
+   json_object_object_add(o,"ok",json_object_new_boolean(true)); json_object_object_add(o,"identity",transport_identity_json(&identity));
+   json_object_object_add(o,"volume_state",room_volume_state_json(&state)); json_object_object_add(o,"busy",json_object_new_boolean(busy));
+   if (!busy) json_object_array_add(actions,json_object_new_string("volume"));
+@@ -81,19 +93,22 @@ static int jsonapi_reply_room_volume_state(struct httpd_request *hreq)
+ static int jsonapi_reply_room_volume_write(struct httpd_request *hreq)
+ {
+   struct output_room_volume_request request={0}; struct output_room_volume_result result;
+-  json_object *body=transport_parse_body(hreq->in_body),*identity,*state,*reply;
+-  const char *phase=hreq->path_parts[4]; bool prepare=!strcmp(phase,"prepare"),cancel=!strcmp(phase,"cancel");
++  bool bound=!strncmp(hreq->path_parts[4],"bound-",6);
++  json_object *body=(bound ? transport_parse_body_limit(hreq->in_body,8192) : transport_parse_body(hreq->in_body)),*identity,*state,*reply;
++  const char *phase=hreq->path_parts[4]+(bound?6:0); bool prepare=!strcmp(phase,"prepare"),cancel=!strcmp(phase,"cancel");
+   int ret=HTTP_BADREQUEST;
+   if (!body || safe_atou64(hreq->path_parts[2],&request.device_id)<0) goto out;
+   if (cancel) {
+     if (json_object_object_length(body)!=2 || !transport_json_string(body,"token",request.token,sizeof(request.token))
+         || !transport_json_string(body,"native_reservation_id",request.native_reservation_id,sizeof(request.native_reservation_id))) goto out;
+     ret=HTTP_NOTFOUND;
+-    if (player_room_volume_result_get(request.token,&result)<0 || result.identity.device_id!=request.device_id
++    if (player_room_volume_result_get(request.token,&result)<0 || result.identity.device_id!=request.device_id || result.command.bound!=bound
+         || player_room_volume_cancel(request.token,request.native_reservation_id,&result)<0) goto out;
+     ret=transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_cancel.v1",&result)); goto out;
+   }
+-  if (json_object_object_length(body)!=6
++  request.bound=bound;
++  if (bound && transport_native_parse(body,&request.native_owner,&request.native_revision)<0) goto out;
++  if (json_object_object_length(body)!=(bound?8:6)
+       || !transport_json_string(body,"native_prepare_id",request.native_prepare_id,sizeof(request.native_prepare_id))
+       || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
+       || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest))
+@@ -107,7 +122,8 @@ static int jsonapi_reply_room_volume_write(struct httpd_request *hreq)
+   if ((prepare ? player_room_volume_prepare(&request,&result) : player_room_volume_commit(&request,&result))<0) goto out;
+   if (!prepare) { ret=transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_commit.v1",&result)); goto out; }
+   reply=json_object_new_object();
+-  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_room_volume_prepare.v1"));
++  json_object_object_add(reply,"schema",json_object_new_string(bound ? "podconnect.output_room_volume_prepare.v2" : "podconnect.output_room_volume_prepare.v1"));
++  if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
+   json_object_object_add(reply,"ok",json_object_new_boolean(true)); json_object_object_add(reply,"token",json_object_new_string(result.command.token));
+   json_object_object_add(reply,"native_prepare_id",json_object_new_string(result.command.native_prepare_id));
+   json_object_object_add(reply,"args_digest",json_object_new_string(result.command.args_digest));
+@@ -123,6 +139,6 @@ static int jsonapi_reply_room_volume_write(struct httpd_request *hreq)
+ static int jsonapi_reply_room_volume_result(struct httpd_request *hreq)
+ {
+   uint64_t id; struct output_room_volume_result result;
+-  if (safe_atou64(hreq->path_parts[2],&id)<0 || player_room_volume_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id) return HTTP_NOTFOUND;
++  if (safe_atou64(hreq->path_parts[2],&id)<0 || player_room_volume_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id || result.command.bound!=(!strcmp(hreq->path_parts[4],"bound-result"))) return HTTP_NOTFOUND;
+   return transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_result.v1",&result));
+ }
+diff --git a/src/httpd_jsonapi_transport_bound.inc.c b/src/httpd_jsonapi_transport_bound.inc.c
+new file mode 100644
+index 0000000..26461a3
+--- /dev/null
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -0,0 +1,68 @@
++/* Closed private native-owner wire helpers. Duplicate/trailing rejection is
++ * performed for the complete nested body before any owner command executes. */
++static int transport_native_counter(json_object *o,const char *key,uint64_t *out)
++{
++  char canonical[32]; const char *value;
++  if (attention_parse_u64(o,key,out)<0) return -1;
++  value=jparse_str_from_obj(o,key); snprintf(canonical,sizeof(canonical),"%" PRIu64,*out);
++  return strcmp(value,canonical) ? -1 : 0;
++}
++static int transport_native_parse(json_object *body,struct output_native_owner *owner,uint64_t *revision)
++{
++  json_object *o,*n;
++  if (!json_object_object_get_ex(body,"native_owner",&o) || !json_object_is_type(o,json_type_object)
++      || json_object_object_length(o)!=9
++      || !transport_json_string(o,"account_user_id",owner->account_user_id,sizeof(owner->account_user_id))
++      || !transport_json_string(o,"target_id",owner->target_id,sizeof(owner->target_id))
++      || !transport_json_string(o,"room_id",owner->room_id,sizeof(owner->room_id))
++      || !transport_json_string(o,"homepod_id",owner->homepod_id,sizeof(owner->homepod_id))
++      || !transport_json_string(o,"connection_id",owner->connection_id,sizeof(owner->connection_id))
++      || !transport_json_string(o,"session_id",owner->session_id,sizeof(owner->session_id))
++      || !transport_json_string(o,"alias_incarnation",owner->alias_incarnation,sizeof(owner->alias_incarnation))
++      || !transport_json_string(o,"alias_registry",owner->alias_registry,sizeof(owner->alias_registry))
++      || !json_object_object_get_ex(o,"alias_revision",&n) || !json_object_is_type(n,json_type_int)
++      || json_object_get_int64(n)<0 || json_object_get_int64(n)>=9007199254740992LL) return -1;
++  owner->alias_revision=json_object_get_int64(n);
++  if (revision && (transport_native_counter(body,"native_revision",revision)<0 || !*revision || *revision==UINT64_MAX)) return -1;
++  return 0;
++}
++static json_object *transport_native_json(const struct output_native_owner *s)
++{
++  json_object *o=json_object_new_object();
++  json_object_object_add(o,"account_user_id",json_object_new_string(s->account_user_id));
++  json_object_object_add(o,"target_id",json_object_new_string(s->target_id));
++  json_object_object_add(o,"room_id",json_object_new_string(s->room_id));
++  json_object_object_add(o,"homepod_id",json_object_new_string(s->homepod_id));
++  json_object_object_add(o,"connection_id",json_object_new_string(s->connection_id));
++  json_object_object_add(o,"session_id",json_object_new_string(s->session_id));
++  json_object_object_add(o,"alias_incarnation",json_object_new_string(s->alias_incarnation));
++  json_object_object_add(o,"alias_registry",json_object_new_string(s->alias_registry));
++  json_object_object_add(o,"alias_revision",json_object_new_int64(s->alias_revision)); return o;
++}
++static void transport_native_binding_json(json_object *reply,const struct output_native_owner *owner,uint64_t revision)
++{
++  json_object_object_add(reply,"native_owner",transport_native_json(owner));
++  attention_json_u64(reply,"native_revision",revision);
++}
++static int jsonapi_reply_transport_bound_state(struct httpd_request *hreq)
++{
++  struct output_transport_identity identity; struct output_native_owner owner={0};
++  uint64_t id; bool busy; size_t i;
++  json_object *body=transport_parse_body_limit(hreq->in_body,8192),*reply,*actions;
++  const char *names[]={"pause","resume","next","previous"}; int ret=HTTP_BADREQUEST;
++  if (!body || json_object_object_length(body)!=1 || transport_native_parse(body,&owner,NULL)<0
++      || safe_atou64(hreq->path_parts[2],&id)<0) goto out;
++  ret=409;
++  if (player_transport_bound_state_get(id,&owner,&identity,&busy)<0) goto out;
++  reply=json_object_new_object(); actions=json_object_new_array();
++  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_state.v2"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true));
++  json_object_object_add(reply,"identity",transport_identity_json(&identity));
++  json_object_object_add(reply,"busy",json_object_new_boolean(busy));
++  if (!busy) for (i=0;i<ARRAY_SIZE(names);i++) json_object_array_add(actions,json_object_new_string(names[i]));
++  json_object_object_add(reply,"actions",actions);
++  json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  ret=transport_json_reply(hreq,reply);
++ out:
++  jparse_free(body); return ret;
++}
+diff --git a/src/outputs.c b/src/outputs.c
+index 3d913be..13abe6b 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -149,6 +149,7 @@ struct transport_slot
+   struct output_transport_result result;
+   struct timespec expiry;
+   bool used;
++  uint64_t admission_generation;
+ };
+ static struct transport_slot transport_slots[OUTPUT_TRANSPORT_SLOTS];
+ static struct transport_slot *transport_pin;
+@@ -169,12 +170,14 @@ transport_remaining(const struct timespec *expiry)
+ }
+ 
+ static bool room_volume_pin_busy(void);
++static bool room_volume_undrained(void);
++static bool transport_custody_busy(void);
+ 
+ bool
+ outputs_transport_busy(void)
+ {
+   if (transport_pin && !transport_remaining(&transport_pin_expiry)) transport_pin = NULL;
+-  return transport_pin != NULL || room_volume_pin_busy();
++  return transport_pin != NULL || room_volume_pin_busy() || transport_custody_busy() || room_volume_undrained();
+ }
+ 
+ static void
+@@ -259,6 +262,8 @@ transport_identity_equal(const struct output_transport_identity *a, const struct
+     && !strcmp(a->input_path_digest,b->input_path_digest);
+ }
+ 
++#include "outputs_transport_custody.inc.c"
++
+ static struct transport_slot *
+ transport_find(const char *token)
+ {
+@@ -273,6 +278,8 @@ bool
+ outputs_transport_current(const struct output_transport_result *operation)
+ {
+   struct output_transport_identity state;
++  if (operation && operation->command.bound)
++    return transport_custody_current(&operation->command.native_owner,&operation->identity,operation->command.native_revision);
+   return operation && transport_pin && outputs_transport_busy() && transport_pin->used
+     && !strcmp(transport_pin->result.command.token,operation->command.token)
+     && transport_identity_get(operation->identity.device_id,&state)==0
+@@ -285,7 +292,8 @@ outputs_transport_prepare(const struct output_transport_request *request, struct
+   struct output_transport_identity identity;
+   struct transport_slot *slot=NULL;
+   size_t i;
+-  if (!result || !transport_command_valid(request) || outputs_transport_busy()
++  if (!result || !transport_command_valid(request) || (request->bound && !request->native_revision)
++      || (request->bound ? !transport_bound_available(request->device_id,&request->native_owner,request->native_revision) : outputs_transport_busy())
+       || transport_identity_get(request->device_id,&identity)<0) return -1;
+   /* Manual physical volume needs its separately reviewed admission contract. */
+   if (!strcmp(request->action,"volume")) return -1;
+@@ -305,6 +313,7 @@ outputs_transport_prepare(const struct output_transport_request *request, struct
+     slot->result.command.token[k]=0;
+   }
+   slot->expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
++  slot->admission_generation=transport_admission_generation;
+   slot->used=false; slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS;
+   *result=slot->result;
+   return 0;
+@@ -325,12 +334,23 @@ outputs_transport_commit(const struct output_transport_request *request, struct
+       || request->percent!=slot->result.command.percent
+       || !transport_hex(request->expected_input_path_digest,64)
+       || strcmp(request->expected_input_path_digest,slot->result.identity.input_path_digest)
+-      || outputs_transport_busy()
++      || request->bound!=slot->result.command.bound
++      || (request->bound && (!native_owner_equal(&request->native_owner,&slot->result.command.native_owner)
++          || request->native_revision!=slot->result.command.native_revision
++          || !transport_bound_available(request->device_id,&request->native_owner,request->native_revision)
++          || slot->admission_generation!=transport_admission_generation))
++      || (!request->bound && outputs_transport_busy())
+       || transport_identity_get(request->device_id,&identity)<0
+       || !transport_identity_equal(&slot->result.identity,&identity)) return -1;
++  if (request->bound) {
++    if (!transport_custody_admit(request->device_id,&request->native_owner,request->native_revision,
++          slot->admission_generation,&slot->result.identity)) return -1;
++    slot->result.remaining_ms=transport_remaining(&transport_custody_expiry); slot->result.outcome=0;
++    *result=slot->result; return 0;
++  }
+   if (clock_gettime(CLOCK_MONOTONIC,&transport_pin_expiry)<0) return -1;
+   transport_pin_expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
+-  transport_pin=slot; slot->expiry=transport_pin_expiry;
++  transport_pin=slot; slot->expiry=transport_pin_expiry; transport_generation_advance();
+   slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS; slot->result.outcome=0;
+   *result=slot->result;
+   return slot->result.outcome<0 ? -1 : 0;
+@@ -342,7 +362,8 @@ outputs_transport_result_get(const char *token, struct output_transport_result *
+   struct transport_slot *slot=transport_find(token);
+   if (!slot || !slot->used || !result) return -1;
+   *result=slot->result;
+-  result->remaining_ms=outputs_transport_busy() && transport_pin==slot ? transport_remaining(&transport_pin_expiry) : 0;
++  result->remaining_ms=slot->result.command.bound ? transport_custody_remaining(&slot->result.command.native_owner,&slot->result.identity) :
++    outputs_transport_busy() && transport_pin==slot ? transport_remaining(&transport_pin_expiry) : 0;
+   return 0;
+ }
+ 
+diff --git a/src/outputs.h b/src/outputs.h
+index e95867a..1198c46 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -98,10 +98,20 @@ struct output_transport_identity
+   uint64_t device_id, device_incarnation, session_epoch, route_revision;
+   uint64_t selection_revision, input_generation, input_item_id;
+ };
++/* Private native actor identity, distinct from actual C route identity. */
++struct output_native_owner
++{
++  char account_user_id[161], target_id[256], room_id[256], homepod_id[21];
++  char connection_id[256], session_id[256], alias_incarnation[256], alias_registry[256];
++  uint64_t alias_revision;
++};
+ struct output_transport_request
+ {
+   uint64_t device_id;
+   char token[33], native_prepare_id[33], action[9], args_digest[65], expected_input_path_digest[65];
++  bool bound;
++  struct output_native_owner native_owner;
++  uint64_t native_revision;
+   int percent; /* -1 for non-volume, exact 0..100 for volume */
+ };
+ struct output_transport_result
+@@ -112,6 +122,7 @@ struct output_transport_result
+   int outcome; /* 0 accepted, 1 pending, -1 failed, -2 unknown */
+ };
+ int outputs_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
++int outputs_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
+ int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_result_get(const char *, struct output_transport_result *);
+@@ -138,6 +149,9 @@ struct output_room_volume_request
+   char token[33], native_prepare_id[33], native_reservation_id[33], args_digest[65];
+   char expected_input_path_digest[65];
+   int percent;
++  bool bound;
++  struct output_native_owner native_owner;
++  uint64_t native_revision;
+   struct output_transport_identity expected_identity;
+   struct output_room_volume_state expected_volume_state;
+ };
+@@ -151,6 +165,7 @@ struct output_room_volume_result
+   unsigned pin_remaining_ms;
+ };
+ int outputs_room_volume_state_get(uint64_t,struct output_transport_identity *,struct output_room_volume_state *,bool *);
++int outputs_room_volume_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,struct output_room_volume_state *,bool *);
+ int outputs_room_volume_prepare(const struct output_room_volume_request *,struct output_room_volume_result *);
+ int outputs_room_volume_commit(const struct output_room_volume_request *,struct output_room_volume_result *);
+ int outputs_room_volume_cancel(const char *,const char *,struct output_room_volume_result *);
+diff --git a/src/outputs_room_volume.inc.c b/src/outputs_room_volume.inc.c
+index be555c5..02767bf 100644
+--- a/src/outputs_room_volume.inc.c
++++ b/src/outputs_room_volume.inc.c
+@@ -4,6 +4,7 @@ struct room_volume_slot {
+   struct output_room_volume_result result;
+   struct timespec deadline;
+   bool used, cancelled;
++  uint64_t admission_generation;
+ };
+ static struct room_volume_slot room_volume_slots[ROOM_VOLUME_SLOTS];
+ static struct room_volume_slot *room_volume_pin;
+@@ -12,7 +13,14 @@ static struct timespec room_volume_pin_expiry;
+ static bool room_volume_pin_busy(void)
+ {
+   if (room_volume_pin && !transport_remaining(&room_volume_pin_expiry)) room_volume_pin=NULL;
+-  return room_volume_pin!=NULL;
++  return room_volume_pin && !room_volume_pin->result.command.bound;
++}
++static bool room_volume_undrained(void)
++{
++  size_t i;
++  for (i=0;i<ARRAY_SIZE(room_volume_slots);i++)
++    if (room_volume_slots[i].result.command.token[0] && !room_volume_slots[i].result.contexts_drained) return true;
++  return false;
+ }
+ static bool room_volume_window_live(const struct room_volume_slot *slot)
+ {
+@@ -53,7 +61,7 @@ static void room_volume_observe(struct room_volume_slot *s,struct output_room_vo
+   if (s->result.deadline_retired && s->result.outcome!=ROOM_VOLUME_PROTOCOL_ACCEPTED
+       && s->result.outcome!=ROOM_VOLUME_REJECTED && s->result.outcome!=ROOM_VOLUME_CANCELLED)
+     s->result.outcome=s->result.possible_effect ? ROOM_VOLUME_UNKNOWN : ROOM_VOLUME_EXPIRED;
+-  s->result.pin_remaining_ms=room_volume_pin_busy() && room_volume_pin==s ? transport_remaining(&room_volume_pin_expiry) : 0;
++  s->result.pin_remaining_ms=s->result.command.bound ? transport_custody_remaining(&s->result.command.native_owner,&s->result.identity) : room_volume_pin_busy() && room_volume_pin==s ? transport_remaining(&room_volume_pin_expiry) : 0;
+   *result=s->result;
+ }
+ static bool room_volume_request_valid(const struct output_room_volume_request *r)
+@@ -68,7 +76,8 @@ int outputs_room_volume_prepare(const struct output_room_volume_request *r,struc
+   struct output_room_volume_state state;
+   struct room_volume_slot *slot=NULL;
+   size_t i,j,k=0; char uuid[37];
+-  if (!out || !room_volume_request_valid(r) || outputs_transport_busy()
++  if (!out || !room_volume_request_valid(r)
++      || (r->bound ? (!r->native_revision || !transport_bound_available(r->device_id,&r->native_owner,r->native_revision)) : outputs_transport_busy())
+       || room_volume_snapshot(r->device_id,&identity,&state)<0
+       || !transport_identity_equal(&identity,&r->expected_identity)
+       || !room_volume_state_equal(&state,&r->expected_volume_state)
+@@ -84,6 +93,7 @@ int outputs_room_volume_prepare(const struct output_room_volume_request *r,struc
+   memset(slot,0,sizeof(*slot));
+   if (clock_gettime(CLOCK_MONOTONIC,&slot->deadline)<0) return -1;
+   slot->deadline.tv_sec++;
++  slot->admission_generation=transport_admission_generation;
+   slot->result.command=*r; slot->result.identity=identity; slot->result.volume_state=state;
+   slot->result.outcome=ROOM_VOLUME_PREPARED; slot->result.contexts_drained=true;
+   outputs_attention_uuid(uuid); /* Shared randomness only, no attention capability. */
+@@ -102,7 +112,8 @@ static bool room_volume_current(struct room_volume_slot *slot)
+   struct output_transport_identity identity;
+   struct output_room_volume_state state;
+   return slot && slot->used && !slot->cancelled && room_volume_window_live(slot)
+-    && room_volume_pin_busy() && room_volume_pin==slot
++    && room_volume_pin==slot
++    && (slot->result.command.bound ? transport_custody_current(&slot->result.command.native_owner,&slot->result.identity,slot->result.command.native_revision) : room_volume_pin_busy())
+     && room_volume_snapshot(slot->result.identity.device_id,&identity,&state)==0
+     && transport_identity_equal(&identity,&slot->result.identity)
+     && room_volume_state_equal(&state,&slot->result.volume_state);
+@@ -118,7 +129,11 @@ int outputs_room_volume_commit(const struct output_room_volume_request *r,struct
+   s->used=true; s->result.outcome=ROOM_VOLUME_REJECTED;
+   if (transport_hex(r->native_reservation_id,32)) memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
+   if (!room_volume_request_valid(r) || !transport_hex(r->native_reservation_id,32)
+-      || !room_volume_window_live(s) || s->cancelled || outputs_transport_busy()
++      || !room_volume_window_live(s) || s->cancelled || r->bound!=s->result.command.bound
++      || (r->bound && (!native_owner_equal(&r->native_owner,&s->result.command.native_owner)
++          || r->native_revision!=s->result.command.native_revision || s->admission_generation!=transport_admission_generation
++          || !transport_bound_available(r->device_id,&r->native_owner,r->native_revision)))
++      || (!r->bound && outputs_transport_busy())
+       || r->device_id!=s->result.command.device_id || r->percent!=s->result.command.percent
+       || strcmp(r->native_prepare_id,s->result.command.native_prepare_id)
+       || strcmp(r->args_digest,s->result.command.args_digest)
+@@ -130,8 +145,12 @@ int outputs_room_volume_commit(const struct output_room_volume_request *r,struct
+     room_volume_observe(s,out); return 0;
+   }
+   memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
++  if (r->bound && !transport_custody_admit(r->device_id,&r->native_owner,r->native_revision,s->admission_generation,&s->result.identity)) {
++    room_volume_observe(s,out); return 0;
++  }
+   if (clock_gettime(CLOCK_MONOTONIC,&room_volume_pin_expiry)<0) { room_volume_observe(s,out); return 0; }
+   room_volume_pin_expiry.tv_sec+=10; room_volume_pin=s;
++  if (!r->bound) transport_generation_advance();
+   s->result.outcome=ROOM_VOLUME_PENDING; s->result.contexts_drained=false;
+   d=outputs_device_get(r->device_id);
+   ret=outputs[d->type]->device_room_volume(d,&s->result);
+@@ -185,3 +204,9 @@ void outputs_room_volume_complete(const char *token,bool accepted)
+         room_volume_window_live(s) ? ROOM_VOLUME_REJECTED : ROOM_VOLUME_EXPIRED;
+   }
+ }
++
++int outputs_room_volume_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,struct output_room_volume_state *state,bool *busy)
++{
++  if (!busy || !native_owner_valid(owner,id) || room_volume_snapshot(id,identity,state)<0) return -1;
++  *busy=!transport_bound_available(id,owner,0); return 0;
++}
+diff --git a/src/outputs_transport_custody.inc.c b/src/outputs_transport_custody.inc.c
+new file mode 100644
+index 0000000..549bbf5
+--- /dev/null
++++ b/src/outputs_transport_custody.inc.c
+@@ -0,0 +1,95 @@
++/* Included by the player event-loop output owner. No network wait/lock. */
++static struct output_native_owner transport_custody_owner;
++static struct output_transport_identity transport_custody_identity;
++static struct timespec transport_custody_expiry;
++static uint64_t transport_admission_generation=1, transport_custody_revision;
++static bool transport_custody_live, transport_custody_lost, transport_generation_exhausted;
++
++static bool native_owner_equal(const struct output_native_owner *a,const struct output_native_owner *b)
++{
++  return !strcmp(a->account_user_id,b->account_user_id) && !strcmp(a->target_id,b->target_id)
++    && !strcmp(a->room_id,b->room_id) && !strcmp(a->homepod_id,b->homepod_id)
++    && !strcmp(a->connection_id,b->connection_id) && !strcmp(a->session_id,b->session_id)
++    && !strcmp(a->alias_incarnation,b->alias_incarnation) && !strcmp(a->alias_registry,b->alias_registry)
++    && a->alias_revision==b->alias_revision;
++}
++static bool native_owner_text(const char *s,size_t capacity)
++{
++  size_t n=strnlen(s,capacity),i;
++  if (!n || n==capacity) return false;
++  for (i=0;i<n;i++) if ((unsigned char)s[i]<32 || (unsigned char)s[i]>=127 || s[i]=='"' || s[i]=='\\') return false;
++  return true;
++}
++static bool native_owner_valid(const struct output_native_owner *o,uint64_t device_id)
++{
++  uint64_t homepod; char canonical[32];
++  if (!o || !native_owner_text(o->account_user_id,sizeof(o->account_user_id))
++      || !native_owner_text(o->target_id,sizeof(o->target_id)) || !native_owner_text(o->room_id,sizeof(o->room_id))
++      || !native_owner_text(o->homepod_id,sizeof(o->homepod_id)) || !native_owner_text(o->connection_id,sizeof(o->connection_id))
++      || !native_owner_text(o->session_id,sizeof(o->session_id)) || !native_owner_text(o->alias_incarnation,sizeof(o->alias_incarnation))
++      || !native_owner_text(o->alias_registry,sizeof(o->alias_registry)) || o->alias_revision>=9007199254740992ULL
++      || safe_atou64(o->homepod_id,&homepod)<0 || !homepod || homepod!=device_id) return false;
++  snprintf(canonical,sizeof(canonical),"%" PRIu64,homepod);
++  return !strcmp(canonical,o->homepod_id);
++}
++static void transport_generation_advance(void)
++{
++  if (transport_admission_generation==UINT64_MAX) transport_generation_exhausted=true;
++  else transport_admission_generation++;
++}
++static bool transport_custody_busy(void)
++{
++  if (transport_custody_live && !transport_remaining(&transport_custody_expiry)) {
++    transport_custody_live=false; transport_generation_advance();
++  }
++  return transport_custody_live || transport_generation_exhausted;
++}
++static bool transport_bound_available(uint64_t id,const struct output_native_owner *owner,uint64_t revision)
++{
++  struct output_transport_identity actual;
++  bool live;
++  (void)outputs_transport_busy();
++  live=transport_custody_busy();
++  if (transport_generation_exhausted || transport_admission_generation==UINT64_MAX || !native_owner_valid(owner,id) || transport_pin || room_volume_pin_busy()
++      || room_volume_undrained() || transport_identity_get(id,&actual)<0) return false;
++  if (live) {
++    if (!transport_identity_equal(&actual,&transport_custody_identity)) transport_custody_lost=true;
++    if (transport_custody_lost || !native_owner_equal(owner,&transport_custody_owner)) return false;
++  }
++  /* A read has revision zero. Same owner never reuses an earlier ordinal,
++   * including across route-custody expiry; a new actor incarnation differs. */
++  if (revision && native_owner_equal(owner,&transport_custody_owner) && revision<=transport_custody_revision) return false;
++  return revision!=UINT64_MAX;
++}
++static bool transport_custody_admit(uint64_t id,const struct output_native_owner *owner,uint64_t revision,
++    uint64_t generation,const struct output_transport_identity *identity)
++{
++  struct timespec expiry;
++  if (!revision || !transport_bound_available(id,owner,revision) || generation!=transport_admission_generation
++      || transport_admission_generation==UINT64_MAX || clock_gettime(CLOCK_MONOTONIC,&expiry)<0) return false;
++  expiry.tv_sec+=10;
++  if (!transport_custody_live || expiry.tv_sec>transport_custody_expiry.tv_sec
++      || (expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec>transport_custody_expiry.tv_nsec))
++    transport_custody_expiry=expiry;
++  transport_custody_owner=*owner; transport_custody_identity=*identity; transport_custody_revision=revision;
++  transport_custody_live=true; transport_custody_lost=false; transport_generation_advance();
++  return true;
++}
++static bool transport_custody_current(const struct output_native_owner *owner,const struct output_transport_identity *identity,uint64_t revision)
++{
++  struct output_transport_identity actual;
++  return transport_custody_busy() && !transport_generation_exhausted && !transport_custody_lost
++    && native_owner_equal(owner,&transport_custody_owner) && transport_custody_revision==revision
++    && transport_identity_equal(identity,&transport_custody_identity)
++    && transport_identity_get(identity->device_id,&actual)==0 && transport_identity_equal(identity,&actual);
++}
++static unsigned transport_custody_remaining(const struct output_native_owner *owner,const struct output_transport_identity *identity)
++{
++  return transport_custody_busy() && native_owner_equal(owner,&transport_custody_owner)
++    && transport_identity_equal(identity,&transport_custody_identity) ? transport_remaining(&transport_custody_expiry) : 0;
++}
++int outputs_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy)
++{
++  if (!busy || !native_owner_valid(owner,id) || transport_identity_get(id,identity)<0) return -1;
++  *busy=!transport_bound_available(id,owner,0); return 0;
++}
+diff --git a/src/player.c b/src/player.c
+index 7479c4b..552658b 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -3111,6 +3111,7 @@ streaming_deregister(void *arg, int *retval)
+ 
+ struct player_transport_command
+ {
++  const struct output_native_owner *owner;
+   const struct output_transport_request *request;
+   struct output_transport_result *result;
+   struct output_transport_identity *identity;
+@@ -3129,6 +3130,7 @@ transport_command(void *arg, int *retval)
+   if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
+   else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
+   else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
++  else if (c->action==4) *retval=outputs_transport_bound_state_get(c->id,c->owner,c->identity,c->busy);
+   else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
+   return COMMAND_END;
+ }
+@@ -3153,25 +3155,35 @@ int player_transport_state_get(uint64_t id, struct output_transport_identity *id
+   return commands_exec_sync(cmdbase,transport_command,NULL,&c);
+ }
+ 
++int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy)
++{
++  struct player_transport_command c={.id=id,.owner=owner,.identity=identity,.busy=busy,.action=4};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++
+ struct player_room_volume_command {
+   int action; uint64_t id; const char *token,*reservation;
++  const struct output_native_owner *owner;
+   const struct output_room_volume_request *request; struct output_room_volume_result *result;
+   struct output_transport_identity *identity; struct output_room_volume_state *state; bool *busy;
+ };
+ static enum command_state room_volume_command(void *arg,int *retval)
+ {
+   struct player_room_volume_command *c=arg;
+-  if (c->action<3 && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
++  if ((c->action<3 || c->action==5) && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
+       || pb_session.reading_now!=pb_session.playing_now)) { *retval=-1; return COMMAND_END; }
+   if (c->action==0) *retval=outputs_room_volume_state_get(c->id,c->identity,c->state,c->busy);
+   else if (c->action==1) *retval=outputs_room_volume_prepare(c->request,c->result);
+   else if (c->action==2) *retval=outputs_room_volume_commit(c->request,c->result);
+   else if (c->action==3) *retval=outputs_room_volume_cancel(c->token,c->reservation,c->result);
++  else if (c->action==5) *retval=outputs_room_volume_bound_state_get(c->id,c->owner,c->identity,c->state,c->busy);
+   else *retval=outputs_room_volume_result_get(c->token,c->result);
+   return COMMAND_END;
+ }
+ int player_room_volume_state_get(uint64_t id,struct output_transport_identity *identity,struct output_room_volume_state *state,bool *busy)
+ { struct player_room_volume_command c={.action=0,.id=id,.identity=identity,.state=state,.busy=busy}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++int player_room_volume_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,struct output_room_volume_state *state,bool *busy)
++{ struct player_room_volume_command c={.action=5,.id=id,.owner=owner,.identity=identity,.state=state,.busy=busy}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
+ int player_room_volume_prepare(const struct output_room_volume_request *request,struct output_room_volume_result *result)
+ { struct player_room_volume_command c={.action=1,.request=request,.result=result}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
+ int player_room_volume_commit(const struct output_room_volume_request *request,struct output_room_volume_result *result)
+diff --git a/src/player.h b/src/player.h
+index 814c880..d287f4e 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -253,3 +253,6 @@ int player_room_volume_cancel(const char *,const char *,struct output_room_volum
+ int player_room_volume_result_get(const char *,struct output_room_volume_result *);
+ #endif /* !__PLAYER_H__ */
+ 
++
++int player_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
++int player_room_volume_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,struct output_room_volume_state *,bool *);
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 70e3653..3a9218e 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -527,6 +527,7 @@ struct recovery_wire_fixture {
+   struct output_attention_result handoff;
+   struct output_room_volume_request volume_command;
+   struct output_room_volume_result volume_result;
++  struct timespec burst_started;
+ };
+ 
+ static struct recovery_wire_fixture *active_recovery_wire;
+@@ -689,7 +690,7 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct(f->mode>=7 ? (f->volumes ? 44 : 27) : 60,f->device->name);
++    float mapped=airplay_volume_from_pct(f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
+     char expected[64];
+     snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+     if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+@@ -737,16 +738,56 @@ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t
+   bufferevent_setcb(f->peer,recovery_wire_read,NULL,recovery_wire_event,f);bufferevent_enable(f->peer,EV_READ|EV_WRITE);
+ }
+ 
++static struct output_native_owner recovery_burst_owner(void)
++{
++  return (struct output_native_owner){.account_user_id="fixture",.target_id="engine",.room_id="room",.homepod_id="1",
++    .connection_id="connection",.session_id="session",.alias_incarnation="incarnation",.alias_registry="registry",.alias_revision=1};
++}
++static int recovery_burst_volume(struct recovery_wire_fixture *f,uint64_t revision,int percent)
++{
++  bool busy; struct output_room_volume_request *r=&f->volume_command;
++  memset(r,0,sizeof(*r)); r->device_id=1; r->percent=percent; r->bound=true;
++  r->native_owner=recovery_burst_owner(); r->native_revision=revision;
++  snprintf(r->native_prepare_id,sizeof(r->native_prepare_id),"%032x",1000+(unsigned)revision);
++  memset(r->args_digest,'b',64); r->args_digest[64]=0;
++  if (outputs_room_volume_bound_state_get(1,&r->native_owner,&r->expected_identity,&r->expected_volume_state,&busy)<0 || busy) return -1;
++  memcpy(r->expected_input_path_digest,r->expected_identity.input_path_digest,65);
++  if (outputs_room_volume_prepare(r,&f->volume_result)<0) return -1;
++  *r=f->volume_result.command; memset(r->native_reservation_id,'a',32); r->native_reservation_id[32]=0;
++  return outputs_room_volume_commit(r,&f->volume_result);
++}
++static int recovery_burst_audio(struct recovery_wire_fixture *f,uint64_t revision,const char *action,struct output_transport_result *out)
++{
++  struct output_transport_request r={.device_id=1,.percent=-1,.bound=true,.native_revision=revision};
++  (void)f; r.native_owner=recovery_burst_owner();
++  snprintf(r.native_prepare_id,sizeof(r.native_prepare_id),"%032x",1000+(unsigned)revision);
++  snprintf(r.action,sizeof(r.action),"%s",action); memset(r.args_digest,'b',64); r.args_digest[64]=0;
++  if (outputs_transport_prepare(&r,out)<0) return -1;
++  r=out->command; memcpy(r.expected_input_path_digest,out->identity.input_path_digest,65);
++  return outputs_transport_commit(&r,out);
++}
++
+ static void recovery_wire_poll(int fd,short what,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct timeval soon={0,1000};(void)fd;(void)what;
+   if (f->mode>=7) {
+     if (!f->phase || outputs_room_volume_result_get(f->volume_command.token,&f->volume_result)<0
+         || !f->volume_result.contexts_drained) { evtimer_add(f->poll,&soon); return; }
+-    if (f->volume_result.outcome!=(f->mode==7 ? ROOM_VOLUME_PROTOCOL_ACCEPTED : ROOM_VOLUME_UNKNOWN)
+-        || !f->volume_result.possible_effect || f->device->volume!=44 || !room_volume_pin_busy()
+-        || !f->device->session || f->volumes!=2 || f->teardowns)
++    if (f->volume_result.outcome!=((f->mode==7 || f->mode==10) ? ROOM_VOLUME_PROTOCOL_ACCEPTED : ROOM_VOLUME_UNKNOWN)
++        || !f->volume_result.possible_effect || f->device->volume!=(f->mode==10 && f->phase==2 ? 45 : 44)
++        || !(f->mode==10 ? transport_custody_busy() : room_volume_pin_busy())
++        || !f->device->session || f->volumes!=(f->mode==10 && f->phase==2 ? 3 : 2) || f->teardowns)
+       { recovery_wire_fail(f,"distinct physical-volume exact-CSeq/result/session ownership"); return; }
++    if (f->mode==10) {
++      struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
++      if ((now.tv_sec-f->burst_started.tv_sec)*1000000000LL+now.tv_nsec-f->burst_started.tv_nsec>=1000000000LL)
++        { recovery_wire_fail(f,"actual rapid owner/volume chain exceeded1s"); return; }
++      if (f->phase==1) {
++        if (recovery_burst_volume(f,4,45)<0) { recovery_wire_fail(f,"second realvolume blocked by old10s custody"); return; }
++        f->phase=2; evtimer_add(f->poll,&soon); return;
++      }
++      puts("PASS actual privateAP2 rapid Cowner pause/resume admissions +44/45 matchingCSeq writes+drained receipts under1s, no10s wait; native actor effect separate");
++    }
+     event_base_loopbreak(f->base); return;
+   }
+   if (f->mode == 6 && f->phase < 2)
+@@ -850,6 +891,14 @@ static void recovery_wire_connected(struct output_device *device, enum output_de
+     bool busy;
+     struct output_room_volume_request *r=&f->volume_command;
+     outputs_transport_input_changed(501,"/srv/media/spotify",true); /* Controlled input-owner fixture, not physical playback. */
++    if (f->mode==10) {
++      struct output_transport_result pause,resume;
++      clock_gettime(CLOCK_MONOTONIC,&f->burst_started);
++      if (recovery_burst_audio(f,1,"pause",&pause)<0 || recovery_burst_audio(f,2,"resume",&resume)<0
++          || outputs_transport_current(&pause) || !outputs_transport_current(&resume) || recovery_burst_volume(f,3,44)<0)
++        { recovery_wire_fail(f,"rapid exactowner audio/volume admission rejected"); return; }
++      f->phase=1; return;
++    }
+     r->device_id=device->id; r->percent=44;
+     snprintf(r->native_prepare_id,sizeof(r->native_prepare_id),"%032x",100+f->mode);
+     memset(r->args_digest,'b',64); r->args_digest[64]=0;
+@@ -962,6 +1011,7 @@ static int recovery_wire_case(int mode)
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if (mode>=7 && room_volume_pin) room_volume_pin_expiry.tv_sec-=11;
+   (void)room_volume_pin_busy();
++  if (mode==10) { transport_custody_expiry.tv_sec-=11; (void)transport_custody_busy(); }
+   if(outputs_device_list)outputs_device_remove(outputs_device_list);
+   for(i=0;i<(int)ARRAY_SIZE(contexts);i++)if(contexts[i])f.failed=1;
+   if (f.peer) bufferevent_free(f.peer);
+@@ -1006,7 +1056,7 @@ int main(int argc, char **argv)
+     if (owner_case(OLD_START_200, mode)) return 1;
+   for (mode = RAW_FREE; mode <= RAW_NESTED_FREE; mode++)
+     if (raw_case((enum raw_mode)mode)) return 1;
+-  for(mode=0;mode<10;mode++) if(recovery_wire_case(mode)) return 1;
++  for(mode=0;mode<11;mode++) if(recovery_wire_case(mode)) return 1;
+   puts("PASS: existing AirPlay config/queue owners plus seven actual private AP2 recovery/write/drain plus3 dedicated volume actualCSeq/rejection cases; no HomePod or physical-volume claim");
+   return 0;
+ }
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+index 08115e8..1086a99 100644
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -816,6 +816,11 @@ int player_transport_state_get(uint64_t id, struct output_transport_identity *ou
+ int player_transport_result_get(const char *token, struct output_transport_result *out)
+ { return outputs_transport_result_get(token,out); }
+ 
++int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *out,bool *busy)
++{ return outputs_transport_bound_state_get(id,owner,out,busy); }
++int player_room_volume_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *i,struct output_room_volume_state *v,bool *busy)
++{ return outputs_room_volume_bound_state_get(id,owner,i,v,busy); }
++
+ /* Controlled owner-state regression only: no real connected speaker or
+  * protocol success is fabricated by these struct fixtures. */
+ static struct output_transport_request transport_fixture_request(const char *action)
+@@ -1049,13 +1054,98 @@ static void exact_room_volume_owner(void)
+   puts("PASS volume owner pending!=base, cancel/expiry beforewrite, oneuse/fullroutepin, partial continuation deadline, newer manual fence, unknownnoreplay, attention lease preserved; no RTSP/device claim");
+ }
+ 
++static struct output_native_owner burst_owner(void)
++{
++  struct output_native_owner owner={.alias_revision=7};
++  snprintf(owner.account_user_id,sizeof(owner.account_user_id),"account");
++  snprintf(owner.target_id,sizeof(owner.target_id),"engine"); snprintf(owner.room_id,sizeof(owner.room_id),"room");
++  snprintf(owner.homepod_id,sizeof(owner.homepod_id),"1"); snprintf(owner.connection_id,sizeof(owner.connection_id),"connection");
++  snprintf(owner.session_id,sizeof(owner.session_id),"session"); snprintf(owner.alias_incarnation,sizeof(owner.alias_incarnation),"incarnation");
++  snprintf(owner.alias_registry,sizeof(owner.alias_registry),"registry"); return owner;
++}
++static struct output_transport_request burst_audio(const struct output_native_owner *owner,uint64_t revision,const char *action)
++{
++  struct output_transport_request r=transport_fixture_request(action); struct output_transport_result out;
++  r.bound=true; r.native_owner=*owner; r.native_revision=revision;
++  assert(outputs_transport_prepare(&r,&out)==0); r=out.command;
++  memcpy(r.expected_input_path_digest,out.identity.input_path_digest,65); return r;
++}
++static struct output_room_volume_request burst_volume(const struct output_native_owner *owner,uint64_t revision,int percent)
++{
++  static unsigned n=10000; bool busy; struct output_room_volume_result out;
++  struct output_room_volume_request r={.device_id=1,.percent=percent,.bound=true,.native_revision=revision};
++  r.native_owner=*owner; snprintf(r.native_prepare_id,sizeof(r.native_prepare_id),"%032x",++n);
++  memset(r.args_digest,'a',64); r.args_digest[64]=0;
++  assert(outputs_room_volume_bound_state_get(1,owner,&r.expected_identity,&r.expected_volume_state,&busy)==0 && !busy);
++  memcpy(r.expected_input_path_digest,r.expected_identity.input_path_digest,65);
++  assert(outputs_room_volume_prepare(&r,&out)==0); r=out.command;
++  memset(r.native_reservation_id,'e',32); r.native_reservation_id[32]=0; return r;
++}
++static void exact_same_owner_burst(void)
++{
++  struct output_device *a=add_device(1),*b=add_device(2); unsigned char session;
++  struct output_native_owner owner=burst_owner(),changed;
++  struct output_transport_identity identity; bool busy; uint64_t generation;
++  struct output_transport_request r,early,newer; struct output_transport_result first,last;
++  struct output_room_volume_request v; struct output_room_volume_result volume;
++  struct timespec expiry; int base;
++  output_airplay.device_room_volume=inert_room_volume;
++  outputs_device_select(a,-1); assert(outputs_device_session_add(1,&session)==0); a->state=OUTPUT_STATE_CONNECTED;
++  outputs_transport_input_changed(777,"/srv/media/spotify",true); assert(outputs_device_volume_register(a,27,-1)==0); base=a->volume;
++  r=burst_audio(&owner,1,"pause"); assert(outputs_transport_commit(&r,&first)==0);
++  assert(outputs_transport_busy() && outputs_transport_current(&first));
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && !busy);
++  r=burst_audio(&owner,2,"resume"); assert(outputs_transport_commit(&r,&last)==0);
++  assert(!outputs_transport_current(&first) && outputs_transport_current(&last) && a->volume==base);
++  /* Each native9 member matters; same pipe/account is insufficient. */
++#define FOREIGN(field) changed=owner; changed.field[0]='X'; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)==0 && busy)
++  FOREIGN(account_user_id); FOREIGN(target_id); FOREIGN(room_id); FOREIGN(connection_id); FOREIGN(session_id);
++  FOREIGN(alias_incarnation); FOREIGN(alias_registry);
++#undef FOREIGN
++  changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)==0 && busy);
++  changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)<0);
++  outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
++  early=burst_audio(&owner,3,"pause"); newer=burst_audio(&owner,4,"resume");
++  assert(outputs_transport_commit(&newer,&last)==0); assert(outputs_transport_commit(&early,&first)<0);
++  assert(outputs_transport_commit(&early,&first)<0); /* Stale consumed token cannot retry. */
++  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,5,"next");
++  assert(outputs_transport_commit(&r,&last)==0 && last.remaining_ms>9900); expiry=transport_custody_expiry;
++  assert(outputs_transport_result_get(r.token,&first)==0);
++  assert(expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec==transport_custody_expiry.tv_nsec);
++  early=burst_audio(&owner,6,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
++  r=burst_audio(&owner,7,"pause"); assert(outputs_transport_commit(&r,&last)==0);
++  assert(outputs_transport_commit(&early,&first)<0); /* Expire/fresh same-route custody ABA. */
++  v=burst_volume(&owner,8,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && busy);
++  assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
++  assert(outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED && volume.contexts_drained);
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && !busy && outputs_transport_busy());
++  v=burst_volume(&owner,9,45); assert(outputs_room_volume_commit(&v,&volume)==0);
++  assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
++  assert(a->volume==45 && outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED);
++  v=burst_volume(&owner,10,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
++  assert(outputs_room_volume_cancel(v.token,v.native_reservation_id,&volume)==0 && volume.outcome==ROOM_VOLUME_UNKNOWN);
++  room_volume_find(v.token)->deadline.tv_sec-=2; transport_custody_expiry.tv_sec-=11;
++  assert(outputs_transport_busy()); /* Undrained context still quarantines even beyond custody expiry. */
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && busy);
++  outputs_device_select(b,-1); assert(!b->selected);
++  outputs_room_volume_complete(v.token,false); assert(!outputs_transport_busy());
++  r=transport_fixture_request("pause"); r.bound=true; r.native_owner=owner; r.native_revision=UINT64_MAX;
++  assert(outputs_transport_prepare(&r,&last)<0);
++  generation=transport_admission_generation; transport_admission_generation=UINT64_MAX;
++  r.native_revision=11; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
++  transport_admission_generation=generation;
++  outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
++  puts("PASS compatible exactnative9 audio order/stalegeneration/expiryABA/maxdeadline/nonrenewingread; sequential terminaldrained volume before10s; undrainedunknown quarantine; overflowfailclosed");
++}
++
+ static int room_volume_http(struct httpd_request *hreq,const char *phase,const char *body)
+ {
+   hreq->path_parts[2]="1"; hreq->path_parts[4]=(char *)phase;
+   evbuffer_drain(hreq->in_body,evbuffer_get_length(hreq->in_body));
+   evbuffer_drain(hreq->out_body,evbuffer_get_length(hreq->out_body));
+   if (body) evbuffer_add(hreq->in_body,body,strlen(body));
+-  return !strcmp(phase,"state") ? jsonapi_reply_room_volume_state(hreq) : jsonapi_reply_room_volume_write(hreq);
++  return (!strcmp(phase,"state") || !strcmp(phase,"bound-state")) ? jsonapi_reply_room_volume_state(hreq) : jsonapi_reply_room_volume_write(hreq);
+ }
+ static char *room_volume_json_replace(const char *source,const char *needle,const char *replacement)
+ {
+@@ -1071,6 +1161,114 @@ static size_t room_volume_token_count(void)
+   size_t i,n=0; for(i=0;i<ARRAY_SIZE(room_volume_slots);i++) if(room_volume_slots[i].result.command.token[0])n++;
+   return n;
+ }
++static void exact_bound_http_contract(void)
++{
++  struct output_device *a=add_device(1); unsigned char session;
++  struct output_native_owner owner=burst_owner();
++  struct httpd_request hreq={0}; json_object *body,*reply,*field,*old; char *raw,*changed; size_t tokens=0,i;
++  char token[33],digest[65];
++  const char *cases[][2]={
++    {"\"session_id\":\"session\"","\"session_id\":\"session\",\"session_id\":\"session\""},
++    {"\"alias_revision\":7","\"alias_revision\":7,\"surprise\":true"},
++    {"\"alias_revision\":7","\"alias_revision\":true"},
++    {"\"alias_revision\":7","\"alias_revision\":9007199254740992"},
++    {"\"native_revision\":\"20\"","\"native_revision\":\"18446744073709551616\""},
++    {"\"native_revision\":\"20\"","\"native_revision\":20"},
++    {"\"native_revision\":\"20\"","\"native_revision\":\"020\""}
++  };
++  hreq.in_body=evbuffer_new(); hreq.out_body=evbuffer_new();
++  outputs_device_select(a,-1); assert(outputs_device_session_add(1,&session)==0); a->state=OUTPUT_STATE_CONNECTED;
++  outputs_transport_input_changed(888,"/srv/media/spotify",true);
++  body=json_object_new_object(); json_object_object_add(body,"native_owner",transport_native_json(&owner));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  hreq.path_parts[2]="1"; hreq.path_parts[4]="bound-state"; evbuffer_add(hreq.in_body,raw,strlen(raw)); free(raw);
++  assert(jsonapi_reply_transport_bound_state(&hreq)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==6);
++  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_transport_state.v2")); jparse_free(reply);
++  json_object_object_add(body,"native_prepare_id",json_object_new_string("dddddddddddddddddddddddddddddddd"));
++  json_object_object_add(body,"native_revision",json_object_new_string("20"));
++  json_object_object_add(body,"action",json_object_new_string("pause"));
++  json_object_object_add(body,"args_digest",json_object_new_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  for (i=0;i<ARRAY_SIZE(transport_slots);i++) if (transport_slots[i].result.command.token[0]) tokens++;
++  for (i=0;i<ARRAY_SIZE(cases);i++) {
++    size_t count=0,j; changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);
++    assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST); free(changed);
++    for (j=0;j<ARRAY_SIZE(transport_slots);j++) if (transport_slots[j].result.command.token[0])count++;
++    assert(count==tokens);
++  }
++  changed=malloc(strlen(raw)+4); sprintf(changed,"%s {}",raw);
++  assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
++  assert(transport_http(&hreq,"bound-prepare",raw)==HTTP_OK);free(raw);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==7);
++  snprintf(token,sizeof(token),"%s",jparse_str_from_obj(reply,"token"));
++  assert(json_object_object_get_ex(reply,"identity",&field)); snprintf(digest,sizeof(digest),"%s",jparse_str_from_obj(field,"input_path_digest"));
++  jparse_free(reply); json_object_object_add(body,"token",json_object_new_string(token));
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string(digest));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  assert(transport_http(&hreq,"bound-commit",raw)==HTTP_OK);free(raw);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==10);
++  assert(!strcmp(jparse_str_from_obj(reply,"native_revision"),"20"));jparse_free(reply);
++  /* The old v1 endpoint cannot commit a bound capability, or change its owner. */
++  old=json_object_new_object(); json_object_object_foreach(body,key,value) {
++    if (strcmp(key,"native_owner") && strcmp(key,"native_revision")) json_object_object_add(old,key,json_object_get(value));
++  }
++  raw=strdup(json_object_to_json_string_ext(old,JSON_C_TO_STRING_PLAIN));
++  assert(transport_http(&hreq,"commit",raw)==409);free(raw);jparse_free(old);jparse_free(body);
++  transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
++  outputs_device_session_remove(1);clear_devices();evbuffer_free(hreq.in_body);evbuffer_free(hreq.out_body);
++  puts("PASS actual privatev2 HTTP state6/prepare7/commit10 fullnative9; nested duplicate/unknown/type/overflow/trailing beforemint; v1bound separation");
++}
++
++static void exact_bound_volume_http_contract(void)
++{
++  struct output_device *a=add_device(1); unsigned char session; bool busy;
++  struct output_native_owner owner=burst_owner(); struct output_transport_identity identity;
++  struct output_room_volume_state state; struct output_room_volume_result result;
++  struct httpd_request hreq={0}; json_object *body,*reply; char *raw,*changed; char token[33],cancel[160]; size_t count;
++  hreq.in_body=evbuffer_new();hreq.out_body=evbuffer_new();output_airplay.device_room_volume=inert_room_volume;
++  outputs_device_select(a,-1);assert(outputs_device_session_add(1,&session)==0);a->state=OUTPUT_STATE_CONNECTED;
++  outputs_transport_input_changed(999,"/srv/media/spotify",true);
++  body=json_object_new_object();json_object_object_add(body,"native_owner",transport_native_json(&owner));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  assert(room_volume_http(&hreq,"bound-state",raw)==HTTP_OK);free(raw);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);assert(json_object_object_length(reply)==7);
++  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_room_volume_state.v2"));jparse_free(reply);
++  assert(outputs_room_volume_bound_state_get(1,&owner,&identity,&state,&busy)==0 && !busy);
++  json_object_object_add(body,"native_prepare_id",json_object_new_string("ffffffffffffffffffffffffffffffff"));
++  json_object_object_add(body,"native_revision",json_object_new_string("30"));
++  json_object_object_add(body,"args_digest",json_object_new_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string(identity.input_path_digest));
++  json_object_object_add(body,"percent",json_object_new_int(47));
++  json_object_object_add(body,"expected_identity",transport_identity_json(&identity));
++  json_object_object_add(body,"expected_volume_state",room_volume_state_json(&state));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));count=room_volume_token_count();
++  changed=room_volume_json_replace(raw,"\"session_id\":\"session\"","\"session_id\":\"session\",\"session_id\":\"session\"");
++  assert(room_volume_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST && room_volume_token_count()==count);free(changed);
++  assert(room_volume_http(&hreq,"bound-prepare",raw)==HTTP_OK);free(raw);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);assert(json_object_object_length(reply)==12);
++  snprintf(token,sizeof(token),"%s",jparse_str_from_obj(reply,"token"));jparse_free(reply);
++  json_object_object_del(body,"expected_identity");json_object_object_del(body,"expected_volume_state");
++  json_object_object_add(body,"token",json_object_new_string(token));
++  json_object_object_add(body,"native_reservation_id",json_object_new_string("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  assert(room_volume_http(&hreq,"bound-commit",raw)==HTTP_OK);free(raw);jparse_free(body);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);assert(json_object_object_length(reply)==17);
++  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_room_volume_commit.v2"));jparse_free(reply);
++  snprintf(cancel,sizeof(cancel),"{\"token\":\"%s\",\"native_reservation_id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}",token);
++  assert(room_volume_http(&hreq,"cancel",cancel)==HTTP_NOTFOUND); /* Legacy path cannot adopt bound capability. */
++  assert(outputs_room_volume_result_get(token,&result)==0 && result.outcome==ROOM_VOLUME_PENDING);
++  assert(room_volume_http(&hreq,"bound-cancel",cancel)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);assert(json_object_object_length(reply)==17 && !strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_room_volume_cancel.v2"));jparse_free(reply);
++  assert(!outputs_room_volume_before_write(token));outputs_room_volume_complete(token,false);
++  hreq.path_parts[4]="bound-result";hreq.path_parts[5]=token;
++  evbuffer_drain(hreq.out_body,evbuffer_get_length(hreq.out_body));assert(jsonapi_reply_room_volume_result(&hreq)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);assert(json_object_object_length(reply)==17);jparse_free(reply);
++  transport_custody_expiry.tv_sec-=11;assert(!outputs_transport_busy());
++  outputs_device_session_remove(1);output_airplay.device_room_volume=NULL;clear_devices();evbuffer_free(hreq.in_body);evbuffer_free(hreq.out_body);
++  puts("PASS actual privatev2 volume HTTP state7/prepare12/commit-cancel-result17; nestednativeowner beforemint; legacycancel cannot adopt token");
++}
++
+ static void exact_room_volume_http_contract(void)
+ {
+   struct output_device *a=add_device(1);
+@@ -1181,6 +1379,9 @@ int main(void)
+   exact_transport_http_contract();
+   exact_room_volume_owner();
+   exact_room_volume_http_contract();
++  exact_same_owner_burst();
++  exact_bound_http_contract();
++  exact_bound_volume_http_contract();
+   event_free(outputs_deferredev);
+   event_base_free(evbase_player);
+   sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);

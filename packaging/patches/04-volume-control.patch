@@ -1,0 +1,1008 @@
+--- a/custom_components/podconnect/room_volume.py
++++ b/custom_components/podconnect/room_volume.py
+@@ -0,0 +1,259 @@
++"""Separate exact-room volume authority; no generic or attention fallback."""
++
++from __future__ import annotations
++
++import asyncio
++import copy
++import re
++import time
++
++from .room_transport import valid_identity
++from .speakers import SpeakersError
++
++_TOKEN = re.compile(r"[a-f0-9]{32}")
++_DECIMAL = re.compile(r"0|[1-9][0-9]{0,19}")
++_STATES = {
++    "prepared",
++    "pending_claim",
++    "reserved",
++    "pending",
++    "admitted_pending",
++    "protocol_accepted",
++    "rejected_before_admission",
++    "expired_before_admission",
++    "cancelled_before_admission",
++    "unknown",
++}
++_RESULT_KEYS = {
++    "schema",
++    "ok",
++    "prepare_id",
++    "state",
++    "reservation_accepted",
++    "protocol_accepted",
++    "possible_effect",
++    "terminal",
++    "deadline_retired",
++    "contexts_drained",
++    "retry_allowed",
++    "physical_result_verified",
++}
++
++
++def valid_volume_state(value):
++    return (
++        isinstance(value, dict)
++        and set(value)
++        == {"base_revision", "attention_revision", "base_percent", "effective_percent"}
++        and all(
++            isinstance(value[k], str)
++            and _DECIMAL.fullmatch(value[k]) is not None
++            and int(value[k]) < 2**64
++            for k in ("base_revision", "attention_revision")
++        )
++        and all(
++            type(value[k]) is int and 0 <= value[k] <= 100
++            for k in ("base_percent", "effective_percent")
++        )
++    )
++
++
++def valid_context(value, target):
++    if not isinstance(value, dict) or set(value) != {
++        "room_id",
++        "homepod_id",
++        "native",
++        "route",
++        "volume_state",
++    }:
++        return False
++    native = value["native"]
++    scope = {
++        "account_user_id": native.get("account_user_id")
++        if isinstance(native, dict)
++        else None,
++        "target_id": target,
++        "room_id": value["room_id"],
++        "homepod_id": value["homepod_id"],
++    }
++    return valid_identity(native, value["route"], scope) and valid_volume_state(
++        value["volume_state"]
++    )
++
++
++def valid_result(value, prepare_id, suffix="commit"):
++    if (
++        not isinstance(value, dict)
++        or set(value) != _RESULT_KEYS
++        or value["schema"] != "podconnect.room_volume_" + suffix + ".v1"
++        or value["prepare_id"] != prepare_id
++        or not isinstance(value["state"], str)
++        or value["state"] not in _STATES
++        or any(
++            type(value[k]) is not bool
++            for k in _RESULT_KEYS - {"schema", "prepare_id", "state"}
++        )
++        or value["retry_allowed"] is not False
++        or value["physical_result_verified"] is not False
++    ):
++        return False
++    if value["protocol_accepted"] != (value["state"] == "protocol_accepted"):
++        return False
++    if value["protocol_accepted"] and not (
++        value["ok"] and value["reservation_accepted"] and value["possible_effect"]
++    ):
++        return False
++    # A drained terminal certificate is distinct from a response timeout.
++    if value["terminal"] and not value["contexts_drained"]:
++        return False
++    return not (
++        not value["possible_effect"]
++        and value["state"] in {"admitted_pending", "protocol_accepted"}
++    )
++
++
++class RoomVolume:
++    def __init__(self, commands):
++        self.commands = commands
++        self.cleanups = set()
++
++    def _scope(self, hass, entry, target, context):
++        return self.commands.room_transport.scope(
++            hass, entry, target, context["room_id"], context["homepod_id"]
++        )
++
++    async def read(self, hass, entry, target, room, homepod):
++        from .commands import CommandRejected
++
++        context = {"room_id": room, "homepod_id": homepod}
++        scope = self._scope(hass, entry, target, context)
++        before = self.commands.controls(entry, target)
++        try:
++            state = await self.commands.data.speakers.room_volume_state(scope)
++        except SpeakersError as exc:
++            raise CommandRejected("room_volume_unavailable") from exc
++        if self._scope(hass, entry, target, context) != scope:
++            raise CommandRejected("native_account_unproven")
++        latest = self.commands.controls(entry, target)
++        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
++            raise CommandRejected("stale_observation")
++        if (
++            not isinstance(state, dict)
++            or set(state)
++            != {
++                "schema",
++                "ok",
++                "native",
++                "route",
++                "volume_state",
++                "actions",
++                "physical_result_verified",
++            }
++            or state["schema"] != "podconnect.room_volume_state.v1"
++            or state["ok"] is not True
++            or state["physical_result_verified"] is not False
++            or state["actions"] not in (["volume"], [])
++            or not valid_identity(state["native"], state["route"], scope)
++            or not valid_volume_state(state["volume_state"])
++        ):
++            raise CommandRejected("room_volume_unavailable")
++        return {
++            **latest,
++            "schema": "podconnect.room_volume_controls.v1",
++            "room_id": room,
++            "homepod_id": homepod,
++            "native": copy.deepcopy(state["native"]),
++            "route": copy.deepcopy(state["route"]),
++            "volume_state": copy.deepcopy(state["volume_state"]),
++            "actions": state["actions"] if latest["status"] == "ready" else [],
++            "volume_percent": None,
++            "track_play_supported": False,
++            "physical_result_verified": False,
++        }
++
++    def _cancel(self, hass, client, prepare_id):
++        async def cleanup():
++            try:
++                async with asyncio.timeout(1):
++                    await client.cancel_room_volume(prepare_id)
++            except (SpeakersError, TimeoutError):
++                return  # No retry, route unlock, or receipt upgrade.
++
++        task = hass.async_create_background_task(
++            cleanup(), "podconnect room volume cancel", eager_start=False
++        )
++        self.cleanups.add(task)
++        task.add_done_callback(self.cleanups.discard)
++
++    async def commit(self, hass, entry, target, context, percent, guard, sending):
++        from .commands import CommandRejected
++
++        if len(self.cleanups) >= 8:
++            raise CommandRejected("room_volume_cleanup_busy")
++        scope = self._scope(hass, entry, target, context)
++        if not valid_identity(context["native"], context["route"], scope):
++            raise CommandRejected("invalid_room_identity")
++        client = self.commands.data.speakers
++        prepare_id = None
++        try:
++            guard()
++            started = time.monotonic()
++            try:
++                prepared = await client.prepare_room_volume(scope, context, percent)
++            except SpeakersError as exc:
++                raise CommandRejected("room_volume_unavailable") from exc
++            # Capture only a well-formed opaque ID for bounded cancellation, even
++            # when another reply field is invalid. It never grants commit authority.
++            if (
++                isinstance(prepared, dict)
++                and isinstance(prepared.get("prepare_id"), str)
++                and _TOKEN.fullmatch(prepared["prepare_id"])
++            ):
++                prepare_id = prepared["prepare_id"]
++            if (
++                not isinstance(prepared, dict)
++                or set(prepared)
++                != {
++                    "schema",
++                    "ok",
++                    "prepare_id",
++                    "expires_after_ms",
++                    "native",
++                    "route",
++                    "volume_state",
++                    "action",
++                    "volume_percent",
++                    "physical_result_verified",
++                }
++                or prepared["schema"] != "podconnect.room_volume_prepare.v1"
++                or prepared["ok"] is not True
++                or prepare_id is None
++                or type(prepared["expires_after_ms"]) is not int
++                or not 1 <= prepared["expires_after_ms"] <= 5000
++                or not valid_identity(prepared["native"], prepared["route"], scope)
++                or not valid_volume_state(prepared["volume_state"])
++                or prepared["native"] != context["native"]
++                or prepared["route"] != context["route"]
++                or prepared["volume_state"] != context["volume_state"]
++                or prepared["action"] != "volume"
++                or type(prepared["volume_percent"]) is not int
++                or prepared["volume_percent"] != percent
++                or prepared["physical_result_verified"] is not False
++            ):
++                raise CommandRejected("room_volume_unavailable")
++            guard()
++            if self._scope(hass, entry, target, context) != scope:
++                raise CommandRejected("native_account_unproven")
++            if time.monotonic() - started >= prepared["expires_after_ms"] / 1000:
++                raise CommandRejected("room_volume_expired")
++            sending()
++            ack = await client.commit_room_volume(prepare_id)
++            if not valid_result(ack, prepare_id):
++                raise SpeakersError("Room volume outcome unknown")
++            if not ack["protocol_accepted"]:
++                self._cancel(hass, client, prepare_id)
++            return ack
++        except BaseException:
++            if prepare_id is not None:
++                self._cancel(hass, client, prepare_id)
++            raise
+--- a/custom_components/podconnect/commands.py
++++ b/custom_components/podconnect/commands.py
+@@ -127,6 +127,9 @@
+         from .room_transport import RoomTransport
+ 
+         self.room_transport = RoomTransport(self)
++        from .room_volume import RoomVolume
++
++        self.room_volume = RoomVolume(self)
+ 
+     def controls(self, entry_id, target_id, *, for_command=False):
+         data = self.data
+@@ -331,7 +334,7 @@
+             self.queue_controls = QueueControls(self)
+         return await self.queue_controls.read(hass, entry_id, target_id, room_id)
+ 
+-    async def execute(self, hass, request, *, room_transport=None):
++    async def execute(self, hass, request, *, room_transport=None, room_volume=None):
+         entry_id, target_id = request["config_entry_id"], request["target_id"]
+         epoch, sequence = request["owner_epoch"], request["expected_poll_sequence"]
+         request_id, action = request["request_id"], request["action"]
+@@ -353,6 +356,12 @@
+ 
+         if room_transport is not None:
+             receipt["accepted_native"] = False
++        if room_volume is not None:
++            receipt.update(
++                protocol_accepted=False,
++                reservation_accepted=False,
++                possible_effect=False,
++            )
+ 
+         def rejected(kind):
+             return {**receipt, "error_kind": kind}
+@@ -365,6 +374,15 @@
+             _arguments(action, request["args"])
+         except CommandRejected as exc:
+             return rejected(str(exc))
++        if room_volume is not None:
++            from .room_volume import valid_context as valid_volume_context
++
++            if (
++                room_transport is not None
++                or action != "volume"
++                or not valid_volume_context(room_volume, target_id)
++            ):
++                return rejected("invalid_arguments")
+         if room_transport is not None:
+             from .room_transport import ACTIONS, valid_context, valid_identity
+ 
+@@ -384,7 +402,9 @@
+                 return rejected("invalid_room_identity")
+         fingerprint = hashlib.sha256(
+             json.dumps(
+-                {"request": request, "room_transport": room_transport}
++                {"request": request, "room_volume": room_volume}
++                if room_volume is not None
++                else {"request": request, "room_transport": room_transport}
+                 if room_transport is not None
+                 else request,
+                 sort_keys=True,
+@@ -423,12 +443,16 @@
+                 if sequence <= self.poll_floor:
+                     raise CommandRejected("awaiting_observation")
+                 if (
+-                    "play_track"
+-                    if action == "play_context"
+-                    else "next"
+-                    if action == "play_queue_occurrence"
+-                    else action
+-                ) not in observed["actions"]:
++                    room_volume is None
++                    and (
++                        "play_track"
++                        if action == "play_context"
++                        else "next"
++                        if action == "play_queue_occurrence"
++                        else action
++                    )
++                    not in observed["actions"]
++                ):
+                     raise CommandRejected("unsupported_action")
+                 if (
+                     action in {"play_track", "play_context"}
+@@ -444,6 +468,8 @@
+         def sending():
+             nonlocal possible_send
+             possible_send = True
++            if room_volume is not None:
++                receipt["possible_effect"] = True
+ 
+         self.busy = True
+         # Monotonic admission is the permanent replay fence, even after eviction.
+@@ -456,7 +482,28 @@
+             del self.receipts[next(iter(self.receipts))]
+         try:
+             guard()
+-            if room_transport is not None:
++            if room_volume is not None:
++                async with asyncio.timeout(8):
++                    ack = await self.room_volume.commit(
++                        hass,
++                        entry_id,
++                        target_id,
++                        room_volume,
++                        request["args"]["percent"],
++                        guard,
++                        sending,
++                    )
++                receipt.update(
++                    ok=ack["protocol_accepted"],
++                    outcome="accepted" if ack["protocol_accepted"] else "unknown",
++                    protocol_accepted=ack["protocol_accepted"],
++                    reservation_accepted=ack["reservation_accepted"],
++                    possible_effect=ack["possible_effect"],
++                    volume_operation_state=ack["state"],
++                )
++                if not ack["protocol_accepted"]:
++                    receipt["error_kind"] = "outcome_unknown"
++            elif room_transport is not None:
+                 if action not in ("pause", "resume", "next", "previous"):
+                     raise CommandRejected("unsupported_action")
+                 async with asyncio.timeout(18):
+@@ -579,7 +626,8 @@
+         except CommandRejected as exc:
+             receipt = (
+                 {**receipt, "outcome": "unknown", "error_kind": "outcome_unknown"}
+-                if room_transport is not None and possible_send
++                if (room_transport is not None or room_volume is not None)
++                and possible_send
+                 else rejected(str(exc))
+             )
+         except asyncio.CancelledError:
+@@ -672,6 +720,29 @@
+         }
+         return await data.commands.execute(hass, request, room_transport=context)
+ 
++    async def volume_controls(call):
++        entry_id = call.data["config_entry_id"]
++        data = current(hass, entry_id)
++        try:
++            return await data.commands.room_volume.read(
++                hass,
++                entry_id,
++                call.data["target_id"],
++                call.data["room_id"],
++                call.data["homepod_id"],
++            )
++        except CommandRejected as exc:
++            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
++
++    async def volume_command(call):
++        data = current(hass, call.data["config_entry_id"])
++        request = dict(call.data)
++        context = {
++            k: request.pop(k)
++            for k in ("room_id", "homepod_id", "native", "route", "volume_state")
++        }
++        return await data.commands.execute(hass, request, room_volume=context)
++
+     async def command(call):
+         data = current(hass, call.data["config_entry_id"])
+         return await data.commands.execute(hass, dict(call.data))
+@@ -697,8 +768,18 @@
+         vol.Required("native"): dict,
+         vol.Required("route"): dict,
+     }
++    volume_command_schema = {
++        **command_schema,
++        **room_identity,
++        vol.Required("action"): vol.In(("volume",)),
++        vol.Required("native"): dict,
++        vol.Required("route"): dict,
++        vol.Required("volume_state"): dict,
++    }
+     for name, handler, schema in (
+         ("get_playback_controls", controls, identity),
++        ("get_room_volume_controls", volume_controls, room_identity),
++        ("control_room_volume", volume_command, volume_command_schema),
+         ("get_room_playback_controls", room_controls, room_identity),
+         ("control_room_playback", room_command, room_command_schema),
+         (
+--- a/custom_components/podconnect/speakers.py
++++ b/custom_components/podconnect/speakers.py
+@@ -270,6 +270,43 @@
+             or reply.get("policy_revision") != policy_revision
+         ):
+             raise SpeakersError("Native start lease outcome unknown")
++
++    async def room_volume_state(self, scope):
++        return await self._request(
++            "GET", "/api/room-volume/state?" + urlencode(scope), budget=2
++        )
++
++    async def prepare_room_volume(self, scope, context, percent):
++        return await self._request(
++            "POST",
++            "/api/room-volume/prepare",
++            {
++                "scope": scope,
++                "native": context["native"],
++                "route": context["route"],
++                "volume_state": context["volume_state"],
++                "action": "volume",
++                "volume_percent": percent,
++            },
++            budget=2,
++        )
++
++    async def commit_room_volume(self, prepare_id):
++        return await self._request(
++            "POST", "/api/room-volume/commit", {"prepare_id": prepare_id}, budget=4
++        )
++
++    async def cancel_room_volume(self, prepare_id):
++        return await self._request(
++            "POST", "/api/room-volume/cancel", {"prepare_id": prepare_id}, budget=1
++        )
++
++    async def room_volume_result(self, prepare_id):
++        return await self._request(
++            "GET",
++            "/api/room-volume/result?" + urlencode({"prepare_id": prepare_id}),
++            budget=2,
++        )
+ 
+     async def room_transport_state(self, scope):
+         """Read both native and exact OwnTone route capabilities; no legacy fallback."""
+--- a/custom_components/podconnect/services.yaml
++++ b/custom_components/podconnect/services.yaml
+@@ -443,3 +443,101 @@
+       required: true
+       selector:
+         object:
++
++get_room_volume_controls:
++  name: Read exact-room native volume controls
++  description: Read actual native/OwnTone manual and effective volume revisions. No preparation, effect, generic fallback, or physical proof.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++
++control_room_volume:
++  name: Control exact-room native volume
++  description: Requires an exact server-authorized human percent plus native/route/volume_state snapshots from get_room_volume_controls. Uses shared canonical account/owner/poll receipts; unknown outcomes are consumed. Native reservation or RTSP acceptance is not physical proof.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++    native:
++      required: true
++      selector:
++        object:
++    route:
++      required: true
++      selector:
++        object:
++    volume_state:
++      required: true
++      selector:
++        object:
++    owner_epoch:
++      required: true
++      selector:
++        text:
++    expected_poll_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    command_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    request_id:
++      required: true
++      selector:
++        text:
++    action:
++      required: true
++      selector:
++        select:
++          options: [volume]
++    args:
++      description: Exactly percent as an integer 0 to 100; no default, delta, start level, or attention authority.
++      required: true
++      selector:
++        object:
+--- a/tests/ha_framework/test_room_volume.py
++++ b/tests/ha_framework/test_room_volume.py
+@@ -0,0 +1,411 @@
++"""Real HA service/client boundaries; volume manager endpoints are inert fixtures."""
++
++import asyncio
++import copy
++import unittest
++
++import voluptuous as vol
++from aiohttp import web
++from test_room_transport import RoomTransportFrameworkTests
++
++
++class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
++    async def asyncSetUp(self):
++        self.volume_posts = []
++        self.volume_hold = False
++        self.volume_entered = asyncio.Event()
++        self.volume_release = asyncio.Event()
++        self.volume_commit_hold = False
++        self.volume_commit_entered = asyncio.Event()
++        self.volume_commit_release = asyncio.Event()
++        self.volume_status = 200
++        self.volume_ack_corrupt = None
++        self.volume_prepare_corrupt = None
++        self.volume_state_corrupt = None
++        self.volume_ttl = 5000
++        self.volume_outcome = "protocol_accepted"
++        self.manual_percent = 27
++        self.prepared_percent = None
++        await super().asyncSetUp()
++        self.holds.extend((self.volume_release, self.volume_commit_release))
++        self.volume_commands = self.entries[0].runtime_data.commands
++
++    def volume_snapshot(self):
++        return {
++            "base_revision": "7",
++            "attention_revision": "8",
++            "base_percent": 27,
++            "effective_percent": 10,
++        }
++
++    def volume_result(self, suffix="commit"):
++        accepted = self.volume_outcome == "protocol_accepted"
++        return {
++            "schema": "podconnect.room_volume_" + suffix + ".v1",
++            "ok": accepted,
++            "prepare_id": "c" * 32,
++            "state": self.volume_outcome,
++            "reservation_accepted": accepted,
++            "protocol_accepted": accepted,
++            "possible_effect": accepted,
++            "terminal": accepted,
++            "deadline_retired": accepted,
++            "contexts_drained": accepted,
++            "retry_allowed": False,
++            "physical_result_verified": False,
++        }
++
++    async def _backend(self, request):
++        if request.path == "/api/room-volume/state":
++            value = {
++                "schema": "podconnect.room_volume_state.v1",
++                "ok": True,
++                "native": self.native(),
++                "route": self.route(),
++                "volume_state": self.volume_snapshot(),
++                "actions": ["volume"],
++                "physical_result_verified": False,
++            }
++            if self.volume_state_corrupt:
++                self.volume_state_corrupt(value)
++            return web.json_response(value)
++        if request.path == "/api/room-volume/result":
++            return web.json_response(self.volume_result("result"))
++        if request.path.startswith("/api/room-volume/"):
++            body = await request.json()
++            self.volume_posts.append((request.path, copy.deepcopy(body)))
++            if request.path.endswith("prepare"):
++                self.volume_entered.set()
++                if self.volume_hold:
++                    await self.volume_release.wait()
++                self.prepared_percent = body["volume_percent"]
++                value = {
++                    "schema": "podconnect.room_volume_prepare.v1",
++                    "ok": True,
++                    "prepare_id": "c" * 32,
++                    "expires_after_ms": self.volume_ttl,
++                    "native": self.native(),
++                    "route": self.route(),
++                    "volume_state": self.volume_snapshot(),
++                    "action": "volume",
++                    "volume_percent": body["volume_percent"],
++                    "physical_result_verified": False,
++                }
++                if self.volume_prepare_corrupt:
++                    self.volume_prepare_corrupt(value)
++                return web.json_response(value)
++            if request.path.endswith("cancel"):
++                result = self.volume_result("cancel")
++                result.update(
++                    state="cancelled_before_admission",
++                    ok=True,
++                    protocol_accepted=False,
++                    possible_effect=False,
++                    reservation_accepted=False,
++                    terminal=True,
++                    contexts_drained=True,
++                )
++                return web.json_response(result)
++            self.volume_commit_entered.set()
++            if self.volume_commit_hold:
++                await self.volume_commit_release.wait()
++            if self.volume_status != 200:
++                return web.Response(status=self.volume_status)
++            value = self.volume_result()
++            if self.volume_ack_corrupt:
++                self.volume_ack_corrupt(value)
++            return web.json_response(value)
++        return await super()._backend(request)
++
++    async def volume_offer(self, **overrides):
++        body = {
++            "config_entry_id": "account-alpha",
++            "kind": "spotify_device",
++            "target_id": "spotify-one",
++            "room_id": "room-alpha",
++            "homepod_id": "123",
++            **overrides,
++        }
++        return await self.hass.services.async_call(
++            "podconnect",
++            "get_room_volume_controls",
++            body,
++            blocking=True,
++            return_response=True,
++        )
++
++    def volume_request(self, percent=41, **overrides):
++        return {
++            **self.room_request("volume", args={"percent": percent}),
++            "volume_state": self.volume_snapshot(),
++            **overrides,
++        }
++
++    async def volume_invoke(self, request):
++        return await self.hass.services.async_call(
++            "podconnect",
++            "control_room_volume",
++            request,
++            blocking=True,
++            return_response=True,
++        )
++
++    async def cleanup_finished(self):
++        tasks = list(self.volume_commands.room_volume.cleanups)
++        if tasks:
++            await asyncio.wait_for(asyncio.gather(*tasks), 2)
++
++    def commits(self):
++        return [body for path, body in self.volume_posts if path.endswith("commit")]
++
++    async def test_volume_read_and_response_only_descriptors_are_exact(self):
++        offer = await self.volume_offer()
++        self.assertEqual(offer["schema"], "podconnect.room_volume_controls.v1")
++        self.assertEqual(offer["volume_state"], self.volume_snapshot())
++        self.assertIsNone(offer["volume_percent"])
++        self.assertEqual(offer["actions"], ["volume"])
++        self.assertEqual(self.volume_posts, [])
++        response = await self.client.get("/api/services")
++        services = next(
++            row["services"]
++            for row in await response.json()
++            if row["domain"] == "podconnect"
++        )
++        self.assertEqual(
++            services["control_room_volume"]["response"], {"optional": False}
++        )
++        self.assertEqual(
++            set(services["control_room_volume"]["fields"]), set(self.volume_request())
++        )
++        self.assertEqual(
++            services["get_room_volume_controls"]["response"], {"optional": False}
++        )
++        status, _body = await self._service(
++            "control_room_volume", self.volume_request(), response=False
++        )
++        self.assertNotEqual(status, 200)
++        self.assertEqual(self.volume_posts, [])
++        with self.assertRaises(vol.Invalid):
++            await self.volume_offer(extra=True)
++
++    async def test_volume_explicit_percent_and_zero_use_only_native_route(self):
++        # This physical capability is independent of Spotify's generic flag.
++        self.entries[0].runtime_data.coordinator.data["playback"]["device"][
++            "supports_volume"
++        ] = False
++        self.assertEqual((await self.volume_offer())["actions"], ["volume"])
++        for percent in (0, 41):
++            if percent:
++                await self.entries[0].runtime_data.coordinator.async_refresh()
++            request = self.volume_request(percent)
++            result = await self.volume_invoke(request)
++            self.assertEqual(result["outcome"], "accepted")
++            self.assertTrue(result["protocol_accepted"])
++            self.assertTrue(result["reservation_accepted"])
++            self.assertFalse(result["provider_request_accepted"])
++            self.assertFalse(result["physical_result_verified"])
++            self.assertEqual(await self.volume_invoke(request), result)
++            self.assertEqual(self.prepared_percent, percent)
++        self.assertEqual(len(self.commits()), 2)
++        self.assertEqual(self.commits()[0], {"prepare_id": "c" * 32})
++        self.assertEqual(
++            self.volume_posts[0][1],
++            {
++                "scope": {
++                    k: self.native()[k]
++                    for k in ("account_user_id", "target_id", "room_id", "homepod_id")
++                },
++                "native": self.native(),
++                "route": self.route(),
++                "volume_state": self.volume_snapshot(),
++                "action": "volume",
++                "volume_percent": 0,
++            },
++        )
++        self.assertEqual(self.manual_percent, 27)
++        self.assertEqual(self._writes(), [])
++        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
++
++    async def test_volume_invalid_percent_and_closed_service_never_prepare(self):
++        for percent in (True, 1.5, float("nan"), -1, 101):
++            result = await self.volume_invoke(self.volume_request(percent))
++            self.assertEqual(result["error_kind"], "invalid_arguments")
++        with self.assertRaises(vol.Invalid):
++            await self.volume_invoke({**self.volume_request(), "extra": True})
++        with self.assertRaises(vol.Invalid):
++            await self.volume_invoke({**self.volume_request(), "action": "resume"})
++        self.assertEqual(
++            (await self.volume_invoke(self.volume_request(args={"delta": 2})))[
++                "outcome"
++            ],
++            "rejected",
++        )
++        self.assertEqual(self.volume_posts, [])
++        self.assertEqual(self.manual_percent, 27)
++
++    async def test_volume_state_malformed_revision_or_capability_denies(self):
++        for corrupt in (
++            lambda v: v.update(extra=True),
++            lambda v: v["volume_state"].update(base_percent=True),
++            lambda v: v["volume_state"].update(base_revision="07"),
++            lambda v: v["route"].pop("input_path_digest"),
++            lambda v: v.update(actions=["resume"]),
++        ):
++            self.volume_state_corrupt = corrupt
++            self.assertFalse((await self.volume_offer())["ok"])
++        self.volume_state_corrupt = lambda v: v.update(actions=[])
++        self.assertEqual((await self.volume_offer())["actions"], [])
++        self.assertEqual(self.volume_posts, [])
++
++    async def test_volume_foreign_native_or_mutated_snapshot_never_prepares(self):
++        for change in (
++            lambda r: r["native"].update(account_user_id="foreign"),
++            lambda r: r["route"].update(input_path_digest="invalid"),
++            lambda r: r["volume_state"].update(base_percent=False),
++        ):
++            request = self.volume_request()
++            change(request)
++            self.assertEqual((await self.volume_invoke(request))["outcome"], "rejected")
++        self.assertEqual(self.volume_posts, [])
++
++    async def test_volume_held_prepare_poll_owner_or_account_change_denies(self):
++        for operation in ("poll", "owner", "account"):
++            self.volume_posts.clear()
++            self.volume_entered.clear()
++            self.volume_release.clear()
++            self.volume_hold = True
++            data = self.entries[0].runtime_data
++            data.coordinator.owner_epoch = data.commands.owner_epoch
++            await data.coordinator.async_refresh()
++            task = self._task(self.volume_invoke(self.volume_request()))
++            await asyncio.wait_for(self.volume_entered.wait(), 2)
++            if operation == "poll":
++                await data.coordinator.async_refresh()
++            elif operation == "owner":
++                data.coordinator.owner_epoch = "replacement"
++            else:
++                self.hass.config_entries.async_update_entry(
++                    self.entries[0], unique_id="other-account"
++                )
++            self.volume_release.set()
++            result = await task
++            self.assertEqual(result["outcome"], "rejected")
++            await self.cleanup_finished()
++            self.assertEqual(self.commits(), [])
++        self.assertEqual(self.manual_percent, 27)
++        self.assertEqual(self._writes(), [])
++
++    async def test_volume_changed_prepare_binding_or_percent_never_commits(self):
++        for corrupt in (
++            lambda v: v["native"].update(alias_revision=8),
++            lambda v: v["route"].update(input_path_digest="d" * 64),
++            lambda v: v["volume_state"].update(attention_revision="9"),
++            lambda v: v.update(volume_percent=42),
++            lambda v: v.update(expires_after_ms=5001),
++        ):
++            self.volume_prepare_corrupt = corrupt
++            await self.entries[0].runtime_data.coordinator.async_refresh()
++            result = await self.volume_invoke(self.volume_request())
++            self.assertEqual(result["outcome"], "rejected")
++            await self.cleanup_finished()
++        self.assertEqual(self.commits(), [])
++        self.assertEqual(self.manual_percent, 27)
++
++    async def test_volume_expired_prepare_is_cancelled_without_dispatch(self):
++        self.volume_hold = True
++        self.volume_ttl = 1
++        task = self._task(self.volume_invoke(self.volume_request()))
++        await asyncio.wait_for(self.volume_entered.wait(), 2)
++        await asyncio.sleep(0.01)
++        self.volume_release.set()
++        self.assertEqual((await task)["error_kind"], "room_volume_expired")
++        await self.cleanup_finished()
++        self.assertEqual(self.commits(), [])
++        self.assertTrue(any(path.endswith("cancel") for path, _ in self.volume_posts))
++
++    async def test_volume_pending_and_late_ack_cannot_upgrade_unknown_receipt(self):
++        self.volume_outcome = "reserved"
++        request = self.volume_request()
++        result = await self.volume_invoke(request)
++        self.assertEqual(result["outcome"], "unknown")
++        self.assertFalse(result["protocol_accepted"])
++        await self.cleanup_finished()
++        self.volume_outcome = "protocol_accepted"
++        observed = await self.entries[0].runtime_data.speakers.room_volume_result(
++            "c" * 32
++        )
++        self.assertEqual(observed["state"], "protocol_accepted")
++        self.assertEqual(await self.volume_invoke(request), result)
++        self.assertEqual(len(self.commits()), 1)
++        self.assertEqual(self.manual_percent, 27)
++
++    async def test_volume_postdispatch_errors_are_consumed_shared_unknown(self):
++        self.volume_status = 502
++        request = self.volume_request()
++        result = await self.volume_invoke(request)
++        self.assertEqual(result["outcome"], "unknown")
++        self.assertTrue(result["possible_effect"])
++        self.assertFalse(result["retry_allowed"])
++        await self.cleanup_finished()
++        self.assertEqual(await self.volume_invoke(request), result)
++        self.assertEqual(
++            (
++                await self.invoke(
++                    self.request(
++                        "volume",
++                        args={"percent": 41},
++                        command_sequence=request["command_sequence"],
++                    )
++                )
++            )["error_kind"],
++            "request_reused",
++        )
++        self.entries[0].runtime_data.commands.receipts.clear()
++        self.assertEqual(
++            (await self.volume_invoke(request))["error_kind"], "stale_command"
++        )
++        self.assertEqual(len(self.commits()), 1)
++        self.assertEqual(self._writes(), [])
++
++    async def test_volume_malformed_ack_is_unknown_not_physical_success(self):
++        for corrupt in (
++            lambda v: v.update(extra=True),
++            lambda v: v.update(physical_result_verified=True),
++            lambda v: v.update(protocol_accepted=False),
++            lambda v: v.update(possible_effect=False),
++            lambda v: v.update(contexts_drained=False),
++        ):
++            self.volume_ack_corrupt = corrupt
++            await self.entries[0].runtime_data.coordinator.async_refresh()
++            result = await self.volume_invoke(self.volume_request())
++            self.assertEqual(result["outcome"], "unknown")
++            self.assertFalse(result["protocol_accepted"])
++            await self.cleanup_finished()
++        self.assertEqual(self._writes(), [])
++
++    async def test_volume_caller_cancel_after_dispatch_cancels_exact_operation_once(
++        self,
++    ):
++        self.volume_commit_hold = True
++        request = self.volume_request()
++        task = self._task(self.volume_invoke(request))
++        await asyncio.wait_for(self.volume_commit_entered.wait(), 2)
++        task.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        result = await self.volume_invoke(request)
++        self.assertEqual(result["outcome"], "unknown")
++        await self.cleanup_finished()
++        cancels = [body for path, body in self.volume_posts if path.endswith("cancel")]
++        self.assertEqual(cancels, [{"prepare_id": "c" * 32}])
++        self.assertEqual(len(self.commits()), 1)
++        self.assertEqual(self.manual_percent, 27)
++        self.volume_commit_release.set()
++
++
++def load_tests(loader, tests, pattern):
++    return unittest.TestSuite(
++        RoomVolumeFrameworkTests(name)
++        for name in loader.getTestCaseNames(RoomVolumeFrameworkTests)
++        if name.startswith("test_volume_")
++    )

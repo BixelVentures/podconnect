@@ -14,8 +14,12 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry
 
 commands = importlib.import_module("custom_components.podconnect.commands")
-SpotifyApiError = importlib.import_module("custom_components.podconnect.api").SpotifyApiError
-start_guards = importlib.import_module("custom_components.podconnect.native_start").start_guards
+SpotifyApiError = importlib.import_module(
+    "custom_components.podconnect.api"
+).SpotifyApiError
+start_guards = importlib.import_module(
+    "custom_components.podconnect.native_start"
+).start_guards
 
 
 class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
@@ -62,10 +66,14 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             prepared["output_volume_percent"] = 35
             if prepared["mode"] == "fresh_start":
                 self.native_output_volume = 35
-            return web.json_response({
-                "schema": "podconnect.start_lease.v1", "lease_id": "A" * 32,
-                "expires_in_ms": 5000, "proof": prepared,
-            })
+            return web.json_response(
+                {
+                    "schema": "podconnect.start_lease.v1",
+                    "lease_id": "A" * 32,
+                    "expires_in_ms": 5000,
+                    "proof": prepared,
+                }
+            )
         if request.path == "/api/start-volume/commit":
             body = await request.json()
             self.calls.append(("POST", request.path, body, False))
@@ -73,14 +81,20 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             if self.native_commit_hold:
                 self.native_commit_entered.set()
                 await self.native_commit_release.wait()
-            if body.get("max_volume") is not None and self.native_output_volume > body["max_volume"]:
+            if (
+                body.get("max_volume") is not None
+                and self.native_output_volume > body["max_volume"]
+            ):
                 return web.Response(status=409)
             if self.native_commit_status != 200:
                 return web.Response(status=self.native_commit_status)
-            return web.json_response({
-                "ok": True, "schema": "podconnect.start_commit.v1",
-                "policy_revision": self.native_revision,
-            })
+            return web.json_response(
+                {
+                    "ok": True,
+                    "schema": "podconnect.start_commit.v1",
+                    "policy_revision": self.native_revision,
+                }
+            )
         if request.path == "/spotify/me/player" and request.method == "GET":
             self.calls.append((request.method, request.path, None, True))
             if self.no_playback:
@@ -126,23 +140,43 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         return await fixture.TargetFrameworkTests._backend(self, request)
 
     def _writes(self):
-        return [call for call in self.calls if call[0] in ("POST", "PUT", "DELETE") and call[1].startswith("/spotify/")]
+        return [
+            call
+            for call in self.calls
+            if call[0] in ("POST", "PUT", "DELETE") and call[1].startswith("/spotify/")
+        ]
 
     def _native_proof(self):
         return {
-            "schema": "podconnect.start_volume.v1", "ready": True,
-            "engine_device_id": "spotify-one", "room_id": self.native_requested_room,
-            "homepod_id": "saved-output-alpha" if self.native_requested_room == "room-alpha" else "saved-output-beta", "policy_revision": self.native_revision,
-            "start_volume_percent": 35, "output_volume_percent": self.native_output_volume,
+            "schema": "podconnect.start_volume.v1",
+            "ready": True,
+            "engine_device_id": "spotify-one",
+            "room_id": self.native_requested_room,
+            "homepod_id": "saved-output-alpha"
+            if self.native_requested_room == "room-alpha"
+            else "saved-output-beta",
+            "policy_revision": self.native_revision,
+            "start_volume_percent": 35,
+            "output_volume_percent": self.native_output_volume,
             "output_selected": self.native_output_selected,
             "mode": "fresh_start" if self.no_playback else "same_session",
-            "alias_binding": {"ready": True, "incarnation": "fixture-incarnation", "registry": "fixture-registry", "room_id": self.native_source_room},
+            "alias_binding": {
+                "ready": True,
+                "incarnation": "fixture-incarnation",
+                "registry": "fixture-registry",
+                "room_id": self.native_source_room,
+            },
         }
 
     def track_args(self, uri, max_volume=40):
         return {
-            "track_uri": uri, "max_volume": max_volume, "room_id": self.native_requested_room,
-            "homepod_id": "saved-output-alpha" if self.native_requested_room == "room-alpha" else "saved-output-beta", "start_policy_revision": "b" * 64,
+            "track_uri": uri,
+            "max_volume": max_volume,
+            "room_id": self.native_requested_room,
+            "homepod_id": "saved-output-alpha"
+            if self.native_requested_room == "room-alpha"
+            else "saved-output-beta",
+            "start_policy_revision": "b" * 64,
             "alias_incarnation": "fixture-incarnation",
         }
 
@@ -186,13 +220,27 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             return_response=True,
         )
 
-    async def test_ordinary_media_start_commits_native_volume_before_one_provider_send(self):
+    async def test_ordinary_media_start_commits_native_volume_before_one_provider_send(
+        self,
+    ):
         self.no_playback = True
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
-            guard, native_ready = start_guards(self.hass, "account-alpha", data, "spotify-one")
-            await data.api.play("spotify-one", uris=["spotify:track:" + "A" * 22], execution_guard=guard, async_execution_guard=native_ready)
+        with patch.object(
+            data.speakers,
+            "start_identity",
+            new_callable=AsyncMock,
+            return_value="spotify-one",
+        ):
+            guard, native_ready = start_guards(
+                self.hass, "account-alpha", data, "spotify-one"
+            )
+            await data.api.play(
+                "spotify-one",
+                uris=["spotify:track:" + "A" * 22],
+                execution_guard=guard,
+                async_execution_guard=native_ready,
+            )
         self.assertEqual(self.native_prepares, 1)
         self.assertEqual(self.native_commits, 1)
         self.assertEqual(len(self._writes()), 1)
@@ -203,9 +251,23 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
         self.native_commit_hold = True
-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
-            guard, native_ready = start_guards(self.hass, "account-alpha", data, "spotify-one")
-            action = self._task(data.api.play("spotify-one", uris=["spotify:track:" + "B" * 22], execution_guard=guard, async_execution_guard=native_ready))
+        with patch.object(
+            data.speakers,
+            "start_identity",
+            new_callable=AsyncMock,
+            return_value="spotify-one",
+        ):
+            guard, native_ready = start_guards(
+                self.hass, "account-alpha", data, "spotify-one"
+            )
+            action = self._task(
+                data.api.play(
+                    "spotify-one",
+                    uris=["spotify:track:" + "B" * 22],
+                    execution_guard=guard,
+                    async_execution_guard=native_ready,
+                )
+            )
             await self.native_commit_entered.wait()
             await data.coordinator.async_refresh()
             self.native_commit_release.set()
@@ -222,11 +284,22 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             "media_player", "podconnect", "account-alpha_spotify-one"
         )
         self.assertIsNotNone(entity_id)
-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
-            await self.hass.services.async_call("media_player", "play_media", {
-                "entity_id": entity_id, "media_content_type": "music",
-                "media_content_id": "spotify:track:" + "C" * 22,
-            }, blocking=True)
+        with patch.object(
+            data.speakers,
+            "start_identity",
+            new_callable=AsyncMock,
+            return_value="spotify-one",
+        ):
+            await self.hass.services.async_call(
+                "media_player",
+                "play_media",
+                {
+                    "entity_id": entity_id,
+                    "media_content_type": "music",
+                    "media_content_id": "spotify:track:" + "C" * 22,
+                },
+                blocking=True,
+            )
         self.assertEqual(self.native_prepares, 1)
         self.assertEqual(self.native_commits, 1)
         self.assertEqual(len(self._writes()), 1)
@@ -235,10 +308,20 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.playing = True
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
-            status, _ = await self._service("move_playback", {
-                "config_entry_id": "account-alpha", "kind": "spotify_device", "target_id": "spotify-one",
-            })
+        with patch.object(
+            data.speakers,
+            "start_identity",
+            new_callable=AsyncMock,
+            return_value="spotify-one",
+        ):
+            status, _ = await self._service(
+                "move_playback",
+                {
+                    "config_entry_id": "account-alpha",
+                    "kind": "spotify_device",
+                    "target_id": "spotify-one",
+                },
+            )
         self.assertEqual(status, 200)
         self.assertEqual(self.native_prepares, 1)
         self.assertEqual(self.native_commits, 1)
@@ -247,7 +330,10 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_session_native_output_above_approved_max_refuses_track(self):
         self.native_output_volume = 90
-        request = self.request("play_track", args=self.track_args("spotify:track:" + "D" * 22, max_volume=40))
+        request = self.request(
+            "play_track",
+            args=self.track_args("spotify:track:" + "D" * 22, max_volume=40),
+        )
         result = await self.invoke(request)
         self.assertEqual(result["outcome"], "rejected")
         self.assertEqual(self.native_prepares, 0)
@@ -255,7 +341,10 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_held_native_commit_rechecks_approved_output_max(self):
         self.native_commit_hold = True
-        request = self.request("play_track", args=self.track_args("spotify:track:" + "E" * 22, max_volume=40))
+        request = self.request(
+            "play_track",
+            args=self.track_args("spotify:track:" + "E" * 22, max_volume=40),
+        )
         action = self._task(self.invoke(request))
         await self.native_commit_entered.wait()
         self.native_output_volume = 90
@@ -305,7 +394,11 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result["physical_result_verified"])
             self.assertFalse(result["retry_allowed"])
             self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
-            self.assertEqual((await self.controls())["status"], "awaiting_observation")
+            refreshed = await self.controls()
+            self.assertEqual(refreshed["status"], "ready")
+            self.assertGreater(
+                refreshed["poll_sequence"], result["observe_after_poll_sequence"]
+            )
         self.assertEqual(len(self._writes()), 5)
         self.assertEqual(self.command_queries[-1]["volume_percent"], "42")
 
@@ -331,12 +424,24 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt["target"]["target_id"], "spotify-one")
         self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
         self.assertEqual(json.loads(self._writes()[0][2]), {"uris": [uri]})
-        sequence = [call[1] for call in self.calls if call[1] in (
-            "/api/start-volume", "/api/start-volume/commit", "/spotify/me/player/play"
-        )]
-        self.assertEqual(sequence[-3:], [
-            "/api/start-volume", "/api/start-volume/commit", "/spotify/me/player/play"
-        ])
+        sequence = [
+            call[1]
+            for call in self.calls
+            if call[1]
+            in (
+                "/api/start-volume",
+                "/api/start-volume/commit",
+                "/spotify/me/player/play",
+            )
+        ]
+        self.assertEqual(
+            sequence[-3:],
+            [
+                "/api/start-volume",
+                "/api/start-volume/commit",
+                "/spotify/me/player/play",
+            ],
+        )
         self.assertEqual(self.native_prepares, 1)
         self.assertEqual(self.native_commits, 1)
         self.assertEqual(await self.invoke(request), receipt)
@@ -359,14 +464,20 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error_kind"], "volume_above_approved_limit")
         self.assertEqual(self._writes(), [])
 
-    async def test_selected_track_requires_shared_start_floor_and_fresh_native_revision(self):
+    async def test_selected_track_requires_shared_start_floor_and_fresh_native_revision(
+        self,
+    ):
         uri = "spotify:track:" + "A" * 22
-        floor = await self.invoke(self.request("play_track", args=self.track_args(uri, 34)))
+        floor = await self.invoke(
+            self.request("play_track", args=self.track_args(uri, 34))
+        )
         self.assertEqual(floor["error_kind"], "native_start_policy_changed")
         self.assertEqual(self.native_prepares, 0)
         self.assertEqual(self._writes(), [])
         self.native_revision = "c" * 64
-        changed = await self.invoke(self.request("play_track", args=self.track_args(uri, 40)))
+        changed = await self.invoke(
+            self.request("play_track", args=self.track_args(uri, 40))
+        )
         self.assertEqual(changed["error_kind"], "native_start_policy_changed")
         self.assertEqual(self.native_prepares, 0)
         self.assertEqual(self._writes(), [])
@@ -432,14 +543,25 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.native_output_selected = False
         await self.entries[0].runtime_data.coordinator.async_refresh()
         controls = await self.hass.services.async_call(
-            "podconnect", "get_track_play_controls",
-            {"config_entry_id":"account-alpha", "kind":"spotify_device", "target_id":"spotify-one", "room_id":"room-beta"},
-            blocking=True, return_response=True,
+            "podconnect",
+            "get_track_play_controls",
+            {
+                "config_entry_id": "account-alpha",
+                "kind": "spotify_device",
+                "target_id": "spotify-one",
+                "room_id": "room-beta",
+            },
+            blocking=True,
+            return_response=True,
         )
         self.assertEqual(controls["actions"], ["play_track"])
-        self.assertEqual(controls["native_start"]["alias_binding"]["room_id"], "room-alpha")
+        self.assertEqual(
+            controls["native_start"]["alias_binding"]["room_id"], "room-alpha"
+        )
         uri = "spotify:track:" + "A" * 22
-        result = await self.invoke(self.request("play_track", args=self.track_args(uri)))
+        result = await self.invoke(
+            self.request("play_track", args=self.track_args(uri))
+        )
         self.assertEqual(result["outcome"], "accepted")
         self.assertEqual(self.native_prepares, 1)
         self.assertEqual(self.native_commits, 1)
@@ -466,7 +588,9 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             data["devices"][0].update(original)
         self.assertEqual(self._writes(), [])
 
-    async def test_duplicate_reuse_and_no_second_command_before_new_poll(self):
+    async def test_duplicate_reuse_and_old_poll_are_not_replayed_after_command_refresh(
+        self,
+    ):
         request = self.request()
         accepted = await self.invoke(request)
         self.assertEqual(await self.invoke(request), accepted)
@@ -475,8 +599,14 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             "request_reused",
         )
         self.assertEqual(
-            (await self.invoke(self.request()))["error_kind"],
-            "awaiting_observation",
+            (
+                await self.invoke(
+                    self.request(
+                        expected_poll_sequence=request["expected_poll_sequence"]
+                    )
+                )
+            )["error_kind"],
+            "stale_observation",
         )
         self.assertEqual(len(self._writes()), 1)
         # A consumer cannot mutate the cached command receipt.
@@ -752,40 +882,57 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.invoke(self.request()))["outcome"], "accepted")
         self.assertEqual(len(self._writes()), 2)
 
-    async def test_playlist_context_keeps_native_prepare_commit_and_existing_context_uri(self):
-        uri = 'spotify:playlist:' + 'P' * 22
+    async def test_playlist_context_keeps_native_prepare_commit_and_existing_context_uri(
+        self,
+    ):
+        uri = "spotify:playlist:" + "P" * 22
         args = self.track_args(uri)
-        args['context_uri'] = args.pop('track_uri')
-        controls = await self.hass.services.async_call('podconnect', 'get_context_play_controls',
-            {'config_entry_id': 'account-alpha', 'kind': 'spotify_device',
-             'target_id': 'spotify-one', 'room_id': 'room-alpha'}, blocking=True, return_response=True)
-        self.assertEqual(controls['actions'], ['play_context'])
-        self.assertTrue(controls['context_play_supported'])
-        request = self.request('play_context', args=args)
+        args["context_uri"] = args.pop("track_uri")
+        controls = await self.hass.services.async_call(
+            "podconnect",
+            "get_context_play_controls",
+            {
+                "config_entry_id": "account-alpha",
+                "kind": "spotify_device",
+                "target_id": "spotify-one",
+                "room_id": "room-alpha",
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(controls["actions"], ["play_context"])
+        self.assertTrue(controls["context_play_supported"])
+        request = self.request("play_context", args=args)
         result = await self.invoke(request)
-        self.assertEqual(result['outcome'], 'accepted')
-        self.assertEqual(json.loads(self._writes()[0][2]), {'context_uri': uri})
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(json.loads(self._writes()[0][2]), {"context_uri": uri})
         self.assertEqual((self.native_prepares, self.native_commits), (1, 1))
         self.assertEqual(await self.invoke(request), result)
         self.assertEqual(len(self._writes()), 1)
-        self.assertEqual(self.command_queries[-1]['device_id'], 'spotify-one')
+        self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
 
     async def test_playlist_context_rejects_track_uri_and_stale_native_proof(self):
-        args = self.track_args('spotify:track:' + 'A' * 22)
-        args['context_uri'] = args.pop('track_uri')
-        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
-        args['context_uri'] = 'spotify:playlist:' + 'P' * 22
-        args['start_policy_revision'] = 'c' * 64
-        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
+        args = self.track_args("spotify:track:" + "A" * 22)
+        args["context_uri"] = args.pop("track_uri")
+        self.assertEqual(
+            (await self.invoke(self.request("play_context", args=args)))["outcome"],
+            "rejected",
+        )
+        args["context_uri"] = "spotify:playlist:" + "P" * 22
+        args["start_policy_revision"] = "c" * 64
+        self.assertEqual(
+            (await self.invoke(self.request("play_context", args=args)))["outcome"],
+            "rejected",
+        )
         self.assertEqual(self._writes(), [])
 
     async def test_playlist_context_unknown_native_commit_never_sends_or_retries(self):
         self.native_commit_status = 500
-        args = self.track_args('spotify:playlist:' + 'P' * 22)
-        args['context_uri'] = args.pop('track_uri')
-        request = self.request('play_context', args=args)
+        args = self.track_args("spotify:playlist:" + "P" * 22)
+        args["context_uri"] = args.pop("track_uri")
+        request = self.request("play_context", args=args)
         first = await self.invoke(request)
-        self.assertEqual(first['outcome'], 'rejected')
+        self.assertEqual(first["outcome"], "rejected")
         self.assertEqual(await self.invoke(request), first)
         self.assertEqual(self._writes(), [])
         self.assertEqual(self.native_commits, 1)

@@ -11,9 +11,10 @@ import (
 )
 
 type aliasEntry struct {
-	ID     uint32 `json:"id"`
-	RoomID string `json:"room_id"`
-	Name   string `json:"name"`
+	ID        uint32 `json:"id"`
+	RoomID    string `json:"room_id"`
+	Name      string `json:"name"`
+	HomepodID string `json:"homepod_id,omitempty"`
 }
 
 type aliasBinding struct {
@@ -75,7 +76,7 @@ func aliasEntriesForRooms(rooms []*Room, names []string) ([]aliasEntry, bool) {
 			return nil, false
 		}
 		seen[room.ID] = true
-		entries[i] = aliasEntry{ID: uint32(i + 1), RoomID: room.ID, Name: names[i]}
+		entries[i] = aliasEntry{ID: uint32(i + 1), RoomID: room.ID, Name: names[i], HomepodID: room.HomepodID}
 	}
 	return entries, true
 }

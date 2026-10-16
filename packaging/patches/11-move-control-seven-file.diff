@@ -1,0 +1,1530 @@
+--- a/custom_components/podconnect/room_content.py
++++ b/custom_components/podconnect/room_content.py
+@@ -91,17 +91,32 @@
+     )
+ 
+ 
+-def valid_selected_receipt(value, identity):
++def valid_selected_receipt(
++    value,
++    identity,
++    *,
++    accepted_key="accepted_selected_content",
++    operation_key="start_operation_id",
++    volume_key="start_volume_percent",
++    actions=("play_track", "play_context"),
++    volume_valid=None,
++):
++    if volume_valid is None:
++        volume_valid = lambda volume: type(volume) is int and volume == 35
++    keys = (
++        _RECEIPT_KEYS
++        - {"accepted_selected_content", "start_operation_id", "start_volume_percent"}
++    ) | {accepted_key, operation_key, volume_key}
+     if (
+         not isinstance(value, dict)
+-        or not _RECEIPT_KEYS <= set(value)
+-        or set(value) - _RECEIPT_KEYS - {"error_kind", "observe_after_poll_sequence"}
++        or not keys <= set(value)
++        or set(value) - keys - {"error_kind", "observe_after_poll_sequence"}
+         or not isinstance(identity, dict)
+         or set(identity) != _IDENTITY_KEYS
+         or any(value[k] != identity[k] for k in identity)
+         or value["schema"] != "podconnect.command.v1"
+         or not isinstance(value["action"], str)
+-        or value["action"] not in {"play_track", "play_context"}
++        or value["action"] not in actions
+         or not all(
+             _text(value[k]) for k in ("config_entry_id", "room_id", "homepod_id")
+         )
+@@ -121,18 +136,15 @@
+     ):
+         return False
+     accepted = value["outcome"] == "accepted"
+-    if (
+-        value["ok"] is not accepted
+-        or value["accepted_selected_content"] is not accepted
+-    ):
+-        return False
+-    operation = value["start_operation_id"]
+-    volume = value["start_volume_percent"]
++    if value["ok"] is not accepted or value[accepted_key] is not accepted:
++        return False
++    operation = value[operation_key]
++    volume = value[volume_key]
+     if operation is not None and not _hex(operation, _HEX32):
+         return False
+-    if volume is not None and (type(volume) is not int or volume != 35):
+-        return False
+-    if accepted and (operation is None or volume != 35):
++    if volume is not None and not volume_valid(volume):
++        return False
++    if accepted and (operation is None or not volume_valid(volume)):
+         return False
+     if "observe_after_poll_sequence" in value and (
+         type(value["observe_after_poll_sequence"]) is not int
+@@ -171,13 +183,28 @@
+ STAGED_COMMIT_TTL_S = 5
+ 
+ 
+-def valid_manager_result(value, request, suffix):
++def valid_manager_result(
++    value,
++    request,
++    suffix,
++    *,
++    namespace="room_content",
++    accepted_key="accepted_selected_content",
++    operation_key="start_operation_id",
++    volume_key="start_volume_percent",
++    offer_key="start_offer",
++    expected_volume=35,
++):
++    keys = (
++        _MANAGER_KEYS
++        - {"accepted_selected_content", "start_operation_id", "start_volume_percent"}
++    ) | {accepted_key, operation_key, volume_key}
+     if (
+         not isinstance(value, dict)
+-        or set(value) != _MANAGER_KEYS
+-        or value["schema"] != "podconnect.room_content_" + suffix + ".v1"
+-        or value["offer_id"] != request["start_offer"]["offer_id"]
+-        or value["binding_id"] != request["start_offer"]["binding_id"]
++        or set(value) != keys
++        or value["schema"] != "podconnect." + namespace + "_" + suffix + ".v1"
++        or value["offer_id"] != request[offer_key]["offer_id"]
++        or value["binding_id"] != request[offer_key]["binding_id"]
+         or value["room_id"] != request["room_id"]
+         or value["homepod_id"] != request["homepod_id"]
+         or not isinstance(value["state"], str)
+@@ -186,21 +213,46 @@
+     ):
+         return False
+     complete = value["state"] == "complete"
+-    if (
+-        value["ok"] is not complete
+-        or value["accepted_selected_content"] is not complete
+-    ):
+-        return False
+-    if value["start_operation_id"] not in (None, request["start_offer"]["offer_id"]):
+-        return False
+-    volume = value["start_volume_percent"]
+-    if volume is not None and (type(volume) is not int or volume != 35):
+-        return False
+-    return not complete or (value["start_operation_id"] is not None and volume == 35)
++    if value["ok"] is not complete or value[accepted_key] is not complete:
++        return False
++    if value[operation_key] not in (None, request[offer_key]["offer_id"]):
++        return False
++    volume = value[volume_key]
++    if volume is not None and (type(volume) is not int or volume != expected_volume):
++        return False
++    return not complete or (
++        value[operation_key] is not None and volume == expected_volume
++    )
+ 
+ 
+ class RoomContent:
+     """Staging records use the existing canonical ledger, never another counter."""
++
++    namespace = "room_content"
++    offer_key = "start_offer"
++    accepted_key = "accepted_selected_content"
++    operation_key = "start_operation_id"
++    volume_key = "start_volume_percent"
++    actions = ("play_track", "play_context")
++    staging_timeout = STAGING_TIMEOUT_S
++    valid_offer = staticmethod(valid_start_offer)
++    valid_arguments = staticmethod(valid_selected_arguments)
++
++    def valid_result(self, value, request, suffix):
++        return valid_manager_result(value, request, suffix)
++
++    def expected_volume(self, request):
++        return 35
++
++    def client_method(self, client, purpose):
++        method = (
++            self.namespace + "_state"
++            if purpose == "state"
++            else self.namespace + "_result"
++            if purpose == "result"
++            else purpose + "_" + self.namespace
++        )
++        return getattr(client, method)
+ 
+     def __init__(self, commands):
+         self.commands = commands
+@@ -228,9 +280,9 @@
+             "provider_request_accepted": False,
+             "retry_allowed": False,
+             "physical_result_verified": False,
+-            "accepted_selected_content": outcome == "accepted",
+-            "start_operation_id": None,
+-            "start_volume_percent": None,
++            self.accepted_key: outcome == "accepted",
++            self.operation_key: None,
++            self.volume_key: None,
+         }
+         if outcome != "accepted":
+             result["error_kind"] = error
+@@ -239,9 +291,9 @@
+     def _preparation(self, request, state, *, cancel=False):
+         return {
+             **self._identity(request),
+-            "schema": "podconnect.room_content_preparation_cancel.v1"
++            "schema": "podconnect." + self.namespace + "_preparation_cancel.v1"
+             if cancel
+-            else "podconnect.room_content_preparation.v1",
++            else "podconnect." + self.namespace + "_preparation.v1",
+             "ok": state == ("cancelled" if cancel else "staged"),
+             "state": state,
+             "retry_allowed": False,
+@@ -251,7 +303,7 @@
+     def _fingerprint(self, request):
+         return hashlib.sha256(
+             json.dumps(
+-                {"room_selected_content": request}, sort_keys=True, allow_nan=False
++                {self.namespace: request}, sort_keys=True, allow_nan=False
+             ).encode()
+         ).hexdigest()
+ 
+@@ -259,8 +311,8 @@
+         from .commands import CommandRejected
+ 
+         if (
+-            not valid_start_offer(request["start_offer"])
+-            or not valid_selected_arguments(request["action"], request["args"])
++            not self.valid_offer(request[self.offer_key])
++            or not self.valid_arguments(request["action"], request["args"])
+             or request["owner_epoch"] != self.commands.owner_epoch
+             or request["request_id"]
+             != f"{request['owner_epoch']}:{request['command_sequence']}"
+@@ -317,9 +369,9 @@
+ 
+             try:
+                 async with asyncio.timeout(1):
+-                    await client.cancel_room_content(
+-                        request["start_offer"]["offer_id"],
+-                        request["start_offer"]["binding_id"],
++                    await self.client_method(client, "cancel")(
++                        request[self.offer_key]["offer_id"],
++                        request[self.offer_key]["binding_id"],
+                     )
+             except (SpeakersError, TimeoutError):
+                 return
+@@ -359,7 +411,9 @@
+         from .speakers import SpeakersError
+ 
+         try:
+-            result = await self.commands.data.speakers.room_content_state(scope)
++            result = await self.client_method(self.commands.data.speakers, "state")(
++                scope
++            )
+         except SpeakersError as exc:
+             raise CommandRejected("native_start_unavailable") from exc
+         if self._owner(hass, request) != scope:
+@@ -372,14 +426,14 @@
+         if (
+             not isinstance(result, dict)
+             or set(result)
+-            != {"schema", "ok", "start_offer", "actions", "physical_result_verified"}
+-            or result["schema"] != "podconnect.room_content_state.v1"
++            != {"schema", "ok", self.offer_key, "actions", "physical_result_verified"}
++            or result["schema"] != "podconnect." + self.namespace + "_state.v1"
+             or result["ok"] is not True
+-            or not valid_start_offer(result["start_offer"])
++            or not self.valid_offer(result[self.offer_key])
+             or result["physical_result_verified"] is not False
+             or not isinstance(result["actions"], list)
+             or any(
+-                not isinstance(a, str) or a not in {"play_track", "play_context"}
++                not isinstance(a, str) or a not in self.actions
+                 for a in result["actions"]
+             )
+             or len(result["actions"]) != len(set(result["actions"]))
+@@ -393,7 +447,7 @@
+         )
+         return {
+             "ok": True,
+-            "schema": "podconnect.room_content_controls.v1",
++            "schema": "podconnect." + self.namespace + "_controls.v1",
+             "config_entry_id": entry,
+             "owner_epoch": observed["owner_epoch"],
+             "poll_sequence": observed["poll_sequence"],
+@@ -410,7 +464,7 @@
+             else "awaiting_observation"
+             if capacity
+             else "sequence_exhausted",
+-            "start_offer": copy.deepcopy(result["start_offer"]),
++            self.offer_key: copy.deepcopy(result[self.offer_key]),
+             "physical_result_verified": False,
+         }
+ 
+@@ -430,7 +484,7 @@
+             if old["fingerprint"] != fingerprint:
+                 return self._preparation(request, "rejected")
+             if old["state"] == "staging":
+-                async with asyncio.timeout(STAGING_TIMEOUT_S + 1):
++                async with asyncio.timeout(self.staging_timeout + 1):
+                     await old["done"].wait()
+             return copy.deepcopy(old["preparation"])
+         if (
+@@ -444,7 +498,7 @@
+             scope, _ = self._fresh(hass, request, initial=True)
+         except CommandRejected:
+             return self._preparation(request, "rejected")
+-        self.retire_before(hass, sequence)
++        commands.retire_preparations_before(hass, sequence)
+         # This synchronous reservation does not block later physical intents
+         # while detached metadata/media staging awaits.
+         commands.command_sequence = sequence
+@@ -470,15 +524,17 @@
+         while len(self.records) > MAX_CONTENT_RECORDS:
+             del self.records[next(iter(self.records))]
+         try:
+-            async with asyncio.timeout(STAGING_TIMEOUT_S):
+-                result = await record["client"].prepare_room_content(scope, request)
++            async with asyncio.timeout(self.staging_timeout):
++                result = await self.client_method(record["client"], "prepare")(
++                    scope, request
++                )
+                 while True:
+                     if (
+                         self._owner(hass, request) != scope
+                         or record["state"] != "staging"
+                     ):
+                         raise CommandRejected("owner_replaced")
+-                    if not valid_manager_result(
++                    if not self.valid_result(
+                         result,
+                         request,
+                         "prepare" if not record.get("queried") else "result",
+@@ -494,9 +550,9 @@
+                     await asyncio.sleep(STATUS_INTERVAL_S)
+                     self._owner(hass, request)
+                     record["queried"] = True
+-                    result = await record["client"].room_content_result(
+-                        request["start_offer"]["offer_id"],
+-                        request["start_offer"]["binding_id"],
++                    result = await self.client_method(record["client"], "result")(
++                        request[self.offer_key]["offer_id"],
++                        request[self.offer_key]["binding_id"],
+                     )
+         except asyncio.CancelledError:
+             record["state"] = "cancelled"
+@@ -575,9 +631,9 @@
+             possible_send = True
+             record["possible_send"] = True
+             async with asyncio.timeout(COMMIT_TIMEOUT_S):
+-                result = await record["client"].commit_room_content(
+-                    request["start_offer"]["offer_id"],
+-                    request["start_offer"]["binding_id"],
++                result = await self.client_method(record["client"], "commit")(
++                    request[self.offer_key]["offer_id"],
++                    request[self.offer_key]["binding_id"],
+                 )
+                 queried = False
+                 while True:
+@@ -586,24 +642,22 @@
+                         break
+                     if self._owner(hass, request) != record["scope"]:
+                         raise CommandRejected("owner_replaced")
+-                    if not valid_manager_result(
++                    if not self.valid_result(
+                         result, request, "result" if queried else "commit"
+                     ):
+                         raise SpeakersError("Invalid content completion receipt")
+                     if result["state"] == "complete":
+                         receipt = self._receipt(request, "accepted")
+-                        receipt.update(
+-                            start_operation_id=result["start_operation_id"],
+-                            start_volume_percent=35,
+-                        )
++                        receipt[self.operation_key] = result[self.operation_key]
++                        receipt[self.volume_key] = self.expected_volume(request)
+                         break
+                     if result["state"] != "committing":
+                         raise SpeakersError("Content outcome unknown")
+                     await asyncio.sleep(STATUS_INTERVAL_S)
+                     queried = True
+-                    result = await record["client"].room_content_result(
+-                        request["start_offer"]["offer_id"],
+-                        request["start_offer"]["binding_id"],
++                    result = await self.client_method(record["client"], "result")(
++                        request[self.offer_key]["offer_id"],
++                        request[self.offer_key]["binding_id"],
+                     )
+         except asyncio.CancelledError:
+             receipt = self._receipt(
+@@ -667,7 +721,7 @@
+                 )
+             )
+             or any(
+-                record["request"]["start_offer"][key] != args[key]
++                record["request"][self.offer_key][key] != args[key]
+                 for key in ("offer_id", "binding_id")
+             )
+         ):
+@@ -700,11 +754,11 @@
+             record["preparation"] = self._preparation(request, "cancelled")
+         try:
+             async with asyncio.timeout(2):
+-                reply = await record["client"].cancel_room_content(
++                reply = await self.client_method(record["client"], "cancel")(
+                     args["offer_id"], args["binding_id"]
+                 )
+             definite = (
+-                valid_manager_result(reply, request, "cancel")
++                self.valid_result(reply, request, "cancel")
+                 and reply["state"] == "cancelled"
+                 and not possible
+             )
+--- /dev/null
++++ b/custom_components/podconnect/room_move.py
+@@ -0,0 +1,81 @@
++"""Retained owned-session MOVE through the shared canonical preparation seam."""
++
++from .room_content import (
++    _HEX32,
++    _HEX64,
++    RoomContent,
++    _hex,
++    valid_manager_result,
++    valid_selected_receipt,
++)
++
++
++def valid_move_offer(value):
++    return (
++        isinstance(value, dict)
++        and set(value)
++        == {
++            "schema",
++            "offer_id",
++            "binding_id",
++            "native_incarnation",
++            "policy_revision",
++            "session_volume_percent",
++            "expires_after_ms",
++        }
++        and value["schema"] == "podconnect.room_output_move_offer.v1"
++        and all(_hex(value[k], _HEX32) for k in ("offer_id", "native_incarnation"))
++        and all(_hex(value[k], _HEX64) for k in ("binding_id", "policy_revision"))
++        and type(value["session_volume_percent"]) is int
++        and 0 <= value["session_volume_percent"] <= 100
++        and type(value["expires_after_ms"]) is int
++        and 1 <= value["expires_after_ms"] <= 5000
++    )
++
++
++def valid_move_arguments(action, value):
++    return action == "move_existing_session" and isinstance(value, dict) and not value
++
++
++def valid_move_receipt(value, identity):
++    return valid_selected_receipt(
++        value,
++        identity,
++        accepted_key="accepted_room_move",
++        operation_key="move_operation_id",
++        volume_key="session_volume_percent",
++        actions=("move_existing_session",),
++        volume_valid=lambda volume: type(volume) is int and 0 <= volume <= 100,
++    )
++
++
++def valid_move_result(value, request, suffix):
++    return valid_manager_result(
++        value,
++        request,
++        suffix,
++        namespace="room_move",
++        accepted_key="accepted_room_move",
++        operation_key="move_operation_id",
++        volume_key="session_volume_percent",
++        offer_key="move_offer",
++        expected_volume=request["move_offer"]["session_volume_percent"],
++    )
++
++
++class RoomMove(RoomContent):
++    """Only the purpose/wire differ; highwater and execution owner remain shared."""
++
++    namespace = "room_move"
++    offer_key = "move_offer"
++    accepted_key = "accepted_room_move"
++    operation_key = "move_operation_id"
++    volume_key = "session_volume_percent"
++    actions = ("move_existing_session",)
++    staging_timeout = 8
++    valid_offer = staticmethod(valid_move_offer)
++    valid_arguments = staticmethod(valid_move_arguments)
++    valid_result = staticmethod(valid_move_result)
++
++    def expected_volume(self, request):
++        return request["move_offer"]["session_volume_percent"]
+--- a/custom_components/podconnect/commands.py
++++ b/custom_components/podconnect/commands.py
+@@ -133,10 +133,17 @@
+         from .room_content import RoomContent
+ 
+         self.room_content = RoomContent(self)
++        from .room_move import RoomMove
++
++        self.room_move = RoomMove(self)
+         coordinator = data.coordinator
+         coordinator.command_owner_guard = lambda: self._refresh_owner_current(
+             coordinator.hass, coordinator.config_entry.entry_id
+         )
++
++    def retire_preparations_before(self, hass, sequence):
++        for preparation in (self.room_content, self.room_move):
++            preparation.retire_before(hass, sequence)
+ 
+     def _refresh_owner_current(self, hass, entry_id):
+         try:
+@@ -502,7 +509,7 @@
+ 
+         self.busy = True
+         # Monotonic admission is the permanent replay fence, even after eviction.
+-        self.room_content.retire_before(hass, command_sequence)
++        self.retire_preparations_before(hass, command_sequence)
+         self.command_sequence = command_sequence
+         self.receipts[command_sequence] = (
+             fingerprint,
+@@ -812,6 +819,37 @@
+         data = current(hass, call.data["config_entry_id"])
+         return await data.commands.room_content.cancel(hass, dict(call.data))
+ 
++    async def move_controls(call):
++        entry_id = call.data["config_entry_id"]
++        data = current(hass, entry_id)
++        try:
++            return await data.commands.room_move.read(
++                hass,
++                entry_id,
++                call.data["target_id"],
++                call.data["room_id"],
++                call.data["homepod_id"],
++            )
++        except CommandRejected as exc:
++            return {
++                "ok": False,
++                "error_kind": str(exc),
++                "retry_allowed": False,
++                "physical_result_verified": False,
++            }
++
++    async def move_prepare(call):
++        data = current(hass, call.data["config_entry_id"])
++        return await data.commands.room_move.prepare(hass, dict(call.data))
++
++    async def move_start(call):
++        data = current(hass, call.data["config_entry_id"])
++        return await data.commands.room_move.start(hass, dict(call.data))
++
++    async def move_cancel(call):
++        data = current(hass, call.data["config_entry_id"])
++        return await data.commands.room_move.cancel(hass, dict(call.data))
++
+     async def command(call):
+         data = current(hass, call.data["config_entry_id"])
+         return await data.commands.execute(hass, dict(call.data))
+@@ -859,8 +897,18 @@
+         vol.Required("offer_id"): text,
+         vol.Required("binding_id"): text,
+     }
++    move_command_schema = {
++        **command_schema,
++        **room_identity,
++        vol.Required("action"): vol.In(("move_existing_session",)),
++        vol.Required("move_offer"): dict,
++    }
+     for name, handler, schema in (
+         ("get_playback_controls", controls, identity),
++        ("get_room_move_controls", move_controls, room_identity),
++        ("prepare_room_move_playback", move_prepare, move_command_schema),
++        ("move_room_playback", move_start, move_command_schema),
++        ("cancel_room_move_preparation", move_cancel, content_cancel_schema),
+         ("get_room_content_controls", content_controls, room_identity),
+         ("prepare_room_selected_content", content_prepare, content_command_schema),
+         ("start_room_selected_content", content_start, content_command_schema),
+--- a/custom_components/podconnect/speakers.py
++++ b/custom_components/podconnect/speakers.py
+@@ -310,6 +310,49 @@
+         return await self._request(
+             "POST",
+             "/api/room-content/cancel",
++            {"offer_id": offer_id, "binding_id": binding_id},
++            budget=1,
++        )
++
++    async def room_move_state(self, scope):
++        return await self._request(
++            "GET", "/api/room-move/state?" + urlencode(scope), budget=9
++        )
++
++    async def prepare_room_move(self, scope, request):
++        return await self._request(
++            "POST",
++            "/api/room-move/prepare",
++            {
++                "scope": scope,
++                "move_offer": request["move_offer"],
++                "action": request["action"],
++                "args": request["args"],
++            },
++            budget=9,
++        )
++
++    async def room_move_result(self, offer_id, binding_id):
++        return await self._request(
++            "GET",
++            "/api/room-move/result?"
++            + urlencode({"offer_id": offer_id, "binding_id": binding_id}),
++            budget=17,
++        )
++
++    async def commit_room_move(self, offer_id, binding_id):
++        return await self._request(
++            "POST",
++            "/api/room-move/commit",
++            {"offer_id": offer_id, "binding_id": binding_id},
++            # Outer retained-session commit owns the16s bound; aiohttp total is16s.
++            budget=17,
++        )
++
++    async def cancel_room_move(self, offer_id, binding_id):
++        return await self._request(
++            "POST",
++            "/api/room-move/cancel",
+             {"offer_id": offer_id, "binding_id": binding_id},
+             budget=1,
+         )
+--- a/custom_components/podconnect/services.yaml
++++ b/custom_components/podconnect/services.yaml
+@@ -726,3 +726,188 @@
+       required: true
+       selector:
+         text:
++
++get_room_move_controls:
++  name: Read exact owned destination content-start controls
++  description: Read a native-owned retained-session MOVE descriptor for default or explicitly selected current owned room. No active WebAPI device/volume is required; this read never starts content.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++
++prepare_room_move_playback:
++  name: Prepare retained session without playback effects
++  description: Reserve the canonical request and stage source only. Returns a distinct preparation receipt; the task owner must recheck its grant before sending the identical request to move_room_playback.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++    move_offer:
++      required: true
++      selector:
++        object:
++    owner_epoch:
++      required: true
++      selector:
++        text:
++    expected_poll_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    command_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    request_id:
++      required: true
++      selector:
++        text:
++    action:
++      required: true
++      selector:
++        select:
++          options: [move_existing_session]
++    args:
++      description: Exactly an empty object. The native owner retains the source/session and its actual old manual volume.
++      required: true
++      selector:
++        object:
++
++move_room_playback:
++  name: Commit prepared retained session to exact owned room
++  description: Commit only the identical staged canonical request after the trusted task owner checks its grant. Complete native movement preserves the owned source, queue, timeline, paused flag and manual volume; never physical proof.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++    move_offer:
++      required: true
++      selector:
++        object:
++    owner_epoch:
++      required: true
++      selector:
++        text:
++    expected_poll_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    command_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    request_id:
++      required: true
++      selector:
++        text:
++    action:
++      required: true
++      selector:
++        select:
++          options: [move_existing_session]
++    args:
++      description: Exactly an empty object. The native owner retains the source/session and its actual old manual volume.
++      required: true
++      selector:
++        object:
++
++cancel_room_move_preparation:
++  name: Cancel exact retained-session MOVE preparation
++  description: Veto only this reserved operation. Cannot change destination, refund its sequence or release uncertain physical fences.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        text:
++    owner_epoch:
++      required: true
++      selector:
++        text:
++    command_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    request_id:
++      required: true
++      selector:
++        text:
++    offer_id:
++      required: true
++      selector:
++        text:
++    binding_id:
++      required: true
++      selector:
++        text:
+--- /dev/null
++++ b/tests/ha_framework/test_room_move.py
+@@ -0,0 +1,581 @@
++"""Actual HA public split services; native/manager effects are inert HTTP fixtures."""
++
++import asyncio
++import copy
++import unittest
++
++import voluptuous as vol
++from aiohttp import web
++from test_room_content import RoomContentFrameworkTests
++
++from custom_components.podconnect.room_move import valid_move_receipt
++
++
++class RoomMoveFrameworkTests(RoomContentFrameworkTests):
++    async def asyncSetUp(self):
++        self.move_posts = []
++        self.move_hold = False
++        self.move_entered = asyncio.Event()
++        self.move_release = asyncio.Event()
++        self.move_commit_hold = False
++        self.move_commit_entered = asyncio.Event()
++        self.move_commit_release = asyncio.Event()
++        self.move_prepare_status = 200
++        self.move_commit_status = 200
++        self.move_commit_corrupt = None
++        self.move_offer_id = "a" * 32
++        self.move_target = "native-owned-engine"
++        await super().asyncSetUp()
++        self.holds.extend((self.move_release, self.move_commit_release))
++        self.move_commands = self.entries[0].runtime_data.commands
++
++    def move_offer_value(self):
++        return {
++            "schema": "podconnect.room_output_move_offer.v1",
++            "offer_id": self.move_offer_id,
++            "binding_id": "b" * 64,
++            "native_incarnation": "c" * 32,
++            "policy_revision": "d" * 64,
++            "session_volume_percent": 27,
++            "expires_after_ms": 5000,
++        }
++
++    def move_result(self, suffix, state):
++        complete = state == "complete"
++        return {
++            "schema": "podconnect.room_move_" + suffix + ".v1",
++            "ok": complete,
++            "offer_id": self.move_offer_id,
++            "binding_id": "b" * 64,
++            "state": state,
++            "accepted_room_move": complete,
++            "move_operation_id": self.move_offer_id,
++            "session_volume_percent": 27,
++            "room_id": "room-beta",
++            "homepod_id": "456",
++            "physical_result_verified": False,
++        }
++
++    async def _backend(self, request):
++        if request.path == "/api/room-move/state":
++            if request.query.get("target_id") != self.move_target:
++                return web.Response(status=409)
++            return web.json_response(
++                {
++                    "schema": "podconnect.room_move_state.v1",
++                    "ok": True,
++                    "move_offer": self.move_offer_value(),
++                    "actions": ["move_existing_session"],
++                    "physical_result_verified": False,
++                }
++            )
++        if request.path == "/api/room-move/result":
++            return web.json_response(self.move_result("result", "staged"))
++        if request.path.startswith("/api/room-move/"):
++            body = await request.json()
++            self.move_posts.append((request.path, copy.deepcopy(body)))
++            if request.path.endswith("prepare"):
++                self.move_entered.set()
++                if self.move_hold:
++                    await self.move_release.wait()
++                if self.move_prepare_status != 200:
++                    return web.Response(status=self.move_prepare_status)
++                return web.json_response(self.move_result("prepare", "staged"))
++            if request.path.endswith("cancel"):
++                return web.json_response(self.move_result("cancel", "cancelled"))
++            self.move_commit_entered.set()
++            if self.move_commit_hold:
++                await self.move_commit_release.wait()
++            if self.move_commit_status != 200:
++                return web.Response(status=self.move_commit_status)
++            result = self.move_result("commit", "complete")
++            if self.move_commit_corrupt:
++                self.move_commit_corrupt(result)
++            return web.json_response(result)
++        return await super()._backend(request)
++
++    def move_request(self, **overrides):
++        return {
++            **self.request("next"),
++            "action": "move_existing_session",
++            "target_id": self.move_target,
++            "room_id": "room-beta",
++            "homepod_id": "456",
++            "args": {},
++            "move_offer": self.move_offer_value(),
++            **overrides,
++        }
++
++    async def move_invoke(self, service, request):
++        return await self.hass.services.async_call(
++            "podconnect", service, request, blocking=True, return_response=True
++        )
++
++    def prepares(self):
++        return [body for path, body in self.move_posts if path.endswith("prepare")]
++
++    def move_commits(self):
++        return [body for path, body in self.move_posts if path.endswith("commit")]
++
++    def cancel_args(self, request):
++        return {
++            **{
++                k: request[k]
++                for k in (
++                    "config_entry_id",
++                    "owner_epoch",
++                    "command_sequence",
++                    "request_id",
++                )
++            },
++            "offer_id": request["move_offer"]["offer_id"],
++            "binding_id": request["move_offer"]["binding_id"],
++        }
++
++    async def move_cleanup(self):
++        tasks = list(self.move_commands.room_move.cleanups)
++        if tasks:
++            await asyncio.wait_for(asyncio.gather(*tasks), 2)
++
++    async def test_move_read_exact_native_owner_without_webapi_volume_flag(
++        self,
++    ):
++        data = self.entries[0].runtime_data
++        data.coordinator.data["devices"] = []
++        value = await self.move_invoke(
++            "get_room_move_controls",
++            {
++                "config_entry_id": "account-alpha",
++                "kind": "spotify_device",
++                "target_id": self.move_target,
++                "room_id": "room-beta",
++                "homepod_id": "456",
++            },
++        )
++        self.assertEqual(len(value), 14)
++        self.assertEqual(
++            value["target"],
++            {"kind": "spotify_device", "target_id": self.move_target},
++        )
++        self.assertEqual(value["actions"], ["move_existing_session"])
++        self.assertNotIn("volume_percent", value)
++        self.assertNotIn("session_id", value)
++        self.assertEqual(self.move_posts, [])
++        response = await self.client.get("/api/services")
++        services = next(
++            row["services"]
++            for row in await response.json()
++            if row["domain"] == "podconnect"
++        )
++        for service in ("prepare_room_move_playback", "move_room_playback"):
++            self.assertEqual(services[service]["response"], {"optional": False})
++            self.assertEqual(set(services[service]["fields"]), set(self.move_request()))
++        self.assertEqual(
++            set(services["cancel_room_move_preparation"]["fields"]),
++            set(self.cancel_args(self.move_request())),
++        )
++
++    async def test_move_stage_returns_to_caller_before_explicit_same_request_start(
++        self,
++    ):
++        request = self.move_request()
++        staged = await self.move_invoke("prepare_room_move_playback", request)
++        self.assertEqual(len(staged), 13)
++        self.assertEqual(staged["schema"], "podconnect.room_move_preparation.v1")
++        self.assertEqual(staged["state"], "staged")
++        self.assertEqual(self.move_commits(), [])
++        # Actual trusted PV grant validation is a separate composed integration.
++        result = await self.move_invoke("move_room_playback", request)
++        identity = {
++            k: result[k]
++            for k in (
++                "config_entry_id",
++                "owner_epoch",
++                "request_id",
++                "command_sequence",
++                "action",
++                "target",
++                "room_id",
++                "homepod_id",
++            )
++        }
++        self.assertTrue(valid_move_receipt(result, identity))
++        self.assertTrue(result["accepted_room_move"])
++        self.assertFalse(result["provider_request_accepted"])
++        self.assertEqual(result["session_volume_percent"], 27)
++        self.assertEqual(await self.move_invoke("move_room_playback", request), result)
++        self.assertEqual(
++            await self.move_invoke("prepare_room_move_playback", request), staged
++        )
++        self.assertEqual(len(self.prepares()), 1)
++        self.assertEqual(
++            self.move_commits(), [{"offer_id": "a" * 32, "binding_id": "b" * 64}]
++        )
++        self.assertEqual(self.prepares()[0]["args"], request["args"])
++        self.assertEqual(self._writes(), [])
++        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
++
++    async def test_move_unprepared_changed_or_invalid_request_never_starts(self):
++        request = self.move_request()
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["error_kind"],
++            "content_not_prepared",
++        )
++        for percent in (True, 34, 35.0, float("nan"), 101):
++            bad = {
++                **request,
++                "args": {
++                    "track_uri": "spotify:track:" + "A" * 22,
++                    "max_volume": percent,
++                },
++            }
++            self.assertFalse(
++                (await self.move_invoke("prepare_room_move_playback", bad))["ok"]
++            )
++        with self.assertRaises(vol.Invalid):
++            await self.move_invoke(
++                "prepare_room_move_playback", {**request, "extra": True}
++            )
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        changed = {**request, "room_id": "another-owned-destination"}
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", changed))["error_kind"],
++            "request_reused",
++        )
++        self.assertEqual(self.move_commits(), [])
++
++    async def test_move_delayed_stage_allows_genuine_advancing_poll_same_captured_owner(
++        self,
++    ):
++        request = self.move_request()
++        self.move_hold = True
++        task = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        data = self.entries[0].runtime_data
++        await data.coordinator.async_refresh()
++        self.assertGreater(
++            data.coordinator.data["poll_sequence"], request["expected_poll_sequence"]
++        )
++        self.assertEqual(self.move_commits(), [])
++        self.move_release.set()
++        self.assertTrue((await task)["ok"])
++        result = await self.move_invoke("move_room_playback", request)
++        self.assertEqual(result["outcome"], "accepted")
++        self.assertEqual(len(self.move_commits()), 1)
++
++    async def test_move_higher_intent_during_held_stage_is_not_blocked_and_retires_old(
++        self,
++    ):
++        request = self.move_request()
++        self.move_hold = True
++        task = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        self.assertFalse(self.entries[0].runtime_data.commands.busy)
++        higher = await self.invoke(self.request("next"))
++        self.assertEqual(higher["outcome"], "accepted")
++        self.move_release.set()
++        self.assertFalse((await task)["ok"])
++        rejected = await self.move_invoke("move_room_playback", request)
++        self.assertEqual(rejected["outcome"], "rejected")
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_concurrent_duplicate_prepares_coalesce_without_published_unknown(
++        self,
++    ):
++        request = self.move_request()
++        self.move_hold = True
++        first = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        second = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.sleep(0)
++        self.assertFalse(second.done())
++        self.move_release.set()
++        self.assertEqual(await first, await second)
++        self.assertEqual(len(self.prepares()), 1)
++        self.assertEqual(self.move_commits(), [])
++
++    async def test_move_replaced_owner_while_staging_denies_physical_commit(self):
++        request = self.move_request()
++        self.move_hold = True
++        task = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        self.entries[0].runtime_data.coordinator.owner_epoch = "replacement"
++        self.move_release.set()
++        self.assertFalse((await task)["ok"])
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["outcome"],
++            "rejected",
++        )
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_revoked_task_cancels_after_stage_before_start(self):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        cancelled = await self.move_invoke(
++            "cancel_room_move_preparation", self.cancel_args(request)
++        )
++        self.assertTrue(cancelled["ok"])
++        self.assertEqual(cancelled["state"], "cancelled")
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["outcome"],
++            "rejected",
++        )
++        self.assertEqual(self.move_commits(), [])
++
++    async def test_move_prepare_unknown_cannot_be_upgraded_by_late_staging(self):
++        self.move_prepare_status = 502
++        request = self.move_request()
++        unknown = await self.move_invoke("prepare_room_move_playback", request)
++        self.assertEqual(unknown["state"], "unknown")
++        self.move_prepare_status = 200
++        self.assertEqual(
++            await self.move_invoke("prepare_room_move_playback", request), unknown
++        )
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["outcome"],
++            "rejected",
++        )
++        self.assertEqual(len(self.prepares()), 1)
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_cancelled_prepare_never_auto_commits_on_late_response(self):
++        request = self.move_request()
++        self.move_hold = True
++        task = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        task.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        self.move_release.set()
++        replay = await self.move_invoke("prepare_room_move_playback", request)
++        self.assertFalse(replay["ok"])
++        self.assertEqual(replay["state"], "cancelled")
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_missing_or_intermediate_ack_is_consumed_unknown_never_complete(
++        self,
++    ):
++        for index, corrupt in enumerate(
++            (
++                lambda v: v.update(state="staged", ok=False, accepted_room_move=False),
++                lambda v: v.update(accepted_room_move=False),
++                lambda v: v.update(move_operation_id=None),
++                lambda v: v.update(room_id="wrong"),
++                lambda v: v.update(physical_result_verified=True),
++            )
++        ):
++            self.move_offer_id = f"{index + 1:032x}"
++            self.move_commit_corrupt = corrupt
++            request = self.move_request()
++            self.assertTrue(
++                (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++            )
++            result = await self.move_invoke("move_room_playback", request)
++            self.assertEqual(result["outcome"], "unknown")
++            self.assertFalse(result["accepted_room_move"])
++            self.assertEqual(
++                await self.move_invoke("move_room_playback", request),
++                result,
++            )
++            await self.move_cleanup()
++        self.assertEqual(len(self.move_commits()), 5)
++        self.assertEqual(self._writes(), [])
++
++    async def test_move_cancel_after_dispatch_seals_unknown_even_when_late_ack_completes(
++        self,
++    ):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        self.move_commit_hold = True
++        task = self._task(self.move_invoke("move_room_playback", request))
++        await asyncio.wait_for(self.move_commit_entered.wait(), 2)
++        task.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        result = await self.move_invoke("move_room_playback", request)
++        self.assertEqual(result["outcome"], "unknown")
++        self.move_commit_release.set()
++        self.assertEqual(await self.move_invoke("move_room_playback", request), result)
++        self.assertEqual(len(self.move_commits()), 1)
++        await self.move_cleanup()
++
++    async def test_move_concurrent_same_commit_waits_for_original_receipt_without_replay(
++        self,
++    ):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        self.move_commit_hold = True
++        first = self._task(self.move_invoke("move_room_playback", request))
++        await asyncio.wait_for(self.move_commit_entered.wait(), 2)
++        second = self._task(self.move_invoke("move_room_playback", request))
++        await asyncio.sleep(0)
++        self.assertFalse(second.done())
++        self.move_commit_release.set()
++        self.assertEqual(await first, await second)
++        self.assertEqual(len(self.move_commits()), 1)
++
++    async def test_move_explicit_cancel_during_commit_seals_identical_unknown(self):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        self.move_commit_hold = True
++        task = self._task(self.move_invoke("move_room_playback", request))
++        await asyncio.wait_for(self.move_commit_entered.wait(), 2)
++        cancelled = await self.move_invoke(
++            "cancel_room_move_preparation", self.cancel_args(request)
++        )
++        self.assertEqual(cancelled["state"], "unknown")
++        first_unknown = await self.move_invoke("move_room_playback", request)
++        self.assertEqual(first_unknown["outcome"], "unknown")
++        self.move_commit_release.set()
++        self.assertEqual(await task, first_unknown)
++        self.assertEqual(
++            await self.move_invoke("move_room_playback", request),
++            first_unknown,
++        )
++        self.assertEqual(len(self.move_commits()), 1)
++
++    async def test_move_cancel_does_not_rewrite_published_preparation_unknown(self):
++        self.move_prepare_status = 502
++        request = self.move_request()
++        original = await self.move_invoke("prepare_room_move_playback", request)
++        self.assertEqual(original["state"], "unknown")
++        await self.move_invoke(
++            "cancel_room_move_preparation", self.cancel_args(request)
++        )
++        self.assertEqual(
++            await self.move_invoke("prepare_room_move_playback", request),
++            original,
++        )
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_transport_does_not_apply_short_legacy_timeout_to_commit(
++        self,
++    ):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        self.move_commit_hold = True
++        task = self._task(self.move_invoke("move_room_playback", request))
++        await asyncio.wait_for(self.move_commit_entered.wait(), 2)
++        await asyncio.sleep(2.1)
++        self.assertFalse(task.done())
++        self.move_commit_release.set()
++        self.assertEqual((await task)["outcome"], "accepted")
++        self.assertEqual(len(self.move_commits()), 1)
++
++    async def test_move_transport_preserves_stage_budget_for_held_initial_reply(
++        self,
++    ):
++        request = self.move_request()
++        self.move_hold = True
++        task = self._task(self.move_invoke("prepare_room_move_playback", request))
++        await asyncio.wait_for(self.move_entered.wait(), 2)
++        await asyncio.sleep(1.1)
++        self.assertFalse(task.done())
++        self.assertFalse(self.move_commands.busy)
++        self.move_release.set()
++        self.assertEqual((await task)["state"], "staged")
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++    async def test_move_complete_requires_bound_old_manual_base_not_target_or_fresh_policy(
++        self,
++    ):
++        for index, wrong in enumerate((60, 35)):
++            self.move_offer_id = f"{index + 100:032x}"
++            self.move_commit_corrupt = lambda result, percent=wrong: result.update(
++                session_volume_percent=percent
++            )
++            request = self.move_request()
++            self.assertTrue(
++                (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++            )
++            result = await self.move_invoke("move_room_playback", request)
++            self.assertEqual(result["outcome"], "unknown")
++            self.assertFalse(result["accepted_room_move"])
++            self.assertIsNone(result["session_volume_percent"])
++            self.assertEqual(
++                await self.move_invoke("move_room_playback", request), result
++            )
++            await self.move_cleanup()
++        self.assertEqual(len(self.move_commits()), 2)
++        self.assertEqual(self._writes(), [])
++
++    async def test_move_and_selected_content_share_one_canonical_highwater_and_retirement(
++        self,
++    ):
++        move = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", move))["ok"]
++        )
++        content = self.content_request()
++        self.assertEqual(content["command_sequence"], move["command_sequence"] + 1)
++        self.assertTrue(
++            (await self.content_invoke("prepare_room_selected_content", content))["ok"]
++        )
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", move))["outcome"], "rejected"
++        )
++        newer_move = self.move_request()
++        self.assertEqual(
++            newer_move["command_sequence"], content["command_sequence"] + 1
++        )
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", newer_move))["ok"]
++        )
++        self.assertEqual(
++            (await self.content_invoke("start_room_selected_content", content))[
++                "outcome"
++            ],
++            "rejected",
++        )
++        self.assertEqual(self.move_commits(), [])
++        self.assertEqual(self.content_commits(), [])
++        self.assertEqual(
++            self.move_commands.command_sequence, newer_move["command_sequence"]
++        )
++        await self.move_cleanup()
++        await self.content_cleanup()
++
++    async def test_move_expired_staged_record_and_evicted_receipt_never_replay(self):
++        request = self.move_request()
++        self.assertTrue(
++            (await self.move_invoke("prepare_room_move_playback", request))["ok"]
++        )
++        record = self.move_commands.room_move.records[request["command_sequence"]]
++        record["staged_at"] -= 6
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["error_kind"],
++            "content_expired",
++        )
++        self.move_commands.receipts.clear()
++        self.assertEqual(
++            (await self.move_invoke("move_room_playback", request))["error_kind"],
++            "stale_command",
++        )
++        self.assertEqual(self.move_commits(), [])
++        await self.move_cleanup()
++
++
++def load_tests(loader, tests, pattern):
++    return unittest.TestSuite(
++        RoomMoveFrameworkTests(name)
++        for name in loader.getTestCaseNames(RoomMoveFrameworkTests)
++        if name.startswith("test_move_")
++    )
+--- /dev/null
++++ b/tests/test_room_move_contract.py
+@@ -0,0 +1,148 @@
++"""Closed MOVE schema validation from shipped sources, without HA or effects."""
++
++import copy
++import importlib
++import sys
++import types
++import unittest
++from pathlib import Path
++
++package = types.ModuleType("podconnect_move_contract")
++package.__path__ = [str(Path(__file__).parents[1] / "custom_components/podconnect")]
++sys.modules[package.__name__] = package
++contract = importlib.import_module(package.__name__ + ".room_move")
++
++
++class MoveContractTests(unittest.TestCase):
++    def offer(self):
++        return {
++            "schema": "podconnect.room_output_move_offer.v1",
++            "offer_id": "a" * 32,
++            "binding_id": "b" * 64,
++            "native_incarnation": "c" * 32,
++            "policy_revision": "d" * 64,
++            "session_volume_percent": 27,
++            "expires_after_ms": 5000,
++        }
++
++    def test_offer_is_closed_with_actual_server_percent_and_no_caller_args(self):
++        for percent in (0, 27, 100):
++            self.assertTrue(
++                contract.valid_move_offer(
++                    {**self.offer(), "session_volume_percent": percent}
++                )
++            )
++        for key, value in (
++            ("session_volume_percent", True),
++            ("session_volume_percent", 27.0),
++            ("session_volume_percent", 101),
++            ("expires_after_ms", 0),
++            ("expires_after_ms", 5001),
++            ("offer_id", "A" * 32),
++        ):
++            self.assertFalse(contract.valid_move_offer({**self.offer(), key: value}))
++        self.assertFalse(
++            contract.valid_move_offer({**self.offer(), "session_id": "caller"})
++        )
++        self.assertTrue(contract.valid_move_arguments("move_existing_session", {}))
++        for args in (
++            {"volume_percent": 27},
++            {"max_volume": 35},
++            {"context_uri": "new-source"},
++            None,
++        ):
++            self.assertFalse(
++                contract.valid_move_arguments("move_existing_session", args)
++            )
++        self.assertFalse(contract.valid_move_arguments("play_context", {}))
++
++    def test_complete_requires_exact_offer_percent_and_only_joined_complete_flag(self):
++        request = {
++            "move_offer": self.offer(),
++            "room_id": "chosen-room",
++            "homepod_id": "456",
++        }
++        result = {
++            "schema": "podconnect.room_move_commit.v1",
++            "ok": True,
++            "offer_id": "a" * 32,
++            "binding_id": "b" * 64,
++            "state": "complete",
++            "accepted_room_move": True,
++            "move_operation_id": "a" * 32,
++            "session_volume_percent": 27,
++            "room_id": "chosen-room",
++            "homepod_id": "456",
++            "physical_result_verified": False,
++        }
++        self.assertTrue(contract.valid_move_result(result, request, "commit"))
++        for key, value in (
++            ("session_volume_percent", 35),
++            ("session_volume_percent", 60),
++            ("session_volume_percent", True),
++            ("move_operation_id", "f" * 32),
++            ("accepted_room_move", False),
++            ("room_id", "default-kitchen"),
++            ("physical_result_verified", True),
++        ):
++            self.assertFalse(
++                contract.valid_move_result({**result, key: value}, request, "commit")
++            )
++        self.assertFalse(
++            contract.valid_move_result(
++                {**result, "accepted_native": True}, request, "commit"
++            )
++        )
++        unknown = {
++            **result,
++            "state": "unknown",
++            "ok": False,
++            "accepted_room_move": False,
++            "move_operation_id": None,
++            "session_volume_percent": None,
++        }
++        self.assertTrue(contract.valid_move_result(unknown, request, "commit"))
++        self.assertFalse(
++            contract.valid_move_result({**unknown, "ok": True}, request, "commit")
++        )
++
++    def test_public_complete_uses_same_canonical_shape_without_start_authority(self):
++        identity = {
++            "config_entry_id": "account",
++            "owner_epoch": "owner",
++            "request_id": "owner:1",
++            "command_sequence": 1,
++            "action": "move_existing_session",
++            "target": {"kind": "spotify_device", "target_id": "same-native-engine"},
++            "room_id": "chosen-room",
++            "homepod_id": "456",
++        }
++        receipt = {
++            **copy.deepcopy(identity),
++            "schema": "podconnect.command.v1",
++            "ok": True,
++            "outcome": "accepted",
++            "provider_request_accepted": False,
++            "retry_allowed": False,
++            "physical_result_verified": False,
++            "accepted_room_move": True,
++            "move_operation_id": "a" * 32,
++            "session_volume_percent": 27,
++        }
++        self.assertTrue(contract.valid_move_receipt(receipt, identity))
++        for key, value in (
++            ("accepted_room_move", False),
++            ("session_volume_percent", None),
++            ("move_operation_id", None),
++            ("provider_request_accepted", True),
++            ("retry_allowed", True),
++            ("physical_result_verified", True),
++        ):
++            self.assertFalse(
++                contract.valid_move_receipt({**receipt, key: value}, identity)
++            )
++        self.assertFalse(
++            contract.valid_move_receipt(
++                {**receipt, "accepted_selected_content": True}, identity
++            )
++        )

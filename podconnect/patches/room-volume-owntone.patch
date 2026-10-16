@@ -1,0 +1,1173 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 9727f25..ddc1a10 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -179,6 +179,7 @@ outputs_attention_owner_LDADD = $(owntone_LDADD) -lm
+ evrtsp_guarded_owner_contract_SOURCES = ../tests/evrtsp_guarded_owner_contract.c evrtsp/rtsp.c
+ evrtsp_guarded_owner_contract_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir)/evrtsp
+ evrtsp_guarded_owner_contract_LDADD = $(owntone_LDADD)
++evrtsp_guarded_owner_contract_LDFLAGS = -Wl,--wrap=evbuffer_write
+ EXTRA_DIST += ../tests/evrtsp_owner_contract.c
+ 
+ # Complete actual AirPlay/outputs/RTSP TUs are included by this owner fixture.
+@@ -247,3 +248,5 @@ airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
+ airplay_callback_owner_LDFLAGS = -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
+ EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
+ airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
++
++EXTRA_DIST += outputs_room_volume.inc.c httpd_jsonapi_room_volume.inc.c outputs/airplay_room_volume.inc.c
+diff --git a/src/evrtsp/evrtsp.h b/src/evrtsp/evrtsp.h
+index 6e5bcc4..a5f0866 100644
+--- a/src/evrtsp/evrtsp.h
++++ b/src/evrtsp/evrtsp.h
+@@ -112,6 +112,9 @@ struct {
+ 	 * Ordinary requests leave this NULL. The predicate must be read-only. */
+ 	int (*dispatch_current)(void *);
+ 	void *dispatch_current_arg;
++	/* Opt-in final socket mutator guard, including partial continuations. */
++	int (*write_current)(void *);
++	void *write_current_arg;
+ };
+ 
+ /**
+diff --git a/src/evrtsp/rtsp.c b/src/evrtsp/rtsp.c
+index 0032885..a815d84 100644
+--- a/src/evrtsp/rtsp.c
++++ b/src/evrtsp/rtsp.c
+@@ -463,6 +463,16 @@ evrtsp_write(int fd, short what, void *arg)
+ 		return;
+ 	}
+ 
++	/* The immutable room-volume request rechecks deadline/cancellation/owner
++	 * after every EV_WRITE delay and before every partial continuation. Legacy
++	 * requests do not install this hook and retain their original contract. */
++	{
++		struct evrtsp_request *req=TAILQ_FIRST(&evcon->requests);
++		if (req && req->write_current && !req->write_current(req->write_current_arg)) {
++			evrtsp_connection_fail(evcon,EVCON_RTSP_EOF);
++			return;
++		}
++	}
+ 	n = evbuffer_write(evcon->output_raw, fd);
+ 	if (n == -1) {
+ 		event_warn("%s: evbuffer_write", __func__);
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index 5117a50..ec6cdaf 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1870,6 +1870,22 @@ transport_json_string(json_object *body, const char *key, char *destination, siz
+   return true;
+ }
+ 
++/* Sum all nested object keys to detect duplicate-key collapse in the strict
++ * canonical identifier protocol. Arrays have no place in mutation bodies. */
++static size_t transport_json_key_count(json_object *object,unsigned depth)
++{
++  size_t count=0;
++  if (depth>4 || json_object_is_type(object,json_type_array)) return SIZE_MAX;
++  if (!json_object_is_type(object,json_type_object)) return 0;
++  json_object_object_foreach(object,key,value) {
++    size_t nested=transport_json_key_count(value,depth+1);
++    (void)key;
++    if (nested==SIZE_MAX || count>SIZE_MAX-nested-1) return SIZE_MAX;
++    count+=nested+1;
++  }
++  return count;
++}
++
+ /* This flat wire protocol has only canonical ASCII identifier/action strings
+  * and an optional integer. Escapes have no valid purpose. Counting unquoted
+  * colons against parsed keys rejects json-c's duplicate-key collapse without
+@@ -1896,7 +1912,7 @@ transport_parse_body(struct evbuffer *buffer)
+   body=json_tokener_parse_ex(tokener,(const char *)text,length);
+   end=json_tokener_get_parse_end(tokener);
+   if (json_tokener_get_error(tokener)!=json_tokener_success || !body
+-      || !json_object_is_type(body,json_type_object) || colons!=json_object_object_length(body))
++      || !json_object_is_type(body,json_type_object) || colons!=transport_json_key_count(body,0))
+     { if (body) json_object_put(body); body=NULL; }
+   for (i=end;body && i<length;i++)
+     if (text[i]!=' ' && text[i]!='\t' && text[i]!='\r' && text[i]!='\n')
+@@ -1969,6 +1985,8 @@ jsonapi_reply_transport_result(struct httpd_request *hreq)
+   return transport_json_reply(hreq,reply);
+ }
+ 
++#include "httpd_jsonapi_room_volume.inc.c"
++
+ static int
+ jsonapi_reply_output_attention_put(struct httpd_request *hreq)
+ {
+@@ -5099,6 +5117,9 @@ static struct httpd_uri_map adm_handlers[] =
+     { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/state$", jsonapi_reply_room_volume_state },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/(prepare|commit|cancel)$", jsonapi_reply_room_volume_write },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/result/[a-f0-9]+$", jsonapi_reply_room_volume_result },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/state$", jsonapi_reply_transport_state },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/prepare$", jsonapi_reply_transport_write },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/commit$", jsonapi_reply_transport_write },
+diff --git a/src/httpd_jsonapi_room_volume.inc.c b/src/httpd_jsonapi_room_volume.inc.c
+new file mode 100644
+index 0000000..b75ba5d
+--- /dev/null
++++ b/src/httpd_jsonapi_room_volume.inc.c
+@@ -0,0 +1,128 @@
++static json_object *room_volume_state_json(const struct output_room_volume_state *s)
++{
++  json_object *o=json_object_new_object();
++  attention_json_u64(o,"base_revision",s->base_revision); attention_json_u64(o,"attention_revision",s->attention_revision);
++  json_object_object_add(o,"base_percent",json_object_new_int(s->base_percent));
++  json_object_object_add(o,"effective_percent",json_object_new_int(s->effective_percent)); return o;
++}
++static int room_volume_parse_counter(json_object *o,const char *key,uint64_t *out)
++{
++  char canonical[32]; const char *value;
++  if (attention_parse_u64(o,key,out)<0) return -1;
++  value=jparse_str_from_obj(o,key); snprintf(canonical,sizeof(canonical),"%" PRIu64,*out);
++  return strcmp(value,canonical) ? -1 : 0;
++}
++static int room_volume_parse_identity(json_object *o,struct output_transport_identity *id)
++{
++  if (!o || !json_object_is_type(o,json_type_object) || json_object_object_length(o)!=9
++      || !transport_json_string(o,"process",id->process,sizeof(id->process))
++      || !transport_json_string(o,"input_path_digest",id->input_path_digest,sizeof(id->input_path_digest))
++      || room_volume_parse_counter(o,"device_id",&id->device_id)<0
++      || room_volume_parse_counter(o,"device_incarnation",&id->device_incarnation)<0
++      || room_volume_parse_counter(o,"session_epoch",&id->session_epoch)<0
++      || room_volume_parse_counter(o,"route_revision",&id->route_revision)<0
++      || room_volume_parse_counter(o,"selection_revision",&id->selection_revision)<0
++      || room_volume_parse_counter(o,"input_generation",&id->input_generation)<0
++      || room_volume_parse_counter(o,"input_item_id",&id->input_item_id)<0) return -1;
++  return 0;
++}
++static int room_volume_parse_percent(json_object *o,const char *key,int *out)
++{
++  json_object *v;
++  if (!json_object_object_get_ex(o,key,&v) || !json_object_is_type(v,json_type_int)
++      || json_object_get_int64(v)<0 || json_object_get_int64(v)>100) return -1;
++  *out=json_object_get_int(v); return 0;
++}
++static int room_volume_parse_state(json_object *o,struct output_room_volume_state *s)
++{
++  return !o || !json_object_is_type(o,json_type_object) || json_object_object_length(o)!=4
++    || room_volume_parse_counter(o,"base_revision",&s->base_revision)<0
++    || room_volume_parse_counter(o,"attention_revision",&s->attention_revision)<0
++    || room_volume_parse_percent(o,"base_percent",&s->base_percent)<0
++    || room_volume_parse_percent(o,"effective_percent",&s->effective_percent)<0 ? -1 : 0;
++}
++static const char *room_volume_outcome_name(enum output_room_volume_outcome outcome)
++{
++  const char *names[]={"prepared","pending","admitted_pending","protocol_accepted","rejected_before_admission","expired_before_admission","cancelled_before_admission","unknown"};
++  return outcome>=0 && (size_t)outcome<ARRAY_SIZE(names) ? names[outcome] : "unknown";
++}
++static json_object *room_volume_result_json(const char *schema,const struct output_room_volume_result *r)
++{
++  json_object *o=json_object_new_object();
++  json_object_object_add(o,"schema",json_object_new_string(schema)); json_object_object_add(o,"ok",json_object_new_boolean(true));
++  json_object_object_add(o,"token",json_object_new_string(r->command.token));
++  json_object_object_add(o,"native_prepare_id",json_object_new_string(r->command.native_prepare_id));
++  json_object_object_add(o,"native_reservation_id",json_object_new_string(r->command.native_reservation_id));
++  json_object_object_add(o,"args_digest",json_object_new_string(r->command.args_digest));
++  json_object_object_add(o,"percent",json_object_new_int(r->command.percent));
++  json_object_object_add(o,"identity",transport_identity_json(&r->identity));
++  json_object_object_add(o,"volume_state",room_volume_state_json(&r->volume_state));
++  json_object_object_add(o,"outcome",json_object_new_string(room_volume_outcome_name(r->outcome)));
++  json_object_object_add(o,"possible_effect",json_object_new_boolean(r->possible_effect));
++  json_object_object_add(o,"deadline_retired",json_object_new_boolean(r->deadline_retired));
++  json_object_object_add(o,"contexts_drained",json_object_new_boolean(r->contexts_drained));
++  json_object_object_add(o,"physical_result_verified",json_object_new_boolean(false));
++  json_object_object_add(o,"pin_remaining_ms",json_object_new_int(r->pin_remaining_ms)); return o;
++}
++static int jsonapi_reply_room_volume_state(struct httpd_request *hreq)
++{
++  uint64_t id; bool busy;
++  struct output_transport_identity identity; struct output_room_volume_state state;
++  json_object *o,*actions;
++  if (safe_atou64(hreq->path_parts[2],&id)<0 || player_room_volume_state_get(id,&identity,&state,&busy)<0) return 409;
++  o=json_object_new_object(); actions=json_object_new_array();
++  json_object_object_add(o,"schema",json_object_new_string("podconnect.output_room_volume_state.v1"));
++  json_object_object_add(o,"ok",json_object_new_boolean(true)); json_object_object_add(o,"identity",transport_identity_json(&identity));
++  json_object_object_add(o,"volume_state",room_volume_state_json(&state)); json_object_object_add(o,"busy",json_object_new_boolean(busy));
++  if (!busy) json_object_array_add(actions,json_object_new_string("volume"));
++  json_object_object_add(o,"actions",actions); json_object_object_add(o,"physical_result_verified",json_object_new_boolean(false));
++  return transport_json_reply(hreq,o);
++}
++static int jsonapi_reply_room_volume_write(struct httpd_request *hreq)
++{
++  struct output_room_volume_request request={0}; struct output_room_volume_result result;
++  json_object *body=transport_parse_body(hreq->in_body),*identity,*state,*reply;
++  const char *phase=hreq->path_parts[4]; bool prepare=!strcmp(phase,"prepare"),cancel=!strcmp(phase,"cancel");
++  int ret=HTTP_BADREQUEST;
++  if (!body || safe_atou64(hreq->path_parts[2],&request.device_id)<0) goto out;
++  if (cancel) {
++    if (json_object_object_length(body)!=2 || !transport_json_string(body,"token",request.token,sizeof(request.token))
++        || !transport_json_string(body,"native_reservation_id",request.native_reservation_id,sizeof(request.native_reservation_id))) goto out;
++    ret=HTTP_NOTFOUND;
++    if (player_room_volume_result_get(request.token,&result)<0 || result.identity.device_id!=request.device_id
++        || player_room_volume_cancel(request.token,request.native_reservation_id,&result)<0) goto out;
++    ret=transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_cancel.v1",&result)); goto out;
++  }
++  if (json_object_object_length(body)!=6
++      || !transport_json_string(body,"native_prepare_id",request.native_prepare_id,sizeof(request.native_prepare_id))
++      || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
++      || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest))
++      || room_volume_parse_percent(body,"percent",&request.percent)<0) goto out;
++  if (prepare) {
++    if (!json_object_object_get_ex(body,"expected_identity",&identity) || room_volume_parse_identity(identity,&request.expected_identity)<0
++        || !json_object_object_get_ex(body,"expected_volume_state",&state) || room_volume_parse_state(state,&request.expected_volume_state)<0) goto out;
++  } else if (!transport_json_string(body,"token",request.token,sizeof(request.token))
++      || !transport_json_string(body,"native_reservation_id",request.native_reservation_id,sizeof(request.native_reservation_id))) goto out;
++  ret=409;
++  if ((prepare ? player_room_volume_prepare(&request,&result) : player_room_volume_commit(&request,&result))<0) goto out;
++  if (!prepare) { ret=transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_commit.v1",&result)); goto out; }
++  reply=json_object_new_object();
++  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_room_volume_prepare.v1"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true)); json_object_object_add(reply,"token",json_object_new_string(result.command.token));
++  json_object_object_add(reply,"native_prepare_id",json_object_new_string(result.command.native_prepare_id));
++  json_object_object_add(reply,"args_digest",json_object_new_string(result.command.args_digest));
++  json_object_object_add(reply,"percent",json_object_new_int(result.command.percent));
++  json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
++  json_object_object_add(reply,"volume_state",room_volume_state_json(&result.volume_state));
++  json_object_object_add(reply,"expires_after_ms",json_object_new_int(OUTPUT_ROOM_VOLUME_WINDOW_MS));
++  json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  ret=transport_json_reply(hreq,reply);
++ out:
++  jparse_free(body); return ret;
++}
++static int jsonapi_reply_room_volume_result(struct httpd_request *hreq)
++{
++  uint64_t id; struct output_room_volume_result result;
++  if (safe_atou64(hreq->path_parts[2],&id)<0 || player_room_volume_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id) return HTTP_NOTFOUND;
++  return transport_json_reply(hreq,room_volume_result_json("podconnect.output_room_volume_result.v1",&result));
++}
+diff --git a/src/outputs.c b/src/outputs.c
+index 81440e2..3d913be 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -168,11 +168,13 @@ transport_remaining(const struct timespec *expiry)
+   return ns > 0 ? (unsigned)((ns + 999999) / 1000000) : 0;
+ }
+ 
++static bool room_volume_pin_busy(void);
++
+ bool
+ outputs_transport_busy(void)
+ {
+   if (transport_pin && !transport_remaining(&transport_pin_expiry)) transport_pin = NULL;
+-  return transport_pin != NULL;
++  return transport_pin != NULL || room_volume_pin_busy();
+ }
+ 
+ static void
+@@ -271,7 +273,7 @@ bool
+ outputs_transport_current(const struct output_transport_result *operation)
+ {
+   struct output_transport_identity state;
+-  return operation && outputs_transport_busy() && transport_pin->used
++  return operation && transport_pin && outputs_transport_busy() && transport_pin->used
+     && !strcmp(transport_pin->result.command.token,operation->command.token)
+     && transport_identity_get(operation->identity.device_id,&state)==0
+     && transport_identity_equal(&operation->identity,&state);
+@@ -344,6 +346,8 @@ outputs_transport_result_get(const char *token, struct output_transport_result *
+   return 0;
+ }
+ 
++#include "outputs_room_volume.inc.c"
++
+ int
+ outputs_device_effective_volume(const struct output_device *device)
+ {
+diff --git a/src/outputs.h b/src/outputs.h
+index 732c952..e95867a 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -119,6 +119,46 @@ bool outputs_transport_current(const struct output_transport_result *);
+ bool outputs_transport_busy(void);
+ void outputs_transport_input_changed(uint64_t item_id, const char *path, bool pipe_input);
+ 
++/* Separate exact-room physical-volume authority; never an attention lease. */
++#define OUTPUT_ROOM_VOLUME_WINDOW_MS 1000
++struct output_room_volume_state
++{
++  uint64_t base_revision, attention_revision;
++  int base_percent, effective_percent;
++};
++enum output_room_volume_outcome
++{
++  ROOM_VOLUME_PREPARED, ROOM_VOLUME_PENDING, ROOM_VOLUME_ADMITTED_PENDING,
++  ROOM_VOLUME_PROTOCOL_ACCEPTED, ROOM_VOLUME_REJECTED, ROOM_VOLUME_EXPIRED,
++  ROOM_VOLUME_CANCELLED, ROOM_VOLUME_UNKNOWN
++};
++struct output_room_volume_request
++{
++  uint64_t device_id;
++  char token[33], native_prepare_id[33], native_reservation_id[33], args_digest[65];
++  char expected_input_path_digest[65];
++  int percent;
++  struct output_transport_identity expected_identity;
++  struct output_room_volume_state expected_volume_state;
++};
++struct output_room_volume_result
++{
++  struct output_room_volume_request command;
++  struct output_transport_identity identity;
++  struct output_room_volume_state volume_state;
++  enum output_room_volume_outcome outcome;
++  bool possible_effect, deadline_retired, contexts_drained;
++  unsigned pin_remaining_ms;
++};
++int outputs_room_volume_state_get(uint64_t,struct output_transport_identity *,struct output_room_volume_state *,bool *);
++int outputs_room_volume_prepare(const struct output_room_volume_request *,struct output_room_volume_result *);
++int outputs_room_volume_commit(const struct output_room_volume_request *,struct output_room_volume_result *);
++int outputs_room_volume_cancel(const char *,const char *,struct output_room_volume_result *);
++int outputs_room_volume_result_get(const char *,struct output_room_volume_result *);
++bool outputs_room_volume_dispatch_current(const char *);
++bool outputs_room_volume_before_write(const char *);
++void outputs_room_volume_complete(const char *,bool protocol_accepted);
++
+ /* Native attention is an overlay on manual desire, never a replacement base.
+  * All entry points below run on the existing player event loop. A result is a
+  * protocol observation, not an acoustic or hardware readback receipt. */
+@@ -392,6 +432,9 @@ struct output_definition
+   // Set the volume and call back
+   int (*device_volume_set)(struct output_device *device, int callback_id);
+ 
++  // Exact-room physical volume has independent purpose/token/result ownership.
++  int (*device_room_volume)(struct output_device *, const struct output_room_volume_result *);
++
+   // Strict attention uses its own immutable operation, not callback_id.
+   int (*device_attention_set)(struct output_device *device, const struct output_attention_result *operation);
+   bool (*device_attention_recovery_idle)(struct output_device *device);
+diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
+index 8c57147..6c8ae2e 100644
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -241,6 +241,7 @@ struct airplay_master_session
+ };
+ 
+ struct airplay_attention_request;
++struct airplay_room_volume_request;
+ struct airplay_seq_ctx;
+ 
+ struct airplay_session
+@@ -252,6 +253,7 @@ struct airplay_session
+   uint64_t device_incarnation;
+   uint64_t session_epoch;
+   struct airplay_attention_request *attention_requests;
++  struct airplay_room_volume_request *room_volume_requests;
+   struct airplay_seq_ctx *sequence_requests;
+   bool attention_managed;
+   bool attention_suspended;
+@@ -335,6 +337,15 @@ struct airplay_session
+ };
+ 
+ 
++struct airplay_room_volume_request
++{
++  struct output_room_volume_result operation;
++  struct airplay_session *session;
++  int cseq;
++  bool guard_rejected, write_guard_seen;
++  struct airplay_room_volume_request *next;
++};
++
+ struct airplay_attention_request
+ {
+   struct output_attention_result operation;
+@@ -1308,6 +1319,12 @@ session_free(struct airplay_session *session)
+       free(pending);
+     }
+ 
++  while (session->room_volume_requests) {
++    struct airplay_room_volume_request *pending=session->room_volume_requests;
++    session->room_volume_requests=pending->next;
++    outputs_room_volume_complete(pending->operation.command.token,false);
++    free(pending);
++  }
+   if (session->deferredev)
+     event_free(session->deferredev);
+ 
+@@ -2174,6 +2191,8 @@ airplay_attention_set(struct output_device *device, const struct output_attentio
+   return -1;
+ }
+ 
++#include "airplay_room_volume.inc.c"
++
+ static bool
+ airplay_attention_recovery_idle(struct output_device *device)
+ {
+@@ -4920,6 +4939,7 @@ struct output_definition output_airplay =
+   .device_free_extra = airplay_device_free_extra,
+   .device_volume_set = airplay_set_volume_one,
+   .device_attention_set = airplay_attention_set,
++  .device_room_volume = airplay_room_volume,
+   .device_attention_recovery_idle = airplay_attention_recovery_idle,
+   .device_attention_recovery_prepare = airplay_attention_recovery_prepare,
+   .device_attention_recovery_abort = airplay_attention_recovery_abort,
+diff --git a/src/outputs/airplay_room_volume.inc.c b/src/outputs/airplay_room_volume.inc.c
+new file mode 100644
+index 0000000..3f82e08
+--- /dev/null
++++ b/src/outputs/airplay_room_volume.inc.c
+@@ -0,0 +1,79 @@
++/* Separate physical-volume purpose, sharing only native RTSP mechanics. */
++static void room_volume_request_remove(struct airplay_room_volume_request *c)
++{
++  struct airplay_room_volume_request **p=&c->session->room_volume_requests;
++  while (*p && *p!=c) p=&(*p)->next;
++  if (*p) *p=c->next;
++}
++static int room_volume_session_current(struct airplay_room_volume_request *c)
++{
++  struct output_device *d=outputs_device_get(c->operation.identity.device_id);
++  return d && d->session==c->session && !c->session->attention_retiring
++    && d->incarnation==c->operation.identity.device_incarnation
++    && d->session_epoch==c->operation.identity.session_epoch;
++}
++static int room_volume_dispatch_guard(void *arg)
++{
++  struct airplay_room_volume_request *c=arg;
++  bool current=room_volume_session_current(c) && outputs_room_volume_dispatch_current(c->operation.command.token);
++  if (!current) c->guard_rejected=true;
++  return current;
++}
++static int room_volume_write_guard(void *arg)
++{
++  struct airplay_room_volume_request *c=arg;
++  c->write_guard_seen=true;
++  bool current=room_volume_session_current(c) && outputs_room_volume_before_write(c->operation.command.token);
++  if (!current) c->guard_rejected=true;
++  return current;
++}
++static void room_volume_response(struct evrtsp_request *request,void *arg)
++{
++  struct airplay_room_volume_request *c=arg;
++  struct airplay_session *session=c->session;
++  const char *header=request ? evrtsp_find_header(request->input_headers,"CSeq") : NULL;
++  int cseq=0;
++  bool accepted=request && request->response_code==RTSP_OK && header
++    && safe_atoi32(header,&cseq)==0 && cseq==c->cseq && room_volume_session_current(c);
++  bool retire=(!request || c->guard_rejected) && (c->write_guard_seen || !c->guard_rejected);
++  room_volume_request_remove(c);
++  session->reqs_in_flight--;
++  if (!session->reqs_in_flight) evrtsp_connection_set_closecb(session->ctrl,rtsp_close_cb,session);
++  outputs_room_volume_complete(c->operation.command.token,accepted);
++  free(c);
++  /* Ciphered/partial output may not be reused after a veto. Exact old session
++   * destruction drains its connection/requests; the global route pin survives. */
++  if (retire) session_cleanup(session);
++}
++static int airplay_room_volume(struct output_device *device,const struct output_room_volume_result *operation)
++{
++  struct airplay_session *session=device->session;
++  struct airplay_room_volume_request *c;
++  struct evrtsp_request *request;
++  int effective=operation->command.percent;
++  float mapped;
++  char volume[32];
++  if (!session || !(session->state&AIRPLAY_STATE_F_CONNECTED) || session->attention_retiring
++      || session->recovery_only || !outputs_room_volume_dispatch_current(operation->command.token)) return -1;
++  c=calloc(1,sizeof(*c)); if (!c) return -1;
++  c->session=session; c->operation=*operation; c->cseq=session->cseq;
++  request=evrtsp_request_new(room_volume_response,c);
++  if (!request) { free(c); return -1; }
++  if (request_headers_add(request,session,EVRTSP_REQ_SET_PARAMETER)<0) goto error;
++  if (device->attention_lease && !device->attention_restoring && effective>device->attention_cap) effective=device->attention_cap;
++  mapped=airplay_volume_from_pct(effective,session->devname);
++  snprintf(volume,sizeof(volume),"-%d.%06d",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
++  evrtsp_add_header(request->output_headers,"Content-Type","text/parameters");
++  if (evbuffer_add_printf(request->output_buffer,"volume: %s\r\n",volume)<0) goto error;
++  request->write_current=room_volume_write_guard; request->write_current_arg=c;
++  c->next=session->room_volume_requests; session->room_volume_requests=c;
++  session->reqs_in_flight++; evrtsp_connection_set_closecb(session->ctrl,NULL,NULL);
++  if (evrtsp_make_request_guarded(session->ctrl,request,EVRTSP_REQ_SET_PARAMETER,session->session_url,room_volume_dispatch_guard,c)<0) {
++    room_volume_request_remove(c); session->reqs_in_flight--;
++    if (!session->reqs_in_flight) evrtsp_connection_set_closecb(session->ctrl,rtsp_close_cb,session);
++    goto error;
++  }
++  return 1;
++ error:
++  evrtsp_request_free(request); free(c); return -1;
++}
+diff --git a/src/outputs_room_volume.inc.c b/src/outputs_room_volume.inc.c
+new file mode 100644
+index 0000000..be555c5
+--- /dev/null
++++ b/src/outputs_room_volume.inc.c
+@@ -0,0 +1,187 @@
++/* Included in outputs.c: the actual output event-loop owner, no HTTP awaits. */
++#define ROOM_VOLUME_SLOTS 64
++struct room_volume_slot {
++  struct output_room_volume_result result;
++  struct timespec deadline;
++  bool used, cancelled;
++};
++static struct room_volume_slot room_volume_slots[ROOM_VOLUME_SLOTS];
++static struct room_volume_slot *room_volume_pin;
++static struct timespec room_volume_pin_expiry;
++
++static bool room_volume_pin_busy(void)
++{
++  if (room_volume_pin && !transport_remaining(&room_volume_pin_expiry)) room_volume_pin=NULL;
++  return room_volume_pin!=NULL;
++}
++static bool room_volume_window_live(const struct room_volume_slot *slot)
++{
++  struct timespec now;
++  return clock_gettime(CLOCK_MONOTONIC,&now)==0 &&
++    (now.tv_sec<slot->deadline.tv_sec || (now.tv_sec==slot->deadline.tv_sec && now.tv_nsec<slot->deadline.tv_nsec));
++}
++static struct room_volume_slot *room_volume_find(const char *token)
++{
++  size_t i;
++  if (!transport_hex(token,32)) return NULL;
++  for (i=0;i<ARRAY_SIZE(room_volume_slots);i++)
++    if (!strcmp(room_volume_slots[i].result.command.token,token)) return &room_volume_slots[i];
++  return NULL;
++}
++static bool room_volume_state_equal(const struct output_room_volume_state *a,const struct output_room_volume_state *b)
++{
++  return a->base_revision==b->base_revision && a->attention_revision==b->attention_revision
++    && a->base_percent==b->base_percent && a->effective_percent==b->effective_percent;
++}
++static int room_volume_snapshot(uint64_t id,struct output_transport_identity *identity,struct output_room_volume_state *state)
++{
++  struct output_device *d=outputs_device_get(id);
++  if (!d || !outputs[d->type]->device_room_volume || transport_identity_get(id,identity)<0
++      || d->base_revision==UINT64_MAX || d->attention_revision==UINT64_MAX) return -1;
++  state->base_revision=d->base_revision; state->attention_revision=d->attention_revision;
++  state->base_percent=d->volume; state->effective_percent=outputs_device_effective_volume(d);
++  return 0;
++}
++int outputs_room_volume_state_get(uint64_t id,struct output_transport_identity *identity,struct output_room_volume_state *state,bool *busy)
++{
++  if (!busy || room_volume_snapshot(id,identity,state)<0) return -1;
++  *busy=outputs_transport_busy(); return 0;
++}
++static void room_volume_observe(struct room_volume_slot *s,struct output_room_volume_result *result)
++{
++  s->result.deadline_retired=!room_volume_window_live(s);
++  if (s->result.deadline_retired && s->result.outcome!=ROOM_VOLUME_PROTOCOL_ACCEPTED
++      && s->result.outcome!=ROOM_VOLUME_REJECTED && s->result.outcome!=ROOM_VOLUME_CANCELLED)
++    s->result.outcome=s->result.possible_effect ? ROOM_VOLUME_UNKNOWN : ROOM_VOLUME_EXPIRED;
++  s->result.pin_remaining_ms=room_volume_pin_busy() && room_volume_pin==s ? transport_remaining(&room_volume_pin_expiry) : 0;
++  *result=s->result;
++}
++static bool room_volume_request_valid(const struct output_room_volume_request *r)
++{
++  return r && r->device_id && transport_hex(r->native_prepare_id,32)
++    && transport_hex(r->args_digest,64) && transport_hex(r->expected_input_path_digest,64)
++    && r->percent>=0 && r->percent<=100;
++}
++int outputs_room_volume_prepare(const struct output_room_volume_request *r,struct output_room_volume_result *out)
++{
++  struct output_transport_identity identity;
++  struct output_room_volume_state state;
++  struct room_volume_slot *slot=NULL;
++  size_t i,j,k=0; char uuid[37];
++  if (!out || !room_volume_request_valid(r) || outputs_transport_busy()
++      || room_volume_snapshot(r->device_id,&identity,&state)<0
++      || !transport_identity_equal(&identity,&r->expected_identity)
++      || !room_volume_state_equal(&state,&r->expected_volume_state)
++      || strcmp(identity.input_path_digest,r->expected_input_path_digest)) return -1;
++  for (i=0;i<ARRAY_SIZE(room_volume_slots);i++) {
++    struct room_volume_slot *s=&room_volume_slots[i];
++    if (s->result.command.token[0] && room_volume_window_live(s)
++        && !strcmp(s->result.command.native_prepare_id,r->native_prepare_id)) return -1;
++    if (!slot && s!=room_volume_pin && (!s->result.command.token[0]
++        || (!room_volume_window_live(s) && s->result.contexts_drained))) slot=s;
++  }
++  if (!slot) return -1;
++  memset(slot,0,sizeof(*slot));
++  if (clock_gettime(CLOCK_MONOTONIC,&slot->deadline)<0) return -1;
++  slot->deadline.tv_sec++;
++  slot->result.command=*r; slot->result.identity=identity; slot->result.volume_state=state;
++  slot->result.outcome=ROOM_VOLUME_PREPARED; slot->result.contexts_drained=true;
++  outputs_attention_uuid(uuid); /* Shared randomness only, no attention capability. */
++  for (j=0;j<36;j++) if (uuid[j]!='-') slot->result.command.token[k++]=uuid[j];
++  slot->result.command.token[k]=0;
++  *out=slot->result; return 0;
++}
++int outputs_room_volume_result_get(const char *token,struct output_room_volume_result *out)
++{
++  struct room_volume_slot *slot=room_volume_find(token);
++  if (!slot || !out) return -1;
++  room_volume_observe(slot,out); return 0;
++}
++static bool room_volume_current(struct room_volume_slot *slot)
++{
++  struct output_transport_identity identity;
++  struct output_room_volume_state state;
++  return slot && slot->used && !slot->cancelled && room_volume_window_live(slot)
++    && room_volume_pin_busy() && room_volume_pin==slot
++    && room_volume_snapshot(slot->result.identity.device_id,&identity,&state)==0
++    && transport_identity_equal(&identity,&slot->result.identity)
++    && room_volume_state_equal(&state,&slot->result.volume_state);
++}
++int outputs_room_volume_commit(const struct output_room_volume_request *r,struct output_room_volume_result *out)
++{
++  struct room_volume_slot *s;
++  struct output_transport_identity identity;
++  struct output_room_volume_state state;
++  struct output_device *d;
++  int ret;
++  if (!r || !out || !(s=room_volume_find(r->token)) || s->used) return -1;
++  s->used=true; s->result.outcome=ROOM_VOLUME_REJECTED;
++  if (transport_hex(r->native_reservation_id,32)) memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
++  if (!room_volume_request_valid(r) || !transport_hex(r->native_reservation_id,32)
++      || !room_volume_window_live(s) || s->cancelled || outputs_transport_busy()
++      || r->device_id!=s->result.command.device_id || r->percent!=s->result.command.percent
++      || strcmp(r->native_prepare_id,s->result.command.native_prepare_id)
++      || strcmp(r->args_digest,s->result.command.args_digest)
++      || strcmp(r->expected_input_path_digest,s->result.command.expected_input_path_digest)
++      || room_volume_snapshot(r->device_id,&identity,&state)<0
++      || !transport_identity_equal(&identity,&s->result.identity)
++      || !room_volume_state_equal(&state,&s->result.volume_state)) {
++    if (!room_volume_window_live(s)) s->result.outcome=ROOM_VOLUME_EXPIRED;
++    room_volume_observe(s,out); return 0;
++  }
++  memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
++  if (clock_gettime(CLOCK_MONOTONIC,&room_volume_pin_expiry)<0) { room_volume_observe(s,out); return 0; }
++  room_volume_pin_expiry.tv_sec+=10; room_volume_pin=s;
++  s->result.outcome=ROOM_VOLUME_PENDING; s->result.contexts_drained=false;
++  d=outputs_device_get(r->device_id);
++  ret=outputs[d->type]->device_room_volume(d,&s->result);
++  if (ret<0) { s->result.outcome=ROOM_VOLUME_REJECTED; s->result.contexts_drained=true; }
++  room_volume_observe(s,out); return 0;
++}
++int outputs_room_volume_cancel(const char *token,const char *reservation,struct output_room_volume_result *out)
++{
++  struct room_volume_slot *s=room_volume_find(token);
++  if (!s || !out || !transport_hex(reservation,32)
++      || (s->result.command.native_reservation_id[0] && strcmp(reservation,s->result.command.native_reservation_id))) return -1;
++  if (!s->used) { s->used=true; memcpy(s->result.command.native_reservation_id,reservation,33); }
++  s->cancelled=true;
++  if (s->result.outcome!=ROOM_VOLUME_PROTOCOL_ACCEPTED)
++    s->result.outcome=s->result.possible_effect ? ROOM_VOLUME_UNKNOWN : ROOM_VOLUME_CANCELLED;
++  room_volume_observe(s,out); return 0;
++}
++bool outputs_room_volume_dispatch_current(const char *token)
++{
++  struct room_volume_slot *s=room_volume_find(token);
++  return room_volume_current(s) && (s->result.outcome==ROOM_VOLUME_PENDING || s->result.outcome==ROOM_VOLUME_ADMITTED_PENDING);
++}
++bool outputs_room_volume_before_write(const char *token)
++{
++  struct room_volume_slot *s=room_volume_find(token);
++  struct output_device *d;
++  struct output_transport_identity identity;
++  if (!outputs_room_volume_dispatch_current(token)) return false;
++  if (s->result.possible_effect) return true;
++  d=outputs_device_get(s->result.identity.device_id);
++  /* This is the final local mutator, after all queue/socket delays. Durable
++   * desired base admission is irreversible; a following error stays unknown. */
++  s->result.possible_effect=true; s->result.outcome=ROOM_VOLUME_ADMITTED_PENDING;
++  if (outputs_device_volume_register(d,s->result.command.percent,-1)<0) {
++    s->result.outcome=ROOM_VOLUME_UNKNOWN; return false; /* Local durable admission may be uncertain. */
++  }
++  if (room_volume_snapshot(d->id,&identity,&s->result.volume_state)<0 || !room_volume_window_live(s)) {
++    s->result.outcome=ROOM_VOLUME_UNKNOWN; return false;
++  }
++  return true;
++}
++void outputs_room_volume_complete(const char *token,bool accepted)
++{
++  struct room_volume_slot *s=room_volume_find(token);
++  if (!s || s->result.contexts_drained) return;
++  s->result.contexts_drained=true;
++  /* Terminal unknown/cancel/expiry cannot be upgraded by a late completion. */
++  if (s->result.outcome==ROOM_VOLUME_PENDING || s->result.outcome==ROOM_VOLUME_ADMITTED_PENDING) {
++    if (accepted && s->result.possible_effect && room_volume_current(s)) s->result.outcome=ROOM_VOLUME_PROTOCOL_ACCEPTED;
++    else s->result.outcome=s->result.possible_effect ? ROOM_VOLUME_UNKNOWN : s->cancelled ? ROOM_VOLUME_CANCELLED :
++        room_volume_window_live(s) ? ROOM_VOLUME_REJECTED : ROOM_VOLUME_EXPIRED;
++  }
++}
+diff --git a/src/player.c b/src/player.c
+index 8ea4452..7479c4b 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -3153,6 +3153,34 @@ int player_transport_state_get(uint64_t id, struct output_transport_identity *id
+   return commands_exec_sync(cmdbase,transport_command,NULL,&c);
+ }
+ 
++struct player_room_volume_command {
++  int action; uint64_t id; const char *token,*reservation;
++  const struct output_room_volume_request *request; struct output_room_volume_result *result;
++  struct output_transport_identity *identity; struct output_room_volume_state *state; bool *busy;
++};
++static enum command_state room_volume_command(void *arg,int *retval)
++{
++  struct player_room_volume_command *c=arg;
++  if (c->action<3 && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
++      || pb_session.reading_now!=pb_session.playing_now)) { *retval=-1; return COMMAND_END; }
++  if (c->action==0) *retval=outputs_room_volume_state_get(c->id,c->identity,c->state,c->busy);
++  else if (c->action==1) *retval=outputs_room_volume_prepare(c->request,c->result);
++  else if (c->action==2) *retval=outputs_room_volume_commit(c->request,c->result);
++  else if (c->action==3) *retval=outputs_room_volume_cancel(c->token,c->reservation,c->result);
++  else *retval=outputs_room_volume_result_get(c->token,c->result);
++  return COMMAND_END;
++}
++int player_room_volume_state_get(uint64_t id,struct output_transport_identity *identity,struct output_room_volume_state *state,bool *busy)
++{ struct player_room_volume_command c={.action=0,.id=id,.identity=identity,.state=state,.busy=busy}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++int player_room_volume_prepare(const struct output_room_volume_request *request,struct output_room_volume_result *result)
++{ struct player_room_volume_command c={.action=1,.request=request,.result=result}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++int player_room_volume_commit(const struct output_room_volume_request *request,struct output_room_volume_result *result)
++{ struct player_room_volume_command c={.action=2,.request=request,.result=result}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++int player_room_volume_cancel(const char *token,const char *reservation,struct output_room_volume_result *result)
++{ struct player_room_volume_command c={.action=3,.token=token,.reservation=reservation,.result=result}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++int player_room_volume_result_get(const char *token,struct output_room_volume_result *result)
++{ struct player_room_volume_command c={.action=4,.token=token,.result=result}; return commands_exec_sync(cmdbase,room_volume_command,NULL,&c); }
++
+ struct player_attention_command
+ {
+   const struct output_attention_request *request;
+diff --git a/src/player.h b/src/player.h
+index 6aead4c..814c880 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -245,5 +245,11 @@ int player_transport_commit(const struct output_transport_request *, struct outp
+ int player_transport_result_get(const char *, struct output_transport_result *);
+ int player_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+ 
++
++int player_room_volume_state_get(uint64_t,struct output_transport_identity *,struct output_room_volume_state *,bool *);
++int player_room_volume_prepare(const struct output_room_volume_request *,struct output_room_volume_result *);
++int player_room_volume_commit(const struct output_room_volume_request *,struct output_room_volume_result *);
++int player_room_volume_cancel(const char *,const char *,struct output_room_volume_result *);
++int player_room_volume_result_get(const char *,struct output_room_volume_result *);
+ #endif /* !__PLAYER_H__ */
+ 
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 0bd916d..70e3653 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -525,6 +525,8 @@ struct recovery_wire_fixture {
+   int udp_fd,mode,phase,failed,wire,volumes,teardowns,pair_messages,start_callbacks,stop_callbacks;
+   int short_salts,padded_salts;
+   struct output_attention_result handoff;
++  struct output_room_volume_request volume_command;
++  struct output_room_volume_result volume_result;
+ };
+ 
+ static struct recovery_wire_fixture *active_recovery_wire;
+@@ -687,7 +689,7 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct(60,f->device->name);
++    float mapped=airplay_volume_from_pct(f->mode>=7 ? (f->volumes ? 44 : 27) : 60,f->device->name);
+     char expected[64];
+     snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+     if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+@@ -699,6 +701,8 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+       {recovery_wire_fail(f,"recovery granted native emission");goto done;}
+     if(f->mode==1 || (f->mode==5 && f->phase==1))cseq++; // Real mismatched server CSeq cannot retire origin.
+     if(f->mode==2)code=503;
++    if(f->mode==8 && f->volumes==2)cseq++;
++    if(f->mode==9 && f->volumes==2)code=503;
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+     f->teardowns++;
+@@ -736,6 +740,15 @@ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t
+ static void recovery_wire_poll(int fd,short what,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct timeval soon={0,1000};(void)fd;(void)what;
++  if (f->mode>=7) {
++    if (!f->phase || outputs_room_volume_result_get(f->volume_command.token,&f->volume_result)<0
++        || !f->volume_result.contexts_drained) { evtimer_add(f->poll,&soon); return; }
++    if (f->volume_result.outcome!=(f->mode==7 ? ROOM_VOLUME_PROTOCOL_ACCEPTED : ROOM_VOLUME_UNKNOWN)
++        || !f->volume_result.possible_effect || f->device->volume!=44 || !room_volume_pin_busy()
++        || !f->device->session || f->volumes!=2 || f->teardowns)
++      { recovery_wire_fail(f,"distinct physical-volume exact-CSeq/result/session ownership"); return; }
++    event_base_loopbreak(f->base); return;
++  }
+   if (f->mode == 6 && f->phase < 2)
+     {
+       struct output_attention_state state;
+@@ -833,6 +846,24 @@ static void recovery_wire_connected(struct output_device *device, enum output_de
+   if (!f || device != f->device || state != OUTPUT_STATE_CONNECTED || ++f->start_callbacks != 1
+       || !device->session || ((struct airplay_session *)device->session)->recovery_only)
+     { if (f) recovery_wire_fail(f, "actual ordinary startup failed exact connected observation"); return; }
++  if (f->mode>=7) {
++    bool busy;
++    struct output_room_volume_request *r=&f->volume_command;
++    outputs_transport_input_changed(501,"/srv/media/spotify",true); /* Controlled input-owner fixture, not physical playback. */
++    r->device_id=device->id; r->percent=44;
++    snprintf(r->native_prepare_id,sizeof(r->native_prepare_id),"%032x",100+f->mode);
++    memset(r->args_digest,'b',64); r->args_digest[64]=0;
++    if (outputs_room_volume_state_get(device->id,&r->expected_identity,&r->expected_volume_state,&busy)<0 || busy)
++      { recovery_wire_fail(f,"actual connected volume state unavailable"); return; }
++    memcpy(r->expected_input_path_digest,r->expected_identity.input_path_digest,65);
++    if (outputs_room_volume_prepare(r,&f->volume_result)<0)
++      { recovery_wire_fail(f,"actual dedicated volume prepare failed"); return; }
++    *r=f->volume_result.command;
++    memset(r->native_reservation_id,'a',32); r->native_reservation_id[32]=0;
++    if (outputs_room_volume_commit(r,&f->volume_result)<0)
++      { recovery_wire_fail(f,"actual dedicated volume commit failed"); return; }
++    f->phase=1; return;
++  }
+   f->command.expected = (struct output_attention_state){0};
+   outputs_attention_state_get(device->id, &f->command.expected);
+   f->phase = 1;
+@@ -884,7 +915,7 @@ static int recovery_wire_case(int mode)
+   f.udp_fd=socket(AF_INET,SOCK_DGRAM,0);if(f.udp_fd<0){f.failed=1;goto cleanup;}
+   {struct sockaddr_in udp={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+     if(bind(f.udp_fd,(struct sockaddr *)&udp,sizeof(udp)) || getsockname(f.udp_fd,(struct sockaddr *)&udp,&length)){f.failed=1;goto cleanup;}f.udp_port=ntohs(udp.sin_port);}
+-  for(attempt=0;attempt<((mode == 3 || mode == 6) ? 1 : 2);attempt++) {
++  for(attempt=0;attempt<((mode == 3 || mode == 6 || mode>=7) ? 1 : 2);attempt++) {
+     outputs_attention_uuid(outputs_process);if(outputs_attention_startup()<0){f.failed=1;goto cleanup;}
+     f.device=calloc(1,sizeof(*f.device));extra=calloc(1,sizeof(*extra));if(!f.device || !extra){f.failed=1;goto cleanup;}
+     f.device->id=1;f.device->name=strdup("private-recovery-native");f.device->type=OUTPUT_TYPE_AIRPLAY;f.device->type_name="AirPlay";
+@@ -892,7 +923,8 @@ static int recovery_wire_case(int mode)
+     f.device->extra_device_info=extra;extra->mdns_name=strdup("private-recovery-native");
+     f.device=outputs_device_add(f.device,false);if(!f.device){f.failed=1;goto cleanup;}
+     if(!attempt) {
+-      if(outputs_device_volume_register(f.device,60,-1)<0){f.failed=1;goto cleanup;}
++      if(outputs_device_volume_register(f.device,mode>=7 ? 27 : 60,-1)<0){f.failed=1;goto cleanup;}
++      if (mode>=7) { outputs_device_select(f.device,-1); continue; }
+       outputs_attention_uuid(begin.request_id);outputs_attention_state_get(1,&begin.expected);
+       if(outputs_attention_admit(&begin,&original)<0 || original.outcome!=OUTPUT_ATTENTION_DESIRED_ONLY){f.failed=1;goto cleanup;}
+       f.command.origin=f.device->attention_origin;
+@@ -900,7 +932,7 @@ static int recovery_wire_case(int mode)
+     }
+   }
+   f.command.action=OUTPUT_ATTENTION_RECOVER;outputs_attention_uuid(f.command.request_id);outputs_attention_state_get(1,&f.command.expected);
+-  if (mode == 4 || mode == 5)
++  if (mode == 4 || mode == 5 || mode>=7)
+     {
+       if (outputs_device_start(f.device, recovery_wire_connected, false) != 1)
+         { recovery_wire_fail(&f, "actual ordinary startup refused"); goto cleanup; }
+@@ -916,6 +948,7 @@ static int recovery_wire_case(int mode)
+   event_base_dispatch(f.base);
+   if(!f.failed && !recovery_salt_red && (f.short_salts != (mode == 5 ? 2 : 1)
+       || f.padded_salts != (mode == 5 ? 2 : 1))) recovery_wire_fail(&f,"deterministic short-salt receiver contract not exercised");
++  if(mode>=7) goto volume_case_complete;
+   if(!f.failed && (f.volumes!=(mode == 4 ? 2 : mode == 5 ? 3 : 1)
+       || f.teardowns!=((mode == 3 || mode == 5 || mode == 6) ? 2 : 1) || f.pair_messages!=(mode == 5 ? 4 : 2) || f.wire<8))recovery_wire_fail(&f,"actual bounded handshake/strict-write/teardown count");
+   if(!f.failed && (db_attention_origin_get(1,&f.command.origin,&origin_state,&proof)<0
+@@ -923,9 +956,12 @@ static int recovery_wire_case(int mode)
+   if(!f.failed && (mode == 0 || mode >= 3) && (f.result.recovery_state!=OUTPUT_RECOVERY_RESTORED || !f.result.current || f.result.response_code!=200
+       || f.result.request_cseq<=0 || strcmp(f.result.recovery_proof.terminal_request_id,f.command.request_id)))recovery_wire_fail(&f,"exact fresh terminal proof");
+   if(!f.failed && (mode == 1 || mode == 2) && f.result.recovery_state!=OUTPUT_RECOVERY_UNKNOWN)recovery_wire_fail(&f,"bad CSeq/non200 got recovery credit");
++ volume_case_complete:
+   if(!f.failed) {char byte; if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"unexpected recovery audio/data packet");}
+  cleanup:
+   while(airplay_sessions)session_cleanup(airplay_sessions);
++  if (mode>=7 && room_volume_pin) room_volume_pin_expiry.tv_sec-=11;
++  (void)room_volume_pin_busy();
+   if(outputs_device_list)outputs_device_remove(outputs_device_list);
+   for(i=0;i<(int)ARRAY_SIZE(contexts);i++)if(contexts[i])f.failed=1;
+   if (f.peer) bufferevent_free(f.peer);
+@@ -970,7 +1006,7 @@ int main(int argc, char **argv)
+     if (owner_case(OLD_START_200, mode)) return 1;
+   for (mode = RAW_FREE; mode <= RAW_NESTED_FREE; mode++)
+     if (raw_case((enum raw_mode)mode)) return 1;
+-  for(mode=0;mode<7;mode++) if(recovery_wire_case(mode)) return 1;
+-  puts("PASS: existing AirPlay config/queue owners plus seven actual private AP2 recovery/write/drain cases; no HomePod or physical-volume claim");
++  for(mode=0;mode<10;mode++) if(recovery_wire_case(mode)) return 1;
++  puts("PASS: existing AirPlay config/queue owners plus seven actual private AP2 recovery/write/drain plus3 dedicated volume actualCSeq/rejection cases; no HomePod or physical-volume claim");
+   return 0;
+ }
+diff --git a/tests/evrtsp_guarded_owner_contract.c b/tests/evrtsp_guarded_owner_contract.c
+index d211de8..d94b8a9 100644
+--- a/tests/evrtsp_guarded_owner_contract.c
++++ b/tests/evrtsp_guarded_owner_contract.c
+@@ -1,3 +1,4 @@
++#include <stdbool.h>
+ /* Actual candidate evrtsp queue/connection regression. No native session flags,
+  * fake ACK, AirPlay state, audio, LAN or provider. Reuses the established finite
+  * loopback fixture and exact real request ownership, with a five-second bound. */
+@@ -5,7 +6,7 @@
+ #include "evrtsp_owner_contract.c"
+ #undef main
+ 
+-enum guarded_mode { FIRST_REJECT, QUEUED_REJECT, NESTED_REJECT_FREE };
++enum guarded_mode { FIRST_REJECT, QUEUED_REJECT, NESTED_REJECT_FREE, FIRST_WRITE_REJECT, PARTIAL_WRITE_REJECT };
+ struct guarded_fixture;
+ struct guarded_op { struct guarded_fixture *owner; int index, calls, null; };
+ struct guarded_fixture {
+@@ -16,8 +17,28 @@ struct guarded_fixture {
+   struct evrtsp_connection *native;
+   struct event *deadline;
+   struct guarded_op op[3];
+-  int wire, failed, retired, cleanup_callback, next_before_prior;
++  int wire, failed, retired, cleanup_callback, next_before_prior, write_guards;
+ };
++/* Test-only bounded partial syscall; writes real bytes to the owned loopback
++ * peer. Production has no wrapper or injected successful transport result. */
++static bool partial_write_active;
++static int partial_write_calls, partial_written_bytes;
++int __real_evbuffer_write(struct evbuffer *,int);
++int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
++{
++  int n;
++  if (!partial_write_active) return __real_evbuffer_write(buffer,fd);
++  partial_write_calls++;
++  n=evbuffer_write_atmost(buffer,fd,7);
++  if (n>0) partial_written_bytes+=n;
++  return n;
++}
++static int actual_write_current(void *arg)
++{
++  struct guarded_op *op=arg;
++  op->owner->write_guards++;
++  return op->owner->mode==PARTIAL_WRITE_REJECT && partial_written_bytes==0;
++}
+ static void guarded_fail(struct guarded_fixture *s, const char *why)
+ {
+   fprintf(stderr, "FAIL guarded=%d: %s\n", s->mode, why);
+@@ -41,7 +62,7 @@ static void guarded_response(struct evrtsp_request *request, void *arg)
+   op->calls++;
+   op->null = request == NULL;
+   if (op->calls != 1) { guarded_fail(s, "duplicate exact request callback"); return; }
+-  if (s->mode == FIRST_REJECT) {
++  if (s->mode == FIRST_REJECT || s->mode == FIRST_WRITE_REJECT || s->mode == PARTIAL_WRITE_REJECT) {
+     if (op->index != 0 || request || s->wire != 0 || queue_count(s->native) != 0)
+       guarded_fail(s, "initial veto emitted wire or lost queue identity");
+     event_base_loopbreak(s->base);
+@@ -109,7 +130,8 @@ static int guarded_case(enum guarded_mode mode)
+   struct sockaddr_in address = { .sin_family = AF_INET };
+   socklen_t length = sizeof(address);
+   struct timeval bound = {5, 0};
+-  int i, count = mode == FIRST_REJECT ? 1 : mode == QUEUED_REJECT ? 2 : 3;
++  int i, count = (mode == FIRST_REJECT || mode == FIRST_WRITE_REJECT || mode == PARTIAL_WRITE_REJECT) ? 1 : mode == QUEUED_REJECT ? 2 : 3;
++  partial_write_active=mode==PARTIAL_WRITE_REJECT; partial_write_calls=partial_written_bytes=0;
+   s.base = event_base_new();
+   if (!s.base) return 1;
+   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+@@ -132,16 +154,21 @@ static int guarded_case(enum guarded_mode mode)
+         || evrtsp_add_header(request->output_headers, "Content-Length", "0") < 0) {
+       evrtsp_request_free(request); guarded_fail(&s, "header preparation failed"); goto cleanup;
+     }
++    if (mode==FIRST_WRITE_REJECT || mode==PARTIAL_WRITE_REJECT) { request->write_current=actual_write_current; request->write_current_arg=&s.op[i]; }
+     if (evrtsp_make_request_guarded(s.native, request, EVRTSP_REQ_SET_PARAMETER,
+         "rtsp://127.0.0.1/pc9-guarded", guarded_current, &s.op[i]) < 0) {
+       evrtsp_request_free(request); guarded_fail(&s, "guarded admission failed"); goto cleanup;
+     }
+   }
+   if (event_base_dispatch(s.base) != 0) guarded_fail(&s, "loop exited without callback completion");
+-  if (s.op[0].calls != 1 || (mode != FIRST_REJECT && s.op[1].calls != 1)
++  if (s.op[0].calls != 1 || ((mode == QUEUED_REJECT || mode == NESTED_REJECT_FREE) && s.op[1].calls != 1)
+       || (mode == NESTED_REJECT_FREE && (!s.cleanup_callback || s.op[2].calls)))
+     guarded_fail(&s, "exact terminal callback/cleanup inventory incomplete");
++  if (mode==FIRST_WRITE_REJECT && (s.write_guards!=1 || partial_written_bytes)) guarded_fail(&s,"first actual write was not vetoed");
++  if (mode==PARTIAL_WRITE_REJECT && (s.write_guards!=2 || partial_write_calls!=1 || partial_written_bytes!=7))
++    guarded_fail(&s,"partial continuation bypassed actual write guard or wrote late bytes");
+ cleanup:
++  partial_write_active=false;
+   if (s.deadline) event_free(s.deadline);
+   if (s.native) evrtsp_connection_free(s.native);
+   if (s.peer) bufferevent_free(s.peer);
+@@ -200,7 +227,8 @@ int main(void)
+ {
+   if (original_evrtsp_owner_main()) return EXIT_FAILURE;
+   if (guarded_case(FIRST_REJECT) || guarded_case(QUEUED_REJECT)
+-      || guarded_case(NESTED_REJECT_FREE) || negative_enqueue_ownership()) return EXIT_FAILURE;
+-  puts("PASS actual guarded queue ownership; no AirPlay/native acoustic acceptance");
++      || guarded_case(NESTED_REJECT_FREE) || guarded_case(FIRST_WRITE_REJECT)
++      || guarded_case(PARTIAL_WRITE_REJECT) || negative_enqueue_ownership()) return EXIT_FAILURE;
++  puts("PASS actual guarded queue and per-socket-write ownership; firstwrite veto and real7byte partial continuation veto; no AirPlay/native acoustic acceptance");
+   return EXIT_SUCCESS;
+ }
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+index cacc21b..08115e8 100644
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -960,6 +960,188 @@ static void exact_transport_http_contract(void)
+   puts("PASS actual transport HTTP closed bodies,9-field identity,32hex token,5-field prepare,8-field commit,4 actions,oneuse andbusy read");
+ }
+ 
++int player_room_volume_state_get(uint64_t id,struct output_transport_identity *i,struct output_room_volume_state *v,bool *busy)
++{ return outputs_room_volume_state_get(id,i,v,busy); }
++int player_room_volume_prepare(const struct output_room_volume_request *r,struct output_room_volume_result *out)
++{ return outputs_room_volume_prepare(r,out); }
++int player_room_volume_commit(const struct output_room_volume_request *r,struct output_room_volume_result *out)
++{ return outputs_room_volume_commit(r,out); }
++int player_room_volume_cancel(const char *t,const char *r,struct output_room_volume_result *out)
++{ return outputs_room_volume_cancel(t,r,out); }
++int player_room_volume_result_get(const char *t,struct output_room_volume_result *out)
++{ return outputs_room_volume_result_get(t,out); }
++static int room_volume_edge_calls;
++static int inert_room_volume(struct output_device *device,const struct output_room_volume_result *operation)
++{
++  assert(device->id==operation->identity.device_id && !operation->possible_effect);
++  room_volume_edge_calls++; return 1; /* Queued only; no fake RTSP or ACK. */
++}
++static struct output_room_volume_request room_volume_fixture_prepare(int percent)
++{
++  static unsigned n;
++  struct output_room_volume_request request={.device_id=1,.percent=percent};
++  struct output_room_volume_result result;
++  bool busy;
++  assert(outputs_room_volume_state_get(1,&request.expected_identity,&request.expected_volume_state,&busy)==0 && !busy);
++  snprintf(request.native_prepare_id,sizeof(request.native_prepare_id),"%032x",++n);
++  memset(request.args_digest,'d',64); request.args_digest[64]=0;
++  memcpy(request.expected_input_path_digest,request.expected_identity.input_path_digest,65);
++  assert(outputs_room_volume_prepare(&request,&result)==0 && result.outcome==ROOM_VOLUME_PREPARED);
++  request=result.command;
++  memset(request.native_reservation_id,'e',32); request.native_reservation_id[32]=0;
++  return request;
++}
++static void room_volume_fixture_end_pin(void)
++{
++  if (room_volume_pin) room_volume_pin_expiry.tv_sec-=11;
++  assert(!outputs_transport_busy());
++}
++static void exact_room_volume_owner(void)
++{
++  struct output_device *a=add_device(1), *b=add_device(2);
++  struct output_room_volume_request volume_request;
++  struct output_room_volume_result result;
++  unsigned char session;
++  uint64_t before,lease; struct timespec attention_deadline;
++  output_airplay.device_room_volume=inert_room_volume;
++  outputs_device_select(a,-1); assert(outputs_device_session_add(1,&session)==0);
++  a->state=OUTPUT_STATE_CONNECTED; outputs_transport_input_changed(401,"/srv/media/spotify",true);
++  assert(outputs_device_volume_register(a,27,-1)==0);
++  volume_request=room_volume_fixture_prepare(33); before=a->base_revision;
++  assert(outputs_room_volume_commit(&volume_request,&result)==0 && result.outcome==ROOM_VOLUME_PENDING);
++  assert(a->volume==27 && a->base_revision==before && !result.possible_effect); /* Queue is not base mutation. */
++  outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
++  assert(outputs_room_volume_commit(&volume_request,&result)<0);
++  assert(outputs_room_volume_cancel(volume_request.token,volume_request.native_reservation_id,&result)==0);
++  assert(!outputs_room_volume_before_write(volume_request.token) && a->volume==27 && a->base_revision==before);
++  assert(!result.contexts_drained); outputs_room_volume_complete(volume_request.token,false);
++  assert(outputs_room_volume_result_get(volume_request.token,&result)==0 && result.contexts_drained && !result.possible_effect && result.outcome==ROOM_VOLUME_CANCELLED);
++  assert(outputs_transport_busy()); room_volume_fixture_end_pin();
++  volume_request=room_volume_fixture_prepare(34); before=a->base_revision;
++  assert(outputs_room_volume_commit(&volume_request,&result)==0);
++  room_volume_find(volume_request.token)->deadline.tv_sec-=2;
++  assert(!outputs_room_volume_before_write(volume_request.token) && a->volume==27 && a->base_revision==before);
++  outputs_room_volume_complete(volume_request.token,false);
++  assert(outputs_room_volume_result_get(volume_request.token,&result)==0 && result.outcome==ROOM_VOLUME_EXPIRED && !result.possible_effect && result.deadline_retired);
++  room_volume_fixture_end_pin();
++  volume_request=room_volume_fixture_prepare(35); before=a->base_revision;
++  assert(outputs_room_volume_commit(&volume_request,&result)==0);
++  assert(outputs_room_volume_before_write(volume_request.token) && a->volume==35 && a->base_revision==before+1);
++  assert(outputs_room_volume_before_write(volume_request.token) && a->base_revision==before+1); /* Partial continuation cannot persist twice. */
++  room_volume_find(volume_request.token)->deadline.tv_sec-=2;
++  assert(!outputs_room_volume_before_write(volume_request.token)); outputs_room_volume_complete(volume_request.token,false);
++  outputs_room_volume_complete(volume_request.token,true); /* Delayed old success cannot upgrade consumed unknown. */
++  assert(outputs_room_volume_result_get(volume_request.token,&result)==0 && result.outcome==ROOM_VOLUME_UNKNOWN && result.possible_effect && result.contexts_drained);
++  room_volume_fixture_end_pin();
++  volume_request=room_volume_fixture_prepare(36); assert(outputs_room_volume_commit(&volume_request,&result)==0);
++  assert(outputs_device_volume_register(a,42,-1)==0); before=a->base_revision;
++  assert(!outputs_room_volume_before_write(volume_request.token) && a->volume==42 && a->base_revision==before);
++  outputs_room_volume_complete(volume_request.token,false); room_volume_fixture_end_pin();
++  /* Existing attention overlay remains the owner of its cap/lease/TTL. */
++  transport_return=0; (void)request(1,OUTPUT_ATTENTION_BEGIN);
++  lease=a->attention_lease; attention_deadline=a->attention_deadline;
++  volume_request=room_volume_fixture_prepare(27); assert(outputs_room_volume_commit(&volume_request,&result)==0);
++  assert(outputs_room_volume_before_write(volume_request.token));
++  assert(a->volume==27 && outputs_device_effective_volume(a)==5 && a->attention_lease==lease);
++  assert(a->attention_deadline.tv_sec==attention_deadline.tv_sec && a->attention_deadline.tv_nsec==attention_deadline.tv_nsec);
++  outputs_room_volume_complete(volume_request.token,false); room_volume_fixture_end_pin();
++  outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
++  puts("PASS volume owner pending!=base, cancel/expiry beforewrite, oneuse/fullroutepin, partial continuation deadline, newer manual fence, unknownnoreplay, attention lease preserved; no RTSP/device claim");
++}
++
++static int room_volume_http(struct httpd_request *hreq,const char *phase,const char *body)
++{
++  hreq->path_parts[2]="1"; hreq->path_parts[4]=(char *)phase;
++  evbuffer_drain(hreq->in_body,evbuffer_get_length(hreq->in_body));
++  evbuffer_drain(hreq->out_body,evbuffer_get_length(hreq->out_body));
++  if (body) evbuffer_add(hreq->in_body,body,strlen(body));
++  return !strcmp(phase,"state") ? jsonapi_reply_room_volume_state(hreq) : jsonapi_reply_room_volume_write(hreq);
++}
++static char *room_volume_json_replace(const char *source,const char *needle,const char *replacement)
++{
++  const char *position=strstr(source,needle); char *changed;
++  size_t before,after;
++  assert(position); before=position-source; after=strlen(position+strlen(needle));
++  changed=malloc(before+strlen(replacement)+after+1); assert(changed);
++  memcpy(changed,source,before); memcpy(changed+before,replacement,strlen(replacement));
++  memcpy(changed+before+strlen(replacement),position+strlen(needle),after+1); return changed;
++}
++static size_t room_volume_token_count(void)
++{
++  size_t i,n=0; for(i=0;i<ARRAY_SIZE(room_volume_slots);i++) if(room_volume_slots[i].result.command.token[0])n++;
++  return n;
++}
++static void exact_room_volume_http_contract(void)
++{
++  struct output_device *a=add_device(1);
++  struct httpd_request hreq={0}; struct output_transport_identity identity;
++  struct output_room_volume_state state; struct output_room_volume_result result;
++  unsigned char session; bool busy;
++  json_object *body,*reply,*field;
++  char *raw,*changed; char token[33],commit[512],cancel[160];
++  const char *prepare_id="fffffffffffffffffffffffffffffffe";
++  const char *args="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
++  const char *reservation="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
++  size_t i,tokens;
++  static const char *cases[][2]={
++    {"\"device_id\":\"1\"","\"device_id\":\"1\",\"device_id\":\"1\""},
++    {"\"base_percent\":27","\"base_percent\":27,\"base_percent\":27"},
++    {"\"base_percent\":27","\"base_percent\":27,\"unknown_nested\":1"},
++    {"\"device_id\":\"1\"","\"device_id\":\"1\",\"unknown_nested\":1"},
++    {"\"percent\":44","\"percent\":true"},
++    {"\"percent\":44","\"percent\":9223372036854775808"},
++    {"\"base_revision\":\"","\"base_revision\":\"18446744073709551616"},
++    {"\"native_prepare_id\":\"","\"native_prepare_id\":\"\\ud800"},
++  };
++  output_airplay.device_room_volume=inert_room_volume;
++  outputs_device_select(a,-1); assert(outputs_device_session_add(1,&session)==0);
++  a->state=OUTPUT_STATE_CONNECTED; outputs_transport_input_changed(601,"/srv/media/spotify",true);
++  assert(outputs_device_volume_register(a,27,-1)==0);
++  hreq.in_body=evbuffer_new(); hreq.out_body=evbuffer_new();
++  assert(room_volume_http(&hreq,"state",NULL)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==7);
++  assert(json_object_object_get_ex(reply,"volume_state",&field) && json_object_object_length(field)==4); jparse_free(reply);
++  assert(outputs_room_volume_state_get(1,&identity,&state,&busy)==0 && !busy);
++  body=json_object_new_object();
++  json_object_object_add(body,"native_prepare_id",json_object_new_string(prepare_id));
++  json_object_object_add(body,"args_digest",json_object_new_string(args));
++  json_object_object_add(body,"percent",json_object_new_int(44));
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string(identity.input_path_digest));
++  json_object_object_add(body,"expected_identity",transport_identity_json(&identity));
++  json_object_object_add(body,"expected_volume_state",room_volume_state_json(&state));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN)); jparse_free(body);
++  tokens=room_volume_token_count();
++  for(i=0;i<ARRAY_SIZE(cases);i++) {
++    changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);
++    assert(room_volume_http(&hreq,"prepare",changed)==HTTP_BADREQUEST); free(changed);
++    assert(room_volume_token_count()==tokens && a->volume==27);
++  }
++  changed=malloc(strlen(raw)+4); assert(changed); sprintf(changed,"%s {}",raw);
++  assert(room_volume_http(&hreq,"prepare",changed)==HTTP_BADREQUEST); free(changed);
++  changed=malloc(strlen(raw)+2); assert(changed); strcpy(changed,raw); changed[strlen(raw)]=34; changed[strlen(raw)+1]=0;
++  assert(room_volume_http(&hreq,"prepare",changed)==HTTP_BADREQUEST); free(changed);
++  changed=strdup(raw); changed[3]=(char)0xc0;
++  assert(room_volume_http(&hreq,"prepare",changed)==HTTP_BADREQUEST); free(changed);
++  assert(room_volume_token_count()==tokens);
++  assert(room_volume_http(&hreq,"prepare",raw)==HTTP_OK); free(raw);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==10);
++  snprintf(token,sizeof(token),"%s",jparse_str_from_obj(reply,"token")); assert(strlen(token)==32); jparse_free(reply);
++  assert(outputs_room_volume_result_get(token,&result)==0 && result.outcome==ROOM_VOLUME_PREPARED && !result.possible_effect);
++  snprintf(commit,sizeof(commit),"{\"token\":\"%s\",\"native_prepare_id\":\"%s\",\"native_reservation_id\":\"%s\",\"args_digest\":\"%s\",\"percent\":44,\"expected_input_path_digest\":\"%s\"}",token,prepare_id,reservation,args,identity.input_path_digest);
++  assert(room_volume_http(&hreq,"commit",commit)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==15);
++  assert(!strcmp(jparse_str_from_obj(reply,"outcome"),"pending")); jparse_free(reply);
++  assert(a->volume==27 && room_volume_http(&hreq,"commit",commit)==409);
++  snprintf(cancel,sizeof(cancel),"{\"token\":\"%s\",\"native_reservation_id\":\"%s\"}",token,reservation);
++  assert(room_volume_http(&hreq,"cancel",cancel)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==15); jparse_free(reply);
++  assert(!outputs_room_volume_before_write(token) && a->volume==27);
++  outputs_room_volume_complete(token,false); room_volume_fixture_end_pin();
++  outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
++  evbuffer_free(hreq.in_body); evbuffer_free(hreq.out_body);
++  puts("PASS actual volume HTTP7/10/15-field contracts; duplicate keys in both nestedobjects, unknownnestedfields, trailing/malformedunicode/string/bool/overflow reject beforetokenmint");
++}
++
+ int main(void)
+ {
+   evbase_player = event_base_new();
+@@ -997,6 +1179,8 @@ int main(void)
+   durable_disk_failure_unknown_and_stale_generation();
+   exact_transport_route_pin_owner();
+   exact_transport_http_contract();
++  exact_room_volume_owner();
++  exact_room_volume_http_contract();
+   event_free(outputs_deferredev);
+   event_base_free(evbase_player);
+   sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);

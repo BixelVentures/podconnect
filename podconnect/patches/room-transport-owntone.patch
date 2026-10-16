@@ -1,0 +1,913 @@
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index f453e5f..5117a50 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1810,6 +1810,165 @@ jsonapi_reply_output_attention_get(struct httpd_request *hreq)
+   return HTTP_OK;
+ }
+ 
++static json_object *
++transport_identity_json(const struct output_transport_identity *s)
++{
++  json_object *o=json_object_new_object();
++  json_object_object_add(o,"process",json_object_new_string(s->process));
++  attention_json_u64(o,"device_id",s->device_id);
++  attention_json_u64(o,"device_incarnation",s->device_incarnation);
++  attention_json_u64(o,"session_epoch",s->session_epoch);
++  attention_json_u64(o,"route_revision",s->route_revision);
++  attention_json_u64(o,"selection_revision",s->selection_revision);
++  attention_json_u64(o,"input_generation",s->input_generation);
++  attention_json_u64(o,"input_item_id",s->input_item_id);
++  json_object_object_add(o,"input_path_digest",json_object_new_string(s->input_path_digest));
++  return o;
++}
++
++static int
++transport_json_reply(struct httpd_request *hreq, json_object *reply)
++{
++  int ret=evbuffer_add_printf(hreq->out_body,"%s",json_object_to_json_string(reply));
++  jparse_free(reply);
++  return ret<0 ? HTTP_INTERNAL : HTTP_OK;
++}
++
++static int
++jsonapi_reply_transport_state(struct httpd_request *hreq)
++{
++  struct output_transport_identity identity;
++  uint64_t id;
++  bool busy;
++  json_object *reply, *actions;
++  const char *names[]={"pause","resume","next","previous"};
++  size_t i;
++  if (safe_atou64(hreq->path_parts[2],&id)<0
++      || player_transport_state_get(id,&identity,&busy)<0) return 409;
++  reply=json_object_new_object(); actions=json_object_new_array();
++  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_state.v1"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true));
++  json_object_object_add(reply,"identity",transport_identity_json(&identity));
++  json_object_object_add(reply,"busy",json_object_new_boolean(busy));
++  /* Physical volume is unavailable until its separate admission contract is reviewed. */
++  if (!busy) for (i=0;i<ARRAY_SIZE(names);i++) json_object_array_add(actions,json_object_new_string(names[i]));
++  json_object_object_add(reply,"actions",actions);
++  json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  return transport_json_reply(hreq,reply);
++}
++
++static bool
++transport_json_string(json_object *body, const char *key, char *destination, size_t capacity)
++{
++  json_object *field;
++  const char *value;
++  size_t length;
++  if (!json_object_object_get_ex(body,key,&field) || !json_object_is_type(field,json_type_string)) return false;
++  value=json_object_get_string(field); length=json_object_get_string_len(field);
++  if (!length || length>=capacity || strlen(value)!=length) return false;
++  memcpy(destination,value,length+1);
++  return true;
++}
++
++/* This flat wire protocol has only canonical ASCII identifier/action strings
++ * and an optional integer. Escapes have no valid purpose. Counting unquoted
++ * colons against parsed keys rejects json-c's duplicate-key collapse without
++ * inventing another general JSON parser; strict parse_end rejects suffix data. */
++static json_object *
++transport_parse_body(struct evbuffer *buffer)
++{
++  size_t length=evbuffer_get_length(buffer), i, end, colons=0;
++  const unsigned char *text=evbuffer_pullup(buffer,-1);
++  bool quoted=false;
++  struct json_tokener *tokener;
++  json_object *body;
++  if (!text || !length || length>1024) return NULL;
++  for (i=0;i<length;i++)
++    {
++      if (!text[i] || text[i]=='\\' || text[i]>=128) return NULL;
++      if (text[i]=='"') quoted=!quoted;
++      else if (!quoted && text[i]==':') colons++;
++    }
++  if (quoted) return NULL;
++  tokener=json_tokener_new();
++  if (!tokener) return NULL;
++  json_tokener_set_flags(tokener,JSON_TOKENER_STRICT);
++  body=json_tokener_parse_ex(tokener,(const char *)text,length);
++  end=json_tokener_get_parse_end(tokener);
++  if (json_tokener_get_error(tokener)!=json_tokener_success || !body
++      || !json_object_is_type(body,json_type_object) || colons!=json_object_object_length(body))
++    { if (body) json_object_put(body); body=NULL; }
++  for (i=end;body && i<length;i++)
++    if (text[i]!=' ' && text[i]!='\t' && text[i]!='\r' && text[i]!='\n')
++      { json_object_put(body); body=NULL; }
++  json_tokener_free(tokener);
++  return body;
++}
++
++static int
++jsonapi_reply_transport_write(struct httpd_request *hreq)
++{
++  struct output_transport_request request={.percent=-1};
++  struct output_transport_result result;
++  json_object *body=transport_parse_body(hreq->in_body), *reply, *percent;
++  bool commit=!strcmp(hreq->path_parts[4],"commit"), volume;
++  int expected, ret=HTTP_BADREQUEST;
++  if (!body || !json_object_is_type(body,json_type_object)
++      || safe_atou64(hreq->path_parts[2],&request.device_id)<0
++      || !transport_json_string(body,"native_prepare_id",request.native_prepare_id,sizeof(request.native_prepare_id))
++      || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
++      || !transport_json_string(body,"action",request.action,sizeof(request.action))) goto out;
++  volume=!strcmp(request.action,"volume");
++  expected=3+(commit?2:0)+(volume?1:0);
++  if (json_object_object_length(body)!=expected) goto out;
++  if (commit && (!transport_json_string(body,"token",request.token,sizeof(request.token))
++      || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest)))) goto out;
++  if (volume)
++    {
++      if (!json_object_object_get_ex(body,"percent",&percent) || !json_object_is_type(percent,json_type_int)
++          || json_object_get_int64(percent)<0 || json_object_get_int64(percent)>100) goto out;
++      request.percent=json_object_get_int(percent);
++    }
++  ret=409;
++  if ((commit ? player_transport_commit(&request,&result) : player_transport_prepare(&request,&result))<0) goto out;
++  reply=json_object_new_object();
++  json_object_object_add(reply,"schema",json_object_new_string(commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true));
++  json_object_object_add(reply,"token",json_object_new_string(result.command.token));
++  if (!commit) json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
++  if (commit)
++    {
++      json_object_object_add(reply,"native_prepare_id",json_object_new_string(result.command.native_prepare_id));
++      json_object_object_add(reply,"args_digest",json_object_new_string(result.command.args_digest));
++    }
++  json_object_object_add(reply,commit ? "pin_remaining_ms" : "expires_after_ms",json_object_new_int(result.remaining_ms));
++  if (commit) json_object_object_add(reply,"outcome",json_object_new_string(result.outcome==1 ? "pending" : "accepted"));
++  if (commit) json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  ret=transport_json_reply(hreq,reply);
++ out:
++  jparse_free(body);
++  return ret;
++}
++
++static int
++jsonapi_reply_transport_result(struct httpd_request *hreq)
++{
++  struct output_transport_result result;
++  uint64_t id;
++  json_object *reply;
++  if (safe_atou64(hreq->path_parts[2],&id)<0
++      || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id) return HTTP_NOTFOUND;
++  reply=json_object_new_object();
++  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_result.v1"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true));
++  json_object_object_add(reply,"token",json_object_new_string(result.command.token));
++  json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
++  json_object_object_add(reply,"outcome",json_object_new_string(result.outcome==1 ? "pending" : result.outcome==-1 ? "failed" : result.outcome==-2 ? "unknown" : "accepted"));
++  json_object_object_add(reply,"pin_remaining_ms",json_object_new_int(result.remaining_ms));
++  json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  return transport_json_reply(hreq,reply);
++}
++
+ static int
+ jsonapi_reply_output_attention_put(struct httpd_request *hreq)
+ {
+@@ -4940,6 +5099,10 @@ static struct httpd_uri_map adm_handlers[] =
+     { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/state$", jsonapi_reply_transport_state },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/prepare$", jsonapi_reply_transport_write },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/commit$", jsonapi_reply_transport_write },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/result/[a-f0-9-]+$", jsonapi_reply_transport_result },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_get },
+     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_put },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention/[[:digit:]]+$", jsonapi_reply_output_attention_result },
+diff --git a/src/outputs.c b/src/outputs.c
+index a5ada22..81440e2 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -141,6 +141,209 @@ static bool outputs_got_new_subscription;
+ 
+ 
+ 
++/* Transport tokens never reuse attention leases or receipts. The bounded store
++ * may evict an old token, but an unknown token can never be committed again. */
++#define OUTPUT_TRANSPORT_SLOTS 64
++struct transport_slot
++{
++  struct output_transport_result result;
++  struct timespec expiry;
++  bool used;
++};
++static struct transport_slot transport_slots[OUTPUT_TRANSPORT_SLOTS];
++static struct transport_slot *transport_pin;
++static struct timespec transport_pin_expiry;
++static uint64_t transport_selection_revision = 1;
++static uint64_t transport_input_generation = 1;
++static uint64_t transport_input_item;
++static char transport_input_path_digest[65];
++
++static unsigned
++transport_remaining(const struct timespec *expiry)
++{
++  struct timespec now;
++  int64_t ns;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return OUTPUT_TRANSPORT_TTL_MS; /* Clock failure cannot unlock. */
++  ns = (int64_t)(expiry->tv_sec - now.tv_sec) * 1000000000LL + expiry->tv_nsec - now.tv_nsec;
++  return ns > 0 ? (unsigned)((ns + 999999) / 1000000) : 0;
++}
++
++bool
++outputs_transport_busy(void)
++{
++  if (transport_pin && !transport_remaining(&transport_pin_expiry)) transport_pin = NULL;
++  return transport_pin != NULL;
++}
++
++static void
++transport_selection_changed(void)
++{
++  if (transport_selection_revision != UINT64_MAX) transport_selection_revision++;
++}
++
++void
++outputs_transport_input_changed(uint64_t item_id, const char *path, bool pipe_input)
++{
++  unsigned char digest[32];
++  static const char hex[]="0123456789abcdef";
++  size_t i;
++  if (transport_input_generation != UINT64_MAX) transport_input_generation++;
++  transport_input_item = item_id;
++  memset(transport_input_path_digest,0,sizeof(transport_input_path_digest));
++  if (!item_id || !path || !*path || !pipe_input) return;
++  /* Exact actual source path bytes, no caller echo or path normalization. */
++  gcry_md_hash_buffer(GCRY_MD_SHA256,digest,path,strlen(path));
++  for (i=0;i<32;i++)
++    { transport_input_path_digest[2*i]=hex[digest[i]>>4]; transport_input_path_digest[2*i+1]=hex[digest[i]&15]; }
++}
++
++static bool
++transport_hex(const char *text, size_t length)
++{
++  size_t i;
++  if (!text || strlen(text) != length) return false;
++  for (i = 0; i < length; i++)
++    if (!((text[i] >= '0' && text[i] <= '9') || (text[i] >= 'a' && text[i] <= 'f'))) return false;
++  return true;
++}
++
++static bool
++transport_command_valid(const struct output_transport_request *r)
++{
++  if (!r || !r->device_id || !transport_hex(r->native_prepare_id,32) || !transport_hex(r->args_digest,64)) return false;
++  if (!strcmp(r->action,"volume")) return r->percent >= 0 && r->percent <= 100;
++  return r->percent == -1 && (!strcmp(r->action,"pause") || !strcmp(r->action,"resume")
++      || !strcmp(r->action,"next") || !strcmp(r->action,"previous"));
++}
++
++static int
++transport_identity_get(uint64_t id, struct output_transport_identity *state)
++{
++  struct output_device *device = outputs_device_get(id), *scan;
++  int selected = 0;
++  if (!device || !state || !outputs_process[0] || !device->selected || !device->advertised
++      || device->type != OUTPUT_TYPE_AIRPLAY || !device->session || device->state < OUTPUT_STATE_CONNECTED
++      || device->busy || device->prevent_playback || device->attention_retiring_session
++      || device->session_epoch == UINT64_MAX || device->route_revision == UINT64_MAX
++      || transport_selection_revision == UINT64_MAX || transport_input_generation == UINT64_MAX
++      || !transport_input_item || !transport_input_path_digest[0]) return -1;
++  for (scan = outputs_device_list; scan; scan = scan->next) if (scan->selected) selected++;
++  if (selected != 1) return -1;
++  memset(state,0,sizeof(*state));
++  memcpy(state->process,outputs_process,sizeof(state->process));
++  state->device_id=id; state->device_incarnation=device->incarnation;
++  state->session_epoch=device->session_epoch; state->route_revision=device->route_revision;
++  state->selection_revision=transport_selection_revision;
++  state->input_generation=transport_input_generation; state->input_item_id=transport_input_item;
++  memcpy(state->input_path_digest,transport_input_path_digest,sizeof(state->input_path_digest));
++  return 0;
++}
++
++int
++outputs_transport_state_get(uint64_t id, struct output_transport_identity *identity, bool *busy)
++{
++  if (!busy || transport_identity_get(id,identity)<0) return -1;
++  *busy=outputs_transport_busy();
++  return 0;
++}
++
++static bool
++transport_identity_equal(const struct output_transport_identity *a, const struct output_transport_identity *b)
++{
++  return !strcmp(a->process,b->process) && a->device_id==b->device_id
++    && a->device_incarnation==b->device_incarnation && a->session_epoch==b->session_epoch
++    && a->route_revision==b->route_revision && a->selection_revision==b->selection_revision
++    && a->input_generation==b->input_generation && a->input_item_id==b->input_item_id
++    && !strcmp(a->input_path_digest,b->input_path_digest);
++}
++
++static struct transport_slot *
++transport_find(const char *token)
++{
++  size_t i;
++  if (!token || strlen(token)!=32) return NULL;
++  for (i=0;i<ARRAY_SIZE(transport_slots);i++)
++    if (!strcmp(transport_slots[i].result.command.token,token)) return &transport_slots[i];
++  return NULL;
++}
++
++bool
++outputs_transport_current(const struct output_transport_result *operation)
++{
++  struct output_transport_identity state;
++  return operation && outputs_transport_busy() && transport_pin->used
++    && !strcmp(transport_pin->result.command.token,operation->command.token)
++    && transport_identity_get(operation->identity.device_id,&state)==0
++    && transport_identity_equal(&operation->identity,&state);
++}
++
++int
++outputs_transport_prepare(const struct output_transport_request *request, struct output_transport_result *result)
++{
++  struct output_transport_identity identity;
++  struct transport_slot *slot=NULL;
++  size_t i;
++  if (!result || !transport_command_valid(request) || outputs_transport_busy()
++      || transport_identity_get(request->device_id,&identity)<0) return -1;
++  /* Manual physical volume needs its separately reviewed admission contract. */
++  if (!strcmp(request->action,"volume")) return -1;
++  for (i=0;i<ARRAY_SIZE(transport_slots);i++)
++    {
++      if (transport_remaining(&transport_slots[i].expiry)
++          && !strcmp(transport_slots[i].result.command.native_prepare_id,request->native_prepare_id)) return -1;
++      if (!slot && !transport_remaining(&transport_slots[i].expiry)) slot=&transport_slots[i];
++    }
++  if (!slot || clock_gettime(CLOCK_MONOTONIC,&slot->expiry)<0) return -1;
++  memset(&slot->result,0,sizeof(slot->result));
++  slot->result.identity=identity; slot->result.command=*request;
++  {
++    char uuid[37]; size_t j,k=0;
++    outputs_attention_uuid(uuid); /* randomness primitive only, no attention authority */
++    for (j=0;j<36;j++) if (uuid[j]!='-') slot->result.command.token[k++]=uuid[j];
++    slot->result.command.token[k]=0;
++  }
++  slot->expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
++  slot->used=false; slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS;
++  *result=slot->result;
++  return 0;
++}
++
++int
++outputs_transport_commit(const struct output_transport_request *request, struct output_transport_result *result)
++{
++  struct transport_slot *slot;
++  struct output_transport_identity identity;
++  if (!request || !result || !(slot=transport_find(request->token)) || slot->used) return -1;
++  slot->used=true; slot->result.outcome=-1; /* Consume before any validation/mutation: altered token cannot retry. */
++  if (!transport_remaining(&slot->expiry) || !transport_command_valid(request)
++      || request->device_id!=slot->result.command.device_id
++      || strcmp(request->native_prepare_id,slot->result.command.native_prepare_id)
++      || strcmp(request->action,slot->result.command.action)
++      || strcmp(request->args_digest,slot->result.command.args_digest)
++      || request->percent!=slot->result.command.percent
++      || !transport_hex(request->expected_input_path_digest,64)
++      || strcmp(request->expected_input_path_digest,slot->result.identity.input_path_digest)
++      || outputs_transport_busy()
++      || transport_identity_get(request->device_id,&identity)<0
++      || !transport_identity_equal(&slot->result.identity,&identity)) return -1;
++  if (clock_gettime(CLOCK_MONOTONIC,&transport_pin_expiry)<0) return -1;
++  transport_pin_expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
++  transport_pin=slot; slot->expiry=transport_pin_expiry;
++  slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS; slot->result.outcome=0;
++  *result=slot->result;
++  return slot->result.outcome<0 ? -1 : 0;
++}
++
++int
++outputs_transport_result_get(const char *token, struct output_transport_result *result)
++{
++  struct transport_slot *slot=transport_find(token);
++  if (!slot || !slot->used || !result) return -1;
++  *result=slot->result;
++  result->remaining_ms=outputs_transport_busy() && transport_pin==slot ? transport_remaining(&transport_pin_expiry) : 0;
++  return 0;
++}
++
+ int
+ outputs_device_effective_volume(const struct output_device *device)
+ {
+@@ -1269,6 +1472,7 @@ outputs_device_session_add(uint64_t device_id, void *session)
+   if (!device)
+     return -1;
+ 
++  if (outputs_transport_busy()) return -1; /* No newer session can inherit a pin. */
+   if (device->session_epoch >= UINT64_MAX - 1)
+     return -1;
+   device->session_epoch++;
+@@ -1284,6 +1488,7 @@ outputs_device_session_remove(uint64_t device_id)
+   device = outputs_device_get(device_id);
+   if (device)
+     {
++      transport_selection_changed(); /* Loss retires identity, never its global pin. */
+       device->session = NULL;
+       if (device->session_epoch != UINT64_MAX)
+         device->session_epoch++;
+@@ -1499,8 +1704,9 @@ outputs_device_add(struct output_device *add, bool new_deselect)
+       if (keep_offset_ms != 0)
+ 	device->offset_ms = keep_offset_ms;
+ 
+-      if (new_deselect)
++      if (new_deselect || outputs_transport_busy())
+ 	device->selected = 0;
++      if (device->selected) transport_selection_changed();
+ 
+       device->next = outputs_device_list;
+       outputs_device_list = device;
+@@ -1556,6 +1762,7 @@ outputs_device_remove(struct output_device *remove)
+   struct output_device *prev;
+   int ret;
+ 
++  transport_selection_changed();
+   attention_restart_cancel(remove);
+ 
+   // Device stop should be able to handle that we invalidate the device, even
+@@ -1596,8 +1803,10 @@ outputs_device_remove(struct output_device *remove)
+ void
+ outputs_device_select(struct output_device *device, int max_volume)
+ {
++  if (outputs_transport_busy()) return; /* All selected-set entry points share owner. */
+   if (!device->selected)
+     {
++      transport_selection_changed();
+       if (device->route_revision != UINT64_MAX) device->route_revision++;
+       device->route_operation = 0;
+     }
+@@ -1629,8 +1838,10 @@ outputs_device_select(struct output_device *device, int max_volume)
+ void
+ outputs_device_deselect(struct output_device *device)
+ {
++  if (outputs_transport_busy()) return;
+   if (device->selected)
+     {
++      transport_selection_changed();
+       if (device->route_revision != UINT64_MAX) device->route_revision++;
+       device->route_operation = 0;
+     }
+@@ -1648,6 +1859,7 @@ outputs_device_start(struct output_device *device, output_status_cb cb, bool onl
+   if (outputs[device->type]->disabled || !outputs[device->type]->device_start || !outputs[device->type]->device_probe)
+     return -1;
+ 
++  if (outputs_transport_busy() && (!device->session || device->attention_retiring_session == device->session)) return -1;
+   if (device->session && device->attention_retiring_session == device->session)
+     {
+       // The first command waits for exact native destruction, never claims running.
+@@ -1663,6 +1875,7 @@ outputs_device_start(struct output_device *device, output_status_cb cb, bool onl
+     }
+   if (device->session)
+     return 0; // Device is already running, nothing to do
++  if (outputs_transport_busy()) return -1;
+ 
+   if (only_probe)
+     ret = outputs[device->type]->device_probe(device, callback_add(device, cb));
+@@ -1683,7 +1896,7 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
+   device->attention_retiring_session = NULL;
+   if (!device->attention_restart_pending)
+     return;
+-  if (device->session || epoch == UINT64_MAX || device->session_epoch != epoch + 1
++  if (outputs_transport_busy() || device->session || epoch == UINT64_MAX || device->session_epoch != epoch + 1
+       || !device->selected || device->route_revision != device->attention_restart_route
+       || !device->advertised || outputs[device->type]->disabled)
+     {
+diff --git a/src/outputs.h b/src/outputs.h
+index ccc9693..732c952 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -87,6 +87,38 @@ enum output_device_state
+ };
+ 
+ 
++/* Exact-room transport purpose is independent of attention volume authority.
++ * Every entry point executes on the player event loop. IDs are owner snapshots,
++ * not authorization supplied by a browser. Native admission is not audibility. */
++#define OUTPUT_TRANSPORT_TTL_MS 10000
++struct output_transport_identity
++{
++  char process[37];
++  char input_path_digest[65];
++  uint64_t device_id, device_incarnation, session_epoch, route_revision;
++  uint64_t selection_revision, input_generation, input_item_id;
++};
++struct output_transport_request
++{
++  uint64_t device_id;
++  char token[33], native_prepare_id[33], action[9], args_digest[65], expected_input_path_digest[65];
++  int percent; /* -1 for non-volume, exact 0..100 for volume */
++};
++struct output_transport_result
++{
++  struct output_transport_identity identity;
++  struct output_transport_request command;
++  unsigned remaining_ms;
++  int outcome; /* 0 accepted, 1 pending, -1 failed, -2 unknown */
++};
++int outputs_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
++int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
++int outputs_transport_commit(const struct output_transport_request *, struct output_transport_result *);
++int outputs_transport_result_get(const char *, struct output_transport_result *);
++bool outputs_transport_current(const struct output_transport_result *);
++bool outputs_transport_busy(void);
++void outputs_transport_input_changed(uint64_t item_id, const char *path, bool pipe_input);
++
+ /* Native attention is an overlay on manual desire, never a replacement base.
+  * All entry points below run on the existing player event loop. A result is a
+  * protocol observation, not an acoustic or hardware readback receipt. */
+diff --git a/src/player.c b/src/player.c
+index a12086d..8ea4452 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -669,6 +669,7 @@ source_next_create(struct player_source *current)
+       return NULL;
+     }
+ 
++  if (outputs_transport_busy()) return NULL; /* A pin never advances into another input. */
+   queue_item = queue_item_next(current->item_id);
+   if (!queue_item)
+     return NULL;
+@@ -797,6 +798,9 @@ session_update_play_eof(void)
+   struct player_source *ps = pb_session.playing_now;
+ 
+   pb_session.playing_now = pb_session.playing_now->next;
++  outputs_transport_input_changed(pb_session.playing_now ? pb_session.playing_now->item_id : 0,
++      pb_session.playing_now ? pb_session.playing_now->path : NULL,
++      pb_session.playing_now && pb_session.playing_now->data_kind==DATA_KIND_PIPE);
+ 
+   // Remove the item we completed playing from source_list
+   if (pb_session.playing_now)
+@@ -1749,6 +1753,8 @@ pb_session_start(struct db_queue_item *queue_item, uint32_t seek_ms)
+   uint32_t item_id;
+   int ret;
+ 
++  if (outputs_transport_busy()) return -1; /* A pin cannot adopt another input. */
++  outputs_transport_input_changed(0,NULL,false);
+   ps = source_create(queue_item, seek_ms);
+ 
+   // Clears the session and attaches the new source as pb_session.source_list
+@@ -1771,6 +1777,8 @@ pb_session_start(struct db_queue_item *queue_item, uint32_t seek_ms)
+   if (!pb_session.playing_now)
+     return -1;
+ 
++  outputs_transport_input_changed(pb_session.playing_now->item_id,pb_session.playing_now->path,
++      pb_session.playing_now->data_kind==DATA_KIND_PIPE);
+   return ret;
+ }
+ 
+@@ -1789,6 +1797,7 @@ pb_session_pause(void)
+ static void
+ pb_session_stop(void)
+ {
++  outputs_transport_input_changed(0,NULL,false); /* Emergency loss invalidates identity; pin remains busy. */
+   pb_timer_stop();
+ 
+   seek_save();
+@@ -1984,6 +1993,7 @@ playing_now(void *arg, int *retval)
+ static enum command_state
+ playback_stop(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = 0;
+@@ -2050,6 +2060,9 @@ playback_start_item(void *arg, int *retval)
+   uint32_t seek_ms;
+   int ret;
+ 
++  if (outputs_transport_busy() && (queue_item || player_state == PLAY_STOPPED))
++    { *retval=-1; return COMMAND_END; }
++
+   if (player_state == PLAY_PLAYING)
+     {
+       DPRINTF(E_DBG, L_PLAYER, "Player is already playing, ignoring call to playback start\n");
+@@ -2112,7 +2125,7 @@ playback_start_item(void *arg, int *retval)
+   // Note that if session count is 0 then retval should never be positive,
+   // because that would mean we are initiating a session. Just to be safe, we
+   // check anyway.
+-  if (speaker_autoselect && outputs_sessions_count() == 0 && *retval <= 0)
++  if (!outputs_transport_busy() && speaker_autoselect && outputs_sessions_count() == 0 && *retval <= 0)
+     {
+       for (device = outputs_list(); device; device = device->next)
+ 	{
+@@ -2141,6 +2154,7 @@ playback_start_item(void *arg, int *retval)
+ static enum command_state
+ playback_start_id(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   struct query_params qp = { .type = Q_ITEMS };
+   struct db_queue_item *queue_item = NULL;
+   union player_arg *cmdarg = arg;
+@@ -2470,6 +2484,7 @@ playback_pause_bh(void *arg, int *retval)
+ static enum command_state
+ playback_pause(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   if (player_state == PLAY_STOPPED)
+     {
+       *retval = -1;
+@@ -2525,6 +2540,7 @@ playback_flush(void *arg, int *retval)
+ static enum command_state
+ playback_seek(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   // Only check if the current playing track is seekable, other checks will be done in playback_pause()
+   if (pb_session.playing_now && !pb_session.playing_now->is_seekable)
+     {
+@@ -2684,6 +2700,7 @@ speaker_get_byindex(void *arg, int *retval)
+ static enum command_state
+ speaker_set(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   struct speaker_set_param *speaker_set_param = arg;
+   struct output_device *device;
+   uint64_t *ids;
+@@ -2736,6 +2753,7 @@ speaker_set(void *arg, int *retval)
+ static enum command_state
+ speaker_enable(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   uint64_t *id = arg;
+   struct output_device *device;
+   int max_volume;
+@@ -2763,6 +2781,7 @@ speaker_enable(void *arg, int *retval)
+ static enum command_state
+ speaker_disable(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   uint64_t *id = arg;
+   struct output_device *device;
+ 
+@@ -2898,6 +2917,7 @@ speaker_busy_set(void *arg, int *retval)
+ static enum command_state
+ speaker_format_set(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   struct speaker_attr_param *param = arg;
+   struct output_device *device;
+ 
+@@ -2925,6 +2945,7 @@ speaker_format_set(void *arg, int *retval)
+ static enum command_state
+ speaker_offset_ms_set(void *arg, int *retval)
+ {
++  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   struct speaker_attr_param *param = arg;
+   struct output_device *device;
+ 
+@@ -3088,6 +3109,50 @@ streaming_deregister(void *arg, int *retval)
+ }
+ 
+ 
++struct player_transport_command
++{
++  const struct output_transport_request *request;
++  struct output_transport_result *result;
++  struct output_transport_identity *identity;
++  bool *busy;
++  const char *token;
++  uint64_t id;
++  int action;
++};
++static enum command_state
++transport_command(void *arg, int *retval)
++{
++  struct player_transport_command *c=arg;
++  if (c->action!=2 && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
++      || pb_session.reading_now!=pb_session.playing_now))
++    { *retval=-1; return COMMAND_END; }
++  if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
++  else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
++  else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
++  else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
++  return COMMAND_END;
++}
++int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
++{
++  struct player_transport_command c={.request=r,.result=out,.action=0};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++int player_transport_commit(const struct output_transport_request *r, struct output_transport_result *out)
++{
++  struct player_transport_command c={.request=r,.result=out,.action=1};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++int player_transport_result_get(const char *token, struct output_transport_result *out)
++{
++  struct player_transport_command c={.token=token,.result=out,.action=2};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++int player_transport_state_get(uint64_t id, struct output_transport_identity *identity, bool *busy)
++{
++  struct player_transport_command c={.id=id,.identity=identity,.busy=busy,.action=3};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++
+ struct player_attention_command
+ {
+   const struct output_attention_request *request;
+diff --git a/src/player.h b/src/player.h
+index 2c43bda..6aead4c 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -236,4 +236,14 @@ player_init(void);
+ void
+ player_deinit(void);
+ 
++/* Additive transport owner adapters: synchronous event-loop admission only. */
++struct output_transport_request;
++struct output_transport_result;
++struct output_transport_identity;
++int player_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
++int player_transport_commit(const struct output_transport_request *, struct output_transport_result *);
++int player_transport_result_get(const char *, struct output_transport_result *);
++int player_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
++
+ #endif /* !__PLAYER_H__ */
++
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+index 7832a22..cacc21b 100644
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -55,7 +55,7 @@ static void selection_fixture_free(void *pointer)
+ }
+ static void selection_fixture_json_free(json_object *object)
+ {
+-  assert(object);
++  if (!object) return; /* Match real jparse_free(NULL) for rejected strict bodies. */
+   selection_fixture_request_freed++;
+   jparse_free(object);
+ }
+@@ -805,6 +805,161 @@ static void durable_disk_failure_unknown_and_stale_generation(void)
+   clear_devices();
+ }
+ 
++/* The fixture directly routes existing synchronous player API adapters to the
++ * actual output owner; HTTP parsing and owner state are the production TUs. */
++int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
++{ return outputs_transport_prepare(r,out); }
++int player_transport_commit(const struct output_transport_request *r, struct output_transport_result *out)
++{ return outputs_transport_commit(r,out); }
++int player_transport_state_get(uint64_t id, struct output_transport_identity *out, bool *busy)
++{ return outputs_transport_state_get(id,out,busy); }
++int player_transport_result_get(const char *token, struct output_transport_result *out)
++{ return outputs_transport_result_get(token,out); }
++
++/* Controlled owner-state regression only: no real connected speaker or
++ * protocol success is fabricated by these struct fixtures. */
++static struct output_transport_request transport_fixture_request(const char *action)
++{
++  static unsigned n;
++  struct output_transport_request r={.device_id=1,.percent=-1};
++  snprintf(r.native_prepare_id,sizeof(r.native_prepare_id),"%032x",++n);
++  memset(r.args_digest,'a',64); r.args_digest[64]=0;
++  snprintf(r.action,sizeof(r.action),"%s",action);
++  return r;
++}
++static void transport_fixture_end_pin(void)
++{
++  if (transport_pin) transport_pin_expiry.tv_sec-=11;
++  assert(!outputs_transport_busy());
++}
++static void exact_transport_route_pin_owner(void)
++{
++  struct output_device *a=add_device(1), *b=add_device(2);
++  struct output_transport_request request, changed;
++  struct output_transport_result prepared, result;
++  struct output_transport_identity identity;
++  bool busy;
++  unsigned char session_a, session_b;
++  int original_volume;
++  outputs_device_select(a,-1);
++  assert(outputs_device_session_add(a->id,&session_a)==0);
++  a->state=OUTPUT_STATE_CONNECTED;
++  outputs_transport_input_changed(101,"/srv/media/spotify",true);
++  assert(outputs_transport_state_get(1,&identity,&busy)==0 && !busy);
++  outputs_transport_input_changed(101,"http://radio.invalid",false);
++  assert(outputs_transport_state_get(1,&identity,&busy)<0);
++  outputs_transport_input_changed(101,"/srv/media/spotify",true);
++  request=transport_fixture_request("resume");
++  assert(outputs_transport_prepare(&request,&prepared)==0);
++  assert(strlen(prepared.command.token)==32 && prepared.remaining_ms==10000);
++  /* Route ABA is rejected even though exactly the original output is selected. */
++  outputs_device_deselect(a); outputs_device_select(a,-1);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65);
++  assert(outputs_transport_commit(&request,&result)<0);
++  assert(outputs_transport_commit(&request,&result)<0 && !outputs_transport_busy());
++  request=transport_fixture_request("pause"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  outputs_device_select(b,-1); request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)<0); outputs_device_deselect(b);
++  /* Exact session replacement, same pointer ABA, and source replacement fence. */
++  request=transport_fixture_request("next"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  outputs_device_session_remove(1); assert(outputs_device_session_add(1,&session_a)==0);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65); assert(outputs_transport_commit(&request,&result)<0);
++  request=transport_fixture_request("previous"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  outputs_transport_input_changed(102,"/srv/media/spotify",true); outputs_transport_input_changed(101,"/srv/media/spotify",true);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65); assert(outputs_transport_commit(&request,&result)<0);
++  request=transport_fixture_request("resume"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65); changed=request; changed.args_digest[0]='b';
++  assert(outputs_transport_commit(&changed,&result)<0);
++  assert(outputs_transport_commit(&request,&result)<0); /* Tamper consumes exact token. */
++  request=transport_fixture_request("pause"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65); transport_find(request.token)->expiry.tv_sec-=11;
++  assert(outputs_transport_commit(&request,&result)<0);
++  {
++    char own_digest[65];
++    assert(outputs_transport_state_get(1,&identity,&busy)==0);
++    memcpy(own_digest,identity.input_path_digest,65);
++    outputs_transport_input_changed(101,"/srv/media/other",true);
++    request=transport_fixture_request("pause"); assert(outputs_transport_prepare(&request,&prepared)==0);
++    request=prepared.command; memcpy(request.expected_input_path_digest,own_digest,65);
++    assert(outputs_transport_commit(&request,&result)<0); /* Other engine FIFO cannot borrow this route. */
++    outputs_transport_input_changed(101,"/srv/media/spotify",true);
++  }
++  request=transport_fixture_request("volume"); request.percent=27;
++  assert(outputs_transport_prepare(&request,&result)<0); /* No physical volume authority. */
++  request=transport_fixture_request("resume"); assert(outputs_transport_prepare(&request,&prepared)==0);
++  request=prepared.command; memcpy(request.expected_input_path_digest,prepared.identity.input_path_digest,65); original_volume=a->volume;
++  assert(outputs_transport_commit(&request,&result)==0 && outputs_transport_busy());
++  assert(outputs_transport_current(&result));
++  assert(a->volume==original_volume); /* No 35 or manual-volume write. */
++  outputs_device_select(b,-1); outputs_device_deselect(a);
++  assert(a->selected && !b->selected && a->volume==original_volume);
++  assert(outputs_device_session_add(2,&session_b)<0);
++  assert(outputs_transport_commit(&request,&prepared)<0); /* One use. */
++  assert(outputs_transport_result_get(result.command.token,&prepared)==0);
++  assert(outputs_transport_busy()); /* Reading an ACK never releases early. */
++  outputs_device_session_remove(1);
++  assert(!outputs_transport_current(&result) && outputs_transport_busy());
++  assert(outputs_device_session_add(1,&session_a)<0); /* Loss does not hand off. */
++  outputs_device_select(b,-1); assert(!b->selected);
++  transport_fixture_end_pin();
++  assert(outputs_device_session_add(1,&session_a)==0);
++  outputs_device_session_remove(1);
++  clear_devices();
++  puts("PASS transport owner route/session/input ABA, whole-set pin, one-use/tamper/expiry, loss quarantine, no volume/start35; no device claim");
++}
++
++static int transport_http(struct httpd_request *hreq, const char *action, const char *body)
++{
++  hreq->path_parts[2]="1"; hreq->path_parts[4]=(char *)action;
++  evbuffer_drain(hreq->in_body,evbuffer_get_length(hreq->in_body));
++  evbuffer_drain(hreq->out_body,evbuffer_get_length(hreq->out_body));
++  if (body) evbuffer_add(hreq->in_body,body,strlen(body));
++  return !strcmp(action,"state") ? jsonapi_reply_transport_state(hreq) : jsonapi_reply_transport_write(hreq);
++}
++static void exact_transport_http_contract(void)
++{
++  struct output_device *a=add_device(1);
++  struct httpd_request hreq={0};
++  unsigned char session;
++  char body[512], token[33], input_digest[65];
++  const char *base="\"native_prepare_id\":\"ffffffffffffffffffffffffffffffff\",\"action\":\"resume\",\"args_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
++  json_object *reply, *field, *identity;
++  hreq.in_body=evbuffer_new(); hreq.out_body=evbuffer_new();
++  outputs_device_select(a,-1); assert(outputs_device_session_add(1,&session)==0);
++  a->state=OUTPUT_STATE_CONNECTED; outputs_transport_input_changed(301,"/srv/media/spotify",true);
++  assert(transport_http(&hreq,"state",NULL)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==6);
++  assert(json_object_object_get_ex(reply,"identity",&identity) && json_object_object_length(identity)==9);
++  assert(json_object_object_get_ex(reply,"actions",&field) && json_object_array_length(field)==4); jparse_free(reply);
++  snprintf(body,sizeof(body),"{%s,\"action\":\"resume\"}",base);
++  assert(transport_http(&hreq,"prepare",body)==HTTP_BADREQUEST);
++  snprintf(body,sizeof(body),"{%s} {}",base);
++  assert(transport_http(&hreq,"prepare",body)==HTTP_BADREQUEST);
++  snprintf(body,sizeof(body),"{%s,\"unexpected\":true}",base);
++  assert(transport_http(&hreq,"prepare",body)==HTTP_BADREQUEST);
++  snprintf(body,sizeof(body),"{%s,\"percent\":27}",base);
++  assert(transport_http(&hreq,"prepare",body)==HTTP_BADREQUEST);
++  snprintf(body,sizeof(body),"{%s}",base);
++  assert(transport_http(&hreq,"prepare",body)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==5);
++  assert(json_object_object_get_ex(reply,"token",&field) && json_object_get_string_len(field)==32);
++  snprintf(token,sizeof(token),"%s",json_object_get_string(field));
++  assert(json_object_object_get_ex(reply,"identity",&identity));
++  snprintf(input_digest,sizeof(input_digest),"%s",jparse_str_from_obj(identity,"input_path_digest")); jparse_free(reply);
++  snprintf(body,sizeof(body),"{%s,\"token\":\"%s\",\"expected_input_path_digest\":\"%s\"}",base,token,input_digest);
++  assert(transport_http(&hreq,"commit",body)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(reply && json_object_object_length(reply)==8);
++  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_transport_commit.v1"));
++  assert(!strcmp(jparse_str_from_obj(reply,"outcome"),"accepted")); jparse_free(reply);
++  assert(transport_http(&hreq,"commit",body)==409);
++  assert(transport_http(&hreq,"state",NULL)==HTTP_OK);
++  reply=jparse_obj_from_evbuffer(hreq.out_body);
++  assert(json_object_object_get_ex(reply,"actions",&field) && json_object_array_length(field)==0); jparse_free(reply);
++  transport_fixture_end_pin(); outputs_device_session_remove(1); clear_devices();
++  evbuffer_free(hreq.in_body); evbuffer_free(hreq.out_body);
++  puts("PASS actual transport HTTP closed bodies,9-field identity,32hex token,5-field prepare,8-field commit,4 actions,oneuse andbusy read");
++}
++
+ int main(void)
+ {
+   evbase_player = event_base_new();
+@@ -840,6 +995,8 @@ int main(void)
+   selection_api_preserves_failure_and_cleanup();
+   durable_crash_origin_all_outputs_and_terminal_proof();
+   durable_disk_failure_unknown_and_stale_generation();
++  exact_transport_route_pin_owner();
++  exact_transport_http_contract();
+   event_free(outputs_deferredev);
+   event_base_free(evbase_player);
+   sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);

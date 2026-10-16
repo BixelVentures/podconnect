@@ -1,0 +1,1363 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -29,7 +29,8 @@
+ }
+ 
+ type ConcreteApiServer struct {
+-	log librespot.Logger
++	roomVolumes roomVolumeStore
++	log         librespot.Logger
+ 
+ 	allowOrigin string
+ 	certFile    string
+@@ -749,6 +750,11 @@
+ 
+ 		s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+ 	})
++	m.HandleFunc("/player/room_volume/state", s.handleRoomVolumeState)
++	m.HandleFunc("/player/room_volume/prepare", s.handleRoomVolumePrepare)
++	m.HandleFunc("/player/room_volume/commit", s.handleRoomVolumeCommit)
++	m.HandleFunc("/player/room_volume/cancel", s.handleRoomVolumeCancel)
++	m.HandleFunc("/player/room_volume/result", s.handleRoomVolumeResult)
+ 	m.HandleFunc("/player/room_transport/state", s.handleRoomTransportState)
+ 	m.HandleFunc("/player/room_transport/prepare", s.handleRoomTransportPrepare)
+ 	m.HandleFunc("/player/room_transport/commit", s.handleRoomTransportCommit)
+diff --git a/daemon/device_alias.go b/daemon/device_alias.go
+--- a/daemon/device_alias.go
++++ b/daemon/device_alias.go
+@@ -106,7 +106,7 @@
+ func (p *AppPlayer) selectLocalAlias(data ApiRequestDataSelectAlias) (*ApiResponseSelectAlias, error) {
+ 	// Close and local commit share only this short admission boundary.
+ 	p.aliasMu.Lock()
+-	if p.aliasRetired || p.aliasFingerprint == "" || data.ExpectedRegistry != p.aliasFingerprint || data.ExpectedIncarnation != p.aliasIncarnation {
++	if p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasFingerprint == "" || data.ExpectedRegistry != p.aliasFingerprint || data.ExpectedIncarnation != p.aliasIncarnation {
+ 		p.aliasMu.Unlock()
+ 		return nil, ErrAliasConflict
+ 	}
+@@ -130,8 +130,4 @@
+ 	return &ApiResponseSelectAlias{AcceptedLocal: true, Binding: binding, ID: id}, nil
+ }
+ 
+-func (p *AppPlayer) retireAliases() {
+-	p.aliasMu.Lock()
+-	p.aliasRetired = true
+-	p.aliasMu.Unlock()
+-}
++func (p *AppPlayer) retireAliases() { p.retireRoomVolumeOwner() }
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,6 +30,10 @@
+ )
+ 
+ type AppPlayer struct {
++	roomVolumeReservation            *nativeRoomVolumeReservation
++	roomVolumeClosing                bool
++	roomCloseMu                      sync.Mutex
++	roomCloseDone                    chan struct{}
+ 	roomTransportOffer               *nativeTransportOffer
+ 	roomTransportPending             *nativeTransportOffer
+ 	aliasRevision                    uint64
+@@ -134,9 +138,9 @@
+ func (p *AppPlayer) handleConnectionMessage(ctx context.Context, msg dealer.Message, sp *spclient.Spclient) error {
+ 	id := msg.Headers["Spotify-Connection-Id"]
+ 	p.aliasMu.Lock()
+-	if p.aliasRetired {
++	if p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() {
+ 		p.aliasMu.Unlock()
+-		return fmt.Errorf("connection owner retired")
++		return fmt.Errorf("connection owner retired or reserved")
+ 	}
+ 	if p.spotConnId != id {
+ 		p.advanceRoomTransportGenerationLocked()
+@@ -219,6 +223,9 @@
+ }
+ 
+ func (p *AppPlayer) handlePlayerCommandWithSpclient(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
++	if p.roomVolumeBusy() {
++		return ErrAliasConflict
++	}
+ 	p.invalidateRoomTransportGeneration()
+ 	var transferState *connectpb.TransferState
+ 	if req.Command.Endpoint == "transfer" && len(req.Command.Data) > 0 {
+@@ -540,11 +547,44 @@
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+ 
++	if p.roomVolumeBusy() {
++		switch req.Type {
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort:
++		default:
++			return nil, ErrAliasConflict
++		}
++	}
+ 	switch req.Type {
+ 	case ApiRequestTypeResume, ApiRequestTypePause, ApiRequestTypeStop, ApiRequestTypePlayPause, ApiRequestTypeSeek, ApiRequestTypePrev, ApiRequestTypeNext, ApiRequestTypePlay, ApiRequestTypeSetVolume, ApiRequestTypeSetRepeatingContext, ApiRequestTypeSetRepeatingTrack, ApiRequestTypeSetShufflingContext, ApiRequestTypeAddToQueue, ApiRequestTypeQueueOccurrence:
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
++	case apiRoomVolumeState:
++		request := req.Data.(roomTransportStateRequest)
++		if (request.Context != nil && request.Context.Err() != nil) || ctx.Err() != nil {
++			return nil, ErrAliasConflict
++		}
++		identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++		if err != nil {
++			return nil, err
++		}
++		actions := []string{"volume"}
++		if p.roomVolumeBusy() {
++			actions = []string{}
++		}
++		return struct {
++			Schema   string                `json:"schema"`
++			Ready    bool                  `json:"ready"`
++			Identity roomTransportIdentity `json:"identity"`
++			Actions  []string              `json:"actions"`
++			Physical bool                  `json:"physical_result_verified"`
++		}{"podconnect.native_room_volume_state.v1", true, identity, actions, false}, nil
++	case apiRoomVolumePrepare:
++		return p.prepareRoomVolume(ctx, req.Data.(roomVolumePrepareActorRequest))
++	case apiRoomVolumeClaim:
++		return p.claimRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
++	case apiRoomVolumeConsume:
++		return p.consumeRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
+ 	case apiRoomTransportState:
+ 		return p.roomTransportState(ctx, req.Data.(roomTransportStateRequest))
+ 	case apiRoomTransportPrepare:
+@@ -779,6 +819,9 @@
+ }
+ 
+ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2PlayerCommand) error {
++	if p.roomVolumeBusy() {
++		return ErrAliasConflict
++	}
+ 	p.invalidateRoomTransportGeneration()
+ 	// Limit ourselves to 30 seconds for handling mpris commands
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+@@ -850,10 +893,28 @@
+ }
+ 
+ func (p *AppPlayer) Close() {
++	// Concurrent replacement paths must all wait for the same completed close.
++	// The short mutex is released before reservation wait, cancellation or I/O.
++	p.roomCloseMu.Lock()
++	if done := p.roomCloseDone; done != nil {
++		p.roomCloseMu.Unlock()
++		<-done
++		return
++	}
++	done := make(chan struct{})
++	p.roomCloseDone = done
++	p.roomCloseMu.Unlock()
++	defer close(done)
+ 	p.retireAliases()
+-	p.stop <- struct{}{}
+-	p.player.Close()
+-	p.sess.Close()
++	if p.stop != nil {
++		p.stop <- struct{}{}
++	}
++	if p.player != nil {
++		p.player.Close()
++	}
++	if p.sess != nil {
++		p.sess.Close()
++	}
+ }
+ 
+ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+@@ -877,6 +938,10 @@
+ 
+ 	for {
+ 		select {
++		case <-ctx.Done():
++			go p.Close()
++			p.waitRoomVolumeReservation(ctx)
++			return
+ 		case <-transportCleanup.C:
+ 			p.discardExpiredRoomTransport()
+ 		case <-p.stop:
+@@ -922,6 +987,9 @@
+ 
+ 			data, err := p.handleApiRequest(ctx, req)
+ 			req.Reply(data, err)
++			if !p.waitRoomVolumeReservation(ctx) {
++				return
++			}
+ 		case mprisReq, ok := <-mprisRecv:
+ 			if !ok {
+ 				continue
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -191,7 +191,7 @@
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
+ 	binding := p.aliasBindingLocked()
+-	if binding == nil || !binding.Ready || binding.RoomID != room || room == "" || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || !p.transportMappingCurrentLocked() {
++	if binding == nil || !binding.Ready || binding.RoomID != room || room == "" || p.roomVolumeClosing || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || !p.transportMappingCurrentLocked() {
+ 		return zero, ErrAliasConflict
+ 	}
+ 	for _, a := range p.aliasRegistry {
+@@ -292,7 +292,7 @@
+ 	return offer.Snapshot, nil
+ }
+ func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, parent, request context.Context) bool {
+-	if offer == nil || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
++	if offer == nil || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
+ 		return false
+ 	}
+ 	binding := p.aliasBindingLocked()
+diff --git a/daemon/room_volume.go b/daemon/room_volume.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_volume.go
+@@ -0,0 +1,425 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"regexp"
++	"strconv"
++	"sync"
++	"time"
++)
++
++const (
++	apiRoomVolumeState            ApiRequestType = "room_volume_state"
++	apiRoomVolumePrepare          ApiRequestType = "room_volume_prepare"
++	apiRoomVolumeClaim            ApiRequestType = "room_volume_claim"
++	apiRoomVolumeConsume          ApiRequestType = "room_volume_consume"
++	roomVolumeReservationLifetime                = 3 * time.Second
++	roomVolumeOfferLifetime                      = 5 * time.Second
++	roomVolumeStoreLimit                         = 128
++)
++
++var volumeHex32 = regexp.MustCompile(`^[a-f0-9]{32}$`)
++var volumeHex64 = regexp.MustCompile(`^[a-f0-9]{64}$`)
++var volumeUUID = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
++var volumeDecimal = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
++
++type roomVolumeScope struct {
++	AccountUserID string `json:"account_user_id"`
++	TargetID      string `json:"target_id"`
++	RoomID        string `json:"room_id"`
++	HomePodID     string `json:"homepod_id"`
++}
++type roomVolumeRoute struct {
++	Process           string `json:"process"`
++	DeviceID          string `json:"device_id"`
++	DeviceIncarnation string `json:"device_incarnation"`
++	SessionEpoch      string `json:"session_epoch"`
++	RouteRevision     string `json:"route_revision"`
++	SelectionRevision string `json:"selection_revision"`
++	InputGeneration   string `json:"input_generation"`
++	InputItemID       string `json:"input_item_id"`
++	InputPathDigest   string `json:"input_path_digest"`
++}
++type roomVolumeState struct {
++	BaseRevision      string `json:"base_revision"`
++	AttentionRevision string `json:"attention_revision"`
++	BasePercent       int    `json:"base_percent"`
++	EffectivePercent  int    `json:"effective_percent"`
++}
++type roomVolumeBinding struct {
++	Scope         roomVolumeScope       `json:"scope"`
++	Native        roomTransportIdentity `json:"native"`
++	Route         roomVolumeRoute       `json:"route"`
++	VolumeState   roomVolumeState       `json:"volume_state"`
++	Action        string                `json:"action"`
++	VolumePercent int                   `json:"volume_percent"`
++}
++type roomVolumePrepareResponse struct {
++	Schema          string                `json:"schema"`
++	NativePrepareID string                `json:"native_prepare_id"`
++	ExpiresAfterMS  int                   `json:"expires_after_ms"`
++	Scope           roomVolumeScope       `json:"scope"`
++	Native          roomTransportIdentity `json:"native"`
++	Route           roomVolumeRoute       `json:"route"`
++	VolumeState     roomVolumeState       `json:"volume_state"`
++	Action          string                `json:"action"`
++	VolumePercent   int                   `json:"volume_percent"`
++	Physical        bool                  `json:"physical_result_verified"`
++}
++type roomVolumeReceipt struct {
++	Schema              string `json:"schema"`
++	NativePrepareID     string `json:"native_prepare_id"`
++	OK                  bool   `json:"ok"`
++	State               string `json:"state"`
++	ReservationAccepted bool   `json:"reservation_accepted"`
++	ProtocolAccepted    bool   `json:"protocol_accepted"`
++	PossibleEffect      bool   `json:"possible_effect"`
++	Terminal            bool   `json:"terminal"`
++	DeadlineRetired     bool   `json:"deadline_retired"`
++	ContextsDrained     bool   `json:"contexts_drained"`
++	RetryAllowed        bool   `json:"retry_allowed"`
++	Physical            bool   `json:"physical_result_verified"`
++}
++type roomVolumePrepareACK struct {
++	Schema          string          `json:"schema"`
++	OK              bool            `json:"ok"`
++	Token           string          `json:"token"`
++	NativePrepareID string          `json:"native_prepare_id"`
++	ArgsDigest      string          `json:"args_digest"`
++	Percent         int             `json:"percent"`
++	Identity        roomVolumeRoute `json:"identity"`
++	VolumeState     roomVolumeState `json:"volume_state"`
++	ExpiresAfterMS  int             `json:"expires_after_ms"`
++	Physical        bool            `json:"physical_result_verified"`
++}
++type roomVolumeOwnerReceipt struct {
++	Schema              string          `json:"schema"`
++	OK                  bool            `json:"ok"`
++	Token               string          `json:"token"`
++	NativePrepareID     string          `json:"native_prepare_id"`
++	NativeReservationID string          `json:"native_reservation_id"`
++	ArgsDigest          string          `json:"args_digest"`
++	Percent             int             `json:"percent"`
++	Identity            roomVolumeRoute `json:"identity"`
++	VolumeState         roomVolumeState `json:"volume_state"`
++	Outcome             string          `json:"outcome"`
++	PossibleEffect      bool            `json:"possible_effect"`
++	DeadlineRetired     bool            `json:"deadline_retired"`
++	ContextsDrained     bool            `json:"contexts_drained"`
++	Physical            bool            `json:"physical_result_verified"`
++	PinRemainingMS      int             `json:"pin_remaining_ms"`
++}
++type roomVolumeOperation struct {
++	mu               sync.Mutex
++	Owner            *AppPlayer
++	Binding          roomVolumeBinding
++	Actor            *nativeTransportOffer
++	ID               string
++	ArgsDigest       string
++	OwnToneURL       string
++	InputDigest      string
++	Expires          time.Time
++	RetainUntil      time.Time
++	Claimed          bool
++	Cancelled        bool
++	CPrepare         *roomVolumePrepareACK
++	ReservationID    string
++	ReservationUntil time.Time
++	ReservedAt       time.Time
++	PreparedSeenAt   time.Time
++	CommitDispatched bool
++	CancelDispatched bool
++	CommitReceipt    *roomVolumeReceipt
++	Latest           roomVolumeReceipt
++}
++type nativeRoomVolumeReservation struct {
++	Operation *roomVolumeOperation
++	Until     time.Time
++}
++type roomVolumeActorRequest struct {
++	Operation *roomVolumeOperation
++	Context   context.Context
++}
++type roomVolumePrepareActorRequest struct {
++	Binding roomVolumeBinding
++	Context context.Context
++}
++type roomVolumeStore struct {
++	mu      sync.Mutex
++	records map[string]*roomVolumeOperation
++}
++
++func (store *roomVolumeStore) put(op *roomVolumeOperation) bool {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	if store.records == nil {
++		store.records = map[string]*roomVolumeOperation{}
++	}
++	for id, old := range store.records {
++		old.mu.Lock()
++		expired := !time.Now().Before(old.RetainUntil)
++		old.mu.Unlock()
++		if expired {
++			delete(store.records, id)
++		}
++	}
++	if len(store.records) >= roomVolumeStoreLimit {
++		return false
++	}
++	store.records[op.ID] = op
++	return true
++}
++func (store *roomVolumeStore) get(id string) *roomVolumeOperation {
++	store.mu.Lock()
++	defer store.mu.Unlock()
++	return store.records[id]
++}
++func volumeCounter(value string) bool {
++	if !volumeDecimal.MatchString(value) {
++		return false
++	}
++	_, err := strconv.ParseUint(value, 10, 64)
++	return err == nil
++}
++func (route roomVolumeRoute) valid() bool {
++	if !volumeUUID.MatchString(route.Process) || !volumeHex64.MatchString(route.InputPathDigest) {
++		return false
++	}
++	for _, v := range []string{route.DeviceID, route.DeviceIncarnation, route.SessionEpoch, route.RouteRevision, route.SelectionRevision, route.InputGeneration, route.InputItemID} {
++		if !volumeCounter(v) {
++			return false
++		}
++	}
++	return route.DeviceID != "0"
++}
++func (state roomVolumeState) valid() bool {
++	return volumeCounter(state.BaseRevision) && volumeCounter(state.AttentionRevision) && state.BasePercent >= 0 && state.BasePercent <= 100 && state.EffectivePercent >= 0 && state.EffectivePercent <= state.BasePercent
++}
++func (binding roomVolumeBinding) valid() bool {
++	scope := binding.Scope
++	native := binding.Native
++	return binding.Action == "volume" && binding.VolumePercent >= 0 && binding.VolumePercent <= 100 && scope.AccountUserID != "" && len(scope.AccountUserID) <= 160 && scope.TargetID != "" && len(scope.TargetID) <= 160 && scope.RoomID != "" && len(scope.RoomID) <= 128 && homePodIDPattern.MatchString(scope.HomePodID) && native.AccountUserID == scope.AccountUserID && native.TargetID == scope.TargetID && native.RoomID == scope.RoomID && native.HomePodID == scope.HomePodID && native.ConnectionID != "" && native.SessionID != "" && volumeHex32.MatchString(native.AliasIncarnation) && volumeHex64.MatchString(native.AliasRegistry) && native.AliasRevision < 1<<53 && binding.Route.valid() && binding.Route.DeviceID == scope.HomePodID && binding.VolumeState.valid()
++}
++func strictVolumeJSON(raw []byte, out any) error {
++	scan := json.NewDecoder(bytes.NewReader(raw))
++	scan.UseNumber()
++	var walk func(int) error
++	walk = func(depth int) error {
++		if depth > 16 {
++			return ErrBadRequest
++		}
++		token, err := scan.Token()
++		if err != nil {
++			return err
++		}
++		if delimiter, ok := token.(json.Delim); ok {
++			switch delimiter {
++			case '{':
++				seen := map[string]bool{}
++				for scan.More() {
++					key, err := scan.Token()
++					name, ok := key.(string)
++					if err != nil || !ok || seen[name] {
++						return ErrBadRequest
++					}
++					seen[name] = true
++					if err := walk(depth + 1); err != nil {
++						return err
++					}
++				}
++				end, err := scan.Token()
++				if err != nil || end != json.Delim('}') {
++					return ErrBadRequest
++				}
++			case '[':
++				for scan.More() {
++					if err := walk(depth + 1); err != nil {
++						return err
++					}
++				}
++				end, err := scan.Token()
++				if err != nil || end != json.Delim(']') {
++					return ErrBadRequest
++				}
++			default:
++				return ErrBadRequest
++			}
++		}
++		return nil
++	}
++	if err := walk(0); err != nil {
++		return err
++	}
++	if scan.Decode(new(any)) != io.EOF {
++		return ErrBadRequest
++	}
++	return decodeQueueJSON(raw, out)
++}
++func (op *roomVolumeOperation) receipt(schema string) roomVolumeReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	receipt := op.Latest
++	receipt.Schema = schema
++	receipt.NativePrepareID = op.ID
++	return receipt
++}
++func nativeVolumeUnknown(id string, reserved bool) roomVolumeReceipt {
++	return roomVolumeReceipt{NativePrepareID: id, State: "unknown", ReservationAccepted: reserved, PossibleEffect: true}
++}
++func (p *AppPlayer) roomVolumeReservedLocked() bool {
++	return p.roomVolumeReservation != nil && time.Now().Before(p.roomVolumeReservation.Until)
++}
++func (p *AppPlayer) roomVolumeBusy() bool {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	return p.roomVolumeClosing || p.roomVolumeReservedLocked()
++}
++func (p *AppPlayer) prepareRoomVolume(parent context.Context, request roomVolumePrepareActorRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	binding := request.Binding
++	if !binding.valid() || ctx.Err() != nil || parent.Err() != nil || p.roomVolumeBusy() {
++		return nil, ErrAliasConflict
++	}
++	identity, err := p.roomTransportIdentity(binding.Scope.AccountUserID, binding.Scope.TargetID, binding.Scope.RoomID, binding.Scope.HomePodID)
++	digest := sha256.Sum256([]byte(p.app.cfg.AudioOutputPipe))
++	inputDigest := hex.EncodeToString(digest[:])
++	if err != nil || identity != binding.Native || inputDigest != binding.Route.InputPathDigest {
++		return nil, ErrAliasConflict
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	raw, err := json.Marshal(binding)
++	if err != nil {
++		return nil, err
++	}
++	sum := sha256.Sum256(raw)
++	actor := &nativeTransportOffer{Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Expires: time.Now().Add(roomVolumeOfferLifetime), Snapshot: roomTransportSnapshot{roomTransportIdentity: identity, PrepareID: id, Action: "volume", VolumePercent: binding.VolumePercent, ArgsDigest: hex.EncodeToString(sum[:])}}
++	op := &roomVolumeOperation{Owner: p, Binding: binding, Actor: actor, ID: id, ArgsDigest: actor.Snapshot.ArgsDigest, OwnToneURL: actor.OwnToneURL, InputDigest: inputDigest, Expires: actor.Expires, RetainUntil: actor.Expires.Add(15 * time.Second), Latest: roomVolumeReceipt{NativePrepareID: id, State: "prepared"}}
++	return op, nil
++}
++func (p *AppPlayer) claimRoomVolume(parent context.Context, request roomVolumeActorRequest) (any, error) {
++	op := request.Operation
++	if op == nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.Owner != p || op.Claimed || op.Cancelled || p.roomVolumeClosing || p.roomVolumeReservedLocked() || !p.transportOfferCurrentLocked(op.Actor, parent, request.Context) {
++		return nil, ErrAliasConflict
++	}
++	op.Claimed = true
++	op.Latest.State = "pending_claim"
++	return op, nil
++}
++func (p *AppPlayer) consumeRoomVolume(parent context.Context, request roomVolumeActorRequest) (any, error) {
++	op := request.Operation
++	if op == nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.Owner != p || !op.Claimed || op.Cancelled || op.CPrepare == nil || op.ReservationID != "" || p.roomVolumeClosing || p.roomVolumeReservedLocked() || !p.transportOfferCurrentLocked(op.Actor, parent, request.Context) {
++		return nil, ErrAliasConflict
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	reservedAt := time.Now()
++	deadline := reservedAt.Add(roomVolumeReservationLifetime)
++	op.ReservedAt = reservedAt
++	op.ReservationID = id
++	op.ReservationUntil = deadline
++	op.RetainUntil = deadline.Add(15 * time.Second)
++	op.Latest = roomVolumeReceipt{NativePrepareID: op.ID, State: "reserved", ReservationAccepted: true}
++	p.roomVolumeReservation = &nativeRoomVolumeReservation{op, deadline}
++	return op, nil
++}
++func (p *AppPlayer) waitRoomVolumeReservation(ctx context.Context) bool {
++	p.aliasMu.Lock()
++	reservation := p.roomVolumeReservation
++	closing := p.roomVolumeClosing
++	p.aliasMu.Unlock()
++	if reservation != nil {
++		remaining := time.Until(reservation.Until)
++		if remaining > 0 {
++			timer := time.NewTimer(remaining)
++			select {
++			case <-timer.C:
++			case <-ctx.Done():
++				go p.Close()
++				<-timer.C
++			}
++			timer.Stop()
++		}
++		p.aliasMu.Lock()
++		if p.roomVolumeReservation == reservation {
++			p.roomVolumeReservation = nil
++		}
++		closing = p.roomVolumeClosing
++		p.aliasMu.Unlock()
++	}
++	if closing || ctx.Err() != nil {
++		return false
++	}
++	return true
++}
++func (p *AppPlayer) retireRoomVolumeOwner() {
++	p.aliasMu.Lock()
++	p.roomVolumeClosing = true
++	reservation := p.roomVolumeReservation
++	p.aliasMu.Unlock()
++	if reservation != nil {
++		reservation.Operation.cancelAtOwner()
++		if remaining := time.Until(reservation.Until); remaining > 0 {
++			timer := time.NewTimer(remaining)
++			<-timer.C
++			timer.Stop()
++		}
++	}
++	p.aliasMu.Lock()
++	p.aliasRetired = true
++	p.aliasMu.Unlock()
++}
++func roomVolumeHTTP(ctx context.Context, method, endpoint string, payload any, out any) error {
++	var body io.Reader
++	if payload != nil {
++		raw, err := json.Marshal(payload)
++		if err != nil {
++			return err
++		}
++		body = bytes.NewReader(raw)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
++	if err != nil {
++		return err
++	}
++	if payload != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	client := &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("volume owner redirect denied") }}
++	response, err := client.Do(request)
++	if err != nil {
++		return err
++	}
++	defer response.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(response.Body, 8193))
++	if err != nil || len(raw) > 8192 || response.StatusCode != 200 {
++		return ErrAliasConflict
++	}
++	return strictVolumeJSON(raw, out)
++}
+diff --git a/daemon/room_volume_http.go b/daemon/room_volume_http.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_volume_http.go
+@@ -0,0 +1,390 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++)
++
++type roomVolumeIDRequest struct {
++	NativePrepareID string `json:"native_prepare_id"`
++}
++type roomVolumeCPrepareRequest struct {
++	NativePrepareID         string          `json:"native_prepare_id"`
++	ArgsDigest              string          `json:"args_digest"`
++	Percent                 int             `json:"percent"`
++	ExpectedInputPathDigest string          `json:"expected_input_path_digest"`
++	ExpectedIdentity        roomVolumeRoute `json:"expected_identity"`
++	ExpectedVolumeState     roomVolumeState `json:"expected_volume_state"`
++}
++type roomVolumeCCommitRequest struct {
++	Token                   string `json:"token"`
++	NativePrepareID         string `json:"native_prepare_id"`
++	NativeReservationID     string `json:"native_reservation_id"`
++	ArgsDigest              string `json:"args_digest"`
++	Percent                 int    `json:"percent"`
++	ExpectedInputPathDigest string `json:"expected_input_path_digest"`
++}
++type roomVolumeCCancelRequest struct {
++	Token               string `json:"token"`
++	NativeReservationID string `json:"native_reservation_id"`
++}
++
++func (op *roomVolumeOperation) endpoint(suffix string) string {
++	return strings.TrimSuffix(op.OwnToneURL, "/") + "/api/outputs/" + op.Binding.Scope.HomePodID + "/volume/" + suffix
++}
++func (op *roomVolumeOperation) prepareResponse() roomVolumePrepareResponse {
++	return roomVolumePrepareResponse{"podconnect.native_room_volume_prepare.v1", op.ID, 5000, op.Binding.Scope, op.Binding.Native, op.Binding.Route, op.Binding.VolumeState, "volume", op.Binding.VolumePercent, false}
++}
++func (op *roomVolumeOperation) prepareOwner(ctx context.Context) error {
++	request := roomVolumeCPrepareRequest{op.ID, op.ArgsDigest, op.Binding.VolumePercent, op.InputDigest, op.Binding.Route, op.Binding.VolumeState}
++	var ack roomVolumePrepareACK
++	if err := roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("prepare"), request, &ack); err != nil {
++		return err
++	}
++	if ack.Schema != "podconnect.output_room_volume_prepare.v1" || !ack.OK || !volumeHex32.MatchString(ack.Token) || ack.NativePrepareID != op.ID || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || ack.VolumeState != op.Binding.VolumeState || ack.ExpiresAfterMS != 1000 || ack.Physical {
++		return ErrAliasConflict
++	}
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.Cancelled {
++		return ErrAliasConflict
++	}
++	op.CPrepare = &ack
++	op.PreparedSeenAt = time.Now()
++	return nil
++}
++func (op *roomVolumeOperation) validOwnerReceipt(ack roomVolumeOwnerReceipt, suffix string) bool {
++	op.mu.Lock()
++	prepared := op.CPrepare
++	reservation := op.ReservationID
++	op.mu.Unlock()
++	if prepared == nil || ack.Schema != "podconnect.output_room_volume_"+suffix+".v1" || !ack.OK || ack.Token != prepared.Token || ack.NativePrepareID != op.ID || ack.NativeReservationID != reservation || ack.ArgsDigest != op.ArgsDigest || ack.Percent != op.Binding.VolumePercent || ack.Identity != op.Binding.Route || !ack.VolumeState.valid() || ack.Physical || ack.PinRemainingMS < 0 || ack.PinRemainingMS > 10000 {
++		return false
++	}
++	switch ack.Outcome {
++	case "prepared", "pending", "admitted_pending", "protocol_accepted", "rejected_before_admission", "expired_before_admission", "cancelled_before_admission", "unknown":
++	default:
++		return false
++	}
++	if ack.PossibleEffect {
++		switch ack.Outcome {
++		case "prepared", "pending", "rejected_before_admission", "expired_before_admission", "cancelled_before_admission":
++			return false
++		}
++	}
++	if ack.PossibleEffect && ack.Outcome == "unknown" && ack.VolumeState == op.Binding.VolumeState {
++		return true
++	}
++	if !ack.PossibleEffect {
++		return ack.VolumeState == op.Binding.VolumeState && ack.Outcome != "protocol_accepted" && ack.Outcome != "admitted_pending"
++	}
++	before := op.Binding.VolumeState
++	after := ack.VolumeState
++	revision, err := strconv.ParseUint(before.BaseRevision, 10, 64)
++	if err != nil || revision == ^uint64(0) || after.BaseRevision != strconv.FormatUint(revision+1, 10) || after.AttentionRevision != before.AttentionRevision || after.BasePercent != op.Binding.VolumePercent {
++		return false
++	}
++	if before.EffectivePercent < before.BasePercent {
++		return after.EffectivePercent == min(op.Binding.VolumePercent, before.EffectivePercent)
++	}
++	return after.EffectivePercent >= min(op.Binding.VolumePercent, before.BasePercent) && after.EffectivePercent <= op.Binding.VolumePercent
++}
++func (op *roomVolumeOperation) recordOwnerReceipt(ack roomVolumeOwnerReceipt) roomVolumeReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	terminal := false
++	switch ack.Outcome {
++	case "protocol_accepted", "rejected_before_admission", "expired_before_admission", "cancelled_before_admission", "unknown":
++		terminal = ack.ContextsDrained
++	}
++	accepted := ack.Outcome == "protocol_accepted" && ack.PossibleEffect && terminal
++	state := ack.Outcome
++	if ack.Outcome == "protocol_accepted" && !accepted {
++		state = "unknown"
++	}
++	receipt := roomVolumeReceipt{NativePrepareID: op.ID, State: state, ReservationAccepted: op.ReservationID != "", OK: accepted, ProtocolAccepted: accepted, PossibleEffect: ack.PossibleEffect, Terminal: terminal, DeadlineRetired: ack.DeadlineRetired, ContextsDrained: ack.ContextsDrained}
++	// A terminal owner receipt is never relabelled by an older pending response.
++	if op.Latest.Terminal {
++		return op.Latest
++	}
++	op.Latest = receipt
++	return receipt
++}
++func (op *roomVolumeOperation) noCommitFailure(cancelled bool) roomVolumeReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.Latest.Terminal {
++		return op.Latest
++	}
++	if op.Cancelled {
++		cancelled = true
++	}
++	if op.CommitDispatched {
++		op.Latest = nativeVolumeUnknown(op.ID, op.ReservationID != "")
++		return op.Latest
++	}
++	op.Cancelled = true
++	state := "rejected_before_admission"
++	if cancelled {
++		state = "cancelled_before_admission"
++	}
++	op.Latest = roomVolumeReceipt{NativePrepareID: op.ID, State: state, ReservationAccepted: op.ReservationID != "", Terminal: true, ContextsDrained: true}
++	return op.Latest
++}
++func (op *roomVolumeOperation) freezeCommit(receipt roomVolumeReceipt) roomVolumeReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.CommitReceipt == nil {
++		copy := receipt
++		op.CommitReceipt = &copy
++	}
++	return *op.CommitReceipt
++}
++func (op *roomVolumeOperation) cancelAtOwner() {
++	op.mu.Lock()
++	op.Cancelled = true
++	if op.ReservationID == "" || op.CPrepare == nil {
++		if !op.CommitDispatched && !op.Latest.Terminal {
++			op.Latest = roomVolumeReceipt{NativePrepareID: op.ID, State: "cancelled_before_admission", Terminal: true, ContextsDrained: true}
++		}
++		op.mu.Unlock()
++		return
++	}
++	if op.CancelDispatched {
++		op.mu.Unlock()
++		return
++	}
++	op.CancelDispatched = true
++	payload := roomVolumeCCancelRequest{op.CPrepare.Token, op.ReservationID}
++	op.mu.Unlock()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	var ack roomVolumeOwnerReceipt
++	if roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("cancel"), payload, &ack) == nil && op.validOwnerReceipt(ack, "cancel") {
++		op.recordOwnerReceipt(ack)
++	}
++}
++func (op *roomVolumeOperation) commitOwner(ctx context.Context) roomVolumeReceipt {
++	op.mu.Lock()
++	if op.Cancelled {
++		op.mu.Unlock()
++		op.cancelAtOwner()
++		return op.receipt("")
++	}
++	if op.CPrepare == nil || op.ReservationID == "" {
++		op.mu.Unlock()
++		return op.noCommitFailure(false)
++	}
++	payload := roomVolumeCCommitRequest{op.CPrepare.Token, op.ID, op.ReservationID, op.ArgsDigest, op.Binding.VolumePercent, op.InputDigest}
++	op.CommitDispatched = true
++	op.Latest = nativeVolumeUnknown(op.ID, true)
++	op.mu.Unlock()
++	var ack roomVolumeOwnerReceipt
++	if err := roomVolumeHTTP(ctx, http.MethodPost, op.endpoint("commit"), payload, &ack); err != nil || !op.validOwnerReceipt(ack, "commit") {
++		return op.receipt("")
++	}
++	receipt := op.recordOwnerReceipt(ack)
++	// Read-only completion polling is bounded and cannot renew the C1s window.
++	until := time.Now().Add(1200 * time.Millisecond)
++	for !receipt.Terminal && ctx.Err() == nil && time.Now().Before(until) {
++		timer := time.NewTimer(75 * time.Millisecond)
++		select {
++		case <-timer.C:
++		case <-ctx.Done():
++			timer.Stop()
++			return op.receipt("")
++		}
++		receipt = op.resultOwner(ctx)
++	}
++	return receipt
++}
++func (op *roomVolumeOperation) resultOwner(ctx context.Context) roomVolumeReceipt {
++	op.mu.Lock()
++	prepared := op.CPrepare
++	reservation := op.ReservationID
++	dispatched := op.CommitDispatched
++	op.mu.Unlock()
++	if prepared == nil || reservation == "" || !dispatched {
++		return op.receipt("")
++	}
++	var ack roomVolumeOwnerReceipt
++	if roomVolumeHTTP(ctx, http.MethodGet, op.endpoint("result/"+prepared.Token), nil, &ack) != nil || !op.validOwnerReceipt(ack, "result") {
++		return op.receipt("")
++	}
++	return op.recordOwnerReceipt(ack)
++}
++func volumeHTTPBody(w http.ResponseWriter, r *http.Request, out any) bool {
++	if r.Method != http.MethodPost {
++		w.WriteHeader(405)
++		return false
++	}
++	if r.URL.RawQuery != "" {
++		w.WriteHeader(400)
++		return false
++	}
++	defer r.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 8193))
++	if err != nil || len(raw) > 8192 || strictVolumeJSON(raw, out) != nil {
++		w.WriteHeader(400)
++		return false
++	}
++	return true
++}
++func volumeWrite(w http.ResponseWriter, receipt roomVolumeReceipt, suffix string) {
++	receipt.Schema = "podconnect.native_room_volume_" + suffix + ".v1"
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	_ = json.NewEncoder(w).Encode(receipt)
++}
++func (s *ConcreteApiServer) handleRoomVolumeState(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(405)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 4 {
++		w.WriteHeader(400)
++		return
++	}
++	for _, key := range []string{"account_user_id", "target_id", "room_id", "homepod_id"} {
++		if len(q[key]) != 1 || q.Get(key) == "" || len(q.Get(key)) > 160 {
++			w.WriteHeader(400)
++			return
++		}
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
++	defer cancel()
++	data, err := s.roomTransportAsk(ctx, apiRoomVolumeState, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	roomTransportResponse(w, data, err)
++}
++func (s *ConcreteApiServer) handleRoomVolumePrepare(w http.ResponseWriter, r *http.Request) {
++	var binding roomVolumeBinding
++	if !volumeHTTPBody(w, r, &binding) {
++		return
++	}
++	if !binding.valid() {
++		w.WriteHeader(400)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
++	defer cancel()
++	value, err := s.roomTransportAsk(ctx, apiRoomVolumePrepare, roomVolumePrepareActorRequest{binding, ctx})
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	op, ok := value.(*roomVolumeOperation)
++	if !ok || op == nil || !s.roomVolumes.put(op) {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	response := op.prepareResponse()
++	remaining := time.Until(op.Expires).Milliseconds()
++	if remaining < 1 {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	response.ExpiresAfterMS = int(min(remaining, 5000))
++	roomTransportResponse(w, response, nil)
++}
++func (s *ConcreteApiServer) handleRoomVolumeCommit(w http.ResponseWriter, r *http.Request) {
++	var request roomVolumeIDRequest
++	if !volumeHTTPBody(w, r, &request) {
++		return
++	}
++	if !volumeHex32.MatchString(request.NativePrepareID) {
++		w.WriteHeader(400)
++		return
++	}
++	op := s.roomVolumes.get(request.NativePrepareID)
++	if op == nil {
++		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "commit")
++		return
++	}
++	op.mu.Lock()
++	if op.Claimed {
++		receipt := op.Latest
++		if op.CommitReceipt != nil {
++			receipt = *op.CommitReceipt
++		}
++		op.mu.Unlock()
++		volumeWrite(w, receipt, "commit")
++		return
++	}
++	op.mu.Unlock()
++	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
++	defer cancel()
++	_, err := s.roomTransportAsk(ctx, apiRoomVolumeClaim, roomVolumeActorRequest{op, ctx})
++	if err != nil {
++		op.mu.Lock()
++		claimed := op.Claimed
++		receipt := op.Latest
++		if op.CommitReceipt != nil {
++			receipt = *op.CommitReceipt
++		}
++		op.mu.Unlock()
++		if claimed {
++			volumeWrite(w, receipt, "commit")
++		} else {
++			volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++		}
++		return
++	}
++	defer func() {
++		if ctx.Err() != nil {
++			go op.cancelAtOwner()
++		}
++	}()
++	if op.prepareOwner(ctx) != nil {
++		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++		return
++	}
++	_, err = s.roomTransportAsk(ctx, apiRoomVolumeConsume, roomVolumeActorRequest{op, ctx})
++	if err != nil {
++		volumeWrite(w, op.freezeCommit(op.noCommitFailure(ctx.Err() != nil)), "commit")
++		return
++	}
++	receipt := op.commitOwner(ctx)
++	volumeWrite(w, op.freezeCommit(receipt), "commit")
++}
++func (s *ConcreteApiServer) handleRoomVolumeCancel(w http.ResponseWriter, r *http.Request) {
++	var request roomVolumeIDRequest
++	if !volumeHTTPBody(w, r, &request) {
++		return
++	}
++	if !volumeHex32.MatchString(request.NativePrepareID) {
++		w.WriteHeader(400)
++		return
++	}
++	op := s.roomVolumes.get(request.NativePrepareID)
++	if op == nil {
++		volumeWrite(w, nativeVolumeUnknown(request.NativePrepareID, false), "cancel")
++		return
++	}
++	op.cancelAtOwner()
++	volumeWrite(w, op.receipt(""), "cancel")
++}
++func (s *ConcreteApiServer) handleRoomVolumeResult(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(405)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 1 || len(q["native_prepare_id"]) != 1 || !volumeHex32.MatchString(q.Get("native_prepare_id")) {
++		w.WriteHeader(400)
++		return
++	}
++	op := s.roomVolumes.get(q.Get("native_prepare_id"))
++	if op == nil {
++		volumeWrite(w, nativeVolumeUnknown(q.Get("native_prepare_id"), false), "result")
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
++	defer cancel()
++	volumeWrite(w, op.resultOwner(ctx), "result")
++}
+diff --git a/daemon/room_volume_test.go b/daemon/room_volume_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_volume_test.go
+@@ -0,0 +1,321 @@
++package daemon
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// As in audio4: seed a locally admitted actor only; do not impersonate an actual
++// authenticated Spotify session or claim that fixture authority is provider proof.
++func roomVolumeFixture(t *testing.T) (*AppPlayer, *roomVolumeOperation) {
++	p, actor := roomTransportAdmittedFixture(t)
++	digest := sha256.Sum256([]byte(p.app.cfg.AudioOutputPipe))
++	input := hex.EncodeToString(digest[:])
++	scope := roomVolumeScope{"account", "engine", "r0", "101"}
++	route := roomVolumeRoute{"00000000-0000-0000-0000-000000000001", "101", "1", "1", "1", "1", "1", "1", input}
++	binding := roomVolumeBinding{scope, actor.Snapshot.roomTransportIdentity, route, roomVolumeState{"7", "2", 27, 27}, "volume", 45}
++	actor.Snapshot.Action = "volume"
++	actor.Snapshot.VolumePercent = 45
++	op := &roomVolumeOperation{Owner: p, Actor: actor, Binding: binding, ID: actor.Snapshot.PrepareID, ArgsDigest: strings.Repeat("b", 64), OwnToneURL: actor.OwnToneURL, InputDigest: input, Expires: actor.Expires, RetainUntil: time.Now().Add(time.Minute), Latest: roomVolumeReceipt{NativePrepareID: actor.Snapshot.PrepareID, State: "prepared"}}
++	return p, op
++}
++func volumeTestActor(t *testing.T, p *AppPlayer, server *ConcreteApiServer) func() {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for req := range server.requests {
++			data, err := p.handleApiRequest(context.Background(), req)
++			req.Reply(data, err)
++		}
++	}()
++	return func() { close(server.requests); <-done }
++}
++func volumeOwnerAck(op *roomVolumeOperation, suffix, outcome string, possible bool) roomVolumeOwnerReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	state := op.Binding.VolumeState
++	if possible {
++		state.BaseRevision = "8"
++		state.BasePercent = 45
++		state.EffectivePercent = 45
++	}
++	return roomVolumeOwnerReceipt{Schema: "podconnect.output_room_volume_" + suffix + ".v1", OK: true, Token: strings.Repeat("c", 32), NativePrepareID: op.ID, NativeReservationID: op.ReservationID, ArgsDigest: op.ArgsDigest, Percent: 45, Identity: op.Binding.Route, VolumeState: state, Outcome: outcome, PossibleEffect: possible, ContextsDrained: outcome != "pending" && outcome != "admitted_pending", PinRemainingMS: 9000}
++}
++func volumeTestC(t *testing.T, p *AppPlayer, op *roomVolumeOperation, onPrepare func(), ackMutation func(*roomVolumePrepareACK), commits *atomic.Int32) *httptest.Server {
++	t.Helper()
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/api/outputs/101/volume/prepare":
++			raw := map[string]json.RawMessage{}
++			if json.NewDecoder(r.Body).Decode(&raw) != nil || len(raw) != 6 {
++				t.Error("Cprepare not closed6")
++			}
++			encoded, _ := json.Marshal(raw)
++			var request roomVolumeCPrepareRequest
++			if strictVolumeJSON(encoded, &request) != nil || request.NativePrepareID != op.ID || request.ArgsDigest != op.ArgsDigest || request.Percent != 45 || request.ExpectedInputPathDigest != op.InputDigest || request.ExpectedIdentity != op.Binding.Route || request.ExpectedVolumeState != op.Binding.VolumeState {
++				t.Error("native immutable preparation binding not forwarded")
++			}
++			if onPrepare != nil {
++				onPrepare()
++			}
++			ack := roomVolumePrepareACK{"podconnect.output_room_volume_prepare.v1", true, strings.Repeat("c", 32), op.ID, op.ArgsDigest, 45, op.Binding.Route, op.Binding.VolumeState, 1000, false}
++			if ackMutation != nil {
++				ackMutation(&ack)
++			}
++			_ = json.NewEncoder(w).Encode(ack)
++		case "/api/outputs/101/volume/commit":
++			commits.Add(1)
++			var request roomVolumeCCommitRequest
++			if json.NewDecoder(r.Body).Decode(&request) != nil || request.Token != strings.Repeat("c", 32) || request.NativePrepareID != op.ID || request.NativeReservationID == "" || request.ArgsDigest != op.ArgsDigest || request.Percent != 45 || request.ExpectedInputPathDigest != op.InputDigest {
++				t.Error("Ccommit binding changed")
++			}
++			_ = json.NewEncoder(w).Encode(volumeOwnerAck(op, "commit", "protocol_accepted", true))
++		case "/api/outputs/101/volume/cancel":
++			_ = json.NewEncoder(w).Encode(volumeOwnerAck(op, "cancel", "cancelled_before_admission", false))
++		case "/api/outputs/101/volume/result/" + strings.Repeat("c", 32):
++			_ = json.NewEncoder(w).Encode(volumeOwnerAck(op, "result", "protocol_accepted", true))
++		default:
++			t.Error("unexpected provider/foreign-output request", r.URL.Path)
++			w.WriteHeader(404)
++		}
++	}))
++	op.OwnToneURL = server.URL
++	op.Actor.OwnToneURL = server.URL
++	p.app.cfg.RoomTransportOwnToneURL = server.URL
++	return server
++}
++func volumeCommitRequest(op *roomVolumeOperation) *http.Request {
++	return httptest.NewRequest("POST", "/player/room_volume/commit", strings.NewReader(`{"native_prepare_id":"`+op.ID+`"}`))
++}
++func TestRoomVolumeDirectOwnerPrepareThenConsumeAndOnePhysicalDispatch(t *testing.T) {
++	p, op := roomVolumeFixture(t)
++	var commits atomic.Int32
++	owner := volumeTestC(t, p, op, nil, nil, &commits)
++	defer owner.Close()
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	if !server.roomVolumes.put(op) {
++		t.Fatal("store")
++	}
++	stop := volumeTestActor(t, p, server)
++	defer stop()
++	out := httptest.NewRecorder()
++	server.handleRoomVolumeCommit(out, volumeCommitRequest(op))
++	var receipt roomVolumeReceipt
++	if strictVolumeJSON(out.Body.Bytes(), &receipt) != nil || !receipt.OK || !receipt.ProtocolAccepted || !receipt.ReservationAccepted || !receipt.PossibleEffect || !receipt.Terminal || !receipt.ContextsDrained || receipt.Physical || receipt.RetryAllowed || commits.Load() != 1 {
++		t.Fatal("matching RTSP protocol receipt not retained", out.Body.String())
++	}
++	if op.ReservationID == "" || p.roomVolumeReservation == nil || op.ReservedAt.Before(op.PreparedSeenAt) || op.ReservationUntil.Sub(op.ReservedAt) != 3*time.Second {
++		t.Fatal("actual native CONSUME did not mint reservation")
++	}
++	// Duplicate is a read of the original immutable commit receipt, never a retry.
++	again := httptest.NewRecorder()
++	server.handleRoomVolumeCommit(again, volumeCommitRequest(op))
++	if again.Body.String() != out.Body.String() || commits.Load() != 1 {
++		t.Fatal("duplicate dispatched or relabelled")
++	}
++}
++func TestRoomVolumePendingClaimAliasABACancelAndMalformedOwnerDenyCommit(t *testing.T) {
++	for _, mode := range []string{"alias-aba", "cancel", "wrong-process", "wrong-pipe", "wrong-volume", "wrong-percent", "wrong-deadline"} {
++		t.Run(mode, func(t *testing.T) {
++			p, op := roomVolumeFixture(t)
++			var commits atomic.Int32
++			server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++			server.roomVolumes.put(op)
++			entered := make(chan struct{})
++			release := make(chan struct{})
++			mutate := func(ack *roomVolumePrepareACK) {
++				switch mode {
++				case "wrong-process":
++					ack.Identity.Process = "00000000-0000-0000-0000-000000000002"
++				case "wrong-pipe":
++					ack.Identity.InputPathDigest = strings.Repeat("d", 64)
++				case "wrong-volume":
++					ack.VolumeState.BaseRevision = "8"
++				case "wrong-percent":
++					ack.Percent = 46
++				case "wrong-deadline":
++					ack.ExpiresAfterMS = 3000
++				}
++			}
++			owner := volumeTestC(t, p, op, func() { close(entered); <-release }, mutate, &commits)
++			defer owner.Close()
++			stop := volumeTestActor(t, p, server)
++			defer stop()
++			out := httptest.NewRecorder()
++			done := make(chan struct{})
++			go func() { defer close(done); server.handleRoomVolumeCommit(out, volumeCommitRequest(op)) }()
++			<-entered
++			if mode == "alias-aba" {
++				for _, room := range []string{"r1", "r0"} {
++					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint}); err != nil {
++						t.Fatal(err)
++					}
++				}
++			}
++			if mode == "cancel" {
++				cancelOut := httptest.NewRecorder()
++				server.handleRoomVolumeCancel(cancelOut, httptest.NewRequest("POST", "/player/room_volume/cancel", strings.NewReader(`{"native_prepare_id":"`+op.ID+`"}`)))
++			}
++			close(release)
++			<-done
++			if commits.Load() != 0 || p.roomVolumeReservation != nil {
++				t.Fatal("pending native claim became physical authority after invalidation", mode, out.Body.String())
++			}
++		})
++	}
++}
++func TestRoomVolumeDuplicatePendingClaimCannotCancelOrPrepareAgain(t *testing.T) {
++	p, op := roomVolumeFixture(t)
++	var commits atomic.Int32
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	owner := volumeTestC(t, p, op, func() { close(entered); <-release }, nil, &commits)
++	defer owner.Close()
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	server.roomVolumes.put(op)
++	stop := volumeTestActor(t, p, server)
++	defer stop()
++	out := httptest.NewRecorder()
++	done := make(chan struct{})
++	go func() { defer close(done); server.handleRoomVolumeCommit(out, volumeCommitRequest(op)) }()
++	<-entered
++	duplicate := httptest.NewRecorder()
++	server.handleRoomVolumeCommit(duplicate, volumeCommitRequest(op))
++	op.mu.Lock()
++	cancelled := op.Cancelled
++	op.mu.Unlock()
++	if cancelled {
++		t.Fatal("pending duplicate cancelled original")
++	}
++	close(release)
++	<-done
++	if commits.Load() != 1 {
++		t.Fatal("pending duplicate caused another or missing effect")
++	}
++}
++func TestRoomVolumeReservationRejectsDirectLegacyAliasAndCloseWaits(t *testing.T) {
++	p, op := roomVolumeFixture(t)
++	// Short fixture deadline tests ordering; production CONSUME fixed3s is tested above.
++	deadline := time.Now().Add(80 * time.Millisecond)
++	p.roomVolumeReservation = &nativeRoomVolumeReservation{op, deadline}
++	op.ReservationUntil = deadline
++	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint}); err == nil {
++		t.Fatal("direct alias mutator bypassed reservation")
++	}
++	if _, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeResume}); err == nil {
++		t.Fatal("legacy transport bypassed reservation")
++	}
++	done := make(chan struct{})
++	go func() { p.retireAliases(); close(done) }()
++	for {
++		p.aliasMu.Lock()
++		closing, retired := p.roomVolumeClosing, p.aliasRetired
++		p.aliasMu.Unlock()
++		if closing {
++			if retired {
++				t.Fatal("retirement applied before reserved deadline")
++			}
++			break
++		}
++		time.Sleep(time.Millisecond)
++	}
++	select {
++	case <-done:
++		t.Fatal("Close released owner while reservation active")
++	default:
++	}
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("bounded owner retirement did not complete")
++	}
++	if !p.aliasRetired {
++		t.Fatal("retired owner stayed ready")
++	}
++}
++func TestRoomVolumeCancelledActorParkKeepsOriginalReservationBoundary(t *testing.T) {
++	p, op := roomVolumeFixture(t)
++	p.player = nil
++	p.sess = nil
++	deadline := time.Now().Add(60 * time.Millisecond)
++	p.roomVolumeReservation = &nativeRoomVolumeReservation{op, deadline}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	done := make(chan bool, 1)
++	go func() { done <- p.waitRoomVolumeReservation(ctx) }()
++	p.aliasMu.Lock()
++	p.roomVolumeClosing = true
++	p.aliasMu.Unlock()
++	select {
++	case <-done:
++		t.Fatal("caller cancellation shortened native quarantine")
++	default:
++	}
++	select {
++	case result := <-done:
++		if result {
++			t.Fatal("closing actor accepted queued work")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("park did not retire")
++	}
++}
++func TestRoomVolumeStrictNestedJSONAndUnknownNeverDispatch(t *testing.T) {
++	_, op := roomVolumeFixture(t)
++	good, _ := json.Marshal(op.Binding)
++	duplicate := strings.Replace(string(good), `"room_id":"r0"`, `"room_id":"r0","room_id":"r1"`, 1)
++	for _, raw := range []string{duplicate, string(good) + ` {}`, strings.Replace(string(good), `"volume_percent":45`, `"volume_percent":true`, 1), strings.Replace(string(good), `"base_revision":"7"`, `"base_revision":"7","foreign":true`, 1)} {
++		var request roomVolumeBinding
++		if strictVolumeJSON([]byte(raw), &request) == nil {
++			t.Fatal("open/nested duplicate/wrong-type protocol admitted")
++		}
++	}
++	server := &ConcreteApiServer{}
++	out := httptest.NewRecorder()
++	server.handleRoomVolumeCommit(out, volumeCommitRequest(op))
++	var receipt roomVolumeReceipt
++	if strictVolumeJSON(out.Body.Bytes(), &receipt) != nil || receipt.State != "unknown" || receipt.OK || receipt.RetryAllowed {
++		t.Fatal("missing/evicted authority reconstructed")
++	}
++}
++func TestRoomVolumeLedgerCapacityRejectsWithoutEvictingActive(t *testing.T) {
++	store := roomVolumeStore{}
++	for i := 0; i < roomVolumeStoreLimit; i++ {
++		id, _ := randomQueueID(16)
++		if !store.put(&roomVolumeOperation{ID: id, RetainUntil: time.Now().Add(time.Minute)}) {
++			t.Fatal("capacity too small")
++		}
++	}
++	if store.put(&roomVolumeOperation{ID: strings.Repeat("f", 32), RetainUntil: time.Now().Add(time.Minute)}) {
++		t.Fatal("active owner evicted for new authority")
++	}
++}
++
++func TestRoomVolumeExplicitZeroAndUnknownDurableSnapshotValidation(t *testing.T) {
++	_, op := roomVolumeFixture(t)
++	binding := op.Binding
++	binding.VolumePercent = 0
++	if !binding.valid() {
++		t.Fatal("explicit authorized zero treated as missing")
++	}
++	op.CPrepare = &roomVolumePrepareACK{Token: strings.Repeat("c", 32)}
++	op.ReservationID = strings.Repeat("d", 32)
++	ack := volumeOwnerAck(op, "result", "unknown", true)
++	ack.VolumeState = op.Binding.VolumeState
++	if !op.validOwnerReceipt(ack, "result") {
++		t.Fatal("uncertain durable base failure cannot retain prepared snapshot")
++	}
++	ack.Outcome = "protocol_accepted"
++	if op.validOwnerReceipt(ack, "result") {
++		t.Fatal("protocol acceptance credited without own admitted base snapshot")
++	}
++}

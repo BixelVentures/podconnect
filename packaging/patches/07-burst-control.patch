@@ -1,0 +1,833 @@
+--- a/custom_components/podconnect/commands.py
++++ b/custom_components/podconnect/commands.py
+@@ -130,6 +130,32 @@
+         from .room_volume import RoomVolume
+ 
+         self.room_volume = RoomVolume(self)
++        coordinator = data.coordinator
++        coordinator.command_owner_guard = lambda: self._refresh_owner_current(
++            coordinator.hass, coordinator.config_entry.entry_id
++        )
++
++    def _refresh_owner_current(self, hass, entry_id):
++        try:
++            current(hass, entry_id, self.data)
++        except HomeAssistantError:
++            return False
++        data = self.data
++        binding = (
++            data.api,
++            data.coordinator,
++            data.session,
++            data.observations,
++            data.speakers,
++            data.api._session,
++            data.api._web,
++        )
++        return (
++            data.commands is self
++            and data.coordinator.owner_epoch == self.owner_epoch
++            and all(now is expected for now, expected in zip(binding, self.binding))
++            and not data.api._web.closed
++        )
+ 
+     def controls(self, entry_id, target_id, *, for_command=False):
+         data = self.data
+@@ -644,6 +670,12 @@
+                 "error_kind": "outcome_unknown" if possible_send else "unavailable",
+             }
+         finally:
++            if (
++                room_volume is not None
++                and possible_send
++                and receipt["outcome"] == "unknown"
++            ):
++                receipt["possible_effect"] = True
+             if possible_send:
+                 self.poll_floor = max(
+                     self.poll_floor, self.data.coordinator.poll_sequence
+@@ -651,6 +683,8 @@
+             receipt["observe_after_poll_sequence"] = self.poll_floor
+             self.receipts[command_sequence] = (fingerprint, receipt)
+             self.busy = False
++            if possible_send and self._refresh_owner_current(hass, entry_id):
++                await self.binding[1].async_refresh_after_command()
+         return copy.deepcopy(receipt)
+ 
+ 
+--- a/custom_components/podconnect/coordinator.py
++++ b/custom_components/podconnect/coordinator.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import secrets
+ import time
+ from datetime import timedelta
+@@ -30,16 +31,52 @@
+         self.api = api
+         self.poll_sequence = 0
+         self.owner_epoch = secrets.token_hex(16)
++        # Covers collection AND HA publication for scheduled/manual/demand polls.
++        self._poll_lock = asyncio.Lock()
++        self._command_refresh_task = None
++        self.command_owner_guard = None
++
++    async def _async_refresh(self, *args, **kwargs):
++        async with self._poll_lock:
++            await super()._async_refresh(*args, **kwargs)
++
++    def _check_command_owner(self):
++        if self.command_owner_guard is not None and not self.command_owner_guard():
++            raise UpdateFailed("Observation owner replaced")
++
++    async def async_refresh_after_command(self):
++        """One bounded shared read; caller cancellation cannot cancel its owner."""
++        if self._command_refresh_task is None or self._command_refresh_task.done():
++
++            async def refresh():
++                try:
++                    async with asyncio.timeout(1):
++                        self._check_command_owner()
++                        await self.async_refresh()
++                except (TimeoutError, UpdateFailed):
++                    return
++
++            self._command_refresh_task = self.hass.async_create_background_task(
++                refresh(), "podconnect post-command observation", eager_start=False
++            )
++        try:
++            async with asyncio.timeout(0.2):
++                await asyncio.shield(self._command_refresh_task)
++        except TimeoutError:
++            return
+ 
+     async def _async_update_data(self) -> dict[str, Any]:
+         """Fetch playback state + the device list."""
++        self._check_command_owner()
+         self.poll_sequence += 1
+         poll_sequence = self.poll_sequence
+         try:
+             playback = await self.api.playback_state()
++            self._check_command_owner()
+             playback_observed_at = dt_util.utcnow()
+             playback_observed_monotonic = time.monotonic()
+             devices = await self.api.devices()
++            self._check_command_owner()
+         except SpotifyApiError as err:
+             raise UpdateFailed(str(err)) from err
+         return {
+--- a/tests/ha_framework/test_commands.py
++++ b/tests/ha_framework/test_commands.py
+@@ -14,8 +14,12 @@
+ from homeassistant.helpers import entity_registry
+ 
+ commands = importlib.import_module("custom_components.podconnect.commands")
+-SpotifyApiError = importlib.import_module("custom_components.podconnect.api").SpotifyApiError
+-start_guards = importlib.import_module("custom_components.podconnect.native_start").start_guards
++SpotifyApiError = importlib.import_module(
++    "custom_components.podconnect.api"
++).SpotifyApiError
++start_guards = importlib.import_module(
++    "custom_components.podconnect.native_start"
++).start_guards
+ 
+ 
+ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
+@@ -62,10 +66,14 @@
+             prepared["output_volume_percent"] = 35
+             if prepared["mode"] == "fresh_start":
+                 self.native_output_volume = 35
+-            return web.json_response({
+-                "schema": "podconnect.start_lease.v1", "lease_id": "A" * 32,
+-                "expires_in_ms": 5000, "proof": prepared,
+-            })
++            return web.json_response(
++                {
++                    "schema": "podconnect.start_lease.v1",
++                    "lease_id": "A" * 32,
++                    "expires_in_ms": 5000,
++                    "proof": prepared,
++                }
++            )
+         if request.path == "/api/start-volume/commit":
+             body = await request.json()
+             self.calls.append(("POST", request.path, body, False))
+@@ -73,14 +81,20 @@
+             if self.native_commit_hold:
+                 self.native_commit_entered.set()
+                 await self.native_commit_release.wait()
+-            if body.get("max_volume") is not None and self.native_output_volume > body["max_volume"]:
++            if (
++                body.get("max_volume") is not None
++                and self.native_output_volume > body["max_volume"]
++            ):
+                 return web.Response(status=409)
+             if self.native_commit_status != 200:
+                 return web.Response(status=self.native_commit_status)
+-            return web.json_response({
+-                "ok": True, "schema": "podconnect.start_commit.v1",
+-                "policy_revision": self.native_revision,
+-            })
++            return web.json_response(
++                {
++                    "ok": True,
++                    "schema": "podconnect.start_commit.v1",
++                    "policy_revision": self.native_revision,
++                }
++            )
+         if request.path == "/spotify/me/player" and request.method == "GET":
+             self.calls.append((request.method, request.path, None, True))
+             if self.no_playback:
+@@ -126,23 +140,43 @@
+         return await fixture.TargetFrameworkTests._backend(self, request)
+ 
+     def _writes(self):
+-        return [call for call in self.calls if call[0] in ("POST", "PUT", "DELETE") and call[1].startswith("/spotify/")]
++        return [
++            call
++            for call in self.calls
++            if call[0] in ("POST", "PUT", "DELETE") and call[1].startswith("/spotify/")
++        ]
+ 
+     def _native_proof(self):
+         return {
+-            "schema": "podconnect.start_volume.v1", "ready": True,
+-            "engine_device_id": "spotify-one", "room_id": self.native_requested_room,
+-            "homepod_id": "saved-output-alpha" if self.native_requested_room == "room-alpha" else "saved-output-beta", "policy_revision": self.native_revision,
+-            "start_volume_percent": 35, "output_volume_percent": self.native_output_volume,
++            "schema": "podconnect.start_volume.v1",
++            "ready": True,
++            "engine_device_id": "spotify-one",
++            "room_id": self.native_requested_room,
++            "homepod_id": "saved-output-alpha"
++            if self.native_requested_room == "room-alpha"
++            else "saved-output-beta",
++            "policy_revision": self.native_revision,
++            "start_volume_percent": 35,
++            "output_volume_percent": self.native_output_volume,
+             "output_selected": self.native_output_selected,
+             "mode": "fresh_start" if self.no_playback else "same_session",
+-            "alias_binding": {"ready": True, "incarnation": "fixture-incarnation", "registry": "fixture-registry", "room_id": self.native_source_room},
++            "alias_binding": {
++                "ready": True,
++                "incarnation": "fixture-incarnation",
++                "registry": "fixture-registry",
++                "room_id": self.native_source_room,
++            },
+         }
+ 
+     def track_args(self, uri, max_volume=40):
+         return {
+-            "track_uri": uri, "max_volume": max_volume, "room_id": self.native_requested_room,
+-            "homepod_id": "saved-output-alpha" if self.native_requested_room == "room-alpha" else "saved-output-beta", "start_policy_revision": "b" * 64,
++            "track_uri": uri,
++            "max_volume": max_volume,
++            "room_id": self.native_requested_room,
++            "homepod_id": "saved-output-alpha"
++            if self.native_requested_room == "room-alpha"
++            else "saved-output-beta",
++            "start_policy_revision": "b" * 64,
+             "alias_incarnation": "fixture-incarnation",
+         }
+ 
+@@ -186,13 +220,27 @@
+             return_response=True,
+         )
+ 
+-    async def test_ordinary_media_start_commits_native_volume_before_one_provider_send(self):
++    async def test_ordinary_media_start_commits_native_volume_before_one_provider_send(
++        self,
++    ):
+         self.no_playback = True
+         data = self.entries[0].runtime_data
+         await data.coordinator.async_refresh()
+-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
+-            guard, native_ready = start_guards(self.hass, "account-alpha", data, "spotify-one")
+-            await data.api.play("spotify-one", uris=["spotify:track:" + "A" * 22], execution_guard=guard, async_execution_guard=native_ready)
++        with patch.object(
++            data.speakers,
++            "start_identity",
++            new_callable=AsyncMock,
++            return_value="spotify-one",
++        ):
++            guard, native_ready = start_guards(
++                self.hass, "account-alpha", data, "spotify-one"
++            )
++            await data.api.play(
++                "spotify-one",
++                uris=["spotify:track:" + "A" * 22],
++                execution_guard=guard,
++                async_execution_guard=native_ready,
++            )
+         self.assertEqual(self.native_prepares, 1)
+         self.assertEqual(self.native_commits, 1)
+         self.assertEqual(len(self._writes()), 1)
+@@ -203,9 +251,23 @@
+         data = self.entries[0].runtime_data
+         await data.coordinator.async_refresh()
+         self.native_commit_hold = True
+-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
+-            guard, native_ready = start_guards(self.hass, "account-alpha", data, "spotify-one")
+-            action = self._task(data.api.play("spotify-one", uris=["spotify:track:" + "B" * 22], execution_guard=guard, async_execution_guard=native_ready))
++        with patch.object(
++            data.speakers,
++            "start_identity",
++            new_callable=AsyncMock,
++            return_value="spotify-one",
++        ):
++            guard, native_ready = start_guards(
++                self.hass, "account-alpha", data, "spotify-one"
++            )
++            action = self._task(
++                data.api.play(
++                    "spotify-one",
++                    uris=["spotify:track:" + "B" * 22],
++                    execution_guard=guard,
++                    async_execution_guard=native_ready,
++                )
++            )
+             await self.native_commit_entered.wait()
+             await data.coordinator.async_refresh()
+             self.native_commit_release.set()
+@@ -222,11 +284,22 @@
+             "media_player", "podconnect", "account-alpha_spotify-one"
+         )
+         self.assertIsNotNone(entity_id)
+-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
+-            await self.hass.services.async_call("media_player", "play_media", {
+-                "entity_id": entity_id, "media_content_type": "music",
+-                "media_content_id": "spotify:track:" + "C" * 22,
+-            }, blocking=True)
++        with patch.object(
++            data.speakers,
++            "start_identity",
++            new_callable=AsyncMock,
++            return_value="spotify-one",
++        ):
++            await self.hass.services.async_call(
++                "media_player",
++                "play_media",
++                {
++                    "entity_id": entity_id,
++                    "media_content_type": "music",
++                    "media_content_id": "spotify:track:" + "C" * 22,
++                },
++                blocking=True,
++            )
+         self.assertEqual(self.native_prepares, 1)
+         self.assertEqual(self.native_commits, 1)
+         self.assertEqual(len(self._writes()), 1)
+@@ -235,10 +308,20 @@
+         self.playing = True
+         data = self.entries[0].runtime_data
+         await data.coordinator.async_refresh()
+-        with patch.object(data.speakers, "start_identity", new_callable=AsyncMock, return_value="spotify-one"):
+-            status, _ = await self._service("move_playback", {
+-                "config_entry_id": "account-alpha", "kind": "spotify_device", "target_id": "spotify-one",
+-            })
++        with patch.object(
++            data.speakers,
++            "start_identity",
++            new_callable=AsyncMock,
++            return_value="spotify-one",
++        ):
++            status, _ = await self._service(
++                "move_playback",
++                {
++                    "config_entry_id": "account-alpha",
++                    "kind": "spotify_device",
++                    "target_id": "spotify-one",
++                },
++            )
+         self.assertEqual(status, 200)
+         self.assertEqual(self.native_prepares, 1)
+         self.assertEqual(self.native_commits, 1)
+@@ -247,7 +330,10 @@
+ 
+     async def test_same_session_native_output_above_approved_max_refuses_track(self):
+         self.native_output_volume = 90
+-        request = self.request("play_track", args=self.track_args("spotify:track:" + "D" * 22, max_volume=40))
++        request = self.request(
++            "play_track",
++            args=self.track_args("spotify:track:" + "D" * 22, max_volume=40),
++        )
+         result = await self.invoke(request)
+         self.assertEqual(result["outcome"], "rejected")
+         self.assertEqual(self.native_prepares, 0)
+@@ -255,7 +341,10 @@
+ 
+     async def test_held_native_commit_rechecks_approved_output_max(self):
+         self.native_commit_hold = True
+-        request = self.request("play_track", args=self.track_args("spotify:track:" + "E" * 22, max_volume=40))
++        request = self.request(
++            "play_track",
++            args=self.track_args("spotify:track:" + "E" * 22, max_volume=40),
++        )
+         action = self._task(self.invoke(request))
+         await self.native_commit_entered.wait()
+         self.native_output_volume = 90
+@@ -305,7 +394,11 @@
+             self.assertFalse(result["physical_result_verified"])
+             self.assertFalse(result["retry_allowed"])
+             self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
+-            self.assertEqual((await self.controls())["status"], "awaiting_observation")
++            refreshed = await self.controls()
++            self.assertEqual(refreshed["status"], "ready")
++            self.assertGreater(
++                refreshed["poll_sequence"], result["observe_after_poll_sequence"]
++            )
+         self.assertEqual(len(self._writes()), 5)
+         self.assertEqual(self.command_queries[-1]["volume_percent"], "42")
+ 
+@@ -331,12 +424,24 @@
+         self.assertEqual(receipt["target"]["target_id"], "spotify-one")
+         self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
+         self.assertEqual(json.loads(self._writes()[0][2]), {"uris": [uri]})
+-        sequence = [call[1] for call in self.calls if call[1] in (
+-            "/api/start-volume", "/api/start-volume/commit", "/spotify/me/player/play"
+-        )]
+-        self.assertEqual(sequence[-3:], [
+-            "/api/start-volume", "/api/start-volume/commit", "/spotify/me/player/play"
+-        ])
++        sequence = [
++            call[1]
++            for call in self.calls
++            if call[1]
++            in (
++                "/api/start-volume",
++                "/api/start-volume/commit",
++                "/spotify/me/player/play",
++            )
++        ]
++        self.assertEqual(
++            sequence[-3:],
++            [
++                "/api/start-volume",
++                "/api/start-volume/commit",
++                "/spotify/me/player/play",
++            ],
++        )
+         self.assertEqual(self.native_prepares, 1)
+         self.assertEqual(self.native_commits, 1)
+         self.assertEqual(await self.invoke(request), receipt)
+@@ -359,14 +464,20 @@
+         self.assertEqual(result["error_kind"], "volume_above_approved_limit")
+         self.assertEqual(self._writes(), [])
+ 
+-    async def test_selected_track_requires_shared_start_floor_and_fresh_native_revision(self):
++    async def test_selected_track_requires_shared_start_floor_and_fresh_native_revision(
++        self,
++    ):
+         uri = "spotify:track:" + "A" * 22
+-        floor = await self.invoke(self.request("play_track", args=self.track_args(uri, 34)))
++        floor = await self.invoke(
++            self.request("play_track", args=self.track_args(uri, 34))
++        )
+         self.assertEqual(floor["error_kind"], "native_start_policy_changed")
+         self.assertEqual(self.native_prepares, 0)
+         self.assertEqual(self._writes(), [])
+         self.native_revision = "c" * 64
+-        changed = await self.invoke(self.request("play_track", args=self.track_args(uri, 40)))
++        changed = await self.invoke(
++            self.request("play_track", args=self.track_args(uri, 40))
++        )
+         self.assertEqual(changed["error_kind"], "native_start_policy_changed")
+         self.assertEqual(self.native_prepares, 0)
+         self.assertEqual(self._writes(), [])
+@@ -432,14 +543,25 @@
+         self.native_output_selected = False
+         await self.entries[0].runtime_data.coordinator.async_refresh()
+         controls = await self.hass.services.async_call(
+-            "podconnect", "get_track_play_controls",
+-            {"config_entry_id":"account-alpha", "kind":"spotify_device", "target_id":"spotify-one", "room_id":"room-beta"},
+-            blocking=True, return_response=True,
++            "podconnect",
++            "get_track_play_controls",
++            {
++                "config_entry_id": "account-alpha",
++                "kind": "spotify_device",
++                "target_id": "spotify-one",
++                "room_id": "room-beta",
++            },
++            blocking=True,
++            return_response=True,
+         )
+         self.assertEqual(controls["actions"], ["play_track"])
+-        self.assertEqual(controls["native_start"]["alias_binding"]["room_id"], "room-alpha")
++        self.assertEqual(
++            controls["native_start"]["alias_binding"]["room_id"], "room-alpha"
++        )
+         uri = "spotify:track:" + "A" * 22
+-        result = await self.invoke(self.request("play_track", args=self.track_args(uri)))
++        result = await self.invoke(
++            self.request("play_track", args=self.track_args(uri))
++        )
+         self.assertEqual(result["outcome"], "accepted")
+         self.assertEqual(self.native_prepares, 1)
+         self.assertEqual(self.native_commits, 1)
+@@ -466,7 +588,9 @@
+             data["devices"][0].update(original)
+         self.assertEqual(self._writes(), [])
+ 
+-    async def test_duplicate_reuse_and_no_second_command_before_new_poll(self):
++    async def test_duplicate_reuse_and_old_poll_are_not_replayed_after_command_refresh(
++        self,
++    ):
+         request = self.request()
+         accepted = await self.invoke(request)
+         self.assertEqual(await self.invoke(request), accepted)
+@@ -475,8 +599,14 @@
+             "request_reused",
+         )
+         self.assertEqual(
+-            (await self.invoke(self.request()))["error_kind"],
+-            "awaiting_observation",
++            (
++                await self.invoke(
++                    self.request(
++                        expected_poll_sequence=request["expected_poll_sequence"]
++                    )
++                )
++            )["error_kind"],
++            "stale_observation",
+         )
+         self.assertEqual(len(self._writes()), 1)
+         # A consumer cannot mutate the cached command receipt.
+@@ -752,40 +882,57 @@
+         self.assertEqual((await self.invoke(self.request()))["outcome"], "accepted")
+         self.assertEqual(len(self._writes()), 2)
+ 
+-    async def test_playlist_context_keeps_native_prepare_commit_and_existing_context_uri(self):
+-        uri = 'spotify:playlist:' + 'P' * 22
++    async def test_playlist_context_keeps_native_prepare_commit_and_existing_context_uri(
++        self,
++    ):
++        uri = "spotify:playlist:" + "P" * 22
+         args = self.track_args(uri)
+-        args['context_uri'] = args.pop('track_uri')
+-        controls = await self.hass.services.async_call('podconnect', 'get_context_play_controls',
+-            {'config_entry_id': 'account-alpha', 'kind': 'spotify_device',
+-             'target_id': 'spotify-one', 'room_id': 'room-alpha'}, blocking=True, return_response=True)
+-        self.assertEqual(controls['actions'], ['play_context'])
+-        self.assertTrue(controls['context_play_supported'])
+-        request = self.request('play_context', args=args)
++        args["context_uri"] = args.pop("track_uri")
++        controls = await self.hass.services.async_call(
++            "podconnect",
++            "get_context_play_controls",
++            {
++                "config_entry_id": "account-alpha",
++                "kind": "spotify_device",
++                "target_id": "spotify-one",
++                "room_id": "room-alpha",
++            },
++            blocking=True,
++            return_response=True,
++        )
++        self.assertEqual(controls["actions"], ["play_context"])
++        self.assertTrue(controls["context_play_supported"])
++        request = self.request("play_context", args=args)
+         result = await self.invoke(request)
+-        self.assertEqual(result['outcome'], 'accepted')
+-        self.assertEqual(json.loads(self._writes()[0][2]), {'context_uri': uri})
++        self.assertEqual(result["outcome"], "accepted")
++        self.assertEqual(json.loads(self._writes()[0][2]), {"context_uri": uri})
+         self.assertEqual((self.native_prepares, self.native_commits), (1, 1))
+         self.assertEqual(await self.invoke(request), result)
+         self.assertEqual(len(self._writes()), 1)
+-        self.assertEqual(self.command_queries[-1]['device_id'], 'spotify-one')
++        self.assertEqual(self.command_queries[-1]["device_id"], "spotify-one")
+ 
+     async def test_playlist_context_rejects_track_uri_and_stale_native_proof(self):
+-        args = self.track_args('spotify:track:' + 'A' * 22)
+-        args['context_uri'] = args.pop('track_uri')
+-        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
+-        args['context_uri'] = 'spotify:playlist:' + 'P' * 22
+-        args['start_policy_revision'] = 'c' * 64
+-        self.assertEqual((await self.invoke(self.request('play_context', args=args)))['outcome'], 'rejected')
++        args = self.track_args("spotify:track:" + "A" * 22)
++        args["context_uri"] = args.pop("track_uri")
++        self.assertEqual(
++            (await self.invoke(self.request("play_context", args=args)))["outcome"],
++            "rejected",
++        )
++        args["context_uri"] = "spotify:playlist:" + "P" * 22
++        args["start_policy_revision"] = "c" * 64
++        self.assertEqual(
++            (await self.invoke(self.request("play_context", args=args)))["outcome"],
++            "rejected",
++        )
+         self.assertEqual(self._writes(), [])
+ 
+     async def test_playlist_context_unknown_native_commit_never_sends_or_retries(self):
+         self.native_commit_status = 500
+-        args = self.track_args('spotify:playlist:' + 'P' * 22)
+-        args['context_uri'] = args.pop('track_uri')
+-        request = self.request('play_context', args=args)
++        args = self.track_args("spotify:playlist:" + "P" * 22)
++        args["context_uri"] = args.pop("track_uri")
++        request = self.request("play_context", args=args)
+         first = await self.invoke(request)
+-        self.assertEqual(first['outcome'], 'rejected')
++        self.assertEqual(first["outcome"], "rejected")
+         self.assertEqual(await self.invoke(request), first)
+         self.assertEqual(self._writes(), [])
+         self.assertEqual(self.native_commits, 1)
+--- a/tests/ha_framework/test_room_volume.py
++++ b/tests/ha_framework/test_room_volume.py
+@@ -329,6 +329,7 @@
+         result = await self.volume_invoke(request)
+         self.assertEqual(result["outcome"], "unknown")
+         self.assertFalse(result["protocol_accepted"])
++        self.assertTrue(result["possible_effect"])
+         await self.cleanup_finished()
+         self.volume_outcome = "protocol_accepted"
+         observed = await self.entries[0].runtime_data.speakers.room_volume_result(
+@@ -380,6 +381,7 @@
+             result = await self.volume_invoke(self.volume_request())
+             self.assertEqual(result["outcome"], "unknown")
+             self.assertFalse(result["protocol_accepted"])
++            self.assertTrue(result["possible_effect"])
+             await self.cleanup_finished()
+         self.assertEqual(self._writes(), [])
+ 
+@@ -395,6 +397,7 @@
+             await task
+         result = await self.volume_invoke(request)
+         self.assertEqual(result["outcome"], "unknown")
++        self.assertTrue(result["possible_effect"])
+         await self.cleanup_finished()
+         cancels = [body for path, body in self.volume_posts if path.endswith("cancel")]
+         self.assertEqual(cancels, [{"prepare_id": "c" * 32}])
+--- a/tests/ha_framework/test_command_refresh.py
++++ b/tests/ha_framework/test_command_refresh.py
+@@ -0,0 +1,227 @@
++"""Actual HA coordinator/HTTP causality; no provider effects outside loopback."""
++
++import asyncio
++import unittest
++
++from test_room_volume import RoomVolumeFrameworkTests
++
++
++class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
++    async def asyncSetUp(self):
++        self.refresh_hold = False
++        self.refresh_entered = asyncio.Event()
++        self.refresh_release = asyncio.Event()
++        self.playback_reads = 0
++        self.active_reads = 0
++        self.max_active_reads = 0
++        await super().asyncSetUp()
++        self.holds.append(self.refresh_release)
++        self.playing = True
++        await self.entries[0].runtime_data.coordinator.async_refresh()
++        self.playback_reads = 0
++        self.refresh_entered.clear()
++
++    async def _backend(self, request):
++        if request.path == "/spotify/me/player" and request.method == "GET":
++            self.playback_reads += 1
++            self.active_reads += 1
++            self.max_active_reads = max(self.max_active_reads, self.active_reads)
++            try:
++                response = await super()._backend(request)
++                self.refresh_entered.set()
++                if self.refresh_hold:
++                    await self.refresh_release.wait()
++                return response
++            finally:
++                self.active_reads -= 1
++        response = await super()._backend(request)
++        if request.path == "/api/room-transport/commit" and response.status == 200:
++            # Actual inert backend changes its source state only after admission.
++            action = next(
++                body["action"]
++                for path, body in reversed(self.room_posts)
++                if path.endswith("prepare")
++            )
++            if action in {"pause", "resume"}:
++                self.playing = action == "resume"
++        return response
++
++    async def demand_done(self):
++        task = self.volume_commands.data.coordinator._command_refresh_task
++        if task is not None:
++            await asyncio.wait_for(asyncio.shield(task), 2)
++
++    async def test_refresh_real_pause_offer_resume_volume_burst_under_one_second(self):
++        start = asyncio.get_running_loop().time()
++        pause = await self.room_invoke(self.room_request("pause"))
++        self.assertEqual(pause["outcome"], "accepted")
++        offered = await self.room_offer()
++        self.assertIn("resume", offered["actions"])
++        self.assertGreater(
++            offered["poll_sequence"], pause["observe_after_poll_sequence"]
++        )
++        self.assertEqual(
++            self.entries[0].runtime_data.coordinator.data["playback"]["is_playing"],
++            False,
++        )
++        resume = await self.room_invoke(self.room_request("resume"))
++        self.assertEqual(resume["outcome"], "accepted")
++        self.assertTrue(
++            self.entries[0].runtime_data.coordinator.data["playback"]["is_playing"]
++        )
++        volume_offer = await self.volume_offer()
++        self.assertEqual(volume_offer["actions"], ["volume"])
++        self.assertGreater(
++            volume_offer["poll_sequence"], resume["observe_after_poll_sequence"]
++        )
++        volume = await self.volume_invoke(self.volume_request(41))
++        self.assertEqual(volume["outcome"], "accepted")
++        elapsed = asyncio.get_running_loop().time() - start
++        self.assertLess(elapsed, 1.0)
++        self.assertEqual(self.playback_reads, 3)
++        self.assertEqual(self.max_active_reads, 1)
++        self.assertEqual(self._writes(), [])
++        self.assertEqual(self.manual_percent, 27)
++        print(f"INERT_BURST_SECONDS={elapsed:.6f}", flush=True)
++
++    async def test_refresh_slow_provider_stays_awaiting_until_real_response(self):
++        self.refresh_hold = True
++        result = await self.room_invoke(self.room_request("pause"))
++        self.assertEqual(result["outcome"], "accepted")
++        offered = await self.room_offer()
++        self.assertEqual(offered["status"], "awaiting_observation")
++        self.assertEqual(offered["actions"], [])
++        self.assertLessEqual(
++            offered["poll_sequence"], result["observe_after_poll_sequence"]
++        )
++        self.assertTrue(
++            self.entries[0].runtime_data.coordinator.data["playback"]["is_playing"]
++        )
++        self.refresh_release.set()
++        await self.demand_done()
++        fresh = await self.room_offer()
++        self.assertIn("resume", fresh["actions"])
++        self.assertGreater(
++            fresh["poll_sequence"], result["observe_after_poll_sequence"]
++        )
++        self.assertEqual(self.playback_reads, 1)
++        self.assertEqual(len(self.room_posts), 2)
++
++    async def test_refresh_scheduled_poll_serializes_before_demand_without_regression(
++        self,
++    ):
++        data = self.entries[0].runtime_data
++        coordinator = data.coordinator
++        published = []
++        remove = coordinator.async_add_listener(
++            lambda: published.append(coordinator.data["poll_sequence"])
++        )
++        self.addCleanup(remove)
++        self.refresh_hold = True
++        old_poll = self._task(coordinator._async_refresh(scheduled=True))
++        await asyncio.wait_for(self.refresh_entered.wait(), 2)
++        result = await self.room_invoke(self.room_request("pause"))
++        self.assertEqual((await self.room_offer())["status"], "awaiting_observation")
++        self.assertEqual(self.playback_reads, 1)
++        self.refresh_release.set()
++        await old_poll
++        await self.demand_done()
++        self.assertEqual(self.playback_reads, 2)
++        self.assertEqual(self.max_active_reads, 1)
++        self.assertEqual(published, sorted(published))
++        self.assertGreater(
++            coordinator.data["poll_sequence"], result["observe_after_poll_sequence"]
++        )
++        self.assertFalse(coordinator.data["playback"]["is_playing"])
++        self.assertIn("resume", (await self.room_offer())["actions"])
++
++    async def test_refresh_requests_coalesce_and_cancelled_waiter_does_not_cancel_poll(
++        self,
++    ):
++        coordinator = self.entries[0].runtime_data.coordinator
++        self.refresh_hold = True
++        command = self._task(self.room_invoke(self.room_request("pause")))
++        await asyncio.wait_for(self.refresh_entered.wait(), 2)
++        waiters = [
++            self._task(coordinator.async_refresh_after_command()) for _ in range(6)
++        ]
++        await asyncio.sleep(0)
++        waiters[0].cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await waiters[0]
++        self.assertFalse(coordinator._command_refresh_task.cancelled())
++        self.refresh_release.set()
++        self.assertEqual((await command)["outcome"], "accepted")
++        await asyncio.gather(*waiters[1:])
++        self.assertEqual(self.playback_reads, 1)
++        self.assertEqual(self.max_active_reads, 1)
++        self.assertIn("resume", (await self.room_offer())["actions"])
++
++    async def test_refresh_owner_replacement_during_read_never_publishes_old_owner(
++        self,
++    ):
++        data = self.entries[0].runtime_data
++        before = data.coordinator.data["poll_sequence"]
++        self.refresh_hold = True
++        request = self.room_request("pause")
++        task = self._task(self.room_invoke(request))
++        await asyncio.wait_for(self.refresh_entered.wait(), 2)
++        data.coordinator.owner_epoch = "replacement"
++        self.refresh_release.set()
++        self.assertEqual((await task)["outcome"], "accepted")
++        await self.demand_done()
++        self.assertEqual(data.coordinator.data["poll_sequence"], before)
++        self.assertFalse(data.coordinator.last_update_success)
++        self.assertEqual(len(self.room_posts), 2)
++        self.assertEqual(
++            await self.room_invoke(request),
++            data.commands.receipts[request["command_sequence"]][1],
++        )
++
++    async def test_refresh_cancelled_command_waiter_preserves_receipt_and_owned_read(
++        self,
++    ):
++        self.refresh_hold = True
++        request = self.room_request("pause")
++        task = self._task(self.room_invoke(request))
++        await asyncio.wait_for(self.refresh_entered.wait(), 2)
++        task.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        cached = self.entries[0].runtime_data.commands.receipts[
++            request["command_sequence"]
++        ][1]
++        self.assertEqual(cached["outcome"], "accepted")
++        self.refresh_release.set()
++        await self.demand_done()
++        self.assertEqual(await self.room_invoke(request), cached)
++        self.assertEqual(self.playback_reads, 1)
++        self.assertIn("resume", (await self.room_offer())["actions"])
++        self.assertEqual(len(self.room_posts), 2)
++
++    async def test_refresh_timeout_is_bounded_and_never_fabricates_ready_or_retries(
++        self,
++    ):
++        self.refresh_hold = True
++        request = self.room_request("pause")
++        result = await self.room_invoke(request)
++        await self.demand_done()
++        coordinator = self.entries[0].runtime_data.coordinator
++        self.assertTrue(coordinator._command_refresh_task.done())
++        self.assertLessEqual(
++            coordinator.data["poll_sequence"], result["observe_after_poll_sequence"]
++        )
++        unavailable = await self.room_offer()
++        self.assertFalse(unavailable.get("ok"))
++        self.assertEqual(self.playback_reads, 1)
++        self.assertEqual(len(self.room_posts), 2)
++        self.refresh_release.set()
++        self.assertEqual(await self.room_invoke(request), result)
++
++
++def load_tests(loader, tests, pattern):
++    return unittest.TestSuite(
++        CommandRefreshFrameworkTests(name)
++        for name in loader.getTestCaseNames(CommandRefreshFrameworkTests)
++        if name.startswith("test_refresh_")
++    )

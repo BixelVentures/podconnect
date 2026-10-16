@@ -349,3 +349,565 @@ get_queue_controls:
       required: true
       selector:
         text:
+
+get_room_playback_controls:
+  name: Read exact-room native audio controls
+  description: Same-session pause/resume/next/previous through native and OwnTone exact-room capabilities. No route selection, volume, generic fallback or physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+
+control_room_playback:
+  name: Control exact-room native audio
+  description: Echo the exact native and route identities from get_room_playback_controls. Uses the existing canonical account/owner/poll sequence and receipts. Unknown outcomes are consumed and must never be retried. Volume and new-session starts are unavailable; accepted_native is not provider or audible acceptance.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    native:
+      required: true
+      selector:
+        object:
+    route:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [pause, resume, next, previous]
+    args:
+      description: Must be an empty object for the four same-session audio actions.
+      required: true
+      selector:
+        object:
+
+get_room_volume_controls:
+  name: Read exact-room native volume controls
+  description: Read actual native/OwnTone manual and effective volume revisions. No preparation, effect, generic fallback, or physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+
+control_room_volume:
+  name: Control exact-room native volume
+  description: Requires an exact server-authorized human percent plus native/route/volume_state snapshots from get_room_volume_controls. Uses shared canonical account/owner/poll receipts; unknown outcomes are consumed. Native reservation or RTSP acceptance is not physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    native:
+      required: true
+      selector:
+        object:
+    route:
+      required: true
+      selector:
+        object:
+    volume_state:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [volume]
+    args:
+      description: Exactly percent as an integer 0 to 100; no default, delta, start level, or attention authority.
+      required: true
+      selector:
+        object:
+
+get_room_content_controls:
+  name: Read exact owned destination content-start controls
+  description: Read a native-owned selected-content descriptor for default or explicitly selected current owned room. No active WebAPI device/volume is required; this read never starts content.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+
+prepare_room_selected_content:
+  name: Prepare selected content without playback effects
+  description: Reserve the canonical request and stage source only. Returns a distinct preparation receipt; the task owner must recheck its grant before sending the identical request to start_room_selected_content.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    start_offer:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [play_track, play_context]
+    args:
+      description: Exactly track_uri or context_uri plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
+      required: true
+      selector:
+        object:
+
+start_room_selected_content:
+  name: Commit prepared selected content to exact owned room
+  description: Commit only the identical staged canonical request after the trusted task owner checks its grant. Complete native start is separate from gate/35 protocol admission and never physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    start_offer:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [play_track, play_context]
+    args:
+      description: Exactly track_uri or context_uri plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
+      required: true
+      selector:
+        object:
+
+cancel_room_content_preparation:
+  name: Cancel exact selected-content preparation
+  description: Veto only this reserved operation. Cannot change destination, refund its sequence or release uncertain physical fences.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    offer_id:
+      required: true
+      selector:
+        text:
+    binding_id:
+      required: true
+      selector:
+        text:
+
+get_room_move_controls:
+  name: Read exact owned destination content-start controls
+  description: Read a native-owned retained-session MOVE descriptor for default or explicitly selected current owned room. No active WebAPI device/volume is required; this read never starts content.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+
+prepare_room_move_playback:
+  name: Prepare retained session without playback effects
+  description: Reserve the canonical request and stage source only. Returns a distinct preparation receipt; the task owner must recheck its grant before sending the identical request to move_room_playback.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    move_offer:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [move_existing_session]
+    args:
+      description: Exactly an empty object. The native owner retains the source/session and its actual old manual volume.
+      required: true
+      selector:
+        object:
+
+move_room_playback:
+  name: Commit prepared retained session to exact owned room
+  description: Commit only the identical staged canonical request after the trusted task owner checks its grant. Complete native movement preserves the owned source, queue, timeline, paused flag and manual volume; never physical proof.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    kind:
+      required: true
+      selector:
+        select:
+          options: [spotify_device]
+    target_id:
+      required: true
+      selector:
+        text:
+    room_id:
+      required: true
+      selector:
+        text:
+    homepod_id:
+      required: true
+      selector:
+        text:
+    move_offer:
+      required: true
+      selector:
+        object:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    expected_poll_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    action:
+      required: true
+      selector:
+        select:
+          options: [move_existing_session]
+    args:
+      description: Exactly an empty object. The native owner retains the source/session and its actual old manual volume.
+      required: true
+      selector:
+        object:
+
+cancel_room_move_preparation:
+  name: Cancel exact retained-session MOVE preparation
+  description: Veto only this reserved operation. Cannot change destination, refund its sequence or release uncertain physical fences.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    owner_epoch:
+      required: true
+      selector:
+        text:
+    command_sequence:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9007199254740991
+          mode: box
+    request_id:
+      required: true
+      selector:
+        text:
+    offer_id:
+      required: true
+      selector:
+        text:
+    binding_id:
+      required: true
+      selector:
+        text:
