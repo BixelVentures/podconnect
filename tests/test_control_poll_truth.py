@@ -96,12 +96,14 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
         tree = ast.parse((ROOT / 'custom_components/podconnect/coordinator.py').read_text())
         method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == '_async_update_data')
         ns = {'SpotifyApiError':SpotifyApiError, 'UpdateFailed':RuntimeError, 'Any':object, 'dt_util':SimpleNamespace(utcnow=lambda:0), 'time':time}
-        exec(compile(ast.Module(body=[method], type_ignores=[]), '<shipped coordinator>', 'exec'), ns)
+        owner_check = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_check_command_owner')
+        exec(compile(ast.Module(body=[owner_check, method], type_ignores=[]), '<shipped coordinator>', 'exec'), ns)
         gate = asyncio.Event()
         async def playback():
             await gate.wait()
             return {'is_playing':False}
-        obj = SimpleNamespace(poll_sequence=4, api=SimpleNamespace(playback_state=playback, devices=AsyncMock(return_value=[])))
+        obj = SimpleNamespace(poll_sequence=4, command_owner_guard=lambda: True, api=SimpleNamespace(playback_state=playback, devices=AsyncMock(return_value=[])))
+        obj._check_command_owner = lambda: ns['_check_command_owner'](obj)
         task = asyncio.create_task(ns['_async_update_data'](obj))
         await asyncio.sleep(0)
         self.assertEqual(obj.poll_sequence, 5)
