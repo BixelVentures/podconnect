@@ -584,3 +584,39 @@
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
      stale_audio.native_owner=r->committed_native_owner;
+--- a/tests/player_startup_owner.inc.c
++++ b/tests/player_startup_owner.inc.c
+@@ -17,7 +17,19 @@
+ static pthread_mutex_t startup_writer_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t startup_writer_condition = PTHREAD_COND_INITIALIZER;
+ static bool startup_writer_ready, startup_writer_begin, startup_writer_held, startup_writer_release;
++static bool startup_library_ready;
+ 
++static enum command_state startup_library_ready_cb(void *arg, int *ret)
++{
++  (void)arg;
++  assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++  startup_library_ready = true;
++  assert(pthread_cond_signal(&startup_writer_condition) == 0);
++  assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
++  *ret = 0;
++  return COMMAND_END;
++}
++
+ int __real_sqlite3_open(const char *, sqlite3 **);
+ int __real_sqlite3_unlock_notify(sqlite3 *, void (*)(void **, int), void *);
+ int __real_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+@@ -158,6 +170,13 @@
+       assert(sqlite3_close(schema) == SQLITE_OK);
+     }
+   assert(worker_init() == 0 && cache_init() == 0 && library_init() == 0);
++  /* The library's init scan holds its own real DB transaction. Queue a marker
++   * on that worker and wait for it before acquiring the fixture's write lock. */
++  assert(library_exec_async(startup_library_ready_cb, NULL) == 0);
++  assert(pthread_mutex_lock(&startup_writer_mutex) == 0);
++  while (!startup_library_ready)
++    assert(pthread_cond_wait(&startup_writer_condition, &startup_writer_mutex) == 0);
++  assert(pthread_mutex_unlock(&startup_writer_mutex) == 0);
+   startup_fault = fault; startup_active = true;
+   if (fault == START_LOCKED)
+     {
