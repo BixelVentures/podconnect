@@ -49,6 +49,12 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/room-start35-native-amendment.patch" \
   && git apply --check "/patches/room-move-native.patch" \
   && git apply "/patches/room-move-native.patch" \
+  && git apply --check -p2 "/patches/room-retirement-native.patch" \
+  && git apply -p2 "/patches/room-retirement-native.patch" \
+  && git apply --check "/patches/room-startcredit-handoff-native.patch" \
+  && git apply "/patches/room-startcredit-handoff-native.patch" \
+  && git apply --check "/patches/room-startcredit-reviewfix-native.patch" \
+  && git apply "/patches/room-startcredit-reviewfix-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -72,6 +78,8 @@ COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
 COPY patches/room-burst-owntone.patch /patches/room-burst-owntone.patch
+COPY patches/room-move-owntone.patch /patches/room-move-owntone.patch
+COPY patches/owntone-move.sha256 /patches/owntone-move.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
   && test "$(git rev-parse HEAD)" = fa607a02768d9e29cd87065ac30ac66ea673f1ae \
@@ -83,6 +91,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && git apply /patches/room-volume-owntone.patch \
   && git apply --check /patches/room-burst-owntone.patch \
   && git apply /patches/room-burst-owntone.patch \
+  && sha256sum -c /patches/owntone-move.sha256 \
+  && git apply --check /patches/room-move-owntone.patch \
+  && git apply /patches/room-move-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

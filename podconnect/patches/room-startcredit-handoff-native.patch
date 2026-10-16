@@ -1,0 +1,729 @@
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -382,7 +382,9 @@
+ 			}
+ 			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
+ 			p.aliasMu.Lock()
+-			p.advanceAliasRevisionLocked()
++			if p.state.device.SelectedAliasId != *aliasId {
++				p.advanceAliasRevisionLocked()
++			}
+ 			p.state.device.SelectedAliasId = *aliasId
+ 			binding := p.aliasBindingLocked()
+ 			p.aliasMu.Unlock()
+diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -25,6 +25,16 @@
+ 		return nil, nil, ErrAliasConflict
+ 	}
+ 	return app.moveCustody, app.startCustody, nil
++}
++
++func (app *App) startWriterFD(op *contentOperation, pipe output.PipeIdentity) string {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != op ||
++		app.openedWriter.PipeIdentity != pipe || !volumeCounter(app.openedWriter.FD) {
++		return ""
++	}
++	return app.openedWriter.FD
+ }
+ 
+ func completedStartCustody(op *contentOperation) bool {
+diff --git a/daemon/room_content_execute.go b/daemon/room_content_execute.go
+--- a/daemon/room_content_execute.go
++++ b/daemon/room_content_execute.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"time"
+ )
+@@ -212,14 +213,48 @@
+ 		failed()
+ 		return
+ 	}
+-	op.mu.Lock()
+-	cancelled := op.Cancelled || ctx.Err() != nil
+-	op.mu.Unlock()
+-	if cancelled {
+-		failed()
+-		return
+-	}
+-	op.finish("complete")
++	// C COMPLETE may block while the independent output loop closes on EOF or
++	// error. Join the actual selected source and fstat-verified writer again,
++	// then credit this exact actor under the same output/source lock boundary.
++	op.mu.Lock()
++	current = op.Stream != nil && op.Stream.Source != nil && op.Pipe.Type == "fifo" && op.Epoch != ""
++	var selected librespot.AudioSource
++	if current {
++		selected = op.Stream.Source
++	}
++	pipe, epoch = op.Pipe, op.Epoch
++	op.mu.Unlock()
++	if !current || op.Owner.app == nil {
++		failed()
++		return
++	}
++	writerFD := op.Owner.app.startWriterFD(op, pipe)
++	if writerFD == "" {
++		failed()
++		return
++	}
++	err = op.Owner.player.VerifyStart35(ctx, selected, pipe, epoch, writerFD, func(mutate func()) error {
++		op.Owner.aliasMu.Lock()
++		defer op.Owner.aliasMu.Unlock()
++		op.mu.Lock()
++		defer op.mu.Unlock()
++		if op.Cancelled || op.Terminal || op.CReceipt == nil || op.CReceipt.Phase != "completed" ||
++			!op.Owner.contentEffectCurrentLocked(op, ctx) || op.Actual == nil || *op.Actual != op.Intended ||
++			op.Stream == nil || op.Stream.Source != selected || op.Pipe != pipe || op.Epoch != epoch {
++			return ErrAliasConflict
++		}
++		mutate()
++		op.State = "complete"
++		op.Terminal = true
++		op.RetainUntil = time.Now().Add(time.Minute)
++		if op.TerminalSignal != nil {
++			close(op.TerminalSignal)
++		}
++		return nil
++	})
++	if err != nil {
++		failed()
++	}
+ }
+ func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
+ 	if identity == nil {
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -251,9 +251,11 @@
+ 			close(server.requests)
+ 			<-done
+ 			<-stopped
+-			positive := mode == "complete" || mode == "move-complete" || mode == "start-complete"
+-			if positive != receipt.Accepted {
+-				t.Fatal("wrong final completion", mode, receipt)
++			completedC := mode == "complete" || mode == "move-complete" || mode == "start-complete"
++			// This protocol fixture deliberately has no actual player worker or
++			// FIFO descriptor. A C COMPLETE alone can no longer credit START.
++			if receipt.Accepted {
++				t.Fatal("mock C completion credited without actual native writer", mode, receipt)
+ 			}
+ 			if priorMove != nil && mode != "move-complete" && p.app.moveCustody != priorMove {
+ 				t.Fatal("ambiguous or stale START ACK cleared old MOVE custody")
+@@ -270,7 +272,7 @@
+ 			if mode == "complete-fails" && p.app.startCustody != op {
+ 				t.Fatal("unknown START lost process-wide source custody")
+ 			}
+-			if positive {
++			if completedC {
+ 				if strings.Join(nativeSteps, ",") != "quiesce,publish,resume" {
+ 					t.Fatal(nativeSteps)
+ 				}
+@@ -281,7 +283,8 @@
+ 					t.Fatal("complete replay/cancel mutated", calls)
+ 				}
+ 				cMu.Unlock()
+-			} else if receipt.State != "unknown" && mode != "wrong-content" {
++			}
++			if receipt.State != "unknown" && mode != "wrong-content" {
+ 				t.Fatal("postgateuncertainty relabelled", receipt)
+ 			}
+ 		})
+diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
+--- a/daemon/context_commit_test.go
++++ b/daemon/context_commit_test.go
+@@ -701,6 +701,8 @@
+ 						t.Fatal("prepared selection lost current room registry binding")
+ 					}
+ 					// An ordinary next empty transfer remains supported and alias 0 retains the selected room.
++					generation := p.roomTransportGeneration
++					revision := p.aliasRevision
+ 					next := pc13PlayRequest(t)
+ 					next.Command.Endpoint, next.Command.Data, next.TargetAliasId = "transfer", nil, proto.Uint32(0)
+ 					if err := p.handlePlayerCommand(context.Background(), next); err != nil {
+@@ -710,6 +712,9 @@
+ 					if p.state.device.SelectedAliasId != wantAlias || *p.aliasBinding() != *binding || len(events) != 3 || events[1].Type != "selected_alias" || events[2].Type != ApiEventTypeActive || requests != wantRequests {
+ 						t.Fatal("next alias0 transfer changed current output owner or made provider request")
+ 					}
++					if p.roomTransportGeneration <= generation || p.aliasRevision != revision {
++						t.Fatal("same-alias command failed to invalidate old intent or changed route revision")
++					}
+ 				})
+ 			}
+ 		}
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -91,6 +91,7 @@
+ 	PreparedState       *connectpb.PlayerState
+ 	OwnToneURL          string
+ 	InputPath           string
++	CompletedWriter     *completedWriter
+ }
+ type roomTransportConsumeRequest struct {
+ 	PrepareID string
+@@ -289,6 +290,12 @@
+ 	latest, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
+ 	if err != nil || latest != identity || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state.tracks != offer.Tracks {
+ 		return nil, ErrAliasConflict
++	}
++	if bound {
++		offer.CompletedWriter, err = p.verifyCompletedWriter(ctx, identity)
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 	id, err := randomQueueID(16)
+ 	if err != nil {
+@@ -316,6 +323,12 @@
+ func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, parent, request context.Context) bool {
+ 	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
+ 		return false
++	}
++	if offer.Bound && offer.CompletedWriter != nil {
++		current, err := p.app.completedWriterCurrent(p, offer.Snapshot.roomTransportIdentity)
++		if err != nil || current == nil || *current != *offer.CompletedWriter {
++			return false
++		}
+ 	}
+ 	binding := p.aliasBindingLocked()
+ 	if !p.transportMappingCurrentLocked() || binding == nil || !binding.Ready || binding.Incarnation != offer.Snapshot.AliasIncarnation || binding.Registry != offer.Snapshot.AliasRegistry || binding.RoomID != offer.Snapshot.RoomID {
+diff --git a/daemon/room_volume.go b/daemon/room_volume.go
+--- a/daemon/room_volume.go
++++ b/daemon/room_volume.go
+@@ -301,6 +301,13 @@
+ 	if err != nil || identity != binding.Native || inputDigest != binding.Route.InputPathDigest || (bound && !nativeBoundOwnerValid(identity)) {
+ 		return nil, ErrAliasConflict
+ 	}
++	var completed *completedWriter
++	if bound {
++		completed, err = p.verifyCompletedWriter(ctx, identity)
++		if err != nil {
++			return nil, err
++		}
++	}
+ 	revision, err := p.nextNativeIntent()
+ 	if err != nil {
+ 		return nil, err
+@@ -322,6 +329,7 @@
+ 	sum := sha256.Sum256(raw)
+ 	actor := &nativeTransportOffer{Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Expires: time.Now().Add(roomVolumeOfferLifetime), Snapshot: roomTransportSnapshot{roomTransportIdentity: identity, PrepareID: id, Action: "volume", VolumePercent: binding.VolumePercent, ArgsDigest: hex.EncodeToString(sum[:])}}
+ 	actor.Bound = bound
++	actor.CompletedWriter = completed
+ 	actor.NativeRevision = revision
+ 	op := &roomVolumeOperation{Bound: bound, NativeRevision: revision, TerminalProof: make(chan struct{}), Owner: p, Binding: binding, Actor: actor, ID: id, ArgsDigest: actor.Snapshot.ArgsDigest, OwnToneURL: actor.OwnToneURL, InputDigest: inputDigest, Expires: actor.Expires, RetainUntil: actor.Expires.Add(15 * time.Second), Latest: roomVolumeReceipt{NativePrepareID: id, State: "prepared"}}
+ 	return op, nil
+diff --git a/daemon/normal_alias_handoff_test.go b/daemon/normal_alias_handoff_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/normal_alias_handoff_test.go
+@@ -0,0 +1,28 @@
++package daemon
++
++import (
++	"testing"
++
++	"github.com/devgianlu/go-librespot/dealer"
++	"google.golang.org/protobuf/proto"
++)
++
++func TestNormalPhoneAliasNoopKeepsRevisionButRealABAAdvances(t *testing.T) {
++	p, _ := localAliasPlayer(t)
++	p.app.cfg.DeviceAliases = []string{"Room A", "Room B"}
++	p.app.cfg.DeviceAliasRoomIDs = []string{"r0", "r1"}
++	p.initAliasRegistry()
++	p.state.device.SelectedAliasId = 1
++	initial := p.aliasRevision
++	for _, alias := range []uint32{0, 1} {
++		p.commitPlayerCommand(dealer.RequestPayload{TargetAliasId: proto.Uint32(alias)})
++		if p.aliasRevision != initial {
++			t.Fatal("resolved current alias advanced owner revision")
++		}
++	}
++	p.commitPlayerCommand(dealer.RequestPayload{TargetAliasId: proto.Uint32(2)})
++	p.commitPlayerCommand(dealer.RequestPayload{TargetAliasId: proto.Uint32(1)})
++	if p.aliasRevision != initial+2 || p.state.device.SelectedAliasId != 1 {
++		t.Fatal("real alias ABA did not advance revision twice")
++	}
++}
+diff --git a/daemon/room_completed_writer.go b/daemon/room_completed_writer.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_completed_writer.go
+@@ -0,0 +1,116 @@
++package daemon
++
++import (
++	"context"
++
++	"github.com/devgianlu/go-librespot/output"
++)
++
++// A completed C source may continue with a new phone connection or playback
++// session only on this same App, Player and live FIFO writer. The two changing
++// owner fields are intentionally excluded only at this completed-source gate.
++type completedWriter struct {
++	start  *contentOperation
++	move   *moveOperation
++	writer output.MovePipeIdentity
++	epoch  string
++}
++
++func sameCompletedRoom(a, b roomTransportIdentity) bool {
++	return a.AccountUserID == b.AccountUserID && a.TargetID == b.TargetID &&
++		a.RoomID == b.RoomID && a.HomePodID == b.HomePodID &&
++		a.AliasIncarnation == b.AliasIncarnation && a.AliasRegistry == b.AliasRegistry &&
++		a.AliasRevision == b.AliasRevision
++}
++
++func (app *App) completedWriterCurrent(owner *AppPlayer, identity roomTransportIdentity) (*completedWriter, error) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil {
++		return nil, ErrAliasConflict
++	}
++	if app.startCustody == nil && app.moveCustody == nil {
++		return nil, nil
++	}
++	if owner == nil || owner.player == nil || owner.sess == nil ||
++		app.startCustody != nil && app.moveCustody != nil {
++		return nil, ErrAliasConflict
++	}
++	var current completedWriter
++	var actual *roomTransportIdentity
++	var process contentProcess
++	if op := app.startCustody; op != nil {
++		op.mu.Lock()
++		valid := op.Owner == owner && op.Capture != nil && op.Capture.Player == owner.player &&
++			op.Capture.Session == owner.sess && op.Terminal && op.State == "complete" &&
++			op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Actual != nil &&
++			op.Actual != nil && *op.CReceipt.Actual == *op.Actual && op.CReceipt.WriterEpoch == op.Epoch
++		if valid {
++			current = completedWriter{start: op, writer: app.openedWriter, epoch: op.Epoch}
++			actual, process = op.Actual, op.Capture.Process
++			valid = op.CReceipt.Pipe != nil && *op.CReceipt.Pipe == outputPipeIdentity{Device: current.writer.Device, Inode: current.writer.Inode, Type: "fifo"}
++		}
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	} else if op := app.moveCustody; op != nil {
++		op.mu.Lock()
++		valid := op.Owner == owner && op.Capture != nil && op.Capture.Player == owner.player &&
++			op.Capture.Session == owner.sess && op.Terminal && op.State == "complete" &&
++			op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Actual != nil &&
++			op.Actual != nil && *op.CReceipt.Actual == *op.Actual && op.CReceipt.WriterEpoch == op.Epoch
++		if valid {
++			current = completedWriter{move: op, writer: op.Pipe, epoch: op.Epoch}
++			actual, process = op.Actual, op.Capture.Process
++			valid = op.CReceipt.Pipe != nil && *op.CReceipt.Pipe == outputPipeIdentity{Device: current.writer.Device, Inode: current.writer.Inode, Type: "fifo"} && current.writer == app.openedWriter
++		}
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	}
++	observed, ok := nativeContentProcess()
++	if !ok || observed != process || actual == nil || !sameCompletedRoom(*actual, identity) ||
++		current.writer.Type != "fifo" || !volumeCounter(current.writer.FD) ||
++		!volumeCounter(current.epoch) || current.epoch == "0" {
++		return nil, ErrAliasConflict
++	}
++	return &current, nil
++}
++
++// This is the existing RoomMove verify worker phase, which performs no move
++// mutation. It joins the real output and source locks and fstats the writer.
++func (p *AppPlayer) verifyCompletedWriter(ctx context.Context, identity roomTransportIdentity) (*completedWriter, error) {
++	current, err := p.app.completedWriterCurrent(p, identity)
++	if err != nil || current == nil {
++		return current, err
++	}
++	if p.primaryStream == nil || p.primaryStream.Source == nil || p.state == nil || p.state.player == nil {
++		return nil, ErrAliasConflict
++	}
++	source := p.primaryStream.Source
++	paused := p.state.player.IsPaused
++	_, _, err = p.player.RoomMove(ctx, "verify", source, current.writer, current.epoch, !paused, func(mutate func()) error {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		fresh, err := p.app.completedWriterCurrent(p, identity)
++		binding := p.aliasBindingLocked()
++		if err != nil || fresh == nil || *fresh != *current || p.primaryStream == nil ||
++			p.primaryStream.Source != source || p.state == nil || p.state.player == nil ||
++			p.state.player.IsPaused != paused || p.spotConnId != identity.ConnectionID ||
++			p.state.player.SessionId != identity.SessionID || !p.hasInitialConnectState || p.aliasRetired ||
++			p.aliasIncarnation != identity.AliasIncarnation || p.aliasFingerprint != identity.AliasRegistry ||
++			p.aliasRevision != identity.AliasRevision || p.app.deviceId != identity.TargetID ||
++			binding == nil || !binding.Ready || binding.RoomID != identity.RoomID ||
++			!p.transportMappingCurrentLocked() {
++			return ErrAliasConflict
++		}
++		mutate()
++		return nil
++	})
++	if err != nil {
++		return nil, ErrAliasConflict
++	}
++	return current, nil
++}
+diff --git a/daemon/room_completed_writer_test.go b/daemon/room_completed_writer_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/room_completed_writer_test.go
+@@ -0,0 +1,125 @@
++package daemon
++
++import (
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++)
++
++type normalPhoneSource struct{ id int }
++
++func (*normalPhoneSource) Read([]float32) (int, error) { return 0, io.EOF }
++func (*normalPhoneSource) PositionMs() int64           { return 0 }
++func (*normalPhoneSource) SetPositionMs(int64) error   { return nil }
++
++func TestCompletedWriterFreshPhoneSessionAndNextTrackReproof(t *testing.T) {
++	p, op := contentFixture(t)
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	actual, err := player.NewPlayer(&player.Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			out, err := create()
++			if err == nil {
++				p.app.openedWriter = out.(interface {
++					OpenedWriterIdentity() output.MovePipeIdentity
++				}).OpenedWriterIdentity()
++			}
++			return out, err
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer actual.Close()
++	old, selected, next := &normalPhoneSource{1}, &normalPhoneSource{2}, &normalPhoneSource{3}
++	if err := actual.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := actual.Start35(context.Background(), "quiesce", nil, old, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = actual.Start35(context.Background(), "publish", selected, old, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = actual.Start35(context.Background(), "resume", nil, selected, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if err := actual.Pause(); err != nil {
++		t.Fatal(err)
++	}
++	p.state.player.IsPaused = true
++	p.player, op.Capture.Player = actual, actual
++	p.primaryStream.Source = selected
++	op.Capture.Session = p.sess
++	op.Epoch = epoch
++	owned := op.Intended
++	p.aliasRevision = owned.AliasRevision
++	p.state.device.SelectedAliasId = 2
++	op.Actual = &owned
++	op.CReceipt = &contentCReceipt{Phase: "completed", Actual: &owned, WriterEpoch: epoch,
++		Pipe: &outputPipeIdentity{Device: pipe.Device, Inode: pipe.Inode, Type: pipe.Type}}
++	op.Terminal, op.State = true, "complete"
++	p.app.startCustody = op
++	actualFD := p.app.openedWriter.FD
++	p.spotConnId, p.state.player.SessionId = "accepted-new-connection", "new-phone-session"
++	p.hasInitialConnectState = true
++	identity := owned
++	identity.ConnectionID, identity.SessionID = p.spotConnId, p.state.player.SessionId
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err != nil {
++		t.Fatal("same App/new accepted phone owner lost exact writer", err)
++	}
++	p.hasInitialConnectState = false
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err == nil {
++		t.Fatal("failed NEW_DEVICE acceptance credited")
++	}
++	p.hasInitialConnectState = true
++	if err := actual.SetPrimaryStream(next, true, false); err != nil {
++		t.Fatal(err)
++	}
++	p.primaryStream.Source = next
++	if _, _, directErr := actual.RoomMove(context.Background(), "verify", next, p.app.openedWriter, epoch, false, guard); directErr != nil {
++		t.Fatal("actual next-track writer changed", directErr)
++	}
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err != nil {
++		t.Fatal("same writer next track was denied", err)
++	}
++	identity.AliasRevision++
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err == nil {
++		t.Fatal("real alias ABA accepted against old completed owner")
++	}
++	identity.AliasRevision--
++	p.app.openedWriter.FD = "999"
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err == nil {
++		t.Fatal("wrong global writer FD accepted")
++	}
++	p.app.openedWriter.FD = actualFD
++	op.State = "unknown"
++	if _, err := p.verifyCompletedWriter(context.Background(), identity); err == nil {
++		t.Fatal("unknown completed source adopted")
++	}
++	op.State = "complete"
++	future := &normalPhoneSource{4}
++	if err := actual.SetPrimaryStream(future, true, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := actual.RoomMove(context.Background(), "verify", next, p.app.openedWriter, epoch, false, guard); err == nil {
++		t.Fatal("old operation crossed a new track source boundary")
++	}
++}
+diff --git a/player/player.go b/player/player.go
+--- a/player/player.go
++++ b/player/player.go
+@@ -422,7 +422,6 @@
+ 	// The actual FIFO descriptor is joined and closed before any retained raw
+ 	// source or decoder can be retired by a replacement owner.
+ 	_ = source.Close()
+-	close(p.cmd)
+ 	close(p.closeDone)
+ }
+ 
+diff --git a/player/start35.go b/player/start35.go
+--- a/player/start35.go
++++ b/player/start35.go
+@@ -16,6 +16,7 @@
+ 	source, expected librespot.AudioSource
+ 	pipe             output.PipeIdentity
+ 	epoch            string
++	writerFD         string
+ 	guard            output.TransportGuard
+ }
+ type start35Result struct {
+@@ -28,12 +29,33 @@
+ func (p *Player) Start35(ctx context.Context, phase string, source, expected librespot.AudioSource, pipe output.PipeIdentity, epoch string, guard output.TransportGuard) (output.PipeIdentity, string, error) {
+ 	reply := make(chan any, 1)
+ 	select {
+-	case p.cmd <- playerCmd{start: &start35Command{ctx, phase, source, expected, pipe, epoch, guard}, resp: reply}:
++	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: phase, source: source, expected: expected, pipe: pipe, epoch: epoch, guard: guard}, resp: reply}:
+ 	case <-ctx.Done():
+ 		return output.PipeIdentity{}, "", ctx.Err()
+ 	}
+ 	result := (<-reply).(start35Result)
+ 	return result.Pipe, result.Epoch, result.Err
++}
++
++// VerifyStart35 joins the live output FD and selected source after a C COMPLETE
++// await. The guard runs under both real locks and may only credit the owner.
++func (p *Player) VerifyStart35(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, guard output.TransportGuard) error {
++	reply := make(chan any, 1)
++	select {
++	case <-p.closeDone:
++		return fmt.Errorf("start player closed")
++	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: "verify", expected: expected, pipe: pipe, epoch: epoch, writerFD: writerFD, guard: guard}, resp: reply}:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	select {
++	case value := <-reply:
++		return value.(start35Result).Err
++	case <-p.closeDone:
++		return fmt.Errorf("start player closed")
++	case <-ctx.Done():
++		return ctx.Err()
++	}
+ }
+ func (p *Player) applyStart35(command *start35Command, out *output.Output, source *SwitchingAudioSource, volume float32) (result start35Result, err error) {
+ 	if command.phase == "snapshot" {
+@@ -48,8 +70,11 @@
+ 		lock.Unlock()
+ 		return result, nil
+ 	}
+-	if command.phase != "quiesce" && command.phase != "publish" && command.phase != "resume" {
++	if command.phase != "quiesce" && command.phase != "publish" && command.phase != "resume" && command.phase != "verify" {
+ 		return result, fmt.Errorf("bad start phase")
++	}
++	if command.phase == "verify" && (command.expected == nil || command.writerFD == "" || command.guard == nil) {
++		return result, fmt.Errorf("incomplete start verification")
+ 	}
+ 	if command.phase == "quiesce" && p.startEpoch == ^uint64(0) {
+ 		return result, fmt.Errorf("start epoch exhausted")
+@@ -71,6 +96,27 @@
+ 	pipe, ok := (*out).(output.StartPipeOutput)
+ 	if !ok {
+ 		return result, fmt.Errorf("no start pipe owner")
++	}
++	if command.phase == "verify" {
++		writer, ok := (*out).(output.MovePipeOutput)
++		if !ok {
++			return result, fmt.Errorf("no start writer FD owner")
++		}
++		return result, writer.WithStartLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
++			lock, ok := source.cond.L.(*sync.Mutex)
++			if !ok {
++				return fmt.Errorf("no source lock")
++			}
++			if e := output.LockTransport(command.ctx, lock); e != nil {
++				return e
++			}
++			defer lock.Unlock()
++			if command.ctx.Err() != nil || source.source[source.which] != command.expected || identity != command.pipe ||
++				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD || writer.FencedUnderStartLock() {
++				return fmt.Errorf("start writer/source changed")
++			}
++			return command.guard(func() {})
++		})
+ 	}
+ 	if command.phase == "quiesce" {
+ 		pipe.FenceStart()
+diff --git a/player/start35_verify_test.go b/player/start35_verify_test.go
+new file mode 100644
+--- /dev/null
++++ b/player/start35_verify_test.go
+@@ -0,0 +1,119 @@
++package player
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type startVerifyEOFSource struct{ id int }
++
++func (*startVerifyEOFSource) Read([]float32) (int, error) { return 0, io.EOF }
++func (*startVerifyEOFSource) PositionMs() int64           { return 0 }
++func (*startVerifyEOFSource) SetPositionMs(int64) error   { return nil }
++
++func TestStart35HeldCCompleteCannotCreditClosedWriter(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	var writer output.MovePipeIdentity
++	p, err := NewPlayer(&Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			out, err := create()
++			if err == nil {
++				writer = out.(interface {
++					OpenedWriterIdentity() output.MovePipeIdentity
++				}).OpenedWriterIdentity()
++			}
++			return out, err
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	old, selected := &startVerifyEOFSource{1}, &startVerifyEOFSource{2}
++	if err := p.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := p.Start35(context.Background(), "quiesce", nil, old, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "publish", selected, old, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "resume", nil, selected, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	credited := false
++	if err = p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err != nil || !credited {
++		t.Fatal("live actual writer/source/epoch did not verify", err)
++	}
++	for _, mismatch := range []struct {
++		source librespot.AudioSource
++		pipe   output.PipeIdentity
++		epoch  string
++		fd     string
++	}{
++		{old, pipe, epoch, writer.FD},
++		{selected, output.PipeIdentity{Device: pipe.Device, Inode: "999", Type: "fifo"}, epoch, writer.FD},
++		{selected, pipe, "999", writer.FD},
++		{selected, pipe, epoch, "999"},
++	} {
++		credited = false
++		if err := p.VerifyStart35(context.Background(), mismatch.source, mismatch.pipe, mismatch.epoch, mismatch.fd, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
++			t.Fatal("stale source/FIFO/epoch/FD credited")
++		}
++	}
++	entered, release := make(chan struct{}), make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		close(entered)
++		<-release
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++	ack := make(chan error, 1)
++	go func() {
++		resp, err := http.Post(server.URL+"/complete", "application/json", nil)
++		if err == nil {
++			_ = resp.Body.Close()
++		}
++		ack <- err
++	}()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("C COMPLETE was not held")
++	}
++	p.Stop() // independent output close while the C bookkeeping ACK is held
++	close(release)
++	if err := <-ack; err != nil {
++		t.Fatal(err)
++	}
++	credited = false
++	if err = p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
++		t.Fatal("C COMPLETE credited a closed native writer")
++	}
++	p.Close()
++	if err = p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
++		t.Fatal("closed player accepted late C COMPLETE")
++	}
++}

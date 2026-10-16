@@ -1,0 +1,1722 @@
+diff -ruN pv35-move-native-author-20261016/native/daemon/app.go pv35-move-native-replacement-author-20261016/native/daemon/app.go
+--- pv35-move-native-author-20261016/native/daemon/app.go	2026-10-16 11:08:25
++++ pv35-move-native-replacement-author-20261016/native/daemon/app.go	2026-10-16 14:38:00
+@@ -8,11 +8,13 @@
+ 	"math"
+ 	"net/http"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/apresolve"
+ 	"github.com/devgianlu/go-librespot/mpris"
++	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	"github.com/devgianlu/go-librespot/playplay"
+ 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
+@@ -37,9 +39,16 @@
+ 	clientToken string
+ 	state       *librespot.AppState
+ 
+-	server   ApiServer
+-	mpris    mpris.Server
+-	logoutCh chan *AppPlayer
++	server             ApiServer
++	mpris              mpris.Server
++	logoutCh           chan *AppPlayer
++	moveCustodyMu      sync.Mutex
++	moveCustody        *moveOperation
++	moveCustodyUnknown bool
++	startCustody       *contentOperation
++	startOutputPermit  *contentOperation
++	openedWriter       output.MovePipeIdentity
++	retirementPending  *retirementAttempt
+ 
+ 	closed bool
+ }
+@@ -255,6 +264,9 @@
+ 
+ 		AudioOutputPipe:       app.cfg.AudioOutputPipe,
+ 		AudioOutputPipeFormat: app.cfg.AudioOutputPipeFormat,
++		WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			return app.withNewOutput(appPlayer, create)
++		},
+ 	},
+ 	); err != nil {
+ 		return nil, fmt.Errorf("failed initializing player: %w", err)
+diff -ruN pv35-move-native-author-20261016/native/daemon/controls.go pv35-move-native-replacement-author-20261016/native/daemon/controls.go
+--- pv35-move-native-author-20261016/native/daemon/controls.go	2026-10-16 13:06:19
++++ pv35-move-native-replacement-author-20261016/native/daemon/controls.go	2026-10-16 14:43:44
+@@ -813,13 +813,30 @@
+ 	})
+ }
+ 
++func (p *AppPlayer) beginStopRetirement() {
++	// Phone Stop and transfer deactivate the current authenticated player. C's
++	// pending gate must be durable before Stop closes the global FIFO writer;
++	// the later AppPlayer.Close joins decoder teardown and completes retirement.
++	if p.app != nil {
++		p.roomCloseMu.Lock()
++		if p.roomCloseDone == nil && p.roomRetirement == nil {
++			p.roomRetirement = p.app.prepareCompletedRetirementFor(p)
++		}
++		p.roomCloseMu.Unlock()
++	}
++}
++
+ func (p *AppPlayer) stopPlayback(ctx context.Context) error {
++	p.beginStopRetirement()
+ 	p.player.Stop()
+ 	p.primaryStream = nil
+ 	p.secondaryStream = nil
+ 
+ 	p.state.reset()
+ 	if err := p.putConnectState(ctx, connectpb.PutStateReason_BECAME_INACTIVE); err != nil {
++		if p.app.cfg.ZeroconfEnabled {
++			p.logout <- p
++		}
+ 		return fmt.Errorf("failed inactive state put: %w", err)
+ 	}
+ 
+diff -ruN pv35-move-native-author-20261016/native/daemon/player.go pv35-move-native-replacement-author-20261016/native/daemon/player.go
+--- pv35-move-native-author-20261016/native/daemon/player.go	2026-10-16 13:44:02
++++ pv35-move-native-replacement-author-20261016/native/daemon/player.go	2026-10-16 14:42:45
+@@ -42,6 +42,7 @@
+ 	roomVolumeClosing                bool
+ 	roomCloseMu                      sync.Mutex
+ 	roomCloseDone                    chan struct{}
++	roomRetirement                   *retirementAttempt
+ 	roomTransportOffer               *nativeTransportOffer
+ 	roomTransportPending             *nativeTransportOffer
+ 	aliasRevision                    uint64
+@@ -941,8 +942,21 @@
+ 	if p.stop != nil {
+ 		p.stop <- struct{}{}
+ 	}
++	var retirement *retirementAttempt
++	p.roomCloseMu.Lock()
++	retirement = p.roomRetirement
++	p.roomRetirement = nil
++	p.roomCloseMu.Unlock()
++	if p.app != nil && retirement == nil {
++		retirement = p.app.prepareCompletedRetirementFor(p)
++	}
+ 	if p.player != nil {
+ 		p.player.Close()
++	}
++	// C's durable pending gate precedes this CloseDone; its independently
++	// drained terminal witness must follow before any successor FIFO opens.
++	if p.app != nil && retirement != nil {
++		p.app.completeRetirementFor(retirement)
+ 	}
+ 	if p.sess != nil {
+ 		p.sess.Close()
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_content_actor.go pv35-move-native-replacement-author-20261016/native/daemon/room_content_actor.go
+--- pv35-move-native-author-20261016/native/daemon/room_content_actor.go	2026-10-16 13:26:16
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_content_actor.go	2026-10-16 14:24:11
+@@ -65,6 +65,10 @@
+ 		if cancel, ok := expected.(interface{ CancelRead() }); ok {
+ 			cancel.CancelRead()
+ 		}
++		if err := p.app.permitStartOutput(op); err != nil {
++			return err
++		}
++		defer p.app.releaseStartOutput(op)
+ 	}
+ 	var newSource librespot.AudioSource
+ 	if step.Phase == "publish" {
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_content_execute.go pv35-move-native-replacement-author-20261016/native/daemon/room_content_execute.go
+--- pv35-move-native-author-20261016/native/daemon/room_content_execute.go	2026-10-16 13:24:58
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_content_execute.go	2026-10-16 14:25:35
+@@ -105,6 +105,15 @@
+ 		failed()
+ 		return
+ 	}
++	var priorMove *moveOperation
++	var priorStart *contentOperation
++	if op.Owner.app != nil {
++		priorMove, priorStart, err = op.Owner.app.contentCustodySnapshot()
++		if err != nil {
++			failed()
++			return
++		}
++	}
+ 	critical, stopCritical := context.WithDeadline(ctx, op.Until)
+ 	defer stopCritical()
+ 	op.mu.Lock()
+@@ -128,9 +137,28 @@
+ 		failed()
+ 		return
+ 	}
++	// C's exact gate-closed commit has replaced its active MOVE token before
++	// native quiesce may create a fresh paused FIFO writer. A stale or ambiguous
++	// ACK cannot clear custody, and the same actor/grant must still own this
++	// operation after the await.
++	op.Owner.aliasMu.Lock()
+ 	op.mu.Lock()
+-	op.Pipe = outputPipe(reply.Pipe)
++	current := op.Owner.contentEffectCurrentLocked(op, critical) &&
++		op.CReceipt != nil && op.CReceipt.Phase == "gate_closed_reader_ready" &&
++		op.CReceipt.Token == prepared.Token && op.CReceipt.ReservationID == op.ReservationID &&
++		op.CReceipt.GateClosed && op.CReceipt.Pipe != nil && *op.CReceipt.Pipe == *reply.Pipe
++	if current && op.Owner.app != nil {
++		err = op.Owner.app.supersedeContentCustody(priorMove, priorStart, op)
++	}
++	if current && err == nil {
++		op.Pipe = outputPipe(reply.Pipe)
++	}
+ 	op.mu.Unlock()
++	op.Owner.aliasMu.Unlock()
++	if !current || err != nil {
++		failed()
++		return
++	}
+ 	if err = op.actorStep(critical, "quiesce"); err != nil {
+ 		failed()
+ 		return
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_content_test.go pv35-move-native-replacement-author-20261016/native/daemon/room_content_test.go
+--- pv35-move-native-author-20261016/native/daemon/room_content_test.go	2026-10-16 13:31:11
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_content_test.go	2026-10-16 14:26:25
+@@ -141,9 +141,21 @@
+ 	}
+ }
+ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testing.T) {
+-	for _, mode := range []string{"complete", "wrong-pipe", "wrong-content", "open-fails", "complete-fails"} {
++	for _, mode := range []string{"complete", "wrong-pipe", "wrong-content", "open-fails", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, op := contentFixture(t)
++			var priorMove *moveOperation
++			var priorStart *contentOperation
++			if strings.HasPrefix(mode, "move-") {
++				priorMove = completedMoveCustody(p, "http://127.0.0.1:1")
++				p.app.installCompletedMoveCustody(priorMove)
++			}
++			if strings.HasPrefix(mode, "start-") {
++				priorStart = &contentOperation{Owner: p, State: "complete", Terminal: true, CReceipt: &contentCReceipt{Phase: "completed"}}
++				if err := p.app.supersedeContentCustody(nil, nil, priorStart); err != nil {
++					t.Fatal(err)
++				}
++			}
+ 			var cMu sync.Mutex
+ 			var calls []string
+ 			var nativeSteps []string
+@@ -171,6 +183,12 @@
+ 				if mode == "wrong-content" && endpoint == "prepare" {
+ 					reply.ContentDigest = strings.Repeat("f", 64)
+ 				}
++				if (mode == "move-ambiguous" || mode == "start-ambiguous") && endpoint == "commit" {
++					reply.Phase = "unknown"
++				}
++				if (mode == "move-stale" || mode == "start-stale") && endpoint == "commit" {
++					reply.Token = strings.Repeat("f", 32)
++				}
+ 				if (mode == "open-fails" && endpoint == "open") || (mode == "complete-fails" && endpoint == "complete") {
+ 					reply.Phase = "unknown"
+ 					reply.GateClosed = true
+@@ -200,6 +218,9 @@
+ 						nativeSteps = append(nativeSteps, step.Phase)
+ 						switch step.Phase {
+ 						case "quiesce":
++							if (mode == "move-complete" || mode == "start-complete") && (p.app.moveCustody != nil || p.app.startCustody != op) {
++								t.Error("previous custody survived exact START commit before writer boundary")
++							}
+ 							if op.Pipe.Inode != "2" {
+ 								op.mu.Unlock()
+ 								step.Reply <- ErrAliasConflict
+@@ -230,10 +251,26 @@
+ 			close(server.requests)
+ 			<-done
+ 			<-stopped
+-			if (mode == "complete") != receipt.Accepted {
++			positive := mode == "complete" || mode == "move-complete" || mode == "start-complete"
++			if positive != receipt.Accepted {
+ 				t.Fatal("wrong final completion", mode, receipt)
+ 			}
+-			if mode == "complete" {
++			if priorMove != nil && mode != "move-complete" && p.app.moveCustody != priorMove {
++				t.Fatal("ambiguous or stale START ACK cleared old MOVE custody")
++			}
++			if mode == "move-complete" && p.app.startCustody != op {
++				t.Fatal("completed START lost process-wide source custody")
++			}
++			if priorStart != nil && mode != "start-complete" && p.app.startCustody != priorStart {
++				t.Fatal("ambiguous or stale START ACK cleared old completed START custody")
++			}
++			if mode == "start-complete" && p.app.startCustody != op {
++				t.Fatal("exact START successor did not receive process-wide source custody")
++			}
++			if mode == "complete-fails" && p.app.startCustody != op {
++				t.Fatal("unknown START lost process-wide source custody")
++			}
++			if positive {
+ 				if strings.Join(nativeSteps, ",") != "quiesce,publish,resume" {
+ 					t.Fatal(nativeSteps)
+ 				}
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_move_custody.go pv35-move-native-replacement-author-20261016/native/daemon/room_move_custody.go
+--- pv35-move-native-author-20261016/native/daemon/room_move_custody.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_move_custody.go	2026-10-16 14:38:54
+@@ -0,0 +1,153 @@
++package daemon
++
++import (
++	"context"
++	"github.com/devgianlu/go-librespot/output"
++	"time"
++)
++
++// The App outlives individual authenticated AppPlayers. A completed MOVE's C
++// token belongs to the process-wide FIFO writer, so the next AppPlayer must
++// retire it before opening a replacement descriptor.
++func (app *App) installCompletedMoveCustody(op *moveOperation) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	app.moveCustody = op
++}
++
++func (app *App) contentCustodySnapshot() (*moveOperation, *contentOperation, error) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil {
++		return nil, nil, ErrAliasConflict
++	}
++	if app.startCustody != nil && !completedStartCustody(app.startCustody) {
++		return nil, nil, ErrAliasConflict
++	}
++	return app.moveCustody, app.startCustody, nil
++}
++
++func completedStartCustody(op *contentOperation) bool {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	return op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed"
++}
++
++// An exact current START35 C commit takes over C's one active token before
++// its native quiesce can open a replacement FIFO writer. The pre-commit native
++// snapshot prevents a delayed ACK from clearing a later MOVE owner.
++func (app *App) supersedeContentCustody(expectedMove *moveOperation, expectedStart, successor *contentOperation) error {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil || app.moveCustody != expectedMove || app.startCustody != expectedStart || successor == nil ||
++		(expectedStart != nil && !completedStartCustody(expectedStart)) {
++		return ErrAliasConflict
++	}
++	app.moveCustody = nil
++	app.startCustody = successor
++	return nil
++}
++
++// The START gate-closed receipt transfers process-wide writer custody before
++// its own quiesce may create a paused FIFO. Completion does not retire C's
++// active START route, so no unrelated writer may be opened afterward.
++func (app *App) permitStartOutput(op *contentOperation) error {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != op || app.startOutputPermit != nil {
++		return ErrAliasConflict
++	}
++	app.startOutputPermit = op
++	return nil
++}
++
++func (app *App) releaseStartOutput(op *contentOperation) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.startOutputPermit == op {
++		app.startOutputPermit = nil
++	}
++}
++
++func (app *App) withNewOutput(owner *AppPlayer, create func() (output.Output, error)) (output.Output, error) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != nil {
++		allowed := !app.moveCustodyUnknown && app.retirementPending == nil && app.startCustody != nil &&
++			app.startOutputPermit == app.startCustody && app.startCustody.Owner == owner
++		if allowed {
++			return app.openRegisteredOutputLocked(create)
++		}
++		return nil, ErrAliasConflict
++	}
++	if err := app.revokeCompletedMoveCustodyLocked(nil); err != nil {
++		return nil, err
++	}
++	return app.openRegisteredOutputLocked(create)
++}
++
++func (app *App) openRegisteredOutputLocked(create func() (output.Output, error)) (output.Output, error) {
++	out, err := create()
++	if err != nil {
++		return nil, err
++	}
++	if owned, ok := out.(interface {
++		OpenedWriterIdentity() output.MovePipeIdentity
++	}); ok {
++		app.openedWriter = owned.OpenedWriterIdentity()
++	} else {
++		app.openedWriter = output.MovePipeIdentity{}
++	}
++	return out, nil
++}
++
++func (app *App) revokeCompletedMoveCustody() error {
++	return app.revokeCompletedMoveCustodyFor(nil)
++}
++
++func (app *App) revokeCompletedMoveCustodyFor(owner *AppPlayer) error {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	return app.revokeCompletedMoveCustodyLocked(owner)
++}
++
++func (app *App) revokeCompletedMoveCustodyLocked(owner *AppPlayer) error {
++	if app.moveCustodyUnknown || app.retirementPending != nil {
++		return ErrAliasConflict
++	}
++	op := app.moveCustody
++	if op == nil || (owner != nil && op.Owner != owner) {
++		return nil
++	}
++	op.mu.Lock()
++	reply := op.CReceipt
++	complete := op.Terminal && op.State == "complete"
++	reservation := op.ReservationID
++	capture := op.Capture
++	offer := op.Offer
++	revision := op.Revision
++	intended := op.Intended
++	op.mu.Unlock()
++	if !complete || reply == nil || reply.Phase != "completed" || capture == nil || capture.OldOwner == nil {
++		app.moveCustodyUnknown = true
++		return ErrAliasConflict
++	}
++	ctx, stop := context.WithTimeout(context.Background(), time.Second)
++	defer stop()
++	var cancelled moveCReceipt
++	err := contentHTTP(ctx, "POST", capture.endpoint("cancel"), struct {
++		Token       string `json:"token"`
++		Reservation string `json:"native_reservation_id"`
++	}{reply.Token, reservation}, &cancelled)
++	if err != nil || cancelled.Schema != "podconnect.output_move_cancel.v1" || !cancelled.OK || cancelled.Token != reply.Token || cancelled.ReservationID != reservation || cancelled.OfferID != offer.OfferID || cancelled.BindingID != offer.BindingID || cancelled.Incarnation != capture.Incarnation || cancelled.Revision != revision || cancelled.Policy != movePolicy || cancelled.OldOwner != *capture.OldOwner || cancelled.Intended != intended || cancelled.Target != op.Target || cancelled.InputDigest != capture.PipeDigest || cancelled.Phase != "unknown" || !cancelled.GateClosed || cancelled.Physical {
++		// An uncertain effect is never retried against a later C owner. Every
++		// future new-output attempt on this process remains closed.
++		app.moveCustodyUnknown = true
++		return ErrAliasConflict
++	}
++	// The completed MOVE cancel receipt closes C's gate but deliberately ends
++	// in UNKNOWN. It is quarantine, never proof that C drained its reader and
++	// durably retired source custody for a replacement FIFO writer.
++	app.moveCustodyUnknown = true
++	return ErrAliasConflict
++}
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_move_custody_test.go pv35-move-native-replacement-author-20261016/native/daemon/room_move_custody_test.go
+--- pv35-move-native-author-20261016/native/daemon/room_move_custody_test.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_move_custody_test.go	2026-10-16 14:40:21
+@@ -0,0 +1,317 @@
++package daemon
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++)
++
++func attemptCustodyOutput(app *App, owner *AppPlayer) error {
++	_, err := app.withNewOutput(owner, func() (output.Output, error) { return nil, nil })
++	return err
++}
++
++func completedMoveCustody(owner *AppPlayer, baseURL string) *moveOperation {
++	old := roomTransportIdentity{AccountUserID: "account", HomePodID: "101"}
++	return &moveOperation{
++		Owner: owner,
++		Capture: &moveCapture{contentCapture: &contentCapture{
++			OldOwner: &old, OwnTone: baseURL, Incarnation: "native-incarnation",
++			Scope: roomVolumeScope{HomePodID: "102"}, PipeDigest: strings.Repeat("a", 64),
++		}},
++		Offer:    moveOffer{OfferID: strings.Repeat("b", 32), BindingID: strings.Repeat("c", 64)},
++		Revision: "7", ReservationID: strings.Repeat("d", 32),
++		Intended: roomTransportIdentity{AccountUserID: "account", HomePodID: "102"},
++		Target:   contentTarget{DeviceID: "102"},
++		CReceipt: &moveCReceipt{Token: strings.Repeat("e", 32), Phase: "completed"},
++		State:    "complete", Terminal: true,
++	}
++}
++
++func TestRoomMoveCompletedCancelIsUnknownNotNewWriterProof(t *testing.T) {
++	calls := 0
++	var op *moveOperation
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls++
++		if r.URL.Path != "/api/outputs/102/move/cancel" || r.Method != http.MethodPost {
++			t.Errorf("wrong C endpoint: %s %s", r.Method, r.URL.Path)
++		}
++		var body map[string]string
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 2 || body["token"] != op.CReceipt.Token || body["native_reservation_id"] != op.ReservationID {
++			t.Errorf("wrong exact C revocation: %#v %v", body, err)
++		}
++		reply := moveCReceipt{Schema: "podconnect.output_move_cancel.v1", OK: true, Token: op.CReceipt.Token, OfferID: op.Offer.OfferID, BindingID: op.Offer.BindingID, Incarnation: op.Capture.Incarnation, Revision: op.Revision, ReservationID: op.ReservationID, Policy: movePolicy, OldOwner: *op.Capture.OldOwner, Intended: op.Intended, Target: op.Target, InputDigest: op.Capture.PipeDigest, Phase: "unknown", GateClosed: true}
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	app := &App{}
++	oldPlayer, err := player.NewPlayer(&player.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer oldPlayer.Close()
++	old := &AppPlayer{app: app, player: oldPlayer, stop: make(chan struct{}, 1)}
++	op = completedMoveCustody(old, server.URL)
++	app.installCompletedMoveCustody(op)
++	_ = app.revokeCompletedMoveCustodyFor(old) // Fallback UNKNOWN is never retirement.
++	if calls != 1 || app.moveCustody != op || !app.moveCustodyUnknown {
++		t.Fatalf("completed C cancel was falsely credited as known retirement: calls=%d", calls)
++	}
++	if err := app.revokeCompletedMoveCustody(); err == nil || calls != 1 {
++		t.Fatal("UNKNOWN cancellation allowed or retried a new writer")
++	}
++}
++
++func TestRoomMoveCompletedCustodyStaleAckBlocksReplacement(t *testing.T) {
++	calls := 0
++	var op *moveOperation
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		calls++
++		reply := moveCReceipt{Schema: "podconnect.output_move_cancel.v1", OK: true, Token: strings.Repeat("f", 32), OfferID: op.Offer.OfferID, BindingID: op.Offer.BindingID, Incarnation: op.Capture.Incarnation, Revision: op.Revision, ReservationID: op.ReservationID, Policy: movePolicy, OldOwner: *op.Capture.OldOwner, Intended: op.Intended, Target: op.Target, InputDigest: op.Capture.PipeDigest, Phase: "unknown", GateClosed: true}
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	app := &App{}
++	owner := &AppPlayer{app: app}
++	op = completedMoveCustody(owner, server.URL)
++	app.installCompletedMoveCustody(op)
++	if app.revokeCompletedMoveCustody() == nil || !app.moveCustodyUnknown {
++		t.Fatal("stale C token was credited as exact retirement")
++	}
++	if app.revokeCompletedMoveCustody() == nil || calls != 1 {
++		t.Fatal("uncertain old cancellation retried against a later owner")
++	}
++	successor := &AppPlayer{app: app}
++	app.installCompletedMoveCustody(completedMoveCustody(successor, server.URL))
++	if err := app.revokeCompletedMoveCustodyFor(owner); err == nil || calls != 1 {
++		t.Fatal("late old owner close escaped unknown quarantine")
++	}
++}
++
++func TestRoomMoveLateOldOwnerCannotCancelSuccessor(t *testing.T) {
++	app := &App{}
++	old, successor := &AppPlayer{app: app}, &AppPlayer{app: app}
++	op := completedMoveCustody(successor, "http://127.0.0.1:1")
++	app.installCompletedMoveCustody(op)
++	if err := app.revokeCompletedMoveCustodyFor(old); err != nil || app.moveCustody != op {
++		t.Fatal("late old owner consumed successor's exact token")
++	}
++}
++
++func TestStart35ProcessCustodyBlocksOtherAndCompletedWriters(t *testing.T) {
++	app := &App{}
++	owner, other := &AppPlayer{app: app}, &AppPlayer{app: app}
++	op := &contentOperation{Owner: owner, State: "committing"}
++	if err := app.supersedeContentCustody(nil, nil, op); err != nil {
++		t.Fatal(err)
++	}
++	if err := attemptCustodyOutput(app, other); err == nil {
++		t.Fatal("other AppPlayer escaped pending START gate")
++	}
++	if err := attemptCustodyOutput(app, owner); err == nil {
++		t.Fatal("START owner opened outside its exact quiesce")
++	}
++	if err := app.permitStartOutput(op); err != nil || attemptCustodyOutput(app, owner) != nil {
++		t.Fatal("exact START quiesce could not create its paused FIFO", err)
++	}
++	if err := attemptCustodyOutput(app, other); err == nil {
++		t.Fatal("other AppPlayer used START quiesce permit")
++	}
++	app.releaseStartOutput(op)
++	op.State, op.Terminal = "complete", true
++	if err := attemptCustodyOutput(app, owner); err == nil {
++		t.Fatal("completed START owner opened a replacement FIFO without retirement")
++	}
++	if err := attemptCustodyOutput(app, other); err == nil {
++		t.Fatal("successor escaped completed START custody")
++	}
++	if app.startCustody != op {
++		t.Fatal("completion erased START C route custody")
++	}
++}
++
++func TestStart35UnknownCustodyBlocksActualSuccessorFIFO(t *testing.T) {
++	app := &App{}
++	owner, successor := &AppPlayer{app: app}, &AppPlayer{app: app}
++	op := &contentOperation{Owner: owner, State: "unknown", Terminal: true}
++	if err := app.supersedeContentCustody(nil, nil, op); err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(t.TempDir(), "successor.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		return app.withNewOutput(successor, create)
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer worker.Close()
++	if err := worker.SetPrimaryStream(&contentInertSource{}, true, false); err == nil {
++		t.Fatal("unknown START allowed successor FIFO creation")
++	}
++	if app.startCustody != op {
++		t.Fatal("unknown START lost its process-wide fence")
++	}
++}
++
++func TestStart35ExactCompletedSuccessorTransfersCustodyWithoutGap(t *testing.T) {
++	app := &App{}
++	owner := &AppPlayer{app: app}
++	old := &contentOperation{Owner: owner, State: "complete", Terminal: true, CReceipt: &contentCReceipt{Phase: "completed"}}
++	if err := app.supersedeContentCustody(nil, nil, old); err != nil {
++		t.Fatal(err)
++	}
++	move, prior, err := app.contentCustodySnapshot()
++	if err != nil || move != nil || prior != old {
++		t.Fatal("completed START source custody not captured", err)
++	}
++	newStart := &contentOperation{Owner: owner, State: "committing"}
++	if err := app.supersedeContentCustody(nil, prior, newStart); err != nil || app.startCustody != newStart {
++		t.Fatal("exact committed START successor did not take custody atomically", err)
++	}
++	if err := app.supersedeContentCustody(nil, prior, old); err == nil || app.startCustody != newStart {
++		t.Fatal("stale old START ACK replaced newer custody")
++	}
++	if _, _, err := app.contentCustodySnapshot(); err == nil {
++		t.Fatal("pending successor was mistaken for completed START")
++	}
++	newStart.mu.Lock()
++	newStart.State, newStart.Terminal = "unknown", true
++	newStart.mu.Unlock()
++	if _, _, err := app.contentCustodySnapshot(); err == nil || attemptCustodyOutput(app, owner) == nil {
++		t.Fatal("unknown successor escaped App-level FIFO quarantine")
++	}
++}
++
++func TestStart35CommitCannotOvertakeFIFODescriptorAdmission(t *testing.T) {
++	app := &App{}
++	old := &AppPlayer{app: app}
++	start := &contentOperation{Owner: old, State: "committing"}
++	inside, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	defer releaseOnce.Do(func() { close(release) })
++	writerDone := make(chan error, 1)
++	go func() {
++		_, err := app.withNewOutput(old, func() (output.Output, error) {
++			close(inside)
++			<-release // The actual descriptor-open boundary is held by custody.
++			return nil, nil
++		})
++		writerDone <- err
++	}()
++	select {
++	case <-inside:
++	case <-time.After(time.Second):
++		t.Fatal("FIFO admission was not entered")
++	}
++	commitDone := make(chan error, 1)
++	go func() { commitDone <- app.supersedeContentCustody(nil, nil, start) }()
++	select {
++	case err := <-commitDone:
++		t.Fatalf("START custody overtook in-progress FIFO open: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	releaseOnce.Do(func() { close(release) })
++	if err := <-writerDone; err != nil {
++		t.Fatal(err)
++	}
++	if err := <-commitDone; err != nil {
++		t.Fatal(err)
++	}
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
++		t.Fatal("unrelated writer opened after START took custody")
++	}
++}
++
++func TestRoomMoveNewAppFIFOEmissionWaitsForExactOldCRevocation(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	defer releaseOnce.Do(func() { close(release) })
++	var op *moveOperation
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		close(entered)
++		<-release // Hold C before it closes the old global gate.
++		reply := moveCReceipt{Schema: "podconnect.output_move_cancel.v1", OK: true, Token: op.CReceipt.Token, OfferID: op.Offer.OfferID, BindingID: op.Offer.BindingID, Incarnation: op.Capture.Incarnation, Revision: op.Revision, ReservationID: op.ReservationID, Policy: movePolicy, OldOwner: *op.Capture.OldOwner, Intended: op.Intended, Target: op.Target, InputDigest: op.Capture.PipeDigest, Phase: "unknown", GateClosed: true}
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	app := &App{}
++	oldWorker, err := player.NewPlayer(&player.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer oldWorker.Close()
++	old := &AppPlayer{app: app, player: oldWorker, stop: make(chan struct{}, 1)}
++	op = completedMoveCustody(old, server.URL)
++	app.installCompletedMoveCustody(op)
++	oldClosed := make(chan struct{})
++	go func() { _ = app.revokeCompletedMoveCustodyFor(old); close(oldClosed) }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("old C cancellation was not reached")
++	}
++	path := filepath.Join(t.TempDir(), "new-writer.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	attempted := make(chan struct{})
++	newWorker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		close(attempted)
++		return app.withNewOutput(&AppPlayer{app: app}, create)
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer newWorker.Close()
++	defer releaseOnce.Do(func() { close(release) })
++	newWriter := make(chan error, 1)
++	go func() { newWriter <- newWorker.SetPrimaryStream(&contentInertSource{}, true, false) }()
++	select {
++	case <-attempted:
++	case <-time.After(time.Second):
++		t.Fatal("replacement FIFO did not reach its pre-open boundary")
++	}
++	select {
++	case err := <-newWriter:
++		t.Fatalf("replacement emitted before C retired old token: %v", err)
++	default:
++	}
++	releaseOnce.Do(func() { close(release) })
++	select {
++	case <-oldClosed:
++	case <-time.After(time.Second):
++		t.Fatal("old close did not join C revocation")
++	}
++	select {
++	case err := <-newWriter:
++		if err == nil {
++			t.Fatal("UNKNOWN C cancel was credited as retirement and opened a new FIFO")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("new FIFO writer did not return after C UNKNOWN quarantine")
++	}
++}
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_move_execute.go pv35-move-native-replacement-author-20261016/native/daemon/room_move_execute.go
+--- pv35-move-native-author-20261016/native/daemon/room_move_execute.go	2026-10-16 13:59:26
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_move_execute.go	2026-10-16 14:14:44
+@@ -239,7 +239,11 @@
+ 		if op.Cancelled || op.Terminal || op.CReceipt == nil || op.CReceipt.Phase != "completed" || !op.Owner.moveEffectCurrentLocked(op, ctx) || op.Actual == nil || *op.Actual != op.Intended || op.Epoch == "" || op.Pipe != op.Capture.WriterPipe {
+ 			return ErrAliasConflict
+ 		}
++		if op.Owner.app == nil {
++			return ErrAliasConflict
++		}
+ 		mutate()
++		op.Owner.app.installCompletedMoveCustody(op)
+ 		op.State = "complete"
+ 		op.Terminal = true
+ 		op.RetainUntil = time.Now().Add(time.Minute)
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_retirement.go pv35-move-native-replacement-author-20261016/native/daemon/room_retirement.go
+--- pv35-move-native-author-20261016/native/daemon/room_retirement.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_retirement.go	2026-10-16 14:58:06
+@@ -0,0 +1,261 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type retirementAttempt struct {
++	owner       *AppPlayer
++	purpose     string
++	baseURL     string
++	deviceID    string
++	completed   string
++	reservation string
++	incarnation string
++	process     contentProcess
++	writer      output.MovePipeIdentity
++	writerEpoch string
++	inputEpoch  string
++	retirement  string
++	prepared    bool
++	startSource *contentOperation
++	moveSource  *moveOperation
++}
++
++type retirementReceipt struct {
++	Schema          string             `json:"schema"`
++	OK              bool               `json:"ok"`
++	Purpose         string             `json:"source_purpose"`
++	RetirementToken string             `json:"retirement_token"`
++	CompletedToken  string             `json:"completed_token"`
++	ReservationID   string             `json:"native_reservation_id"`
++	Outcome         string             `json:"outcome"`
++	WriterEpoch     string             `json:"writer_source_epoch"`
++	AdmittedInput   string             `json:"admitted_input_epoch"`
++	InputEpoch      string             `json:"input_epoch"`
++	Pipe            outputPipeIdentity `json:"pipe_identity"`
++	ReaderReady     bool               `json:"reader_ready_closed"`
++	GateClosed      bool               `json:"gate_closed"`
++	ContextsDrained bool               `json:"contexts_drained"`
++	DurablePending  bool               `json:"durable_pending"`
++	DurableTerminal bool               `json:"durable_terminal"`
++	RetiredWitness  bool               `json:"retired_witness"`
++	Physical        bool               `json:"physical_result_verified"`
++}
++
++func (a *retirementAttempt) endpoint(phase string) string {
++	return strings.TrimSuffix(a.baseURL, "/") + "/api/outputs/" + a.deviceID + "/" + a.purpose + "/retire/" + phase
++}
++
++func retirementHTTP(ctx context.Context, method, url string, body, out any) error {
++	var source io.Reader
++	if body != nil {
++		raw, err := json.Marshal(body)
++		if err != nil {
++			return err
++		}
++		source = bytes.NewReader(raw)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, url, source)
++	if err != nil {
++		return err
++	}
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	client := &http.Client{Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAliasConflict }}
++	reply, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer reply.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(reply.Body, 16385))
++	if err != nil || len(raw) > 16384 || reply.StatusCode != http.StatusOK {
++		return ErrAliasConflict
++	}
++	return strictContentJSON(raw, out)
++}
++
++func (a *retirementAttempt) matches(reply retirementReceipt, phase string) bool {
++	return reply.Schema == "podconnect.output_"+a.purpose+"_retirement_"+phase+".v1" &&
++		reply.Purpose == a.purpose && reply.RetirementToken == a.retirement &&
++		reply.CompletedToken == a.completed && reply.ReservationID == a.reservation &&
++		reply.WriterEpoch == a.writerEpoch && reply.AdmittedInput == a.inputEpoch &&
++		reply.Pipe == outputPipeIdentity{Device: a.writer.Device, Inode: a.writer.Inode, Type: a.writer.Type} &&
++		reply.GateClosed && !reply.Physical
++}
++
++func (a *retirementAttempt) validPrepare(reply retirementReceipt) bool {
++	return a.matches(reply, "prepare") && reply.OK && reply.Outcome == "pending" &&
++		reply.InputEpoch == a.inputEpoch && reply.ReaderReady && reply.DurablePending &&
++		!reply.DurableTerminal && !reply.RetiredWitness
++}
++
++func (a *retirementAttempt) validTerminal(reply retirementReceipt, phase string) bool {
++	admitted, err1 := strconv.ParseUint(a.inputEpoch, 10, 64)
++	actual, err2 := strconv.ParseUint(reply.InputEpoch, 10, 64)
++	return err1 == nil && err2 == nil && actual > admitted && a.matches(reply, phase) &&
++		(reply.Outcome == "retired" || reply.Outcome == "unknown") &&
++		reply.ReaderReady && reply.ContextsDrained && reply.DurableTerminal && reply.RetiredWitness
++}
++
++func (app *App) prepareCompletedRetirementFor(owner *AppPlayer) *retirementAttempt {
++	app.moveCustodyMu.Lock()
++	if app.moveCustodyUnknown || app.retirementPending != nil {
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	var a retirementAttempt
++	switch {
++	case app.startCustody != nil && app.startCustody.Owner == owner:
++		op := app.startCustody
++		op.mu.Lock()
++		if op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.Capture != nil {
++			a = retirementAttempt{owner: owner, purpose: "start", baseURL: op.Capture.OwnTone, deviceID: op.Target.DeviceID,
++				completed: op.CReceipt.Token, incarnation: op.Capture.Incarnation, process: op.Capture.Process,
++				writerEpoch: op.Epoch, inputEpoch: op.CReceipt.InputEpoch, startSource: op}
++			if op.CReceipt.WriterEpoch != op.Epoch || op.CReceipt.Pipe == nil ||
++				*op.CReceipt.Pipe != (outputPipeIdentity{Device: app.openedWriter.Device, Inode: app.openedWriter.Inode, Type: app.openedWriter.Type}) {
++				a.purpose = ""
++			}
++		}
++		op.mu.Unlock()
++	case app.moveCustody != nil && app.moveCustody.Owner == owner:
++		op := app.moveCustody
++		op.mu.Lock()
++		if op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.Capture != nil {
++			a = retirementAttempt{owner: owner, purpose: "move", baseURL: op.Capture.OwnTone, deviceID: op.Target.DeviceID,
++				completed: op.CReceipt.Token, incarnation: op.Capture.Incarnation, process: op.Capture.Process,
++				writerEpoch: op.Epoch, inputEpoch: op.CReceipt.InputEpoch, moveSource: op}
++			if op.CReceipt.WriterEpoch != op.Epoch || op.CReceipt.Pipe == nil ||
++				*op.CReceipt.Pipe != (outputPipeIdentity{Device: app.openedWriter.Device, Inode: app.openedWriter.Inode, Type: app.openedWriter.Type}) {
++				a.purpose = ""
++			}
++		}
++		op.mu.Unlock()
++	default:
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	if owner == nil || owner.player == nil {
++		app.moveCustodyUnknown = true
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	process, current := nativeContentProcess()
++	if !current || process != a.process || a.purpose == "" || !volumeHex32.MatchString(a.completed) || !volumeHex32.MatchString(a.incarnation) ||
++		!volumeCounter(a.writerEpoch) || a.writerEpoch == "0" || !volumeCounter(a.inputEpoch) || a.inputEpoch == "0" ||
++		!volumeCounter(app.openedWriter.FD) || app.openedWriter.Type != "fifo" || !volumeCounter(app.openedWriter.Device) ||
++		!volumeCounter(app.openedWriter.Inode) || app.openedWriter.Inode == "0" || !roomTransportURL(a.baseURL) {
++		app.moveCustodyUnknown = true
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	reservation, err := randomQueueID(16)
++	if err != nil {
++		app.moveCustodyUnknown = true
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	a.reservation, a.writer = reservation, app.openedWriter
++	app.retirementPending = &a
++	app.moveCustodyMu.Unlock()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
++	defer cancel()
++	var reply retirementReceipt
++	err = retirementHTTP(ctx, "POST", a.endpoint("prepare"), struct {
++		Completed   string             `json:"completed_token"`
++		Reservation string             `json:"native_reservation_id"`
++		Incarnation string             `json:"native_incarnation"`
++		Process     contentProcess     `json:"native_process"`
++		Epoch       string             `json:"writer_source_epoch"`
++		FD          string             `json:"writer_fd"`
++		Pipe        outputPipeIdentity `json:"pipe_identity"`
++		InputEpoch  string             `json:"expected_input_epoch"`
++	}{a.completed, a.reservation, a.incarnation, a.process, a.writerEpoch, a.writer.FD,
++		outputPipeIdentity{Device: a.writer.Device, Inode: a.writer.Inode, Type: a.writer.Type}, a.inputEpoch}, &reply)
++	if err != nil || !volumeHex32.MatchString(reply.RetirementToken) {
++		app.retirementFailed(&a)
++		return nil
++	}
++	a.retirement = reply.RetirementToken
++	if !a.validPrepare(reply) {
++		app.retirementFailed(&a)
++		return nil
++	}
++	app.moveCustodyMu.Lock()
++	if app.retirementPending != &a || app.moveCustodyUnknown {
++		app.moveCustodyUnknown = true
++		app.moveCustodyMu.Unlock()
++		return nil
++	}
++	a.prepared = true
++	app.moveCustodyMu.Unlock()
++	// C has durably closed the emission gate and established its draining
++	// reader. Interrupt an in-flight network read without waiting for the
++	// output/source locks that the read itself may hold.
++	owner.player.InterruptRetiringRead()
++	return &a
++}
++
++func (app *App) retirementFailed(a *retirementAttempt) {
++	app.moveCustodyMu.Lock()
++	if app.retirementPending == a {
++		app.moveCustodyUnknown = true
++	}
++	app.moveCustodyMu.Unlock()
++}
++
++func (app *App) completeRetirementFor(a *retirementAttempt) {
++	if a == nil || !a.prepared {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
++	defer cancel()
++	var reply retirementReceipt
++	err := retirementHTTP(ctx, "POST", a.endpoint("complete"), struct {
++		Retirement  string             `json:"retirement_token"`
++		Reservation string             `json:"native_reservation_id"`
++		Process     contentProcess     `json:"native_process"`
++		Epoch       string             `json:"writer_source_epoch"`
++		Pipe        outputPipeIdentity `json:"pipe_identity"`
++		InputEpoch  string             `json:"input_epoch"`
++		Closed      bool               `json:"native_close_done"`
++	}{a.retirement, a.reservation, a.process, a.writerEpoch,
++		outputPipeIdentity{Device: a.writer.Device, Inode: a.writer.Inode, Type: a.writer.Type}, a.inputEpoch, true}, &reply)
++	valid := err == nil && a.validTerminal(reply, "complete")
++	if !valid {
++		var observed retirementReceipt
++		readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
++		defer readCancel()
++		if retirementHTTP(readCtx, "GET", a.endpoint("result/")+a.retirement, nil, &observed) == nil {
++			valid = a.validTerminal(observed, "result")
++		}
++	}
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.retirementPending != a || !valid {
++		app.moveCustodyUnknown = true
++		return
++	}
++	if a.purpose == "start" && app.startCustody == a.startSource && app.startCustody != nil && app.startCustody.Owner == a.owner {
++		app.startCustody = nil
++	} else if a.purpose == "move" && app.moveCustody == a.moveSource && app.moveCustody != nil && app.moveCustody.Owner == a.owner {
++		app.moveCustody = nil
++	} else {
++		app.moveCustodyUnknown = true
++		return
++	}
++	app.retirementPending = nil
++	app.openedWriter = output.MovePipeIdentity{}
++}
+diff -ruN pv35-move-native-author-20261016/native/daemon/room_retirement_test.go pv35-move-native-replacement-author-20261016/native/daemon/room_retirement_test.go
+--- pv35-move-native-author-20261016/native/daemon/room_retirement_test.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/daemon/room_retirement_test.go	2026-10-16 14:58:12
+@@ -0,0 +1,329 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++)
++
++type retirementHeldRead struct {
++	entered     chan struct{}
++	release     chan struct{}
++	once        sync.Once
++	releaseOnce sync.Once
++	cancel      atomic.Bool
++}
++
++func (s *retirementHeldRead) Read([]float32) (int, error) {
++	s.once.Do(func() { close(s.entered) })
++	<-s.release
++	return 0, io.EOF
++}
++func (*retirementHeldRead) PositionMs() int64         { return 0 }
++func (*retirementHeldRead) SetPositionMs(int64) error { return nil }
++func (s *retirementHeldRead) CancelRead() {
++	s.cancel.Store(true)
++	s.releaseOnce.Do(func() { close(s.release) })
++}
++
++func retirementOwnerFixture(t *testing.T, baseURL, purpose string) (*App, *AppPlayer, string) {
++	t.Helper()
++	process, valid := nativeContentProcess()
++	if !valid {
++		t.Skip("requires actual Linux process certificate")
++	}
++	path := filepath.Join(t.TempDir(), "retiring.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = reader.Close() })
++	app := &App{}
++	owner := &AppPlayer{app: app, stop: make(chan struct{}, 1)}
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		return app.withNewOutput(owner, create)
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	owner.player = worker
++	source := &contentInertSource{}
++	if err := worker.SetPrimaryStream(source, true, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := worker.Start35(context.Background(), "quiesce", nil, source, output.PipeIdentity{}, "", func(mutate func()) error { mutate(); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	pipe := &outputPipeIdentity{Device: app.openedWriter.Device, Inode: app.openedWriter.Inode, Type: app.openedWriter.Type}
++	incarnation, token := strings.Repeat("a", 32), strings.Repeat("e", 32)
++	capture := &contentCapture{Process: process, Incarnation: incarnation, OwnTone: baseURL, Scope: roomVolumeScope{HomePodID: "102"}}
++	if purpose == "start" {
++		op := &contentOperation{Owner: owner, Capture: capture, Target: contentTarget{DeviceID: "102"}, Epoch: "1", State: "complete", Terminal: true,
++			CReceipt: &contentCReceipt{Token: token, Phase: "completed", WriterEpoch: "1", InputEpoch: "1", Pipe: pipe}}
++		if err := app.supersedeContentCustody(nil, nil, op); err != nil {
++			t.Fatal(err)
++		}
++	} else {
++		op := &moveOperation{Owner: owner, Capture: &moveCapture{contentCapture: capture}, Target: contentTarget{DeviceID: "102"}, Epoch: "1", State: "complete", Terminal: true,
++			CReceipt: &moveCReceipt{Token: token, Phase: "completed", WriterEpoch: "1", InputEpoch: "1", Pipe: pipe}}
++		app.installCompletedMoveCustody(op)
++	}
++	return app, owner, app.openedWriter.FD
++}
++
++func retirementReply(purpose, phase, reservation string, writer output.MovePipeIdentity) retirementReceipt {
++	r := retirementReceipt{Schema: "podconnect.output_" + purpose + "_retirement_" + phase + ".v1", OK: true, Purpose: purpose,
++		RetirementToken: strings.Repeat("f", 32), CompletedToken: strings.Repeat("e", 32), ReservationID: reservation,
++		WriterEpoch: "1", AdmittedInput: "1", InputEpoch: "1", Pipe: outputPipeIdentity{Device: writer.Device, Inode: writer.Inode, Type: writer.Type},
++		Outcome: "pending", ReaderReady: true, GateClosed: true, DurablePending: true}
++	if phase == "complete" || phase == "result" {
++		r.Outcome, r.InputEpoch, r.ContextsDrained, r.DurableTerminal, r.RetiredWitness = "retired", "2", true, true, true
++	}
++	return r
++}
++
++func TestRoomKnownRetirementGatesBeforeCloseAndWitnessesBeforeReplacement(t *testing.T) {
++	for _, scenario := range []struct {
++		purpose string
++		stop    bool
++	}{{"start", false}, {"move", false}, {"start", true}, {"move", true}} {
++		purpose := scenario.purpose
++		name := purpose
++		if scenario.stop {
++			name += "_phone_stop"
++		}
++		t.Run(name, func(t *testing.T) {
++			var app *App
++			var writerFD string
++			var writer output.MovePipeIdentity
++			var orderMu sync.Mutex
++			var order []string
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body map[string]json.RawMessage
++				_ = json.NewDecoder(r.Body).Decode(&body)
++				if r.URL.Path == "/api/outputs/102/"+purpose+"/retire/prepare" {
++					orderMu.Lock()
++					order = append(order, "prepare")
++					orderMu.Unlock()
++					if len(body) != 8 {
++						t.Errorf("prepare request has %d fields", len(body))
++					}
++					var reservation string
++					_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++					var fd string
++					_ = json.Unmarshal(body["writer_fd"], &fd)
++					if fd != writerFD {
++						t.Error("prepare did not bind registered writer FD")
++					}
++					var stat syscall.Stat_t
++					if fdInt, err := strconv.Atoi(fd); err != nil || syscall.Fstat(fdInt, &stat) != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFIFO {
++						t.Error("native writer closed before C pending gate")
++					}
++					_ = json.NewEncoder(w).Encode(retirementReply(purpose, "prepare", reservation, writer))
++					return
++				}
++				if r.URL.Path == "/api/outputs/102/"+purpose+"/retire/complete" {
++					orderMu.Lock()
++					order = append(order, "complete")
++					orderMu.Unlock()
++					if len(body) != 7 || string(body["native_close_done"]) != "true" {
++						t.Error("complete request lacks exact CloseDone assertion")
++					}
++					var reservation string
++					_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++					fdInt, _ := strconv.Atoi(writerFD)
++					var stat syscall.Stat_t
++					if syscall.Fstat(fdInt, &stat) == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFIFO &&
++						strconv.FormatUint(uint64(stat.Ino), 10) == writer.Inode {
++						t.Error("native writer remained open at C complete")
++					}
++					_ = json.NewEncoder(w).Encode(retirementReply(purpose, "complete", reservation, writer))
++					return
++				}
++				t.Errorf("unexpected retirement endpoint %s", r.URL.Path)
++				w.WriteHeader(404)
++			}))
++			defer server.Close()
++			var owner *AppPlayer
++			app, owner, writerFD = retirementOwnerFixture(t, server.URL, purpose)
++			writer = app.openedWriter
++			if scenario.stop {
++				owner.beginStopRetirement()
++				if owner.roomRetirement == nil {
++					t.Fatal("phone Stop did not record the C pending gate before closing its FIFO")
++				}
++				owner.player.Stop()
++			}
++			owner.Close()
++			orderMu.Lock()
++			defer orderMu.Unlock()
++			if strings.Join(order, ",") != "prepare,complete" || app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != nil || app.moveCustody != nil {
++				t.Fatalf("retirement did not reach exact known terminal: order=%v", order)
++			}
++			if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err != nil {
++				t.Fatal("known terminal did not release old source custody", err)
++			}
++		})
++	}
++}
++
++func TestRoomKnownRetirementPendingBlocksConcurrentNewFIFO(t *testing.T) {
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	defer releaseOnce.Do(func() { close(release) })
++	var app *App
++	var writer output.MovePipeIdentity
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasSuffix(r.URL.Path, "/prepare") {
++			var body map[string]json.RawMessage
++			_ = json.NewDecoder(r.Body).Decode(&body)
++			var reservation string
++			_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++			close(entered)
++			<-release
++			_ = json.NewEncoder(w).Encode(retirementReply("move", "prepare", reservation, writer))
++			return
++		}
++		var body map[string]json.RawMessage
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		_ = json.NewEncoder(w).Encode(retirementReply("move", "complete", reservation, writer))
++	}))
++	defer server.Close()
++	var owner *AppPlayer
++	app, owner, _ = retirementOwnerFixture(t, server.URL, "move")
++	writer = app.openedWriter
++	done := make(chan struct{})
++	go func() { owner.Close(); close(done) }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("C pending gate was not entered")
++	}
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
++		t.Fatal("new FIFO admitted while retirement prepare was unresolved")
++	}
++	releaseOnce.Do(func() { close(release) })
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("retirement did not join native CloseDone and C terminal")
++	}
++}
++
++func TestRoomKnownRetirementUncertainPrepareQuarantinesPhoneStop(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusServiceUnavailable)
++	}))
++	defer server.Close()
++	app, owner, _ := retirementOwnerFixture(t, server.URL, "move")
++	owner.beginStopRetirement()
++	if owner.roomRetirement != nil || !app.moveCustodyUnknown {
++		t.Fatal("uncertain C prepare was credited as a known pending gate")
++	}
++	owner.player.Stop()
++	owner.Close()
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
++		t.Fatal("new FIFO admitted after uncertain retirement prepare")
++	}
++}
++
++func TestRoomKnownRetirementTerminalWithoutFreshReaderStaysClosed(t *testing.T) {
++	var writer output.MovePipeIdentity
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]json.RawMessage
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		phase := "prepare"
++		if strings.HasSuffix(r.URL.Path, "/complete") {
++			phase = "complete"
++		}
++		reply := retirementReply("move", phase, reservation, writer)
++		if phase == "complete" {
++			reply.ReaderReady = false
++		}
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	app, owner, _ := retirementOwnerFixture(t, server.URL, "move")
++	writer = app.openedWriter
++	owner.Close()
++	if !app.moveCustodyUnknown {
++		t.Fatal("terminal witness without a fresh FIFO reader admitted a replacement")
++	}
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
++		t.Fatal("new writer admitted without C fresh-reader readiness")
++	}
++}
++
++func TestRoomKnownRetirementInterruptsHeldRawReadAfterCGate(t *testing.T) {
++	var writer output.MovePipeIdentity
++	var gated atomic.Bool
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]json.RawMessage
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		if strings.HasSuffix(r.URL.Path, "/prepare") {
++			gated.Store(true)
++			_ = json.NewEncoder(w).Encode(retirementReply("move", "prepare", reservation, writer))
++			return
++		}
++		_ = json.NewEncoder(w).Encode(retirementReply("move", "complete", reservation, writer))
++	}))
++	defer server.Close()
++	app, owner, _ := retirementOwnerFixture(t, server.URL, "move")
++	writer = app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer held.CancelRead()
++	if _, _, err := owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", func(mutate func()) error { mutate(); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", func(mutate func()) error { mutate(); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("actual FIFO output did not enter held raw read")
++	}
++	done := make(chan struct{})
++	go func() {
++		owner.beginStopRetirement()
++		owner.player.Stop()
++		owner.Close()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("phone Stop hung on raw read after C reader-ready gate")
++	}
++	if !gated.Load() || !held.cancel.Load() || app.retirementPending != nil || app.moveCustodyUnknown {
++		t.Fatal("held raw read was not cancelled after exact C gate and retired by witness")
++	}
++}
+diff -ruN pv35-move-native-author-20261016/native/output/driver-pipe.go pv35-move-native-replacement-author-20261016/native/output/driver-pipe.go
+--- pv35-move-native-author-20261016/native/output/driver-pipe.go	2026-10-16 13:53:37
++++ pv35-move-native-replacement-author-20261016/native/output/driver-pipe.go	2026-10-16 14:38:54
+@@ -8,6 +8,7 @@
+ 	"io"
+ 	"math"
+ 	"os"
++	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -16,9 +17,10 @@
+ )
+ 
+ type pipeOutput struct {
+-	startFenced atomic.Bool
+-	reader      librespot.Float32Reader
+-	file        *os.File
++	startFenced  atomic.Bool
++	reader       librespot.Float32Reader
++	file         *os.File
++	openedWriter MovePipeIdentity
+ 
+ 	lock sync.Mutex
+ 	cond *sync.Cond
+@@ -87,6 +89,24 @@
+ 	if err := syscall.SetNonblock(int(out.file.Fd()), false); err != nil {
+ 		_ = out.file.Close()
+ 		return nil, fmt.Errorf("failed to set blocking mode on fifo: %w", err)
++	}
++	info, err := out.file.Stat()
++	if err != nil {
++		_ = out.file.Close()
++		return nil, fmt.Errorf("cannot identify opened FIFO writer: %w", err)
++	}
++	if info.Mode()&os.ModeNamedPipe == 0 {
++		_ = out.file.Close()
++		return nil, fmt.Errorf("opened writer is not a FIFO")
++	}
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !ok {
++		_ = out.file.Close()
++		return nil, fmt.Errorf("opened writer lacks kernel identity")
++	}
++	out.openedWriter = MovePipeIdentity{
++		PipeIdentity: PipeIdentity{Device: strconv.FormatUint(uint64(stat.Dev), 10), Inode: strconv.FormatUint(uint64(stat.Ino), 10), Type: "fifo"},
++		FD:           strconv.FormatUint(uint64(out.file.Fd()), 10),
+ 	}
+ 
+ 	go out.outputLoop()
+diff -ruN pv35-move-native-author-20261016/native/output/room_move.go pv35-move-native-replacement-author-20261016/native/output/room_move.go
+--- pv35-move-native-author-20261016/native/output/room_move.go	2026-10-16 13:45:51
++++ pv35-move-native-replacement-author-20261016/native/output/room_move.go	2026-10-16 14:37:06
+@@ -20,6 +20,11 @@
+ 	SetMoveStateUnderStartLock(paused, fenced bool)
+ }
+ 
++// OpenedWriterIdentity is immutable proof recorded at the successful kernel
++// FIFO open, before the output worker can acquire its write lock. C separately
++// checks that this descriptor remains live at retirement prepare.
++func (out *pipeOutput) OpenedWriterIdentity() MovePipeIdentity { return out.openedWriter }
++
+ func (out *pipeOutput) PausedUnderStartLock() bool { return out.paused }
+ func (out *pipeOutput) FencedUnderStartLock() bool { return out.startFenced.Load() }
+ func (out *pipeOutput) WriterFDUnderStartLock() string {
+diff -ruN pv35-move-native-author-20261016/native/player/player.go pv35-move-native-replacement-author-20261016/native/player/player.go
+--- pv35-move-native-author-20261016/native/player/player.go	2026-10-16 13:53:37
++++ pv35-move-native-replacement-author-20261016/native/player/player.go	2026-10-16 14:56:47
+@@ -61,6 +61,7 @@
+ 	movePlaying     bool
+ 	newPausedOutput func(source librespot.Float32Reader, volume float32) (output.Output, error)
+ 	newOutput       func(source librespot.Float32Reader, volume float32) (output.Output, error)
++	source          *SwitchingAudioSource
+ 
+ 	cmd       chan playerCmd
+ 	ev        chan Event
+@@ -173,6 +174,9 @@
+ 	//
+ 	// This is only supported on the pipe backend.
+ 	AudioOutputPipeFormat string
++	// WithNewOutput holds process-wide route custody across admission and the
++	// actual descriptor open. Reusing the current output for the next item skips it.
++	WithNewOutput func(create func() (output.Output, error)) (output.Output, error)
+ }
+ 
+ func NewPlayer(opts *Options) (*Player, error) {
+@@ -188,26 +192,33 @@
+ 		normalisationPregain:      opts.NormalisationPregain,
+ 		countryCode:               opts.CountryCode,
+ 		newOutput: func(reader librespot.Float32Reader, volume float32) (output.Output, error) {
+-			return output.NewOutput(&output.NewOutputOptions{
+-				Log:              opts.Log,
+-				Backend:          opts.AudioBackend,
+-				Reader:           reader,
+-				SampleRate:       SampleRate,
+-				ChannelCount:     Channels,
+-				Device:           opts.AudioDevice,
+-				RuntimeSocket:    opts.AudioBackendRuntimeSocket,
+-				Mixer:            opts.MixerDevice,
+-				Control:          opts.MixerControlName,
+-				InitialVolume:    volume,
+-				BufferTimeMicro:  opts.AudioBufferTime,
+-				PeriodCount:      opts.AudioPeriodCount,
+-				ExternalVolume:   opts.ExternalVolume,
+-				VolumeUpdate:     opts.VolumeUpdate,
+-				OutputPipe:       opts.AudioOutputPipe,
+-				OutputPipeFormat: opts.AudioOutputPipeFormat,
+-			})
++			create := func() (output.Output, error) {
++				return output.NewOutput(&output.NewOutputOptions{
++					Log:              opts.Log,
++					Backend:          opts.AudioBackend,
++					Reader:           reader,
++					SampleRate:       SampleRate,
++					ChannelCount:     Channels,
++					Device:           opts.AudioDevice,
++					RuntimeSocket:    opts.AudioBackendRuntimeSocket,
++					Mixer:            opts.MixerDevice,
++					Control:          opts.MixerControlName,
++					InitialVolume:    volume,
++					BufferTimeMicro:  opts.AudioBufferTime,
++					PeriodCount:      opts.AudioPeriodCount,
++					ExternalVolume:   opts.ExternalVolume,
++					VolumeUpdate:     opts.VolumeUpdate,
++					OutputPipe:       opts.AudioOutputPipe,
++					OutputPipeFormat: opts.AudioOutputPipeFormat,
++				})
++			}
++			if opts.WithNewOutput != nil {
++				return opts.WithNewOutput(create)
++			}
++			return create()
+ 		},
+ 
++		source:    NewSwitchingAudioSource(),
+ 		cmd:       make(chan playerCmd),
+ 		ev:        make(chan Event, 128),
+ 		closeDone: make(chan struct{}),
+@@ -215,7 +226,13 @@
+ 
+ 	if opts.AudioBackend == "pipe" {
+ 		p.newPausedOutput = func(source librespot.Float32Reader, volume float32) (output.Output, error) {
+-			return output.NewOutput(&output.NewOutputOptions{Backend: "pipe", Reader: source, InitialVolume: volume, ExternalVolume: opts.ExternalVolume, VolumeUpdate: opts.VolumeUpdate, OutputPipe: opts.AudioOutputPipe, OutputPipeFormat: opts.AudioOutputPipeFormat, InitiallyPaused: true})
++			create := func() (output.Output, error) {
++				return output.NewOutput(&output.NewOutputOptions{Backend: "pipe", Reader: source, InitialVolume: volume, ExternalVolume: opts.ExternalVolume, VolumeUpdate: opts.VolumeUpdate, OutputPipe: opts.AudioOutputPipe, OutputPipeFormat: opts.AudioOutputPipeFormat, InitiallyPaused: true})
++			}
++			if opts.WithNewOutput != nil {
++				return opts.WithNewOutput(create)
++			}
++			return create()
+ 		}
+ 	}
+ 	go p.manageLoop()
+@@ -232,7 +249,7 @@
+ 	volume := float32(1)
+ 
+ 	// init main source
+-	source := NewSwitchingAudioSource()
++	source := p.source
+ 
+ loop:
+ 	for {
+@@ -392,7 +409,9 @@
+ 			// FIXME: this is called even if not needed, like when autoplay starts
+ 			p.ev <- Event{Type: EventTypeStop}
+ 		case <-source.Done():
+-			p.ev <- Event{Type: EventTypeNotPlaying}
++			for count := source.TakeDone(); count > 0; count-- {
++				p.ev <- Event{Type: EventTypeNotPlaying}
++			}
+ 		}
+ 	}
+ 
+@@ -422,6 +441,15 @@
+ func (p *Player) Close() {
+ 	p.closeOnce.Do(func() { p.cmd <- playerCmd{typ: playerCmdClose} })
+ 	<-p.closeDone
++}
++
++// InterruptRetiringRead is called only after the C reader has durably gated
++// this completed source. It does not take the output/source lock or close an
++// active decoder; the subsequent Stop/Close joins both before terminal proof.
++func (p *Player) InterruptRetiringRead() {
++	if p.source != nil {
++		p.source.CancelRead()
++	}
+ }
+ 
+ func (p *Player) SetVolume(val uint32) {
+diff -ruN pv35-move-native-author-20261016/native/player/room_move_replacement_test.go pv35-move-native-replacement-author-20261016/native/player/room_move_replacement_test.go
+--- pv35-move-native-author-20261016/native/player/room_move_replacement_test.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/player/room_move_replacement_test.go	2026-10-16 14:28:34
+@@ -0,0 +1,42 @@
++package player
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++func TestRoomMoveSameWriterNextItemSkipsRevokeButNewWriterWaits(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	calls := 0
++	p, err := NewPlayer(&Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) { calls++; return create() },
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	if err := p.SetPrimaryStream(&transportSource{id: 1}, true, false); err != nil || calls != 1 {
++		t.Fatalf("first writer not guarded: %v calls=%d", err, calls)
++	}
++	if err := p.SetPrimaryStream(&transportSource{id: 2}, true, false); err != nil || calls != 1 {
++		t.Fatalf("same writer next item wrongly revoked C custody: %v calls=%d", err, calls)
++	}
++	p.Stop()
++	if err := p.SetPrimaryStream(&transportSource{id: 3}, true, false); err != nil || calls != 2 {
++		t.Fatalf("new writer was opened without custody boundary: %v calls=%d", err, calls)
++	}
++}
+diff -ruN pv35-move-native-author-20261016/native/player/source.go pv35-move-native-replacement-author-20261016/native/player/source.go
+--- pv35-move-native-author-20261016/native/player/source.go	2026-05-25 17:06:30
++++ pv35-move-native-replacement-author-20261016/native/player/source.go	2026-10-16 14:57:03
+@@ -4,18 +4,38 @@
+ 	"errors"
+ 	"io"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ )
+ 
+ type SwitchingAudioSource struct {
+-	source map[bool]librespot.AudioSource
+-	which  bool
+-	cond   *sync.Cond
++	source      map[bool]librespot.AudioSource
++	which       bool
++	cond        *sync.Cond
++	retiring    atomic.Bool
++	active      atomic.Pointer[activeAudioRead]
++	pendingDone atomic.Uint64
+ 
+ 	done chan struct{}
+ }
+ 
++type activeAudioRead struct {
++	source librespot.AudioSource
++}
++
++// CancelRead is a one-way retirement fence. It never waits for the source
++// mutex, which the active raw Read holds, and does not close the decoder.
++func (s *SwitchingAudioSource) CancelRead() {
++	s.retiring.Store(true)
++	s.cond.Broadcast()
++	if read := s.active.Load(); read != nil {
++		if source, ok := read.source.(interface{ CancelRead() }); ok {
++			source.CancelRead()
++		}
++	}
++}
++
+ func NewSwitchingAudioSource() *SwitchingAudioSource {
+ 	return &SwitchingAudioSource{
+ 		source: map[bool]librespot.AudioSource{},
+@@ -42,18 +62,43 @@
+ 	return s.done
+ }
+ 
++func (s *SwitchingAudioSource) TakeDone() uint64 {
++	return s.pendingDone.Swap(0)
++}
++
+ func (s *SwitchingAudioSource) Read(p []float32) (n int, err error) {
+ 	s.cond.L.Lock()
+ 	defer s.cond.L.Unlock()
+ 
+ 	for s.source[s.which] == nil {
++		if s.retiring.Load() {
++			return 0, io.EOF
++		}
+ 		s.cond.Wait()
+ 	}
++	if s.retiring.Load() {
++		return 0, io.EOF
++	}
+ 
+-	n, err = s.source[s.which].Read(p)
++	read := &activeAudioRead{source: s.source[s.which]}
++	s.active.Store(read)
++	if s.retiring.Load() {
++		if source, ok := read.source.(interface{ CancelRead() }); ok {
++			source.CancelRead()
++		}
++		s.active.CompareAndSwap(read, nil)
++		return 0, io.EOF
++	}
++	n, err = read.source.Read(p)
++	s.active.CompareAndSwap(read, nil)
+ 	if errors.Is(err, io.EOF) {
+-		// notify this source is done
+-		s.done <- struct{}{}
++		// Wakeups coalesce, but each EOF remains counted. Sending while holding
++		// the source/output locks must never block CloseDone.
++		s.pendingDone.Add(1)
++		select {
++		case s.done <- struct{}{}:
++		default:
++		}
+ 
+ 		// if there's no other source just let the EOF through
+ 		if s.source[!s.which] == nil {
+diff -ruN pv35-move-native-author-20261016/native/player/source_retirement_test.go pv35-move-native-replacement-author-20261016/native/player/source_retirement_test.go
+--- pv35-move-native-author-20261016/native/player/source_retirement_test.go	1970-01-01 01:00:00
++++ pv35-move-native-replacement-author-20261016/native/player/source_retirement_test.go	2026-10-16 14:56:54
+@@ -0,0 +1,34 @@
++package player
++
++import (
++	"io"
++	"testing"
++	"time"
++)
++
++type retirementEOFSource struct{}
++
++func (retirementEOFSource) Read([]float32) (int, error) { return 0, io.EOF }
++func (retirementEOFSource) PositionMs() int64           { return 0 }
++func (retirementEOFSource) SetPositionMs(int64) error   { return nil }
++
++func TestRoomKnownRetirementFullDoneCannotHoldSourceLock(t *testing.T) {
++	source := NewSwitchingAudioSource()
++	source.SetPrimary(retirementEOFSource{})
++	source.SetSecondary(retirementEOFSource{})
++	finished := make(chan struct{})
++	go func() {
++		_, _ = source.Read(make([]float32, 1))
++		_, _ = source.Read(make([]float32, 1))
++		close(finished)
++	}()
++	select {
++	case <-finished:
++	case <-time.After(time.Second):
++		source.CancelRead()
++		t.Fatal("second EOF blocked with Done full while holding the source lock")
++	}
++	if got := source.TakeDone(); got != 2 {
++		t.Fatalf("two distinct EOFs require two queue advances, got %d", got)
++	}
++}
+diff -ruN pv35-move-native-author-20261016/native/player/start35.go pv35-move-native-replacement-author-20261016/native/player/start35.go
+--- pv35-move-native-author-20261016/native/player/start35.go	2026-10-16 13:06:19
++++ pv35-move-native-replacement-author-20261016/native/player/start35.go	2026-10-16 14:56:51
+@@ -113,6 +113,7 @@
+ 					}
+ 				}
+ 			sourceDrained:
++				source.pendingDone.Store(0)
+ 				for {
+ 					select {
+ 					case <-p.ev:

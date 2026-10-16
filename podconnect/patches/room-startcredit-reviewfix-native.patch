@@ -1,0 +1,764 @@
+diff --git a/output/room_transport_lock.go b/output/room_transport_lock.go
+--- a/output/room_transport_lock.go
++++ b/output/room_transport_lock.go
+@@ -3,7 +3,6 @@
+ import (
+ 	"context"
+ 	"sync"
+-	"time"
+ )
+ 
+ // LockTransport is used only for bounded, explicitly requested transport. The
+@@ -16,18 +15,32 @@
+ 		return err
+ 	}
+ 	if lock.TryLock() {
++		if err := ctx.Err(); err != nil {
++			lock.Unlock()
++			return err
++		}
+ 		return nil
+ 	}
+-	tick := time.NewTicker(time.Millisecond)
+-	defer tick.Stop()
+-	for {
++	// A polling TryLock can starve forever while a playing output repeatedly
++	// releases and reacquires its lock between PCM chunks. Join the mutex's
++	// waiter queue so a live writer can be verified without changing playback.
++	acquired := make(chan struct{})
++	go func() {
++		lock.Lock()
+ 		select {
++		case acquired <- struct{}{}:
+ 		case <-ctx.Done():
+-			return ctx.Err()
+-		case <-tick.C:
+-			if lock.TryLock() {
+-				return nil
+-			}
++			lock.Unlock()
+ 		}
++	}()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-acquired:
++		if err := ctx.Err(); err != nil {
++			lock.Unlock()
++			return err
++		}
++		return nil
+ 	}
+ }
+diff --git a/output/room_transport_lock_test.go b/output/room_transport_lock_test.go
+new file mode 100644
+--- /dev/null
++++ b/output/room_transport_lock_test.go
+@@ -0,0 +1,63 @@
++package output
++
++import (
++	"context"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++)
++
++func waitTransportLockReleased(t *testing.T, lock *sync.Mutex) {
++	t.Helper()
++	deadline := time.Now().Add(time.Second)
++	for !lock.TryLock() {
++		if time.Now().After(deadline) {
++			t.Fatal("canceled waiter retained transport lock")
++		}
++		runtime.Gosched()
++	}
++	lock.Unlock()
++}
++
++func TestTransportLockCanceledWaiterNeverRetainsLaterLock(t *testing.T) {
++	var lock sync.Mutex
++	lock.Lock()
++	ctx, cancel := context.WithCancel(context.Background())
++	result := make(chan error, 1)
++	go func() {
++		err := LockTransport(ctx, &lock)
++		if err == nil {
++			lock.Unlock()
++		}
++		result <- err
++	}()
++	cancel()
++	if err := <-result; err != context.Canceled {
++		t.Fatal("canceled waiter accepted", err)
++	}
++	lock.Unlock()
++	waitTransportLockReleased(t, &lock)
++}
++
++func TestTransportLockAcquireCancelRaceReleasesExactlyOnce(t *testing.T) {
++	for i := 0; i < 100; i++ {
++		var lock sync.Mutex
++		lock.Lock()
++		ctx, cancel := context.WithCancel(context.Background())
++		result := make(chan error, 1)
++		go func() {
++			err := LockTransport(ctx, &lock)
++			if err == nil {
++				lock.Unlock()
++			}
++			result <- err
++		}()
++		lock.Unlock()
++		cancel()
++		if err := <-result; err != nil && err != context.Canceled {
++			t.Fatal(err)
++		}
++		waitTransportLockReleased(t, &lock)
++	}
++}
+diff --git a/player/player.go b/player/player.go
+--- a/player/player.go
++++ b/player/player.go
+@@ -442,6 +442,24 @@
+ 	<-p.closeDone
+ }
+ 
++func (p *Player) sendCommand(cmd playerCmd) bool {
++	select {
++	case <-p.closeDone:
++		return false
++	case p.cmd <- cmd:
++		return true
++	}
++}
++
++func (p *Player) commandResult(reply <-chan any) (any, bool) {
++	select {
++	case value := <-reply:
++		return value, true
++	case <-p.closeDone:
++		return nil, false
++	}
++}
++
+ // InterruptRetiringRead is called only after the C reader has durably gated
+ // this completed source. It does not take the output/source lock or close an
+ // active decoder; the subsequent Stop/Close joins both before terminal proof.
+@@ -453,13 +471,19 @@
+ 
+ func (p *Player) SetVolume(val uint32) {
+ 	vol := float32(val) / MaxStateVolume
+-	p.cmd <- playerCmd{typ: playerCmdVolume, data: vol}
++	p.sendCommand(playerCmd{typ: playerCmdVolume, data: vol})
+ }
+ 
+ func (p *Player) Play() error {
+ 	resp := make(chan any, 1)
+-	p.cmd <- playerCmd{typ: playerCmdPlay, resp: resp}
+-	if err := <-resp; err != nil {
++	if !p.sendCommand(playerCmd{typ: playerCmdPlay, resp: resp}) {
++		return fmt.Errorf("player closed")
++	}
++	result, ok := p.commandResult(resp)
++	if !ok {
++		return fmt.Errorf("player closed")
++	}
++	if err := result; err != nil {
+ 		return err.(error)
+ 	}
+ 
+@@ -468,8 +492,14 @@
+ 
+ func (p *Player) Pause() error {
+ 	resp := make(chan any, 1)
+-	p.cmd <- playerCmd{typ: playerCmdPause, resp: resp}
+-	if err := <-resp; err != nil {
++	if !p.sendCommand(playerCmd{typ: playerCmdPause, resp: resp}) {
++		return fmt.Errorf("player closed")
++	}
++	result, ok := p.commandResult(resp)
++	if !ok {
++		return fmt.Errorf("player closed")
++	}
++	if err := result; err != nil {
+ 		return err.(error)
+ 	}
+ 
+@@ -478,14 +508,21 @@
+ 
+ func (p *Player) Stop() {
+ 	resp := make(chan any, 1)
+-	p.cmd <- playerCmd{typ: playerCmdStop, resp: resp}
+-	<-resp
++	if p.sendCommand(playerCmd{typ: playerCmdStop, resp: resp}) {
++		p.commandResult(resp)
++	}
+ }
+ 
+ func (p *Player) SeekMs(pos int64) error {
+ 	resp := make(chan any, 1)
+-	p.cmd <- playerCmd{typ: playerCmdSeek, data: pos, resp: resp}
+-	if err := <-resp; err != nil {
++	if !p.sendCommand(playerCmd{typ: playerCmdSeek, data: pos, resp: resp}) {
++		return fmt.Errorf("player closed")
++	}
++	result, ok := p.commandResult(resp)
++	if !ok {
++		return fmt.Errorf("player closed")
++	}
++	if err := result; err != nil {
+ 		return err.(error)
+ 	}
+ 
+@@ -494,15 +531,26 @@
+ 
+ func (p *Player) PositionMs() int64 {
+ 	resp := make(chan any, 1)
+-	p.cmd <- playerCmd{typ: playerCmdPosition, resp: resp}
+-	pos := <-resp
++	if !p.sendCommand(playerCmd{typ: playerCmdPosition, resp: resp}) {
++		return 0
++	}
++	pos, ok := p.commandResult(resp)
++	if !ok {
++		return 0
++	}
+ 	return pos.(int64)
+ }
+ 
+ func (p *Player) SetPrimaryStream(source librespot.AudioSource, paused, drop bool) error {
+ 	resp := make(chan any)
+-	p.cmd <- playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop}, resp: resp}
+-	if err := <-resp; err != nil {
++	if !p.sendCommand(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop}, resp: resp}) {
++		return fmt.Errorf("player closed")
++	}
++	result, ok := p.commandResult(resp)
++	if !ok {
++		return fmt.Errorf("player closed")
++	}
++	if err := result; err != nil {
+ 		return err.(error)
+ 	}
+ 
+@@ -511,8 +559,9 @@
+ 
+ func (p *Player) SetSecondaryStream(source librespot.AudioSource) {
+ 	resp := make(chan any)
+-	p.cmd <- playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: false}, resp: resp}
+-	<-resp
++	if p.sendCommand(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: false}, resp: resp}) {
++		p.commandResult(resp)
++	}
+ }
+ 
+ func (p *Player) httpChunkedReaderFromStorageResolve(log librespot.Logger, client *http.Client, storageResolve *downloadpb.StorageResolveResponse) (*audio.HttpChunkedReader, error) {
+diff --git a/player/room_move.go b/player/room_move.go
+--- a/player/room_move.go
++++ b/player/room_move.go
+@@ -38,10 +38,18 @@
+ 	command := &roomMoveCommand{ctx: ctx, phase: phase, expectedSource: expectedSource, pipe: pipe, epoch: epoch, wasPlaying: wasPlaying, guard: guard}
+ 	select {
+ 	case p.cmd <- playerCmd{move: command, resp: reply}:
++	case <-p.closeDone:
++		return output.MovePipeIdentity{}, "", fmt.Errorf("player closed")
+ 	case <-ctx.Done():
+ 		return output.MovePipeIdentity{}, "", ctx.Err()
+ 	}
+-	result := (<-reply).(roomMoveResult)
++	var value any
++	select {
++	case value = <-reply:
++	case <-p.closeDone:
++		return output.MovePipeIdentity{}, "", fmt.Errorf("player closed")
++	}
++	result := value.(roomMoveResult)
+ 	return result.Pipe, result.Epoch, result.Err
+ }
+ 
+diff --git a/player/room_transport.go b/player/room_transport.go
+--- a/player/room_transport.go
++++ b/player/room_transport.go
+@@ -23,10 +23,18 @@
+ 	reply := make(chan any, 1)
+ 	select {
+ 	case p.cmd <- playerCmd{guarded: &guardedTransportCommand{context: ctx, paused: paused, source: source, expectedSource: expectedSource, guard: guard}, resp: reply}:
++	case <-p.closeDone:
++		return fmt.Errorf("player closed")
+ 	case <-ctx.Done():
+ 		return ctx.Err()
+ 	}
+-	if result := <-reply; result != nil {
++	var result any
++	select {
++	case result = <-reply:
++	case <-p.closeDone:
++		return fmt.Errorf("player closed")
++	}
++	if result != nil {
+ 		return result.(error)
+ 	}
+ 	return nil
+diff --git a/player/room_move_close_test.go b/player/room_move_close_test.go
+--- a/player/room_move_close_test.go
++++ b/player/room_move_close_test.go
+@@ -1,9 +1,12 @@
+ package player
+ 
+ import (
++	"context"
+ 	"sync"
+ 	"testing"
+ 	"time"
++
++	"github.com/devgianlu/go-librespot/output"
+ )
+ 
+ func TestPlayerCloseWaitsForWorkerCleanupAndSendsOnce(t *testing.T) {
+@@ -41,3 +44,85 @@
+ 		t.Fatal("concurrent close caller did not join")
+ 	}
+ }
++
++func TestPlayerCallsReturnAfterWorkerClose(t *testing.T) {
++	p := &Player{cmd: make(chan playerCmd), closeDone: make(chan struct{})}
++	close(p.closeDone)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		p.SetVolume(100)
++		if p.Play() == nil || p.Pause() == nil || p.SeekMs(1) == nil || p.SetPrimaryStream(nil, true, false) == nil {
++			t.Error("closed player accepted legacy command")
++		}
++		p.Stop()
++		p.SetSecondaryStream(nil)
++		if p.PositionMs() != 0 || p.VerifyStart35(context.Background(), nil, output.PipeIdentity{}, "", "", nil) == nil {
++			t.Error("closed player retained synchronous command")
++		}
++		if _, _, err := p.Start35(context.Background(), "snapshot", nil, nil, output.PipeIdentity{}, "", nil); err == nil {
++			t.Error("closed player accepted START command")
++		}
++		if _, err := p.Start35CurrentSource(context.Background()); err == nil {
++			t.Error("closed player accepted source snapshot")
++		}
++		if _, _, err := p.RoomMove(context.Background(), "verify", nil, output.MovePipeIdentity{}, "", false, nil); err == nil {
++			t.Error("closed player accepted MOVE command")
++		}
++		if err := p.GuardedTransport(context.Background(), false, nil, nil, nil); err == nil {
++			t.Error("closed player accepted guarded command")
++		}
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("legacy call hung after worker close")
++	}
++}
++
++func TestSubmittedTransportCommandsJoinWorkerAfterContextCancel(t *testing.T) {
++	cases := []struct {
++		name  string
++		call  func(*Player, context.Context) error
++		reply any
++	}{
++		{"start", func(p *Player, ctx context.Context) error {
++			_, _, err := p.Start35(ctx, "snapshot", nil, nil, output.PipeIdentity{}, "", nil)
++			return err
++		}, start35Result{}},
++		{"verify", func(p *Player, ctx context.Context) error {
++			return p.VerifyStart35(ctx, nil, output.PipeIdentity{}, "", "", nil)
++		}, start35Result{}},
++		{"move", func(p *Player, ctx context.Context) error {
++			_, _, err := p.RoomMove(ctx, "snapshot", nil, output.MovePipeIdentity{}, "", false, nil)
++			return err
++		}, roomMoveResult{}},
++		{"guarded", func(p *Player, ctx context.Context) error {
++			return p.GuardedTransport(ctx, false, nil, nil, nil)
++		}, nil},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			p := &Player{cmd: make(chan playerCmd), closeDone: make(chan struct{})}
++			ctx, cancel := context.WithCancel(context.Background())
++			finished := make(chan error, 1)
++			go func() { finished <- tc.call(p, ctx) }()
++			command := <-p.cmd // Worker accepted the command before cancellation.
++			cancel()
++			select {
++			case <-finished:
++				t.Fatal("caller returned before accepted worker command completed")
++			case <-time.After(10 * time.Millisecond):
++			}
++			command.resp <- tc.reply
++			select {
++			case err := <-finished:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("caller did not join accepted worker command")
++			}
++		})
++	}
++}
+diff --git a/player/start35.go b/player/start35.go
+--- a/player/start35.go
++++ b/player/start35.go
+@@ -30,10 +30,18 @@
+ 	reply := make(chan any, 1)
+ 	select {
+ 	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: phase, source: source, expected: expected, pipe: pipe, epoch: epoch, guard: guard}, resp: reply}:
++	case <-p.closeDone:
++		return output.PipeIdentity{}, "", fmt.Errorf("player closed")
+ 	case <-ctx.Done():
+ 		return output.PipeIdentity{}, "", ctx.Err()
+ 	}
+-	result := (<-reply).(start35Result)
++	var value any
++	select {
++	case value = <-reply:
++	case <-p.closeDone:
++		return output.PipeIdentity{}, "", fmt.Errorf("player closed")
++	}
++	result := value.(start35Result)
+ 	return result.Pipe, result.Epoch, result.Err
+ }
+ 
+@@ -53,8 +61,6 @@
+ 		return value.(start35Result).Err
+ 	case <-p.closeDone:
+ 		return fmt.Errorf("start player closed")
+-	case <-ctx.Done():
+-		return ctx.Err()
+ 	}
+ }
+ func (p *Player) applyStart35(command *start35Command, out *output.Output, source *SwitchingAudioSource, volume float32) (result start35Result, err error) {
+@@ -112,7 +118,8 @@
+ 			}
+ 			defer lock.Unlock()
+ 			if command.ctx.Err() != nil || source.source[source.which] != command.expected || identity != command.pipe ||
+-				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD || writer.FencedUnderStartLock() {
++				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD ||
++				writer.FencedUnderStartLock() || writer.PausedUnderStartLock() {
+ 				return fmt.Errorf("start writer/source changed")
+ 			}
+ 			return command.guard(func() {})
+@@ -198,9 +205,17 @@
+ 	reply := make(chan any, 1)
+ 	select {
+ 	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: "snapshot"}, resp: reply}:
++	case <-p.closeDone:
++		return nil, fmt.Errorf("player closed")
+ 	case <-ctx.Done():
+ 		return nil, ctx.Err()
+ 	}
+-	r := (<-reply).(start35Result)
++	var value any
++	select {
++	case value = <-reply:
++	case <-p.closeDone:
++		return nil, fmt.Errorf("player closed")
++	}
++	r := value.(start35Result)
+ 	return r.Source, r.Err
+ }
+diff --git a/player/start35_verify_test.go b/player/start35_verify_test.go
+--- a/player/start35_verify_test.go
++++ b/player/start35_verify_test.go
+@@ -7,6 +7,8 @@
+ 	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
++	"sync/atomic"
+ 	"syscall"
+ 	"testing"
+ 	"time"
+@@ -15,11 +17,42 @@
+ 	"github.com/devgianlu/go-librespot/output"
+ )
+ 
+-type startVerifyEOFSource struct{ id int }
+-
+-func (*startVerifyEOFSource) Read([]float32) (int, error) { return 0, io.EOF }
+-func (*startVerifyEOFSource) PositionMs() int64           { return 0 }
+-func (*startVerifyEOFSource) SetPositionMs(int64) error   { return nil }
++type startVerifyEOFSource struct {
++	id  int
++	end atomic.Bool
++}
++
++type startVerifyPCMSource struct {
++	tokens  chan struct{}
++	entered chan struct{}
++}
++
++func (s *startVerifyPCMSource) Read(samples []float32) (int, error) {
++	select {
++	case s.entered <- struct{}{}:
++	default:
++	}
++	if _, ok := <-s.tokens; !ok {
++		return 0, io.EOF
++	}
++	n := min(len(samples), 512)
++	for i := 0; i < n; i++ {
++		samples[i] = 0.1
++	}
++	return n, nil
++}
++func (*startVerifyPCMSource) PositionMs() int64         { return 0 }
++func (*startVerifyPCMSource) SetPositionMs(int64) error { return nil }
++
++func (s *startVerifyEOFSource) Read([]float32) (int, error) {
++	if s.end.Load() {
++		return 0, io.EOF
++	}
++	time.Sleep(time.Millisecond)
++	return 0, nil
++}
++func (*startVerifyEOFSource) PositionMs() int64         { return 0 }
++func (*startVerifyEOFSource) SetPositionMs(int64) error { return nil }
+ 
+ func TestStart35HeldCCompleteCannotCreditClosedWriter(t *testing.T) {
+ 	path := filepath.Join(t.TempDir(), "pcm.fifo")
+@@ -48,7 +81,8 @@
+ 		t.Fatal(err)
+ 	}
+ 	defer p.Close()
+-	old, selected := &startVerifyEOFSource{1}, &startVerifyEOFSource{2}
++	old, selected := &startVerifyEOFSource{id: 1}, &startVerifyEOFSource{id: 2}
++	old.end.Store(true)
+ 	if err := p.SetPrimaryStream(old, true, false); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -117,3 +151,227 @@
+ 		t.Fatal("closed player accepted late C COMPLETE")
+ 	}
+ }
++
++func TestStart35HeldCCompleteCannotCreditNaturalEOFPause(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	var writer output.MovePipeIdentity
++	var actual output.MovePipeOutput
++	p, err := NewPlayer(&Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			out, err := create()
++			if err == nil {
++				actual = out.(output.MovePipeOutput)
++				writer = out.(interface {
++					OpenedWriterIdentity() output.MovePipeIdentity
++				}).OpenedWriterIdentity()
++			}
++			return out, err
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	old, selected := &startVerifyEOFSource{id: 1}, &startVerifyEOFSource{id: 2}
++	old.end.Store(true)
++	if err := p.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := p.Start35(context.Background(), "quiesce", nil, old, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "publish", selected, old, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "resume", nil, selected, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	entered, release := make(chan struct{}), make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		close(entered)
++		<-release
++		w.WriteHeader(http.StatusOK)
++	}))
++	defer server.Close()
++	ack := make(chan error, 1)
++	go func() {
++		resp, err := http.Post(server.URL+"/complete", "application/json", nil)
++		if err == nil {
++			_ = resp.Body.Close()
++		}
++		ack <- err
++	}()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("C COMPLETE was not held")
++	}
++	selected.end.Store(true)
++	deadline := time.Now().Add(time.Second)
++	for {
++		paused := false
++		if err := actual.WithStartLock(context.Background(), func(_ output.PipeIdentity, _ func(bool)) error {
++			paused = actual.PausedUnderStartLock()
++			return nil
++		}); err != nil {
++			t.Fatal(err)
++		}
++		if paused {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("natural EOF did not pause actual output")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	close(release)
++	if err := <-ack; err != nil {
++		t.Fatal(err)
++	}
++	credited := false
++	if err := p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
++		t.Fatal("C COMPLETE credited a naturally paused native writer")
++	}
++}
++
++func TestStart35FinalProofWhileNonzeroPCMPlays(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	drainStop := make(chan struct{})
++	drainDone := make(chan struct{})
++	drainedPCM := make(chan struct{}, 16)
++	go func() {
++		defer close(drainDone)
++		buf := make([]byte, 8192)
++		for {
++			select {
++			case <-drainStop:
++				return
++			default:
++			}
++			if n, err := syscall.Read(int(reader.Fd()), buf); err == syscall.EAGAIN {
++				runtime.Gosched()
++			} else if err != nil {
++				return
++			} else if n > 0 {
++				for _, sample := range buf[:n] {
++					if sample != 0 {
++						select {
++						case drainedPCM <- struct{}{}:
++						default:
++						}
++						break
++					}
++				}
++			}
++		}
++	}()
++	defer func() { close(drainStop); <-drainDone }()
++	var writer output.MovePipeIdentity
++	p, err := NewPlayer(&Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			out, err := create()
++			if err == nil {
++				writer = out.(interface {
++					OpenedWriterIdentity() output.MovePipeIdentity
++				}).OpenedWriterIdentity()
++			}
++			return out, err
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	old := &startVerifyEOFSource{id: 1}
++	old.end.Store(true)
++	selected := &startVerifyPCMSource{tokens: make(chan struct{}, 1), entered: make(chan struct{}, 1)}
++	defer func() { close(selected.tokens); p.Close() }()
++	if err := p.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := p.Start35(context.Background(), "quiesce", nil, old, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "publish", selected, old, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = p.Start35(context.Background(), "resume", nil, selected, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	// Prove a real nonzero PCM write reached the registered FIFO reader before
++	// claiming that verification can join a playing output.
++	select {
++	case <-selected.entered:
++	case <-ctx.Done():
++		t.Fatal("playing source did not start reading", ctx.Err())
++	}
++	selected.tokens <- struct{}{}
++	select {
++	case <-drainedPCM:
++	case <-ctx.Done():
++		t.Fatal("playing writer did not deliver nonzero PCM", ctx.Err())
++	}
++	// A fresh Read is now blocked on its token while holding the output-side
++	// playback path; the verification must wait for that work to finish.
++	select {
++	case <-selected.entered:
++	case <-ctx.Done():
++		t.Fatal("playing source did not enter its next read", ctx.Err())
++	}
++	finished := make(chan error, 1)
++	go func() {
++		finished <- p.VerifyStart35(ctx, selected, pipe, epoch, writer.FD, guard)
++	}()
++	select {
++	case <-finished:
++		t.Fatal("verification returned while a live source Read was blocked")
++	default:
++	}
++	// Release the blocked Read with another real PCM chunk.
++	selected.tokens <- struct{}{}
++	morePCM := false
++	for {
++		select {
++		case <-drainedPCM:
++			morePCM = true
++		case err := <-finished:
++			if err != nil {
++				t.Fatal("live nonzero PCM writer was not verified", err)
++			}
++			if !morePCM {
++				select {
++				case <-drainedPCM:
++				case <-ctx.Done():
++					t.Fatal("verification saw no subsequent nonzero PCM", ctx.Err())
++				}
++			}
++			return
++		case selected.tokens <- struct{}{}:
++		case <-ctx.Done():
++			t.Fatal("live nonzero PCM writer verification timed out", ctx.Err())
++		}
++	}
++}
