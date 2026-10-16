@@ -1,0 +1,968 @@
+--- a/podconnect/manager/main.go
++++ b/podconnect/manager/main.go
+@@ -1402,6 +1402,11 @@
+ 	http.HandleFunc("/api/room-volume/commit", roomVolumeCommitHandler)
+ 	http.HandleFunc("/api/room-volume/cancel", roomVolumeCancelHandler)
+ 	http.HandleFunc("/api/room-volume/result", roomVolumeResultHandler)
++	http.HandleFunc("/api/room-content/state", roomContentStateHandler)
++	http.HandleFunc("/api/room-content/prepare", roomContentPrepareHandler)
++	http.HandleFunc("/api/room-content/result", roomContentResultHandler)
++	http.HandleFunc("/api/room-content/commit", roomContentCommitHandler)
++	http.HandleFunc("/api/room-content/cancel", roomContentCancelHandler)
+ 	http.HandleFunc("/api/queue-occurrences", queueReadHandler)
+ 	http.HandleFunc("/api/queue-occurrence", queueJumpHandler)
+ 	http.HandleFunc("/api/start-volume", startRequest)
+--- /dev/null
++++ b/podconnect/manager/room_content.go
+@@ -0,0 +1,105 @@
++package main
++
++// Native owns all selected-content staging and the complete C-gate transaction.
++// Manager exposes only bound descriptors/results, never C tokens or a WebAPI
++// fallback. Effect handlers are registered only with the complete owner slice.
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/url"
++	"slices"
++	"time"
++)
++
++const roomContentPolicy = "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
++
++type roomContentOffer struct {
++	Schema      string `json:"schema"`
++	ID          string `json:"offer_id"`
++	Binding     string `json:"binding_id"`
++	Incarnation string `json:"native_incarnation"`
++	Policy      string `json:"policy_revision"`
++	Percent     int    `json:"start_volume_percent"`
++	Expires     int    `json:"expires_after_ms"`
++}
++
++type nativeRoomContentControls struct {
++	Schema      string             `json:"schema"`
++	Ready       bool               `json:"ready"`
++	Scope       roomTransportScope `json:"scope"`
++	Actions     []string           `json:"actions"`
++	Offer       roomContentOffer   `json:"start_offer"`
++	Physical    bool               `json:"physical_result_verified"`
++	Registry    string             `json:"alias_registry"`
++	InputDigest string             `json:"input_path_digest"`
++	OutputURL   string             `json:"own_tone_url"`
++}
++
++func validRoomContentOffer(offer roomContentOffer) bool {
++	return offer.Schema == "podconnect.room_content_offer.v1" && queueObservationPattern.MatchString(offer.ID) && transportDigest.MatchString(offer.Binding) && queueObservationPattern.MatchString(offer.Incarnation) && offer.Policy == roomContentPolicy && offer.Percent == 35 && offer.Expires >= 1 && offer.Expires <= 5000
++}
++
++func validRoomContentActions(actions []string) bool {
++	if actions == nil || len(actions) > 2 {
++		return false
++	}
++	seen := map[string]bool{}
++	for _, action := range actions {
++		if !slices.Contains([]string{"play_track", "play_context"}, action) || seen[action] {
++			return false
++		}
++		seen[action] = true
++	}
++	return true
++}
++
++func readRoomContent(ctx context.Context, scope roomTransportScope) (roomContentBinding, nativeRoomContentControls, error) {
++	var state nativeRoomContentControls
++	binding, ok := roomContentBindingNow(scope)
++	if !ok {
++		return binding, state, fmt.Errorf("configured content destination unavailable")
++	}
++	q := url.Values{"account_user_id": {scope.Account}, "target_id": {scope.Target}, "room_id": {scope.Room}, "homepod_id": {scope.Homepod}}
++	started := time.Now()
++	raw, err := roomContentRPC(ctx, binding.NativeURL, http.MethodGet, "/player/room_content/controls?"+q.Encode(), nil)
++	fields, shapeErr := contentFields(raw, "schema", "ready", "scope", "actions", "start_offer", "physical_result_verified", "alias_registry", "input_path_digest", "own_tone_url")
++	if err != nil || shapeErr != nil || decodeQueueManagerJSON(raw, &state) != nil || decodeQueueManagerJSON(fields["scope"], &state.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &state.Offer) != nil || state.Schema != "podconnect.native_room_content_controls.v1" || !state.Ready || state.Physical || state.Scope != scope || !validRoomContentOffer(state.Offer) || !validRoomContentActions(state.Actions) || state.Registry != binding.Registry || state.InputDigest != binding.PipeDigest || state.OutputURL != binding.OutputURL || !roomContentBindingCurrent(binding) {
++		return binding, state, fmt.Errorf("actual native content destination unavailable")
++	}
++	// Relative expiry can only shrink while traversing the manager. Native keeps
++	// the original absolute one-use offer deadline regardless of this descriptor.
++	remaining := state.Offer.Expires - int(time.Since(started).Milliseconds())
++	if remaining <= 0 {
++		return binding, state, fmt.Errorf("content offer expired")
++	}
++	state.Offer.Expires = remaining
++	return binding, state, nil
++}
++
++func roomContentStateHandler(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		http.Error(w, "method", 405)
++		return
++	}
++	q := r.URL.Query()
++	scope := roomTransportScope{q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), q.Get("account_user_id")}
++	if len(q) != 4 || !validTransportScope(scope) {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	for _, values := range q {
++		if len(values) != 1 {
++			http.Error(w, "arguments", 400)
++			return
++		}
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
++	defer cancel()
++	_, state, err := readRoomContent(ctx, scope)
++	if err != nil {
++		http.Error(w, "content unavailable", 409)
++		return
++	}
++	writeJSON(w, map[string]any{"schema": "podconnect.room_content_state.v1", "ok": true, "start_offer": state.Offer, "actions": state.Actions, "physical_result_verified": false})
++}
+--- /dev/null
++++ b/podconnect/manager/room_content_binding.go
+@@ -0,0 +1,85 @@
++package main
++
++// Selected-content ownership starts from the configured engine and its current
++// destination catalogue, including an idle engine. It deliberately does not use
++// currentStartClaim, whose same-session/selected-output predicates cannot prove
++// an explicit transition to a different owned output. This is configuration
++// validation only; native and OwnTone still own all effect admission.
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"os"
++	"path/filepath"
++)
++
++type roomContentBinding struct {
++	Scope        roomTransportScope
++	RT           *roomRuntime
++	Registry     string
++	PipeDigest   string
++	ConfigDigest string
++	NativeURL    string
++	OutputURL    string
++	RunEpoch     uint64
++	PhaseEpoch   uint64
++}
++
++func roomContentBindingFor(primary *Room, rt *roomRuntime, rooms []*Room, scope roomTransportScope) (roomContentBinding, bool) {
++	if !validTransportScope(scope) || primary == nil || rt == nil || rt.room == nil || rt.room.ID != primary.ID || configuredEngineID(primary) != scope.Target || primary.Pipe == "" || primary.Librespot == "" || primary.OwnTone == "" {
++		return roomContentBinding{}, false
++	}
++	entries, ok := aliasEntriesForRooms(rooms, connectAliasesForRooms(rooms))
++	if !ok || !transportDigest.MatchString(aliasRegistryHash(entries)) {
++		return roomContentBinding{}, false
++	}
++	matches := 0
++	for _, entry := range entries {
++		if entry.RoomID == scope.Room && entry.HomepodID == scope.Homepod {
++			matches++
++		}
++	}
++	if matches != 1 {
++		return roomContentBinding{}, false
++	}
++	raw, err := os.ReadFile(filepath.Join(primary.ConfigDir, "config.yml"))
++	if err != nil {
++		return roomContentBinding{}, false
++	}
++	config := sha256.Sum256(raw)
++	pipe := sha256.Sum256([]byte(primary.Pipe))
++	rt.live.mu.Lock()
++	rt.live.observeStopLocked()
++	run, phase, retired := rt.live.runEpoch, rt.live.phaseEpoch, rt.live.sourceRetired
++	rt.live.mu.Unlock()
++	if retired {
++		return roomContentBinding{}, false
++	}
++	return roomContentBinding{scope, rt, aliasRegistryHash(entries), hex.EncodeToString(pipe[:]), hex.EncodeToString(config[:]), primary.Librespot, primary.OwnTone, run, phase}, true
++}
++
++func currentRoomContentBinding(scope roomTransportScope) (roomContentBinding, bool) {
++	if mgr == nil || store == nil {
++		return roomContentBinding{}, false
++	}
++	rooms := loadRooms()
++	var primary *Room
++	for _, room := range rooms {
++		if room != nil && room.Idx == 0 {
++			if primary != nil {
++				return roomContentBinding{}, false
++			}
++			primary = room
++		}
++	}
++	if primary == nil {
++		return roomContentBinding{}, false
++	}
++	return roomContentBindingFor(primary, mgr.runtime(primary.ID), rooms, scope)
++}
++
++var roomContentBindingNow = currentRoomContentBinding
++
++func roomContentBindingCurrent(binding roomContentBinding) bool {
++	current, ok := roomContentBindingNow(binding.Scope)
++	return ok && current == binding
++}
+--- /dev/null
++++ b/podconnect/manager/room_content_binding_test.go
+@@ -0,0 +1,84 @@
++package main
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func contentBindingFixture(t *testing.T) (*Room, *roomRuntime, []*Room, roomTransportScope) {
++	t.Helper()
++	primary := &Room{ID: "r0", Idx: 0, Name: "Kitchen", HomepodID: "42", ConfigDir: t.TempDir(), Pipe: "/config/native.fifo", Librespot: "http://127.0.0.1:24879", OwnTone: "http://127.0.0.1:3689"}
++	id := strings.Repeat("a", 40)
++	if err := os.WriteFile(filepath.Join(primary.ConfigDir, "device_id"), []byte(id), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(primary.ConfigDir, "config.yml"), []byte(fmt.Sprintf("device_id: %q\ninitial_volume: 35\n", id)), 0600); err != nil {
++		t.Fatal(err)
++	}
++	other := &Room{ID: "r6", Idx: 1, Name: "Other", HomepodID: "66"}
++	return primary, &roomRuntime{room: primary}, []*Room{primary, other}, roomTransportScope{id, "r6", "66", "actual-account"}
++}
++
++func TestContentBindingAdmitsExplicitOwnedDestinationWithoutFabricatingActiveSession(t *testing.T) {
++	primary, runtime, rooms, scope := contentBindingFixture(t)
++	// This genuine runtime has no source run, session, selected alias or route.
++	// Native authentication/effect admission is separate from manager mapping.
++	got, ok := roomContentBindingFor(primary, runtime, rooms, scope)
++	if !ok || got.Scope.Room != "r6" || got.Scope.Homepod != "66" || got.RT != runtime || got.Registry == "" || got.PipeDigest == "" {
++		t.Fatalf("explicit actual catalogue destination rejected: %+v %v", got, ok)
++	}
++	for name, invalid := range map[string]roomTransportScope{
++		"foreign engine": {strings.Repeat("b", 40), "r6", "66", "actual-account"},
++		"unknown room":   {scope.Target, "tesla", "66", "actual-account"},
++		"wrong output":   {scope.Target, "r6", "42", "actual-account"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, ok := roomContentBindingFor(primary, runtime, rooms, invalid); ok {
++				t.Fatal("foreign destination admitted")
++			}
++		})
++	}
++}
++
++func TestContentBindingInvalidatesHeldCatalogueConfigAndRuntime(t *testing.T) {
++	primary, runtime, rooms, scope := contentBindingFixture(t)
++	old := roomContentBindingNow
++	t.Cleanup(func() { roomContentBindingNow = old })
++	roomContentBindingNow = func(s roomTransportScope) (roomContentBinding, bool) {
++		return roomContentBindingFor(primary, runtime, rooms, s)
++	}
++	prepared, ok := roomContentBindingNow(scope)
++	if !ok || !roomContentBindingCurrent(prepared) {
++		t.Fatal("actual initial binding unavailable")
++	}
++	rooms[1].HomepodID = "77"
++	if roomContentBindingCurrent(prepared) {
++		t.Fatal("room/output replacement preserved stale binding")
++	}
++	rooms[1].HomepodID = "66"
++	if !roomContentBindingCurrent(prepared) {
++		t.Fatal("unchanged current mapping unavailable")
++	}
++	runtime = &roomRuntime{room: primary}
++	if roomContentBindingCurrent(prepared) {
++		t.Fatal("runtime replacement preserved stale binding")
++	}
++	runtime = prepared.RT
++	runtime.live.beginRun(nil)
++	if roomContentBindingCurrent(prepared) {
++		t.Fatal("same runtime's native process replacement preserved stale binding")
++	}
++	prepared, ok = roomContentBindingNow(scope)
++	if !ok {
++		t.Fatal("new actual source unavailable")
++	}
++	if err := os.WriteFile(filepath.Join(primary.ConfigDir, "config.yml"), []byte(fmt.Sprintf("device_id: %q\ninitial_volume: 35\nchanged: true\n", scope.Target)), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if roomContentBindingCurrent(prepared) {
++		t.Fatal("source configuration replacement preserved stale binding")
++	}
++}
+--- /dev/null
++++ b/podconnect/manager/room_content_operation.go
+@@ -0,0 +1,309 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"regexp"
++	"slices"
++	"sync"
++	"time"
++)
++
++type roomContentRequest struct {
++	Scope  roomTransportScope `json:"scope"`
++	Offer  roomContentOffer   `json:"start_offer"`
++	Action string             `json:"action"`
++	Args   map[string]any     `json:"args"`
++}
++
++type roomContentResult struct {
++	Schema    string  `json:"schema"`
++	OK        bool    `json:"ok"`
++	Offer     string  `json:"offer_id"`
++	Binding   string  `json:"binding_id"`
++	State     string  `json:"state"`
++	Accepted  bool    `json:"accepted_selected_content"`
++	Operation *string `json:"start_operation_id"`
++	Percent   *int    `json:"start_volume_percent"`
++	Room      string  `json:"room_id"`
++	Homepod   string  `json:"homepod_id"`
++	Physical  bool    `json:"physical_result_verified"`
++}
++
++type roomContentRecord struct {
++	Binding    roomContentBinding
++	Request    roomContentRequest
++	Digest     string
++	Created    time.Time
++	Preparing  bool
++	Dispatched bool
++	Cancelled  bool
++	Result     roomContentResult
++}
++
++var roomContentStore = struct {
++	sync.Mutex
++	Records map[string]*roomContentRecord
++}{Records: make(map[string]*roomContentRecord)}
++
++var contentURI = regexp.MustCompile(`^spotify:(track|playlist):[A-Za-z0-9]{22}$`)
++var roomContentRPC = doRoomContentRPC
++
++// The native critical section has its own immutable twelve-second cutoff.
++// This HTTP limit never replaces that actual-owner fence or retries a send.
++func doRoomContentRPC(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	client := &http.Client{Timeout: 18 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return fmt.Errorf("content redirect rejected") }}
++	response, err := client.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer response.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(response.Body, 65537))
++	if err != nil || len(raw) > 65536 || response.StatusCode != 200 {
++		return nil, fmt.Errorf("content owner unavailable")
++	}
++	return raw, nil
++}
++
++func contentFields(raw []byte, keys ...string) (map[string]json.RawMessage, error) {
++	var fields map[string]json.RawMessage
++	if decodeQueueManagerJSON(raw, &fields) != nil || len(fields) != len(keys) {
++		return nil, fmt.Errorf("closed object required")
++	}
++	for _, key := range keys {
++		if _, ok := fields[key]; !ok {
++			return nil, fmt.Errorf("missing field")
++		}
++	}
++	return fields, nil
++}
++
++func decodeRoomContentRequest(raw []byte) (roomContentRequest, error) {
++	var request roomContentRequest
++	fields, err := contentFields(raw, "scope", "start_offer", "action", "args")
++	if err != nil || decodeQueueManagerJSON(fields["scope"], &request.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &request.Offer) != nil || json.Unmarshal(fields["action"], &request.Action) != nil || !validTransportScope(request.Scope) || !validRoomContentOffer(request.Offer) {
++		return request, fmt.Errorf("invalid content request")
++	}
++	key, prefix := "track_uri", "spotify:track:"
++	if request.Action == "play_context" {
++		key, prefix = "context_uri", "spotify:playlist:"
++	} else if request.Action != "play_track" {
++		return request, fmt.Errorf("invalid action")
++	}
++	args, err := contentFields(fields["args"], key, "max_volume")
++	var uri string
++	var ceiling int
++	if err != nil || json.Unmarshal(args[key], &uri) != nil || json.Unmarshal(args["max_volume"], &ceiling) != nil || !contentURI.MatchString(uri) || len(uri) != len(prefix)+22 || uri[:len(prefix)] != prefix || ceiling < 35 || ceiling > 100 {
++		return request, fmt.Errorf("invalid content arguments")
++	}
++	request.Args = map[string]any{key: uri, "max_volume": ceiling}
++	return request, nil
++}
++
++func decodeRoomContentResult(raw []byte, endpoint string, record *roomContentRecord) (roomContentResult, error) {
++	var result roomContentResult
++	fields, err := contentFields(raw, "schema", "ok", "offer_id", "binding_id", "state", "accepted_selected_content", "start_operation_id", "start_volume_percent", "room_id", "homepod_id", "physical_result_verified")
++	for key, value := range fields {
++		if key != "start_operation_id" && key != "start_volume_percent" && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++			return result, fmt.Errorf("null required result field")
++		}
++	}
++	if err != nil || json.Unmarshal(raw, &result) != nil || result.Schema != "podconnect.native_room_content_"+endpoint+".v1" || result.Offer != record.Request.Offer.ID || result.Binding != record.Request.Offer.Binding || result.Room != record.Request.Scope.Room || result.Homepod != record.Request.Scope.Homepod || result.Physical || !slices.Contains([]string{"staging", "staged", "committing", "complete", "rejected", "cancelled", "unknown"}, result.State) || result.OK != (result.State == "complete") || result.Accepted != result.OK || result.Operation != nil && *result.Operation != result.Offer || result.Percent != nil && *result.Percent != 35 || result.OK && (result.Operation == nil || result.Percent == nil) {
++		return result, fmt.Errorf("invalid actual content result")
++	}
++	if endpoint == "prepare" && (result.State == "committing" || result.State == "complete") {
++		return result, fmt.Errorf("start phase without actual commit dispatch")
++	}
++	return result, nil
++}
++
++func terminalRoomContent(state string) bool {
++	return slices.Contains([]string{"complete", "rejected", "cancelled", "unknown"}, state)
++}
++func contentUnknown(record *roomContentRecord) roomContentResult {
++	return roomContentResult{Offer: record.Request.Offer.ID, Binding: record.Request.Offer.Binding, State: "unknown", Room: record.Request.Scope.Room, Homepod: record.Request.Scope.Homepod}
++}
++func writeRoomContentResult(w http.ResponseWriter, endpoint string, result roomContentResult) {
++	result.Schema = "podconnect.room_content_" + endpoint + ".v1"
++	writeJSON(w, result)
++}
++func contentIDBody(r *http.Request) (string, string, error) {
++	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
++		return "", "", fmt.Errorf("method/arguments")
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 1025))
++	defer r.Body.Close()
++	fields, parseErr := contentFields(raw, "offer_id", "binding_id")
++	var offer, binding string
++	if err != nil || len(raw) > 1024 || parseErr != nil || json.Unmarshal(fields["offer_id"], &offer) != nil || json.Unmarshal(fields["binding_id"], &binding) != nil || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
++		return "", "", fmt.Errorf("invalid ids")
++	}
++	return offer, binding, nil
++}
++
++func roomContentPrepareHandler(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
++		http.Error(w, "method/arguments", 400)
++		return
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 8193))
++	r.Body.Close()
++	request, parseErr := decodeRoomContentRequest(raw)
++	if err != nil || len(raw) > 8192 || parseErr != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	binding, ok := roomContentBindingNow(request.Scope)
++	if !ok {
++		http.Error(w, "destination unavailable", 409)
++		return
++	}
++	canonical, _ := json.Marshal(request)
++	digest := sha256.Sum256(canonical)
++	record := &roomContentRecord{Binding: binding, Request: request, Digest: hex.EncodeToString(digest[:]), Created: time.Now(), Preparing: true}
++	record.Result = contentUnknown(record)
++	roomContentStore.Lock()
++	if old := roomContentStore.Records[request.Offer.ID]; old != nil {
++		matching := old.Digest == record.Digest && old.Binding == binding
++		result := old.Result
++		roomContentStore.Unlock()
++		if !matching {
++			http.Error(w, "operation conflict", 409)
++			return
++		}
++		writeRoomContentResult(w, "prepare", result)
++		return
++	}
++	// Expired undispatched offers have no future manager commit authority.
++	// Dispatched unknowns remain fenced; never evict them to make capacity.
++	if len(roomContentStore.Records) >= 128 {
++		for id, old := range roomContentStore.Records {
++			if !old.Preparing && !old.Dispatched && time.Since(old.Created) > 35*time.Second || slices.Contains([]string{"complete", "rejected", "cancelled"}, old.Result.State) {
++				delete(roomContentStore.Records, id)
++				break
++			}
++		}
++	}
++	if len(roomContentStore.Records) >= 128 {
++		roomContentStore.Unlock()
++		http.Error(w, "busy", 409)
++		return
++	}
++	roomContentStore.Records[request.Offer.ID] = record
++	roomContentStore.Unlock()
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	nativeRaw, rpcErr := roomContentRPC(ctx, binding.NativeURL, http.MethodPost, "/player/room_content/prepare", canonical)
++	result, resultErr := decodeRoomContentResult(nativeRaw, "prepare", record)
++	roomContentStore.Lock()
++	record.Preparing = false
++	if rpcErr != nil || resultErr != nil || record.Cancelled || !roomContentBindingCurrent(binding) {
++		record.Result = contentUnknown(record)
++	} else {
++		record.Result = result
++	}
++	result = record.Result
++	roomContentStore.Unlock()
++	writeRoomContentResult(w, "prepare", result)
++}
++
++func roomContentResultHandler(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query()
++	offer, binding := q.Get("offer_id"), q.Get("binding_id")
++	if r.Method != http.MethodGet || len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomContentOperation(w, r, "result", offer, binding)
++}
++func roomContentCommitHandler(w http.ResponseWriter, r *http.Request) {
++	offer, binding, err := contentIDBody(r)
++	if err != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomContentOperation(w, r, "commit", offer, binding)
++}
++func roomContentCancelHandler(w http.ResponseWriter, r *http.Request) {
++	offer, binding, err := contentIDBody(r)
++	if err != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomContentOperation(w, r, "cancel", offer, binding)
++}
++
++func roomContentOperation(w http.ResponseWriter, r *http.Request, endpoint, offer, binding string) {
++	roomContentStore.Lock()
++	record := roomContentStore.Records[offer]
++	if record == nil || record.Request.Offer.Binding != binding {
++		roomContentStore.Unlock()
++		http.Error(w, "unknown operation", 409)
++		return
++	}
++	if terminalRoomContent(record.Result.State) && !record.Preparing && (endpoint != "cancel" || record.Result.State != "unknown") {
++		result := record.Result
++		roomContentStore.Unlock()
++		writeRoomContentResult(w, endpoint, result)
++		return
++	}
++	if endpoint == "commit" {
++		if record.Preparing || record.Dispatched || record.Cancelled || record.Result.State != "staged" || !roomContentBindingCurrent(record.Binding) {
++			roomContentStore.Unlock()
++			http.Error(w, "not staged/current", 409)
++			return
++		}
++		record.Dispatched = true
++		record.Result.State = "committing"
++	} else if endpoint == "cancel" {
++		record.Cancelled = true
++	}
++	if record.Preparing && endpoint == "result" {
++		result := record.Result
++		roomContentStore.Unlock()
++		writeRoomContentResult(w, endpoint, result)
++		return
++	}
++	nativeURL := record.Binding.NativeURL
++	roomContentStore.Unlock()
++	ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
++	defer cancel()
++	method, path, body := http.MethodGet, "/player/room_content/result?"+url.Values{"offer_id": {offer}, "binding_id": {binding}}.Encode(), []byte(nil)
++	if endpoint != "result" {
++		method, path = http.MethodPost, "/player/room_content/"+endpoint
++		body, _ = json.Marshal(map[string]string{"offer_id": offer, "binding_id": binding})
++	}
++	raw, rpcErr := roomContentRPC(ctx, nativeURL, method, path, body)
++	result, resultErr := decodeRoomContentResult(raw, endpoint, record)
++	roomContentStore.Lock()
++	if (result.State == "committing" || result.State == "complete") && !record.Dispatched {
++		resultErr = fmt.Errorf("start phase without actual commit dispatch")
++	}
++	// A terminal unknown never becomes a late success, even if another pending
++	// observation/cancel completes after it. Native independently retires effects.
++	if !terminalRoomContent(record.Result.State) {
++		if rpcErr != nil || resultErr != nil || !roomContentBindingCurrent(record.Binding) || record.Cancelled && result.State == "complete" {
++			record.Result = contentUnknown(record)
++		} else {
++			record.Result = result
++		}
++	}
++	result = record.Result
++	roomContentStore.Unlock()
++	writeRoomContentResult(w, endpoint, result)
++}
+--- /dev/null
++++ b/podconnect/manager/room_content_operation_test.go
+@@ -0,0 +1,248 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++type contentOperationFixture struct {
++	Request    roomContentRequest
++	Prepared   int
++	Commits    int
++	Cancels    int
++	Stage      string
++	FailCommit bool
++}
++
++func contentOperationSetup(t *testing.T) *contentOperationFixture {
++	t.Helper()
++	state, binding := contentStateFixture(t)
++	f := &contentOperationFixture{Request: roomContentRequest{binding.Scope, state.Offer, "play_track", map[string]any{"track_uri": "spotify:track:1234567890123456789012", "max_volume": 35}}, Stage: "staging"}
++	roomContentStore.Lock()
++	roomContentStore.Records = make(map[string]*roomContentRecord)
++	roomContentStore.Unlock()
++	t.Cleanup(func() {
++		roomContentStore.Lock()
++		roomContentStore.Records = make(map[string]*roomContentRecord)
++		roomContentStore.Unlock()
++	})
++	roomContentRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		if base != binding.NativeURL {
++			t.Fatal("foreign native selected", base)
++		}
++		endpoint, phase := "", f.Stage
++		switch {
++		case path == "/player/room_content/prepare":
++			f.Prepared++
++			endpoint = "prepare"
++			if method != http.MethodPost {
++				t.Fatal("not POST")
++			}
++			parsed, err := decodeRoomContentRequest(body)
++			if err != nil || parsed.Scope != f.Request.Scope || parsed.Offer != f.Request.Offer {
++				t.Fatal("unbound native preparation", string(body), err)
++			}
++		case strings.HasPrefix(path, "/player/room_content/result?"):
++			endpoint = "result"
++		case path == "/player/room_content/commit":
++			endpoint = "commit"
++			f.Commits++
++			if f.FailCommit {
++				return nil, fmt.Errorf("lost commit reply")
++			}
++			phase = "complete"
++		case path == "/player/room_content/cancel":
++			endpoint = "cancel"
++			f.Cancels++
++			phase = "cancelled"
++		default:
++			t.Fatal("unexpected/fallback source path", method, path)
++		}
++		result := roomContentResult{Schema: "podconnect.native_room_content_" + endpoint + ".v1", Offer: f.Request.Offer.ID, Binding: f.Request.Offer.Binding, State: phase, Room: f.Request.Scope.Room, Homepod: f.Request.Scope.Homepod}
++		if phase == "complete" {
++			id, percent := result.Offer, 35
++			result.OK = true
++			result.Accepted = true
++			result.Operation = &id
++			result.Percent = &percent
++		}
++		return json.Marshal(result)
++	}
++	return f
++}
++
++func (f *contentOperationFixture) prepare(t *testing.T) *httptest.ResponseRecorder {
++	t.Helper()
++	raw, _ := json.Marshal(f.Request)
++	w := httptest.NewRecorder()
++	roomContentPrepareHandler(w, httptest.NewRequest("POST", "/api/room-content/prepare", bytes.NewReader(raw)))
++	return w
++}
++func (f *contentOperationFixture) operation(t *testing.T, endpoint string) *httptest.ResponseRecorder {
++	t.Helper()
++	w := httptest.NewRecorder()
++	if endpoint == "result" {
++		roomContentResultHandler(w, httptest.NewRequest("GET", "/api/room-content/result?offer_id="+f.Request.Offer.ID+"&binding_id="+f.Request.Offer.Binding, nil))
++		return w
++	}
++	raw, _ := json.Marshal(map[string]string{"offer_id": f.Request.Offer.ID, "binding_id": f.Request.Offer.Binding})
++	request := httptest.NewRequest("POST", "/api/room-content/"+endpoint, bytes.NewReader(raw))
++	if endpoint == "commit" {
++		roomContentCommitHandler(w, request)
++	} else {
++		roomContentCancelHandler(w, request)
++	}
++	return w
++}
++
++func TestContentStagingAndReadsNeverStartAndFinalCommitIsOneUse(t *testing.T) {
++	f := contentOperationSetup(t)
++	if w := f.prepare(t); w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	for i := 0; i < 3; i++ {
++		if w := f.operation(t, "result"); w.Code != 200 {
++			t.Fatal(w.Code)
++		}
++	}
++	if f.Commits != 0 {
++		t.Fatal("stage/read caused physical commit")
++	}
++	if w := f.operation(t, "commit"); w.Code != 409 {
++		t.Fatal("unstaged source admitted")
++	}
++	f.Stage = "staged"
++	f.operation(t, "result")
++	w := f.operation(t, "commit")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), `"accepted_selected_content":true`) || f.Commits != 1 {
++		t.Fatal(w.Code, w.Body.String(), f.Commits)
++	}
++	f.operation(t, "commit")
++	f.operation(t, "result")
++	f.prepare(t)
++	if f.Commits != 1 || f.Prepared != 1 {
++		t.Fatal("consumed request replayed", f.Commits, f.Prepared)
++	}
++}
++
++func TestContentCancelledOrReplacedDestinationCannotCommit(t *testing.T) {
++	t.Run("cancelled staged operation", func(t *testing.T) {
++		f := contentOperationSetup(t)
++		f.Stage = "staged"
++		f.prepare(t)
++		f.operation(t, "cancel")
++		w := f.operation(t, "commit")
++		if w.Code != 200 || f.Commits != 0 || !strings.Contains(w.Body.String(), `"state":"cancelled"`) {
++			t.Fatal(w.Code, w.Body.String(), f.Commits)
++		}
++	})
++	t.Run("held mapping replaced", func(t *testing.T) {
++		f := contentOperationSetup(t)
++		f.Stage = "staged"
++		f.prepare(t)
++		roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
++		w := f.operation(t, "commit")
++		if w.Code != 409 || f.Commits != 0 {
++			t.Fatal("stale destination sent", w.Code, f.Commits)
++		}
++	})
++	t.Run("same offer different content", func(t *testing.T) {
++		f := contentOperationSetup(t)
++		f.prepare(t)
++		f.Request.Args["track_uri"] = "spotify:track:abcdefghijklmnopqrstuv"
++		if w := f.prepare(t); w.Code != 409 || f.Prepared != 1 {
++			t.Fatal("offer reassigned to changed content", w.Code, f.Prepared)
++		}
++	})
++}
++
++func TestContentUnknownNeverUpgradesOrReplaysButCancellationStillReachesNative(t *testing.T) {
++	f := contentOperationSetup(t)
++	f.Stage = "staged"
++	f.prepare(t)
++	f.FailCommit = true
++	w := f.operation(t, "commit")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || f.Commits != 1 {
++		t.Fatal(w.Code, w.Body.String(), f.Commits)
++	}
++	f.FailCommit = false
++	f.Stage = "complete"
++	for _, endpoint := range []string{"result", "commit", "cancel", "result"} {
++		w = f.operation(t, endpoint)
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_selected_content":true`) {
++			t.Fatal("immutable unknown upgraded", endpoint, w.Code, w.Body.String())
++		}
++	}
++	if f.Commits != 1 || f.Cancels != 1 {
++		t.Fatal("uncertain effect replayed or cancel suppressed", f.Commits, f.Cancels)
++	}
++}
++
++func TestContentClosedRequestsRejectDuplicateNestedURIAndInvalidCeilings(t *testing.T) {
++	f := contentOperationSetup(t)
++	raw, _ := json.Marshal(f.Request)
++	for name, mutate := range map[string]func(string) string{
++		"duplicate URI": func(s string) string {
++			return strings.Replace(s, `"track_uri":`, `"track_uri":"spotify:track:abcdefghijklmnopqrstuv","track_uri":`, 1)
++		},
++		"bool ceiling":      func(s string) string { return strings.Replace(s, `"max_volume":35`, `"max_volume":true`, 1) },
++		"low ceiling":       func(s string) string { return strings.Replace(s, `"max_volume":35`, `"max_volume":34`, 1) },
++		"URI type mismatch": func(s string) string { return strings.Replace(s, "spotify:track:", "spotify:playlist:", 1) },
++		"authority flag":    func(s string) string { return s[:len(s)-1] + `,"authorized":true}` },
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := decodeRoomContentRequest([]byte(mutate(string(raw)))); err == nil {
++				t.Fatal("malformed/authority assertion accepted")
++			}
++		})
++	}
++}
++
++func TestContentCapacityRetainsDispatchedUnknownButReclaimsExpiredUndispatched(t *testing.T) {
++	f := contentOperationSetup(t)
++	roomContentStore.Lock()
++	for i := 0; i < 128; i++ {
++		id := fmt.Sprintf("%032x", i)
++		roomContentStore.Records[id] = &roomContentRecord{Dispatched: true, Created: time.Now().Add(-time.Hour), Result: roomContentResult{State: "unknown"}}
++	}
++	roomContentStore.Unlock()
++	if w := f.prepare(t); w.Code != 409 || f.Prepared != 0 {
++		t.Fatal("dispatched unknown evicted", w.Code, f.Prepared)
++	}
++	roomContentStore.Lock()
++	roomContentStore.Records[fmt.Sprintf("%032x", 0)].Dispatched = false
++	roomContentStore.Unlock()
++	if w := f.prepare(t); w.Code != 200 || f.Prepared != 1 {
++		t.Fatal("expired undispatched offer exhausted capacity", w.Code, w.Body.String(), f.Prepared)
++	}
++}
++
++func TestContentCannotCreditPhysicalCompletionFromStageOrUndispatchedStatus(t *testing.T) {
++	t.Run("prepare claims complete", func(t *testing.T) {
++		f := contentOperationSetup(t)
++		f.Stage = "complete"
++		w := f.prepare(t)
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_selected_content":true`) || f.Commits != 0 {
++			t.Fatal("prepare credited physical effect", w.Code, w.Body.String(), f.Commits)
++		}
++	})
++	t.Run("result claims complete before commit", func(t *testing.T) {
++		f := contentOperationSetup(t)
++		f.prepare(t)
++		f.Stage = "complete"
++		w := f.operation(t, "result")
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_selected_content":true`) || f.Commits != 0 {
++			t.Fatal("read credited undispatched physical effect", w.Code, w.Body.String(), f.Commits)
++		}
++	})
++}
+--- /dev/null
++++ b/podconnect/manager/room_content_test.go
+@@ -0,0 +1,105 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++)
++
++func contentStateFixture(t *testing.T) (*nativeRoomContentControls, *roomContentBinding) {
++	t.Helper()
++	primary, runtime, rooms, scope := contentBindingFixture(t)
++	binding, ok := roomContentBindingFor(primary, runtime, rooms, scope)
++	if !ok {
++		t.Fatal("binding unavailable")
++	}
++	state := &nativeRoomContentControls{
++		Schema: "podconnect.native_room_content_controls.v1", Ready: true, Scope: scope,
++		Actions:  []string{"play_track", "play_context"},
++		Offer:    roomContentOffer{"podconnect.room_content_offer.v1", strings.Repeat("b", 32), strings.Repeat("c", 64), strings.Repeat("d", 32), roomContentPolicy, 35, 5000},
++		Registry: binding.Registry, InputDigest: binding.PipeDigest, OutputURL: binding.OutputURL,
++	}
++	oldBinding, oldRPC := roomContentBindingNow, roomContentRPC
++	t.Cleanup(func() { roomContentBindingNow, roomContentRPC = oldBinding, oldRPC })
++	roomContentBindingNow = func(s roomTransportScope) (roomContentBinding, bool) { return binding, s == scope }
++	roomContentRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		if base != binding.NativeURL || method != http.MethodGet || !strings.HasPrefix(path, "/player/room_content/controls?") || body != nil {
++			t.Fatalf("unexpected effect/client path %s %s %s", base, method, path)
++		}
++		return json.Marshal(state)
++	}
++	return state, &binding
++}
++
++func TestContentStateUsesActualIdleEngineDestinationWithoutProviderDeviceInference(t *testing.T) {
++	state, binding := contentStateFixture(t)
++	q := url.Values{"account_user_id": {binding.Scope.Account}, "target_id": {binding.Scope.Target}, "room_id": {binding.Scope.Room}, "homepod_id": {binding.Scope.Homepod}}
++	w := httptest.NewRecorder()
++	roomContentStateHandler(w, httptest.NewRequest("GET", "/api/room-content/state?"+q.Encode(), nil))
++	if w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	var got map[string]json.RawMessage
++	if json.Unmarshal(w.Body.Bytes(), &got) != nil || len(got) != 5 {
++		t.Fatal("public state shape", w.Body.String())
++	}
++	for _, private := range []string{"alias_registry", "input_path_digest", "own_tone_url", "session_id", "name", "volume_percent"} {
++		if _, ok := got[private]; ok {
++			t.Fatal("invented/private field exposed", private)
++		}
++	}
++	if !strings.Contains(w.Body.String(), state.Offer.ID) {
++		t.Fatal("actual native offer lost")
++	}
++}
++
++func TestContentStateRejectsMixedOwnerConfigurationAndUnavailableSchemas(t *testing.T) {
++	for name, mutate := range map[string]func(*nativeRoomContentControls){
++		"foreign account":   func(s *nativeRoomContentControls) { s.Scope.Account = "other" },
++		"other room":        func(s *nativeRoomContentControls) { s.Scope.Room = "r0" },
++		"stale registry":    func(s *nativeRoomContentControls) { s.Registry = strings.Repeat("e", 64) },
++		"foreign pipe":      func(s *nativeRoomContentControls) { s.InputDigest = strings.Repeat("e", 64) },
++		"different C owner": func(s *nativeRoomContentControls) { s.OutputURL = "http://127.0.0.1:3690" },
++		"old schema":        func(s *nativeRoomContentControls) { s.Schema = "podconnect.native_room_content_controls.v0" },
++		"wrong policy":      func(s *nativeRoomContentControls) { s.Offer.Policy = strings.Repeat("e", 64) },
++		"not ready":         func(s *nativeRoomContentControls) { s.Ready = false },
++		"duplicate actions": func(s *nativeRoomContentControls) { s.Actions = []string{"play_track", "play_track"} },
++		"other action":      func(s *nativeRoomContentControls) { s.Actions = []string{"resume"} },
++	} {
++		t.Run(name, func(t *testing.T) {
++			state, binding := contentStateFixture(t)
++			mutate(state)
++			if _, _, err := readRoomContent(context.Background(), binding.Scope); err == nil {
++				t.Fatal("mixed/unavailable native owner admitted")
++			}
++		})
++	}
++	t.Run("configuration changes while read awaits", func(t *testing.T) {
++		state, binding := contentStateFixture(t)
++		roomContentRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
++			roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
++			return json.Marshal(state)
++		}
++		if _, _, err := readRoomContent(context.Background(), binding.Scope); err == nil {
++			t.Fatal("replaced runtime/configuration admitted")
++		}
++	})
++	t.Run("closed native shape", func(t *testing.T) {
++		state, binding := contentStateFixture(t)
++		roomContentRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
++			raw, _ := json.Marshal(state)
++			return []byte(fmt.Sprintf("%s,\"authorized\":true}", raw[:len(raw)-1])), nil
++		}
++		if _, _, err := readRoomContent(context.Background(), binding.Scope); err == nil {
++			t.Fatal("extra asserted authority accepted")
++		}
++	})
++}

@@ -1,0 +1,989 @@
+diff --git a/podconnect/manager/main.go b/podconnect/manager/main.go
+--- a/podconnect/manager/main.go
++++ b/podconnect/manager/main.go
+@@ -1407,6 +1407,11 @@
+ 	http.HandleFunc("/api/room-content/result", roomContentResultHandler)
+ 	http.HandleFunc("/api/room-content/commit", roomContentCommitHandler)
+ 	http.HandleFunc("/api/room-content/cancel", roomContentCancelHandler)
++	http.HandleFunc("/api/room-move/state", roomMoveStateHandler)
++	http.HandleFunc("/api/room-move/prepare", roomMovePrepareHandler)
++	http.HandleFunc("/api/room-move/result", roomMoveResultHandler)
++	http.HandleFunc("/api/room-move/commit", roomMoveCommitHandler)
++	http.HandleFunc("/api/room-move/cancel", roomMoveCancelHandler)
+ 	http.HandleFunc("/api/queue-occurrences", queueReadHandler)
+ 	http.HandleFunc("/api/queue-occurrence", queueJumpHandler)
+ 	http.HandleFunc("/api/start-volume", startRequest)
+diff --git a/podconnect/manager/room_move.go b/podconnect/manager/room_move.go
+new file mode 100644
+--- /dev/null
++++ b/podconnect/manager/room_move.go
+@@ -0,0 +1,109 @@
++package main
++
++// Native owns all retained-session movement and the complete C-gate transaction.
++// Manager exposes only bound descriptors/results, never C tokens or a WebAPI
++// fallback. Effect handlers are registered only with the complete owner slice.
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/url"
++	"slices"
++	"time"
++)
++
++const roomMovePolicy = "a674d94e377e8ba2b51ca4ea5f541370bd9dd7f2ecc6fabb2cf3e2f50cbdb5b4"
++
++type roomMoveOffer struct {
++	Schema      string `json:"schema"`
++	ID          string `json:"offer_id"`
++	Binding     string `json:"binding_id"`
++	Incarnation string `json:"native_incarnation"`
++	Policy      string `json:"policy_revision"`
++	Percent     int    `json:"session_volume_percent"`
++	Expires     int    `json:"expires_after_ms"`
++}
++
++type nativeRoomMoveControls struct {
++	Schema      string                `json:"schema"`
++	Ready       bool                  `json:"ready"`
++	Scope       roomTransportScope    `json:"scope"`
++	Actions     []string              `json:"actions"`
++	Offer       roomMoveOffer         `json:"move_offer"`
++	Physical    bool                  `json:"physical_result_verified"`
++	Registry    string                `json:"alias_registry"`
++	InputDigest string                `json:"input_path_digest"`
++	OutputURL   string                `json:"own_tone_url"`
++	OldOwner    roomTransportIdentity `json:"old_native_owner"`
++}
++
++func validRoomMoveOffer(offer roomMoveOffer) bool {
++	return offer.Schema == "podconnect.room_output_move_offer.v1" && queueObservationPattern.MatchString(offer.ID) && transportDigest.MatchString(offer.Binding) && queueObservationPattern.MatchString(offer.Incarnation) && offer.Policy == roomMovePolicy && offer.Percent >= 0 && offer.Percent <= 100 && offer.Expires >= 1 && offer.Expires <= 5000
++}
++
++func validRoomMoveActions(actions []string) bool {
++	return slices.Equal(actions, []string{"move_existing_session"})
++}
++
++// Validate the actual OLD session against its own configured registry pair,
++// independently from the explicitly chosen destination. Configuration binds
++// provenance only; native remains the actual retained-source owner.
++func validRoomMoveOldOwner(binding roomContentBinding, owner roomTransportIdentity) bool {
++	oldScope := roomTransportScope{binding.Scope.Target, owner.Room, owner.Homepod, binding.Scope.Account}
++	if !validTransportIdentity(owner, oldScope) || owner.Registry != binding.Registry {
++		return false
++	}
++	oldBinding, ok := roomContentBindingNow(oldScope)
++	oldBinding.Scope = binding.Scope
++	return ok && oldBinding == binding
++}
++
++func readRoomMove(ctx context.Context, scope roomTransportScope) (roomContentBinding, nativeRoomMoveControls, error) {
++	var state nativeRoomMoveControls
++	binding, ok := roomContentBindingNow(scope)
++	if !ok {
++		return binding, state, fmt.Errorf("configured move destination unavailable")
++	}
++	q := url.Values{"account_user_id": {scope.Account}, "target_id": {scope.Target}, "room_id": {scope.Room}, "homepod_id": {scope.Homepod}}
++	started := time.Now()
++	raw, err := roomMoveRPC(ctx, binding.NativeURL, http.MethodGet, "/player/room_move/controls?"+q.Encode(), nil)
++	fields, shapeErr := contentFields(raw, "schema", "ready", "scope", "actions", "move_offer", "physical_result_verified", "alias_registry", "input_path_digest", "own_tone_url", "old_native_owner")
++	if err != nil || shapeErr != nil || decodeQueueManagerJSON(raw, &state) != nil || decodeQueueManagerJSON(fields["scope"], &state.Scope) != nil || decodeQueueManagerJSON(fields["move_offer"], &state.Offer) != nil || decodeQueueManagerJSON(fields["old_native_owner"], &state.OldOwner) != nil || !validRoomMoveOldOwner(binding, state.OldOwner) || state.Schema != "podconnect.native_room_move_controls.v1" || !state.Ready || state.Physical || state.Scope != scope || !validRoomMoveOffer(state.Offer) || !validRoomMoveActions(state.Actions) || state.Registry != binding.Registry || state.InputDigest != binding.PipeDigest || state.OutputURL != binding.OutputURL || !roomContentBindingCurrent(binding) {
++		return binding, state, fmt.Errorf("actual native move destination unavailable")
++	}
++	// Relative expiry can only shrink while traversing the manager. Native keeps
++	// the original absolute one-use offer deadline regardless of this descriptor.
++	remaining := state.Offer.Expires - int(time.Since(started).Milliseconds())
++	if remaining <= 0 {
++		return binding, state, fmt.Errorf("move offer expired")
++	}
++	state.Offer.Expires = remaining
++	return binding, state, nil
++}
++
++func roomMoveStateHandler(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		http.Error(w, "method", 405)
++		return
++	}
++	q := r.URL.Query()
++	scope := roomTransportScope{q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), q.Get("account_user_id")}
++	if len(q) != 4 || !validTransportScope(scope) {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	for _, values := range q {
++		if len(values) != 1 {
++			http.Error(w, "arguments", 400)
++			return
++		}
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
++	defer cancel()
++	_, state, err := readRoomMove(ctx, scope)
++	if err != nil {
++		http.Error(w, "move unavailable", 409)
++		return
++	}
++	writeJSON(w, map[string]any{"schema": "podconnect.room_move_state.v1", "ok": true, "move_offer": state.Offer, "actions": state.Actions, "physical_result_verified": false})
++}
+diff --git a/podconnect/manager/room_move_operation.go b/podconnect/manager/room_move_operation.go
+new file mode 100644
+--- /dev/null
++++ b/podconnect/manager/room_move_operation.go
+@@ -0,0 +1,280 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"slices"
++	"sync"
++	"time"
++)
++
++type roomMoveRequest struct {
++	Scope  roomTransportScope `json:"scope"`
++	Offer  roomMoveOffer      `json:"move_offer"`
++	Action string             `json:"action"`
++	Args   map[string]any     `json:"args"`
++}
++
++type roomMoveResult struct {
++	Schema    string  `json:"schema"`
++	OK        bool    `json:"ok"`
++	Offer     string  `json:"offer_id"`
++	Binding   string  `json:"binding_id"`
++	State     string  `json:"state"`
++	Accepted  bool    `json:"accepted_room_move"`
++	Operation *string `json:"move_operation_id"`
++	Percent   *int    `json:"session_volume_percent"`
++	Room      string  `json:"room_id"`
++	Homepod   string  `json:"homepod_id"`
++	Physical  bool    `json:"physical_result_verified"`
++}
++
++type roomMoveRecord struct {
++	Binding          roomContentBinding
++	Request          roomMoveRequest
++	Digest           string
++	Created          time.Time
++	Preparing        bool
++	Dispatched       bool
++	Cancelled        bool
++	Result           roomMoveResult
++	CancelDispatched bool
++	InFlight         int
++}
++
++var roomMoveStore = struct {
++	sync.Mutex
++	Records map[string]*roomMoveRecord
++}{Records: make(map[string]*roomMoveRecord)}
++
++var roomMoveRPC = doRoomContentRPC
++
++func decodeRoomMoveRequest(raw []byte) (roomMoveRequest, error) {
++	var request roomMoveRequest
++	fields, err := contentFields(raw, "scope", "move_offer", "action", "args")
++	if err != nil || decodeQueueManagerJSON(fields["scope"], &request.Scope) != nil || decodeQueueManagerJSON(fields["move_offer"], &request.Offer) != nil || json.Unmarshal(fields["action"], &request.Action) != nil || !validTransportScope(request.Scope) || !validRoomMoveOffer(request.Offer) || request.Action != "move_existing_session" {
++		return request, fmt.Errorf("invalid retained-session move request")
++	}
++	if _, err := contentFields(fields["args"]); err != nil {
++		return request, fmt.Errorf("empty move args required")
++	}
++	request.Args = map[string]any{}
++	return request, nil
++}
++
++func decodeRoomMoveResult(raw []byte, endpoint string, record *roomMoveRecord) (roomMoveResult, error) {
++	var result roomMoveResult
++	fields, err := contentFields(raw, "schema", "ok", "offer_id", "binding_id", "state", "accepted_room_move", "move_operation_id", "session_volume_percent", "room_id", "homepod_id", "physical_result_verified")
++	for key, value := range fields {
++		if key != "move_operation_id" && key != "session_volume_percent" && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++			return result, fmt.Errorf("null required result field")
++		}
++	}
++	if err != nil || json.Unmarshal(raw, &result) != nil || result.Schema != "podconnect.native_room_move_"+endpoint+".v1" || result.Offer != record.Request.Offer.ID || result.Binding != record.Request.Offer.Binding || result.Room != record.Request.Scope.Room || result.Homepod != record.Request.Scope.Homepod || result.Physical || !slices.Contains([]string{"staging", "staged", "committing", "complete", "rejected", "cancelled", "unknown"}, result.State) || result.OK != (result.State == "complete") || result.Accepted != result.OK || result.Operation != nil && *result.Operation != result.Offer || result.Percent != nil && *result.Percent != record.Request.Offer.Percent || result.OK && (result.Operation == nil || result.Percent == nil) {
++		return result, fmt.Errorf("invalid actual move result")
++	}
++	if endpoint == "prepare" && (result.State == "committing" || result.State == "complete") {
++		return result, fmt.Errorf("move phase without actual commit dispatch")
++	}
++	return result, nil
++}
++
++func terminalRoomMove(state string) bool {
++	return slices.Contains([]string{"complete", "rejected", "cancelled", "unknown"}, state)
++}
++func moveUnknown(record *roomMoveRecord) roomMoveResult {
++	return roomMoveResult{Offer: record.Request.Offer.ID, Binding: record.Request.Offer.Binding, State: "unknown", Room: record.Request.Scope.Room, Homepod: record.Request.Scope.Homepod}
++}
++func writeRoomMoveResult(w http.ResponseWriter, endpoint string, result roomMoveResult) {
++	result.Schema = "podconnect.room_move_" + endpoint + ".v1"
++	writeJSON(w, result)
++}
++func moveIDBody(r *http.Request) (string, string, error) {
++	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
++		return "", "", fmt.Errorf("method/arguments")
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 1025))
++	defer r.Body.Close()
++	fields, parseErr := contentFields(raw, "offer_id", "binding_id")
++	var offer, binding string
++	if err != nil || len(raw) > 1024 || parseErr != nil || json.Unmarshal(fields["offer_id"], &offer) != nil || json.Unmarshal(fields["binding_id"], &binding) != nil || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
++		return "", "", fmt.Errorf("invalid ids")
++	}
++	return offer, binding, nil
++}
++
++func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
++		http.Error(w, "method/arguments", 400)
++		return
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 8193))
++	r.Body.Close()
++	request, parseErr := decodeRoomMoveRequest(raw)
++	if err != nil || len(raw) > 8192 || parseErr != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	binding, ok := roomContentBindingNow(request.Scope)
++	if !ok {
++		http.Error(w, "destination unavailable", 409)
++		return
++	}
++	canonical, _ := json.Marshal(request)
++	digest := sha256.Sum256(canonical)
++	record := &roomMoveRecord{Binding: binding, Request: request, Digest: hex.EncodeToString(digest[:]), Created: time.Now(), Preparing: true, InFlight: 1}
++	record.Result = moveUnknown(record)
++	record.Result.State = "staging"
++	roomMoveStore.Lock()
++	if old := roomMoveStore.Records[request.Offer.ID]; old != nil {
++		matching := old.Digest == record.Digest && old.Binding == binding
++		result := old.Result
++		roomMoveStore.Unlock()
++		if !matching {
++			http.Error(w, "operation conflict", 409)
++			return
++		}
++		writeRoomMoveResult(w, "prepare", result)
++		return
++	}
++	// Expired undispatched offers have no future manager commit authority.
++	// Dispatched unknowns remain fenced; never evict them to make capacity.
++	if len(roomMoveStore.Records) >= 128 {
++		for id, old := range roomMoveStore.Records {
++			if old.InFlight == 0 && ((!old.Dispatched && time.Since(old.Created) > 35*time.Second) || slices.Contains([]string{"complete", "rejected", "cancelled"}, old.Result.State)) {
++				delete(roomMoveStore.Records, id)
++				break
++			}
++		}
++	}
++	if len(roomMoveStore.Records) >= 128 {
++		roomMoveStore.Unlock()
++		http.Error(w, "busy", 409)
++		return
++	}
++	roomMoveStore.Records[request.Offer.ID] = record
++	roomMoveStore.Unlock()
++	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
++	defer cancel()
++	nativeRaw, rpcErr := roomMoveRPC(ctx, binding.NativeURL, http.MethodPost, "/player/room_move/prepare", canonical)
++	result, resultErr := decodeRoomMoveResult(nativeRaw, "prepare", record)
++	roomMoveStore.Lock()
++	record.Preparing = false
++	record.InFlight--
++	if terminalRoomMove(record.Result.State) {
++		result = record.Result
++	} else if rpcErr != nil || resultErr != nil || record.Cancelled || !roomContentBindingCurrent(binding) {
++		record.Result = moveUnknown(record)
++	} else {
++		record.Result = result
++	}
++	result = record.Result
++	roomMoveStore.Unlock()
++	writeRoomMoveResult(w, "prepare", result)
++}
++
++func roomMoveResultHandler(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query()
++	offer, binding := q.Get("offer_id"), q.Get("binding_id")
++	if r.Method != http.MethodGet || len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomMoveOperation(w, r, "result", offer, binding)
++}
++func roomMoveCommitHandler(w http.ResponseWriter, r *http.Request) {
++	offer, binding, err := moveIDBody(r)
++	if err != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomMoveOperation(w, r, "commit", offer, binding)
++}
++func roomMoveCancelHandler(w http.ResponseWriter, r *http.Request) {
++	offer, binding, err := moveIDBody(r)
++	if err != nil {
++		http.Error(w, "arguments", 400)
++		return
++	}
++	roomMoveOperation(w, r, "cancel", offer, binding)
++}
++
++func roomMoveOperation(w http.ResponseWriter, r *http.Request, endpoint, offer, binding string) {
++	roomMoveStore.Lock()
++	record := roomMoveStore.Records[offer]
++	if record == nil || record.Request.Offer.Binding != binding {
++		roomMoveStore.Unlock()
++		http.Error(w, "unknown operation", 409)
++		return
++	}
++	if terminalRoomMove(record.Result.State) && !record.Preparing && (endpoint != "cancel" || record.Result.State != "unknown") {
++		result := record.Result
++		roomMoveStore.Unlock()
++		writeRoomMoveResult(w, endpoint, result)
++		return
++	}
++	if endpoint == "commit" {
++		if record.Preparing || record.Dispatched || record.Cancelled || record.Result.State != "staged" || !roomContentBindingCurrent(record.Binding) {
++			roomMoveStore.Unlock()
++			http.Error(w, "not staged/current", 409)
++			return
++		}
++		record.Dispatched = true
++		record.Result.State = "committing"
++	} else if endpoint == "cancel" {
++		record.Cancelled = true
++		if record.CancelDispatched {
++			result := record.Result
++			roomMoveStore.Unlock()
++			writeRoomMoveResult(w, endpoint, result)
++			return
++		}
++		record.CancelDispatched = true
++	}
++	if record.Preparing && endpoint == "result" {
++		result := record.Result
++		roomMoveStore.Unlock()
++		writeRoomMoveResult(w, endpoint, result)
++		return
++	}
++	nativeURL := record.Binding.NativeURL
++	record.InFlight++
++	roomMoveStore.Unlock()
++	limit := 16 * time.Second
++	if endpoint == "cancel" {
++		limit = time.Second
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), limit)
++	defer cancel()
++	method, path, body := http.MethodGet, "/player/room_move/result?"+url.Values{"offer_id": {offer}, "binding_id": {binding}}.Encode(), []byte(nil)
++	if endpoint != "result" {
++		method, path = http.MethodPost, "/player/room_move/"+endpoint
++		body, _ = json.Marshal(map[string]string{"offer_id": offer, "binding_id": binding})
++	}
++	raw, rpcErr := roomMoveRPC(ctx, nativeURL, method, path, body)
++	result, resultErr := decodeRoomMoveResult(raw, endpoint, record)
++	roomMoveStore.Lock()
++	record.InFlight--
++	if (result.State == "committing" || result.State == "complete") && !record.Dispatched {
++		resultErr = fmt.Errorf("move phase without actual commit dispatch")
++	}
++	// A terminal unknown never becomes a late success, even if another pending
++	// observation/cancel completes after it. Native independently retires effects.
++	if !terminalRoomMove(record.Result.State) {
++		if rpcErr != nil || resultErr != nil || !roomContentBindingCurrent(record.Binding) || record.Cancelled && result.State == "complete" {
++			record.Result = moveUnknown(record)
++		} else {
++			record.Result = result
++		}
++	}
++	result = record.Result
++	roomMoveStore.Unlock()
++	writeRoomMoveResult(w, endpoint, result)
++}
+diff --git a/podconnect/manager/room_move_test.go b/podconnect/manager/room_move_test.go
+new file mode 100644
+--- /dev/null
++++ b/podconnect/manager/room_move_test.go
+@@ -0,0 +1,112 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++)
++
++func moveStateFixture(t *testing.T) (*nativeRoomMoveControls, *roomContentBinding) {
++	t.Helper()
++	primary, runtime, rooms, scope := contentBindingFixture(t)
++	binding, ok := roomContentBindingFor(primary, runtime, rooms, scope)
++	if !ok {
++		t.Fatal("binding unavailable")
++	}
++	state := &nativeRoomMoveControls{
++		Schema: "podconnect.native_room_move_controls.v1", Ready: true, Scope: scope,
++		Actions:  []string{"move_existing_session"},
++		Offer:    roomMoveOffer{"podconnect.room_output_move_offer.v1", strings.Repeat("b", 32), strings.Repeat("c", 64), strings.Repeat("d", 32), roomMovePolicy, 27, 5000},
++		Registry: binding.Registry, InputDigest: binding.PipeDigest, OutputURL: binding.OutputURL,
++		OldOwner: roomTransportIdentity{Account: scope.Account, Target: scope.Target, Room: "r0", Homepod: "42", Connection: "actual-connection", Session: "same-session", Incarnation: "actual-alias", Registry: binding.Registry, Revision: 2},
++	}
++	oldBinding, oldRPC := roomContentBindingNow, roomMoveRPC
++	t.Cleanup(func() { roomContentBindingNow, roomMoveRPC = oldBinding, oldRPC })
++	roomContentBindingNow = func(s roomTransportScope) (roomContentBinding, bool) {
++		b := binding
++		b.Scope = s
++		return b, s == scope || s == (roomTransportScope{scope.Target, "r0", "42", scope.Account})
++	}
++	roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		if base != binding.NativeURL || method != http.MethodGet || !strings.HasPrefix(path, "/player/room_move/controls?") || body != nil {
++			t.Fatalf("unexpected effect/client path %s %s %s", base, method, path)
++		}
++		return json.Marshal(state)
++	}
++	return state, &binding
++}
++
++func TestMoveStateUsesActualOldSessionSeparateFromDestination(t *testing.T) {
++	state, binding := moveStateFixture(t)
++	q := url.Values{"account_user_id": {binding.Scope.Account}, "target_id": {binding.Scope.Target}, "room_id": {binding.Scope.Room}, "homepod_id": {binding.Scope.Homepod}}
++	w := httptest.NewRecorder()
++	roomMoveStateHandler(w, httptest.NewRequest("GET", "/api/room-content/state?"+q.Encode(), nil))
++	if w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	var got map[string]json.RawMessage
++	if json.Unmarshal(w.Body.Bytes(), &got) != nil || len(got) != 5 {
++		t.Fatal("public state shape", w.Body.String())
++	}
++	for _, private := range []string{"alias_registry", "input_path_digest", "own_tone_url", "session_id", "name", "volume_percent"} {
++		if _, ok := got[private]; ok {
++			t.Fatal("invented/private field exposed", private)
++		}
++	}
++	if !strings.Contains(w.Body.String(), state.Offer.ID) {
++		t.Fatal("actual native offer lost")
++	}
++}
++
++func TestMoveStateRejectsMixedOwnerConfigurationAndUnavailableSchemas(t *testing.T) {
++	for name, mutate := range map[string]func(*nativeRoomMoveControls){
++		"foreign account":   func(s *nativeRoomMoveControls) { s.Scope.Account = "other" },
++		"other room":        func(s *nativeRoomMoveControls) { s.Scope.Room = "r0" },
++		"stale registry":    func(s *nativeRoomMoveControls) { s.Registry = strings.Repeat("e", 64) },
++		"foreign pipe":      func(s *nativeRoomMoveControls) { s.InputDigest = strings.Repeat("e", 64) },
++		"different C owner": func(s *nativeRoomMoveControls) { s.OutputURL = "http://127.0.0.1:3690" },
++		"old schema":        func(s *nativeRoomMoveControls) { s.Schema = "podconnect.native_room_move_controls.v0" },
++		"wrong policy":      func(s *nativeRoomMoveControls) { s.Offer.Policy = strings.Repeat("e", 64) },
++		"not ready":         func(s *nativeRoomMoveControls) { s.Ready = false },
++		"duplicate actions": func(s *nativeRoomMoveControls) {
++			s.Actions = []string{"move_existing_session", "move_existing_session"}
++		},
++		"other action": func(s *nativeRoomMoveControls) { s.Actions = []string{"resume"} },
++	} {
++		t.Run(name, func(t *testing.T) {
++			state, binding := moveStateFixture(t)
++			mutate(state)
++			if _, _, err := readRoomMove(context.Background(), binding.Scope); err == nil {
++				t.Fatal("mixed/unavailable native owner admitted")
++			}
++		})
++	}
++	t.Run("configuration changes while read awaits", func(t *testing.T) {
++		state, binding := moveStateFixture(t)
++		roomMoveRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
++			roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
++			return json.Marshal(state)
++		}
++		if _, _, err := readRoomMove(context.Background(), binding.Scope); err == nil {
++			t.Fatal("replaced runtime/configuration admitted")
++		}
++	})
++	t.Run("closed native shape", func(t *testing.T) {
++		state, binding := moveStateFixture(t)
++		roomMoveRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
++			raw, _ := json.Marshal(state)
++			return []byte(fmt.Sprintf("%s,\"authorized\":true}", raw[:len(raw)-1])), nil
++		}
++		if _, _, err := readRoomMove(context.Background(), binding.Scope); err == nil {
++			t.Fatal("extra asserted authority accepted")
++		}
++	})
++}
+diff --git a/podconnect/manager/room_move_operation_test.go b/podconnect/manager/room_move_operation_test.go
+new file mode 100644
+--- /dev/null
++++ b/podconnect/manager/room_move_operation_test.go
+@@ -0,0 +1,251 @@
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++type moveOperationFixture struct {
++	Request    roomMoveRequest
++	Prepared   int
++	Commits    int
++	Cancels    int
++	Stage      string
++	FailCommit bool
++}
++
++func moveOperationSetup(t *testing.T) *moveOperationFixture {
++	t.Helper()
++	state, binding := moveStateFixture(t)
++	f := &moveOperationFixture{Request: roomMoveRequest{binding.Scope, state.Offer, "move_existing_session", map[string]any{}}, Stage: "staging"}
++	roomMoveStore.Lock()
++	roomMoveStore.Records = make(map[string]*roomMoveRecord)
++	roomMoveStore.Unlock()
++	t.Cleanup(func() {
++		roomMoveStore.Lock()
++		roomMoveStore.Records = make(map[string]*roomMoveRecord)
++		roomMoveStore.Unlock()
++	})
++	roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		if base != binding.NativeURL {
++			t.Fatal("foreign native selected", base)
++		}
++		endpoint, phase := "", f.Stage
++		switch {
++		case path == "/player/room_move/prepare":
++			f.Prepared++
++			endpoint = "prepare"
++			if method != http.MethodPost {
++				t.Fatal("not POST")
++			}
++			parsed, err := decodeRoomMoveRequest(body)
++			if err != nil || parsed.Scope != f.Request.Scope || parsed.Offer != f.Request.Offer {
++				t.Fatal("unbound native preparation", string(body), err)
++			}
++		case strings.HasPrefix(path, "/player/room_move/result?"):
++			endpoint = "result"
++		case path == "/player/room_move/commit":
++			endpoint = "commit"
++			f.Commits++
++			if f.FailCommit {
++				return nil, fmt.Errorf("lost commit reply")
++			}
++			phase = "complete"
++		case path == "/player/room_move/cancel":
++			endpoint = "cancel"
++			f.Cancels++
++			phase = "cancelled"
++		default:
++			t.Fatal("unexpected/fallback source path", method, path)
++		}
++		result := roomMoveResult{Schema: "podconnect.native_room_move_" + endpoint + ".v1", Offer: f.Request.Offer.ID, Binding: f.Request.Offer.Binding, State: phase, Room: f.Request.Scope.Room, Homepod: f.Request.Scope.Homepod}
++		if phase == "complete" {
++			id, percent := result.Offer, f.Request.Offer.Percent
++			result.OK = true
++			result.Accepted = true
++			result.Operation = &id
++			result.Percent = &percent
++		}
++		return json.Marshal(result)
++	}
++	return f
++}
++
++func (f *moveOperationFixture) prepare(t *testing.T) *httptest.ResponseRecorder {
++	t.Helper()
++	raw, _ := json.Marshal(f.Request)
++	w := httptest.NewRecorder()
++	roomMovePrepareHandler(w, httptest.NewRequest("POST", "/api/room-move/prepare", bytes.NewReader(raw)))
++	return w
++}
++func (f *moveOperationFixture) operation(t *testing.T, endpoint string) *httptest.ResponseRecorder {
++	t.Helper()
++	w := httptest.NewRecorder()
++	if endpoint == "result" {
++		roomMoveResultHandler(w, httptest.NewRequest("GET", "/api/room-move/result?offer_id="+f.Request.Offer.ID+"&binding_id="+f.Request.Offer.Binding, nil))
++		return w
++	}
++	raw, _ := json.Marshal(map[string]string{"offer_id": f.Request.Offer.ID, "binding_id": f.Request.Offer.Binding})
++	request := httptest.NewRequest("POST", "/api/room-move/"+endpoint, bytes.NewReader(raw))
++	if endpoint == "commit" {
++		roomMoveCommitHandler(w, request)
++	} else {
++		roomMoveCancelHandler(w, request)
++	}
++	return w
++}
++
++func TestMoveStagingAndReadsNeverStartAndFinalCommitIsOneUse(t *testing.T) {
++	f := moveOperationSetup(t)
++	if w := f.prepare(t); w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++	for i := 0; i < 3; i++ {
++		if w := f.operation(t, "result"); w.Code != 200 {
++			t.Fatal(w.Code)
++		}
++	}
++	if f.Commits != 0 {
++		t.Fatal("stage/read caused physical commit")
++	}
++	if w := f.operation(t, "commit"); w.Code != 409 {
++		t.Fatal("unstaged source admitted")
++	}
++	f.Stage = "staged"
++	f.operation(t, "result")
++	w := f.operation(t, "commit")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), `"accepted_room_move":true`) || f.Commits != 1 {
++		t.Fatal(w.Code, w.Body.String(), f.Commits)
++	}
++	f.operation(t, "commit")
++	f.operation(t, "result")
++	f.prepare(t)
++	if f.Commits != 1 || f.Prepared != 1 {
++		t.Fatal("consumed request replayed", f.Commits, f.Prepared)
++	}
++}
++
++func TestMoveCancelledOrReplacedDestinationCannotCommit(t *testing.T) {
++	t.Run("cancelled staged operation", func(t *testing.T) {
++		f := moveOperationSetup(t)
++		f.Stage = "staged"
++		f.prepare(t)
++		f.operation(t, "cancel")
++		w := f.operation(t, "commit")
++		if w.Code != 200 || f.Commits != 0 || !strings.Contains(w.Body.String(), `"state":"cancelled"`) {
++			t.Fatal(w.Code, w.Body.String(), f.Commits)
++		}
++	})
++	t.Run("held mapping replaced", func(t *testing.T) {
++		f := moveOperationSetup(t)
++		f.Stage = "staged"
++		f.prepare(t)
++		roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
++		w := f.operation(t, "commit")
++		if w.Code != 409 || f.Commits != 0 {
++			t.Fatal("stale destination sent", w.Code, f.Commits)
++		}
++	})
++	t.Run("same offer different content", func(t *testing.T) {
++		f := moveOperationSetup(t)
++		f.prepare(t)
++		f.Request.Offer.Percent = 60
++		if w := f.prepare(t); w.Code != 409 || f.Prepared != 1 {
++			t.Fatal("offer reassigned to changed content", w.Code, f.Prepared)
++		}
++	})
++}
++
++func TestMoveUnknownNeverUpgradesOrReplaysButCancellationStillReachesNative(t *testing.T) {
++	f := moveOperationSetup(t)
++	f.Stage = "staged"
++	f.prepare(t)
++	f.FailCommit = true
++	w := f.operation(t, "commit")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || f.Commits != 1 {
++		t.Fatal(w.Code, w.Body.String(), f.Commits)
++	}
++	f.FailCommit = false
++	f.Stage = "complete"
++	for _, endpoint := range []string{"result", "commit", "cancel", "result"} {
++		w = f.operation(t, endpoint)
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_room_move":true`) {
++			t.Fatal("immutable unknown upgraded", endpoint, w.Code, w.Body.String())
++		}
++	}
++	if f.Commits != 1 || f.Cancels != 1 {
++		t.Fatal("uncertain effect replayed or cancel suppressed", f.Commits, f.Cancels)
++	}
++}
++
++func TestMoveClosedRequestsRejectCallerSourceVolumeAndAuthority(t *testing.T) {
++	f := moveOperationSetup(t)
++	raw, _ := json.Marshal(f.Request)
++	for name, mutate := range map[string]func(string) string{
++		"caller volume": func(s string) string { return strings.Replace(s, `"args":{}`, `"args":{"percent":35}`, 1) },
++		"caller content": func(s string) string {
++			return strings.Replace(s, `"args":{}`, `"args":{"track_uri":"spotify:track:1234567890123456789012"}`, 1)
++		},
++		"start action": func(s string) string { return strings.Replace(s, "move_existing_session", "play_track", 1) },
++		"null args":    func(s string) string { return strings.Replace(s, `"args":{}`, `"args":null`, 1) },
++		"duplicate offer": func(s string) string {
++			return strings.Replace(s, `"offer_id":`, `"offer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","offer_id":`, 1)
++		},
++		"authority flag": func(s string) string { return s[:len(s)-1] + `,"authorized":true}` },
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := decodeRoomMoveRequest([]byte(mutate(string(raw)))); err == nil {
++				t.Fatal("caller source/volume/authority admitted")
++			}
++		})
++	}
++}
++
++func TestMoveCapacityRetainsDispatchedUnknownButReclaimsExpiredUndispatched(t *testing.T) {
++	f := moveOperationSetup(t)
++	roomMoveStore.Lock()
++	for i := 0; i < 128; i++ {
++		id := fmt.Sprintf("%032x", i)
++		roomMoveStore.Records[id] = &roomMoveRecord{Dispatched: true, Created: time.Now().Add(-time.Hour), Result: roomMoveResult{State: "unknown"}}
++	}
++	roomMoveStore.Unlock()
++	if w := f.prepare(t); w.Code != 409 || f.Prepared != 0 {
++		t.Fatal("dispatched unknown evicted", w.Code, f.Prepared)
++	}
++	roomMoveStore.Lock()
++	roomMoveStore.Records[fmt.Sprintf("%032x", 0)].Dispatched = false
++	roomMoveStore.Unlock()
++	if w := f.prepare(t); w.Code != 200 || f.Prepared != 1 {
++		t.Fatal("expired undispatched offer exhausted capacity", w.Code, w.Body.String(), f.Prepared)
++	}
++}
++
++func TestMoveCannotCreditPhysicalCompletionFromStageOrUndispatchedStatus(t *testing.T) {
++	t.Run("prepare claims complete", func(t *testing.T) {
++		f := moveOperationSetup(t)
++		f.Stage = "complete"
++		w := f.prepare(t)
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_room_move":true`) || f.Commits != 0 {
++			t.Fatal("prepare credited physical effect", w.Code, w.Body.String(), f.Commits)
++		}
++	})
++	t.Run("result claims complete before commit", func(t *testing.T) {
++		f := moveOperationSetup(t)
++		f.prepare(t)
++		f.Stage = "complete"
++		w := f.operation(t, "result")
++		if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_room_move":true`) || f.Commits != 0 {
++			t.Fatal("read credited undispatched physical effect", w.Code, w.Body.String(), f.Commits)
++		}
++	})
++}
+diff --git a/podconnect/manager/room_move_guards_test.go b/podconnect/manager/room_move_guards_test.go
+new file mode 100644
+--- /dev/null
++++ b/podconnect/manager/room_move_guards_test.go
+@@ -0,0 +1,197 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestMoveActualOldOwnerRequiresItsOwnClosedConfiguredPair(t *testing.T) {
++	for name, mutate := range map[string]func(*nativeRoomMoveControls){
++		"missing session":    func(s *nativeRoomMoveControls) { s.OldOwner.Session = "" },
++		"wrong account":      func(s *nativeRoomMoveControls) { s.OldOwner.Account = "foreign" },
++		"wrong engine":       func(s *nativeRoomMoveControls) { s.OldOwner.Target = strings.Repeat("f", 40) },
++		"unknown old room":   func(s *nativeRoomMoveControls) { s.OldOwner.Room = "unknown" },
++		"wrong old HomePod":  func(s *nativeRoomMoveControls) { s.OldOwner.Homepod = "66" },
++		"stale old registry": func(s *nativeRoomMoveControls) { s.OldOwner.Registry = strings.Repeat("e", 64) },
++	} {
++		t.Run(name, func(t *testing.T) {
++			state, binding := moveStateFixture(t)
++			mutate(state)
++			if _, _, err := readRoomMove(context.Background(), binding.Scope); err == nil {
++				t.Fatal("foreign/missing actual old owner admitted")
++			}
++		})
++	}
++	for _, field := range []string{"null", "extra", "duplicate"} {
++		t.Run(field, func(t *testing.T) {
++			state, binding := moveStateFixture(t)
++			roomMoveRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
++				raw, _ := json.Marshal(state)
++				owner, _ := json.Marshal(state.OldOwner)
++				replacement := "null"
++				if field == "extra" {
++					replacement = string(owner[:len(owner)-1]) + `,"approved":true}`
++				} else if field == "duplicate" {
++					replacement = strings.Replace(string(owner), `"session_id":`, `"session_id":"invented","session_id":`, 1)
++				}
++				return []byte(strings.Replace(string(raw), string(owner), replacement, 1)), nil
++			}
++			if _, _, err := readRoomMove(context.Background(), binding.Scope); err == nil {
++				t.Fatal("nonclosed old session proof admitted")
++			}
++		})
++	}
++}
++
++func TestMoveOnlyBoundOldManualBaseCanCompleteIncludingZero(t *testing.T) {
++	for _, percent := range []int{0, 27, 100} {
++		t.Run(fmt.Sprint(percent), func(t *testing.T) {
++			f := moveOperationSetup(t)
++			f.Request.Offer.Percent = percent
++			f.Stage = "staged"
++			f.prepare(t)
++			w := f.operation(t, "commit")
++			var got roomMoveResult
++			if json.Unmarshal(w.Body.Bytes(), &got) != nil || !got.Accepted || got.Percent == nil || *got.Percent != percent {
++				t.Fatal("bound session base lost", w.Body.String())
++			}
++		})
++	}
++	for _, wrong := range []int{35, 60} {
++		t.Run(fmt.Sprintf("reject substitute %d", wrong), func(t *testing.T) {
++			f := moveOperationSetup(t)
++			f.Stage = "staged"
++			f.prepare(t)
++			original := roomMoveRPC
++			roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++				raw, err := original(ctx, base, method, path, body)
++				var got roomMoveResult
++				json.Unmarshal(raw, &got)
++				if got.State == "complete" {
++					got.Percent = &wrong
++					raw, _ = json.Marshal(got)
++				}
++				return raw, err
++			}
++			w := f.operation(t, "commit")
++			if !strings.Contains(w.Body.String(), `"state":"unknown"`) || strings.Contains(w.Body.String(), `"accepted_room_move":true`) {
++				t.Fatal("fresh35/target60 substituted for old27", w.Body.String())
++			}
++		})
++	}
++}
++
++func TestMoveOldRegistryRevocationBlocksAlreadyStagedCommit(t *testing.T) {
++	f := moveOperationSetup(t)
++	primary, runtime, rooms, scope := contentBindingFixture(t)
++	roomContentBindingNow = func(s roomTransportScope) (roomContentBinding, bool) {
++		return roomContentBindingFor(primary, runtime, rooms, s)
++	}
++	f.Request.Scope = scope
++	f.Stage = "staged"
++	f.prepare(t)
++	// Revoke the old route while preserving the selected destination. The
++	// complete registry digest must invalidate the already staged binding.
++	primary.HomepodID = "43"
++	w := f.operation(t, "commit")
++	if w.Code != 409 || f.Commits != 0 {
++		t.Fatal("old owner catalogue revocation dispatched", w.Code, f.Commits)
++	}
++}
++
++func TestMoveCapturedOwnerCancellationOnceWhilePrepareIsHeld(t *testing.T) {
++	f := moveOperationSetup(t)
++	entered, release := make(chan struct{}), make(chan struct{})
++	var cancels atomic.Int32
++	old := roomMoveRPC
++	roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		switch path {
++		case "/player/room_move/prepare":
++			close(entered)
++			<-release
++			result := roomMoveResult{Schema: "podconnect.native_room_move_prepare.v1", Offer: f.Request.Offer.ID, Binding: f.Request.Offer.Binding, State: "staged", Room: f.Request.Scope.Room, Homepod: f.Request.Scope.Homepod}
++			return json.Marshal(result)
++		case "/player/room_move/cancel":
++			cancels.Add(1)
++			deadline, ok := ctx.Deadline()
++			if !ok || time.Until(deadline) > time.Second {
++				t.Error("cancel exceeded captured-owner one-second wait")
++			}
++			result := roomMoveResult{Schema: "podconnect.native_room_move_cancel.v1", Offer: f.Request.Offer.ID, Binding: f.Request.Offer.Binding, State: "cancelled", Room: f.Request.Scope.Room, Homepod: f.Request.Scope.Homepod}
++			return json.Marshal(result)
++		default:
++			return old(ctx, base, method, path, body)
++		}
++	}
++	done := make(chan *httptest.ResponseRecorder, 1)
++	go func() { done <- f.prepare(t) }()
++	<-entered
++	// Actual configured owner can disappear after preparation begins. Cleanup
++	// must still go to its captured native client, never the replacement.
++	roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() { defer wg.Done(); f.operation(t, "cancel") }()
++	}
++	wg.Wait()
++	close(release)
++	w := <-done
++	if cancels.Load() != 1 || !strings.Contains(w.Body.String(), `"state":"unknown"`) || f.Commits != 0 {
++		t.Fatal("cancel replayed or late staged reply revived operation", cancels.Load(), w.Body.String())
++	}
++	for i := 0; i < 3; i++ {
++		f.operation(t, "cancel")
++	}
++	if cancels.Load() != 1 {
++		t.Fatal("cancel replayed after terminal result")
++	}
++}
++
++func TestMoveReadWaitBudgetDoesNotRenewOffer(t *testing.T) {
++	state, binding := moveStateFixture(t)
++	original := roomMoveRPC
++	roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		deadline, ok := ctx.Deadline()
++		if !ok || time.Until(deadline) > 8*time.Second || time.Until(deadline) < 7*time.Second {
++			t.Fatal("unexpected finite read ceiling")
++		}
++		return original(ctx, base, method, path, body)
++	}
++	q := url.Values{"account_user_id": {binding.Scope.Account}, "target_id": {binding.Scope.Target}, "room_id": {binding.Scope.Room}, "homepod_id": {binding.Scope.Homepod}}
++	w := httptest.NewRecorder()
++	roomMoveStateHandler(w, httptest.NewRequest(http.MethodGet, "/api/room-move/state?"+q.Encode(), nil))
++	if w.Code != 200 || state.Offer.Expires != 5000 {
++		t.Fatal("read renewed actual native offer", w.Code, state.Offer.Expires)
++	}
++}
++
++func TestMovePrepareAndCommitUseSeparateFiniteWaitCeilings(t *testing.T) {
++	f := moveOperationSetup(t)
++	f.Stage = "staged"
++	original := roomMoveRPC
++	roomMoveRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
++		ceiling := 8 * time.Second
++		if strings.HasSuffix(path, "/commit") {
++			ceiling = 16 * time.Second
++		}
++		deadline, ok := ctx.Deadline()
++		if !ok || time.Until(deadline) > ceiling || time.Until(deadline) < ceiling-time.Second {
++			t.Fatal("wrong communication ceiling", path)
++		}
++		return original(ctx, base, method, path, body)
++	}
++	f.prepare(t)
++	if w := f.operation(t, "commit"); w.Code != 200 {
++		t.Fatal(w.Code, w.Body.String())
++	}
++}

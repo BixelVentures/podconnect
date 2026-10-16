@@ -84,7 +84,9 @@ class SpeakersClient:
         if (
             not isinstance(binding, dict)
             or binding.get("ready") is not True
-            or not all(_text(binding.get(k)) for k in ("incarnation", "registry", "room_id"))
+            or not all(
+                _text(binding.get(k)) for k in ("incarnation", "registry", "room_id")
+            )
             or not isinstance(rows, list)
             or not rows
         ):
@@ -106,7 +108,9 @@ class SpeakersClient:
         if binding["room_id"] not in rooms:
             raise SpeakersError("Current alias missing from registry")
         return {
-            "binding": {k: binding[k] for k in ("ready", "incarnation", "registry", "room_id")},
+            "binding": {
+                k: binding[k] for k in ("ready", "incarnation", "registry", "room_id")
+            },
             "aliases": [{k: r[k] for k in ("id", "room_id", "name")} for r in rows],
         }
 
@@ -171,7 +175,9 @@ class SpeakersClient:
         """Read the native owner's exact engine, room, output and start policy."""
         if not _text(room_id) or not _text(target_id):
             raise SpeakersError("Invalid native start identity")
-        path = "/api/start-volume?" + urlencode({"room_id": room_id, "target_id": target_id})
+        path = "/api/start-volume?" + urlencode(
+            {"room_id": room_id, "target_id": target_id}
+        )
         proof = await self._request("GET", path)
         if not _start_proof(proof, room_id, target_id):
             raise SpeakersError("Native start owner unavailable")
@@ -179,7 +185,9 @@ class SpeakersClient:
 
     async def account_identity(self) -> dict:
         """One explicit bounded native diagnostic read; never forwards OAuth."""
-        return await self._request("GET", "/api/start-volume/identity?account=1", budget=5)
+        return await self._request(
+            "GET", "/api/start-volume/identity?account=1", budget=5
+        )
 
     async def start_identity(self) -> str:
         """The configured native Spotify ID, independent of a browser/device name."""
@@ -196,36 +204,60 @@ class SpeakersClient:
 
     async def prepare_start(self, proof: dict) -> dict:
         """Prime the exact output; the owner issues a short one-use lease."""
-        if not isinstance(proof, dict) or not _start_proof(proof, proof.get("room_id"), proof.get("engine_device_id")):
+        if not isinstance(proof, dict) or not _start_proof(
+            proof, proof.get("room_id"), proof.get("engine_device_id")
+        ):
             raise SpeakersError("Invalid native start proof")
-        reply = await self._request("POST", "/api/start-volume", {
-            "room_id": proof["room_id"],
-            "target_id": proof["engine_device_id"],
-            "policy_revision": proof["policy_revision"],
-            "alias_incarnation": proof["alias_binding"]["incarnation"],
-        }, budget=10)
+        reply = await self._request(
+            "POST",
+            "/api/start-volume",
+            {
+                "room_id": proof["room_id"],
+                "target_id": proof["engine_device_id"],
+                "policy_revision": proof["policy_revision"],
+                "alias_incarnation": proof["alias_binding"]["incarnation"],
+            },
+            budget=10,
+        )
         if (
             not isinstance(reply, dict)
             or reply.get("schema") != "podconnect.start_lease.v1"
             or not isinstance(reply.get("lease_id"), str)
             or len(reply["lease_id"]) != 32
             or reply.get("expires_in_ms") != 5000
-            or not _start_proof(reply.get("proof"), proof["room_id"], proof["engine_device_id"])
-            or any(reply["proof"].get(key) != proof.get(key) for key in (
-                "engine_device_id", "room_id", "homepod_id", "policy_revision", "start_volume_percent", "mode"
-            ))
-            or any(reply["proof"]["alias_binding"].get(key) != proof["alias_binding"].get(key)
-                   for key in ("incarnation", "registry"))
+            or not _start_proof(
+                reply.get("proof"), proof["room_id"], proof["engine_device_id"]
+            )
+            or any(
+                reply["proof"].get(key) != proof.get(key)
+                for key in (
+                    "engine_device_id",
+                    "room_id",
+                    "homepod_id",
+                    "policy_revision",
+                    "start_volume_percent",
+                    "mode",
+                )
+            )
+            or any(
+                reply["proof"]["alias_binding"].get(key)
+                != proof["alias_binding"].get(key)
+                for key in ("incarnation", "registry")
+            )
             or reply["proof"]["alias_binding"]["room_id"] != proof["room_id"]
         ):
             raise SpeakersError("Native start lease outcome unknown")
         return reply
 
-    async def commit_start(self, lease_id: str, policy_revision: str, max_volume: int | None = None) -> None:
+    async def commit_start(
+        self, lease_id: str, policy_revision: str, max_volume: int | None = None
+    ) -> None:
         """Consume readiness immediately before the one provider send."""
         if not isinstance(lease_id, str) or len(lease_id) != 32:
             raise SpeakersError("Invalid native start lease")
-        if max_volume is not None and (type(max_volume) is not int or not 0 <= max_volume <= 100):
+        if max_volume is not None and (
+            type(max_volume) is not int or not 0 <= max_volume <= 100
+        ):
             raise SpeakersError("Invalid approved volume limit")
         body = {"lease_id": lease_id}
         if max_volume is not None:
@@ -239,17 +271,178 @@ class SpeakersClient:
         ):
             raise SpeakersError("Native start lease outcome unknown")
 
+    async def room_content_state(self, scope):
+        return await self._request(
+            "GET", "/api/room-content/state?" + urlencode(scope), budget=9
+        )
+
+    async def prepare_room_content(self, scope, request):
+        return await self._request(
+            "POST",
+            "/api/room-content/prepare",
+            {
+                "scope": scope,
+                "start_offer": request["start_offer"],
+                "action": request["action"],
+                "args": request["args"],
+            },
+            budget=33,
+        )
+
+    async def room_content_result(self, offer_id, binding_id):
+        return await self._request(
+            "GET",
+            "/api/room-content/result?"
+            + urlencode({"offer_id": offer_id, "binding_id": binding_id}),
+            budget=17,
+        )
+
+    async def commit_room_content(self, offer_id, binding_id):
+        return await self._request(
+            "POST",
+            "/api/room-content/commit",
+            {"offer_id": offer_id, "binding_id": binding_id},
+            # Outer selected-content commit owns the16s bound; aiohttp total is16s.
+            budget=17,
+        )
+
+    async def cancel_room_content(self, offer_id, binding_id):
+        return await self._request(
+            "POST",
+            "/api/room-content/cancel",
+            {"offer_id": offer_id, "binding_id": binding_id},
+            budget=1,
+        )
+
+    async def room_move_state(self, scope):
+        return await self._request(
+            "GET", "/api/room-move/state?" + urlencode(scope), budget=9
+        )
+
+    async def prepare_room_move(self, scope, request):
+        return await self._request(
+            "POST",
+            "/api/room-move/prepare",
+            {
+                "scope": scope,
+                "move_offer": request["move_offer"],
+                "action": request["action"],
+                "args": request["args"],
+            },
+            budget=9,
+        )
+
+    async def room_move_result(self, offer_id, binding_id):
+        return await self._request(
+            "GET",
+            "/api/room-move/result?"
+            + urlencode({"offer_id": offer_id, "binding_id": binding_id}),
+            budget=17,
+        )
+
+    async def commit_room_move(self, offer_id, binding_id):
+        return await self._request(
+            "POST",
+            "/api/room-move/commit",
+            {"offer_id": offer_id, "binding_id": binding_id},
+            # Outer retained-session commit owns the16s bound; aiohttp total is16s.
+            budget=17,
+        )
+
+    async def cancel_room_move(self, offer_id, binding_id):
+        return await self._request(
+            "POST",
+            "/api/room-move/cancel",
+            {"offer_id": offer_id, "binding_id": binding_id},
+            budget=1,
+        )
+
+    async def room_volume_state(self, scope):
+        return await self._request(
+            "GET", "/api/room-volume/state?" + urlencode(scope), budget=2
+        )
+
+    async def prepare_room_volume(self, scope, context, percent):
+        return await self._request(
+            "POST",
+            "/api/room-volume/prepare",
+            {
+                "scope": scope,
+                "native": context["native"],
+                "route": context["route"],
+                "volume_state": context["volume_state"],
+                "action": "volume",
+                "volume_percent": percent,
+            },
+            budget=2,
+        )
+
+    async def commit_room_volume(self, prepare_id):
+        return await self._request(
+            "POST", "/api/room-volume/commit", {"prepare_id": prepare_id}, budget=4
+        )
+
+    async def cancel_room_volume(self, prepare_id):
+        return await self._request(
+            "POST", "/api/room-volume/cancel", {"prepare_id": prepare_id}, budget=1
+        )
+
+    async def room_volume_result(self, prepare_id):
+        return await self._request(
+            "GET",
+            "/api/room-volume/result?" + urlencode({"prepare_id": prepare_id}),
+            budget=2,
+        )
+
+    async def room_transport_state(self, scope):
+        """Read both native and exact OwnTone route capabilities; no legacy fallback."""
+        return await self._request(
+            "GET", "/api/room-transport/state?" + urlencode(scope)
+        )
+
+    async def prepare_room_transport(self, scope, native, route, action):
+        return await self._request(
+            "POST",
+            "/api/room-transport/prepare",
+            {
+                "scope": scope,
+                "native": native,
+                "route": route,
+                "action": action,
+                "volume_percent": 0,
+            },
+            budget=10,
+        )
+
+    async def commit_room_transport(self, prepare_id):
+        return await self._request(
+            "POST", "/api/room-transport/commit", {"prepare_id": prepare_id}, budget=7
+        )
 
     async def queue_occurrences(self, room_id, target_id, account_user_id):
-        query = urlencode({"room_id": room_id, "target_id": target_id, "account_user_id": account_user_id})
+        query = urlencode(
+            {
+                "room_id": room_id,
+                "target_id": target_id,
+                "account_user_id": account_user_id,
+            }
+        )
         return await self._request("GET", "/api/queue-occurrences?" + query, budget=13)
 
     async def play_queue_occurrence(self, target_id, account_user_id, args):
-        return await self._request("POST", "/api/queue-occurrence", {**args, "target_id": target_id, "account_user_id": account_user_id}, budget=7)
+        return await self._request(
+            "POST",
+            "/api/queue-occurrence",
+            {**args, "target_id": target_id, "account_user_id": account_user_id},
+            budget=7,
+        )
 
 
 def _start_proof(value, room_id, target_id) -> bool:
-    if not isinstance(value, dict) or value.get("schema") != "podconnect.start_volume.v1":
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "podconnect.start_volume.v1"
+    ):
         return False
     binding = value.get("alias_binding")
     return (
@@ -272,4 +465,3 @@ def _start_proof(value, room_id, target_id) -> bool:
         and (value["mode"] != "same_session" or binding["room_id"] == room_id)
         and all(_text(binding.get(key)) for key in ("incarnation", "registry"))
     )
-

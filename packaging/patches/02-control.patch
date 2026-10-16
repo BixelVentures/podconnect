@@ -1,0 +1,1446 @@
+--- a/custom_components/podconnect/room_transport.py
++++ b/custom_components/podconnect/room_transport.py
+@@ -0,0 +1,232 @@
++"""Exact-room native audio transport, within PlaybackCommands' sequence authority."""
++
++from __future__ import annotations
++
++import copy
++import re
++import time
++import uuid
++
++from .observations import current
++from .speakers import SpeakersError
++
++ACTIONS = ("pause", "resume", "next", "previous")
++_NATIVE = {
++    "account_user_id",
++    "target_id",
++    "room_id",
++    "homepod_id",
++    "connection_id",
++    "session_id",
++    "alias_incarnation",
++    "alias_registry",
++    "alias_revision",
++}
++_ROUTE = {
++    "process",
++    "device_id",
++    "device_incarnation",
++    "session_epoch",
++    "route_revision",
++    "selection_revision",
++    "input_generation",
++    "input_item_id",
++    "input_path_digest",
++}
++_TOKEN = re.compile(r"[a-f0-9]{32}")
++_DIGEST = re.compile(r"[a-f0-9]{64}")
++_DECIMAL = re.compile(r"0|[1-9][0-9]{0,19}")
++
++
++def _text(value):
++    return isinstance(value, str) and 1 <= len(value) <= 1024
++
++
++def valid_identity(native, route, scope):
++    if (
++        not isinstance(native, dict)
++        or set(native) != _NATIVE
++        or not isinstance(route, dict)
++        or set(route) != _ROUTE
++        or any(not _text(native[k]) for k in _NATIVE - {"alias_revision"})
++        or type(native["alias_revision"]) is not int
++        or not 0 <= native["alias_revision"] < 2**53
++        or any(native[k] != scope[k] for k in scope)
++        or route["device_id"] != scope["homepod_id"]
++        or not isinstance(route["input_path_digest"], str)
++        or _DIGEST.fullmatch(route["input_path_digest"]) is None
++    ):
++        return False
++    try:
++        if (
++            not isinstance(route["process"], str)
++            or str(uuid.UUID(route["process"])) != route["process"]
++        ):
++            return False
++    except (ValueError, AttributeError):
++        return False
++    return all(
++        isinstance(route[k], str)
++        and _DECIMAL.fullmatch(route[k]) is not None
++        and int(route[k]) < 2**64
++        for k in _ROUTE - {"process", "input_path_digest"}
++    )
++
++
++def valid_context(value):
++    return (
++        isinstance(value, dict)
++        and set(value) == {"room_id", "homepod_id", "native", "route"}
++        and _text(value["room_id"])
++        and _text(value["homepod_id"])
++    )
++
++
++def _snapshot(value, schema, extra, scope):
++    return (
++        isinstance(value, dict)
++        and set(value)
++        == {"schema", "ok", "native", "route", "physical_result_verified"} | extra
++        and value["schema"] == schema
++        and value["ok"] is True
++        and value["physical_result_verified"] is False
++        and valid_identity(value["native"], value["route"], scope)
++    )
++
++
++class RoomTransport:
++    """No replay cache, sequence, routing mutation, or generic provider fallback."""
++
++    def __init__(self, commands):
++        self.commands = commands
++
++    def scope(self, hass, entry, target, room, homepod):
++        from .commands import CommandRejected
++
++        current(hass, entry, self.commands.data)
++        config = hass.config_entries.async_get_entry(entry)
++        account = config.unique_id if config is not None else None
++        if not _text(account):
++            raise CommandRejected("native_account_unproven")
++        if self.commands.data.speakers is None:
++            raise CommandRejected("room_transport_unavailable")
++        return {
++            "account_user_id": account,
++            "target_id": target,
++            "room_id": room,
++            "homepod_id": homepod,
++        }
++
++    async def read(self, hass, entry, target, room, homepod):
++        from .commands import CommandRejected
++
++        scope = self.scope(hass, entry, target, room, homepod)
++        before = self.commands.controls(entry, target)
++        try:
++            state = await self.commands.data.speakers.room_transport_state(scope)
++        except SpeakersError as exc:
++            raise CommandRejected("room_transport_unavailable") from exc
++        if self.scope(hass, entry, target, room, homepod) != scope:
++            raise CommandRejected("native_account_unproven")
++        latest = self.commands.controls(entry, target)
++        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
++            raise CommandRejected("stale_observation")
++        if (
++            not _snapshot(
++                state, "podconnect.room_transport_state.v1", {"actions"}, scope
++            )
++            or not isinstance(state["actions"], list)
++            or not state["actions"]
++            or any(
++                not isinstance(action, str) or action not in ACTIONS
++                for action in state["actions"]
++            )
++            or len(state["actions"]) != len(set(state["actions"]))
++        ):
++            raise CommandRejected("room_transport_unavailable")
++        return {
++            **latest,
++            "schema": "podconnect.room_controls.v1",
++            "actions": [a for a in latest["actions"] if a in state["actions"]],
++            "native": copy.deepcopy(state["native"]),
++            "route": copy.deepcopy(state["route"]),
++            "room_id": room,
++            "homepod_id": homepod,
++            "track_play_supported": False,
++            "volume_percent": None,
++            "volume_supported": False,
++            "volume_unavailable_reason": "room_volume_not_supported",
++            "physical_result_verified": False,
++        }
++
++    async def commit(self, hass, entry, target, context, action, guard, sending):
++        from .commands import CommandRejected
++
++        if action not in ACTIONS or not valid_context(context):
++            raise CommandRejected("invalid_arguments")
++        scope = self.scope(
++            hass, entry, target, context["room_id"], context["homepod_id"]
++        )
++        if not valid_identity(context["native"], context["route"], scope):
++            raise CommandRejected("invalid_room_identity")
++        guard()
++        started = time.monotonic()
++        try:
++            prepared = await self.commands.data.speakers.prepare_room_transport(
++                scope, context["native"], context["route"], action
++            )
++        except SpeakersError as exc:
++            raise CommandRejected("room_transport_unavailable") from exc
++        if (
++            not _snapshot(
++                prepared,
++                "podconnect.room_transport_prepare.v1",
++                {"prepare_id", "expires_after_ms", "action", "volume_percent"},
++                scope,
++            )
++            or prepared["native"] != context["native"]
++            or prepared["route"] != context["route"]
++            or prepared["action"] != action
++            or type(prepared["volume_percent"]) is not int
++            or prepared["volume_percent"] != 0
++            or not isinstance(prepared["prepare_id"], str)
++            or _TOKEN.fullmatch(prepared["prepare_id"]) is None
++            or type(prepared["expires_after_ms"]) is not int
++            or not 1 <= prepared["expires_after_ms"] <= 5000
++        ):
++            raise CommandRejected("room_transport_unavailable")
++        # Last local owner/account/poll checks, after the awaited prepare, before
++        # the irreversible commit request. Native/C perform final mutator checks.
++        guard()
++        if (
++            self.scope(hass, entry, target, context["room_id"], context["homepod_id"])
++            != scope
++        ):
++            raise CommandRejected("native_account_unproven")
++        if time.monotonic() - started >= prepared["expires_after_ms"] / 1000:
++            raise CommandRejected("room_transport_expired")
++        sending()
++        ack = await self.commands.data.speakers.commit_room_transport(
++            prepared["prepare_id"]
++        )
++        if (
++            not isinstance(ack, dict)
++            or set(ack)
++            != {
++                "schema",
++                "ok",
++                "prepare_id",
++                "outcome",
++                "accepted_native",
++                "retry_allowed",
++                "physical_result_verified",
++            }
++            or ack["schema"] != "podconnect.room_transport_commit.v1"
++            or ack["ok"] is not True
++            or ack["prepare_id"] != prepared["prepare_id"]
++            or ack["outcome"] != "accepted"
++            or ack["accepted_native"] is not True
++            or ack["retry_allowed"] is not False
++            or ack["physical_result_verified"] is not False
++        ):
++            raise SpeakersError("Room transport outcome unknown")
+--- a/custom_components/podconnect/commands.py
++++ b/custom_components/podconnect/commands.py
+@@ -49,13 +49,21 @@
+ def _arguments(action, args):
+     if action == "play_queue_occurrence":
+         from .queue_controls import valid_arguments
++
+         if not valid_arguments(args):
+             raise CommandRejected("invalid_arguments")
+         return
+     if not isinstance(args, dict) or set(args) != (
+         {"percent"}
+         if action == "volume"
+-        else {"context_uri" if action == "play_context" else "track_uri", "max_volume", "room_id", "homepod_id", "start_policy_revision", "alias_incarnation"}
++        else {
++            "context_uri" if action == "play_context" else "track_uri",
++            "max_volume",
++            "room_id",
++            "homepod_id",
++            "start_policy_revision",
++            "alias_incarnation",
++        }
+         if action in {"play_track", "play_context"}
+         else set()
+     ):
+@@ -66,8 +74,16 @@
+         except vol.Invalid as exc:
+             raise CommandRejected("invalid_arguments") from exc
+     if action in {"play_track", "play_context"} and (
+-        not isinstance(args.get("context_uri" if action == "play_context" else "track_uri"), str)
+-        or re.fullmatch(r"spotify:playlist:[A-Za-z0-9]{22}" if action == "play_context" else r"spotify:track:[A-Za-z0-9]{22}", args["context_uri" if action == "play_context" else "track_uri"]) is None
++        not isinstance(
++            args.get("context_uri" if action == "play_context" else "track_uri"), str
++        )
++        or re.fullmatch(
++            r"spotify:playlist:[A-Za-z0-9]{22}"
++            if action == "play_context"
++            else r"spotify:track:[A-Za-z0-9]{22}",
++            args["context_uri" if action == "play_context" else "track_uri"],
++        )
++        is None
+     ):
+         raise CommandRejected("invalid_arguments")
+     if action in {"play_track", "play_context"}:
+@@ -75,10 +91,14 @@
+             _integer(args["max_volume"])
+         except vol.Invalid as exc:
+             raise CommandRejected("invalid_arguments") from exc
+-        if any(
+-            not isinstance(args[key], str) or not 1 <= len(args[key]) <= 128
+-            for key in ("room_id", "homepod_id", "alias_incarnation")
+-        ) or not isinstance(args["start_policy_revision"], str) or len(args["start_policy_revision"]) != 64:
++        if (
++            any(
++                not isinstance(args[key], str) or not 1 <= len(args[key]) <= 128
++                for key in ("room_id", "homepod_id", "alias_incarnation")
++            )
++            or not isinstance(args["start_policy_revision"], str)
++            or len(args["start_policy_revision"]) != 64
++        ):
+             raise CommandRejected("invalid_arguments")
+ 
+ 
+@@ -104,6 +124,9 @@
+         self.poll_floor = 0
+         self.command_sequence = 0
+         self.queue_controls = None
++        from .room_transport import RoomTransport
++
++        self.room_transport = RoomTransport(self)
+ 
+     def controls(self, entry_id, target_id, *, for_command=False):
+         data = self.data
+@@ -291,7 +314,11 @@
+             raise CommandRejected("stale_observation")
+         if proof["mode"] == "same_session":
+             playback = self.data.observations.playback(entry_id)
+-            target = playback.get("playback", {}).get("target") if playback.get("ok") else None
++            target = (
++                playback.get("playback", {}).get("target")
++                if playback.get("ok")
++                else None
++            )
+             if not isinstance(target, dict) or target.get("target_id") != target_id:
+                 raise CommandRejected("native_account_unproven")
+         result["native_start"] = proof
+@@ -299,11 +326,12 @@
+ 
+     async def queue_start_controls(self, hass, entry_id, target_id, room_id):
+         from .queue_controls import QueueControls
++
+         if self.queue_controls is None:
+             self.queue_controls = QueueControls(self)
+         return await self.queue_controls.read(hass, entry_id, target_id, room_id)
+ 
+-    async def execute(self, hass, request):
++    async def execute(self, hass, request, *, room_transport=None):
+         entry_id, target_id = request["config_entry_id"], request["target_id"]
+         epoch, sequence = request["owner_epoch"], request["expected_poll_sequence"]
+         request_id, action = request["request_id"], request["action"]
+@@ -323,6 +351,9 @@
+             "physical_result_verified": False,
+         }
+ 
++        if room_transport is not None:
++            receipt["accepted_native"] = False
++
+         def rejected(kind):
+             return {**receipt, "error_kind": kind}
+ 
+@@ -334,8 +365,31 @@
+             _arguments(action, request["args"])
+         except CommandRejected as exc:
+             return rejected(str(exc))
++        if room_transport is not None:
++            from .room_transport import ACTIONS, valid_context, valid_identity
++
++            if action not in ACTIONS or not valid_context(room_transport):
++                return rejected("invalid_arguments")
++            scope = {
++                "account_user_id": room_transport["native"].get("account_user_id")
++                if isinstance(room_transport["native"], dict)
++                else None,
++                "target_id": target_id,
++                "room_id": room_transport["room_id"],
++                "homepod_id": room_transport["homepod_id"],
++            }
++            if not valid_identity(
++                room_transport["native"], room_transport["route"], scope
++            ):
++                return rejected("invalid_room_identity")
+         fingerprint = hashlib.sha256(
+-            json.dumps(request, sort_keys=True, allow_nan=False).encode()
++            json.dumps(
++                {"request": request, "room_transport": room_transport}
++                if room_transport is not None
++                else request,
++                sort_keys=True,
++                allow_nan=False,
++            ).encode()
+         ).hexdigest()
+         old = self.receipts.get(command_sequence)
+         if old:
+@@ -368,7 +422,13 @@
+                 # command's floor still prevents acting on pre-command observations.
+                 if sequence <= self.poll_floor:
+                     raise CommandRejected("awaiting_observation")
+-                if ("play_track" if action == "play_context" else "next" if action == "play_queue_occurrence" else action) not in observed["actions"]:
++                if (
++                    "play_track"
++                    if action == "play_context"
++                    else "next"
++                    if action == "play_queue_occurrence"
++                    else action
++                ) not in observed["actions"]:
+                     raise CommandRejected("unsupported_action")
+                 if (
+                     action in {"play_track", "play_context"}
+@@ -396,80 +456,132 @@
+             del self.receipts[next(iter(self.receipts))]
+         try:
+             guard()
+-            lease = None
+-            if action in {"play_track", "play_context"}:
+-                if self.data.speakers is None:
+-                    raise CommandRejected("native_start_unavailable")
+-                args = request["args"]
+-                try:
+-                    proof = await self.data.speakers.start_readiness(args["room_id"], target_id)
+-                except SpeakersError as exc:
+-                    raise CommandRejected("native_start_unavailable") from exc
+-                if (
+-                    proof["homepod_id"] != args["homepod_id"]
+-                    or proof["policy_revision"] != args["start_policy_revision"]
+-                    or proof["alias_binding"]["incarnation"] != args["alias_incarnation"]
+-                    or args["max_volume"] < proof["start_volume_percent"]
+-                    or (
+-                        proof["mode"] == "same_session"
+-                        and proof["output_volume_percent"] > args["max_volume"]
++            if room_transport is not None:
++                if action not in ("pause", "resume", "next", "previous"):
++                    raise CommandRejected("unsupported_action")
++                async with asyncio.timeout(18):
++                    await self.room_transport.commit(
++                        hass,
++                        entry_id,
++                        target_id,
++                        room_transport,
++                        action,
++                        guard,
++                        sending,
+                     )
++                receipt = {
++                    **receipt,
++                    "ok": True,
++                    "outcome": "accepted",
++                    "accepted_native": True,
++                }
++            else:
++                lease = None
++                if action in {"play_track", "play_context"}:
++                    if self.data.speakers is None:
++                        raise CommandRejected("native_start_unavailable")
++                    args = request["args"]
++                    try:
++                        proof = await self.data.speakers.start_readiness(
++                            args["room_id"], target_id
++                        )
++                    except SpeakersError as exc:
++                        raise CommandRejected("native_start_unavailable") from exc
++                    if (
++                        proof["homepod_id"] != args["homepod_id"]
++                        or proof["policy_revision"] != args["start_policy_revision"]
++                        or proof["alias_binding"]["incarnation"]
++                        != args["alias_incarnation"]
++                        or args["max_volume"] < proof["start_volume_percent"]
++                        or (
++                            proof["mode"] == "same_session"
++                            and proof["output_volume_percent"] > args["max_volume"]
++                        )
++                    ):
++                        raise CommandRejected("native_start_policy_changed")
++                    if proof["mode"] == "same_session":
++                        playback = self.data.observations.playback(entry_id)
++                        current_target = (
++                            playback.get("playback", {}).get("target")
++                            if playback.get("ok")
++                            else None
++                        )
++                        if (
++                            not isinstance(current_target, dict)
++                            or current_target.get("target_id") != target_id
++                        ):
++                            raise CommandRejected("native_account_unproven")
++                    guard()
++                    try:
++                        lease = await self.data.speakers.prepare_start(proof)
++                    except SpeakersError as exc:
++                        raise CommandRejected("native_start_unavailable") from exc
++
++                async def native_commit():
++                    guard()
++                    if lease is None:
++                        raise CommandRejected("native_start_unavailable")
++                    try:
++                        await self.data.speakers.commit_start(
++                            lease["lease_id"],
++                            lease["proof"]["policy_revision"],
++                            request["args"]["max_volume"],
++                        )
++                    except SpeakersError as exc:
++                        raise CommandRejected("native_start_unavailable") from exc
++
++                methods = {
++                    "pause": self.data.api.pause,
++                    "resume": self.data.api.play,
++                    "next": self.data.api.next,
++                    "previous": self.data.api.previous,
++                    "volume": self.data.api.set_volume,
++                    "play_track": self.data.api.play,
++                    "play_context": self.data.api.play,
++                }
++                kwargs = {"execution_guard": guard, "on_send": sending}
++                async with asyncio.timeout(
++                    14
++                    if action in {"play_track", "play_context"}
++                    else 8
++                    if action == "play_queue_occurrence"
++                    else COMMAND_TIMEOUT_S
+                 ):
+-                    raise CommandRejected("native_start_policy_changed")
+-                if proof["mode"] == "same_session":
+-                    playback = self.data.observations.playback(entry_id)
+-                    current_target = playback.get("playback", {}).get("target") if playback.get("ok") else None
+-                    if not isinstance(current_target, dict) or current_target.get("target_id") != target_id:
+-                        raise CommandRejected("native_account_unproven")
+-                guard()
+-                try:
+-                    lease = await self.data.speakers.prepare_start(proof)
+-                except SpeakersError as exc:
+-                    raise CommandRejected("native_start_unavailable") from exc
+-
+-            async def native_commit():
+-                guard()
+-                if lease is None:
+-                    raise CommandRejected("native_start_unavailable")
+-                try:
+-                    await self.data.speakers.commit_start(lease["lease_id"], lease["proof"]["policy_revision"], request["args"]["max_volume"])
+-                except SpeakersError as exc:
+-                    raise CommandRejected("native_start_unavailable") from exc
+-
+-            methods = {
+-                "pause": self.data.api.pause,
+-                "resume": self.data.api.play,
+-                "next": self.data.api.next,
+-                "previous": self.data.api.previous,
+-                "volume": self.data.api.set_volume,
+-                "play_track": self.data.api.play,
+-                "play_context": self.data.api.play,
+-            }
+-            kwargs = {"execution_guard": guard, "on_send": sending}
+-            async with asyncio.timeout(14 if action in {"play_track", "play_context"} else 8 if action == "play_queue_occurrence" else COMMAND_TIMEOUT_S):
+-                if action == "play_queue_occurrence":
+-                    if self.queue_controls is None:
+-                        raise CommandRejected("native_queue_stale")
+-                    await self.queue_controls.commit(hass, entry_id, target_id, request["args"], guard, sending)
+-                elif action in {"play_track", "play_context"}:
+-                    await methods[action](
+-                        target_id, **({"context_uri": request["args"]["context_uri"]} if action == "play_context" else {"uris": [request["args"]["track_uri"]]}),
+-                        async_execution_guard=native_commit, **kwargs
+-                    )
+-                elif action == "volume":
+-                    await methods[action](
+-                        request["args"]["percent"], target_id, **kwargs
+-                    )
+-                else:
+-                    await methods[action](target_id, **kwargs)
+-            receipt = {
+-                **receipt,
+-                "ok": True,
+-                "outcome": "accepted",
+-                "provider_request_accepted": True,
+-            }
++                    if action == "play_queue_occurrence":
++                        if self.queue_controls is None:
++                            raise CommandRejected("native_queue_stale")
++                        await self.queue_controls.commit(
++                            hass, entry_id, target_id, request["args"], guard, sending
++                        )
++                    elif action in {"play_track", "play_context"}:
++                        await methods[action](
++                            target_id,
++                            **(
++                                {"context_uri": request["args"]["context_uri"]}
++                                if action == "play_context"
++                                else {"uris": [request["args"]["track_uri"]]}
++                            ),
++                            async_execution_guard=native_commit,
++                            **kwargs,
++                        )
++                    elif action == "volume":
++                        await methods[action](
++                            request["args"]["percent"], target_id, **kwargs
++                        )
++                    else:
++                        await methods[action](target_id, **kwargs)
++                receipt = {
++                    **receipt,
++                    "ok": True,
++                    "outcome": "accepted",
++                    "provider_request_accepted": True,
++                }
+         except CommandRejected as exc:
+-            receipt = rejected(str(exc))
++            receipt = (
++                {**receipt, "outcome": "unknown", "error_kind": "outcome_unknown"}
++                if room_transport is not None and possible_send
++                else rejected(str(exc))
++            )
+         except asyncio.CancelledError:
+             receipt = {
+                 **receipt,
+@@ -515,7 +627,9 @@
+         entry_id = call.data["config_entry_id"]
+         data = current(hass, entry_id)
+         try:
+-            return await data.commands.track_start_controls(entry_id, call.data["target_id"], call.data["room_id"])
++            return await data.commands.track_start_controls(
++                entry_id, call.data["target_id"], call.data["room_id"]
++            )
+         except CommandRejected as exc:
+             return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+ 
+@@ -530,9 +644,33 @@
+         entry_id = call.data["config_entry_id"]
+         data = current(hass, entry_id)
+         try:
+-            return await data.commands.queue_start_controls(hass, entry_id, call.data["target_id"], call.data["room_id"])
++            return await data.commands.queue_start_controls(
++                hass, entry_id, call.data["target_id"], call.data["room_id"]
++            )
+         except CommandRejected as exc:
+             return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
++
++    async def room_controls(call):
++        entry_id = call.data["config_entry_id"]
++        data = current(hass, entry_id)
++        try:
++            return await data.commands.room_transport.read(
++                hass,
++                entry_id,
++                call.data["target_id"],
++                call.data["room_id"],
++                call.data["homepod_id"],
++            )
++        except CommandRejected as exc:
++            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
++
++    async def room_command(call):
++        data = current(hass, call.data["config_entry_id"])
++        request = dict(call.data)
++        context = {
++            k: request.pop(k) for k in ("room_id", "homepod_id", "native", "route")
++        }
++        return await data.commands.execute(hass, request, room_transport=context)
+ 
+     async def command(call):
+         data = current(hass, call.data["config_entry_id"])
+@@ -547,11 +685,41 @@
+         vol.Required("action"): vol.In(_COMMAND_ACTIONS),
+         vol.Required("args"): dict,
+     }
++    room_identity = {
++        **identity,
++        vol.Required("room_id"): target,
++        vol.Required("homepod_id"): target,
++    }
++    room_command_schema = {
++        **command_schema,
++        **room_identity,
++        vol.Required("action"): vol.In(("pause", "resume", "next", "previous")),
++        vol.Required("native"): dict,
++        vol.Required("route"): dict,
++    }
+     for name, handler, schema in (
+         ("get_playback_controls", controls, identity),
+-        ("get_track_play_controls", track_controls, {**identity, vol.Required("room_id"): target}),
+-        ("get_context_play_controls", context_controls, {**identity, vol.Required("room_id"): target}),
+-        ("get_queue_controls", queue_controls, {vol.Required("config_entry_id"): target, vol.Required("target_id"): target, vol.Required("room_id"): target}),
++        ("get_room_playback_controls", room_controls, room_identity),
++        ("control_room_playback", room_command, room_command_schema),
++        (
++            "get_track_play_controls",
++            track_controls,
++            {**identity, vol.Required("room_id"): target},
++        ),
++        (
++            "get_context_play_controls",
++            context_controls,
++            {**identity, vol.Required("room_id"): target},
++        ),
++        (
++            "get_queue_controls",
++            queue_controls,
++            {
++                vol.Required("config_entry_id"): target,
++                vol.Required("target_id"): target,
++                vol.Required("room_id"): target,
++            },
++        ),
+         ("control_playback", command, command_schema),
+     ):
+         if not hass.services.has_service(DOMAIN, name):
+--- a/custom_components/podconnect/speakers.py
++++ b/custom_components/podconnect/speakers.py
+@@ -84,7 +84,9 @@
+         if (
+             not isinstance(binding, dict)
+             or binding.get("ready") is not True
+-            or not all(_text(binding.get(k)) for k in ("incarnation", "registry", "room_id"))
++            or not all(
++                _text(binding.get(k)) for k in ("incarnation", "registry", "room_id")
++            )
+             or not isinstance(rows, list)
+             or not rows
+         ):
+@@ -106,7 +108,9 @@
+         if binding["room_id"] not in rooms:
+             raise SpeakersError("Current alias missing from registry")
+         return {
+-            "binding": {k: binding[k] for k in ("ready", "incarnation", "registry", "room_id")},
++            "binding": {
++                k: binding[k] for k in ("ready", "incarnation", "registry", "room_id")
++            },
+             "aliases": [{k: r[k] for k in ("id", "room_id", "name")} for r in rows],
+         }
+ 
+@@ -171,7 +175,9 @@
+         """Read the native owner's exact engine, room, output and start policy."""
+         if not _text(room_id) or not _text(target_id):
+             raise SpeakersError("Invalid native start identity")
+-        path = "/api/start-volume?" + urlencode({"room_id": room_id, "target_id": target_id})
++        path = "/api/start-volume?" + urlencode(
++            {"room_id": room_id, "target_id": target_id}
++        )
+         proof = await self._request("GET", path)
+         if not _start_proof(proof, room_id, target_id):
+             raise SpeakersError("Native start owner unavailable")
+@@ -179,7 +185,9 @@
+ 
+     async def account_identity(self) -> dict:
+         """One explicit bounded native diagnostic read; never forwards OAuth."""
+-        return await self._request("GET", "/api/start-volume/identity?account=1", budget=5)
++        return await self._request(
++            "GET", "/api/start-volume/identity?account=1", budget=5
++        )
+ 
+     async def start_identity(self) -> str:
+         """The configured native Spotify ID, independent of a browser/device name."""
+@@ -196,36 +204,60 @@
+ 
+     async def prepare_start(self, proof: dict) -> dict:
+         """Prime the exact output; the owner issues a short one-use lease."""
+-        if not isinstance(proof, dict) or not _start_proof(proof, proof.get("room_id"), proof.get("engine_device_id")):
++        if not isinstance(proof, dict) or not _start_proof(
++            proof, proof.get("room_id"), proof.get("engine_device_id")
++        ):
+             raise SpeakersError("Invalid native start proof")
+-        reply = await self._request("POST", "/api/start-volume", {
+-            "room_id": proof["room_id"],
+-            "target_id": proof["engine_device_id"],
+-            "policy_revision": proof["policy_revision"],
+-            "alias_incarnation": proof["alias_binding"]["incarnation"],
+-        }, budget=10)
++        reply = await self._request(
++            "POST",
++            "/api/start-volume",
++            {
++                "room_id": proof["room_id"],
++                "target_id": proof["engine_device_id"],
++                "policy_revision": proof["policy_revision"],
++                "alias_incarnation": proof["alias_binding"]["incarnation"],
++            },
++            budget=10,
++        )
+         if (
+             not isinstance(reply, dict)
+             or reply.get("schema") != "podconnect.start_lease.v1"
+             or not isinstance(reply.get("lease_id"), str)
+             or len(reply["lease_id"]) != 32
+             or reply.get("expires_in_ms") != 5000
+-            or not _start_proof(reply.get("proof"), proof["room_id"], proof["engine_device_id"])
+-            or any(reply["proof"].get(key) != proof.get(key) for key in (
+-                "engine_device_id", "room_id", "homepod_id", "policy_revision", "start_volume_percent", "mode"
+-            ))
+-            or any(reply["proof"]["alias_binding"].get(key) != proof["alias_binding"].get(key)
+-                   for key in ("incarnation", "registry"))
++            or not _start_proof(
++                reply.get("proof"), proof["room_id"], proof["engine_device_id"]
++            )
++            or any(
++                reply["proof"].get(key) != proof.get(key)
++                for key in (
++                    "engine_device_id",
++                    "room_id",
++                    "homepod_id",
++                    "policy_revision",
++                    "start_volume_percent",
++                    "mode",
++                )
++            )
++            or any(
++                reply["proof"]["alias_binding"].get(key)
++                != proof["alias_binding"].get(key)
++                for key in ("incarnation", "registry")
++            )
+             or reply["proof"]["alias_binding"]["room_id"] != proof["room_id"]
+         ):
+             raise SpeakersError("Native start lease outcome unknown")
+         return reply
+ 
+-    async def commit_start(self, lease_id: str, policy_revision: str, max_volume: int | None = None) -> None:
++    async def commit_start(
++        self, lease_id: str, policy_revision: str, max_volume: int | None = None
++    ) -> None:
+         """Consume readiness immediately before the one provider send."""
+         if not isinstance(lease_id, str) or len(lease_id) != 32:
+             raise SpeakersError("Invalid native start lease")
+-        if max_volume is not None and (type(max_volume) is not int or not 0 <= max_volume <= 100):
++        if max_volume is not None and (
++            type(max_volume) is not int or not 0 <= max_volume <= 100
++        ):
+             raise SpeakersError("Invalid approved volume limit")
+         body = {"lease_id": lease_id}
+         if max_volume is not None:
+@@ -239,17 +271,55 @@
+         ):
+             raise SpeakersError("Native start lease outcome unknown")
+ 
++    async def room_transport_state(self, scope):
++        """Read both native and exact OwnTone route capabilities; no legacy fallback."""
++        return await self._request(
++            "GET", "/api/room-transport/state?" + urlencode(scope)
++        )
++
++    async def prepare_room_transport(self, scope, native, route, action):
++        return await self._request(
++            "POST",
++            "/api/room-transport/prepare",
++            {
++                "scope": scope,
++                "native": native,
++                "route": route,
++                "action": action,
++                "volume_percent": 0,
++            },
++            budget=10,
++        )
++
++    async def commit_room_transport(self, prepare_id):
++        return await self._request(
++            "POST", "/api/room-transport/commit", {"prepare_id": prepare_id}, budget=7
++        )
+ 
+     async def queue_occurrences(self, room_id, target_id, account_user_id):
+-        query = urlencode({"room_id": room_id, "target_id": target_id, "account_user_id": account_user_id})
++        query = urlencode(
++            {
++                "room_id": room_id,
++                "target_id": target_id,
++                "account_user_id": account_user_id,
++            }
++        )
+         return await self._request("GET", "/api/queue-occurrences?" + query, budget=13)
+ 
+     async def play_queue_occurrence(self, target_id, account_user_id, args):
+-        return await self._request("POST", "/api/queue-occurrence", {**args, "target_id": target_id, "account_user_id": account_user_id}, budget=7)
++        return await self._request(
++            "POST",
++            "/api/queue-occurrence",
++            {**args, "target_id": target_id, "account_user_id": account_user_id},
++            budget=7,
++        )
+ 
+ 
+ def _start_proof(value, room_id, target_id) -> bool:
+-    if not isinstance(value, dict) or value.get("schema") != "podconnect.start_volume.v1":
++    if (
++        not isinstance(value, dict)
++        or value.get("schema") != "podconnect.start_volume.v1"
++    ):
+         return False
+     binding = value.get("alias_binding")
+     return (
+@@ -272,4 +342,3 @@
+         and (value["mode"] != "same_session" or binding["room_id"] == room_id)
+         and all(_text(binding.get(key)) for key in ("incarnation", "registry"))
+     )
+-
+--- a/custom_components/podconnect/services.yaml
++++ b/custom_components/podconnect/services.yaml
+@@ -349,3 +349,97 @@
+       required: true
+       selector:
+         text:
++
++get_room_playback_controls:
++  name: Read exact-room native audio controls
++  description: Same-session pause/resume/next/previous through native and OwnTone exact-room capabilities. No route selection, volume, generic fallback or physical proof.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++
++control_room_playback:
++  name: Control exact-room native audio
++  description: Echo the exact native and route identities from get_room_playback_controls. Uses the existing canonical account/owner/poll sequence and receipts. Unknown outcomes are consumed and must never be retried. Volume and new-session starts are unavailable; accepted_native is not provider or audible acceptance.
++  fields:
++    config_entry_id:
++      required: true
++      selector:
++        config_entry:
++          integration: podconnect
++    kind:
++      required: true
++      selector:
++        select:
++          options: [spotify_device]
++    target_id:
++      required: true
++      selector:
++        text:
++    room_id:
++      required: true
++      selector:
++        text:
++    homepod_id:
++      required: true
++      selector:
++        text:
++    native:
++      required: true
++      selector:
++        object:
++    route:
++      required: true
++      selector:
++        object:
++    owner_epoch:
++      required: true
++      selector:
++        text:
++    expected_poll_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    command_sequence:
++      required: true
++      selector:
++        number:
++          min: 1
++          max: 9007199254740991
++          mode: box
++    request_id:
++      required: true
++      selector:
++        text:
++    action:
++      required: true
++      selector:
++        select:
++          options: [pause, resume, next, previous]
++    args:
++      description: Must be an empty object for the four same-session audio actions.
++      required: true
++      selector:
++        object:
+--- a/tests/ha_framework/test_room_transport.py
++++ b/tests/ha_framework/test_room_transport.py
+@@ -0,0 +1,389 @@
++"""Actual HA services and HTTP with inert native/OwnTone manager fixtures only."""
++
++import asyncio
++import copy
++import unittest
++
++import voluptuous as vol
++from aiohttp import web
++from test_commands import CommandFrameworkTests
++
++
++class RoomTransportFrameworkTests(CommandFrameworkTests):
++    async def asyncSetUp(self):
++        self.room_posts = []
++        self.room_reads = []
++        self.room_hold = False
++        self.room_entered = asyncio.Event()
++        self.room_release = asyncio.Event()
++        self.room_commit_hold = False
++        self.room_commit_entered = asyncio.Event()
++        self.room_commit_release = asyncio.Event()
++        self.room_status = 200
++        self.room_corrupt = None
++        self.state_corrupt = None
++        self.prepare_corrupt = None
++        self.ttl = 5000
++        await super().asyncSetUp()
++        self.holds.extend((self.room_release, self.room_commit_release))
++
++    def native(self):
++        return {
++            "account_user_id": self.entries[0].unique_id,
++            "target_id": "spotify-one",
++            "room_id": "room-alpha",
++            "homepod_id": "123",
++            "connection_id": "connection-a",
++            "session_id": "session-a",
++            "alias_incarnation": "incarnation-a",
++            "alias_registry": "registry-a",
++            "alias_revision": 7,
++        }
++
++    def route(self):
++        return {
++            "process": "12345678-1234-4234-8234-123456789abc",
++            "device_id": "123",
++            "device_incarnation": "1",
++            "session_epoch": "2",
++            "route_revision": "3",
++            "selection_revision": "4",
++            "input_generation": "5",
++            "input_item_id": "6",
++            "input_path_digest": "b" * 64,
++        }
++
++    async def _backend(self, request):
++        if request.path == "/api/room-transport/state":
++            self.room_reads.append(dict(request.query))
++            value = {
++                "schema": "podconnect.room_transport_state.v1",
++                "ok": True,
++                "native": self.native(),
++                "route": self.route(),
++                "actions": ["pause", "resume", "next", "previous"],
++                "physical_result_verified": False,
++            }
++            if self.state_corrupt:
++                self.state_corrupt(value)
++            return web.json_response(value)
++        if request.path in {
++            "/api/room-transport/prepare",
++            "/api/room-transport/commit",
++        }:
++            body = await request.json()
++            self.room_posts.append((request.path, copy.deepcopy(body)))
++            if request.path.endswith("prepare"):
++                self.room_entered.set()
++                if self.room_hold:
++                    await self.room_release.wait()
++                if self.native_source_room != body["scope"]["room_id"]:
++                    return web.Response(status=409)
++                value = {
++                    "schema": "podconnect.room_transport_prepare.v1",
++                    "ok": True,
++                    "native": self.native(),
++                    "route": self.route(),
++                    "prepare_id": "a" * 32,
++                    "expires_after_ms": self.ttl,
++                    "action": body["action"],
++                    "volume_percent": 0,
++                    "physical_result_verified": False,
++                }
++                if self.prepare_corrupt:
++                    self.prepare_corrupt(value)
++                return web.json_response(value)
++            self.room_commit_entered.set()
++            if self.room_commit_hold:
++                await self.room_commit_release.wait()
++            if self.room_status != 200:
++                return web.Response(status=self.room_status)
++            value = {
++                "schema": "podconnect.room_transport_commit.v1",
++                "ok": True,
++                "prepare_id": "a" * 32,
++                "outcome": "accepted",
++                "accepted_native": True,
++                "retry_allowed": False,
++                "physical_result_verified": False,
++            }
++            if self.room_corrupt:
++                self.room_corrupt(value)
++            return web.json_response(value)
++        return await super()._backend(request)
++
++    async def room_offer(self, **overrides):
++        body = {
++            "config_entry_id": "account-alpha",
++            "kind": "spotify_device",
++            "target_id": "spotify-one",
++            "room_id": "room-alpha",
++            "homepod_id": "123",
++            **overrides,
++        }
++        return await self.hass.services.async_call(
++            "podconnect",
++            "get_room_playback_controls",
++            body,
++            blocking=True,
++            return_response=True,
++        )
++
++    def room_request(self, action="resume", **overrides):
++        return self.request(
++            action,
++            room_id="room-alpha",
++            homepod_id="123",
++            native=self.native(),
++            route=self.route(),
++            **overrides,
++        )
++
++    async def room_invoke(self, request):
++        return await self.hass.services.async_call(
++            "podconnect",
++            "control_room_playback",
++            request,
++            blocking=True,
++            return_response=True,
++        )
++
++    async def test_room_offer_and_four_actions_use_exact_manager_only(self):
++        offer = await self.room_offer()
++        self.assertEqual(offer["schema"], "podconnect.room_controls.v1")
++        self.assertFalse(offer["volume_supported"])
++        self.assertNotIn("volume", offer["actions"])
++        self.assertEqual(
++            self.room_reads[0],
++            {
++                k: self.native()[k]
++                for k in ("account_user_id", "target_id", "room_id", "homepod_id")
++            },
++        )
++        for action in ("resume", "pause", "next", "previous"):
++            self.playing = action != "resume"
++            await self.entries[0].runtime_data.coordinator.async_refresh()
++            request = self.room_request(action)
++            result = await self.room_invoke(request)
++            self.assertEqual(result["outcome"], "accepted")
++            self.assertTrue(result["accepted_native"])
++            self.assertFalse(result["provider_request_accepted"])
++            self.assertFalse(result["physical_result_verified"])
++            self.assertEqual(await self.room_invoke(request), result)
++        self.assertEqual(len(self.room_posts), 8)
++        self.assertEqual(
++            self.room_posts[0][1],
++            {
++                "scope": {
++                    k: self.native()[k]
++                    for k in ("account_user_id", "target_id", "room_id", "homepod_id")
++                },
++                "native": self.native(),
++                "route": self.route(),
++                "action": "resume",
++                "volume_percent": 0,
++            },
++        )
++        self.assertEqual(self.room_posts[1][1], {"prepare_id": "a" * 32})
++        self.assertEqual(self._writes(), [])
++        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
++
++    async def test_room_services_are_closed_and_volume_is_unavailable(self):
++        for body in (
++            self.room_request("volume", args={"percent": 27}),
++            {**self.room_request(), "unexpected": True},
++            {k: v for k, v in self.room_request().items() if k != "native"},
++        ):
++            with self.assertRaises(vol.Invalid):
++                await self.room_invoke(body)
++        with self.assertRaises(vol.Invalid):
++            await self.room_offer(unexpected=True)
++        self.assertEqual(self.room_posts, [])
++
++    async def test_room_prepare_poll_or_owner_replacement_denies_before_commit(self):
++        for replacement in ("poll", "owner", "account"):
++            self.room_posts.clear()
++            self.room_entered.clear()
++            self.room_release.clear()
++            self.room_hold = True
++            data = self.entries[0].runtime_data
++            data.coordinator.owner_epoch = data.commands.owner_epoch
++            await data.coordinator.async_refresh()
++            request = self.room_request()
++            task = self._task(self.room_invoke(request))
++            await asyncio.wait_for(self.room_entered.wait(), 2)
++            if replacement == "poll":
++                await data.coordinator.async_refresh()
++            elif replacement == "owner":
++                data.coordinator.owner_epoch = "replaced"
++            else:
++                self.hass.config_entries.async_update_entry(
++                    self.entries[0], unique_id="other-account"
++                )
++            self.room_release.set()
++            result = await task
++            self.assertEqual(result["outcome"], "rejected")
++            self.assertEqual(len(self.room_posts), 1)
++        self.assertEqual(self._writes(), [])
++
++    async def test_room_prepare_expired_in_transit_never_commits(self):
++        self.ttl = 1
++        self.room_hold = True
++        task = self._task(self.room_invoke(self.room_request()))
++        await asyncio.wait_for(self.room_entered.wait(), 2)
++        await asyncio.sleep(0.01)
++        self.room_release.set()
++        result = await task
++        self.assertEqual(result["error_kind"], "room_transport_expired")
++        self.assertEqual(len(self.room_posts), 1)
++        self.assertEqual(self._writes(), [])
++
++    async def test_room_cancellation_after_commit_keeps_unknown_receipt(self):
++        self.room_commit_hold = True
++        request = self.room_request()
++        task = self._task(self.room_invoke(request))
++        await asyncio.wait_for(self.room_commit_entered.wait(), 2)
++        task.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await task
++        result = await self.room_invoke(request)
++        self.assertEqual(result["outcome"], "unknown")
++        self.assertFalse(result["retry_allowed"])
++        self.room_commit_release.set()
++        self.assertEqual(len(self.room_posts), 2)
++        self.assertEqual(self._writes(), [])
++
++    async def test_room_same_engine_alias_change_during_prepare_never_sends(self):
++        data = self.entries[0].runtime_data
++        offer = await self.room_offer()
++        self.assertTrue(offer["ok"])
++        request = self.room_request()
++        original = (
++            data.coordinator.owner_epoch,
++            data.coordinator.poll_sequence,
++            self.entries[0].unique_id,
++        )
++        self.room_hold = True
++        task = self._task(self.room_invoke(request))
++        await asyncio.wait_for(self.room_entered.wait(), 2)
++        self.native_source_room = "room-beta"
++        self.assertEqual(
++            (
++                data.coordinator.owner_epoch,
++                data.coordinator.poll_sequence,
++                self.entries[0].unique_id,
++            ),
++            original,
++        )
++        self.room_release.set()
++        result = await task
++        self.assertEqual(result["outcome"], "rejected")
++        self.assertEqual(result["error_kind"], "room_transport_unavailable")
++        self.assertEqual(len(self.room_posts), 1)
++        self.assertEqual(self._writes(), [])
++        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
++
++    async def test_room_response_only_http_service_descriptors_match_callers(self):
++        response = await self.client.get("/api/services")
++        services = next(
++            row["services"]
++            for row in await response.json()
++            if row["domain"] == "podconnect"
++        )
++        self.assertEqual(
++            services["control_room_playback"]["response"], {"optional": False}
++        )
++        self.assertEqual(
++            set(services["control_room_playback"]["fields"]), set(self.room_request())
++        )
++        self.assertEqual(
++            services["get_room_playback_controls"]["response"], {"optional": False}
++        )
++        self.assertEqual(
++            set(services["get_room_playback_controls"]["fields"]),
++            {"config_entry_id", "kind", "target_id", "room_id", "homepod_id"},
++        )
++        status, _body = await self._service(
++            "control_room_playback", self.room_request(), response=False
++        )
++        self.assertNotEqual(status, 200)
++        self.assertEqual(self.room_posts, [])
++
++    async def test_room_mixed_or_malformed_state_is_unavailable(self):
++        cases = [
++            lambda v: v.update(extra=True),
++            lambda v: v["native"].update(alias_revision=True),
++            lambda v: v["native"].update(account_user_id="foreign"),
++            lambda v: v["route"].update(selection_revision="04"),
++            lambda v: v.update(actions=[{}]),
++            lambda v: v.update(actions=["volume"]),
++            lambda v: v["route"].update(device_id="456"),
++            lambda v: v["route"].update(input_path_digest="B" * 64),
++            lambda v: v["route"].pop("input_path_digest"),
++        ]
++        for corrupt in cases:
++            self.state_corrupt = corrupt
++            self.assertFalse((await self.room_offer())["ok"])
++        self.assertEqual(self.room_posts, [])
++
++    async def test_room_prepare_changed_identity_or_invalid_cutoff_never_commits(self):
++        for corrupt in (
++            lambda v: v["native"].update(alias_revision=8),
++            lambda v: v["route"].update(selection_revision="9"),
++            lambda v: v["route"].update(input_path_digest="c" * 64),
++            lambda v: v.update(expires_after_ms=5001),
++            lambda v: v.update(volume_percent=True),
++        ):
++            self.prepare_corrupt = corrupt
++            await self.entries[0].runtime_data.coordinator.async_refresh()
++            result = await self.room_invoke(self.room_request())
++            self.assertEqual(result["outcome"], "rejected")
++        self.assertEqual(len(self.room_posts), 5)
++        self.assertTrue(all(path.endswith("prepare") for path, _ in self.room_posts))
++
++    async def test_room_unknown_is_consumed_and_shared_with_legacy_sequence(self):
++        self.room_status = 502
++        request = self.room_request()
++        result = await self.room_invoke(request)
++        self.assertEqual(result["outcome"], "unknown")
++        self.assertFalse(result["retry_allowed"])
++        self.assertEqual(await self.room_invoke(request), result)
++        self.assertEqual(len(self.room_posts), 2)
++        self.assertEqual(
++            (
++                await self.invoke(
++                    self.request(command_sequence=request["command_sequence"])
++                )
++            )["error_kind"],
++            "request_reused",
++        )
++        data = self.entries[0].runtime_data
++        data.commands.receipts.clear()
++        self.assertEqual(
++            (await self.room_invoke(request))["error_kind"], "stale_command"
++        )
++        self.assertEqual(self._writes(), [])
++
++    async def test_room_invalid_ack_after_send_is_unknown_and_never_replayed(self):
++        for corrupt in (
++            lambda v: v.update(extra=True),
++            lambda v: v.update(accepted_native=False),
++            lambda v: v.update(physical_result_verified=True),
++            lambda v: v.update(ok=False, outcome="unknown"),
++        ):
++            self.room_corrupt = corrupt
++            await self.entries[0].runtime_data.coordinator.async_refresh()
++            request = self.room_request()
++            result = await self.room_invoke(request)
++            self.assertEqual(result["outcome"], "unknown")
++            self.assertEqual(await self.room_invoke(request), result)
++        self.assertEqual(len(self.room_posts), 8)
++        self.assertEqual(self._writes(), [])
++
++
++def load_tests(loader, tests, pattern):
++    return unittest.TestSuite(
++        RoomTransportFrameworkTests(name)
++        for name in loader.getTestCaseNames(RoomTransportFrameworkTests)
++        if name.startswith("test_room_")
++    )
+--- a/tests/diagnostics/room_alias_baseline_witness.py
++++ b/tests/diagnostics/room_alias_baseline_witness.py
+@@ -0,0 +1,77 @@
++"""Expected unsafe baseline witness, run explicitly against ORIGINAL Control 14.
++
++This preserves the generic service's semantics; it is not an acceptance test or
++proof of real speaker delivery. Only the fixture's inert Spotify endpoint sees a
++write. Execute with the original repository and HA framework fixture on PYTHONPATH.
++"""
++
++import asyncio
++import json
++import unittest
++from unittest.mock import patch
++
++from test_commands import CommandFrameworkTests
++
++
++class LegacyRoomAliasWitness(CommandFrameworkTests):
++    async def witness_same_engine_alias_change_is_not_a_generic_command_guard(self):
++        data = self.entries[0].runtime_data
++        original = data.session.async_ensure_token_valid
++        entered, release = asyncio.Event(), asyncio.Event()
++        self.holds.append(release)
++
++        async def held():
++            await original()
++            entered.set()
++            await release.wait()
++
++        request = self.request("resume")
++        epoch, poll, account = (
++            data.coordinator.owner_epoch,
++            data.coordinator.poll_sequence,
++            self.entries[0].unique_id,
++        )
++        with patch.object(data.session, "async_ensure_token_valid", held):
++            task = self._task(self.invoke(request))
++            await asyncio.wait_for(entered.wait(), 2)
++            self.native_source_room = "room-beta"
++            self.assertEqual(
++                (
++                    data.coordinator.owner_epoch,
++                    data.coordinator.poll_sequence,
++                    self.entries[0].unique_id,
++                ),
++                (epoch, poll, account),
++            )
++            release.set()
++            result = await task
++        self.assertEqual(result["outcome"], "accepted")
++        self.assertEqual(len(self._writes()), 1)
++        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
++        self.assertFalse(any(call[1].startswith("/api/") for call in self.calls))
++        print(
++            json.dumps(
++                {
++                    "witness": "expected_unsafe_legacy_room_alias_gap",
++                    "same_account_engine_owner_poll": True,
++                    "alias_changed": "room-alpha_to_room-beta",
++                    "legacy_outcome": result["outcome"],
++                    "inert_spotify_writes": len(self._writes()),
++                    "native_checks": 0,
++                    "physical_result_verified": False,
++                }
++            ),
++            flush=True,
++        )
++
++
++if __name__ == "__main__":
++    suite = unittest.TestSuite(
++        [
++            LegacyRoomAliasWitness(
++                "witness_same_engine_alias_change_is_not_a_generic_command_guard"
++            )
++        ]
++    )
++    result = unittest.TextTestRunner(verbosity=2).run(suite)
++    raise SystemExit(not result.wasSuccessful())

@@ -1,0 +1,1716 @@
+--- a/cmd/daemon/cli_config.go
++++ b/cmd/daemon/cli_config.go
+@@ -33,6 +33,8 @@
+ 	DeviceName                   string   `koanf:"device_name"`
+ 	DeviceAliases                []string `koanf:"device_aliases"`
+ 	DeviceAliasRoomIDs           []string `koanf:"device_alias_room_ids"`
++	DeviceAliasHomePodIDs        []string `koanf:"device_alias_homepod_ids"`
++	RoomTransportOwnToneURL      string   `koanf:"room_transport_owntone_url"`
+ 	DeviceAliasRoomIDsConfigured bool
+ 	DeviceType                   string `koanf:"device_type"`
+ 	ClientToken                  string `koanf:"client_token"`
+@@ -95,6 +97,8 @@
+ 		DeviceName:                   c.DeviceName,
+ 		DeviceAliases:                c.DeviceAliases,
+ 		DeviceAliasRoomIDs:           c.DeviceAliasRoomIDs,
++		DeviceAliasHomePodIDs:        c.DeviceAliasHomePodIDs,
++		RoomTransportOwnToneURL:      c.RoomTransportOwnToneURL,
+ 		DeviceAliasRoomIDsConfigured: c.DeviceAliasRoomIDsConfigured,
+ 		DeviceType:                   c.DeviceType,
+ 		ClientToken:                  c.ClientToken,
+--- a/output/driver-pipe.go
++++ b/output/driver-pipe.go
+@@ -1,6 +1,7 @@
+ package output
+ 
+ import (
++	"context"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -208,3 +209,16 @@
+ 
+ 	return nil
+ }
++
++// WithTransportLock is the actual paused-state mutation boundary. Acquiring the
++// existing lock may wait for a FIFO write; guard evaluation must follow it.
++func (out *pipeOutput) WithTransportLock(ctx context.Context, apply func(func(bool)) error) error {
++	if err := LockTransport(ctx, &out.lock); err != nil {
++		return err
++	}
++	defer out.lock.Unlock()
++	if out.closed {
++		return fmt.Errorf("pipe output closed")
++	}
++	return apply(func(paused bool) { out.paused = paused; out.cond.Signal() })
++}
+--- /dev/null
++++ b/output/room_transport_lock.go
+@@ -0,0 +1,33 @@
++package output
++
++import (
++	"context"
++	"sync"
++	"time"
++)
++
++// LockTransport is used only for bounded, explicitly requested transport. The
++// existing audio path retains its blocking lock behavior.
++func LockTransport(ctx context.Context, lock *sync.Mutex) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if lock.TryLock() {
++		return nil
++	}
++	tick := time.NewTicker(time.Millisecond)
++	defer tick.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-tick.C:
++			if lock.TryLock() {
++				return nil
++			}
++		}
++	}
++}
+--- /dev/null
++++ b/output/room_transport_test.go
+@@ -0,0 +1,78 @@
++package output
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestRoomTransportPipeGuardFollowsBlockingOutputLock(t *testing.T) {
++	out := &pipeOutput{paused: false}
++	out.cond = sync.NewCond(&out.lock)
++	out.lock.Lock()
++	ctx, cancel := context.WithCancel(context.Background())
++	started := make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		close(started)
++		done <- out.WithTransportLock(ctx, func(setPaused func(bool)) error {
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			setPaused(true)
++			return nil
++		})
++	}()
++	<-started
++	cancel() // causal invalidation while the actual output mutex is unavailable
++	out.lock.Unlock()
++	select {
++	case err := <-done:
++		if err != context.Canceled {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("guarded operation not joined")
++	}
++	if out.paused {
++		t.Fatal("late blocked output mutation executed")
++	}
++}
++func TestRoomTransportPipeGuardMutatesOnlyOnAdmission(t *testing.T) {
++	out := &pipeOutput{}
++	out.cond = sync.NewCond(&out.lock)
++	n := 0
++	err := out.WithTransportLock(context.Background(), func(setPaused func(bool)) error { n++; setPaused(true); return nil })
++	if err != nil || n != 1 || !out.paused {
++		t.Fatal("actual pipe mutation was not performed exactly once")
++	}
++	out.closed = true
++	if out.WithTransportLock(context.Background(), func(func(bool)) error { t.Fatal("closed output guard ran"); return nil }) == nil {
++		t.Fatal("closed output accepted")
++	}
++}
++
++func TestRoomTransportPipeHeldLockReturnsOnCancellation(t *testing.T) {
++	out := &pipeOutput{}
++	out.cond = sync.NewCond(&out.lock)
++	out.lock.Lock()
++	ctx, cancel := context.WithCancel(context.Background())
++	started := make(chan struct{})
++	done := make(chan error, 1)
++	go func() {
++		close(started)
++		done <- out.WithTransportLock(ctx, func(func(bool)) error { t.Error("held cancelled lock entered callback"); return nil })
++	}()
++	<-started
++	cancel()
++	select {
++	case err := <-done:
++		if err != context.Canceled {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("actor remained blocked on held output lock")
++	}
++	out.lock.Unlock()
++}
+--- a/output/output.go
++++ b/output/output.go
+@@ -1,6 +1,7 @@
+ package output
+ 
+ import (
++	"context"
+ 	"fmt"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+@@ -27,6 +28,14 @@
+ 
+ 	// Close closes the output.
+ 	Close() error
++}
++
++type TransportGuard func(func()) error
++
++// GuardedPipeOutput is deliberately implemented only by the pipe backend.
++// Its callback runs after the pipe lock; no delayed lock acquisition may bypass a guard.
++type GuardedPipeOutput interface {
++	WithTransportLock(context.Context, func(setPaused func(bool)) error) error
+ }
+ 
+ type NewOutputOptions struct {
+--- /dev/null
++++ b/tracks/room_transport_test.go
+@@ -0,0 +1,60 @@
++package tracks
++
++import (
++	"context"
++	librespot "github.com/devgianlu/go-librespot"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"reflect"
++	"testing"
++)
++
++func TestRoomTransportDetachedNextPreviousPreserveRetainedList(t *testing.T) {
++	rows := []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000001"}, {Uri: "spotify:track:0000000000000000000002"}, {Uri: "spotify:track:0000000000000000000003"}}
++	list, err := NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: rows}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = list.TrySeek(context.Background(), func(track *connectpb.ContextTrack) bool { return track.Uri == rows[1].Uri }); err != nil {
++		t.Fatal(err)
++	}
++	list.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"})
++	beforeTrack, beforeQueue, beforeRevision, beforePosition := list.CurrentTrack().Uri, append([]*connectpb.ContextTrack(nil), list.queue...), list.queueRevision, list.tracks.pos
++	for _, previous := range []bool{false, true} {
++		prepared, err := list.PrepareTransport(context.Background(), previous, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		expected := "spotify:track:0000000000000000000004"
++		if previous {
++			expected = rows[0].Uri
++		}
++		if prepared.CurrentTrack().Uri != expected {
++			t.Fatal("native occurrence order changed")
++		}
++		if list.CurrentTrack().Uri != beforeTrack || list.tracks.pos != beforePosition || list.queueRevision != beforeRevision || !reflect.DeepEqual(list.queue, beforeQueue) {
++			t.Fatal("preparation changed retained cursor/queue/revision")
++		}
++		if prepared == list || prepared.tracks == list.tracks {
++			t.Fatal("staged cursor shares mutable native list storage")
++		}
++	}
++}
++
++func TestRoomTransportPreviousRestartsCurrentWithoutMovingDetachedCursor(t *testing.T) {
++	rows := []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000001"}, {Uri: "spotify:track:0000000000000000000002"}}
++	list, err := NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: rows}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = list.TrySeek(context.Background(), func(track *connectpb.ContextTrack) bool { return track.Uri == rows[1].Uri }); err != nil {
++		t.Fatal(err)
++	}
++	restart, err := list.PrepareTransport(context.Background(), true, 3001)
++	if err != nil || restart.CurrentTrack().Uri != rows[1].Uri || list.CurrentTrack().Uri != rows[1].Uri {
++		t.Fatal("restart moved current native occurrence")
++	}
++	previous, err := list.PrepareTransport(context.Background(), true, 3000)
++	if err != nil || previous.CurrentTrack().Uri != rows[0].Uri || list.CurrentTrack().Uri != rows[1].Uri {
++		t.Fatal("prior-track staging changed retained cursor")
++	}
++}
+--- /dev/null
++++ b/tracks/room_transport.go
+@@ -0,0 +1,53 @@
++package tracks
++
++import (
++	"context"
++	"fmt"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"google.golang.org/protobuf/proto"
++	"slices"
++)
++
++// PrepareTransport stages a cursor on detached native list storage. It does not
++// mutate the retained cursor, manual queue, revision or shuffle order.
++func (tl *List) PrepareTransport(ctx context.Context, previous bool, positionMS int64) (*List, error) {
++	if tl == nil || tl.tracks == nil || tl.tracks.pos < 0 || tl.ctx == nil || tl.queueRevisionExhausted {
++		return nil, fmt.Errorf("native list unavailable")
++	}
++	clone := *tl
++	pages := *tl.tracks
++	pages.list = slices.Clone(tl.tracks.list)
++	for i := range pages.list {
++		if pages.list[i].item == nil {
++			return nil, fmt.Errorf("nil native track")
++		}
++		pages.list[i].item = proto.Clone(pages.list[i].item).(*connectpb.ContextTrack)
++	}
++	clone.tracks = &pages
++	clone.queue = make([]*connectpb.ContextTrack, len(tl.queue))
++	for i, track := range tl.queue {
++		if track == nil {
++			return nil, fmt.Errorf("nil queued track")
++		}
++		clone.queue[i] = proto.Clone(track).(*connectpb.ContextTrack)
++	}
++	if previous && positionMS > 3000 {
++		clone.invalidateQueueObservation()
++	} else if previous {
++		clone.GoPrev()
++	} else if !clone.GoNext(ctx) {
++		return nil, fmt.Errorf("no next native occurrence")
++	}
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	return &clone, nil
++}
++
++// TransportRevision is an actor-owned monotonic queue mutation fence.
++func (tl *List) TransportRevision() uint64 {
++	if tl == nil {
++		return 0
++	}
++	return tl.queueRevision
++}
+--- a/daemon/config.go
++++ b/daemon/config.go
+@@ -5,6 +5,8 @@
+ 	DeviceId                     string
+ 	DeviceName                   string
+ 	DeviceAliases                []string
++	DeviceAliasHomePodIDs        []string
++	RoomTransportOwnToneURL      string
+ 	DeviceAliasRoomIDs           []string
+ 	DeviceAliasRoomIDsConfigured bool
+ 	DeviceType                   string
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -106,6 +106,7 @@
+ }
+ 
+ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
++	p.invalidateRoomTransportGeneration()
+ 	// Limit ourselves to 30 seconds for handling player events
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+--- a/daemon/device_alias.go
++++ b/daemon/device_alias.go
+@@ -39,6 +39,9 @@
+ 		}
+ 		seen[id] = true
+ 		entries[i] = ApiAlias{ID: uint32(i + 1), RoomID: id, Name: names[i]}
++		if hp := p.app.cfg.DeviceAliasHomePodIDs; len(hp) == len(ids) {
++			entries[i].HomePodID = hp[i]
++		}
+ 	}
+ 	var nonce [16]byte
+ 	if _, err := rand.Read(nonce[:]); err != nil {
+@@ -118,6 +121,7 @@
+ 		p.aliasMu.Unlock()
+ 		return nil, ErrAliasConflict
+ 	}
++	p.advanceAliasRevisionLocked()
+ 	p.state.device.SelectedAliasId = id
+ 	binding := p.aliasBindingLocked()
+ 	p.aliasMu.Unlock()
+--- /dev/null
++++ b/daemon/room_transport_http.go
+@@ -0,0 +1,167 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++type roomTransportCommitRequest struct {
++	PrepareID    string `json:"prepare_id"`
++	OwnToneToken string `json:"own_tone_token"`
++}
++type roomTransportOutputACK struct {
++	Schema          string `json:"schema"`
++	OK              bool   `json:"ok"`
++	Token           string `json:"token"`
++	NativePrepareID string `json:"native_prepare_id"`
++	ArgsDigest      string `json:"args_digest"`
++	PinRemainingMS  int    `json:"pin_remaining_ms"`
++	Outcome         string `json:"outcome"`
++	Physical        bool   `json:"physical_result_verified"`
++}
++
++func (s *ConcreteApiServer) roomTransportAsk(ctx context.Context, typ ApiRequestType, data any) (any, error) {
++	req, wait := NewApiRequest(typ, data)
++	select {
++	case s.requests <- req:
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	return wait(ctx)
++}
++func roomTransportResponse(w http.ResponseWriter, data any, err error) {
++	if err != nil {
++		if errors.Is(err, ErrBadRequest) {
++			w.WriteHeader(400)
++		} else if errors.Is(err, ErrAliasConflict) || errors.Is(err, ErrNoSession) {
++			w.WriteHeader(409)
++		} else {
++			w.WriteHeader(504)
++		}
++		return
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	_ = json.NewEncoder(w).Encode(data)
++}
++func roomTransportBody(w http.ResponseWriter, r *http.Request, out any) bool {
++	if r.Method != http.MethodPost {
++		w.WriteHeader(405)
++		return false
++	}
++	if r.URL.RawQuery != "" {
++		w.WriteHeader(400)
++		return false
++	}
++	defer r.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 2049))
++	if err != nil || len(raw) > 2048 || decodeQueueJSON(raw, out) != nil {
++		w.WriteHeader(400)
++		return false
++	}
++	return true
++}
++func (s *ConcreteApiServer) handleRoomTransportState(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(405)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 4 {
++		w.WriteHeader(400)
++		return
++	}
++	for _, key := range []string{"account_user_id", "target_id", "room_id", "homepod_id"} {
++		if len(q[key]) != 1 || q.Get(key) == "" || len(q.Get(key)) > 160 {
++			w.WriteHeader(400)
++			return
++		}
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	data, err := s.roomTransportAsk(ctx, apiRoomTransportState, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	roomTransportResponse(w, data, err)
++}
++func (s *ConcreteApiServer) handleRoomTransportPrepare(w http.ResponseWriter, r *http.Request) {
++	var request roomTransportPrepareRequest
++	if !roomTransportBody(w, r, &request) {
++		return
++	}
++	if request.AccountUserID == "" || len(request.AccountUserID) > 160 || request.TargetID == "" || len(request.TargetID) > 160 || request.RoomID == "" || len(request.RoomID) > 128 || !homePodIDPattern.MatchString(request.HomePodID) || request.VolumePercent != 0 {
++		w.WriteHeader(400)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	request.Context = ctx
++	data, err := s.roomTransportAsk(ctx, apiRoomTransportPrepare, request)
++	roomTransportResponse(w, data, err)
++}
++func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *http.Request) {
++	var request roomTransportCommitRequest
++	if !roomTransportBody(w, r, &request) {
++		return
++	}
++	if !queueIDPattern.MatchString(request.PrepareID) || !queueIDPattern.MatchString(request.OwnToneToken) {
++		w.WriteHeader(400)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
++	defer cancel()
++	// First actor consumption occurs before the only OwnTone await. The actor is
++	// available to process retirement/alias/session updates during this HTTP call.
++	value, err := s.roomTransportAsk(ctx, apiRoomTransportConsume, roomTransportConsumeRequest{request.PrepareID, ctx})
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	offer, ok := value.(*nativeTransportOffer)
++	if !ok || offer == nil || ctx.Err() != nil || !time.Now().Before(offer.Expires) {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	defer func() {
++		cleanup, cancelCleanup := context.WithTimeout(context.Background(), time.Second)
++		defer cancelCleanup()
++		_, _ = s.roomTransportAsk(cleanup, apiRoomTransportAbort, offer)
++	}()
++	inputDigest := sha256.Sum256([]byte(offer.InputPath))
++	body, _ := json.Marshal(struct {
++		Token                   string `json:"token"`
++		NativePrepareID         string `json:"native_prepare_id"`
++		Action                  string `json:"action"`
++		ArgsDigest              string `json:"args_digest"`
++		ExpectedInputPathDigest string `json:"expected_input_path_digest"`
++	}{request.OwnToneToken, offer.Snapshot.PrepareID, offer.Snapshot.Action, offer.Snapshot.ArgsDigest, hex.EncodeToString(inputDigest[:])})
++	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/commit"
++	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	call.Header.Set("Content-Type", "application/json")
++	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("transport redirect denied") }}
++	response, err := client.Do(call)
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 2049))
++	_ = response.Body.Close()
++	var ack roomTransportOutputACK
++	if response.StatusCode != 200 || readErr != nil || len(raw) > 2048 || decodeQueueJSON(raw, &ack) != nil || ack.Schema != "podconnect.output_transport_commit.v1" || !ack.OK || ack.Token != request.OwnToneToken || ack.NativePrepareID != offer.Snapshot.PrepareID || ack.ArgsDigest != offer.Snapshot.ArgsDigest || ack.PinRemainingMS < 1 || ack.PinRemainingMS > 10000 || ack.Outcome != "accepted" || ack.Physical {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	// No public endpoint accepts this pointer. A real C ACK is required to enqueue.
++	data, err := s.roomTransportAsk(ctx, apiRoomTransportEffect, roomTransportEffectRequest{offer, ctx})
++	roomTransportResponse(w, data, err)
++}
+--- /dev/null
++++ b/daemon/room_transport_test.go
+@@ -0,0 +1,274 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/devgianlu/go-librespot/player"
++	"github.com/devgianlu/go-librespot/session"
++)
++
++// This fixture seeds an admitted local actor only. It is not a real authenticated
++// session or a claim that the production account admission getter was exercised.
++func roomTransportAdmittedFixture(t *testing.T) (*AppPlayer, *nativeTransportOffer) {
++	p, _ := localAliasPlayer(t)
++	p.app.deviceId = "engine"
++	p.app.cfg.DeviceAliasHomePodIDs = []string{"101", "202"}
++	p.app.cfg.RoomTransportOwnToneURL = "http://127.0.0.1:3689"
++	p.initAliasRegistry()
++	p.sess = &session.Session{}
++	p.player = &player.Player{}
++	p.primaryStream = &player.Stream{}
++	p.state.active = true
++	p.state.player.IsPlaying = true
++	p.state.player.SessionId = "session"
++	p.spotConnId = "connection"
++	p.app.cfg.AudioOutputPipe = "/tmp/native-fixture.pcm"
++	binding := p.aliasBinding()
++	offer := &nativeTransportOffer{OriginalPlayerState: p.state.player, Generation: p.roomTransportGeneration, QueueRevision: p.state.tracks.TransportRevision(), Snapshot: roomTransportSnapshot{roomTransportIdentity: roomTransportIdentity{"account", "engine", "r0", "101", "connection", "session", binding.Incarnation, binding.Registry, p.aliasRevision}, PrepareID: strings.Repeat("a", 32), Action: "pause", ArgsDigest: strings.Repeat("b", 64)}, Expires: time.Now().Add(5 * time.Second), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe}
++	p.roomTransportOffer = offer
++	return p, offer
++}
++func TestRoomTransportActualActorConsumptionRejectsABAAndRetirement(t *testing.T) {
++	for _, mutation := range []string{"alias-aba", "retire", "session", "connection", "actor", "mapping", "pipe", "expiry", "cancel"} {
++		t.Run(mutation, func(t *testing.T) {
++			p, offer := roomTransportAdmittedFixture(t)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch mutation {
++			case "alias-aba":
++				for _, room := range []string{"r1", "r0"} {
++					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint}); err != nil {
++						t.Fatal(err)
++					}
++				}
++			case "retire":
++				p.retireAliases()
++			case "session":
++				p.state.player.SessionId = "new"
++			case "connection":
++				p.spotConnId = "new"
++			case "actor":
++				p.sess = &session.Session{}
++			case "mapping":
++				p.app.cfg.DeviceAliasHomePodIDs[0] = "303"
++			case "pipe":
++				p.app.cfg.AudioOutputPipe = "/tmp/other.pcm"
++			case "expiry":
++				offer.Expires = time.Now().Add(-time.Second)
++			case "cancel":
++				cancel()
++			}
++			_, err := p.handleApiRequest(context.Background(), ApiRequest{Type: apiRoomTransportConsume, Data: roomTransportConsumeRequest{offer.Snapshot.PrepareID, ctx}})
++			if err == nil || p.roomTransportOffer != nil || p.roomTransportPending != nil {
++				t.Fatal("stale owner admitted or exact attempted offer not consumed")
++			}
++		})
++	}
++}
++func TestRoomTransportFinalGuardRechecksInvalidationAfterConsumption(t *testing.T) {
++	p, offer := roomTransportAdmittedFixture(t)
++	value, err := p.handleApiRequest(context.Background(), ApiRequest{Type: apiRoomTransportConsume, Data: roomTransportConsumeRequest{offer.Snapshot.PrepareID, context.Background()}})
++	if err != nil || value != offer {
++		t.Fatal("valid actual actor consumption failed", err)
++	}
++	p.retireAliases()
++	p.aliasMu.Lock()
++	current := p.transportOfferCurrentLocked(offer, context.Background(), context.Background())
++	p.aliasMu.Unlock()
++	if current {
++		t.Fatal("post-consume retirement passed final actual mutation guard")
++	}
++	if _, err = p.consumeRoomTransport(context.Background(), roomTransportConsumeRequest{offer.Snapshot.PrepareID, context.Background()}); err == nil {
++		t.Fatal("consumed offer replayed")
++	}
++}
++func TestRoomTransportForeignTokenDoesNotConsumeNewOffer(t *testing.T) {
++	p, offer := roomTransportAdmittedFixture(t)
++	if _, err := p.consumeRoomTransport(context.Background(), roomTransportConsumeRequest{strings.Repeat("c", 32), context.Background()}); err == nil || p.roomTransportOffer != offer {
++		t.Fatal("foreign token erased active offer")
++	}
++}
++func TestRoomTransportMappingDigestLegacyAndUnsupportedPolicy(t *testing.T) {
++	p, _ := localAliasPlayer(t)
++	legacy := p.aliasFingerprint
++	p.app.cfg.DeviceAliasHomePodIDs = []string{"101", "202"}
++	p.initAliasRegistry()
++	if p.aliasFingerprint == legacy || p.aliasRegistry[0].HomePodID != "101" {
++		t.Fatal("physical configured mapping absent from immutable registry")
++	}
++	p.app.cfg.DeviceAliasHomePodIDs = nil
++	p.initAliasRegistry()
++	if p.aliasFingerprint != legacy {
++		t.Fatal("absent additive mapping changed legacy registry digest")
++	}
++	for _, action := range []string{"volume", "play_track", "play_context"} {
++		if _, err := p.prepareRoomTransport(context.Background(), roomTransportPrepareRequest{Action: action}); err != ErrBadRequest {
++			t.Fatal("unsupported physical action advertised", action)
++		}
++	}
++	if !reflect.DeepEqual(roomTransportActions, []string{"pause", "resume", "next", "previous"}) {
++		t.Fatal("unsupported action included")
++	}
++}
++func TestRoomTransportHTTPRejectsOpenProtocolAndCancelledActor(t *testing.T) {
++	server := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
++	good := `{"account_user_id":"a","target_id":"e","room_id":"r0","homepod_id":"101","action":"pause","volume_percent":0}`
++	for _, raw := range []string{`{}`, strings.Replace(good, `"volume_percent":0`, `"volume_percent":null`, 1), strings.Replace(good, `"action":"pause"`, `"action":"pause","action":"resume"`, 1), good + ` {}`, strings.Replace(good, `"action":"pause"`, `"uri":"spotify:track:x","action":"pause"`, 1)} {
++		out := httptest.NewRecorder()
++		server.handleRoomTransportPrepare(out, httptest.NewRequest("POST", "/player/room_transport/prepare", strings.NewReader(raw)))
++		if out.Code != 400 {
++			t.Fatal(out.Code)
++		}
++		select {
++		case <-server.requests:
++			t.Fatal("open protocol reached actor")
++		default:
++		}
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	result, err := (&AppPlayer{}).handleApiRequest(context.Background(), ApiRequest{Type: apiRoomTransportState, Data: roomTransportStateRequest{Context: ctx}})
++	if err == nil || result != nil {
++		t.Fatal("cancelled read minted state")
++	}
++}
++func TestRoomTransportHTTPRequiresActualClosedOwnToneACKBeforePrivateEffect(t *testing.T) {
++	for _, mode := range []string{"accepted", "missing-false", "wrong-token", "pending", "extra-field", "duplicate-field"} {
++		t.Run(mode, func(t *testing.T) {
++			p, offer := roomTransportAdmittedFixture(t)
++			token := strings.Repeat("c", 32)
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var request map[string]any
++				if json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 5 || request["token"] != token || request["native_prepare_id"] != offer.Snapshot.PrepareID || request["args_digest"] != offer.Snapshot.ArgsDigest || request["action"] != "pause" || request["expected_input_path_digest"] != "12c45d7fbc8028f5d05a33aa2f3513309a0584d1220e3500fe386c1159d19397" {
++					t.Error("OwnTone request not exact immutable binding")
++				}
++				if r.URL.Path != "/api/outputs/101/transport/commit" {
++					t.Error(r.URL.Path)
++				}
++				ack := map[string]any{"schema": "podconnect.output_transport_commit.v1", "ok": true, "token": token, "native_prepare_id": offer.Snapshot.PrepareID, "args_digest": offer.Snapshot.ArgsDigest, "pin_remaining_ms": 10000, "outcome": "accepted", "physical_result_verified": false}
++				switch mode {
++				case "missing-false":
++					delete(ack, "physical_result_verified")
++				case "wrong-token":
++					ack["token"] = strings.Repeat("d", 32)
++				case "pending":
++					ack["outcome"] = "pending"
++				case "extra-field":
++					ack["pin"] = true
++				}
++				raw, _ := json.Marshal(ack)
++				if mode == "duplicate-field" {
++					raw = append([]byte(`{"ok":true,`), raw[1:]...)
++				}
++				_, _ = w.Write(raw)
++			}))
++			defer output.Close()
++			offer.OwnToneURL = output.URL
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++			effects := 0
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for req := range server.requests {
++					if req.Type == apiRoomTransportConsume {
++						value, err := p.handleApiRequest(context.Background(), req)
++						req.Reply(value, err)
++					} else if req.Type == apiRoomTransportEffect {
++						effects++
++						req.Reply(map[string]bool{"accepted_native": true}, nil)
++					} else if req.Type == apiRoomTransportAbort {
++						p.abortRoomTransport(req.Data.(*nativeTransportOffer))
++						req.Reply(nil, nil)
++					} else {
++						t.Error("unexpected actor request")
++						req.Reply(nil, ErrBadRequest)
++					}
++				}
++			}()
++			body, _ := json.Marshal(roomTransportCommitRequest{offer.Snapshot.PrepareID, token})
++			out := httptest.NewRecorder()
++			server.handleRoomTransportCommit(out, httptest.NewRequest("POST", "/player/room_transport/commit", strings.NewReader(string(body))))
++			close(server.requests)
++			<-done
++			if (mode == "accepted" && (out.Code != 200 || effects != 1)) || (mode != "accepted" && (out.Code == 200 || effects != 0)) {
++				t.Fatal("C ACK bypassed final private-effect gate", mode, out.Code, effects)
++			}
++			if p.roomTransportOffer != nil {
++				t.Fatal("C uncertainty left native offer reusable")
++			}
++		})
++	}
++}
++
++// Inert closeable decoder proves exact source ownership without audio/provider I/O.
++type roomTransportClosableSource struct {
++	closes int
++	owner  *AppPlayer
++	locked bool
++}
++
++func (*roomTransportClosableSource) Read([]float32) (int, error) { return 0, nil }
++func (*roomTransportClosableSource) PositionMs() int64           { return 0 }
++func (*roomTransportClosableSource) SetPositionMs(int64) error   { return nil }
++func (source *roomTransportClosableSource) Close() error {
++	source.closes++
++	if source.owner != nil {
++		if source.owner.aliasMu.TryLock() {
++			source.owner.aliasMu.Unlock()
++		} else {
++			source.locked = true
++		}
++	}
++	return nil
++}
++func TestRoomTransportPreparedSourceDiscardOwnership(t *testing.T) {
++	for _, mode := range []string{"replace", "expire", "consume-reject", "abort", "late-effect", "teardown", "adopted"} {
++		t.Run(mode, func(t *testing.T) {
++			p, offer := roomTransportAdmittedFixture(t)
++			source := &roomTransportClosableSource{owner: p}
++			offer.PreparedStream = &player.Stream{Source: source}
++			switch mode {
++			case "replace":
++				p.storeRoomTransportOffer(&nativeTransportOffer{})
++			case "expire":
++				offer.Expires = time.Now().Add(-time.Second)
++				p.discardExpiredRoomTransport()
++			case "consume-reject":
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				_, _ = p.consumeRoomTransport(context.Background(), roomTransportConsumeRequest{offer.Snapshot.PrepareID, ctx})
++			case "abort":
++				p.roomTransportPending = offer
++				p.roomTransportOffer = nil
++				p.abortRoomTransport(offer)
++			case "late-effect":
++				p.roomTransportPending = offer
++				p.roomTransportOffer = nil
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				_, _ = p.effectRoomTransport(ctx, roomTransportEffectRequest{offer, ctx})
++			case "teardown":
++				p.clearRoomTransport()
++			case "adopted":
++				offer.Published = true
++				p.clearRoomTransport()
++			}
++			offer.discardPrepared() // repeated cleanup must never close twice
++			expected := 1
++			if mode == "adopted" {
++				expected = 0
++			}
++			if source.closes != expected || source.locked {
++				t.Fatal("decoder ownership leak/double-close or I/O while alias mutex held", mode, source.closes, source.locked)
++			}
++		})
++	}
++}
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,9 +30,15 @@
+ )
+ 
+ type AppPlayer struct {
+-	queueOccurrenceOffer *nativeQueueOffer
+-	app                  *App
+-	sess                 *session.Session
++	roomTransportOffer               *nativeTransportOffer
++	roomTransportPending             *nativeTransportOffer
++	aliasRevision                    uint64
++	aliasRevisionExhausted           bool
++	roomTransportGeneration          uint64
++	roomTransportGenerationExhausted bool
++	queueOccurrenceOffer             *nativeQueueOffer
++	app                              *App
++	sess                             *session.Session
+ 
+ 	stop   chan struct{}
+ 	logout chan *AppPlayer
+@@ -133,6 +139,7 @@
+ 		return fmt.Errorf("connection owner retired")
+ 	}
+ 	if p.spotConnId != id {
++		p.advanceRoomTransportGenerationLocked()
+ 		p.hasInitialConnectState = false
+ 	}
+ 	p.spotConnId = id
+@@ -212,6 +219,7 @@
+ }
+ 
+ func (p *AppPlayer) handlePlayerCommandWithSpclient(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
++	p.invalidateRoomTransportGeneration()
+ 	var transferState *connectpb.TransferState
+ 	if req.Command.Endpoint == "transfer" && len(req.Command.Data) > 0 {
+ 		transferState = &connectpb.TransferState{}
+@@ -357,8 +365,12 @@
+ 				name = p.app.cfg.DeviceAliases[*aliasId-1]
+ 			}
+ 			p.app.log.Infof("device-alias selected: id=%d name=%q", *aliasId, name)
++			p.aliasMu.Lock()
++			p.advanceAliasRevisionLocked()
+ 			p.state.device.SelectedAliasId = *aliasId
+-			p.emitSelectedAlias(*aliasId, p.aliasBinding())
++			binding := p.aliasBindingLocked()
++			p.aliasMu.Unlock()
++			p.emitSelectedAlias(*aliasId, binding)
+ 		}
+ 	}
+ }
+@@ -529,6 +541,21 @@
+ 	defer cancel()
+ 
+ 	switch req.Type {
++	case ApiRequestTypeResume, ApiRequestTypePause, ApiRequestTypeStop, ApiRequestTypePlayPause, ApiRequestTypeSeek, ApiRequestTypePrev, ApiRequestTypeNext, ApiRequestTypePlay, ApiRequestTypeSetVolume, ApiRequestTypeSetRepeatingContext, ApiRequestTypeSetRepeatingTrack, ApiRequestTypeSetShufflingContext, ApiRequestTypeAddToQueue, ApiRequestTypeQueueOccurrence:
++		p.invalidateRoomTransportGeneration()
++	}
++	switch req.Type {
++	case apiRoomTransportState:
++		return p.roomTransportState(ctx, req.Data.(roomTransportStateRequest))
++	case apiRoomTransportPrepare:
++		return p.prepareRoomTransport(ctx, req.Data.(roomTransportPrepareRequest))
++	case apiRoomTransportConsume:
++		return p.consumeRoomTransport(ctx, req.Data.(roomTransportConsumeRequest))
++	case apiRoomTransportEffect:
++		return p.effectRoomTransport(ctx, req.Data.(roomTransportEffectRequest))
++	case apiRoomTransportAbort:
++		p.abortRoomTransport(req.Data.(*nativeTransportOffer))
++		return nil, nil
+ 	case ApiRequestTypeQueueOccurrences:
+ 		return p.observeQueueOccurrences(ctx, req.Data.(queueReadRequest))
+ 	case ApiRequestTypeQueueOccurrence:
+@@ -752,6 +779,7 @@
+ }
+ 
+ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2PlayerCommand) error {
++	p.invalidateRoomTransportGeneration()
+ 	// Limit ourselves to 30 seconds for handling mpris commands
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+@@ -829,6 +857,9 @@
+ }
+ 
+ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
++	defer p.clearRoomTransport()
++	transportCleanup := time.NewTicker(time.Second)
++	defer transportCleanup.Stop()
+ 	err := p.sess.Dealer().Connect(ctx)
+ 	if err != nil {
+ 		p.app.log.WithError(err).Error("failed connecting to dealer")
+@@ -846,6 +877,8 @@
+ 
+ 	for {
+ 		select {
++		case <-transportCleanup.C:
++			p.discardExpiredRoomTransport()
+ 		case <-p.stop:
+ 			return
+ 		case pkt, ok := <-apRecv:
+@@ -932,6 +965,7 @@
+ // Closed transport channels mean upstream has exhausted reconnection, not a brief
+ // disconnect. Never execute or replay commands against this stranded session.
+ func (p *AppPlayer) runFailedTransport(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
++	p.clearRoomTransport()
+ 	for {
+ 		select {
+ 		case <-p.stop:
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -297,9 +297,10 @@
+ }
+ 
+ type ApiAlias struct {
+-	ID     uint32 `json:"id"`
+-	RoomID string `json:"room_id"`
+-	Name   string `json:"name"`
++	ID        uint32 `json:"id"`
++	RoomID    string `json:"room_id"`
++	Name      string `json:"name"`
++	HomePodID string `json:"homepod_id,omitempty"`
+ }
+ 
+ type ApiAliasBinding struct {
+@@ -748,6 +749,9 @@
+ 
+ 		s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+ 	})
++	m.HandleFunc("/player/room_transport/state", s.handleRoomTransportState)
++	m.HandleFunc("/player/room_transport/prepare", s.handleRoomTransportPrepare)
++	m.HandleFunc("/player/room_transport/commit", s.handleRoomTransportCommit)
+ 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+ 		opts := &websocket.AcceptOptions{}
+ 		if len(s.allowOrigin) > 0 {
+--- /dev/null
++++ b/daemon/room_transport.go
+@@ -0,0 +1,402 @@
++package daemon
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"net"
++	"net/url"
++	"path/filepath"
++	"regexp"
++	"slices"
++	"strconv"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++const (
++	apiRoomTransportState   ApiRequestType = "room_transport_state"
++	apiRoomTransportPrepare ApiRequestType = "room_transport_prepare"
++	apiRoomTransportConsume ApiRequestType = "room_transport_consume"
++	apiRoomTransportEffect  ApiRequestType = "room_transport_effect"
++	apiRoomTransportAbort   ApiRequestType = "room_transport_abort"
++	roomTransportLifetime                  = 5 * time.Second
++)
++
++var roomTransportActions = []string{"pause", "resume", "next", "previous"}
++var homePodIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
++
++type roomTransportIdentity struct {
++	AccountUserID    string `json:"account_user_id"`
++	TargetID         string `json:"target_id"`
++	RoomID           string `json:"room_id"`
++	HomePodID        string `json:"homepod_id"`
++	ConnectionID     string `json:"connection_id"`
++	SessionID        string `json:"session_id"`
++	AliasIncarnation string `json:"alias_incarnation"`
++	AliasRegistry    string `json:"alias_registry"`
++	AliasRevision    uint64 `json:"alias_revision"`
++}
++type roomTransportStateRequest struct {
++	AccountUserID string          `json:"account_user_id"`
++	TargetID      string          `json:"target_id"`
++	RoomID        string          `json:"room_id"`
++	HomePodID     string          `json:"homepod_id"`
++	Context       context.Context `json:"-"`
++}
++type roomTransportPrepareRequest struct {
++	AccountUserID string          `json:"account_user_id"`
++	TargetID      string          `json:"target_id"`
++	RoomID        string          `json:"room_id"`
++	HomePodID     string          `json:"homepod_id"`
++	Action        string          `json:"action"`
++	VolumePercent int             `json:"volume_percent"`
++	Context       context.Context `json:"-"`
++}
++type roomTransportSnapshot struct {
++	roomTransportIdentity
++	Schema         string `json:"schema"`
++	PrepareID      string `json:"prepare_id"`
++	Action         string `json:"action"`
++	VolumePercent  int    `json:"volume_percent"`
++	ArgsDigest     string `json:"args_digest"`
++	ExpiresAfterMS int    `json:"expires_after_ms"`
++}
++type nativeTransportOffer struct {
++	Published           bool
++	Disposed            bool
++	Generation          uint64
++	OriginalPlayerState *connectpb.PlayerState
++	QueueRevision       uint64
++	Snapshot            roomTransportSnapshot
++	Expires             time.Time
++	State               *State
++	Session             *session.Session
++	Player              *player.Player
++	Primary             *player.Stream
++	Tracks              *tracks.List
++	PreparedTracks      *tracks.List
++	PreparedStream      *player.Stream
++	PreparedState       *connectpb.PlayerState
++	OwnToneURL          string
++	InputPath           string
++}
++type roomTransportConsumeRequest struct {
++	PrepareID string
++	Context   context.Context
++}
++type roomTransportEffectRequest struct {
++	Offer   *nativeTransportOffer
++	Context context.Context
++}
++
++func (offer *nativeTransportOffer) discardPrepared() {
++	if offer == nil || offer.Published || offer.Disposed {
++		return
++	}
++	offer.Disposed = true
++	if offer.PreparedStream != nil {
++		if closer, ok := offer.PreparedStream.Source.(io.Closer); ok {
++			_ = closer.Close()
++		}
++	}
++}
++func (p *AppPlayer) storeRoomTransportOffer(offer *nativeTransportOffer) {
++	if p.roomTransportOffer != offer {
++		p.roomTransportOffer.discardPrepared()
++	}
++	p.roomTransportOffer = offer
++}
++func (p *AppPlayer) discardExpiredRoomTransport() {
++	if offer := p.roomTransportOffer; offer != nil && !time.Now().Before(offer.Expires) {
++		p.roomTransportOffer = nil
++		offer.discardPrepared()
++	}
++	if offer := p.roomTransportPending; offer != nil && !time.Now().Before(offer.Expires) {
++		p.roomTransportPending = nil
++		offer.discardPrepared()
++	}
++}
++func (p *AppPlayer) clearRoomTransport() {
++	p.roomTransportOffer.discardPrepared()
++	p.roomTransportPending.discardPrepared()
++	p.roomTransportOffer = nil
++	p.roomTransportPending = nil
++}
++func (p *AppPlayer) abortRoomTransport(offer *nativeTransportOffer) {
++	if offer != nil && p.roomTransportPending == offer {
++		p.roomTransportPending = nil
++		offer.discardPrepared()
++	}
++}
++func (p *AppPlayer) advanceRoomTransportGenerationLocked() {
++	if p.roomTransportGeneration >= 1<<53-1 {
++		p.roomTransportGenerationExhausted = true
++		return
++	}
++	p.roomTransportGeneration++
++}
++func (p *AppPlayer) invalidateRoomTransportGeneration() {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	p.advanceRoomTransportGenerationLocked()
++}
++func (p *AppPlayer) advanceAliasRevisionLocked() {
++	if p.aliasRevision >= 1<<53-1 {
++		p.aliasRevisionExhausted = true
++		return
++	}
++	p.aliasRevision++
++}
++func roomTransportURL(raw string) bool {
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || u.Port() == "" {
++		return false
++	}
++	host := u.Hostname()
++	if host == "localhost" {
++		return true
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
++func (p *AppPlayer) transportMappingCurrentLocked() bool {
++	ids := p.app.cfg.DeviceAliasHomePodIDs
++	if len(ids) == 0 || len(ids) != len(p.aliasRegistry) || len(p.app.cfg.DeviceAliasRoomIDs) != len(ids) || len(p.app.cfg.DeviceAliases) != len(ids) {
++		return false
++	}
++	seen := make(map[string]bool, len(ids))
++	for i, id := range ids {
++		n, err := strconv.ParseUint(id, 10, 64)
++		if err != nil || n == 0 || !homePodIDPattern.MatchString(id) || seen[id] || p.aliasRegistry[i].HomePodID != id || p.aliasRegistry[i].RoomID != p.app.cfg.DeviceAliasRoomIDs[i] || p.aliasRegistry[i].Name != p.app.cfg.DeviceAliases[i] {
++			return false
++		}
++		seen[id] = true
++	}
++	return true
++}
++func (p *AppPlayer) roomTransportIdentity(account, target, room, homepod string) (roomTransportIdentity, error) {
++	zero := roomTransportIdentity{}
++	if p.sess == nil || p.state == nil || p.state.player == nil || p.state.device == nil || p.primaryStream == nil || p.primaryStream.Source == nil || p.player == nil || !p.state.active || !p.state.player.IsPlaying || account == "" || len(account) > 160 || target == "" || target != p.app.deviceId || p.sess.Username() != account || !p.playbackReady() || p.spotConnId == "" || p.state.player.SessionId == "" || p.app.cfg.AudioBackend != "pipe" || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !p.app.cfg.ExternalVolume || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) || !homePodIDPattern.MatchString(homepod) {
++		return zero, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	binding := p.aliasBindingLocked()
++	if binding == nil || !binding.Ready || binding.RoomID != room || room == "" || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || !p.transportMappingCurrentLocked() {
++		return zero, ErrAliasConflict
++	}
++	for _, a := range p.aliasRegistry {
++		if a.RoomID == room && a.HomePodID == homepod {
++			return roomTransportIdentity{account, target, room, homepod, p.spotConnId, p.state.player.SessionId, binding.Incarnation, binding.Registry, p.aliasRevision}, nil
++		}
++	}
++	return zero, ErrAliasConflict
++}
++func (p *AppPlayer) roomTransportState(parent context.Context, request roomTransportStateRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	if ctx.Err() != nil || parent.Err() != nil {
++		return nil, ErrAliasConflict
++	}
++	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil {
++		return nil, err
++	}
++	return struct {
++		Schema   string                `json:"schema"`
++		Ready    bool                  `json:"ready"`
++		Identity roomTransportIdentity `json:"identity"`
++		Actions  []string              `json:"actions"`
++		Physical bool                  `json:"physical_result_verified"`
++	}{"podconnect.native_room_transport_state.v1", true, identity, slices.Clone(roomTransportActions), false}, nil
++}
++func (p *AppPlayer) prepareRoomTransport(parent context.Context, request roomTransportPrepareRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	if !slices.Contains(roomTransportActions, request.Action) || request.VolumePercent != 0 || ctx.Err() != nil || parent.Err() != nil {
++		return nil, ErrBadRequest
++	}
++	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil {
++		return nil, err
++	}
++	offer := &nativeTransportOffer{Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe}
++	stagedOwned := true
++	defer func() {
++		if stagedOwned {
++			offer.discardPrepared()
++		}
++	}()
++	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: "podconnect.native_room_transport.v1", Action: request.Action, VolumePercent: 0, ExpiresAfterMS: 5000}
++	if request.Action == "next" || request.Action == "previous" {
++		staged, err := p.state.tracks.PrepareTransport(ctx, request.Action == "previous", p.state.trackPosition())
++		if err != nil {
++			return nil, ErrAliasConflict
++		}
++		state := proto.Clone(p.state.player).(*connectpb.PlayerState)
++		if request.Action == "next" {
++			state.IsPaused = false
++		}
++		state.Track = staged.CurrentTrack()
++		state.PrevTracks = staged.PrevTracks()
++		state.NextTracks = staged.NextTracks(ctx, nil)
++		state.Index = staged.Index()
++		id, err := librespot.SpotifyIdFromUri(state.Track.Uri)
++		if err != nil {
++			return nil, ErrBadRequest
++		}
++		stream, err := p.player.NewStream(ctx, p.app.client, *id, p.app.cfg.Bitrate, 0)
++		if err != nil {
++			return nil, err
++		}
++		offer.PreparedTracks = staged
++		offer.PreparedState = state
++		offer.PreparedStream = stream
++	}
++	if ctx.Err() != nil || parent.Err() != nil {
++		return nil, ErrAliasConflict
++	}
++	latest, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil || latest != identity || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state.tracks != offer.Tracks {
++		return nil, ErrAliasConflict
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	offer.Snapshot.PrepareID = id
++	// Full immutable native identity/action/args, encoded by this owner.
++	raw, err := json.Marshal(struct {
++		Identity roomTransportIdentity `json:"identity"`
++		Action   string                `json:"action"`
++		Percent  int                   `json:"volume_percent"`
++	}{identity, request.Action, 0})
++	if err != nil {
++		return nil, err
++	}
++	digest := sha256.Sum256(raw)
++	offer.Snapshot.ArgsDigest = hex.EncodeToString(digest[:])
++	// All detached network work precedes this monotonic cutoff and any OwnTone pin.
++	offer.Expires = time.Now().Add(roomTransportLifetime)
++	p.storeRoomTransportOffer(offer)
++	stagedOwned = false
++	return offer.Snapshot, nil
++}
++func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, parent, request context.Context) bool {
++	if offer == nil || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
++		return false
++	}
++	binding := p.aliasBindingLocked()
++	if !p.transportMappingCurrentLocked() || binding == nil || !binding.Ready || binding.Incarnation != offer.Snapshot.AliasIncarnation || binding.Registry != offer.Snapshot.AliasRegistry || binding.RoomID != offer.Snapshot.RoomID {
++		return false
++	}
++	for _, alias := range p.aliasRegistry {
++		if alias.RoomID == offer.Snapshot.RoomID && alias.HomePodID == offer.Snapshot.HomePodID {
++			return true
++		}
++	}
++	return false
++}
++func (p *AppPlayer) consumeRoomTransport(parent context.Context, request roomTransportConsumeRequest) (any, error) {
++	offer := p.roomTransportOffer
++	if offer == nil || request.PrepareID != offer.Snapshot.PrepareID {
++		return nil, ErrAliasConflict
++	}
++	p.roomTransportOffer = nil
++	p.aliasMu.Lock()
++	current := p.transportOfferCurrentLocked(offer, parent, request.Context)
++	p.aliasMu.Unlock()
++	if !current {
++		offer.discardPrepared()
++		return nil, ErrAliasConflict
++	}
++	if p.roomTransportPending != nil && time.Now().Before(p.roomTransportPending.Expires) {
++		offer.discardPrepared()
++		return nil, ErrAliasConflict
++	}
++	p.roomTransportPending.discardPrepared()
++	p.roomTransportPending = offer
++	return offer, nil
++}
++
++func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTransportEffectRequest) (any, error) {
++	offer := request.Offer
++	if offer == nil || p.roomTransportPending != offer {
++		return nil, ErrAliasConflict
++	}
++	p.roomTransportPending = nil // private in-process capability, never an HTTP field
++	defer offer.discardPrepared()
++	if parent.Err() != nil || (request.Context != nil && request.Context.Err() != nil) || !time.Now().Before(offer.Expires) {
++		return nil, ErrAliasConflict
++	}
++	var stream librespot.AudioSource
++	if offer.PreparedStream != nil {
++		stream = offer.PreparedStream.Source
++	}
++	paused := offer.Snapshot.Action == "pause"
++	if offer.PreparedStream != nil {
++		paused = offer.PreparedState.IsPaused
++	}
++	requestContext := request.Context
++	if requestContext == nil {
++		requestContext = parent
++	}
++	effectContext, cancelEffect := context.WithDeadline(requestContext, offer.Expires)
++	defer cancelEffect()
++	stop := context.AfterFunc(parent, cancelEffect)
++	defer stop()
++	err := p.player.GuardedTransport(effectContext, paused, stream, offer.Primary.Source, func(mutate func()) error {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		if !p.transportOfferCurrentLocked(offer, parent, request.Context) {
++			return ErrAliasConflict
++		}
++		// No I/O or deferred operation in this callback.
++		mutate()
++		offer.Published = true
++		if offer.PreparedStream != nil {
++			p.primaryStream = offer.PreparedStream
++			p.secondaryStream = nil
++			p.state.tracks = offer.PreparedTracks
++			p.state.player = offer.PreparedState
++			p.state.player.PlaybackId = hex.EncodeToString(offer.PreparedStream.PlaybackId)
++			p.state.player.Duration = int64(offer.PreparedStream.Media.Duration())
++			p.state.player.PositionAsOfTimestamp = 0
++		} else {
++			p.state.player.PositionAsOfTimestamp = p.state.trackPosition()
++		}
++		p.state.player.Timestamp = time.Now().UnixMilli()
++		p.state.setPaused(paused)
++		p.state.player.IsBuffering = false
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	// Observations after acceptance are never additional physical writes.
++	if offer.PreparedStream != nil {
++		p.sess.Events().PostPrimaryStreamLoad(p.primaryStream, paused)
++	}
++	event := player.EventTypeResume
++	if paused {
++		event = player.EventTypePause
++	} else if offer.PreparedStream != nil {
++		event = player.EventTypePlay
++	}
++	p.handlePlayerEvent(parent, &player.Event{Type: event})
++	return struct {
++		Schema         string `json:"schema"`
++		AcceptedNative bool   `json:"accepted_native"`
++		PrepareID      string `json:"prepare_id"`
++		Physical       bool   `json:"physical_result_verified"`
++	}{"podconnect.native_room_transport_commit.v1", true, offer.Snapshot.PrepareID, false}, nil
++}
+--- /dev/null
++++ b/player/room_transport_test.go
+@@ -0,0 +1,174 @@
++package player
++
++import (
++	"context"
++	"errors"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"sync"
++	"testing"
++	"time"
++)
++
++type transportTestOutput struct {
++	gate    chan struct{}
++	entered chan struct{}
++	paused  bool
++}
++
++func (o *transportTestOutput) WithTransportLock(_ context.Context, f func(func(bool)) error) error {
++	close(o.entered)
++	<-o.gate
++	return f(func(v bool) { o.paused = v })
++}
++func (*transportTestOutput) Pause() error            { return nil }
++func (*transportTestOutput) Resume() error           { return nil }
++func (*transportTestOutput) Drop() error             { return nil }
++func (*transportTestOutput) DelayMs() (int64, error) { return 0, nil }
++func (*transportTestOutput) SetVolume(float32)       {}
++func (*transportTestOutput) Error() <-chan error     { return nil }
++func (*transportTestOutput) Close() error            { return nil }
++
++type transportSource struct{ id int }
++
++func (*transportSource) Read([]float32) (int, error) { return 0, nil }
++func (*transportSource) PositionMs() int64           { return 0 }
++func (*transportSource) SetPositionMs(int64) error   { return nil }
++func TestRoomTransportPlayerGuardFollowsActualPipeAndSourceLocks(t *testing.T) {
++	for _, stage := range []string{"pipe", "source"} {
++		t.Run(stage, func(t *testing.T) {
++			backend := &transportTestOutput{gate: make(chan struct{}), entered: make(chan struct{})}
++			var out output.Output = backend
++			source := NewSwitchingAudioSource()
++			old := &transportSource{id: 1}
++			source.SetPrimary(old)
++			replacement := &transportSource{id: 2}
++			expired := false
++			var mu sync.Mutex
++			if stage == "source" {
++				source.cond.L.Lock()
++				close(backend.gate)
++			}
++			done := make(chan error, 1)
++			go func() {
++				done <- (&Player{}).applyGuardedTransport(&guardedTransportCommand{source: replacement, expectedSource: old, guard: func(mutate func()) error {
++					mu.Lock()
++					defer mu.Unlock()
++					if expired {
++						return errors.New("expired")
++					}
++					mutate()
++					return nil
++				}}, &out, source, 1)
++			}()
++			<-backend.entered
++			mu.Lock()
++			expired = true
++			mu.Unlock()
++			if stage == "source" {
++				source.cond.L.Unlock()
++			} else {
++				close(backend.gate)
++			}
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("late native command admitted")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("native command not joined")
++			}
++			if source.source[source.which] != librespot.AudioSource(old) || backend.paused {
++				t.Fatal("state or source changed after guard rejection")
++			}
++		})
++	}
++}
++func TestRoomTransportPlayerSourcePublicationAndPauseAreOneGuard(t *testing.T) {
++	backend := &transportTestOutput{gate: make(chan struct{}), entered: make(chan struct{})}
++	close(backend.gate)
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	old := &transportSource{id: 1}
++	source.SetPrimary(old)
++	source.SetSecondary(old)
++	replacement := &transportSource{id: 2}
++	calls := 0
++	err := (&Player{}).applyGuardedTransport(&guardedTransportCommand{paused: true, source: replacement, expectedSource: old, guard: func(mutate func()) error { calls++; mutate(); return nil }}, &out, source, 1)
++	if err != nil || calls != 1 || source.source[source.which] != librespot.AudioSource(replacement) || !backend.paused || source.source[!source.which] != nil {
++		t.Fatal("guarded source and paused state did not commit together")
++	}
++}
++
++func TestRoomTransportSourceHeldLockReturnsOnCancellation(t *testing.T) {
++	backend := &transportTestOutput{gate: make(chan struct{}), entered: make(chan struct{})}
++	close(backend.gate)
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	old := &transportSource{id: 1}
++	source.SetPrimary(old)
++	source.cond.L.Lock()
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() {
++		done <- (&Player{}).applyGuardedTransport(&guardedTransportCommand{context: ctx, expectedSource: old, guard: func(func()) error { t.Error("cancelled source lock admitted"); return nil }}, &out, source, 1)
++	}()
++	<-backend.entered
++	cancel()
++	select {
++	case err := <-done:
++		if err != context.Canceled {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("actor remained blocked on held source lock")
++	}
++	source.cond.L.Unlock()
++}
++
++type transportRawCloser struct{ closes int }
++
++func (raw *transportRawCloser) Close() error { raw.closes++; return nil }
++
++type transportVoidDecoder struct {
++	transportSource
++	closes       int
++	raw          *transportRawCloser
++	rawWasClosed bool
++}
++
++func (decoder *transportVoidDecoder) Close() {
++	decoder.closes++
++	decoder.rawWasClosed = decoder.raw.closes == 1
++}
++func TestRoomTransportOwnedSourceClosesRawBeforeVoidDecoderExactlyOnce(t *testing.T) {
++	raw := &transportRawCloser{}
++	decoder := &transportVoidDecoder{raw: raw}
++	source := &ownedAudioSource{AudioSource: decoder, raw: raw}
++	if source.Close() != nil || source.Close() != nil || raw.closes != 1 || decoder.closes != 1 || !decoder.rawWasClosed {
++		t.Fatal("raw fetch/void decoder ownership not closed exactly once in cancellation order")
++	}
++}
++
++func TestRoomTransportPublicationDisposesDisplacedSourcesOnly(t *testing.T) {
++	oldRaw := &transportRawCloser{}
++	oldDecoder := &transportVoidDecoder{raw: oldRaw}
++	old := &ownedAudioSource{AudioSource: oldDecoder, raw: oldRaw}
++	newRaw := &transportRawCloser{}
++	newDecoder := &transportVoidDecoder{raw: newRaw}
++	replacement := &ownedAudioSource{AudioSource: newDecoder, raw: newRaw}
++	backend := &transportTestOutput{gate: make(chan struct{}), entered: make(chan struct{})}
++	close(backend.gate)
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	source.SetPrimary(old)
++	source.SetSecondary(old)
++	err := (&Player{}).applyGuardedTransport(&guardedTransportCommand{source: replacement, expectedSource: old, guard: func(mutate func()) error { mutate(); return nil }}, &out, source, 1)
++	if err != nil || oldRaw.closes != 1 || oldDecoder.closes != 1 || newRaw.closes != 0 || newDecoder.closes != 0 {
++		t.Fatal("displaced source leaked or adopted source closed", err)
++	}
++	_ = source.Close()
++	if newRaw.closes != 1 || newDecoder.closes != 1 {
++		t.Fatal("player teardown did not close adopted raw/decoder owner")
++	}
++}
+--- /dev/null
++++ b/player/owned_source.go
+@@ -0,0 +1,39 @@
++package player
++
++import (
++	librespot "github.com/devgianlu/go-librespot"
++	"io"
++	"sync"
++)
++
++// ownedAudioSource retains the raw HTTP reader hidden by decoder section/meta
++// readers. Closing cancels fetches before decoder teardown, and handles Vorbis'
++// legacy void Close signature as well as io.Closer. The player owns adopted
++// sources; the transport offer owns sources until guarded publication.
++type ownedAudioSource struct {
++	librespot.AudioSource
++	raw  io.Closer
++	once sync.Once
++	err  error
++}
++
++func closeAudioDecoder(source librespot.AudioSource) error {
++	switch decoder := source.(type) {
++	case io.Closer:
++		return decoder.Close()
++	case interface{ Close() }:
++		decoder.Close()
++	}
++	return nil
++}
++func (source *ownedAudioSource) Close() error {
++	source.once.Do(func() {
++		if source.raw != nil {
++			source.err = source.raw.Close()
++		}
++		if err := closeAudioDecoder(source.AudioSource); source.err == nil {
++			source.err = err
++		}
++	})
++	return source.err
++}
+--- a/player/player.go
++++ b/player/player.go
+@@ -76,9 +76,10 @@
+ )
+ 
+ type playerCmd struct {
+-	typ  playerCmdType
+-	data any
+-	resp chan any
++	guarded *guardedTransportCommand
++	typ     playerCmdType
++	data    any
++	resp    chan any
+ }
+ 
+ type playerCmdDataSet struct {
+@@ -219,6 +220,14 @@
+ 	for {
+ 		select {
+ 		case cmd := <-p.cmd:
++			if cmd.guarded != nil {
++				err := p.applyGuardedTransport(cmd.guarded, &out, source, volume)
++				if out != nil {
++					outErr = out.Error()
++				}
++				cmd.resp <- err
++				continue
++			}
+ 			switch cmd.typ {
+ 			case playerCmdSet:
+ 				data := cmd.data.(playerCmdDataSet)
+@@ -671,13 +680,19 @@
+ 	}
+ 
+ 	p.events.PostStreamInitHttpChunkReader(playbackId, rawStream)
++	var stream librespot.AudioSource
++	sourceOwned := false
++	defer func() {
++		if !sourceOwned {
++			_ = rawStream.Close()
++			_ = closeAudioDecoder(stream)
++		}
++	}()
+ 
+ 	decryptedStream, err := audio.NewAesAudioDecryptor(rawStream, audioKey)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed intializing audio decryptor: %w", err)
+ 	}
+-
+-	var stream librespot.AudioSource
+ 
+ 	audioFormat := GetAudioFileFormatAudioFormat(*file.Format)
+ 	if audioFormat == AudioFormatOGGVorbis {
+@@ -691,6 +706,7 @@
+ 			return nil, fmt.Errorf("failed initializing ogg vorbis stream: %w", err)
+ 		}
+ 
++		stream = vorbisStream
+ 		if vorbisStream.SampleRate != SampleRate {
+ 			return nil, fmt.Errorf("unsupported sample rate: %d", vorbisStream.SampleRate)
+ 		} else if vorbisStream.Channels != Channels {
+@@ -705,6 +721,7 @@
+ 			return nil, fmt.Errorf("failed initializing flac stream: %w", err)
+ 		}
+ 
++		stream = flacStream
+ 		if flacStream.SampleRate != SampleRate {
+ 			return nil, fmt.Errorf("unsupported sample rate: %d", flacStream.SampleRate)
+ 		} else if flacStream.Channels != Channels {
+@@ -723,5 +740,6 @@
+ 		}
+ 	}
+ 
+-	return &Stream{PlaybackId: playbackId, Source: stream, Media: media, File: file}, nil
+-}
++	sourceOwned = true
++	return &Stream{PlaybackId: playbackId, Source: &ownedAudioSource{AudioSource: stream, raw: rawStream}, Media: media, File: file}, nil
++}
+--- /dev/null
++++ b/player/room_transport.go
+@@ -0,0 +1,81 @@
++package player
++
++import (
++	"context"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"sync"
++)
++
++type guardedTransportCommand struct {
++	context        context.Context
++	paused         bool
++	source         librespot.AudioSource
++	expectedSource librespot.AudioSource
++	guard          output.TransportGuard
++}
++
++// GuardedTransport is additive; legacy player operations keep their behavior.
++// After enqueue, wait for the worker's terminal answer to preserve AppPlayer
++// serialization. The HTTP caller may have timed out independently.
++func (p *Player) GuardedTransport(ctx context.Context, paused bool, source librespot.AudioSource, expectedSource librespot.AudioSource, guard output.TransportGuard) error {
++	reply := make(chan any, 1)
++	select {
++	case p.cmd <- playerCmd{guarded: &guardedTransportCommand{context: ctx, paused: paused, source: source, expectedSource: expectedSource, guard: guard}, resp: reply}:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	if result := <-reply; result != nil {
++		return result.(error)
++	}
++	return nil
++}
++
++func (p *Player) applyGuardedTransport(command *guardedTransportCommand, out *output.Output, source *SwitchingAudioSource, volume float32) error {
++	if *out == nil {
++		return fmt.Errorf("no existing pipe output")
++	}
++
++	pipe, ok := (*out).(output.GuardedPipeOutput)
++	if !ok {
++		return fmt.Errorf("guarded pipe output unavailable")
++	}
++	var displaced []librespot.AudioSource
++	err := pipe.WithTransportLock(command.context, func(setPaused func(bool)) error {
++		lock, ok := source.cond.L.(*sync.Mutex)
++		if !ok {
++			return fmt.Errorf("native source lock unavailable")
++		}
++		if err := output.LockTransport(command.context, lock); err != nil {
++			return err
++		}
++		defer lock.Unlock()
++		if source.source[source.which] != command.expectedSource {
++			return fmt.Errorf("native primary source changed")
++		}
++		// Both possibly blocking locks precede the deadline/owner test. The guarded
++		// callback is only local assignment; it never seeks, reads, writes or awaits.
++		return command.guard(func() {
++			if command.source != nil {
++				displaced = append(displaced, source.source[source.which], source.source[!source.which])
++				source.source[source.which] = command.source
++				delete(source.source, !source.which)
++				source.cond.Broadcast()
++			}
++			setPaused(command.paused)
++		})
++	})
++	if err == nil {
++		// Publication removed these sources while both source/output locks were
++		// held. Dispose them after releasing locks; the adopted source remains live.
++		seen := map[librespot.AudioSource]bool{}
++		for _, old := range displaced {
++			if old != nil && old != command.source && !seen[old] {
++				seen[old] = true
++				_ = closeAudioDecoder(old)
++			}
++		}
++	}
++	return err
++}

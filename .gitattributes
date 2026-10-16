@@ -1,0 +1,3 @@
+podconnect/patches/*.patch -whitespace
+packaging/patches/*.patch -whitespace
+packaging/patches/*.diff -whitespace

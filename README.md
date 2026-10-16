@@ -8,7 +8,7 @@ halves**, both installed from this one repo.
 Spotify app / Home Assistant ─► go-librespot (Spotify Connect) ─► pipe ─► OwnTone ─► AirPlay 2 ─► HomePod
 ```
 
-## Optional exact-source control contracts (Speakers 0.26.21 / Control 0.10.14 candidate)
+## Optional exact-source control contracts (Speakers 0.26.22 / Control 0.10.15 candidate)
 
 The optional account-identifier diagnostic observes the current native connection and compares
 its identifier hash with the selected Control account's existing identifier. It never returns

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from datetime import timedelta
@@ -30,16 +31,52 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self.poll_sequence = 0
         self.owner_epoch = secrets.token_hex(16)
+        # Covers collection AND HA publication for scheduled/manual/demand polls.
+        self._poll_lock = asyncio.Lock()
+        self._command_refresh_task = None
+        self.command_owner_guard = None
+
+    async def _async_refresh(self, *args, **kwargs):
+        async with self._poll_lock:
+            await super()._async_refresh(*args, **kwargs)
+
+    def _check_command_owner(self):
+        if self.command_owner_guard is not None and not self.command_owner_guard():
+            raise UpdateFailed("Observation owner replaced")
+
+    async def async_refresh_after_command(self):
+        """One bounded shared read; caller cancellation cannot cancel its owner."""
+        if self._command_refresh_task is None or self._command_refresh_task.done():
+
+            async def refresh():
+                try:
+                    async with asyncio.timeout(1):
+                        self._check_command_owner()
+                        await self.async_refresh()
+                except (TimeoutError, UpdateFailed):
+                    return
+
+            self._command_refresh_task = self.hass.async_create_background_task(
+                refresh(), "podconnect post-command observation", eager_start=False
+            )
+        try:
+            async with asyncio.timeout(0.2):
+                await asyncio.shield(self._command_refresh_task)
+        except TimeoutError:
+            return
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch playback state + the device list."""
+        self._check_command_owner()
         self.poll_sequence += 1
         poll_sequence = self.poll_sequence
         try:
             playback = await self.api.playback_state()
+            self._check_command_owner()
             playback_observed_at = dt_util.utcnow()
             playback_observed_monotonic = time.monotonic()
             devices = await self.api.devices()
+            self._check_command_owner()
         except SpotifyApiError as err:
             raise UpdateFailed(str(err)) from err
         return {

@@ -88,13 +88,18 @@ func renderGLConfig(r *Room) error {
 				for _, entry := range entries {
 					fmt.Fprintf(&b, "  - %q\n", entry.RoomID)
 				}
+				b.WriteString("device_alias_homepod_ids:\n")
+				for _, entry := range entries {
+					fmt.Fprintf(&b, "  - %q\n", entry.HomepodID)
+				}
 			} else {
 				b.WriteString("device_alias_room_ids: []\n") // explicitly unavailable, never legacy
 			}
 			aliasesBlock = b.String()
 		}
 	}
-	cfg := fmt.Sprintf(`device_name: "%s"
+	cfg := fmt.Sprintf(`room_transport_owntone_url: %q
+device_name: "%s"
 device_id: "%s"
 device_type: speaker
 bitrate: %s
@@ -114,7 +119,7 @@ server:
   enabled: true
   address: 0.0.0.0
   port: %d
-`, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, startVolumePercent, r.GLPort)
+`, r.OwnTone, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, startVolumePercent, r.GLPort)
 	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 
