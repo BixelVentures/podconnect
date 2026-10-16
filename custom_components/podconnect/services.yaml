@@ -911,3 +911,24 @@ cancel_room_move_preparation:
       required: true
       selector:
         text:
+
+get_room_queue_controls:
+  name: Hent rummets køvalg
+  description: Læs kun native køforekomster for den præcise konto, motor og HomePod.
+  fields:
+    config_entry_id:
+      required: true
+    kind:
+      required: true
+    target_id:
+      required: true
+    room_id:
+      required: true
+    homepod_id:
+      required: true
+prepare_room_queue:
+  name: Forbered rummets køvalg
+  description: Forbered ét opaque køvalg uden afspilning; godkendelse skal kontrolleres igen før commit.
+control_room_queue:
+  name: Udfør rummets forberedte køvalg
+  description: Brug den samme kommandoidentitet og et kortlivet engangs-ID; ukendt resultat må ikke gentages.

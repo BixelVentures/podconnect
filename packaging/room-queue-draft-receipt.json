@@ -1,0 +1,50 @@
+{
+  "schema": "podconnect.room_queue_draft_composition.v1",
+  "base_head": "d2aaaa044d7fed43f2d192de9f6726e84332b6d2",
+  "candidate_versions": {
+    "speakers": "0.26.23",
+    "control": "0.10.16"
+  },
+  "reviewed_source_bytes": {
+    "podconnect/manager/room_queue.go": "d3374d39f6a9253c7253f5f5e965c4e53a1ac5db9c47ead9d0d0b84085fa5a2f",
+    "podconnect/manager/room_queue_test.go": "00ac9ac1eae5a1653dca1532ba5bc66b3077e3366022b57074be0791e7abfc1d",
+    "podconnect/manager/main.go": "7554778424fbd32e2196d6828d11b1035bf3299b5398319525adeefa7310546d",
+    "custom_components/podconnect/commands.py": "34ea9f36499bfe84b60fa0f1bad2713a9a44a7341f7ef8abe73fa509828c6607",
+    "custom_components/podconnect/speakers.py": "a97fd039b4dd9ad4c6e3290a7d43eb7efe71b24956342b96568b150d82d78b5e",
+    "custom_components/podconnect/services.yaml": "dc2387302b619d84fecdc6ece5f10c5692d8a250451bd8b336d95e2eab761fd0",
+    "custom_components/podconnect/room_queue.py": "792f6e7e2aac4a2a96ff6adc58b3cf4cc2fb60be2426ec4cb6a5cc797346dc25",
+    "tests/ha_framework/test_room_queue.py": "c0db9d7cb8390a188171e417ee0d3ea8325a0281ee04444e15722a3927a2279e"
+  },
+  "new_patch_bytes": {
+    "podconnect/patches/room-queue-native.patch": "29cabcb74969c8a2e605c3eec166141ad812732037fadd1a94d581ee0af63d72",
+    "podconnect/patches/room-queue-owntone.patch": "5015a42d0ca6cab0fc535944c794094e45024332a43b0600fa2b15d5bdd96d9a"
+  },
+  "patch_replay_evidence": {
+    "native_changed_files": 14,
+    "native_files_compared": 274,
+    "c_changed_files": 12,
+    "c_files_compared": 563,
+    "mismatches": 0,
+    "source": "PodView/integration/queue-occurrence-next/combined-patch-application.json"
+  },
+  "local_checks": {
+    "source_copy_exact": "8/8 PASS",
+    "new_patch_sha256": "2/2 PASS",
+    "native_stack_manifest": "17/17 PASS",
+    "c_queue_manifest": "1/1 PASS",
+    "reverse_apply_on_reviewed_replay": "2/2 PASS",
+    "dockerfile_order_and_modes": "PASS",
+    "workflow_yaml_parse": "PASS",
+    "git_diff_check": "PASS",
+    "manager_focused_go_tests": "PASS on byte-identical isolated source; not repeated in this clone"
+  },
+  "pending": [
+    "Linux Native CGO/race execution",
+    "OwnTone C build and queue wire modes",
+    "Home Assistant framework execution",
+    "composed end-to-end custody review",
+    "immutable image publication",
+    "installation",
+    "provider and audible acceptance"
+  ]
+}

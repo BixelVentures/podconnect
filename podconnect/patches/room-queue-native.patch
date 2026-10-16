@@ -1,0 +1,1525 @@
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -753,6 +753,7 @@
+ 		s.handleRequest(ApiRequest{Type: ApiRequestSetDeviceName, Data: data.Name}, w)
+ 	})
+ 	m.HandleFunc("/player/room_transport/bound-state", s.handleRoomTransportState)
++	m.HandleFunc("/player/room_transport/bound-queue", s.handleRoomQueue)
+ 	m.HandleFunc("/player/room_transport/bound-prepare", s.handleRoomTransportPrepare)
+ 	m.HandleFunc("/player/room_transport/bound-commit", s.handleRoomTransportCommit)
+ 	m.HandleFunc("/player/room_content/controls", s.handleContentControls)
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -39,16 +39,19 @@
+ 	clientToken string
+ 	state       *librespot.AppState
+ 
+-	server             ApiServer
+-	mpris              mpris.Server
+-	logoutCh           chan *AppPlayer
+-	moveCustodyMu      sync.Mutex
+-	moveCustody        *moveOperation
+-	moveCustodyUnknown bool
+-	startCustody       *contentOperation
+-	startOutputPermit  *contentOperation
+-	openedWriter       output.MovePipeIdentity
+-	retirementPending  *retirementAttempt
++	server                 ApiServer
++	mpris                  mpris.Server
++	logoutCh               chan *AppPlayer
++	moveCustodyMu          sync.Mutex
++	moveCustody            *moveOperation
++	moveCustodyUnknown     bool
++	startCustody           *contentOperation
++	startOutputPermit      *contentOperation
++	openedWriter           output.MovePipeIdentity
++	openedWriterOwner      *AppPlayer
++	openedWriterGeneration uint64
++	queueWriterFences      map[*nativeTransportOffer]queueWriterFence
++	retirementPending      *retirementAttempt
+ 
+ 	closed bool
+ }
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -570,6 +570,8 @@
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
++	case apiRoomBoundQueue:
++		return p.observeRoomQueue(ctx, req.Data.(roomTransportStateRequest))
+ 	case apiMoveObserve:
+ 		return p.captureMove(req.Data.(roomVolumeScope))
+ 	case apiMoveOffer:
+--- a/daemon/queue_occurrence.go
++++ b/daemon/queue_occurrence.go
+@@ -14,6 +14,9 @@
+ 	"strings"
+ 	"time"
+ 
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ )
+ 
+@@ -57,11 +60,18 @@
+ 	Truncated        bool              `json:"truncated"`
+ }
+ type nativeQueueOffer struct {
+-	Snapshot nativeQueueSnapshot
+-	State    *State
+-	Tracks   *tracks.List
+-	Alias    ApiAliasBinding
+-	Expires  time.Time
++	Snapshot    nativeQueueSnapshot
++	State       *State
++	Tracks      *tracks.List
++	Alias       ApiAliasBinding
++	Expires     time.Time
++	BoundOwner  *roomTransportIdentity
++	PlayerState *connectpb.PlayerState
++	Session     *session.Session
++	Player      *player.Player
++	Primary     *player.Stream
++	Generation  uint64
++	Writer      *queueWriterProof
+ }
+ 
+ func randomQueueID(bytes int) (string, error) {
+@@ -95,7 +105,7 @@
+ 	}
+ 	return binding, nil
+ }
+-func (p *AppPlayer) observeQueueOccurrences(parent context.Context, request queueReadRequest) (any, error) {
++func (p *AppPlayer) newQueueObservation(parent context.Context, request queueReadRequest) (*nativeQueueOffer, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	binding, err := p.queueBinding(request.AccountUserID, request.RoomID)
+@@ -129,8 +139,17 @@
+ 		}
+ 		result.Items = append(result.Items, nativeQueueItem{occurrence, row.Position, row.URI, row.Queued})
+ 	}
+-	p.queueOccurrenceOffer = &nativeQueueOffer{result, p.state, p.state.tracks, *binding, time.Now().Add(queueOfferLifetime)}
+-	return result, nil
++	return &nativeQueueOffer{Snapshot: result, State: p.state, Tracks: p.state.tracks, Alias: *binding, Expires: time.Now().Add(queueOfferLifetime)}, nil
++}
++
++// Build detached observations so a failed bound read cannot replace another token.
++func (p *AppPlayer) observeQueueOccurrences(parent context.Context, request queueReadRequest) (any, error) {
++	offer, err := p.newQueueObservation(parent, request)
++	if err != nil {
++		return nil, err
++	}
++	p.queueOccurrenceOffer = offer
++	return offer.Snapshot, nil
+ }
+ func (p *AppPlayer) commitQueueOccurrence(parent context.Context, request queueJumpRequest) (any, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+@@ -142,6 +161,9 @@
+ 		return nil, ErrAliasConflict
+ 	}
+ 	p.queueOccurrenceOffer = nil
++	if offer.BoundOwner != nil {
++		return nil, ErrAliasConflict
++	}
+ 	binding, err := p.queueBinding(request.AccountUserID, request.RoomID)
+ 	if err != nil || ctx.Err() != nil || !time.Now().Before(offer.Expires) || p.state != offer.State || p.state.tracks != offer.Tracks || binding == nil || *binding != offer.Alias || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || request.SessionID != offer.Snapshot.SessionID || request.QueueRevision != offer.Snapshot.QueueRevision || request.AccountUserID != offer.Snapshot.AccountUserID || request.RoomID != offer.Snapshot.RoomID {
+ 		return nil, ErrAliasConflict
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -82,21 +82,27 @@
+ func (app *App) withNewOutput(owner *AppPlayer, create func() (output.Output, error)) (output.Output, error) {
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
++	if app.queueWriterBusyLocked() {
++		return nil, ErrAliasConflict
++	}
+ 	if app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != nil {
+ 		allowed := !app.moveCustodyUnknown && app.retirementPending == nil && app.startCustody != nil &&
+ 			app.startOutputPermit == app.startCustody && app.startCustody.Owner == owner
+ 		if allowed {
+-			return app.openRegisteredOutputLocked(create)
++			return app.openRegisteredOutputLocked(owner, create)
+ 		}
+ 		return nil, ErrAliasConflict
+ 	}
+ 	if err := app.revokeCompletedMoveCustodyLocked(nil); err != nil {
+ 		return nil, err
+ 	}
+-	return app.openRegisteredOutputLocked(create)
++	return app.openRegisteredOutputLocked(owner, create)
+ }
+ 
+-func (app *App) openRegisteredOutputLocked(create func() (output.Output, error)) (output.Output, error) {
++func (app *App) openRegisteredOutputLocked(owner *AppPlayer, create func() (output.Output, error)) (output.Output, error) {
++	if app.openedWriterGeneration == ^uint64(0) {
++		return nil, ErrAliasConflict
++	}
+ 	out, err := create()
+ 	if err != nil {
+ 		return nil, err
+@@ -108,6 +114,8 @@
+ 	} else {
+ 		app.openedWriter = output.MovePipeIdentity{}
+ 	}
++	app.openedWriterOwner = owner
++	app.openedWriterGeneration++
+ 	return out, nil
+ }
+ 
+--- /dev/null
++++ b/daemon/room_queue.go
+@@ -0,0 +1,433 @@
++package daemon
++
++// Queue is a distinct same-writer transport purpose. Preparation never changes
++// the live cursor/source; only the existing guarded worker may publish it.
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"net/http"
++	"path/filepath"
++	"strconv"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"google.golang.org/protobuf/proto"
++)
++
++const apiRoomBoundQueue ApiRequestType = "room_bound_queue"
++const queuePurpose = "queue_occurrence_v1"
++
++type queueSelection struct {
++	ObservationID string `json:"observation_id"`
++	SessionID     string `json:"session_id"`
++	QueueRevision uint64 `json:"queue_revision"`
++	OccurrenceID  string `json:"occurrence_id"`
++}
++type queueWriterWire struct {
++	Process     contentProcess      `json:"native_process"`
++	FD          string              `json:"writer_fd"`
++	Pipe        output.PipeIdentity `json:"pipe_identity"`
++	Epoch       string              `json:"source_epoch"`
++	Generation  string              `json:"open_generation"`
++	InputDigest string              `json:"input_path_digest"`
++}
++type queueWriterProof struct {
++	Wire      queueWriterWire
++	Completed *completedWriter
++}
++type queueTransportProof struct {
++	Selection      queueSelection
++	Position       int
++	Observation    *nativeQueueOffer
++	Owner          *AppPlayer
++	EffectEnqueued bool
++	EffectJoined   bool
++}
++type queueWriterFence struct {
++	Owner      *AppPlayer
++	Writer     output.MovePipeIdentity
++	Generation uint64
++	Until      time.Time
++}
++type queueStateResponse struct {
++	Schema        string                `json:"schema"`
++	Ready         bool                  `json:"ready"`
++	Purpose       string                `json:"purpose"`
++	Owner         roomTransportIdentity `json:"native_owner"`
++	ObservationID string                `json:"observation_id"`
++	Revision      uint64                `json:"queue_revision"`
++	Expires       int                   `json:"expires_after_ms"`
++	Items         []nativeQueueItem     `json:"items"`
++	Truncated     bool                  `json:"truncated"`
++	Writer        queueWriterWire       `json:"writer_proof"`
++	Physical      bool                  `json:"physical_result_verified"`
++}
++type queuePrepareResponse struct {
++	Schema    string                `json:"schema"`
++	Purpose   string                `json:"purpose"`
++	PrepareID string                `json:"prepare_id"`
++	Owner     roomTransportIdentity `json:"native_owner"`
++	Revision  string                `json:"native_revision"`
++	Action    string                `json:"action"`
++	Percent   int                   `json:"volume_percent"`
++	Digest    string                `json:"args_digest"`
++	Expires   int                   `json:"expires_after_ms"`
++	Queue     queueSelection        `json:"queue"`
++	Writer    queueWriterWire       `json:"writer_proof"`
++}
++type queueCommitResponse struct {
++	Schema        string                `json:"schema"`
++	Accepted      bool                  `json:"accepted_native"`
++	Purpose       string                `json:"purpose"`
++	PrepareID     string                `json:"prepare_id"`
++	ObservationID string                `json:"observation_id"`
++	OccurrenceID  string                `json:"occurrence_id"`
++	QueueRevision uint64                `json:"queue_revision"`
++	Owner         roomTransportIdentity `json:"native_owner"`
++	Revision      string                `json:"native_revision"`
++	Digest        string                `json:"args_digest"`
++	Physical      bool                  `json:"physical_result_verified"`
++}
++type queueCCommit struct {
++	Token       string                `json:"token"`
++	PrepareID   string                `json:"native_prepare_id"`
++	Action      string                `json:"action"`
++	Digest      string                `json:"args_digest"`
++	InputDigest string                `json:"expected_input_path_digest"`
++	Owner       roomTransportIdentity `json:"native_owner"`
++	Revision    string                `json:"native_revision"`
++	Queue       queueSelection        `json:"queue"`
++	Writer      queueWriterWire       `json:"writer_proof"`
++}
++type queueCACK struct {
++	Schema    string                `json:"schema"`
++	OK        bool                  `json:"ok"`
++	Purpose   string                `json:"purpose"`
++	Token     string                `json:"token"`
++	PrepareID string                `json:"native_prepare_id"`
++	Digest    string                `json:"args_digest"`
++	Remaining int                   `json:"pin_remaining_ms"`
++	Outcome   string                `json:"outcome"`
++	Owner     roomTransportIdentity `json:"native_owner"`
++	Revision  string                `json:"native_revision"`
++	Queue     queueSelection        `json:"queue"`
++	Writer    queueWriterWire       `json:"writer_proof"`
++	Physical  bool                  `json:"physical_result_verified"`
++}
++
++func (app *App) queueWriterBusyLocked() bool {
++	now := time.Now()
++	for op, fence := range app.queueWriterFences {
++		if !now.Before(fence.Until) {
++			delete(app.queueWriterFences, op)
++		}
++	}
++	return len(app.queueWriterFences) > 0
++}
++func (app *App) releaseQueueWriter(op *nativeTransportOffer) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	delete(app.queueWriterFences, op)
++}
++func (p *AppPlayer) queueWriterCurrentLocked(proof *queueWriterProof, offer *nativeTransportOffer) bool {
++	if proof == nil || p.app == nil {
++		return false
++	}
++	process, ok := nativeContentProcess()
++	if !ok || process != proof.Wire.Process {
++		return false
++	}
++	generation, err := strconv.ParseUint(proof.Wire.Generation, 10, 64)
++	if err != nil || generation == 0 {
++		return false
++	}
++	current, err := p.app.completedWriterCurrent(p, offer.Snapshot.roomTransportIdentity)
++	if err != nil || (current == nil) != (proof.Completed == nil) || current != nil && *current != *proof.Completed {
++		return false
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	app := p.app
++	writer := output.MovePipeIdentity{PipeIdentity: proof.Wire.Pipe, FD: proof.Wire.FD}
++	if app.moveCustodyUnknown || app.retirementPending != nil || app.openedWriterOwner != p || app.openedWriter != writer || app.openedWriterGeneration != generation {
++		return false
++	}
++	fence, ok := app.queueWriterFences[offer]
++	return ok && fence.Owner == p && fence.Writer == writer && fence.Generation == generation && time.Now().Before(fence.Until)
++}
++func (p *AppPlayer) captureQueueWriter(ctx context.Context, identity roomTransportIdentity, reserve *nativeTransportOffer) (*queueWriterProof, error) {
++	if p.primaryStream == nil || p.primaryStream.Source == nil || p.player == nil || p.state == nil || p.state.player == nil || p.app == nil || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) {
++		return nil, ErrAliasConflict
++	}
++	process, ok := nativeContentProcess()
++	if !ok {
++		return nil, ErrAliasConflict
++	}
++	completed, err := p.app.completedWriterCurrent(p, identity)
++	if err != nil {
++		return nil, err
++	}
++	p.app.moveCustodyMu.Lock()
++	writer, generation, owner := p.app.openedWriter, p.app.openedWriterGeneration, p.app.openedWriterOwner
++	invalid := p.app.moveCustodyUnknown || p.app.retirementPending != nil
++	p.app.moveCustodyMu.Unlock()
++	if invalid || owner != p || generation == 0 || writer.Type != "fifo" || !volumeCounter(writer.FD) {
++		return nil, ErrAliasConflict
++	}
++	primary, paused := p.primaryStream, p.state.player.IsPaused
++	actual, epoch, err := p.player.RoomMove(ctx, "inspect", primary.Source, output.MovePipeIdentity{}, "", !paused, func(mutate func()) error {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		current, err := p.app.completedWriterCurrent(p, identity)
++		if err != nil || (current == nil) != (completed == nil) || current != nil && *current != *completed {
++			return ErrAliasConflict
++		}
++		binding := p.aliasBindingLocked()
++		if ctx.Err() != nil || p.primaryStream != primary || p.state == nil || p.state.player == nil || p.state.player.IsPaused != paused || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || !p.hasInitialConnectState || p.spotConnId != identity.ConnectionID || p.state.player.SessionId != identity.SessionID || p.aliasIncarnation != identity.AliasIncarnation || p.aliasFingerprint != identity.AliasRegistry || p.aliasRevision != identity.AliasRevision || binding == nil || !binding.Ready || binding.RoomID != identity.RoomID || !p.transportMappingCurrentLocked() {
++			return ErrAliasConflict
++		}
++		p.app.moveCustodyMu.Lock()
++		defer p.app.moveCustodyMu.Unlock()
++		app := p.app
++		if app.moveCustodyUnknown || app.retirementPending != nil || app.openedWriterOwner != p || app.openedWriter != writer || app.openedWriterGeneration != generation {
++			return ErrAliasConflict
++		}
++		if reserve != nil {
++			if !time.Now().Before(reserve.Expires) {
++				return ErrAliasConflict
++			}
++			app.queueWriterBusyLocked()
++			if app.queueWriterFences == nil {
++				app.queueWriterFences = make(map[*nativeTransportOffer]queueWriterFence)
++			}
++			if len(app.queueWriterFences) >= 128 {
++				return ErrAliasConflict
++			}
++			app.queueWriterFences[reserve] = queueWriterFence{p, writer, generation, reserve.Expires}
++		}
++		mutate()
++		return nil
++	})
++	if err != nil || actual != writer || !volumeCounter(epoch) || completed != nil && (completed.writer != actual || completed.epoch != epoch) {
++		if reserve != nil {
++			p.app.releaseQueueWriter(reserve)
++		}
++		return nil, ErrAliasConflict
++	}
++	digest := sha256.Sum256([]byte(p.app.cfg.AudioOutputPipe))
++	return &queueWriterProof{queueWriterWire{process, actual.FD, actual.PipeIdentity, epoch, strconv.FormatUint(generation, 10), hex.EncodeToString(digest[:])}, completed}, nil
++}
++func (p *AppPlayer) strongQueueCurrent(offer *nativeQueueOffer, identity roomTransportIdentity) bool {
++	if offer == nil || offer.BoundOwner == nil || *offer.BoundOwner != identity || !time.Now().Before(offer.Expires) || p.state != offer.State || p.state == nil || p.state.player != offer.PlayerState || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.Snapshot.QueueRevision || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.roomTransportGeneration != offer.Generation {
++		return false
++	}
++	latest, err := p.roomTransportIdentity(identity.AccountUserID, identity.TargetID, identity.RoomID, identity.HomePodID)
++	return err == nil && latest == identity && nativeBoundOwnerValid(latest)
++}
++func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTransportStateRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil || !nativeBoundOwnerValid(identity) {
++		return nil, ErrAliasConflict
++	}
++	offer, err := p.newQueueObservation(parent, queueReadRequest{request.AccountUserID, request.RoomID, ctx})
++	if err != nil {
++		return nil, err
++	}
++	if !validRoomQueueObservation(offer) {
++		return nil, ErrAliasConflict
++	}
++	offer.BoundOwner = &identity
++	offer.PlayerState = p.state.player
++	offer.Session = p.sess
++	offer.Player = p.player
++	offer.Primary = p.primaryStream
++	offer.Generation = p.roomTransportGeneration
++	writer, err := p.captureQueueWriter(ctx, identity, nil)
++	if err != nil || ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(offer, identity) {
++		return nil, ErrAliasConflict
++	}
++	offer.Writer = writer
++	remaining := int(time.Until(offer.Expires).Milliseconds())
++	if remaining < 1 {
++		return nil, ErrAliasConflict
++	}
++	p.queueOccurrenceOffer = offer
++	return queueStateResponse{"podconnect.native_room_queue_state.v1", true, queuePurpose, identity, offer.Snapshot.ObservationID, offer.Snapshot.QueueRevision, min(remaining, 10000), offer.Snapshot.Items, offer.Snapshot.Truncated, writer.Wire, false}, nil
++}
++func validRoomQueueObservation(offer *nativeQueueOffer) bool {
++	if offer == nil || offer.Snapshot.QueueRevision >= 1<<53 || len(offer.Snapshot.Items) > 20 {
++		return false
++	}
++	for _, row := range offer.Snapshot.Items {
++		if !contentTrackURI.MatchString(row.URI) {
++			return false
++		}
++	}
++	return true
++}
++func validQueueSelection(q *queueSelection) bool {
++	return q != nil && queueIDPattern.MatchString(q.ObservationID) && queueOccurrenceIDPattern.MatchString(q.OccurrenceID) && nativeOwnerASCII(q.SessionID, 255) && q.QueueRevision < 1<<53
++}
++func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransportPrepareRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	if request.Action != "queue" || request.VolumePercent != 0 || !validQueueSelection(request.Queue) {
++		return nil, ErrBadRequest
++	}
++	observed := p.queueOccurrenceOffer
++	if observed == nil || observed.Snapshot.ObservationID != request.Queue.ObservationID {
++		return nil, ErrAliasConflict
++	}
++	p.queueOccurrenceOffer = nil
++	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil || !p.strongQueueCurrent(observed, identity) || observed.Writer == nil || request.Queue.SessionID != identity.SessionID || request.Queue.QueueRevision != observed.Snapshot.QueueRevision {
++		return nil, ErrAliasConflict
++	}
++	position := -1
++	for _, item := range observed.Snapshot.Items {
++		if item.ID == request.Queue.OccurrenceID {
++			position = item.Position
++			break
++		}
++	}
++	if position < 0 {
++		return nil, ErrBadRequest
++	}
++	offer := &nativeTransportOffer{Bound: true, Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: observed.Snapshot.QueueRevision, State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Queue: &queueTransportProof{Selection: *request.Queue, Position: position, Observation: observed, Owner: p}}
++	owned := true
++	defer func() {
++		if owned {
++			offer.discardPrepared()
++		}
++	}()
++	staged, err := p.state.tracks.PrepareQueueOccurrence(ctx, request.Queue.QueueRevision, position)
++	if err != nil {
++		return nil, err
++	}
++	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++		return nil, ErrAliasConflict
++	}
++	state := proto.Clone(p.state.player).(*connectpb.PlayerState)
++	state.Track = staged.CurrentTrack()
++	state.PrevTracks = staged.PrevTracks()
++	state.NextTracks = staged.NextTracks(ctx, nil)
++	state.Index = staged.Index()
++	state.IsPaused = false
++	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++		return nil, ErrAliasConflict
++	}
++	// Stream identity is resolved from the exact staged native occurrence, never an input URI.
++	stream, err := p.queuePreparedStream(ctx, state.Track.Uri)
++	if err != nil {
++		return nil, err
++	}
++	offer.PreparedTracks = staged
++	offer.PreparedState = state
++	offer.PreparedStream = stream
++	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++		return nil, ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return nil, err
++	}
++	offer.NativeRevision = revision
++	offer.Expires = minTime(observed.Expires, time.Now().Add(roomTransportLifetime))
++	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: "podconnect.native_room_queue_prepare.v1", Action: "queue", NativeRevision: revision, ExpiresAfterMS: int(time.Until(offer.Expires).Milliseconds())}
++	writer, err := p.captureQueueWriter(ctx, identity, offer)
++	if err != nil || writer == nil || writer.Wire != observed.Writer.Wire || !p.strongQueueCurrent(observed, identity) {
++		return nil, ErrAliasConflict
++	}
++	offer.Writer = writer
++	offer.CompletedWriter = writer.Completed
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	offer.Snapshot.PrepareID = id
++	raw, err := json.Marshal(struct {
++		Owner    roomTransportIdentity `json:"native_owner"`
++		Action   string                `json:"action"`
++		Queue    queueSelection        `json:"queue"`
++		Writer   queueWriterWire       `json:"writer_proof"`
++		Revision string                `json:"native_revision"`
++	}{identity, "queue", *request.Queue, writer.Wire, revision})
++	if err != nil {
++		return nil, err
++	}
++	digest := sha256.Sum256(raw)
++	offer.Snapshot.ArgsDigest = hex.EncodeToString(digest[:])
++	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++		return nil, ErrAliasConflict
++	}
++	remaining := int(time.Until(offer.Expires).Milliseconds())
++	if remaining < 1 {
++		return nil, ErrAliasConflict
++	}
++	p.storeRoomTransportOffer(offer)
++	owned = false
++	return queuePrepareResponse{"podconnect.native_room_queue_prepare.v1", queuePurpose, id, identity, revision, "queue", 0, offer.Snapshot.ArgsDigest, remaining, *request.Queue, writer.Wire}, nil
++}
++func minTime(a, b time.Time) time.Time {
++	if a.Before(b) {
++		return a
++	}
++	return b
++}
++func (p *AppPlayer) queuePreparedStream(ctx context.Context, uri string) (*player.Stream, error) {
++	// Keep the same metadata/decoder implementation used by guarded Next.
++	if !contentTrackURI.MatchString(uri) {
++		return nil, ErrBadRequest
++	}
++	id, err := librespot.SpotifyIdFromUri(uri)
++	if err != nil {
++		return nil, err
++	}
++	return p.player.NewStream(ctx, p.app.client, *id, p.app.cfg.Bitrate, 0)
++}
++func queueCommitPayload(offer *nativeTransportOffer, token string) queueCCommit {
++	return queueCCommit{token, offer.Snapshot.PrepareID, "queue", offer.Snapshot.ArgsDigest, offer.Writer.Wire.InputDigest, offer.Snapshot.roomTransportIdentity, offer.NativeRevision, offer.Queue.Selection, offer.Writer.Wire}
++}
++func validQueueACK(raw []byte, offer *nativeTransportOffer, token string) bool {
++	var ack queueCACK
++	if strictContentJSON(raw, &ack) != nil {
++		return false
++	}
++	return ack.Schema == "podconnect.output_queue_commit.v1" && ack.OK && ack.Purpose == queuePurpose && ack.Token == token && ack.PrepareID == offer.Snapshot.PrepareID && ack.Digest == offer.Snapshot.ArgsDigest && ack.Remaining > 0 && ack.Remaining <= 10000 && ack.Outcome == "accepted" && ack.Owner == offer.Snapshot.roomTransportIdentity && ack.Revision == offer.NativeRevision && ack.Queue == offer.Queue.Selection && ack.Writer == offer.Writer.Wire && !ack.Physical
++}
++func queueAccepted(offer *nativeTransportOffer) queueCommitResponse {
++	q := offer.Queue.Selection
++	return queueCommitResponse{"podconnect.native_room_queue_commit.v1", true, queuePurpose, offer.Snapshot.PrepareID, q.ObservationID, q.OccurrenceID, q.QueueRevision, offer.Snapshot.roomTransportIdentity, offer.NativeRevision, offer.Snapshot.ArgsDigest, false}
++}
++func (s *ConcreteApiServer) handleRoomQueue(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(405)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 4 {
++		w.WriteHeader(400)
++		return
++	}
++	for _, key := range []string{"account_user_id", "target_id", "room_id", "homepod_id"} {
++		if len(q[key]) != 1 || !nativeOwnerASCII(q.Get(key), 160) {
++			w.WriteHeader(400)
++			return
++		}
++	}
++	if !homePodIDPattern.MatchString(q.Get("homepod_id")) {
++		w.WriteHeader(400)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	data, err := s.roomTransportAsk(ctx, apiRoomBoundQueue, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	roomTransportResponse(w, data, err)
++}
+--- /dev/null
++++ b/daemon/room_queue_test.go
+@@ -0,0 +1,155 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func queueAdmittedFixture(t *testing.T) (*AppPlayer, *nativeTransportOffer) {
++	p, offer := roomTransportAdmittedFixture(t)
++	process := contentProcess{"11111111-1111-1111-1111-111111111111", "123", "1"}
++	// Private actor/receipt fixture, not a real authenticated provider or kernel proof.
++	writer := &queueWriterProof{Wire: queueWriterWire{process, "0", output.PipeIdentity{"1", "2", "fifo"}, "0", "1", strings.Repeat("a", 64)}}
++	owner := offer.Snapshot.roomTransportIdentity
++	observation := &nativeQueueOffer{Snapshot: nativeQueueSnapshot{ObservationID: strings.Repeat("c", 32), QueueRevision: offer.QueueRevision}, Expires: time.Now().Add(time.Second), BoundOwner: &owner, Writer: writer}
++	offer.Bound = true
++	offer.NativeRevision = "2"
++	p.roomNativeIntent = 2
++	offer.Snapshot.NativeRevision = "2"
++	offer.Snapshot.Action = "queue"
++	offer.Writer = writer
++	offer.Queue = &queueTransportProof{Selection: queueSelection{strings.Repeat("c", 32), owner.SessionID, offer.QueueRevision, strings.Repeat("d", 24)}, Position: 1, Observation: observation, Owner: p}
++	p.app.openedWriter = output.MovePipeIdentity{PipeIdentity: writer.Wire.Pipe, FD: writer.Wire.FD}
++	p.app.openedWriterOwner = p
++	p.app.openedWriterGeneration = 1
++	p.app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{offer: {p, p.app.openedWriter, 1, offer.Expires}}
++	return p, offer
++}
++func TestQueueCACKClosedExactPurposeSelectionOwnerAndWriter(t *testing.T) {
++	_, offer := queueAdmittedFixture(t)
++	token := strings.Repeat("f", 32)
++	ack := queueCACK{"podconnect.output_queue_commit.v1", true, queuePurpose, token, offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, 10000, "accepted", offer.Snapshot.roomTransportIdentity, "2", offer.Queue.Selection, offer.Writer.Wire, false}
++	raw, _ := json.Marshal(ack)
++	if !validQueueACK(raw, offer, token) {
++		t.Fatal("exact queue ACK rejected")
++	}
++	for _, change := range []func(*queueCACK){func(a *queueCACK) { a.Schema = "podconnect.output_transport_commit.v2" }, func(a *queueCACK) { a.Purpose = "next" }, func(a *queueCACK) { a.Owner.AliasRevision++ }, func(a *queueCACK) { a.Revision = "1" }, func(a *queueCACK) { a.Queue.OccurrenceID = strings.Repeat("e", 24) }, func(a *queueCACK) { a.Writer.FD = "1" }, func(a *queueCACK) { a.Writer.Epoch = "1" }, func(a *queueCACK) { a.Writer.Generation = "2" }, func(a *queueCACK) { a.Outcome = "unknown" }, func(a *queueCACK) { a.Remaining = 0 }} {
++		bad := ack
++		change(&bad)
++		body, _ := json.Marshal(bad)
++		if validQueueACK(body, offer, token) {
++			t.Fatal("foreign queue ACK accepted", string(body))
++		}
++	}
++	duplicate := strings.Replace(string(raw), `"writer_fd":"0"`, `"writer_fd":"0","writer_fd":"0"`, 1)
++	if validQueueACK([]byte(duplicate), offer, token) {
++		t.Fatal("nested duplicate proof admitted")
++	}
++}
++func TestQueueWriterFenceNoEarlyReleaseAndJoinedCleanup(t *testing.T) {
++	p, offer := queueAdmittedFixture(t)
++	calls := 0
++	create := func() (output.Output, error) { calls++; return nil, context.Canceled }
++	if _, err := p.app.withNewOutput(p, create); err == nil || calls != 0 {
++		t.Fatal("writer factory ran during exact queue fence")
++	}
++	offer.Queue.EffectEnqueued = true
++	offer.discardPrepared()
++	if !p.app.queueWriterBusyLocked() {
++		t.Fatal("unjoined/unknown operation released writer fence")
++	}
++	offer.Queue.EffectJoined = true
++	offer.discardPrepared()
++	if p.app.queueWriterBusyLocked() {
++		t.Fatal("joined queue kept writer blocked")
++	}
++	p.app.queueWriterFences[offer] = queueWriterFence{p, p.app.openedWriter, 1, time.Now().Add(-time.Second)}
++	if p.app.queueWriterBusyLocked() {
++		t.Fatal("expired last-effect cutoff still blocked")
++	}
++}
++func TestQueueBoundObservationCannotUseLegacyDirectCommit(t *testing.T) {
++	p, offer := queueAdmittedFixture(t)
++	p.queueOccurrenceOffer = offer.Queue.Observation
++	_, err := p.commitQueueOccurrence(context.Background(), queueJumpRequest{ObservationID: offer.Queue.Selection.ObservationID})
++	if err == nil || p.queueOccurrenceOffer != nil {
++		t.Fatal("bound token bypassed C admission through old endpoint")
++	}
++}
++func TestQueueConditionalPrepareClosedAndLegacyRejectsSelection(t *testing.T) {
++	for _, body := range []string{`{"account_user_id":"account","target_id":"engine","room_id":"r0","homepod_id":"101","action":"queue","volume_percent":0,"queue":{"observation_id":"x","session_id":"s","queue_revision":0,"occurrence_id":"y"}}`, `{"account_user_id":"account","target_id":"engine","room_id":"r0","homepod_id":"101","action":"next","volume_percent":0,"queue":{"observation_id":"x","session_id":"s","queue_revision":0,"occurrence_id":"y"}}`} {
++		var request roomTransportPrepareRequest
++		if strictContentJSON([]byte(body), &request) != nil {
++			t.Fatal("closed conditional fields did not decode")
++		}
++		if _, err := (&AppPlayer{}).prepareRoomTransportVersion(context.Background(), request, false); err == nil {
++			t.Fatal("legacy mode accepted queue authority")
++		}
++	}
++	response := httptest.NewRecorder()
++	(&ConcreteApiServer{}).handleRoomQueue(response, httptest.NewRequest("GET", "/player/room_transport/bound-queue?account_user_id=a&target_id=e&room_id=r", nil))
++	if response.Code != 400 {
++		t.Fatal("queue state accepted missing HomePod scope", response.Code)
++	}
++}
++func TestQueueDisposalNeverClosesPublishedOrReplaysPreparedSource(t *testing.T) {
++	p, offer := queueAdmittedFixture(t)
++	_ = p
++	source := &contentInertSource{}
++	offer.PreparedStream = &player.Stream{Source: source}
++	offer.discardPrepared()
++	offer.discardPrepared()
++	if source.closes.Load() != 1 {
++		t.Fatal("unadopted decoder not closed exactly once")
++	}
++	_, published := queueAdmittedFixture(t)
++	adopted := &contentInertSource{}
++	published.PreparedStream = &player.Stream{Source: adopted}
++	published.Published = true
++	published.Queue.EffectEnqueued = true
++	published.Queue.EffectJoined = true
++	published.discardPrepared()
++	if adopted.closes.Load() != 0 {
++		t.Fatal("adopted queue stream closed by cleanup")
++	}
++}
++
++func TestQueueBoundObservationOnlyEmitsTrackRowsAndSafeRevision(t *testing.T) {
++	valid := nativeQueueSnapshot{QueueRevision: 1<<53 - 1, Items: []nativeQueueItem{{ID: strings.Repeat("a", 24), Position: 1, URI: "spotify:track:0123456789012345678901"}}}
++	if !validRoomQueueObservation(&nativeQueueOffer{Snapshot: valid}) {
++		t.Fatal("valid track observation at highest JSON-safe revision rejected")
++	}
++	for _, uri := range []string{"spotify:episode:0123456789012345678901", "spotify:local:artist:album:track:120", "https://example.invalid/track", "spotify:track:short"} {
++		t.Run(uri, func(t *testing.T) {
++			bad := valid
++			bad.Items = append(append([]nativeQueueItem{}, valid.Items...), nativeQueueItem{URI: uri})
++			if validRoomQueueObservation(&nativeQueueOffer{Snapshot: bad}) {
++				t.Fatal("unsupported upcoming row advertised as executable", uri)
++			}
++		})
++	}
++	invalidRevision := valid
++	invalidRevision.QueueRevision = 1 << 53
++	if validRoomQueueObservation(&nativeQueueOffer{Snapshot: invalidRevision}) || validRoomQueueObservation(nil) {
++		t.Fatal("invalid observation or unsafe revision admitted")
++	}
++}
++
++func TestQueueFailedBoundReadPreservesExistingObservation(t *testing.T) {
++	p, offer := queueAdmittedFixture(t)
++	retained := offer.Queue.Observation
++	p.queueOccurrenceOffer = retained
++	// The failed scope check must not consume or replace another current token.
++	if _, err := p.observeRoomQueue(context.Background(), roomTransportStateRequest{AccountUserID: "foreign"}); err == nil {
++		t.Fatal("unbound read was admitted")
++	}
++	if p.queueOccurrenceOffer != retained {
++		t.Fatal("failed bound read consumed an unrelated observation")
++	}
++}
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -15,6 +15,7 @@
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"github.com/devgianlu/go-librespot/session"
+@@ -59,6 +60,7 @@
+ 	HomePodID     string          `json:"homepod_id"`
+ 	Action        string          `json:"action"`
+ 	VolumePercent int             `json:"volume_percent"`
++	Queue         *queueSelection `json:"queue,omitempty"`
+ 	Context       context.Context `json:"-"`
+ }
+ type roomTransportSnapshot struct {
+@@ -92,6 +94,8 @@
+ 	OwnToneURL          string
+ 	InputPath           string
+ 	CompletedWriter     *completedWriter
++	Queue               *queueTransportProof
++	Writer              *queueWriterProof
+ }
+ type roomTransportConsumeRequest struct {
+ 	PrepareID string
+@@ -103,6 +107,9 @@
+ }
+ 
+ func (offer *nativeTransportOffer) discardPrepared() {
++	if offer != nil && offer.Queue != nil && offer.Queue.Owner != nil && (!offer.Queue.EffectEnqueued || offer.Queue.EffectJoined) {
++		offer.Queue.Owner.app.releaseQueueWriter(offer)
++	}
+ 	if offer == nil || offer.Published || offer.Disposed {
+ 		return
+ 	}
+@@ -230,6 +237,15 @@
+ 	return p.prepareRoomTransportVersion(parent, request, false)
+ }
+ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request roomTransportPrepareRequest, bound bool) (any, error) {
++	if request.Action == "queue" {
++		if !bound {
++			return nil, ErrBadRequest
++		}
++		return p.prepareBoundQueue(parent, request)
++	}
++	if request.Queue != nil {
++		return nil, ErrBadRequest
++	}
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	if !slices.Contains(roomTransportActions, request.Action) || request.VolumePercent != 0 || ctx.Err() != nil || parent.Err() != nil {
+@@ -330,6 +346,12 @@
+ 			return false
+ 		}
+ 	}
++	if offer.Queue != nil {
++		q := offer.Queue
++		if !offer.Bound || offer.Snapshot.Action != "queue" || q.Owner != p || q.Observation == nil || q.Observation.BoundOwner == nil || *q.Observation.BoundOwner != offer.Snapshot.roomTransportIdentity || !time.Now().Before(q.Observation.Expires) || q.Selection.SessionID != offer.Snapshot.SessionID || q.Selection.QueueRevision != offer.QueueRevision || q.Observation.Writer == nil || offer.Writer == nil || q.Observation.Writer.Wire != offer.Writer.Wire || !p.queueWriterCurrentLocked(offer.Writer, offer) {
++			return false
++		}
++	}
+ 	binding := p.aliasBindingLocked()
+ 	if !p.transportMappingCurrentLocked() || binding == nil || !binding.Ready || binding.Incarnation != offer.Snapshot.AliasIncarnation || binding.Registry != offer.Snapshot.AliasRegistry || binding.RoomID != offer.Snapshot.RoomID {
+ 		return false
+@@ -392,7 +414,7 @@
+ 	defer cancelEffect()
+ 	stop := context.AfterFunc(parent, cancelEffect)
+ 	defer stop()
+-	err := p.player.GuardedTransport(effectContext, paused, stream, offer.Primary.Source, func(mutate func()) error {
++	guard := func(mutate func()) error {
+ 		p.aliasMu.Lock()
+ 		defer p.aliasMu.Unlock()
+ 		if !p.transportOfferCurrentLocked(offer, parent, request.Context) {
+@@ -416,7 +438,16 @@
+ 		p.state.setPaused(paused)
+ 		p.state.player.IsBuffering = false
+ 		return nil
+-	})
++	}
++	var err error
++	if offer.Queue != nil {
++		offer.Queue.EffectEnqueued = true
++		writer := output.MovePipeIdentity{PipeIdentity: offer.Writer.Wire.Pipe, FD: offer.Writer.Wire.FD}
++		err = p.player.GuardedQueueTransport(effectContext, stream, offer.Primary.Source, writer, offer.Writer.Wire.Epoch, guard)
++		offer.Queue.EffectJoined = true
++	} else {
++		err = p.player.GuardedTransport(effectContext, paused, stream, offer.Primary.Source, guard)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -431,6 +462,9 @@
+ 		event = player.EventTypePlay
+ 	}
+ 	p.handlePlayerEvent(parent, &player.Event{Type: event})
++	if offer.Queue != nil {
++		return queueAccepted(offer), nil
++	}
+ 	return struct {
+ 		Schema         string `json:"schema"`
+ 		AcceptedNative bool   `json:"accepted_native"`
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -62,10 +62,21 @@
+ 		return false
+ 	}
+ 	defer r.Body.Close()
+-	raw, err := io.ReadAll(io.LimitReader(r.Body, 2049))
+-	if err != nil || len(raw) > 2048 || decodeQueueJSON(raw, out) != nil {
++	limit := 2048
++	if roomBoundRequest(r) && strings.HasSuffix(r.URL.Path, "bound-prepare") {
++		limit = 8192
++	}
++	raw, err := io.ReadAll(io.LimitReader(r.Body, int64(limit+1)))
++	if err != nil || len(raw) > limit || strictContentJSON(raw, out) != nil {
+ 		w.WriteHeader(400)
+ 		return false
++	}
++	if len(raw) > 2048 {
++		request, ok := out.(*roomTransportPrepareRequest)
++		if !ok || request.Action != "queue" {
++			w.WriteHeader(400)
++			return false
++		}
+ 	}
+ 	return true
+ }
+@@ -157,6 +168,9 @@
+ 	if offer.Bound {
+ 		envelope = boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
+ 	}
++	if offer.Queue != nil {
++		envelope = queueCommitPayload(offer, request.OwnToneToken)
++	}
+ 	body, _ := json.Marshal(envelope)
+ 	suffix := "commit"
+ 	if offer.Bound {
+@@ -186,7 +200,11 @@
+ 	if offer.Bound {
+ 		decodeErr = decodeBoundOwner(raw, &ack, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
+ 	}
+-	if response.StatusCode != 200 || readErr != nil || int64(len(raw)) > limit || decodeErr != nil || ack.Schema != boundSchema("podconnect.output_transport_commit.v1", offer.Bound) || !ack.OK || ack.Token != request.OwnToneToken || ack.NativePrepareID != offer.Snapshot.PrepareID || ack.ArgsDigest != offer.Snapshot.ArgsDigest || ack.PinRemainingMS < 1 || ack.PinRemainingMS > 10000 || ack.Outcome != "accepted" || ack.Physical {
++	valid := decodeErr == nil && ack.Schema == boundSchema("podconnect.output_transport_commit.v1", offer.Bound) && ack.OK && ack.Token == request.OwnToneToken && ack.NativePrepareID == offer.Snapshot.PrepareID && ack.ArgsDigest == offer.Snapshot.ArgsDigest && ack.PinRemainingMS >= 1 && ack.PinRemainingMS <= 10000 && ack.Outcome == "accepted" && !ack.Physical
++	if offer.Queue != nil {
++		valid = validQueueACK(raw, offer, request.OwnToneToken)
++	}
++	if response.StatusCode != 200 || readErr != nil || int64(len(raw)) > limit || !valid {
+ 		roomTransportResponse(w, nil, ErrAliasConflict)
+ 		return
+ 	}
+--- a/player/room_move.go
++++ b/player/room_move.go
+@@ -57,7 +57,7 @@
+ 	if command.ctx == nil || (command.expectedSource == nil && command.phase != "fence") || (command.guard == nil && command.phase != "snapshot" && command.phase != "abort" && command.phase != "fence") {
+ 		return result, fmt.Errorf("incomplete move command")
+ 	}
+-	if command.phase != "snapshot" && command.phase != "quiesce" && command.phase != "switch" && command.phase != "resume" && command.phase != "abort" && command.phase != "fence" && command.phase != "verify" {
++	if command.phase != "snapshot" && command.phase != "inspect" && command.phase != "quiesce" && command.phase != "switch" && command.phase != "resume" && command.phase != "abort" && command.phase != "fence" && command.phase != "verify" {
+ 		return result, fmt.Errorf("bad move phase")
+ 	}
+ 	if *out == nil {
+@@ -99,6 +99,12 @@
+ 			return fmt.Errorf("actual output writer descriptor unavailable")
+ 		}
+ 		currentEpoch := strconv.FormatUint(p.startEpoch, 10)
++		if command.phase == "inspect" {
++			if p.movePhase != "" || pipe.FencedUnderStartLock() || pipe.PausedUnderStartLock() == command.wasPlaying {
++				return fmt.Errorf("queue writer is moving, fenced, or changed pause state")
++			}
++			return command.guard(func() { result.Pipe, result.Epoch = writer, currentEpoch })
++		}
+ 		if command.phase == "verify" {
+ 			if p.movePhase != "" || writer != command.pipe || command.epoch == "" || command.epoch != currentEpoch || pipe.PausedUnderStartLock() == command.wasPlaying || pipe.FencedUnderStartLock() {
+ 				return fmt.Errorf("move final source, writer, or paused state changed")
+--- /dev/null
++++ b/player/room_queue_test.go
+@@ -0,0 +1,151 @@
++package player
++
++import (
++	"context"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++	"io"
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++type queueEOFSource struct{ identity int }
++
++func (*queueEOFSource) Read([]float32) (int, error) { return 0, io.EOF }
++func (*queueEOFSource) PositionMs() int64           { return 0 }
++func (*queueEOFSource) SetPositionMs(int64) error   { return nil }
++
++func queueFIFO(t *testing.T) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "queue.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { reader.Close() })
++	return path
++}
++func TestQueueRealWorkerOrdinaryEpochZeroPublishesExactSameWriter(t *testing.T) {
++	path := queueFIFO(t)
++	var actual output.MovePipeOutput
++	p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		out, err := create()
++		if err == nil {
++			actual = out.(output.MovePipeOutput)
++		}
++		return out, err
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	old, next := &queueEOFSource{1}, &queueEOFSource{2}
++	if err = p.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	before, epoch, err := p.RoomMove(context.Background(), "inspect", old, output.MovePipeIdentity{}, "", false, func(mutate func()) error { mutate(); return nil })
++	if err != nil || epoch != "0" || before.Type != "fifo" {
++		t.Fatal("normal phone writer inspection needs no START/MOVE", before, epoch, err)
++	}
++	cursor := 0
++	err = p.GuardedQueueTransport(context.Background(), next, old, before, epoch, func(mutate func()) error { mutate(); cursor = 2; return nil })
++	if err != nil || cursor != 2 {
++		t.Fatal("exact queue publication failed", err, cursor)
++	}
++	snapshot := make(chan librespot.AudioSource, 1)
++	// Existing actual worker snapshot joins its selected source; no legacy load is used.
++	reply := make(chan any, 1)
++	p.cmd <- playerCmd{start: &start35Command{ctx: context.Background(), phase: "snapshot"}, resp: reply}
++	result := (<-reply).(start35Result)
++	snapshot <- result.Source
++	if <-snapshot != librespot.AudioSource(next) {
++		t.Fatal("queue source not published")
++	}
++	var after output.MovePipeIdentity
++	if err = actual.WithStartLock(context.Background(), func(pipe output.PipeIdentity, _ func(bool)) error {
++		after = output.MovePipeIdentity{PipeIdentity: pipe, FD: actual.WriterFDUnderStartLock()}
++		return nil
++	}); err != nil || after != before {
++		t.Fatal("queue replaced FIFO/descriptor", before, after, err)
++	}
++	if p.startEpoch != 0 || p.movePhase != "" {
++		t.Fatal("queue fabricated source transition or MOVE")
++	}
++}
++func TestQueueActualWriterAndDeadlineGuardBeforeCursorOrSource(t *testing.T) {
++	for _, mode := range []string{"fd", "inode", "epoch", "source", "owner", "deadline-after-output-lock", "deadline-after-source-lock"} {
++		t.Run(mode, func(t *testing.T) {
++			source := NewSwitchingAudioSource()
++			old, next := &queueEOFSource{1}, &queueEOFSource{2}
++			source.SetPrimary(old)
++			out, err := output.NewOutput(&output.NewOutputOptions{Log: &librespot.NullLogger{}, Backend: "pipe", Reader: source, OutputPipe: queueFIFO(t), OutputPipeFormat: "s16le", InitiallyPaused: true, InitialVolume: 0.27, ExternalVolume: true})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer out.Close()
++			actual := out.(output.MovePipeOutput)
++			var writer output.MovePipeIdentity
++			err = actual.WithStartLock(context.Background(), func(identity output.PipeIdentity, _ func(bool)) error {
++				writer = output.MovePipeIdentity{PipeIdentity: identity, FD: actual.WriterFDUnderStartLock()}
++				return nil
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			epoch := "0"
++			expected := librespot.AudioSource(old)
++			switch mode {
++			case "fd":
++				writer.FD = "999999"
++			case "inode":
++				writer.Inode = "999999"
++			case "epoch":
++				epoch = "1"
++			case "source":
++				expected = next
++			}
++			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
++			defer cancel()
++			release := make(chan struct{})
++			held := make(chan struct{})
++			holderDone := make(chan error, 1)
++			if mode == "deadline-after-output-lock" {
++				go func() {
++					holderDone <- actual.WithStartLock(context.Background(), func(output.PipeIdentity, func(bool)) error { close(held); <-release; return nil })
++				}()
++				<-held
++			}
++			if mode == "deadline-after-source-lock" {
++				source.cond.L.Lock()
++			}
++			cursor := 0
++			command := &guardedTransportCommand{context: ctx, source: next, expectedSource: expected, writer: &writer, epoch: epoch, guard: func(mutate func()) error {
++				if mode == "owner" {
++					return context.Canceled
++				}
++				mutate()
++				cursor++
++				return nil
++			}}
++			err = (&Player{}).applyGuardedTransport(command, &out, source, 0.27)
++			if mode == "deadline-after-output-lock" {
++				close(release)
++				if e := <-holderDone; e != nil {
++					t.Fatal(e)
++				}
++			}
++			if mode == "deadline-after-source-lock" {
++				source.cond.L.Unlock()
++			}
++			if err == nil || cursor != 0 || source.source[source.which] != librespot.AudioSource(old) {
++				t.Fatal("stale queue changed cursor/source", mode, err, cursor)
++			}
++		})
++	}
++}
+--- a/player/room_transport.go
++++ b/player/room_transport.go
+@@ -14,19 +14,31 @@
+ 	source         librespot.AudioSource
+ 	expectedSource librespot.AudioSource
+ 	guard          output.TransportGuard
++	writer         *output.MovePipeIdentity
++	epoch          string
+ }
+ 
+ // GuardedTransport is additive; legacy player operations keep their behavior.
+ // After enqueue, wait for the worker's terminal answer to preserve AppPlayer
+ // serialization. The HTTP caller may have timed out independently.
+ func (p *Player) GuardedTransport(ctx context.Context, paused bool, source librespot.AudioSource, expectedSource librespot.AudioSource, guard output.TransportGuard) error {
++	return p.guardedTransport(&guardedTransportCommand{context: ctx, paused: paused, source: source, expectedSource: expectedSource, guard: guard})
++}
++
++// GuardedQueueTransport uses the same worker and publication boundary, with an
++// actual writer fstat/epoch check for the distinct queue-purpose admission.
++func (p *Player) GuardedQueueTransport(ctx context.Context, source, expectedSource librespot.AudioSource, writer output.MovePipeIdentity, epoch string, guard output.TransportGuard) error {
++	return p.guardedTransport(&guardedTransportCommand{context: ctx, source: source, expectedSource: expectedSource, writer: &writer, epoch: epoch, guard: guard})
++}
++
++func (p *Player) guardedTransport(command *guardedTransportCommand) error {
+ 	reply := make(chan any, 1)
+ 	select {
+-	case p.cmd <- playerCmd{guarded: &guardedTransportCommand{context: ctx, paused: paused, source: source, expectedSource: expectedSource, guard: guard}, resp: reply}:
++	case p.cmd <- playerCmd{guarded: command, resp: reply}:
+ 	case <-p.closeDone:
+ 		return fmt.Errorf("player closed")
+-	case <-ctx.Done():
+-		return ctx.Err()
++	case <-command.context.Done():
++		return command.context.Err()
+ 	}
+ 	var result any
+ 	select {
+@@ -50,7 +62,7 @@
+ 		return fmt.Errorf("guarded pipe output unavailable")
+ 	}
+ 	var displaced []librespot.AudioSource
+-	err := pipe.WithTransportLock(command.context, func(setPaused func(bool)) error {
++	apply := func(setPaused func(bool)) error {
+ 		lock, ok := source.cond.L.(*sync.Mutex)
+ 		if !ok {
+ 			return fmt.Errorf("native source lock unavailable")
+@@ -59,7 +71,7 @@
+ 			return err
+ 		}
+ 		defer lock.Unlock()
+-		if source.source[source.which] != command.expectedSource {
++		if (command.context != nil && command.context.Err() != nil) || source.source[source.which] != command.expectedSource {
+ 			return fmt.Errorf("native primary source changed")
+ 		}
+ 		// Both possibly blocking locks precede the deadline/owner test. The guarded
+@@ -73,7 +85,23 @@
+ 			}
+ 			setPaused(command.paused)
+ 		})
+-	})
++	}
++	var err error
++	if command.writer != nil {
++		writer, ok := (*out).(output.MovePipeOutput)
++		if !ok {
++			return fmt.Errorf("queue writer owner unavailable")
++		}
++		err = writer.WithStartLock(command.context, func(identity output.PipeIdentity, setPaused func(bool)) error {
++			actual := output.MovePipeIdentity{PipeIdentity: identity, FD: writer.WriterFDUnderStartLock()}
++			if actual != *command.writer || command.epoch == "" || command.epoch != fmt.Sprint(p.startEpoch) || p.movePhase != "" || writer.FencedUnderStartLock() {
++				return fmt.Errorf("queue writer or source epoch changed")
++			}
++			return apply(setPaused)
++		})
++	} else {
++		err = pipe.WithTransportLock(command.context, apply)
++	}
+ 	if err == nil {
+ 		// Publication removed these sources while both source/output locks were
+ 		// held. Dispose them after releasing locks; the adopted source remains live.
+--- /dev/null
++++ b/tracks/queue_prepare_test.go
+@@ -0,0 +1,242 @@
++package tracks
++
++import (
++	"context"
++	"errors"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"google.golang.org/protobuf/proto"
++	"io"
++	"math"
++	"reflect"
++	"testing"
++)
++
++type queuePrepareState struct {
++	position                     int
++	revision                     uint64
++	exhausted, playing, shuffled bool
++	seed                         uint64
++	shuffleLen, shuffleKeep      int
++	rows                         []pagedListItem[*connectpb.ContextTrack]
++	queue                        []*connectpb.ContextTrack
++}
++
++func prepareState(list *List) queuePrepareState {
++	state := queuePrepareState{position: list.tracks.pos, revision: list.queueRevision, exhausted: list.queueRevisionExhausted, playing: list.playingQueue, shuffled: list.shuffled, seed: list.shuffleSeed, shuffleLen: list.shuffleLen, shuffleKeep: list.shuffleKeep}
++	for _, row := range list.tracks.list {
++		copied := row
++		copied.item = proto.Clone(row.item).(*connectpb.ContextTrack)
++		state.rows = append(state.rows, copied)
++	}
++	for _, row := range list.queue {
++		state.queue = append(state.queue, proto.Clone(row).(*connectpb.ContextTrack))
++	}
++	return state
++}
++func assertPrepareState(t *testing.T, list *List, before queuePrepareState) {
++	t.Helper()
++	if !reflect.DeepEqual(prepareState(list), before) {
++		t.Fatal("preparation mutated retained cursor, rows, manual queue, revision or shuffle state")
++	}
++}
++func addDuplicateManual(list *List) {
++	for _, which := range []string{"first", "second", "last"} {
++		list.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:3333333333333333333333", Uid: "duplicate", Metadata: map[string]string{"which": which}})
++	}
++}
++
++func TestPrepareQueueExactDetachedOccurrencePreservesLiveState(t *testing.T) {
++	for _, mode := range []string{"duplicate-context", "manual-duplicate", "context-after-manual", "playing-queue", "shuffle"} {
++		t.Run(mode, func(t *testing.T) {
++			list := occurrenceFixture(t)
++			position := 1
++			switch mode {
++			case "manual-duplicate", "context-after-manual", "playing-queue":
++				addDuplicateManual(list)
++				if mode == "context-after-manual" {
++					position = 4
++				}
++				if mode == "playing-queue" {
++					list.SetPlayingQueue(true)
++					position = 0
++				}
++			case "shuffle":
++				if err := list.ToggleShuffle(context.Background(), true); err != nil {
++					t.Fatal(err)
++				}
++				// Existing shuffled order is the authority; no re-shuffle or URI search.
++				position = 0
++			}
++			observed, err := list.ObserveUpcoming(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			before := prepareState(list)
++			prepared, err := list.PrepareQueueOccurrence(context.Background(), observed.Revision, position)
++			if err != nil {
++				t.Fatal(err)
++			}
++			assertPrepareState(t, list, before)
++			if prepared == list || prepared.tracks == list.tracks || prepared.queueRevision != observed.Revision+1 || prepared.ctx != list.ctx {
++				t.Fatal("detached staging lost context or revision")
++			}
++			if prepared.CurrentTrack().Uri != observed.Items[position].URI {
++				t.Fatal("wrong occurrence")
++			}
++			switch mode {
++			case "duplicate-context", "context-after-manual":
++				if prepared.tracks.pos != 2 || prepared.playingQueue || len(prepared.queue) != 0 {
++					t.Fatal("wrong duplicate context position")
++				}
++			case "manual-duplicate", "playing-queue":
++				if !prepared.playingQueue || len(prepared.queue) != 2 || prepared.queue[0].Metadata["which"] != "second" || prepared.tracks.pos != list.tracks.pos {
++					t.Fatal("wrong manual occurrence or following queue")
++				}
++			case "shuffle":
++				if prepared.shuffled != list.shuffled || prepared.shuffleSeed != list.shuffleSeed || prepared.shuffleLen != list.shuffleLen || prepared.shuffleKeep != list.shuffleKeep {
++					t.Fatal("shuffle configuration changed")
++				}
++			}
++			// Both resident page rows and queued protobuf metadata must be detached.
++			prepared.tracks.list[0].item.Uid = "staged-only"
++			if len(prepared.queue) > 0 {
++				prepared.queue[0].Metadata["which"] = "staged-only"
++			}
++			assertPrepareState(t, list, before)
++		})
++	}
++}
++
++type queuePreparePages func(context.Context, int) ([]*connectpb.ContextTrack, error)
++
++func (p queuePreparePages) Page(ctx context.Context, index int) ([]*connectpb.ContextTrack, error) {
++	return p(ctx, index)
++}
++
++func TestPrepareQueuePaginationCancellationAndFailureNeverMutateRetainedList(t *testing.T) {
++	for _, mode := range []string{"cancel-before", "cancel-page", "page-error", "owner-revision-change"} {
++		t.Run(mode, func(t *testing.T) {
++			list := occurrenceFixture(t)
++			addDuplicateManual(list)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			if mode == "cancel-before" {
++				cancel()
++			}
++			calls := 0
++			list.tracks.pages = queuePreparePages(func(ctx context.Context, index int) ([]*connectpb.ContextTrack, error) {
++				calls++
++				if index > 1 {
++					return nil, io.EOF
++				}
++				if mode == "cancel-page" {
++					cancel()
++				}
++				if mode == "page-error" {
++					return nil, errors.New("inert page failure")
++				}
++				if mode == "owner-revision-change" {
++					list.SetPlayingQueue(false)
++				}
++				return []*connectpb.ContextTrack{{Uri: "spotify:track:4444444444444444444444", Uid: "next-page"}}, nil
++			})
++			before := prepareState(list)
++			prepared, err := list.PrepareQueueOccurrence(ctx, list.queueRevision, 1)
++			if err == nil || prepared != nil {
++				t.Fatal("cancelled/failed/stale preparation returned a list")
++			}
++			if mode == "owner-revision-change" {
++				before.revision++
++			}
++			assertPrepareState(t, list, before)
++			expectedCalls := 1
++			if mode == "cancel-before" {
++				expectedCalls = 0
++			}
++			if mode == "owner-revision-change" {
++				expectedCalls = 2
++			}
++			if calls != expectedCalls {
++				t.Fatal("unexpected page admission count")
++			}
++		})
++	}
++}
++
++func TestRepeatedQueuePreparationDoesNotNestPageResolvers(t *testing.T) {
++	list := occurrenceFixture(t)
++	for i := 0; i < 12; i++ {
++		list.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:3333333333333333333333", Uid: "manual"})
++	}
++	for i := 0; i < 10; i++ {
++		prepared, err := list.PrepareQueueOccurrence(context.Background(), list.queueRevision, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		isolated, ok := prepared.tracks.pages.(preparationPages)
++		if !ok {
++			t.Fatal("prepared resolver no longer isolates fetched rows")
++		}
++		if _, nested := isolated.source.(preparationPages); nested {
++			t.Fatal("repeated queue selections accumulate resolver wrappers")
++		}
++		list = prepared // The real owner adopts the prepared list after commit.
++	}
++}
++
++func TestPrepareQueueFetchedRowsAreDetachedFromResolverCache(t *testing.T) {
++	list := occurrenceFixture(t)
++	row := &connectpb.ContextTrack{Uri: "spotify:track:4444444444444444444444", Uid: "cached", Metadata: map[string]string{"source": "cached"}}
++	list.tracks.pages = queuePreparePages(func(ctx context.Context, index int) ([]*connectpb.ContextTrack, error) {
++		if index == 1 {
++			return []*connectpb.ContextTrack{row}, nil
++		}
++		return nil, io.EOF
++	})
++	before := prepareState(list)
++	prepared, err := list.PrepareQueueOccurrence(context.Background(), list.queueRevision, 3)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if prepared.tracks.pos != 4 || len(prepared.tracks.list) != 5 || prepared.CurrentTrack().Uri != row.Uri {
++		t.Fatal("missing detached paginated occurrence")
++	}
++	prepared.tracks.list[4].item.Metadata["source"] = "staged"
++	if row.Metadata["source"] != "cached" {
++		t.Fatal("staged row aliases resolver cache")
++	}
++	assertPrepareState(t, list, before)
++}
++
++func TestPrepareQueueStaleInvalidAndRevisionSaturationAreClosed(t *testing.T) {
++	for _, mode := range []string{"stale", "negative", "missing", "overflow-position", "max-revision", "exhausted"} {
++		t.Run(mode, func(t *testing.T) {
++			list := occurrenceFixture(t)
++			revision, position := list.queueRevision, 1
++			switch mode {
++			case "stale":
++				list.SetPlayingQueue(false)
++			case "negative":
++				position = -1
++			case "missing":
++				position = 19
++			case "overflow-position":
++				position = MaxQueueOccurrences
++			case "max-revision":
++				list.queueRevision = math.MaxUint64
++				revision = list.queueRevision
++			case "exhausted":
++				list.queueRevisionExhausted = true
++			}
++			before := prepareState(list)
++			if staged, err := list.PrepareQueueOccurrence(context.Background(), revision, position); err == nil || staged != nil {
++				t.Fatal("invalid occurrence produced detached candidate")
++			}
++			assertPrepareState(t, list, before)
++		})
++	}
++	var list *List
++	if staged, err := list.PrepareQueueOccurrence(context.Background(), 0, 0); err == nil || staged != nil {
++		t.Fatal("nil list accepted")
++	}
++}
+--- a/tracks/room_transport.go
++++ b/tracks/room_transport.go
+@@ -3,14 +3,15 @@
+ import (
+ 	"context"
+ 	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"google.golang.org/protobuf/proto"
++	"math"
+ 	"slices"
+ )
+ 
+-// PrepareTransport stages a cursor on detached native list storage. It does not
+-// mutate the retained cursor, manual queue, revision or shuffle order.
+-func (tl *List) PrepareTransport(ctx context.Context, previous bool, positionMS int64) (*List, error) {
++// cloneForPreparation copies resident mutable list and manual queue storage.
++func (tl *List) cloneForPreparation() (*List, error) {
+ 	if tl == nil || tl.tracks == nil || tl.tracks.pos < 0 || tl.ctx == nil || tl.queueRevisionExhausted {
+ 		return nil, fmt.Errorf("native list unavailable")
+ 	}
+@@ -31,6 +32,15 @@
+ 		}
+ 		clone.queue[i] = proto.Clone(track).(*connectpb.ContextTrack)
+ 	}
++	return &clone, nil
++}
++
++// PrepareTransport stages a cursor without mutating the retained list.
++func (tl *List) PrepareTransport(ctx context.Context, previous bool, positionMS int64) (*List, error) {
++	clone, err := tl.cloneForPreparation()
++	if err != nil {
++		return nil, err
++	}
+ 	if previous && positionMS > 3000 {
+ 		clone.invalidateQueueObservation()
+ 	} else if previous {
+@@ -41,7 +51,7 @@
+ 	if ctx.Err() != nil {
+ 		return nil, ctx.Err()
+ 	}
+-	return &clone, nil
++	return clone, nil
+ }
+ 
+ // TransportRevision is an actor-owned monotonic queue mutation fence.
+@@ -51,3 +61,59 @@
+ 	}
+ 	return tl.queueRevision
+ }
++
++// preparationPages isolates newly fetched protobuf rows too. The resolver may
++// cache pages, but no prepared row may alias those retained resolver rows.
++type preparationPages struct {
++	source librespot.PageResolver[*connectpb.ContextTrack]
++}
++
++func (p preparationPages) Page(ctx context.Context, index int) ([]*connectpb.ContextTrack, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	rows, err := p.source.Page(ctx, index)
++	if err != nil {
++		return nil, err
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	copied := make([]*connectpb.ContextTrack, len(rows))
++	for i, row := range rows {
++		if row == nil {
++			return nil, fmt.Errorf("nil native track")
++		}
++		copied[i] = proto.Clone(row).(*connectpb.ContextTrack)
++	}
++	return copied, nil
++}
++
++// PrepareQueueOccurrence stages an internally resolved occurrence position on a
++// detached list. It grants no queue, session, output or commit authority: the
++// serialized player owner must still bind and revalidate that authority at effect.
++func (tl *List) PrepareQueueOccurrence(ctx context.Context, revision uint64, position int) (*List, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if tl == nil || tl.queueRevisionExhausted || revision != tl.queueRevision || revision == math.MaxUint64 {
++		return nil, fmt.Errorf("stale or exhausted queue occurrence")
++	}
++	clone, err := tl.cloneForPreparation()
++	if err != nil {
++		return nil, err
++	}
++	if _, isolated := clone.tracks.pages.(preparationPages); !isolated {
++		clone.tracks.pages = preparationPages{source: clone.tracks.pages}
++	}
++	if err = clone.SelectUpcoming(ctx, revision, position); err != nil {
++		return nil, err
++	}
++	if err = ctx.Err(); err != nil {
++		return nil, err
++	}
++	if tl.queueRevisionExhausted || tl.queueRevision != revision {
++		return nil, fmt.Errorf("queue occurrence owner changed during preparation")
++	}
++	return clone, nil
++}

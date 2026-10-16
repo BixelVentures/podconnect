@@ -1,0 +1,586 @@
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -260,3 +260,5 @@
+ EXTRA_DIST += ../tests/start35_wire_owner.inc.c
+ 
+ EXTRA_DIST += ../tests/start_streaming_owner.inc.c
++
++EXTRA_DIST += outputs_queue.inc.c httpd_jsonapi_queue.inc.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1934,20 +1934,24 @@
+   bool bound=!strncmp(hreq->path_parts[4],"bound-",6);
+   const char *phase=hreq->path_parts[4]+(bound?6:0);
+   json_object *body=(bound ? transport_parse_body_limit(hreq->in_body,8192) : transport_parse_body(hreq->in_body)), *reply, *percent;
+-  bool commit=!strcmp(phase,"commit"), volume;
++  bool commit=!strcmp(phase,"commit"), volume,queue;
+   int expected, ret=HTTP_BADREQUEST;
+   if (!body || !json_object_is_type(body,json_type_object)
+       || safe_atou64(hreq->path_parts[2],&request.device_id)<0
+       || !transport_json_string(body,"native_prepare_id",request.native_prepare_id,sizeof(request.native_prepare_id))
+       || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
+       || !transport_json_string(body,"action",request.action,sizeof(request.action))) goto out;
+-  volume=!strcmp(request.action,"volume");
++  volume=!strcmp(request.action,"volume");queue=!strcmp(request.action,"queue");
++  if(queue && !bound)goto out;
+   request.bound=bound;
+-  expected=3+(commit?2:0)+(volume?1:0)+(bound?2:0);
++  expected=3+(commit?2:0)+(volume?1:0)+(bound?2:0)+(queue?2:0);
+   if (bound && transport_native_parse(body,&request.native_owner,&request.native_revision)<0) goto out;
++  if(queue && (!queue_wire_hex(request.native_owner.alias_incarnation,32) || !queue_wire_hex(request.native_owner.alias_registry,64)))goto out;
+   if (json_object_object_length(body)!=expected) goto out;
++  if(queue && (queue_selection_parse(body,&request.queue,&request.native_owner)<0 || queue_writer_parse(body,&request.writer)<0))goto out;
+   if (commit && (!transport_json_string(body,"token",request.token,sizeof(request.token))
+       || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest)))) goto out;
++  if(queue && commit && strcmp(request.expected_input_path_digest,request.writer.input_path_digest))goto out;
+   if (volume)
+     {
+       if (!json_object_object_get_ex(body,"percent",&percent) || !json_object_is_type(percent,json_type_int)
+@@ -1957,12 +1961,17 @@
+   ret=409;
+   if ((commit ? player_transport_commit(&request,&result) : player_transport_prepare(&request,&result))<0) goto out;
+   reply=json_object_new_object();
+-  json_object_object_add(reply,"schema",json_object_new_string(bound ? (commit ? "podconnect.output_transport_commit.v2" : "podconnect.output_transport_prepare.v2") : (commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1")));
++  json_object_object_add(reply,"schema",json_object_new_string(queue ? (commit ? "podconnect.output_queue_commit.v1" : "podconnect.output_queue_prepare.v1") : bound ? (commit ? "podconnect.output_transport_commit.v2" : "podconnect.output_transport_prepare.v2") : (commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1")));
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+   json_object_object_add(reply,"token",json_object_new_string(result.command.token));
+   if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
++  if(queue){
++    json_object_object_add(reply,"purpose",json_object_new_string("queue_occurrence_v1"));
++    json_object_object_add(reply,"queue",queue_selection_json(&result.command.queue));
++    json_object_object_add(reply,"writer_proof",queue_writer_json(&result.command.writer));
++  }
+   if (!commit) json_object_object_add(reply,"identity",transport_identity_json(&result.identity));
+-  if (commit)
++  if (commit || queue)
+     {
+       json_object_object_add(reply,"native_prepare_id",json_object_new_string(result.command.native_prepare_id));
+       json_object_object_add(reply,"args_digest",json_object_new_string(result.command.args_digest));
+@@ -1984,7 +1993,7 @@
+   json_object *reply;
+   bool bound=!strcmp(hreq->path_parts[4],"bound-result");
+   if (safe_atou64(hreq->path_parts[2],&id)<0
+-      || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id || bound!=result.command.bound) return HTTP_NOTFOUND;
++      || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id || bound!=result.command.bound || !strcmp(result.command.action,"queue")) return HTTP_NOTFOUND;
+   reply=json_object_new_object();
+   json_object_object_add(reply,"schema",json_object_new_string(bound ? "podconnect.output_transport_result.v2" : "podconnect.output_transport_result.v1"));
+   if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
+--- /dev/null
++++ b/src/httpd_jsonapi_queue.inc.c
+@@ -0,0 +1,50 @@
++/* Queue-only conditional wire; old AUDIO4 fields/schemas stay exact. */
++static bool queue_wire_hex(const char *s,size_t n)
++{size_t i;if(!s || strlen(s)!=n)return false;for(i=0;i<n;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')))return false;return true;}
++static int queue_writer_parse(json_object *body,struct output_queue_writer *w)
++{
++  json_object *o,*process,*pipe;char type[8];
++  if(!json_object_object_get_ex(body,"writer_proof",&o) || !json_object_is_type(o,json_type_object) || json_object_object_length(o)!=6
++      || !json_object_object_get_ex(o,"native_process",&process) || !json_object_is_type(process,json_type_object) || json_object_object_length(process)!=3
++      || !transport_json_string(process,"boot_id",w->native_process.boot_id,sizeof(w->native_process.boot_id))
++      || transport_native_counter(process,"pid",&w->native_process.pid)<0 || !w->native_process.pid || w->native_process.pid>INT_MAX
++      || transport_native_counter(process,"proc_start_ticks",&w->native_process.proc_start_ticks)<0 || !w->native_process.proc_start_ticks
++      || transport_native_counter(o,"writer_fd",&w->writer_fd)<0 || w->writer_fd>INT_MAX
++      || transport_native_counter(o,"source_epoch",&w->source_epoch)<0
++      || transport_native_counter(o,"open_generation",&w->open_generation)<0 || !w->open_generation
++      || !transport_json_string(o,"input_path_digest",w->input_path_digest,sizeof(w->input_path_digest)) || !queue_wire_hex(w->input_path_digest,64)
++      || !json_object_object_get_ex(o,"pipe_identity",&pipe) || !json_object_is_type(pipe,json_type_object) || json_object_object_length(pipe)!=3
++      || transport_native_counter(pipe,"device",&w->pipe_device)<0 || !w->pipe_device
++      || transport_native_counter(pipe,"inode",&w->pipe_inode)<0 || !w->pipe_inode
++      || !transport_json_string(pipe,"type",type,sizeof(type)) || strcmp(type,"fifo"))return -1;
++  size_t i;for(i=0;i<36;i++)if((i==8||i==13||i==18||i==23) ? w->native_process.boot_id[i]!='-' : !((w->native_process.boot_id[i]>='0'&&w->native_process.boot_id[i]<='9')||(w->native_process.boot_id[i]>='a'&&w->native_process.boot_id[i]<='f')))return -1;
++  return strlen(w->native_process.boot_id)==36 ? 0 : -1;
++}
++static int queue_selection_parse(json_object *body,struct output_queue_selection *q,const struct output_native_owner *owner)
++{
++  json_object *o,*revision;
++  if(!json_object_object_get_ex(body,"queue",&o) || !json_object_is_type(o,json_type_object) || json_object_object_length(o)!=4
++      || !transport_json_string(o,"observation_id",q->observation_id,sizeof(q->observation_id)) || !queue_wire_hex(q->observation_id,32)
++      || !transport_json_string(o,"occurrence_id",q->occurrence_id,sizeof(q->occurrence_id)) || !queue_wire_hex(q->occurrence_id,24)
++      || !transport_json_string(o,"session_id",q->session_id,sizeof(q->session_id)) || strcmp(q->session_id,owner->session_id)
++      || !json_object_object_get_ex(o,"queue_revision",&revision) || !json_object_is_type(revision,json_type_int)
++      || json_object_get_int64(revision)<0 || json_object_get_int64(revision)>=9007199254740992LL)return -1;
++  q->queue_revision=json_object_get_int64(revision);return 0;
++}
++static json_object *queue_writer_json(const struct output_queue_writer *w)
++{
++  json_object *o=json_object_new_object(),*process=json_object_new_object(),*pipe=json_object_new_object();
++  json_object_object_add(process,"boot_id",json_object_new_string(w->native_process.boot_id));
++  attention_json_u64(process,"pid",w->native_process.pid);attention_json_u64(process,"proc_start_ticks",w->native_process.proc_start_ticks);
++  json_object_object_add(o,"native_process",process);attention_json_u64(o,"writer_fd",w->writer_fd);
++  attention_json_u64(pipe,"device",w->pipe_device);attention_json_u64(pipe,"inode",w->pipe_inode);
++  json_object_object_add(pipe,"type",json_object_new_string("fifo"));json_object_object_add(o,"pipe_identity",pipe);
++  attention_json_u64(o,"source_epoch",w->source_epoch);attention_json_u64(o,"open_generation",w->open_generation);
++  json_object_object_add(o,"input_path_digest",json_object_new_string(w->input_path_digest));return o;
++}
++static json_object *queue_selection_json(const struct output_queue_selection *q)
++{
++  json_object *o=json_object_new_object();json_object_object_add(o,"observation_id",json_object_new_string(q->observation_id));
++  json_object_object_add(o,"session_id",json_object_new_string(q->session_id));json_object_object_add(o,"queue_revision",json_object_new_int64(q->queue_revision));
++  json_object_object_add(o,"occurrence_id",json_object_new_string(q->occurrence_id));return o;
++}
+--- a/src/httpd_jsonapi_transport_bound.inc.c
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -44,22 +44,33 @@
+   json_object_object_add(reply,"native_owner",transport_native_json(owner));
+   attention_json_u64(reply,"native_revision",revision);
+ }
++#include "httpd_jsonapi_queue.inc.c"
++
+ static int jsonapi_reply_transport_bound_state(struct httpd_request *hreq)
+ {
+   struct output_transport_identity identity; struct output_native_owner owner={0};
+-  uint64_t id; bool busy; size_t i;
++  uint64_t id; bool busy,queue=false; size_t i;
++  struct output_queue_writer writer={0};
+   json_object *body=transport_parse_body_limit(hreq->in_body,8192),*reply,*actions;
+   const char *names[]={"pause","resume","next","previous"}; int ret=HTTP_BADREQUEST;
+-  if (!body || json_object_object_length(body)!=1 || transport_native_parse(body,&owner,NULL)<0
++  if(body && json_object_object_length(body)==2)queue=true;
++  if (!body || json_object_object_length(body)!=(queue?2:1) || (queue && queue_writer_parse(body,&writer)<0) || transport_native_parse(body,&owner,NULL)<0
+       || safe_atou64(hreq->path_parts[2],&id)<0) goto out;
++  if(queue && (!queue_wire_hex(owner.alias_incarnation,32) || !queue_wire_hex(owner.alias_registry,64)))goto out;
+   ret=409;
+-  if (player_transport_bound_state_get(id,&owner,&identity,&busy)<0) goto out;
++  if ((queue ? player_queue_state_get(id,&owner,&writer,&identity,&busy) : player_transport_bound_state_get(id,&owner,&identity,&busy))<0) goto out;
+   reply=json_object_new_object(); actions=json_object_new_array();
+-  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_state.v2"));
++  json_object_object_add(reply,"schema",json_object_new_string(queue?"podconnect.output_queue_state.v1":"podconnect.output_transport_state.v2"));
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+   json_object_object_add(reply,"identity",transport_identity_json(&identity));
+   json_object_object_add(reply,"busy",json_object_new_boolean(busy));
+-  if (!busy) for (i=0;i<ARRAY_SIZE(names);i++) json_object_array_add(actions,json_object_new_string(names[i]));
++  if(queue){
++    json_object_object_add(reply,"purpose",json_object_new_string("queue_occurrence_v1"));
++    json_object_object_add(reply,"native_owner",transport_native_json(&owner));
++    json_object_object_add(reply,"writer_proof",queue_writer_json(&writer));
++    if(!busy)json_object_array_add(actions,json_object_new_string("queue"));
++  }
++  if (!queue && !busy) for (i=0;i<ARRAY_SIZE(names);i++) json_object_array_add(actions,json_object_new_string(names[i]));
+   json_object_object_add(reply,"actions",actions);
+   json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
+   ret=transport_json_reply(hreq,reply);
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -156,7 +156,7 @@
+   struct output_transport_result result;
+   struct timespec expiry;
+   bool used;
+-  uint64_t admission_generation;
++  uint64_t admission_generation,queue_reader_epoch;
+ };
+ static struct transport_slot transport_slots[OUTPUT_TRANSPORT_SLOTS];
+ static struct transport_slot *transport_pin;
+@@ -219,10 +219,28 @@
+   return true;
+ }
+ 
++static bool queue_writer_current(const struct output_queue_writer *,const struct output_transport_identity *,uint64_t *);
++static bool queue_writer_equal(const struct output_queue_writer *a,const struct output_queue_writer *b)
++{
++  return !strcmp(a->native_process.boot_id,b->native_process.boot_id)
++    && a->native_process.pid==b->native_process.pid && a->native_process.proc_start_ticks==b->native_process.proc_start_ticks
++    && a->writer_fd==b->writer_fd && a->pipe_device==b->pipe_device && a->pipe_inode==b->pipe_inode
++    && a->source_epoch==b->source_epoch && a->open_generation==b->open_generation
++    && !strcmp(a->input_path_digest,b->input_path_digest);
++}
++static bool queue_selection_equal(const struct output_queue_selection *a,const struct output_queue_selection *b)
++{ return !strcmp(a->observation_id,b->observation_id) && !strcmp(a->session_id,b->session_id)
++    && !strcmp(a->occurrence_id,b->occurrence_id) && a->queue_revision==b->queue_revision; }
+ static bool
+ transport_command_valid(const struct output_transport_request *r)
+ {
+   if (!r || !r->device_id || !transport_hex(r->native_prepare_id,32) || !transport_hex(r->args_digest,64)) return false;
++  if (!strcmp(r->action,"queue")) return r->bound && r->percent==-1
++    && transport_hex(r->native_owner.alias_incarnation,32) && transport_hex(r->native_owner.alias_registry,64)
++    && transport_hex(r->queue.observation_id,32) && transport_hex(r->queue.occurrence_id,24)
++    && r->queue.queue_revision<9007199254740992ULL && !strcmp(r->queue.session_id,r->native_owner.session_id)
++    && transport_hex(r->writer.input_path_digest,64) && r->writer.open_generation
++    && r->writer.writer_fd<=INT_MAX && r->writer.pipe_device && r->writer.pipe_inode;
+   if (!strcmp(r->action,"volume")) return r->percent >= 0 && r->percent <= 100;
+   return r->percent == -1 && (!strcmp(r->action,"pause") || !strcmp(r->action,"resume")
+       || !strcmp(r->action,"next") || !strcmp(r->action,"previous"));
+@@ -298,10 +316,11 @@
+ {
+   struct output_transport_identity identity;
+   struct transport_slot *slot=NULL;
+-  size_t i;
++  size_t i;uint64_t queue_reader_epoch=0;
+   if (!result || !transport_command_valid(request) || (request->bound && !request->native_revision)
+       || (request->bound ? !transport_bound_available(request->device_id,&request->native_owner,request->native_revision) : outputs_transport_busy())
+       || transport_identity_get(request->device_id,&identity)<0) return -1;
++  if (!strcmp(request->action,"queue") && !queue_writer_current(&request->writer,&identity,&queue_reader_epoch)) return -1;
+   /* Manual physical volume needs its separately reviewed admission contract. */
+   if (!strcmp(request->action,"volume")) return -1;
+   for (i=0;i<ARRAY_SIZE(transport_slots);i++)
+@@ -320,7 +339,7 @@
+     slot->result.command.token[k]=0;
+   }
+   slot->expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
+-  slot->admission_generation=transport_admission_generation;
++  slot->admission_generation=transport_admission_generation;slot->queue_reader_epoch=queue_reader_epoch;
+   slot->used=false; slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS;
+   *result=slot->result;
+   return 0;
+@@ -330,7 +349,7 @@
+ outputs_transport_commit(const struct output_transport_request *request, struct output_transport_result *result)
+ {
+   struct transport_slot *slot;
+-  struct output_transport_identity identity;
++  struct output_transport_identity identity;uint64_t queue_reader_epoch=0;
+   if (!request || !result || !(slot=transport_find(request->token)) || slot->used) return -1;
+   slot->used=true; slot->result.outcome=-1; /* Consume before any validation/mutation: altered token cannot retry. */
+   if (!transport_remaining(&slot->expiry) || !transport_command_valid(request)
+@@ -339,6 +358,8 @@
+       || strcmp(request->action,slot->result.command.action)
+       || strcmp(request->args_digest,slot->result.command.args_digest)
+       || request->percent!=slot->result.command.percent
++      || (!strcmp(request->action,"queue") && (!queue_selection_equal(&request->queue,&slot->result.command.queue)
++          || !queue_writer_equal(&request->writer,&slot->result.command.writer)))
+       || !transport_hex(request->expected_input_path_digest,64)
+       || strcmp(request->expected_input_path_digest,slot->result.identity.input_path_digest)
+       || request->bound!=slot->result.command.bound
+@@ -349,9 +370,14 @@
+       || (!request->bound && outputs_transport_busy())
+       || transport_identity_get(request->device_id,&identity)<0
+       || !transport_identity_equal(&slot->result.identity,&identity)) return -1;
++  if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
++      || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry))) return -1;
+   if (request->bound) {
+     if (!transport_custody_admit(request->device_id,&request->native_owner,request->native_revision,
+           slot->admission_generation,&slot->result.identity)) return -1;
++    if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
++        || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
++        || !transport_custody_current(&request->native_owner,&identity,request->native_revision))) return -1;
+     slot->result.remaining_ms=transport_remaining(&transport_custody_expiry); slot->result.outcome=0;
+     *result=slot->result; return 0;
+   }
+@@ -379,6 +405,7 @@
+ static void vol_adjust(void);
+ #include "proc_native_scope.inc.c"
+ #include "outputs_start.inc.c"
++#include "outputs_queue.inc.c"
+ 
+ int
+ outputs_device_effective_volume(const struct output_device *device)
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -105,6 +105,16 @@
+   char connection_id[256], session_id[256], alias_incarnation[256], alias_registry[256];
+   uint64_t alias_revision;
+ };
++struct output_native_process { char boot_id[37]; uint64_t pid,proc_start_ticks; };
++struct output_queue_selection {
++  char observation_id[33],session_id[256],occurrence_id[25];
++  uint64_t queue_revision;
++};
++struct output_queue_writer {
++  struct output_native_process native_process;
++  uint64_t writer_fd,pipe_device,pipe_inode,source_epoch,open_generation;
++  char input_path_digest[65];
++};
+ struct output_transport_request
+ {
+   uint64_t device_id;
+@@ -113,6 +123,8 @@
+   struct output_native_owner native_owner;
+   uint64_t native_revision;
+   int percent; /* -1 for non-volume, exact 0..100 for volume */
++  struct output_queue_selection queue;
++  struct output_queue_writer writer;
+ };
+ struct output_transport_result
+ {
+@@ -121,6 +133,7 @@
+   unsigned remaining_ms;
+   int outcome; /* 0 accepted, 1 pending, -1 failed, -2 unknown */
+ };
++int outputs_queue_state_get(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_transport_identity *,bool *);
+ int outputs_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+ int outputs_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
+ int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+@@ -135,7 +148,6 @@
+ #define OUTPUT_START_PIN_MS 15000
+ #define OUTPUT_START_POLICY "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
+ #define OUTPUT_MOVE_POLICY "a674d94e377e8ba2b51ca4ea5f541370bd9dd7f2ecc6fabb2cf3e2f50cbdb5b4"
+-struct output_native_process { char boot_id[37]; uint64_t pid,proc_start_ticks; };
+ struct output_start_request {
+   struct output_native_process native_process;
+   uint64_t device_id,native_revision,writer_source_epoch,pipe_device,pipe_inode;
+--- /dev/null
++++ b/src/outputs_queue.inc.c
+@@ -0,0 +1,47 @@
++/* Queue swaps native source on the SAME live FIFO/reader. These mechanical
++ * proofs grant no START/MOVE/volume or reader-generation transition. */
++static bool queue_writer_current(const struct output_queue_writer *w,const struct output_transport_identity *expected,uint64_t *reader_epoch)
++{
++  struct media_file_info *mfi;struct db_queue_item *item;struct input_fifo_identity reader={0};
++  struct output_transport_identity after;struct timespec deadline;struct stat path;
++  char configured[4096],digest[65];uint64_t fd=0;
++  struct output_start_request registration={0};
++  if(!w || !expected || !expected->input_item_id || expected->input_item_id>UINT32_MAX
++      || !w->open_generation || strcmp(w->input_path_digest,expected->input_path_digest)
++      || !(item=db_queue_fetch_byitemid((uint32_t)expected->input_item_id)))return false;
++  if(!item->file_id || item->id!=expected->input_item_id || !item->path
++      || !(mfi=db_file_fetch_byid(item->file_id))){free_queue_item(item,0);return false;}
++  bool valid=mfi->path && !strcmp(item->path,mfi->path) && mfi->path[0]=='/' && strlen(mfi->path)<sizeof(configured)
++    && mfi->data_kind==DATA_KIND_PIPE;
++  if(valid)memcpy(configured,mfi->path,strlen(mfi->path)+1);
++  free_queue_item(item,0);free_mfi(mfi,0);if(!valid)return false;
++  memcpy(registration.expected_input_path,configured,strlen(configured)+1);
++  memcpy(registration.expected_input_path_digest,w->input_path_digest,sizeof(registration.expected_input_path_digest));
++  if(!start_pipe_registered(&registration,digest)
++      || stat(configured,&path)<0 || !S_ISFIFO(path.st_mode)
++      || (uint64_t)path.st_dev!=w->pipe_device || (uint64_t)path.st_ino!=w->pipe_inode
++      || !start_proven_writer_fd(&w->native_process,w->writer_fd,w->pipe_device,w->pipe_inode)
++      || !start_unique_writer_fd(&w->native_process,w->pipe_device,w->pipe_inode,&fd) || fd!=w->writer_fd
++      || clock_gettime(CLOCK_MONOTONIC,&deadline)<0)return false;
++  deadline.tv_nsec+=100000000;
++  if(deadline.tv_nsec>=1000000000){deadline.tv_sec++;deadline.tv_nsec-=1000000000;}
++  if(input_fifo_owner_get(expected->input_item_id,configured,false,0,0,&deadline,&reader)<0
++      || reader.device!=w->pipe_device || reader.inode!=w->pipe_inode
++      || !start_proven_writer_fd(&w->native_process,w->writer_fd,w->pipe_device,w->pipe_inode)
++      || !start_unique_writer_fd(&w->native_process,w->pipe_device,w->pipe_inode,&fd) || fd!=w->writer_fd
++      || transport_identity_get(expected->device_id,&after)<0 || !transport_identity_equal(expected,&after))return false;
++  if(reader_epoch)*reader_epoch=reader.epoch;
++  return true;
++}
++int outputs_queue_state_get(uint64_t id,const struct output_native_owner *owner,
++    const struct output_queue_writer *writer,struct output_transport_identity *identity,bool *busy)
++{
++  struct output_transport_identity after;
++  if(!busy || !native_owner_valid(owner,id) || !transport_hex(owner->alias_incarnation,32) || !transport_hex(owner->alias_registry,64) || transport_identity_get(id,identity)<0
++      || !queue_writer_current(writer,identity,NULL))return -1;
++  *busy=!transport_bound_available(id,owner,0);
++  /* bound custody can itself inspect proc/input owners. Recheck after it. */
++  if(!queue_writer_current(writer,identity,NULL) || transport_identity_get(id,&after)<0
++      || !transport_identity_equal(identity,&after))return -1;
++  return 0;
++}
+--- a/src/player.c
++++ b/src/player.c
+@@ -3125,6 +3125,7 @@
+ {
+   const struct output_native_owner *owner;
+   const struct output_transport_request *request;
++  const struct output_queue_writer *queue_writer;
+   struct output_transport_result *result;
+   struct output_transport_identity *identity;
+   bool *busy;
+@@ -3142,6 +3143,7 @@
+   if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
+   else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
+   else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
++  else if (c->action==5) *retval=outputs_queue_state_get(c->id,c->owner,c->queue_writer,c->identity,c->busy);
+   else if (c->action==4) *retval=outputs_transport_bound_state_get(c->id,c->owner,c->identity,c->busy);
+   else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
+   return COMMAND_END;
+@@ -3164,6 +3166,12 @@
+ int player_transport_state_get(uint64_t id, struct output_transport_identity *identity, bool *busy)
+ {
+   struct player_transport_command c={.id=id,.identity=identity,.busy=busy,.action=3};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++
++int player_queue_state_get(uint64_t id,const struct output_native_owner *owner,const struct output_queue_writer *writer,struct output_transport_identity *identity,bool *busy)
++{
++  struct player_transport_command c={.id=id,.owner=owner,.queue_writer=writer,.identity=identity,.busy=busy,.action=5};
+   return commands_exec_sync(cmdbase,transport_command,NULL,&c);
+ }
+ 
+--- a/src/player.h
++++ b/src/player.h
+@@ -254,6 +254,7 @@
+ #endif /* !__PLAYER_H__ */
+ 
+ 
++int player_queue_state_get(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_transport_identity *,bool *);
+ int player_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
+ int player_room_volume_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,struct output_room_volume_state *,bool *);
+ 
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -745,7 +745,7 @@
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct((f->mode==16 || f->mode==17 || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
++    float mapped=airplay_volume_from_pct((f->mode==16 || f->mode==17 || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23 || f->mode==24 || f->mode==25) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
+     char expected[64];
+     snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+     if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+@@ -764,7 +764,7 @@
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+     f->teardowns++;
+-    if(f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
++    if(f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
+       {recovery_wire_fail(f,"BASE receipt did not preserve exact control custody");goto done;}
+   } else if(strncmp(header,"RECORD ",7) && strncmp(header,"SETPEERS ",9) && strncmp(header,"POST /auth-setup ",17))
+     {recovery_wire_fail(f,"unexpected music/metadata/request");goto done;}
+@@ -1140,6 +1140,8 @@
+   if (!gcry_check_version(GCRYPT_VERSION)) return 1;
+   if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
+     { recovery_salt_red = true; return recovery_wire_case(0); }
++  if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
++  if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-wire")) return start35_wire_case(17);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-wire")) return start35_wire_case(18);
+@@ -1151,7 +1153,7 @@
+   if (argc == 2 && !strcmp(argv[1], "--start35-streaming")) return start_streaming_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--rss-owner-red")) return rss_owner_cases(true);
+   if (argc == 2 && !strcmp(argv[1], "--rss-owner")) return rss_owner_cases(false);
+-  for(mode=11;mode<=16;mode++){fflush(NULL);pid_t child=fork();int status;assert(child>=0);if(!child){int result=start35_wire_case(mode);fflush(NULL);_exit(result);}assert(waitpid(child,&status,0)==child);fprintf(stderr,"START35/MOVE mode%d child status%d\n",mode,status);if(!WIFEXITED(status) || WEXITSTATUS(status))return 1;}
++  for(mode=11;mode<=25;mode++){if(mode>16 && mode!=24 && mode!=25)continue;fflush(NULL);pid_t child=fork();int status;assert(child>=0);if(!child){int result=start35_wire_case(mode);fflush(NULL);_exit(result);}assert(waitpid(child,&status,0)==child);fprintf(stderr,"START35/MOVE mode%d child status%d\n",mode,status);if(!WIFEXITED(status) || WEXITSTATUS(status))return 1;}
+   if (rss_owner_cases(false)) return 1;
+   actual_player_startup_cases();
+   for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -1391,6 +1391,34 @@
+   puts("PASS private retirement prepare8 parser rejects duplicate/trailing bytes and permits fd0; reply exactly18");
+ }
+ 
++int player_queue_state_get(uint64_t id,const struct output_native_owner *owner,const struct output_queue_writer *writer,
++    struct output_transport_identity *identity,bool *busy)
++{return outputs_queue_state_get(id,owner,writer,identity,busy);}
++static void queue_strict_wire(void)
++{
++  struct output_transport_request q={.device_id=1,.percent=-1,.bound=true,.native_revision=1};
++  q.native_owner=burst_owner();memset(q.native_owner.alias_incarnation,'a',32);q.native_owner.alias_incarnation[32]=0;memset(q.native_owner.alias_registry,'b',64);q.native_owner.alias_registry[64]=0;strcpy(q.action,"queue");memset(q.native_prepare_id,'a',32);memset(q.args_digest,'b',64);
++  memset(q.queue.observation_id,'c',32);memset(q.queue.occurrence_id,'d',24);strcpy(q.queue.session_id,q.native_owner.session_id);
++  q.writer.open_generation=1;q.writer.pipe_device=1;q.writer.pipe_inode=2;memset(q.writer.input_path_digest,'e',64);
++  strcpy(q.writer.native_process.boot_id,"12345678-1234-1234-1234-123456789abc");q.writer.native_process.pid=1;q.writer.native_process.proc_start_ticks=1;
++  assert(transport_command_valid(&q));q.native_owner.alias_incarnation[0]='g';assert(!transport_command_valid(&q));q.native_owner.alias_incarnation[0]='a';q.bound=false;assert(!transport_command_valid(&q));q.bound=true;
++  json_object *body=json_object_new_object();json_object_object_add(body,"writer_proof",queue_writer_json(&q.writer));
++  json_object_object_add(body,"queue",queue_selection_json(&q.queue));
++  struct output_queue_writer writer={0};struct output_queue_selection selected={0};
++  assert(queue_writer_parse(body,&writer)==0 && writer.writer_fd==0 && writer.source_epoch==0);
++  assert(queue_selection_parse(body,&selected,&q.native_owner)==0 && selected.queue_revision==0);
++  json_object *encoded=NULL;assert(json_object_object_get_ex(body,"writer_proof",&encoded));
++  json_object_object_add(encoded,"writer_fd",json_object_new_string("00"));assert(queue_writer_parse(body,&writer)<0);
++  json_object_object_add(encoded,"writer_fd",json_object_new_string("0"));
++  json_object_object_add(encoded,"unknown",json_object_new_int(1));assert(queue_writer_parse(body,&writer)<0);
++  json_object_object_del(encoded,"unknown");json_object_object_add(encoded,"source_epoch",json_object_new_int(0));assert(queue_writer_parse(body,&writer)<0);
++  json_object_put(body);
++  struct evbuffer *raw=evbuffer_new();const char *duplicate="{\"writer_proof\":{},\"writer_proof\":{}}";
++  evbuffer_add(raw,duplicate,strlen(duplicate));assert(!transport_parse_body_limit(raw,8192));evbuffer_drain(raw,evbuffer_get_length(raw));
++  evbuffer_add(raw,"{} true",7);assert(!transport_parse_body_limit(raw,8192));evbuffer_free(raw);
++  puts("PASS queue conditional field parser keeps canonical fd0/epoch0, denies unbound purpose and malformed/duplicate/trailing fields");
++}
++
+ static void move_actual_writer_fd_proof(void)
+ {
+   char path[]="/tmp/owntone-move-fifo-XXXXXX";
+@@ -1507,6 +1535,7 @@
+   exact_bound_volume_http_contract();
+   move_fd_wire_parser();
+   retirement_wire_parser();
++  queue_strict_wire();
+   move_actual_writer_fd_proof();
+   exact_start_durable_gate();
+   event_free(outputs_deferredev);
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -8,7 +8,7 @@
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+ {
+   struct recovery_wire_fixture *f=active_recovery_wire;
+-  if(!f || (f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23) || device!=f->device || state!=OUTPUT_STATE_CONNECTED || !device->session)
++  if(!f || (f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25) || device!=f->device || state!=OUTPUT_STATE_CONNECTED || !device->session)
+     {if(f)recovery_wire_fail(f,"MOVE old actual AP2 route did not connect");return;}
+   f->phase=1;event_base_loopbreak(f->base);
+ }
+@@ -22,6 +22,39 @@
+   if(f->start_result.phase==OUTPUT_START_UNKNOWN || f->start_result.phase==OUTPUT_START_CANCELLED)
+     {recovery_wire_fail(f,"MOVE target route became unknown");return;}
+   evtimer_add(f->poll,&soon);
++}
++static void queue_actual_same_reader(struct output_device *target,const struct output_native_owner *owner,
++    const struct output_queue_writer *proof,const char *path)
++{
++      struct output_transport_identity before,after;bool busy;
++      assert(outputs_queue_state_get(target->id,owner,proof,&before,&busy)==0 && !busy);
++      /* Queue item IDs and library file IDs are separate namespaces. */
++      struct db_queue_item *queued=db_queue_fetch_byitemid(before.input_item_id);
++      assert(queued && queued->file_id==1 && queued->id!=queued->file_id);free_queue_item(queued,0);
++      struct output_queue_writer wrong=*proof;wrong.pipe_inode++;
++      assert(outputs_queue_state_get(target->id,owner,&wrong,&after,&busy)<0);
++      int readonly=open(path,O_RDONLY|O_NONBLOCK);assert(readonly>=0);wrong=*proof;wrong.writer_fd=readonly;
++      assert(outputs_queue_state_get(target->id,owner,&wrong,&after,&busy)<0);close(readonly);
++      struct output_transport_request q={.device_id=target->id,.percent=-1,.bound=true,.native_revision=2};
++      struct output_transport_result result;q.native_owner=*owner;q.writer=*proof;
++      strcpy(q.action,"queue");memset(q.native_prepare_id,'a',32);memset(q.args_digest,'b',64);
++      memset(q.queue.observation_id,'c',32);memset(q.queue.occurrence_id,'d',24);
++      strcpy(q.queue.session_id,q.native_owner.session_id);q.queue.queue_revision=0;
++      assert(outputs_transport_prepare(&q,&result)==0);q=result.command;
++      memcpy(q.expected_input_path_digest,result.identity.input_path_digest,65);
++      int volume=target->volume;uint64_t input_generation=transport_input_generation;
++      assert(outputs_transport_commit(&q,&result)==0 && result.outcome==0);
++      assert(outputs_transport_commit(&q,&result)<0); /* one-use */
++      assert(transport_identity_get(target->id,&after)==0 && transport_identity_equal(&before,&after)
++        && transport_input_generation==input_generation && target->volume==volume
++        && target->selected && target->session && !outputs_start_gate_closed());
++      q.native_revision=3;memset(q.native_prepare_id,'f',32);q.token[0]=0;
++      assert(outputs_transport_prepare(&q,&result)==0);q=result.command;
++      memcpy(q.expected_input_path_digest,result.identity.input_path_digest,65);
++      struct timespec deadline;struct input_fifo_identity changed={0};clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++      assert(input_fifo_owner_get(before.input_item_id,path,true,proof->pipe_device,proof->pipe_inode,&deadline,&changed)==0);
++      assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
++      puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
+ }
+ static int start35_wire_case(int mode)
+ {
+@@ -50,7 +83,12 @@
+   sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
+   assert(sqlite3_exec(seed,sql,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(sql);sqlite3_close(seed);mfi.id=1;
+   qp.id=mfi.id;assert(db_queue_add_by_query(&qp,0,0,-1,NULL,&item)==0);
+-  if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23){
++  if(mode==24 || mode==25){
++    sqlite3 *shift=NULL;assert(sqlite3_open(database,&shift)==SQLITE_OK);
++    char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
++    assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
++  }
++  if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
+     struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
+     struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
+     struct output_start_result observed;
+@@ -71,7 +109,9 @@
+     assert(input_fifo_owner_get(item,fifo,false,0,0,&read_deadline,&fd)==0);
+     outputs_transport_input_changed(item,fifo,true);
+     *r=(struct output_start_request){.device_id=2,.native_revision=1,.move_existing_session=true};
+-    r->old_native_owner=recovery_burst_owner();r->old_owner_present=true;r->intended_native_owner=r->old_native_owner;
++    r->old_native_owner=recovery_burst_owner();
++    if(mode==24 || mode==25){memset(r->old_native_owner.alias_incarnation,'a',32);r->old_native_owner.alias_incarnation[32]=0;memset(r->old_native_owner.alias_registry,'b',64);r->old_native_owner.alias_registry[64]=0;}
++    r->old_owner_present=true;r->intended_native_owner=r->old_native_owner;
+     strcpy(r->intended_native_owner.homepod_id,"2");strcpy(r->intended_native_owner.room_id,"new-room");r->intended_native_owner.alias_revision++;
+     memset(r->native_incarnation,'a',32);memset(r->offer_id,'b',32);memset(r->binding_id,'c',64);
+     strcpy(r->policy_revision,OUTPUT_MOVE_POLICY);strcpy(r->expected_input_path,fifo);
+@@ -81,6 +121,14 @@
+     assert(start_process_ticks(getpid(),&r->native_process.proc_start_ticks)==1);
+     struct stat writer_stat;assert(fstat(writer,&writer_stat)==0);
+     r->writer_fd=writer;r->writer_pipe_device=writer_stat.st_dev;r->writer_pipe_inode=writer_stat.st_ino;
++    if(mode==25){
++      assert(fd.epoch==0 && !outputs_start_source_owned());
++      assert(dup2(writer,0)==0);if(writer!=0)close(writer);writer=0;r->writer_fd=0;
++      struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
++        .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
++      proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
++      queue_actual_same_reader(old,&r->old_native_owner,&proof,fifo);goto cleanup;
++    }
+     assert(!start_journal.token[0]);
+     assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
+     r->writer_fd=writer+1;assert(outputs_start_state_get(r,&state)<0);r->writer_fd=writer;
+@@ -122,6 +170,12 @@
+     }
+     assert(outputs_start_complete(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_COMPLETED
+       && transport_input_item==(uint64_t)item && !strcmp(transport_input_path_digest,r->expected_input_path_digest));
++    if(mode==24){
++      struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
++        .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
++      proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
++      queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);goto cleanup;
++    }
+     struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
+     struct output_transport_result stale_audio_result;
+     stale_audio.native_owner=r->committed_native_owner;
