@@ -1,3 +1,8 @@
+## Speakers 0.26.22 / Control 0.10.15 — combined candidate, unpublished
+
+- Candidate bundle for the reviewed native room-content and room-move contracts, with independent Speakers and Control versions. Existing account, room, source, grant, queue, volume and one-use ownership checks remain part of the contract.
+- This entry records candidate scope only; it does not claim all behavior complete or physically accepted. Source checks, independent review, immutable image publication, the exact Control GitHub Release, installation and physical acceptance remain separate gates.
+
 ## Speakers 0.26.21 / Control 0.10.14 — combined candidate, unpublished
 
 - Add an explicit read-only account-identifier diagnostic for the current native engine. Ordinary identity reads remain unchanged; optional account observation is bounded to the actual engine and current connection, and reveals no raw username or credential.
