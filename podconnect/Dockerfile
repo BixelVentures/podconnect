@@ -22,6 +22,7 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && cd /gl \
   && test "${GO_LIBRESPOT_VERSION}" = v0.7.3 \
   && test "$(git rev-parse HEAD)" = c191a43c548e698c1dfc83590665f455fc54f084 \
+  && sha256sum -c /patches/native-stack.sha256 \
   && git apply --check "/patches/aliases-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply "/patches/aliases-${GO_LIBRESPOT_VERSION}.patch" \
   && git apply --check "/patches/recovery-${GO_LIBRESPOT_VERSION}.patch" \
@@ -42,7 +43,13 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/room-volume-native.patch" \
   && git apply --check "/patches/room-burst-native.patch" \
   && git apply "/patches/room-burst-native.patch" \
-  && go test ./tracks ./daemon ./zeroconf ./spclient \
+  && git apply --check "/patches/room-start35-native.patch" \
+  && git apply "/patches/room-start35-native.patch" \
+  && git apply --check "/patches/room-start35-native-amendment.patch" \
+  && git apply "/patches/room-start35-native-amendment.patch" \
+  && git apply --check "/patches/room-move-native.patch" \
+  && git apply "/patches/room-move-native.patch" \
+  && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
 FROM ${BUILD_FROM}

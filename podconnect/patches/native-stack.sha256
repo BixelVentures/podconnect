@@ -1,0 +1,13 @@
+5233c2f94094ca834a747294e31ed1d904a132e437af343c56563a339b99cdea  /patches/aliases-v0.7.3.patch
+db27060558618cb82318537066676ef81e620a54ad040020b11bd139f1b1fe2e  /patches/recovery-v0.7.3.patch
+1cb27c5bd7a0f8a83b2d912d26f3b94e10e9f773884f7c7e1567d0a1cfb6212c  /patches/autoplay-v0.7.3.patch
+f7003224acff9401a07f0af304532db294de60f85a78160f093d13ef9c05469d  /patches/context-commit-v0.7.3.patch
+114c48559b73711976b4bfdf5d5ac5b050cd33ec76fd924971ba07ca583b9d57  /patches/volume-action-v0.7.3.patch
+2c8a645654d4f5793661367c7a09d8e4b9f7978a2138d263934420b865367c2a  /patches/initial-publication-v0.7.3.patch
+586b957d508cf54d2b4d126d61dc2b53c28a4209c731be1797329c0ba7bdcac6  /patches/queue-occurrence-v0.7.3.patch
+3e6f87419414aa621433a1a7c297ae1253ac6f4c04544678866795752d77eb68  /patches/room-transport-native.patch
+bec9c9121869f783193acbc7201750362255f6f801a09068e1eb6b742f55cc7e  /patches/room-volume-native.patch
+2823c1e6ec85263e34c29857e9f84cd5ef8b4f018ce4af7bb96c6d49baf1b4bb  /patches/room-burst-native.patch
+b81355ec0cdce88d36cf808780709273aee1573303a37f156ed2228ff4f2767c  /patches/room-start35-native.patch
+c14c5810767b335f117c2953e5c60a0c0d4f67bf454ca700e8431e0ea3c6da36  /patches/room-start35-native-amendment.patch
+bd0654a0ade4f8b62e38dc167bc201f67b118a3a1c6c73fc0f9ed38d37468c24  /patches/room-move-native.patch

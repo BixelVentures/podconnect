@@ -1,0 +1,510 @@
+--- a/audio/chunked-reader.go
++++ b/audio/chunked-reader.go
+@@ -56,8 +56,12 @@
+ }
+ 
+ type HttpChunkedReader struct {
+-	log    librespot.Logger
+-	client *http.Client
++	preparationMu      sync.Mutex
++	preparationStop    func() bool
++	preparationDone    chan struct{}
++	preparationContext context.Context
++	log                librespot.Logger
++	client             *http.Client
+ 
+ 	// TODO: this url will expire at some point
+ 	url *url.URL
+@@ -76,7 +80,19 @@
+ 	latencies []time.Duration
+ }
+ 
+-func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl string) (_ *HttpChunkedReader, err error) {
++func NewHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl string) (*HttpChunkedReader, error) {
++	return newHttpChunkedReader(log, client, audioUrl, nil)
++}
++
++// Preparation cancellation owns construction and decoder reads until explicitly
++// detached by the successfully prepared stream owner. Playback has its own ctx.
++func NewHttpChunkedReaderForPreparation(log librespot.Logger, client *http.Client, audioUrl string, preparation context.Context) (*HttpChunkedReader, error) {
++	if preparation == nil {
++		return nil, fmt.Errorf("missing preparation context")
++	}
++	return newHttpChunkedReader(log, client, audioUrl, preparation)
++}
++func newHttpChunkedReader(log librespot.Logger, client *http.Client, audioUrl string, preparation context.Context) (_ *HttpChunkedReader, err error) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	r := &HttpChunkedReader{
+ 		log:    log,
+@@ -85,14 +101,22 @@
+ 		cancel: cancel,
+ 	}
+ 
++	if preparation != nil {
++		r.preparationContext = preparation
++		r.preparationDone = make(chan struct{})
++		r.preparationStop = context.AfterFunc(preparation, func() { r.cancel(); close(r.preparationDone) })
++	}
+ 	r.url, err = url.Parse(audioUrl)
+ 	if err != nil {
++		r.cancel()
++		_ = r.DetachPreparation()
+ 		return nil, fmt.Errorf("failed parsing resource url: %w", err)
+ 	}
+ 
+ 	defer func() {
+ 		if err != nil {
+ 			r.cancel()
++			_ = r.DetachPreparation()
+ 		}
+ 	}()
+ 
+@@ -473,8 +497,23 @@
+ 	}
+ 
+ }
++func (r *HttpChunkedReader) DetachPreparation() error {
++	r.preparationMu.Lock()
++	stop, done, prepared := r.preparationStop, r.preparationDone, r.preparationContext
++	// Keep done immutable because an already executing cancellation callback owns it.
++	r.preparationStop = nil
++	r.preparationMu.Unlock()
++	if stop != nil && !stop() {
++		<-done
++	}
++	if prepared != nil && prepared.Err() != nil {
++		return prepared.Err()
++	}
++	return r.ctx.Err()
++}
+ func (r *HttpChunkedReader) Close() error {
+ 	r.CancelRead()
++	_ = r.DetachPreparation()
+ 	r.prefetchWg.Wait()
+ 	return nil
+ }
+--- /dev/null
++++ b/audio/start35_test.go
+@@ -0,0 +1,85 @@
++package audio
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestStart35PreparedRawDetachSurvivesStageCancellation(t *testing.T) {
++	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var start, end int
++		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
++			t.Error(err)
++			return
++		}
++		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 2*DefaultChunkSize))
++		w.WriteHeader(206)
++		_, _ = w.Write(bytes.Repeat([]byte{7}, int(DefaultChunkSize)))
++	}))
++	defer owner.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	raw, err := NewHttpChunkedReaderForPreparation(&librespot.NullLogger{}, owner.Client(), owner.URL, ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer raw.Close()
++	if err = raw.DetachPreparation(); err != nil {
++		t.Fatal(err)
++	}
++	cancel()
++	b := make([]byte, 1)
++	if n, err := raw.ReadAt(b, DefaultChunkSize); err != nil || n != 1 || b[0] != 7 {
++		t.Fatal("stage defercancel killed adopted playback reader", n, err)
++	}
++}
++func TestStart35CancelledDecoderReadsJoinBeforeAdoption(t *testing.T) {
++	entered, drained := make(chan struct{}), make(chan struct{})
++	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
++			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", DefaultChunkSize-1, 2*DefaultChunkSize))
++			w.WriteHeader(206)
++			_, _ = w.Write(bytes.Repeat([]byte{1}, int(DefaultChunkSize)))
++		} else {
++			close(entered)
++			<-r.Context().Done()
++			close(drained)
++		}
++	}))
++	defer owner.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	raw, err := NewHttpChunkedReaderForPreparation(&librespot.NullLogger{}, owner.Client(), owner.URL, ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { b := make([]byte, 1); _, err := raw.ReadAt(b, DefaultChunkSize); done <- err }()
++	<-entered
++	cancel()
++	select {
++	case err = <-done:
++		if err == nil {
++			t.Fatal("cancelled decoder read succeeded")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("decoder raw read did not join cancellation")
++	}
++	if err = raw.DetachPreparation(); err == nil {
++		t.Fatal("cancelled decoder adopted")
++	}
++	if err = raw.Close(); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-drained:
++	case <-time.After(time.Second):
++		t.Fatal("raw HTTP worker not drained")
++	}
++}
+--- /dev/null
++++ b/output/start35_linux_test.go
+@@ -0,0 +1,125 @@
++//go:build linux
++
++package output
++
++import (
++	"context"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"os"
++	"runtime"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++type pinnedStartRead struct {
++	tid    chan int
++	pinned bool
++}
++
++func (r *pinnedStartRead) Read(samples []float32) (int, error) {
++	if !r.pinned {
++		runtime.LockOSThread()
++		r.pinned = true
++		r.tid <- syscall.Gettid()
++	}
++	for i := range samples {
++		samples[i] = 0.25
++	}
++	return len(samples), nil
++}
++func TestStart35FullFIFOQuiescenceRequiresActualWriterJoin(t *testing.T) {
++	reader := &pinnedStartRead{tid: make(chan int, 1)}
++	out, read, path := startPipeFixture(t, reader)
++	// Failure cleanup must itself drain the owned FIFO before fixture Close joins.
++	t.Cleanup(func() {
++		out.FenceStart()
++		until := time.Now().Add(time.Second)
++		buffer := make([]byte, 65536)
++		for time.Now().Before(until) {
++			_, _ = syscall.Read(int(read.Fd()), buffer)
++			if out.lock.TryLock() {
++				out.lock.Unlock()
++				return
++			}
++			time.Sleep(time.Millisecond)
++		}
++	})
++	writer, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	fill := make([]byte, 4096)
++	binary.LittleEndian.PutUint32(fill, 123)
++	for {
++		_, err = syscall.Write(writer, fill)
++		if err == syscall.EAGAIN {
++			break
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	syscall.Close(writer)
++	if err = out.Resume(); err != nil {
++		t.Fatal(err)
++	}
++	tid := <-reader.tid
++	// Kernel-visible syscall admission proves the writer passed Read and the
++	// post-Read fence. A reader-entered notification alone does not prove Write.
++	syscallPath := fmt.Sprintf("/proc/self/task/%d/syscall", tid)
++	deadline := time.Now().Add(time.Second)
++	blocked := false
++	for time.Now().Before(deadline) {
++		raw, e := os.ReadFile(syscallPath)
++		if e != nil {
++			t.Fatal(e)
++		}
++		fields := strings.Fields(string(raw))
++		if len(fields) > 1 && fields[0] == strconv.Itoa(syscall.SYS_WRITE) {
++			fd, e := strconv.ParseUint(fields[1], 0, 64)
++			if e == nil && fd == uint64(out.file.Fd()) {
++				blocked = true
++				break
++			}
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if !blocked {
++		t.Fatal("actual native writer was not observed blocked inside kernel Write on exact FIFO fd")
++	}
++	out.FenceStart()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	joined := make(chan error, 1)
++	go func() {
++		joined <- out.WithStartLock(ctx, func(_ PipeIdentity, pause func(bool)) error { pause(true); return nil })
++	}()
++	select {
++	case err = <-joined:
++		t.Fatal("quiescence certificate preceded actual blocked Write drain", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	buffer := make([]byte, 65536)
++	deadline = time.Now().Add(time.Second)
++	for time.Now().Before(deadline) {
++		select {
++		case err = <-joined:
++			if err != nil {
++				t.Fatal(err)
++			}
++			return
++		default:
++		}
++		_, err = syscall.Read(int(read.Fd()), buffer)
++		if err != nil && err != syscall.EAGAIN && err != io.EOF {
++			t.Fatal(err)
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Fatal("full FIFO writer was not joined after actual controlled drain")
++}
+--- a/output/start35_test.go
++++ b/output/start35_test.go
+@@ -2,8 +2,7 @@
+ 
+ import (
+ 	"context"
+-	"encoding/binary"
+-	"io"
++	librespot "github.com/devgianlu/go-librespot"
+ 	"os"
+ 	"path/filepath"
+ 	"sync/atomic"
+@@ -30,7 +29,7 @@
+ 	}
+ 	return len(samples), nil
+ }
+-func startPipeFixture(t *testing.T, reader *startRead) (*pipeOutput, *os.File, string) {
++func startPipeFixture(t *testing.T, reader librespot.Float32Reader) (*pipeOutput, *os.File, string) {
+ 	t.Helper()
+ 	path := filepath.Join(t.TempDir(), "owned.fifo")
+ 	if err := syscall.Mkfifo(path, 0600); err != nil {
+@@ -96,52 +95,3 @@
+ 		t.Fatal("late pre-barrier samples reached FIFO", n, err)
+ 	}
+ }
+-func TestStart35FullFIFOQuiescenceRequiresActualWriterJoin(t *testing.T) {
+-	reader := &startRead{entered: make(chan struct{})}
+-	out, read, path := startPipeFixture(t, reader)
+-	writer, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	fill := make([]byte, 4096)
+-	binary.LittleEndian.PutUint32(fill, 123)
+-	for {
+-		_, err = syscall.Write(writer, fill)
+-		if err == syscall.EAGAIN {
+-			break
+-		}
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-	syscall.Close(writer)
+-	if err = out.Resume(); err != nil {
+-		t.Fatal(err)
+-	}
+-	<-reader.entered
+-	out.FenceStart()
+-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+-	defer cancel()
+-	joined := make(chan error, 1)
+-	go func() {
+-		joined <- out.WithStartLock(ctx, func(_ PipeIdentity, pause func(bool)) error { pause(true); return nil })
+-	}()
+-	buffer := make([]byte, 65536)
+-	until := time.Now().Add(time.Second)
+-	for time.Now().Before(until) {
+-		select {
+-		case err = <-joined:
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			return
+-		default:
+-		}
+-		_, err = syscall.Read(int(read.Fd()), buffer)
+-		if err != nil && err != syscall.EAGAIN && err != io.EOF {
+-			t.Fatal(err)
+-		}
+-		time.Sleep(time.Millisecond)
+-	}
+-	t.Fatal("full FIFO writer was not joined by gated reader draining")
+-}
+--- a/player/player.go
++++ b/player/player.go
+@@ -38,7 +38,8 @@
+ }
+ 
+ type Player struct {
+-	log librespot.Logger
++	preparationContext context.Context
++	log                librespot.Logger
+ 
+ 	flacEnabled               bool
+ 	normalisationEnabled      bool
+@@ -484,6 +485,9 @@
+ 
+ 		var err error
+ 		for i := 0; i < len(storageResolve.Cdnurl); i++ {
++			if p.preparationContext != nil && p.preparationContext.Err() != nil {
++				return nil, p.preparationContext.Err()
++			}
+ 			var cdnUrl *url.URL
+ 			cdnUrl, err = url.Parse(storageResolve.Cdnurl[i])
+ 			if err != nil {
+@@ -501,7 +505,11 @@
+ 			}
+ 
+ 			var rawStream *audio.HttpChunkedReader
+-			rawStream, err = audio.NewHttpChunkedReader(log, client, cdnUrl.String())
++			if p.preparationContext != nil {
++				rawStream, err = audio.NewHttpChunkedReaderForPreparation(log, client, cdnUrl.String(), p.preparationContext)
++			} else {
++				rawStream, err = audio.NewHttpChunkedReader(log, client, cdnUrl.String())
++			}
+ 			if err != nil {
+ 				log.WithError(err).WithField("host", cdnUrl.Host).Warnf("failed creating chunked reader, trying next url")
+ 				p.cdnQuarantine[cdnUrl.Host] = time.Now()
+@@ -757,6 +765,14 @@
+ 		}
+ 	}
+ 
++	if p.preparationContext != nil {
++		if err := rawStream.DetachPreparation(); err != nil {
++			return nil, fmt.Errorf("preparation cancelled before decoder adoption: %w", err)
++		}
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++	}
+ 	sourceOwned = true
+ 	return &Stream{PlaybackId: playbackId, Source: &ownedAudioSource{AudioSource: stream, raw: rawStream}, Media: media, File: file}, nil
+ }
+--- a/player/start_staging.go
++++ b/player/start_staging.go
+@@ -30,6 +30,7 @@
+ 	return &StreamPreparation{loader, events}
+ }
+ func (preparation *StreamPreparation) NewStream(ctx context.Context, client *http.Client, id librespot.SpotifyId, bitrate int) (*Stream, error) {
++	preparation.loader.preparationContext = ctx
+ 	return preparation.loader.NewStream(ctx, client, id, bitrate, 0)
+ }
+ func (preparation *StreamPreparation) PublishEvents() {
+--- /dev/null
++++ b/player/start_staging_test.go
+@@ -0,0 +1,72 @@
++package player
++
++import (
++	"context"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	downloadpb "github.com/devgianlu/go-librespot/proto/spotify/download"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// Uses the actual detached loader's storage->raw construction seam, not a
++// fabricated provider login or decoder payload. HTTP and body cancellation must
++// join construction before any stream can be staged.
++func TestStart35PreparationCancelsActualHeldCDNConstruction(t *testing.T) {
++	for _, mode := range []string{"headers", "body"} {
++		t.Run(mode, func(t *testing.T) {
++			entered, drained := make(chan struct{}), make(chan struct{})
++			release := make(chan struct{})
++			var requests atomic.Int32
++			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				requests.Add(1)
++				if mode == "body" {
++					w.Header().Set("Content-Range", "bytes 0-15/16")
++					w.WriteHeader(206)
++					w.(http.Flusher).Flush()
++				}
++				close(entered)
++				select {
++				case <-r.Context().Done():
++				case <-release:
++				}
++				close(drained)
++			}))
++			defer func() { close(release); owner.Close() }()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			loader := &Player{preparationContext: ctx, cdnQuarantine: map[string]time.Time{}}
++			done := make(chan error, 1)
++			go func() {
++				raw, err := loader.httpChunkedReaderFromStorageResolve(&librespot.NullLogger{}, owner.Client(), &downloadpb.StorageResolveResponse{Result: downloadpb.StorageResolveResponse_CDN, Cdnurl: []string{owner.URL, owner.URL + "/never-fallback"}})
++				if raw != nil {
++					_ = raw.Close()
++					done <- fmt.Errorf("cancelled construction returned raw owner")
++					return
++				}
++				done <- err
++			}()
++			<-entered
++			cancel()
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("cancelled construction succeeded")
++				}
++			case <-time.After(time.Second):
++				t.Fatal("held CDN construction ignored stage cancellation")
++			}
++			select {
++			case <-drained:
++			case <-time.After(time.Second):
++				t.Fatal("actual HTTP worker not drained")
++			}
++			if requests.Load() != 1 {
++				t.Fatal("cancel attempted later CDN/retry", requests.Load())
++			}
++		})
++	}
++}

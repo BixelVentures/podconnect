@@ -1,0 +1,2067 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index 65dd8b7..e336347 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -31,6 +31,7 @@ type ApiServer interface {
+ type ConcreteApiServer struct {
+ 	roomVolumes  roomVolumeStore
+ 	roomContents contentStore
++	roomMoves    moveStore
+ 	log          librespot.Logger
+ 
+ 	allowOrigin string
+@@ -759,6 +760,11 @@ func (s *ConcreteApiServer) serve() {
+ 	m.HandleFunc("/player/room_content/commit", s.handleContentCommit)
+ 	m.HandleFunc("/player/room_content/cancel", s.handleContentCancel)
+ 	m.HandleFunc("/player/room_content/result", s.handleContentResult)
++	m.HandleFunc("/player/room_move/controls", s.handleMoveControls)
++	m.HandleFunc("/player/room_move/prepare", s.handleMovePrepare)
++	m.HandleFunc("/player/room_move/commit", s.handleMoveCommit)
++	m.HandleFunc("/player/room_move/cancel", s.handleMoveCancel)
++	m.HandleFunc("/player/room_move/result", s.handleMoveResult)
+ 	m.HandleFunc("/player/room_volume/bound-state", s.handleRoomVolumeState)
+ 	m.HandleFunc("/player/room_volume/bound-prepare", s.handleRoomVolumePrepare)
+ 	m.HandleFunc("/player/room_volume/bound-commit", s.handleRoomVolumeCommit)
+diff --git a/daemon/player.go b/daemon/player.go
+index 59b83c7..77abb4b 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,6 +30,9 @@ import (
+ )
+ 
+ type AppPlayer struct {
++	roomMoveReservation              *moveReservation
++	roomMoveQuarantined              bool
++	roomMoveSteps                    chan moveStep
+ 	roomContentIncarnation           string
+ 	roomContentReservation           *contentReservation
+ 	roomContentQuarantined           bool
+@@ -554,7 +557,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 
+ 	if p.roomVolumeBusy() {
+ 		switch req.Type {
+-		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort:
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort, apiMoveConsume:
+ 		default:
+ 			return nil, ErrAliasConflict
+ 		}
+@@ -564,6 +567,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
++	case apiMoveObserve:
++		return p.captureMove(req.Data.(roomVolumeScope))
++	case apiMoveOffer:
++		return p.offerMove(req.Data.(moveOfferActorRequest))
++	case apiMoveClaim:
++		return p.claimMove(req.Data.(moveActorRequest))
++	case apiMoveConsume:
++		return p.consumeMove(req.Data.(moveActorRequest))
+ 	case apiContentObserve:
+ 		return p.captureContent(req.Data.(roomVolumeScope))
+ 	case apiContentOffer:
+@@ -1079,5 +1090,8 @@ func (p *AppPlayer) dispatchAPIAndPark(ctx context.Context, req ApiRequest) bool
+ 	if !p.waitContentReservation(ctx) {
+ 		return false
+ 	}
++	if !p.waitMoveReservation(ctx) {
++		return false
++	}
+ 	return p.waitRoomVolumeReservation(ctx)
+ }
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index c9f1507..8062d30 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -228,7 +228,7 @@ func (op *contentOperation) discard() {
+ func (p *AppPlayer) contentBusyLocked() bool {
+ 	// Only the actor park retires the reservation and installs quarantine atomically.
+ 	// An elapsed deadline alone cannot open a scheduling gap for another owner.
+-	return p.roomContentQuarantined || p.roomContentReservation != nil
++	return p.roomContentQuarantined || p.roomContentReservation != nil || p.moveBusyLocked()
+ }
+ func (p *AppPlayer) captureContent(scope roomVolumeScope) (*contentCapture, error) {
+ 	actualAccount, authenticated := p.sess.BoundUsername()
+diff --git a/daemon/room_move.go b/daemon/room_move.go
+new file mode 100644
+index 0000000..75c4b62
+--- /dev/null
++++ b/daemon/room_move.go
+@@ -0,0 +1,264 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"strconv"
++	"sync"
++	"time"
++
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++const movePolicy = "a674d94e377e8ba2b51ca4ea5f541370bd9dd7f2ecc6fabb2cf3e2f50cbdb5b4"
++const (
++	apiMoveObserve ApiRequestType = "move_observe"
++	apiMoveOffer   ApiRequestType = "move_offer"
++	apiMoveClaim   ApiRequestType = "move_claim"
++	apiMoveConsume ApiRequestType = "move_consume"
++)
++
++type moveOffer struct {
++	Schema               string `json:"schema"`
++	OfferID              string `json:"offer_id"`
++	BindingID            string `json:"binding_id"`
++	NativeIncarnation    string `json:"native_incarnation"`
++	PolicyRevision       string `json:"policy_revision"`
++	SessionVolumePercent int    `json:"session_volume_percent"`
++	ExpiresAfterMS       int    `json:"expires_after_ms"`
++}
++type moveArgs struct{}
++type movePrepareRequest struct {
++	Scope  roomVolumeScope `json:"scope"`
++	Offer  moveOffer       `json:"move_offer"`
++	Action string          `json:"action"`
++	Args   moveArgs        `json:"args"`
++}
++type moveIDRequest struct {
++	OfferID   string `json:"offer_id"`
++	BindingID string `json:"binding_id"`
++}
++type moveReceipt struct {
++	Schema        string  `json:"schema"`
++	OK            bool    `json:"ok"`
++	OfferID       string  `json:"offer_id"`
++	BindingID     string  `json:"binding_id"`
++	State         string  `json:"state"`
++	Accepted      bool    `json:"accepted_room_move"`
++	OperationID   *string `json:"move_operation_id"`
++	SessionVolume *int    `json:"session_volume_percent"`
++	RoomID        string  `json:"room_id"`
++	HomePodID     string  `json:"homepod_id"`
++	Physical      bool    `json:"physical_result_verified"`
++}
++type moveCapture struct {
++	*contentCapture
++	Tracks        *tracks.List
++	QueueRevision uint64
++	Paused        bool
++	StateVolume   uint32
++	WriterPipe    output.MovePipeIdentity
++	WriterFD      string
++	WriterEpoch   string
++}
++type moveOperation struct {
++	mu                                                                                                   sync.Mutex
++	Owner                                                                                                *AppPlayer
++	Capture                                                                                              *moveCapture
++	Offer                                                                                                moveOffer
++	CState                                                                                               moveCState
++	Target                                                                                               contentTarget
++	Intended                                                                                             roomTransportIdentity
++	Actual                                                                                               *roomTransportIdentity
++	Expires, StagedUntil, Until, RetainUntil                                                             time.Time
++	State                                                                                                string
++	Claimed, CommitClaimed, Cancelled, Possible, Quiescent, Switched, Terminal, CancelSent, OwnerClosing bool
++	Revision, ReservationID                                                                              string
++	CReceipt                                                                                             *moveCReceipt
++	Pipe                                                                                                 output.MovePipeIdentity
++	Epoch                                                                                                string
++	Cancel                                                                                               context.CancelFunc
++	TerminalSignal                                                                                       chan struct{}
++}
++type moveOfferActorRequest struct {
++	Capture *moveCapture
++	State   moveCState
++	Context context.Context
++}
++type moveActorRequest struct {
++	Operation *moveOperation
++	Context   context.Context
++	Request   movePrepareRequest
++}
++type moveStep struct {
++	Operation *moveOperation
++	Phase     string
++	Context   context.Context
++	Reply     chan error
++}
++type moveReservation struct {
++	Operation *moveOperation
++	Until     time.Time
++}
++type moveStore struct {
++	mu      sync.Mutex
++	records map[string]*moveOperation
++}
++
++func (s *moveStore) put(op *moveOperation) bool {
++	s.mu.Lock()
++	if s.records == nil {
++		s.records = map[string]*moveOperation{}
++	}
++	for id, old := range s.records {
++		old.mu.Lock()
++		expired := (!old.Claimed && time.Now().After(old.Expires)) || (old.Terminal && old.State != "unknown" && time.Now().After(old.RetainUntil))
++		old.mu.Unlock()
++		if expired {
++			delete(s.records, id)
++		}
++	}
++	ok := len(s.records) < 128
++	if ok {
++		s.records[op.Offer.OfferID] = op
++	}
++	s.mu.Unlock()
++	return ok
++}
++func (s *moveStore) get(id, binding string) *moveOperation {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	op := s.records[id]
++	if op == nil || op.Offer.BindingID != binding {
++		return nil
++	}
++	return op
++}
++func (op *moveOperation) receipt(endpoint string) moveReceipt {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	complete := op.State == "complete"
++	var id *string
++	var percent *int
++	if complete {
++		value := op.Offer.OfferID
++		id = &value
++		valuePercent := op.Offer.SessionVolumePercent
++		percent = &valuePercent
++	}
++	return moveReceipt{"podconnect.native_room_move_" + endpoint + ".v1", complete, op.Offer.OfferID, op.Offer.BindingID, op.State, complete, id, percent, op.Capture.Scope.RoomID, op.Capture.Scope.HomePodID, false}
++}
++func (op *moveOperation) finish(state string) {
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if op.Terminal {
++		return
++	}
++	op.State = state
++	op.Terminal = true
++	op.RetainUntil = time.Now().Add(time.Minute)
++	if (state == "complete" || state == "rejected" || state == "cancelled") && op.TerminalSignal != nil {
++		close(op.TerminalSignal)
++	}
++}
++func (p *AppPlayer) moveBusyLocked() bool {
++	return p.roomMoveQuarantined || p.roomMoveReservation != nil
++}
++func (p *AppPlayer) captureMove(scope roomVolumeScope) (*moveCapture, error) {
++	c, err := p.captureContent(scope)
++	if err != nil {
++		return nil, err
++	}
++	snapshotCtx, stopSnapshot := context.WithTimeout(context.Background(), 2*time.Second)
++	defer stopSnapshot()
++	writer, writerEpoch, err := p.player.RoomMove(snapshotCtx, "snapshot", c.Source, output.MovePipeIdentity{}, "", !c.PlayerState.IsPaused, nil)
++	if err != nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if c.OldOwner == nil || c.OldOwner.HomePodID == scope.HomePodID || c.OldOwner.RoomID == scope.RoomID || c.Primary == nil || c.Source == nil || c.Primary.Source != c.Source || !c.State.active || !c.PlayerState.IsPlaying || c.SessionID == "" || c.State.tracks == nil || p.moveBusyLocked() {
++		return nil, ErrAliasConflict
++	}
++	return &moveCapture{contentCapture: c, Tracks: c.State.tracks, QueueRevision: c.State.tracks.TransportRevision(), Paused: c.PlayerState.IsPaused, StateVolume: c.State.device.Volume, WriterPipe: writer, WriterFD: writer.FD, WriterEpoch: writerEpoch}, nil
++}
++func (p *AppPlayer) moveCurrentLocked(c *moveCapture) bool {
++	return c != nil && p.contentCurrentLocked(c.contentCapture) && p.state.active && p.state.player.IsPlaying && p.state.player.IsPaused == c.Paused && p.state.device.Volume == c.StateVolume && p.state.tracks == c.Tracks && c.Tracks.TransportRevision() == c.QueueRevision && p.primaryStream != nil && p.primaryStream.Source == c.Source
++}
++func (p *AppPlayer) offerMove(request moveOfferActorRequest) (any, error) {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	c := request.Capture
++	if request.Context.Err() != nil || !p.moveCurrentLocked(c) || !request.State.valid(c) {
++		return nil, ErrAliasConflict
++	}
++	if p.roomContentSteps == nil {
++		p.roomContentSteps = make(chan contentStep)
++	}
++	if p.roomMoveSteps == nil {
++		p.roomMoveSteps = make(chan moveStep)
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	binding := contentDigest(struct {
++		Scope                                              roomVolumeScope
++		Process                                            contentProcess
++		Registry, Connection, Session, PipeDigest, OwnTone string
++		AliasRevision, QueueRevision, Intent               uint64
++		Paused                                             bool
++		Source, Primary                                    string
++		CState                                             moveCState
++	}{c.Scope, c.Process, c.Registry, c.Connection, c.SessionID, c.PipeDigest, c.OwnTone, c.AliasRevision, c.QueueRevision, c.Intent, c.Paused, fmt.Sprintf("%p", c.Source), fmt.Sprintf("%p", c.Primary), request.State})
++	op := &moveOperation{Owner: p, Capture: c, Offer: moveOffer{"podconnect.room_output_move_offer.v1", id, binding, c.Incarnation, movePolicy, request.State.SessionVolume, 5000}, CState: request.State, Target: request.State.Target, Expires: time.Now().Add(5 * time.Second), RetainUntil: time.Now().Add(45 * time.Second), State: "staging", TerminalSignal: make(chan struct{})}
++	return op, nil
++}
++func (p *AppPlayer) claimMove(request moveActorRequest) (any, error) {
++	op := request.Operation
++	if op == nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	echo, original := request.Request.Offer, op.Offer
++	echo.ExpiresAfterMS = original.ExpiresAfterMS
++	if request.Context.Err() != nil || request.Request.Action != "move_existing_session" || request.Request.Scope != op.Capture.Scope || echo != original || request.Request.Offer.ExpiresAfterMS < 1 || request.Request.Offer.ExpiresAfterMS > original.ExpiresAfterMS || op.Claimed || op.Cancelled || !time.Now().Before(op.Expires) || !p.moveCurrentLocked(op.Capture) || p.roomNativeIntent == ^uint64(0) || p.aliasRevision >= 1<<53-1 {
++		return nil, ErrAliasConflict
++	}
++	p.roomNativeIntent++
++	op.Capture.Intent = p.roomNativeIntent
++	op.Revision = strconv.FormatUint(p.roomNativeIntent, 10)
++	op.Claimed = true
++	c := op.Capture
++	op.Intended = roomTransportIdentity{c.Scope.AccountUserID, c.Scope.TargetID, c.Scope.RoomID, c.Scope.HomePodID, c.Connection, c.SessionID, c.AliasIncarnation, c.Registry, c.AliasRevision + 1}
++	if !nativeBoundOwnerValid(op.Intended) {
++		return nil, ErrAliasConflict
++	}
++	return op, nil
++}
++func (p *AppPlayer) consumeMove(request moveActorRequest) (any, error) {
++	op := request.Operation
++	if op == nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	op.mu.Lock()
++	defer op.mu.Unlock()
++	if request.Context.Err() != nil || op.Owner != p || !op.CommitClaimed || op.Cancelled || op.Terminal || op.State != "committing" || op.CReceipt == nil || op.CReceipt.Phase != "prepared" || op.ReservationID != "" || !time.Now().Before(op.StagedUntil) || !p.moveCurrentLocked(op.Capture) || p.roomVolumeReservedLocked() || p.contentBusyLocked() || p.moveBusyLocked() {
++		return nil, ErrAliasConflict
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	op.ReservationID = id
++	op.Until = time.Now().Add(12 * time.Second)
++	op.RetainUntil = op.Until.Add(time.Minute)
++	p.roomMoveReservation = &moveReservation{op, op.Until}
++	return op, nil
++}
+diff --git a/daemon/room_move_actor.go b/daemon/room_move_actor.go
+new file mode 100644
+index 0000000..5218478
+--- /dev/null
++++ b/daemon/room_move_actor.go
+@@ -0,0 +1,181 @@
++package daemon
++
++import (
++	"context"
++	"time"
++)
++
++func (p *AppPlayer) moveEffectCurrentLocked(op *moveOperation, ctx context.Context) bool {
++	if ctx.Err() != nil || op.Cancelled || op.Terminal || !time.Now().Before(op.Until) || p.roomMoveReservation == nil || p.roomMoveReservation.Operation != op || p.roomVolumeClosing || p.aliasRetired || p.roomMoveQuarantined {
++		return false
++	}
++	if !op.Switched {
++		return p.moveCurrentLocked(op.Capture)
++	}
++	c := op.Capture
++	return c.processCurrent() && p.state == c.State && p.state.player == c.PlayerState && p.state.player.SessionId == c.SessionID && p.state.device.Volume == c.StateVolume && p.state.tracks == c.Tracks && c.Tracks.TransportRevision() == c.QueueRevision && p.primaryStream == c.Primary && p.primaryStream.Source == c.Source && p.sess == c.Session && p.player == c.Player && p.spotConnId == c.Connection && p.roomNativeIntent == c.Intent && p.aliasIncarnation == c.AliasIncarnation && p.aliasFingerprint == c.Registry && p.aliasRevision == op.Intended.AliasRevision && p.state.device.SelectedAliasId == c.TargetAlias && p.state.player.IsPaused == c.Paused && p.app.cfg.AudioOutputPipe == c.Pipe && p.transportMappingCurrentLocked()
++}
++
++func (p *AppPlayer) applyMoveStep(step moveStep) error {
++	op := step.Operation
++	if op == nil {
++		return ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	op.mu.Lock()
++	valid := p.moveEffectCurrentLocked(op, step.Context) && contentAccountMatches(p.sess, op.Capture.Scope.AccountUserID)
++	if step.Phase == "quiesce" {
++		valid = valid && op.CReceipt != nil && op.CReceipt.Phase == "gate_closed_reader_ready" && op.CReceipt.GateClosed
++	}
++	if step.Phase == "switch" {
++		valid = valid && op.Quiescent && op.CReceipt != nil && op.CReceipt.Phase == "route_ready_closed" && op.CReceipt.GateClosed
++	}
++	if step.Phase == "resume" {
++		valid = valid && op.Switched && op.CReceipt != nil && op.CReceipt.Phase == "opened" && !op.CReceipt.GateClosed
++	}
++	pipe, epoch := op.Pipe, op.Epoch
++	if step.Phase == "quiesce" {
++		pipe, epoch = op.Capture.WriterPipe, op.Capture.WriterEpoch
++	}
++	op.mu.Unlock()
++	p.aliasMu.Unlock()
++	if !valid {
++		return ErrAliasConflict
++	}
++	ctx, cancel := context.WithDeadline(step.Context, op.Until)
++	defer cancel()
++	actualPipe, actualEpoch, err := p.player.RoomMove(ctx, step.Phase, op.Capture.Source, pipe, epoch, !op.Capture.Paused, func(mutate func()) error {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		op.mu.Lock()
++		defer op.mu.Unlock()
++		if !p.moveEffectCurrentLocked(op, ctx) || !contentAccountMatches(p.sess, op.Capture.Scope.AccountUserID) {
++			return ErrAliasConflict
++		}
++		if step.Phase == "switch" && (!op.Quiescent || op.CReceipt == nil || op.CReceipt.Phase != "route_ready_closed") {
++			return ErrAliasConflict
++		}
++		if step.Phase == "resume" && (!op.Switched || op.CReceipt == nil || op.CReceipt.Phase != "opened") {
++			return ErrAliasConflict
++		}
++		mutate()
++		if step.Phase == "switch" {
++			p.state.device.SelectedAliasId = op.Capture.TargetAlias
++			p.aliasRevision = op.Intended.AliasRevision
++			op.Switched = true
++			actualAccount, _ := p.sess.BoundUsername()
++			actual := roomTransportIdentity{actualAccount, p.app.deviceId, op.Capture.Scope.RoomID, op.Capture.Scope.HomePodID, p.spotConnId, p.state.player.SessionId, p.aliasIncarnation, p.aliasFingerprint, p.aliasRevision}
++			op.Actual = &actual
++		}
++		if step.Phase == "quiesce" {
++			op.Quiescent = true
++		}
++		return nil
++	})
++	if err != nil {
++		return err
++	}
++	op.mu.Lock()
++	op.Pipe = actualPipe
++	op.Epoch = actualEpoch
++	op.mu.Unlock()
++	return nil
++}
++
++func (op *moveOperation) actorStep(ctx context.Context, phase string) error {
++	reply := make(chan error, 1)
++	select {
++	case op.Owner.roomMoveSteps <- moveStep{op, phase, ctx, reply}:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	return <-reply
++}
++
++func (p *AppPlayer) waitMoveReservation(ctx context.Context) bool {
++	p.aliasMu.Lock()
++	reservation := p.roomMoveReservation
++	p.aliasMu.Unlock()
++	if reservation == nil {
++		return ctx.Err() == nil
++	}
++	op := reservation.Operation
++	timer := time.NewTimer(max(0, time.Until(reservation.Until)))
++	defer timer.Stop()
++	stopRequested := false
++	for {
++		select {
++		case step := <-p.roomMoveSteps:
++			if step.Operation != op {
++				step.Reply <- ErrAliasConflict
++				continue
++			}
++			step.Reply <- p.applyMoveStep(step)
++		case <-op.TerminalSignal:
++			op.mu.Lock()
++			completed := op.State == "complete"
++			op.mu.Unlock()
++			if completed && p.primaryStream == op.Capture.Primary && p.primaryStream.Source == op.Capture.Source && p.state.player == op.Capture.PlayerState && p.state.tracks == op.Capture.Tracks && p.state.player.SessionId == op.Capture.SessionID {
++				p.emitSelectedAlias(op.Capture.TargetAlias, p.aliasBinding())
++			}
++			p.aliasMu.Lock()
++			if p.roomMoveReservation == reservation {
++				p.roomMoveReservation = nil
++			}
++			closing := p.roomVolumeClosing
++			p.aliasMu.Unlock()
++			return !closing && !stopRequested && ctx.Err() == nil
++		case <-ctx.Done():
++			stopRequested = true
++			op.mu.Lock()
++			op.OwnerClosing = true
++			op.mu.Unlock()
++			op.cancelMove()
++			go p.Close()
++			ctx = context.Background()
++		case <-timer.C:
++			op.mu.Lock()
++			possible := op.Possible
++			alreadyClosing := op.OwnerClosing
++			if possible {
++				op.OwnerClosing = true
++			}
++			pipe, epoch := op.Pipe, op.Epoch
++			if !op.Quiescent {
++				pipe, epoch = op.Capture.WriterPipe, op.Capture.WriterEpoch
++			}
++			op.mu.Unlock()
++			op.cancelMove()
++			if possible && alreadyClosing {
++				// A context-triggered Close may still be joining an old write.
++				p.Close()
++			} else if possible {
++				// The actor cannot resume ordinary dealer or player events while
++				// an unknown MOVE may still own a live FIFO writer.
++				fenceCtx, stopFence := context.WithTimeout(context.Background(), time.Second)
++				_, _, fenceErr := p.player.RoomMove(fenceCtx, "fence", nil, pipe, epoch, false, nil)
++				stopFence()
++				if fenceErr != nil {
++					// Close joins the actual writer FD before this actor exits.
++					p.player.Close()
++				}
++				go p.Close()
++			}
++			if possible {
++				op.finish("unknown")
++			} else {
++				op.finish("cancelled")
++			}
++			p.aliasMu.Lock()
++			if possible {
++				p.roomMoveQuarantined = true
++			}
++			if p.roomMoveReservation == reservation {
++				p.roomMoveReservation = nil
++			}
++			closing := p.roomVolumeClosing
++			p.aliasMu.Unlock()
++			return !possible && !closing && !stopRequested && ctx.Err() == nil
++		}
++	}
++}
+diff --git a/daemon/room_move_c.go b/daemon/room_move_c.go
+new file mode 100644
+index 0000000..8f98bd4
+--- /dev/null
++++ b/daemon/room_move_c.go
+@@ -0,0 +1,171 @@
++package daemon
++
++import (
++	"context"
++	"strings"
++)
++
++type moveCState struct {
++	Schema             string          `json:"schema"`
++	OK                 bool            `json:"ok"`
++	Ready              bool            `json:"ready"`
++	Busy               bool            `json:"busy"`
++	Policy             string          `json:"policy_revision"`
++	SessionVolume      int             `json:"session_volume_percent"`
++	OldBaseRevision    string          `json:"old_base_revision"`
++	TargetBaseRevision string          `json:"target_base_revision"`
++	OldRoute           roomVolumeRoute `json:"old_route_identity"`
++	Target             contentTarget   `json:"target_identity"`
++	InputDigest        string          `json:"input_path_digest"`
++	Paused             bool            `json:"paused"`
++	Physical           bool            `json:"physical_result_verified"`
++}
++type moveCReceipt struct {
++	Schema             string                 `json:"schema"`
++	OK                 bool                   `json:"ok"`
++	Token              string                 `json:"token"`
++	OfferID            string                 `json:"offer_id"`
++	BindingID          string                 `json:"binding_id"`
++	Incarnation        string                 `json:"native_incarnation"`
++	Revision           string                 `json:"native_revision"`
++	ReservationID      string                 `json:"native_reservation_id"`
++	Policy             string                 `json:"policy_revision"`
++	SessionVolume      int                    `json:"session_volume_percent"`
++	OldBaseRevision    string                 `json:"old_base_revision"`
++	TargetBaseRevision string                 `json:"target_base_revision"`
++	OldOwner           roomTransportIdentity  `json:"old_native_owner"`
++	Intended           roomTransportIdentity  `json:"intended_native_owner"`
++	Actual             *roomTransportIdentity `json:"actual_native_owner"`
++	OldRoute           roomVolumeRoute        `json:"old_route_identity"`
++	Target             contentTarget          `json:"target_identity"`
++	Route              *roomVolumeRoute       `json:"route_identity"`
++	InputDigest        string                 `json:"input_path_digest"`
++	Pipe               *outputPipeIdentity    `json:"pipe_identity"`
++	InputEpoch         string                 `json:"input_epoch"`
++	WriterEpoch        string                 `json:"writer_source_epoch"`
++	Phase              string                 `json:"phase"`
++	Possible           bool                   `json:"possible_effect"`
++	Drained            bool                   `json:"contexts_drained"`
++	GateClosed         bool                   `json:"gate_closed"`
++	Retired            bool                   `json:"deadline_retired"`
++	PinRemaining       int                    `json:"pin_remaining_ms"`
++	Expires            int                    `json:"expires_after_ms"`
++	Physical           bool                   `json:"physical_result_verified"`
++}
++
++func (c *moveCapture) endpoint(suffix string) string {
++	return strings.TrimSuffix(c.OwnTone, "/") + "/api/outputs/" + c.Scope.HomePodID + "/move/" + suffix
++}
++func (c *moveCapture) stateBody() any {
++	return struct {
++		Incarnation  string                `json:"native_incarnation"`
++		Process      contentProcess        `json:"native_process"`
++		Path         string                `json:"expected_input_path"`
++		Digest       string                `json:"expected_input_path_digest"`
++		Old          roomTransportIdentity `json:"old_native_owner"`
++		WriterFD     string                `json:"writer_fd"`
++		WriterDevice string                `json:"writer_pipe_device"`
++		WriterInode  string                `json:"writer_pipe_inode"`
++	}{c.Incarnation, c.Process, c.Pipe, c.PipeDigest, *c.OldOwner, c.WriterFD, c.WriterPipe.Device, c.WriterPipe.Inode}
++}
++func (state moveCState) valid(c *moveCapture) bool {
++	if c == nil || c.OldOwner == nil {
++		return false
++	}
++	if state.Schema != "podconnect.output_move_state.v1" || !state.OK || !state.Ready || state.Busy || state.Policy != movePolicy || state.Physical || state.Paused != c.Paused || state.SessionVolume < 0 || state.SessionVolume > 100 || !volumeCounter(state.OldBaseRevision) || !volumeCounter(state.TargetBaseRevision) || !state.OldRoute.valid() || state.OldRoute.DeviceID != c.OldOwner.HomePodID || state.OldRoute.InputPathDigest != c.PipeDigest || state.InputDigest != c.PipeDigest || state.Target.DeviceID != c.Scope.HomePodID || !volumeUUID.MatchString(state.Target.Process) || !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0" {
++		return false
++	}
++	return true
++}
++func (c *moveCapture) readCState(ctx context.Context) (moveCState, error) {
++	var state moveCState
++	if c == nil || c.OldOwner == nil || !volumeCounter(c.WriterFD) || c.WriterPipe.Type != "fifo" {
++		return state, ErrAliasConflict
++	}
++	if err := contentHTTP(ctx, "POST", c.endpoint("state"), c.stateBody(), &state); err != nil || !state.valid(c) {
++		return state, ErrAliasConflict
++	}
++	return state, nil
++}
++func (op *moveOperation) cPrepareBody() any {
++	c := op.Capture
++	return struct {
++		Incarnation  string                `json:"native_incarnation"`
++		Process      contentProcess        `json:"native_process"`
++		Path         string                `json:"expected_input_path"`
++		Digest       string                `json:"expected_input_path_digest"`
++		Old          roomTransportIdentity `json:"old_native_owner"`
++		WriterFD     string                `json:"writer_fd"`
++		WriterDevice string                `json:"writer_pipe_device"`
++		WriterInode  string                `json:"writer_pipe_inode"`
++		OfferID      string                `json:"offer_id"`
++		BindingID    string                `json:"binding_id"`
++		Revision     string                `json:"native_revision"`
++		Intended     roomTransportIdentity `json:"intended_native_owner"`
++		Policy       string                `json:"policy_revision"`
++	}{c.Incarnation, c.Process, c.Pipe, c.PipeDigest, *c.OldOwner, c.WriterFD, c.WriterPipe.Device, c.WriterPipe.Inode, op.Offer.OfferID, op.Offer.BindingID, op.Revision, op.Intended, movePolicy}
++}
++func (op *moveOperation) cValid(reply moveCReceipt, endpoint string) bool {
++	op.mu.Lock()
++	previous := op.CReceipt
++	reservation := op.ReservationID
++	epoch := op.Epoch
++	pipe := op.Pipe
++	op.mu.Unlock()
++	c := op.Capture
++	if reply.Schema != "podconnect.output_move_"+endpoint+".v1" || !reply.OK || !volumeHex32.MatchString(reply.Token) || reply.OfferID != op.Offer.OfferID || reply.BindingID != op.Offer.BindingID || reply.Incarnation != c.Incarnation || reply.Revision != op.Revision || reply.ReservationID != reservation || reply.Policy != movePolicy || reply.SessionVolume != op.Offer.SessionVolumePercent || reply.OldBaseRevision != op.CState.OldBaseRevision || reply.TargetBaseRevision != op.CState.TargetBaseRevision || reply.OldOwner != *c.OldOwner || reply.Intended != op.Intended || reply.OldRoute != op.CState.OldRoute || reply.Target != op.Target || reply.InputDigest != c.PipeDigest || !volumeCounter(reply.InputEpoch) || !volumeCounter(reply.WriterEpoch) || reply.PinRemaining < 0 || reply.PinRemaining > 15000 || reply.Expires != 8000 || reply.Physical {
++		return false
++	}
++	if previous != nil && previous.Token != reply.Token {
++		return false
++	}
++	if previous != nil && previous.Route != nil && (reply.Phase == "opened" || reply.Phase == "completed") && (reply.Route == nil || *reply.Route != *previous.Route || reply.InputEpoch != previous.InputEpoch || reply.Pipe == nil || previous.Pipe == nil || *reply.Pipe != *previous.Pipe) {
++		return false
++	}
++	if reply.Route != nil && (!reply.Route.valid() || reply.Route.DeviceID != c.Scope.HomePodID || reply.Route.InputPathDigest != c.PipeDigest || reply.Route.Process != op.Target.Process || reply.Route.DeviceIncarnation != op.Target.Incarnation) {
++		return false
++	}
++	if reply.Pipe != nil && (!volumeCounter(reply.Pipe.Device) || !volumeCounter(reply.Pipe.Inode) || reply.Pipe.Inode == "0" || reply.Pipe.Type != "fifo") {
++		return false
++	}
++	if epoch != "" && (reply.WriterEpoch != epoch || reply.Pipe == nil || reply.Pipe.Device != pipe.Device || reply.Pipe.Inode != pipe.Inode) {
++		return false
++	}
++	switch reply.Phase {
++	case "prepared":
++		return reservation == "" && !reply.Possible && reply.Actual == nil && reply.WriterEpoch == "0"
++	case "gate_draining", "gate_closed_reader_ready", "preparing_route", "route_ready_closed":
++		if reply.Retired || reply.PinRemaining < 1 || !reply.GateClosed || !reply.Possible || reply.Actual != nil {
++			return false
++		}
++	case "opened", "completed":
++		if reply.PinRemaining < 1 || (reply.Phase == "opened" && reply.Retired) || reply.GateClosed || !reply.Possible || !reply.Drained || reply.Actual == nil || *reply.Actual != op.Intended || reply.Route == nil || reply.InputEpoch == "0" || reply.WriterEpoch == "0" {
++			return false
++		}
++	case "rejected_before_admission", "expired_before_admission", "cancelled_before_admission":
++		return !reply.Possible && reply.Drained
++	case "unknown":
++		return true
++	default:
++		return false
++	}
++	if reply.Phase == "route_ready_closed" && (reply.Route == nil || reply.Pipe == nil || reply.InputEpoch == "0" || reply.WriterEpoch == "0" || !reply.Drained) {
++		return false
++	}
++	if reply.Phase == "gate_closed_reader_ready" && reply.Pipe == nil {
++		return false
++	}
++	return true
++}
++func (op *moveOperation) cCall(ctx context.Context, method, endpoint string, payload any) (moveCReceipt, error) {
++	var reply moveCReceipt
++	err := contentHTTP(ctx, method, op.Capture.endpoint(endpoint), payload, &reply)
++	schemaEndpoint := strings.Split(endpoint, "/")[0]
++	if err != nil || !op.cValid(reply, schemaEndpoint) {
++		return reply, ErrAliasConflict
++	}
++	op.mu.Lock()
++	op.CReceipt = &reply
++	op.mu.Unlock()
++	return reply, nil
++}
+diff --git a/daemon/room_move_execute.go b/daemon/room_move_execute.go
+new file mode 100644
+index 0000000..201393c
+--- /dev/null
++++ b/daemon/room_move_execute.go
+@@ -0,0 +1,253 @@
++package daemon
++
++import (
++	"context"
++	"time"
++)
++
++func (op *moveOperation) cancelMove() {
++	op.mu.Lock()
++	if op.Terminal && op.State == "complete" {
++		op.mu.Unlock()
++		return
++	}
++	op.Cancelled = true
++	cancel := op.Cancel
++	token, reservation := "", op.ReservationID
++	if op.CReceipt != nil && !op.CancelSent {
++		token = op.CReceipt.Token
++		op.CancelSent = true
++	}
++	possible := op.Possible
++	terminal := op.Terminal
++	op.mu.Unlock()
++	if cancel != nil {
++		cancel()
++	}
++	if token != "" {
++		go func() {
++			ctx, stop := context.WithTimeout(context.Background(), time.Second)
++			defer stop()
++			_, _ = op.cCall(ctx, "POST", "cancel", struct {
++				Token       string `json:"token"`
++				Reservation string `json:"native_reservation_id"`
++			}{token, reservation})
++		}()
++	}
++	if !possible && !terminal {
++		op.finish("cancelled")
++	}
++}
++
++func (op *moveOperation) cPoll(ctx context.Context, reply moveCReceipt, want string) (moveCReceipt, error) {
++	for reply.Phase != want {
++		if reply.Phase == "unknown" || reply.Phase == "rejected_before_admission" || reply.Phase == "expired_before_admission" || reply.Phase == "cancelled_before_admission" {
++			return reply, ErrAliasConflict
++		}
++		timer := time.NewTimer(50 * time.Millisecond)
++		select {
++		case <-timer.C:
++		case <-ctx.Done():
++			timer.Stop()
++			return reply, ctx.Err()
++		}
++		var err error
++		reply, err = op.cCall(ctx, "GET", "result/"+reply.Token, nil)
++		if err != nil {
++			return reply, err
++		}
++	}
++	return reply, nil
++}
++
++func (op *moveOperation) prepare(ctx context.Context) {
++	op.mu.Lock()
++	if !op.Claimed || op.Cancelled || op.Terminal || op.State != "staging" {
++		op.mu.Unlock()
++		return
++	}
++	op.mu.Unlock()
++	prepared, err := op.cCall(ctx, "POST", "prepare", op.cPrepareBody())
++	if err != nil || prepared.Phase != "prepared" {
++		op.finish("rejected")
++		return
++	}
++	op.mu.Lock()
++	if op.Cancelled || op.Terminal || ctx.Err() != nil {
++		op.mu.Unlock()
++		op.cancelMove()
++		return
++	}
++	op.State = "staged"
++	op.StagedUntil = time.Now().Add(8 * time.Second)
++	op.mu.Unlock()
++}
++
++func (op *moveOperation) commit(parent context.Context, server *ConcreteApiServer) {
++	op.mu.Lock()
++	if !op.Claimed || op.CommitClaimed || op.Cancelled || op.Terminal || op.State != "staged" || !time.Now().Before(op.StagedUntil) {
++		op.mu.Unlock()
++		return
++	}
++	op.CommitClaimed = true
++	op.State = "committing"
++	ctx, cancel := context.WithTimeout(parent, 14*time.Second)
++	op.Cancel = cancel
++	op.mu.Unlock()
++	defer cancel()
++	failed := func() {
++		op.mu.Lock()
++		possible := op.Possible
++		reply := op.CReceipt
++		cancelled := op.Cancelled || ctx.Err() != nil
++		switched := op.Switched
++		ownerClosing := op.OwnerClosing
++		pipe, epoch := op.Pipe, op.Epoch
++		if !op.Quiescent {
++			pipe, epoch = op.Capture.WriterPipe, op.Capture.WriterEpoch
++		}
++		op.mu.Unlock()
++		if possible && !ownerClosing {
++			// Unknown C status cannot leave the same actual native writer free
++			// to emit. The independent C cancel closes its global gate.
++			fenceCtx, stopFence := context.WithTimeout(context.Background(), time.Second)
++			_, _, fenceErr := op.Owner.player.RoomMove(fenceCtx, "fence", nil, pipe, epoch, false, nil)
++			stopFence()
++			if fenceErr != nil {
++				go op.Owner.Close()
++			}
++			op.cancelMove()
++		}
++		if possible || switched {
++			op.Owner.aliasMu.Lock()
++			op.Owner.roomMoveQuarantined = true
++			op.Owner.aliasMu.Unlock()
++			op.finish("unknown")
++		} else {
++			state := "rejected"
++			if cancelled {
++				state = "cancelled"
++			}
++			if reply != nil && reply.Possible {
++				state = "unknown"
++			}
++			op.finish(state)
++		}
++	}
++	if ctx.Err() != nil {
++		failed()
++		return
++	}
++	prepared := op.CReceipt
++	if prepared == nil || prepared.Phase != "prepared" {
++		failed()
++		return
++	}
++	_, err := server.roomTransportAsk(ctx, apiMoveConsume, moveActorRequest{Operation: op, Context: ctx})
++	if err != nil {
++		op.cancelMove()
++		failed()
++		return
++	}
++	critical, stopCritical := context.WithDeadline(ctx, op.Until)
++	defer stopCritical()
++	op.mu.Lock()
++	op.Possible = true
++	op.mu.Unlock()
++	reply, err := op.cCall(critical, "POST", "commit", struct {
++		Incarnation string                `json:"native_incarnation"`
++		Old         roomTransportIdentity `json:"old_native_owner"`
++		Offer       string                `json:"offer_id"`
++		Binding     string                `json:"binding_id"`
++		Revision    string                `json:"native_revision"`
++		Token       string                `json:"token"`
++		Reservation string                `json:"native_reservation_id"`
++		Drained     bool                  `json:"pending_native_mutators_drained"`
++	}{op.Capture.Incarnation, *op.Capture.OldOwner, op.Offer.OfferID, op.Offer.BindingID, op.Revision, prepared.Token, op.ReservationID, true})
++	if err == nil {
++		reply, err = op.cPoll(critical, reply, "gate_closed_reader_ready")
++	}
++	if err != nil || reply.Pipe == nil || reply.Pipe.Device != op.Capture.WriterPipe.Device || reply.Pipe.Inode != op.Capture.WriterPipe.Inode || reply.Pipe.Type != "fifo" {
++		failed()
++		return
++	}
++	if err = op.actorStep(critical, "quiesce"); err != nil {
++		failed()
++		return
++	}
++	op.mu.Lock()
++	pipe, epoch := op.Pipe, op.Epoch
++	op.mu.Unlock()
++	reply, err = op.cCall(critical, "POST", "barrier", struct {
++		Token       string `json:"token"`
++		Reservation string `json:"native_reservation_id"`
++		Epoch       string `json:"writer_source_epoch"`
++		Pipe        any    `json:"pipe_identity"`
++		Digest      string `json:"expected_input_path_digest"`
++		Quiescent   bool   `json:"writer_quiescent"`
++	}{prepared.Token, op.ReservationID, epoch, pipe.PipeIdentity, op.Capture.PipeDigest, true})
++	if err == nil {
++		reply, err = op.cPoll(critical, reply, "route_ready_closed")
++	}
++	if err != nil {
++		failed()
++		return
++	}
++	if err = op.actorStep(critical, "switch"); err != nil {
++		failed()
++		return
++	}
++	op.mu.Lock()
++	actual := op.Actual
++	op.mu.Unlock()
++	if actual == nil {
++		failed()
++		return
++	}
++	reply, err = op.cCall(critical, "POST", "open", struct {
++		Token       string                `json:"token"`
++		Reservation string                `json:"native_reservation_id"`
++		Epoch       string                `json:"writer_source_epoch"`
++		Actual      roomTransportIdentity `json:"committed_native_owner"`
++	}{prepared.Token, op.ReservationID, epoch, *actual})
++	if err != nil || reply.Phase != "opened" {
++		failed()
++		return
++	}
++	if err = op.actorStep(critical, "resume"); err != nil {
++		failed()
++		return
++	}
++	reply, err = op.cCall(ctx, "POST", "complete", struct {
++		Token       string                `json:"token"`
++		Reservation string                `json:"native_reservation_id"`
++		Epoch       string                `json:"writer_source_epoch"`
++		Actual      roomTransportIdentity `json:"committed_native_owner"`
++		Drained     bool                  `json:"native_mutators_drained"`
++	}{prepared.Token, op.ReservationID, epoch, *actual, true})
++	if err != nil || reply.Phase != "completed" {
++		failed()
++		return
++	}
++	// Join the real writer/source and credit completion within one output/source
++	// lock boundary. Actor metadata can lag an EOF/autoplay replacement.
++	_, _, err = op.Owner.player.RoomMove(ctx, "verify", op.Capture.Source, op.Pipe, op.Epoch, !op.Capture.Paused, func(mutate func()) error {
++		op.Owner.aliasMu.Lock()
++		defer op.Owner.aliasMu.Unlock()
++		op.mu.Lock()
++		defer op.mu.Unlock()
++		if op.Cancelled || op.Terminal || op.CReceipt == nil || op.CReceipt.Phase != "completed" || !op.Owner.moveEffectCurrentLocked(op, ctx) || op.Actual == nil || *op.Actual != op.Intended || op.Epoch == "" || op.Pipe != op.Capture.WriterPipe {
++			return ErrAliasConflict
++		}
++		mutate()
++		op.State = "complete"
++		op.Terminal = true
++		op.RetainUntil = time.Now().Add(time.Minute)
++		close(op.TerminalSignal)
++		return nil
++	})
++	if err != nil {
++		failed()
++		return
++	}
++}
+diff --git a/daemon/room_move_http.go b/daemon/room_move_http.go
+new file mode 100644
+index 0000000..877e21c
+--- /dev/null
++++ b/daemon/room_move_http.go
+@@ -0,0 +1,196 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"time"
++)
++
++// moveBody checks the closed MOVE request before it can reach the actor. In
++// particular, a duplicate JSON key cannot silently replace a captured grant.
++func moveBody(w http.ResponseWriter, r *http.Request, out any, keys ...string) bool {
++	if r.Method != http.MethodPost {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return false
++	}
++	if r.URL.RawQuery != "" {
++		w.WriteHeader(http.StatusBadRequest)
++		return false
++	}
++	defer r.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(r.Body, 8193))
++	if err != nil || len(raw) > 8192 {
++		w.WriteHeader(http.StatusBadRequest)
++		return false
++	}
++	var fields map[string]json.RawMessage
++	if strictVolumeJSON(raw, &fields) != nil || len(fields) != len(keys) {
++		w.WriteHeader(http.StatusBadRequest)
++		return false
++	}
++	for _, key := range keys {
++		if _, ok := fields[key]; !ok {
++			w.WriteHeader(http.StatusBadRequest)
++			return false
++		}
++	}
++	if value, ok := fields["args"]; ok {
++		var args map[string]json.RawMessage
++		if !bytes.HasPrefix(bytes.TrimSpace(value), []byte("{")) || json.Unmarshal(value, &args) != nil || len(args) != 0 {
++			w.WriteHeader(http.StatusBadRequest)
++			return false
++		}
++	}
++	if strictContentJSON(raw, out) != nil {
++		w.WriteHeader(http.StatusBadRequest)
++		return false
++	}
++	return true
++}
++
++func moveWrite(w http.ResponseWriter, value moveReceipt) {
++	w.Header().Set("Content-Type", "application/json")
++	w.Header().Set("Cache-Control", "no-store")
++	_ = json.NewEncoder(w).Encode(value)
++}
++
++func (s *ConcreteApiServer) handleMoveControls(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 4 {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	for _, key := range []string{"account_user_id", "target_id", "room_id", "homepod_id"} {
++		if len(q[key]) != 1 || q.Get(key) == "" || len(q.Get(key)) > 160 {
++			w.WriteHeader(http.StatusBadRequest)
++			return
++		}
++	}
++	scope := roomVolumeScope{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id")}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	value, err := s.roomTransportAsk(ctx, apiMoveObserve, scope)
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	capture, ok := value.(*moveCapture)
++	if !ok || capture == nil || capture.OldOwner == nil {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	state, err := capture.readCState(ctx)
++	if err != nil {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	value, err = s.roomTransportAsk(ctx, apiMoveOffer, moveOfferActorRequest{Capture: capture, State: state, Context: ctx})
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	op, ok := value.(*moveOperation)
++	if !ok || op == nil || !s.roomMoves.put(op) {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	roomTransportResponse(w, struct {
++		Schema   string                 `json:"schema"`
++		Ready    bool                   `json:"ready"`
++		Scope    roomVolumeScope        `json:"scope"`
++		Actions  []string               `json:"actions"`
++		Offer    moveOffer              `json:"move_offer"`
++		Physical bool                   `json:"physical_result_verified"`
++		Registry string                 `json:"alias_registry"`
++		Digest   string                 `json:"input_path_digest"`
++		OwnTone  string                 `json:"own_tone_url"`
++		OldOwner *roomTransportIdentity `json:"old_native_owner"`
++	}{"podconnect.native_room_move_controls.v1", true, scope, []string{"move_existing_session"}, op.Offer, false, capture.Registry, capture.PipeDigest, capture.OwnTone, capture.OldOwner}, nil)
++}
++
++func (s *ConcreteApiServer) handleMovePrepare(w http.ResponseWriter, r *http.Request) {
++	var request movePrepareRequest
++	if !moveBody(w, r, &request, "scope", "move_offer", "action", "args") {
++		return
++	}
++	if request.Action != "move_existing_session" || !volumeHex32.MatchString(request.Offer.OfferID) || !volumeHex64.MatchString(request.Offer.BindingID) {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	op := s.roomMoves.get(request.Offer.OfferID, request.Offer.BindingID)
++	if op == nil {
++		w.WriteHeader(http.StatusConflict)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
++	defer cancel()
++	_, err := s.roomTransportAsk(ctx, apiMoveClaim, moveActorRequest{Operation: op, Context: ctx, Request: request})
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	// Prepare captures C/actor provenance only; physical routing belongs to commit.
++	op.prepare(ctx)
++	moveWrite(w, op.receipt("prepare"))
++}
++
++func (s *ConcreteApiServer) moveID(w http.ResponseWriter, r *http.Request) *moveOperation {
++	var request moveIDRequest
++	if !moveBody(w, r, &request, "offer_id", "binding_id") {
++		return nil
++	}
++	if !volumeHex32.MatchString(request.OfferID) || !volumeHex64.MatchString(request.BindingID) {
++		w.WriteHeader(http.StatusBadRequest)
++		return nil
++	}
++	op := s.roomMoves.get(request.OfferID, request.BindingID)
++	if op == nil {
++		w.WriteHeader(http.StatusConflict)
++	}
++	return op
++}
++
++func (s *ConcreteApiServer) handleMoveCommit(w http.ResponseWriter, r *http.Request) {
++	op := s.moveID(w, r)
++	if op == nil {
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 16*time.Second)
++	defer cancel()
++	op.commit(ctx, s)
++	moveWrite(w, op.receipt("commit"))
++}
++
++func (s *ConcreteApiServer) handleMoveCancel(w http.ResponseWriter, r *http.Request) {
++	op := s.moveID(w, r)
++	if op == nil {
++		return
++	}
++	op.cancelMove()
++	moveWrite(w, op.receipt("cancel"))
++}
++
++func (s *ConcreteApiServer) handleMoveResult(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !volumeHex32.MatchString(q.Get("offer_id")) || !volumeHex64.MatchString(q.Get("binding_id")) {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	op := s.roomMoves.get(q.Get("offer_id"), q.Get("binding_id"))
++	if op == nil {
++		w.WriteHeader(http.StatusConflict)
++		return
++	}
++	moveWrite(w, op.receipt("result"))
++}
+diff --git a/daemon/room_move_http_test.go b/daemon/room_move_http_test.go
+new file mode 100644
+index 0000000..4247d98
+--- /dev/null
++++ b/daemon/room_move_http_test.go
+@@ -0,0 +1,42 @@
++package daemon
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestMoveHTTPRejectsDuplicateAndExtraBodyFields(t *testing.T) {
++	for _, body := range []string{
++		`{"offer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","offer_id":"cccccccccccccccccccccccccccccccc"}`,
++		`{"offer_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","binding_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","extra":true}`,
++	} {
++		request := httptest.NewRequest(http.MethodPost, "/player/room_move/commit", strings.NewReader(body))
++		response := httptest.NewRecorder()
++		var ids moveIDRequest
++		if moveBody(response, request, &ids, "offer_id", "binding_id") || response.Code != http.StatusBadRequest {
++			t.Fatalf("unexpected acceptance of body %s: status %d", body, response.Code)
++		}
++	}
++	request := httptest.NewRequest(http.MethodPost, "/player/room_move/prepare", strings.NewReader(`{"scope":{},"move_offer":{},"action":"move_existing_session","args":{"volume_percent":35}}`))
++	response := httptest.NewRecorder()
++	var preparation movePrepareRequest
++	if moveBody(response, request, &preparation, "scope", "move_offer", "action", "args") || response.Code != http.StatusBadRequest {
++		t.Fatalf("MOVE args must be the exact empty object: status %d", response.Code)
++	}
++}
++
++func TestMoveResultRejectsExtraAndRepeatedQueryValues(t *testing.T) {
++	server := &ConcreteApiServer{}
++	for _, query := range []string{
++		"offer_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&binding_id=" + strings.Repeat("b", 64) + "&extra=1",
++		"offer_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&offer_id=cccccccccccccccccccccccccccccccc&binding_id=" + strings.Repeat("b", 64),
++	} {
++		response := httptest.NewRecorder()
++		server.handleMoveResult(response, httptest.NewRequest(http.MethodGet, "/player/room_move/result?"+query, nil))
++		if response.Code != http.StatusBadRequest {
++			t.Fatalf("unexpected acceptance of query %s: status %d", query, response.Code)
++		}
++	}
++}
+diff --git a/daemon/room_move_state_test.go b/daemon/room_move_state_test.go
+new file mode 100644
+index 0000000..8fb8a45
+--- /dev/null
++++ b/daemon/room_move_state_test.go
+@@ -0,0 +1,58 @@
++package daemon
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/devgianlu/go-librespot/player"
++)
++
++func TestRoomMoveStateRequiresJoinedOldRouteAndPausedState(t *testing.T) {
++	digest := strings.Repeat("a", 64)
++	process := "11111111-1111-4111-8111-111111111111"
++	owner := roomTransportIdentity{AccountUserID: "account", TargetID: "engine", RoomID: "old", HomePodID: "101", ConnectionID: "connection", SessionID: "session", AliasIncarnation: strings.Repeat("b", 32), AliasRegistry: strings.Repeat("c", 64), AliasRevision: 1}
++	capture := &moveCapture{contentCapture: &contentCapture{OldOwner: &owner, Scope: roomVolumeScope{AccountUserID: "account", TargetID: "engine", RoomID: "new", HomePodID: "102"}, PipeDigest: digest}, Paused: true}
++	state := moveCState{Schema: "podconnect.output_move_state.v1", OK: true, Ready: true, Policy: movePolicy, SessionVolume: 27, OldBaseRevision: "1", TargetBaseRevision: "2", OldRoute: roomVolumeRoute{Process: process, DeviceID: "101", DeviceIncarnation: "1", SessionEpoch: "2", RouteRevision: "3", SelectionRevision: "4", InputGeneration: "5", InputItemID: "6", InputPathDigest: digest}, Target: contentTarget{Process: process, DeviceID: "102", Incarnation: "1"}, InputDigest: digest, Paused: true}
++	if !state.valid(capture) {
++		t.Fatal("settled exact paused state rejected")
++	}
++	state.Paused = false
++	if state.valid(capture) {
++		t.Fatal("C/native paused mismatch admitted")
++	}
++	capture.Paused = false
++	if !state.valid(capture) {
++		t.Fatal("settled exact playing state rejected")
++	}
++	state.OldRoute.DeviceID = "102"
++	if state.valid(capture) {
++		t.Fatal("wrong old selected route admitted")
++	}
++}
++
++func TestRoomMoveCancelAfterCompleteDoesNotDispatchOrRewriteReceipt(t *testing.T) {
++	op := &moveOperation{State: "complete", Terminal: true, CReceipt: &moveCReceipt{Token: strings.Repeat("d", 32)}}
++	op.cancelMove()
++	if op.Cancelled || op.CancelSent || op.State != "complete" {
++		t.Fatal("completed MOVE was changed by late cancel")
++	}
++}
++
++func TestRoomMoveUnknownDeadlineRetiresWriterBeforeActorRelease(t *testing.T) {
++	worker, err := player.NewPlayer(&player.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := &AppPlayer{player: worker, stop: make(chan struct{}, 1), roomMoveSteps: make(chan moveStep)}
++	op := &moveOperation{Owner: p, Capture: &moveCapture{WriterEpoch: "0"}, State: "committing", Possible: true, Until: time.Now().Add(20 * time.Millisecond), TerminalSignal: make(chan struct{})}
++	p.roomMoveReservation = &moveReservation{Operation: op, Until: op.Until}
++	if p.waitMoveReservation(context.Background()) {
++		t.Fatal("unknown MOVE returned actor to ordinary playback")
++	}
++	p.Close() // Joins the same already retired player worker.
++	if !p.roomMoveQuarantined || p.roomMoveReservation != nil || op.State != "unknown" || !op.OwnerClosing {
++		t.Fatal("unknown MOVE released owner before joined writer retirement")
++	}
++}
+diff --git a/daemon/room_volume.go b/daemon/room_volume.go
+index deed7f0..e2ffeb2 100644
+--- a/daemon/room_volume.go
++++ b/daemon/room_volume.go
+@@ -283,7 +283,7 @@ func (p *AppPlayer) roomVolumeReservedLocked() bool {
+ func (p *AppPlayer) roomVolumeBusy() bool {
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
+-	return p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.contentBusyLocked()
++	return p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.contentBusyLocked() || p.moveBusyLocked()
+ }
+ func (p *AppPlayer) prepareRoomVolume(parent context.Context, request roomVolumePrepareActorRequest) (any, error) {
+ 	return p.prepareRoomVolumeVersion(parent, request, false)
+diff --git a/output/driver-pipe.go b/output/driver-pipe.go
+index c93c4bb..3e3afaf 100644
+--- a/output/driver-pipe.go
++++ b/output/driver-pipe.go
+@@ -25,9 +25,10 @@ type pipeOutput struct {
+ 
+ 	externalVolume bool
+ 
+-	volume float32
+-	paused bool
+-	closed bool
++	volume     float32
++	paused     bool
++	closed     bool
++	fileClosed bool
+ 
+ 	volumeUpdate chan float32
+ 	err          chan error
+@@ -84,6 +85,7 @@ func newPipeOutput(opts *NewOutputOptions) (out *pipeOutput, err error) {
+ 
+ 	// Restore blocking mode now that we are sure we have a reader.
+ 	if err := syscall.SetNonblock(int(out.file.Fd()), false); err != nil {
++		_ = out.file.Close()
+ 		return nil, fmt.Errorf("failed to set blocking mode on fifo: %w", err)
+ 	}
+ 
+@@ -208,17 +210,14 @@ func (out *pipeOutput) Error() <-chan error {
+ func (out *pipeOutput) Close() error {
+ 	out.lock.Lock()
+ 	defer out.lock.Unlock()
+-
+-	if out.closed {
+-		return nil
++	var closeErr error
++	if !out.fileClosed && out.file != nil {
++		closeErr = out.file.Close()
++		out.fileClosed = true
+ 	}
+-
+-	_ = out.file.Close()
+-
+ 	out.closed = true
+ 	out.cond.Signal()
+-
+-	return nil
++	return closeErr
+ }
+ 
+ // WithTransportLock is the actual paused-state mutation boundary. Acquiring the
+diff --git a/output/room_move.go b/output/room_move.go
+new file mode 100644
+index 0000000..25e47be
+--- /dev/null
++++ b/output/room_move.go
+@@ -0,0 +1,33 @@
++package output
++
++import "strconv"
++
++// MovePipeIdentity is the actual writer descriptor and its fstat identity.
++// FD is a private transport proof, never a pathname or public control field.
++type MovePipeIdentity struct {
++	PipeIdentity
++	FD string
++}
++
++// MovePipeOutput exposes only state already owned by the pipe lock. Callers must
++// invoke both methods from within WithStartLock's callback; the lock joins any
++// in-flight reader or FIFO writer before the state is observed or changed.
++type MovePipeOutput interface {
++	StartPipeOutput
++	PausedUnderStartLock() bool
++	FencedUnderStartLock() bool
++	WriterFDUnderStartLock() string
++	SetMoveStateUnderStartLock(paused, fenced bool)
++}
++
++func (out *pipeOutput) PausedUnderStartLock() bool { return out.paused }
++func (out *pipeOutput) FencedUnderStartLock() bool { return out.startFenced.Load() }
++func (out *pipeOutput) WriterFDUnderStartLock() string {
++	return strconv.FormatUint(uint64(out.file.Fd()), 10)
++}
++
++func (out *pipeOutput) SetMoveStateUnderStartLock(paused, fenced bool) {
++	out.paused = paused
++	out.startFenced.Store(fenced)
++	out.cond.Broadcast()
++}
+diff --git a/output/room_move_close_test.go b/output/room_move_close_test.go
+new file mode 100644
+index 0000000..804dc83
+--- /dev/null
++++ b/output/room_move_close_test.go
+@@ -0,0 +1,77 @@
++package output
++
++import (
++	"io"
++	"os"
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestPipeCloseJoinsActualBlockedWriterAndClosesAfterLoopError(t *testing.T) {
++	read, write, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer read.Close()
++	out := &pipeOutput{file: write}
++	out.cond = sync.NewCond(&out.lock)
++	writing := make(chan struct{})
++	writerDone := make(chan struct{})
++	go func() {
++		out.lock.Lock()
++		close(writing)
++		_, _ = write.Write(make([]byte, 1024*1024))
++		out.lock.Unlock()
++		close(writerDone)
++	}()
++	<-writing
++	closeDone := make(chan struct{})
++	go func() { _ = out.Close(); close(closeDone) }()
++	select {
++	case <-closeDone:
++		t.Fatal("Close returned before actual writer joined")
++	case <-time.After(20 * time.Millisecond):
++	}
++	drainDone := make(chan struct{})
++	go func() { _, _ = io.Copy(io.Discard, read); close(drainDone) }()
++	select {
++	case <-writerDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("writer did not drain")
++	}
++	select {
++	case <-closeDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close did not join writer")
++	}
++	<-drainDone
++	if _, err := write.Stat(); err == nil {
++		t.Fatal("old writer descriptor remains open")
++	}
++	out.lock.Lock()
++	out.closed = true
++	out.lock.Unlock()
++	if err := out.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestPipeCloseClosesDescriptorWhenOutputLoopAlreadyMarkedClosed(t *testing.T) {
++	read, write, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer read.Close()
++	out := &pipeOutput{file: write, closed: true}
++	out.cond = sync.NewCond(&out.lock)
++	if err := out.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := write.Stat(); err == nil {
++		t.Fatal("error-loop closed flag leaked writer FD")
++	}
++	if err := out.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/output/room_move_test.go b/output/room_move_test.go
+new file mode 100644
+index 0000000..910e65c
+--- /dev/null
++++ b/output/room_move_test.go
+@@ -0,0 +1,44 @@
++package output
++
++import (
++	"context"
++	"os"
++	"syscall"
++	"testing"
++)
++
++func TestRoomMoveActualDescriptorAndPausedFenceAreSeparate(t *testing.T) {
++	out, _, path := startPipeFixture(t, &startRead{})
++	var original PipeIdentity
++	if err := out.WithStartLock(context.Background(), func(identity PipeIdentity, _ func(bool)) error {
++		original = identity
++		if out.WriterFDUnderStartLock() == "" || out.WriterFDUnderStartLock() == "0" {
++			t.Fatal("actual writer FD unavailable")
++		}
++		if !out.PausedUnderStartLock() {
++			t.Fatal("paused fixture reported playing")
++		}
++		out.SetMoveStateUnderStartLock(true, true)
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Remove(path); err != nil {
++		t.Fatal(err)
++	}
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := out.WithStartLock(context.Background(), func(identity PipeIdentity, _ func(bool)) error {
++		if identity != original {
++			t.Fatal("descriptor followed replacement pathname")
++		}
++		out.SetMoveStateUnderStartLock(true, false)
++		if !out.PausedUnderStartLock() || out.startFenced.Load() {
++			t.Fatal("paused move left stale start fence")
++		}
++		return nil
++	}); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/player/player.go b/player/player.go
+index b282daf..81e3399 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -7,6 +7,7 @@ import (
+ 	"math"
+ 	"net/http"
+ 	"net/url"
++	"sync"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+@@ -54,11 +55,17 @@ type Player struct {
+ 	cdnQuarantine map[string]time.Time
+ 
+ 	startEpoch      uint64
++	movePhase       string
++	movePipe        output.MovePipeIdentity
++	moveSource      librespot.AudioSource
++	movePlaying     bool
+ 	newPausedOutput func(source librespot.Float32Reader, volume float32) (output.Output, error)
+ 	newOutput       func(source librespot.Float32Reader, volume float32) (output.Output, error)
+ 
+-	cmd chan playerCmd
+-	ev  chan Event
++	cmd       chan playerCmd
++	ev        chan Event
++	closeOnce sync.Once
++	closeDone chan struct{}
+ 
+ 	volumeSteps uint32
+ 
+@@ -80,6 +87,7 @@ const (
+ 
+ type playerCmd struct {
+ 	start   *start35Command
++	move    *roomMoveCommand
+ 	guarded *guardedTransportCommand
+ 	typ     playerCmdType
+ 	data    any
+@@ -200,8 +208,9 @@ func NewPlayer(opts *Options) (*Player, error) {
+ 			})
+ 		},
+ 
+-		cmd: make(chan playerCmd),
+-		ev:  make(chan Event, 128),
++		cmd:       make(chan playerCmd),
++		ev:        make(chan Event, 128),
++		closeDone: make(chan struct{}),
+ 	}
+ 
+ 	if opts.AudioBackend == "pipe" {
+@@ -229,6 +238,12 @@ loop:
+ 	for {
+ 		select {
+ 		case cmd := <-p.cmd:
++			if cmd.move != nil {
++				result, err := p.applyRoomMove(cmd.move, &out, source)
++				result.Err = err
++				cmd.resp <- result
++				continue
++			}
+ 			if cmd.start != nil {
+ 				result, err := p.applyStart35(cmd.start, &out, source, volume)
+ 				if out != nil {
+@@ -381,14 +396,15 @@ loop:
+ 		}
+ 	}
+ 
+-	close(p.cmd)
+-
+-	_ = source.Close()
+-
+ 	if out != nil {
+ 		_ = out.Close()
+ 		out = nil
+ 	}
++	// The actual FIFO descriptor is joined and closed before any retained raw
++	// source or decoder can be retired by a replacement owner.
++	_ = source.Close()
++	close(p.cmd)
++	close(p.closeDone)
+ }
+ 
+ func (p *Player) HasBeenPlayingFor() time.Duration {
+@@ -404,7 +420,8 @@ func (p *Player) Receive() <-chan Event {
+ }
+ 
+ func (p *Player) Close() {
+-	p.cmd <- playerCmd{typ: playerCmdClose}
++	p.closeOnce.Do(func() { p.cmd <- playerCmd{typ: playerCmdClose} })
++	<-p.closeDone
+ }
+ 
+ func (p *Player) SetVolume(val uint32) {
+diff --git a/player/room_move.go b/player/room_move.go
+new file mode 100644
+index 0000000..92a9711
+--- /dev/null
++++ b/player/room_move.go
+@@ -0,0 +1,177 @@
++package player
++
++import (
++	"context"
++	"fmt"
++	"strconv"
++	"sync"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type roomMoveCommand struct {
++	ctx            context.Context
++	phase          string
++	expectedSource librespot.AudioSource
++	pipe           output.MovePipeIdentity
++	epoch          string
++	wasPlaying     bool
++	guard          output.TransportGuard
++}
++
++type roomMoveResult struct {
++	Pipe  output.MovePipeIdentity
++	Epoch string
++	Err   error
++}
++
++// RoomMove serializes each phase through the player worker. The switch phase
++// invokes guard while the real FIFO and source locks are held. The guard owner
++// may synchronously mutate only its already validated native destination alias;
++// this method never replaces, closes, seeks, or restarts the audio source.
++func (p *Player) RoomMove(ctx context.Context, phase string, expectedSource librespot.AudioSource, pipe output.MovePipeIdentity, epoch string, wasPlaying bool, guard output.TransportGuard) (output.MovePipeIdentity, string, error) {
++	if ctx == nil {
++		return output.MovePipeIdentity{}, "", fmt.Errorf("move context required")
++	}
++	reply := make(chan any, 1)
++	command := &roomMoveCommand{ctx: ctx, phase: phase, expectedSource: expectedSource, pipe: pipe, epoch: epoch, wasPlaying: wasPlaying, guard: guard}
++	select {
++	case p.cmd <- playerCmd{move: command, resp: reply}:
++	case <-ctx.Done():
++		return output.MovePipeIdentity{}, "", ctx.Err()
++	}
++	result := (<-reply).(roomMoveResult)
++	return result.Pipe, result.Epoch, result.Err
++}
++
++func (p *Player) applyRoomMove(command *roomMoveCommand, out *output.Output, source *SwitchingAudioSource) (result roomMoveResult, err error) {
++	if command.ctx == nil || (command.expectedSource == nil && command.phase != "fence") || (command.guard == nil && command.phase != "snapshot" && command.phase != "abort" && command.phase != "fence") {
++		return result, fmt.Errorf("incomplete move command")
++	}
++	if command.phase != "snapshot" && command.phase != "quiesce" && command.phase != "switch" && command.phase != "resume" && command.phase != "abort" && command.phase != "fence" && command.phase != "verify" {
++		return result, fmt.Errorf("bad move phase")
++	}
++	if *out == nil {
++		return result, fmt.Errorf("no existing pipe output")
++	}
++	pipe, ok := (*out).(output.MovePipeOutput)
++	if !ok {
++		return result, fmt.Errorf("move pipe owner unavailable")
++	}
++	if command.phase == "snapshot" && p.movePhase != "" && p.movePhase != "snapshot" {
++		return result, fmt.Errorf("move already active")
++	}
++	if command.phase == "quiesce" {
++		if p.movePhase != "snapshot" || p.startEpoch == ^uint64(0) {
++			return result, fmt.Errorf("move snapshot unavailable or epoch exhausted")
++		}
++	}
++	err = pipe.WithStartLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
++		lock, ok := source.cond.L.(*sync.Mutex)
++		if !ok {
++			return fmt.Errorf("native source lock unavailable")
++		}
++		if e := output.LockTransport(command.ctx, lock); e != nil {
++			return e
++		}
++		defer lock.Unlock()
++		if e := command.ctx.Err(); e != nil {
++			return e
++		}
++		if command.phase != "fence" && source.source[source.which] != command.expectedSource {
++			return fmt.Errorf("native primary source changed")
++		}
++		if identity.Type != "fifo" {
++			return fmt.Errorf("actual output descriptor is not FIFO")
++		}
++		writer := output.MovePipeIdentity{PipeIdentity: identity, FD: pipe.WriterFDUnderStartLock()}
++		fd, e := strconv.ParseUint(writer.FD, 10, 64)
++		if e != nil || writer.FD == "" || strconv.FormatUint(fd, 10) != writer.FD {
++			return fmt.Errorf("actual output writer descriptor unavailable")
++		}
++		currentEpoch := strconv.FormatUint(p.startEpoch, 10)
++		if command.phase == "verify" {
++			if p.movePhase != "" || writer != command.pipe || command.epoch == "" || command.epoch != currentEpoch || pipe.PausedUnderStartLock() == command.wasPlaying || pipe.FencedUnderStartLock() {
++				return fmt.Errorf("move final source, writer, or paused state changed")
++			}
++			return command.guard(func() { result.Pipe, result.Epoch = writer, currentEpoch })
++		}
++		if command.phase == "fence" {
++			if writer != command.pipe || command.epoch == "" || command.epoch != currentEpoch {
++				return fmt.Errorf("move fail-closed writer identity changed")
++			}
++			pipe.FenceStart()
++			pipe.SetMoveStateUnderStartLock(true, true)
++			result.Pipe, result.Epoch = writer, currentEpoch
++			return nil
++		}
++		if command.phase != "snapshot" {
++			if writer != command.pipe || command.pipe.Type != "fifo" || command.epoch == "" || command.epoch != currentEpoch || p.movePipe != writer || p.moveSource != command.expectedSource || p.movePlaying != command.wasPlaying {
++				return fmt.Errorf("move FIFO, writer epoch, source, or state changed")
++			}
++		}
++		if command.phase == "snapshot" {
++			if pipe.PausedUnderStartLock() == command.wasPlaying {
++				return fmt.Errorf("actual pipe pause state changed")
++			}
++			commit := func() {
++				p.movePhase = "snapshot"
++				p.movePipe = writer
++				p.moveSource = command.expectedSource
++				p.movePlaying = command.wasPlaying
++				result.Pipe, result.Epoch = writer, currentEpoch
++			}
++			if command.guard == nil {
++				commit()
++				return nil
++			}
++			return command.guard(commit)
++		}
++		if (command.phase == "quiesce" && p.movePhase != "snapshot") || (command.phase == "switch" && p.movePhase != "quiesced") || (command.phase == "resume" && p.movePhase != "switched") || (command.phase == "abort" && p.movePhase != "snapshot" && p.movePhase != "quiesced") {
++			return fmt.Errorf("move phase out of order")
++		}
++		if (command.phase == "switch" || command.phase == "resume" || (command.phase == "abort" && p.movePhase == "quiesced")) && (!pipe.PausedUnderStartLock() || !pipe.FencedUnderStartLock()) {
++			return fmt.Errorf("move quiescence was lost")
++		}
++		if command.phase == "abort" {
++			if p.movePhase == "quiesced" {
++				pipe.SetMoveStateUnderStartLock(!p.movePlaying, false)
++			}
++			p.movePhase = ""
++			p.moveSource = nil
++			p.movePipe = output.MovePipeIdentity{}
++			result.Pipe, result.Epoch = writer, currentEpoch
++			return nil
++		}
++		if command.phase == "quiesce" && pipe.PausedUnderStartLock() == command.wasPlaying {
++			return fmt.Errorf("actual pipe pause state changed")
++		}
++		return command.guard(func() {
++			switch command.phase {
++			case "quiesce":
++				// The lock has joined any blocked Read or Write. Fence and pause
++				// before releasing it; no bytes can cross the later switch.
++				pipe.FenceStart()
++				pipe.SetMoveStateUnderStartLock(true, true)
++				p.startEpoch++
++				p.movePhase = "quiesced"
++			case "switch":
++				// The guard owns the synchronous alias mutation. The source and
++				// FIFO writer remain the same through this phase.
++				p.movePhase = "switched"
++			case "resume":
++				pipe.SetMoveStateUnderStartLock(!p.movePlaying, false)
++				p.movePhase = ""
++				p.moveSource = nil
++				p.movePipe = output.MovePipeIdentity{}
++			}
++			result.Pipe = writer
++			result.Epoch = strconv.FormatUint(p.startEpoch, 10)
++		})
++	})
++	if err == nil && result.Pipe.Type == "" {
++		err = fmt.Errorf("move guard did not commit")
++	}
++	return result, err
++}
+diff --git a/player/room_move_close_test.go b/player/room_move_close_test.go
+new file mode 100644
+index 0000000..fcfba8c
+--- /dev/null
++++ b/player/room_move_close_test.go
+@@ -0,0 +1,43 @@
++package player
++
++import (
++	"sync"
++	"testing"
++	"time"
++)
++
++func TestPlayerCloseWaitsForWorkerCleanupAndSendsOnce(t *testing.T) {
++	p := &Player{cmd: make(chan playerCmd), closeDone: make(chan struct{})}
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	workerDone := make(chan struct{})
++	go func() {
++		command := <-p.cmd
++		if command.typ != playerCmdClose {
++			t.Errorf("unexpected close command %v", command.typ)
++		}
++		close(entered)
++		<-release
++		close(p.cmd)
++		close(p.closeDone)
++		close(workerDone)
++	}()
++	var callers sync.WaitGroup
++	callers.Add(2)
++	returned := make(chan struct{}, 2)
++	for i := 0; i < 2; i++ {
++		go func() { defer callers.Done(); p.Close(); returned <- struct{}{} }()
++	}
++	<-entered
++	select {
++	case <-returned:
++		t.Fatal("Close returned before worker cleanup")
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(release)
++	callers.Wait()
++	<-workerDone
++	if len(returned) != 2 {
++		t.Fatal("concurrent close caller did not join")
++	}
++}
+diff --git a/player/room_move_test.go b/player/room_move_test.go
+new file mode 100644
+index 0000000..2d3752a
+--- /dev/null
++++ b/player/room_move_test.go
+@@ -0,0 +1,209 @@
++package player
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type moveBackend struct {
++	transportTestOutput
++	lock     sync.Mutex
++	identity output.PipeIdentity
++	fd       string
++	fenced   bool
++}
++
++func (backend *moveBackend) FenceStart()                    { backend.fenced = true }
++func (backend *moveBackend) PausedUnderStartLock() bool     { return backend.paused }
++func (backend *moveBackend) FencedUnderStartLock() bool     { return backend.fenced }
++func (backend *moveBackend) WriterFDUnderStartLock() string { return backend.fd }
++func (backend *moveBackend) SetMoveStateUnderStartLock(paused, fenced bool) {
++	backend.paused, backend.fenced = paused, fenced
++}
++func (backend *moveBackend) WithStartLock(ctx context.Context, apply func(output.PipeIdentity, func(bool)) error) error {
++	if err := output.LockTransport(ctx, &backend.lock); err != nil {
++		return err
++	}
++	defer backend.lock.Unlock()
++	return apply(backend.identity, func(paused bool) { backend.paused, backend.fenced = paused, paused })
++}
++
++func TestRoomMoveSameSourceAndPausedPreservation(t *testing.T) {
++	for _, playing := range []bool{true, false} {
++		t.Run(map[bool]string{true: "playing", false: "paused"}[playing], func(t *testing.T) {
++			backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "42"}
++			backend.paused = !playing
++			var out output.Output = backend
++			source := NewSwitchingAudioSource()
++			primary := &transportSource{id: 1}
++			source.SetPrimary(primary)
++			p := &Player{}
++			aliasMutations := 0
++			var finalPipe output.MovePipeIdentity
++			for _, phase := range []string{"snapshot", "quiesce", "switch", "resume"} {
++				guard := func(mutate func()) error {
++					mutate()
++					if phase == "switch" {
++						aliasMutations++
++					}
++					return nil
++				}
++				command := &roomMoveCommand{ctx: context.Background(), phase: phase, expectedSource: primary, pipe: p.movePipe, epoch: "0", wasPlaying: playing, guard: guard}
++				if phase == "switch" || phase == "resume" {
++					command.epoch = "1"
++				}
++				result, err := p.applyRoomMove(command, &out, source)
++				if err != nil || result.Pipe.PipeIdentity != backend.identity || result.Pipe.FD != backend.fd {
++					t.Fatalf("%s: result=%+v err=%v", phase, result, err)
++				}
++				finalPipe = result.Pipe
++				if phase != "resume" && phase != "snapshot" && (!backend.paused || !backend.fenced) {
++					t.Fatalf("%s did not hold writer quiescent", phase)
++				}
++				if source.source[source.which] != librespot.AudioSource(primary) {
++					t.Fatal("retained source replaced")
++				}
++			}
++			verified := 0
++			_, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "verify", expectedSource: primary, pipe: finalPipe, epoch: "1", wasPlaying: playing, guard: func(mutate func()) error { mutate(); verified++; return nil }}, &out, source)
++			if err != nil || verified != 1 {
++				t.Fatalf("final same-source proof failed: %v verified=%d", err, verified)
++			}
++			if aliasMutations != 1 || backend.paused == playing || backend.fenced {
++				t.Fatalf("wrong final state: alias=%d paused=%v fenced=%v", aliasMutations, backend.paused, backend.fenced)
++			}
++		})
++	}
++}
++
++func TestRoomMoveRejectsDelayedBlockedWriterAndEpochOrDescriptorChange(t *testing.T) {
++	backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "42"}
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	primary := &transportSource{id: 1}
++	source.SetPrimary(primary)
++	p := &Player{}
++	guard := func(mutate func()) error { mutate(); return nil }
++	snapshot, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "snapshot", expectedSource: primary, wasPlaying: true, guard: guard}, &out, source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	backend.lock.Lock()
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		_, e := p.applyRoomMove(&roomMoveCommand{ctx: ctx, phase: "quiesce", expectedSource: primary, pipe: snapshot.Pipe, epoch: snapshot.Epoch, wasPlaying: true, guard: guard}, &out, source)
++		done <- e
++	}()
++	if e := <-done; !errors.Is(e, context.DeadlineExceeded) {
++		t.Fatalf("blocked writer admitted: %v", e)
++	}
++	backend.lock.Unlock()
++	if backend.paused || backend.fenced || p.movePhase != "snapshot" {
++		t.Fatal("timed-out quiesce mutated output")
++	}
++	quiesce, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "quiesce", expectedSource: primary, pipe: snapshot.Pipe, epoch: snapshot.Epoch, wasPlaying: true, guard: guard}, &out, source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mutations := 0
++	trySwitch := func(pipe output.MovePipeIdentity, epoch string) error {
++		_, e := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "switch", expectedSource: primary, pipe: pipe, epoch: epoch, wasPlaying: true, guard: func(mutate func()) error { mutate(); mutations++; return nil }}, &out, source)
++		return e
++	}
++	if trySwitch(quiesce.Pipe, "0") == nil || mutations != 0 {
++		t.Fatal("stale writer epoch admitted")
++	}
++	backend.fenced = false
++	if trySwitch(quiesce.Pipe, quiesce.Epoch) == nil || mutations != 0 {
++		t.Fatal("lost quiescence admitted")
++	}
++	backend.fenced = true
++	backend.fd = "43"
++	if trySwitch(quiesce.Pipe, quiesce.Epoch) == nil || mutations != 0 {
++		t.Fatal("replacement writer FD admitted")
++	}
++	backend.fd = "42"
++	backend.identity = output.PipeIdentity{Device: "1", Inode: "3", Type: "fifo"}
++	if trySwitch(quiesce.Pipe, quiesce.Epoch) == nil || mutations != 0 {
++		t.Fatal("replacement descriptor admitted")
++	}
++}
++
++func TestRoomMoveRefreshesUnclaimedSnapshotAndAbortsQuiescence(t *testing.T) {
++	backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "0"}
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	primary := &transportSource{id: 1}
++	source.SetPrimary(primary)
++	p := &Player{}
++	for i := 0; i < 2; i++ {
++		result, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "snapshot", expectedSource: primary, wasPlaying: true}, &out, source)
++		if err != nil || result.Pipe.FD != "0" || p.movePhase != "snapshot" {
++			t.Fatal("unclaimed snapshot cannot refresh or FD0 rejected", result, err)
++		}
++	}
++	quiesce, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "quiesce", expectedSource: primary, pipe: p.movePipe, epoch: "0", wasPlaying: true, guard: func(mutate func()) error { mutate(); return nil }}, &out, source)
++	if err != nil || !backend.paused || !backend.fenced {
++		t.Fatal("quiesce absent", err)
++	}
++	_, err = p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "abort", expectedSource: primary, pipe: quiesce.Pipe, epoch: quiesce.Epoch, wasPlaying: true}, &out, source)
++	if err != nil || backend.paused || backend.fenced || p.movePhase != "" || source.source[source.which] != librespot.AudioSource(primary) {
++		t.Fatal("quiesced move did not restore retained playing source", err)
++	}
++}
++
++func TestRoomMoveRejectsAutoplaySourceReplacementAfterSnapshot(t *testing.T) {
++	backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "42"}
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	original := &transportSource{id: 1}
++	source.SetPrimary(original)
++	p := &Player{}
++	snapshot, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "snapshot", expectedSource: original, wasPlaying: true}, &out, source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	replacement := &transportSource{id: 2}
++	source.SetPrimary(replacement)
++	mutations := 0
++	_, err = p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "quiesce", expectedSource: original, pipe: snapshot.Pipe, epoch: snapshot.Epoch, wasPlaying: true, guard: func(mutate func()) error { mutate(); mutations++; return nil }}, &out, source)
++	if err == nil || mutations != 0 || backend.paused || backend.fenced {
++		t.Fatalf("replaced source reached MOVE effect: err=%v mutations=%d paused=%v fenced=%v", err, mutations, backend.paused, backend.fenced)
++	}
++}
++
++func TestRoomMoveFinalSnapshotRejectsPostOpenAutoplayReplacement(t *testing.T) {
++	backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "42"}
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	original := &transportSource{id: 1}
++	source.SetPrimary(original)
++	p := &Player{}
++	guard := func(mutate func()) error { mutate(); return nil }
++	result, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "snapshot", expectedSource: original, wasPlaying: true}, &out, source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, phase := range []string{"quiesce", "switch", "resume"} {
++		result, err = p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: phase, expectedSource: original, pipe: result.Pipe, epoch: result.Epoch, wasPlaying: true, guard: guard}, &out, source)
++		if err != nil {
++			t.Fatal(phase, err)
++		}
++	}
++	source.SetPrimary(&transportSource{id: 2})
++	verified := 0
++	if _, err = p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "verify", expectedSource: original, pipe: result.Pipe, epoch: result.Epoch, wasPlaying: true, guard: func(mutate func()) error { mutate(); verified++; return nil }}, &out, source); err == nil || verified != 0 {
++		t.Fatal("post-open replaced source certified by final verification")
++	}
++	if _, err = p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "fence", pipe: result.Pipe, epoch: result.Epoch}, &out, source); err != nil || !backend.paused || !backend.fenced {
++		t.Fatalf("unknown post-open source did not fence same actual writer: %v", err)
++	}
++}
