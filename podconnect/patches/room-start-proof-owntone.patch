@@ -273,7 +273,15 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      fresh_owner.alias_revision--;
      struct output_room_volume_request fresh_volume={.device_id=2,.percent=27,.bound=true,.native_revision=4};
      struct output_room_volume_result fresh_volume_result;
-@@ -392,6 +392,75 @@
+@@ -381,6 +381,7 @@
+   assert(outputs_start_barrier_begin(r,&f.start_result)==0);
+   assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&deadline,&fd)==0 && fd.epoch);
+   outputs_transport_input_changed(item,fifo,true);assert(outputs_start_barrier_done(r->token,fd.epoch)==0);
++  if(mode==18) session_update_read_start(0); /* Same loaded-source bookkeeping as pb_session_start after actual FIFO open. */
+   assert(f.device->session && !attention_emission_current(f.device->session,NULL) && packet_send(f.device->session,NULL)<0);
+   if(mode==21)fixture_post_full_writer=&writer;
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+@@ -392,6 +393,75 @@
      strcpy(same_app.connection_id,"new-phone-connection");
      assert(outputs_start_bound_owner_current(&same_app,&same_route,false)
        && outputs_start_bound_owner_current(&same_app,&same_route,true));
