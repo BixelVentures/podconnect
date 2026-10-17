@@ -519,7 +519,7 @@
 +}
 --- /dev/null
 +++ b/daemon/room_transport_test.go
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,312 @@
 +package daemon
 +
 +import (
@@ -611,6 +611,44 @@
 +		t.Fatal("consumed offer replayed")
 +	}
 +}
++func TestRoomTransportLoadedPausedResumeKeepsOwnerFence(t *testing.T) {
++	for _, mutation := range []string{"valid", "foreign-session", "stopped", "retired", "cancelled"} {
++		t.Run(mutation, func(t *testing.T) {
++			p, offer := roomTransportAdmittedFixture(t)
++			p.state.player.IsPaused = true
++			offer.Snapshot.Action = "resume"
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch mutation {
++			case "foreign-session":
++				p.state.player.SessionId = "other-session"
++			case "stopped":
++				p.state.player.IsPlaying = false
++				p.primaryStream = nil
++			case "retired":
++				p.retireAliases()
++			case "cancelled":
++				cancel()
++			}
++			got, err := p.consumeRoomTransport(context.Background(), roomTransportConsumeRequest{offer.Snapshot.PrepareID, ctx})
++			if mutation == "valid" {
++				if err != nil || got != offer || p.roomTransportPending != offer {
++					t.Fatal("loaded paused same-owner resume offer was not admitted", err)
++				}
++				p.invalidateRoomTransportGeneration()
++				p.aliasMu.Lock()
++				current := p.transportOfferCurrentLocked(offer, context.Background(), ctx)
++				p.aliasMu.Unlock()
++				if current {
++					t.Fatal("stale paused resume passed final mutation fence")
++				}
++			} else if err == nil || got != nil || p.roomTransportPending != nil {
++				t.Fatal("foreign, stopped, retired or cancelled paused resume admitted")
++			}
++		})
++	}
++}
++
 +func TestRoomTransportForeignTokenDoesNotConsumeNewOffer(t *testing.T) {
 +	p, offer := roomTransportAdmittedFixture(t)
 +	if _, err := p.consumeRoomTransport(context.Background(), roomTransportConsumeRequest{strings.Repeat("c", 32), context.Background()}); err == nil || p.roomTransportOffer != offer {
@@ -1335,7 +1373,7 @@
 +}
 --- /dev/null
 +++ b/player/room_transport_test.go
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,192 @@
 +package player
 +
 +import (
@@ -1435,6 +1473,24 @@
 +	err := (&Player{}).applyGuardedTransport(&guardedTransportCommand{paused: true, source: replacement, expectedSource: old, guard: func(mutate func()) error { calls++; mutate(); return nil }}, &out, source, 1)
 +	if err != nil || calls != 1 || source.source[source.which] != librespot.AudioSource(replacement) || !backend.paused || source.source[!source.which] != nil {
 +		t.Fatal("guarded source and paused state did not commit together")
++	}
++}
++
++func TestRoomTransportPlayerResumesExistingPausedSourceUnderFinalGuard(t *testing.T) {
++	backend := &transportTestOutput{gate: make(chan struct{}), entered: make(chan struct{}), paused: true}
++	close(backend.gate)
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	old := &transportSource{id: 1}
++	source.SetPrimary(old)
++	called := 0
++	err := (&Player{}).applyGuardedTransport(&guardedTransportCommand{paused: false, expectedSource: old, guard: func(mutate func()) error {
++		called++
++		mutate()
++		return nil
++	}}, &out, source, 1)
++	if err != nil || called != 1 || backend.paused || source.source[source.which] != librespot.AudioSource(old) {
++		t.Fatal("same owned source did not resume atomically", err)
 +	}
 +}
 +

@@ -83,6 +83,8 @@ COPY patches/room-burst-owntone.patch /patches/room-burst-owntone.patch
 COPY patches/room-move-owntone.patch /patches/room-move-owntone.patch
 COPY patches/owntone-move.sha256 /patches/owntone-move.sha256
 COPY patches/room-queue-owntone.patch /patches/room-queue-owntone.patch
+COPY patches/room-start-proof-owntone.patch /patches/room-start-proof-owntone.patch
+COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
@@ -101,6 +103,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/owntone-queue.sha256 \
   && git apply --check /patches/room-queue-owntone.patch \
   && git apply /patches/room-queue-owntone.patch \
+  && sha256sum -c /patches/owntone-start-proof.sha256 \
+  && git apply --check /patches/room-start-proof-owntone.patch \
+  && git apply /patches/room-start-proof-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

@@ -1,0 +1,365 @@
+diff --git a/src/httpd_jsonapi_transport_bound.inc.c b/src/httpd_jsonapi_transport_bound.inc.c
+--- a/src/httpd_jsonapi_transport_bound.inc.c
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -49,7 +49,7 @@
+ static int jsonapi_reply_transport_bound_state(struct httpd_request *hreq)
+ {
+   struct output_transport_identity identity; struct output_native_owner owner={0};
+-  uint64_t id; bool busy,queue=false; size_t i;
++  uint64_t id; bool busy,start_owned=false,clean_absent=false,queue=false; size_t i;
+   struct output_queue_writer writer={0};
+   json_object *body=transport_parse_body_limit(hreq->in_body,8192),*reply,*actions;
+   const char *names[]={"pause","resume","next","previous"}; int ret=HTTP_BADREQUEST;
+@@ -58,12 +58,16 @@
+       || safe_atou64(hreq->path_parts[2],&id)<0) goto out;
+   if(queue && (!queue_wire_hex(owner.alias_incarnation,32) || !queue_wire_hex(owner.alias_registry,64)))goto out;
+   ret=409;
+-  if ((queue ? player_queue_state_get(id,&owner,&writer,&identity,&busy) : player_transport_bound_state_get(id,&owner,&identity,&busy))<0) goto out;
++  if ((queue ? player_queue_state_get(id,&owner,&writer,&identity,&busy) : player_transport_bound_state_get(id,&owner,&identity,&busy,&start_owned,&clean_absent))<0) goto out;
+   reply=json_object_new_object(); actions=json_object_new_array();
+   json_object_object_add(reply,"schema",json_object_new_string(queue?"podconnect.output_queue_state.v1":"podconnect.output_transport_state.v2"));
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+   json_object_object_add(reply,"identity",transport_identity_json(&identity));
+   json_object_object_add(reply,"busy",json_object_new_boolean(busy));
++  if(!queue){
++    json_object_object_add(reply,"start_owned",json_object_new_boolean(start_owned));
++    json_object_object_add(reply,"clean_absent",json_object_new_boolean(clean_absent));
++  }
+   if(queue){
+     json_object_object_add(reply,"purpose",json_object_new_string("queue_occurrence_v1"));
+     json_object_object_add(reply,"native_owner",transport_native_json(&owner));
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -287,6 +287,8 @@
+     && !strcmp(a->input_path_digest,b->input_path_digest);
+ }
+ 
++static bool start_route_owned(const struct output_native_owner *,const struct output_transport_identity *);
++static bool start_route_clean_absent(void);
+ #include "outputs_transport_custody.inc.c"
+ 
+ static struct transport_slot *
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -135,7 +135,7 @@
+ };
+ int outputs_queue_state_get(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_transport_identity *,bool *);
+ int outputs_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+-int outputs_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
++int outputs_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *,bool *,bool *);
+ int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_result_get(const char *, struct output_transport_result *);
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -71,6 +71,30 @@
+ 
+ bool outputs_start_source_owned(void)
+ { return atomic_load(&start_owned_latch); }
++/* Only a current, journaled completed START may be advertised as owned.
++ * A false result is unknown; callers must separately prove clean absence. */
++static bool start_route_owned(const struct output_native_owner *owner,
++    const struct output_transport_identity *identity)
++{
++  struct start_slot *s=start_active;
++  return outputs_start_source_owned() && !outputs_start_gate_closed()
++    && !start_journal_fault && !start_startup_quarantine && !start_retired_reopen_pending
++    && s && !s->cancelled && !s->writer_pending && !s->result.command.move_existing_session
++    && s->result.phase==OUTPUT_START_COMPLETED && s->result.actual_owner_present
++    && s->retirement.outcome==OUTPUT_RETIRE_NONE
++    && start_journal_retirement_outcome==OUTPUT_RETIRE_NONE
++    && start_journal.token[0] && start_journal.payload && start_journal_payload_valid()
++    && !strcmp(start_journal.token,s->result.command.token)
++    && !strcmp(start_journal.c_process,outputs_process)
++    && outputs_start_bound_owner_current(owner,identity,false);
++}
++static bool start_route_clean_absent(void)
++{
++  return !start_active && !start_scope && !outputs_start_source_owned()
++    && !outputs_start_gate_closed() && !start_journal_fault && !start_startup_quarantine
++    && !start_retired_reopen_pending && !start_retired_stage_ready
++    && !start_journal.token[0] && !start_journal.payload;
++}
+ static bool start_completed_writer_current(const struct start_slot *s)
+ {
+   uint64_t fd=0;
+diff --git a/src/outputs_transport_custody.inc.c b/src/outputs_transport_custody.inc.c
+--- a/src/outputs_transport_custody.inc.c
++++ b/src/outputs_transport_custody.inc.c
+@@ -113,8 +113,12 @@
+   return transport_custody_busy() && native_owner_equal(owner,&transport_custody_owner)
+     && transport_identity_equal(identity,&transport_custody_identity) ? transport_remaining(&transport_custody_expiry) : 0;
+ }
+-int outputs_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy)
++int outputs_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy,bool *start_owned,bool *clean_absent)
+ {
+-  if (!busy || !native_owner_valid(owner,id) || transport_identity_get(id,identity)<0) return -1;
+-  *busy=!transport_bound_available(id,owner,0); return 0;
++  if (!busy || !start_owned || !clean_absent || !native_owner_valid(owner,id)
++      || transport_identity_get(id,identity)<0) return -1;
++  *busy=!transport_bound_available(id,owner,0);
++  *start_owned=!*busy && start_route_owned(owner,identity);
++  *clean_absent=!*busy && !*start_owned && start_route_clean_absent();
++  return 0;
+ }
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3128,7 +3128,7 @@
+   const struct output_queue_writer *queue_writer;
+   struct output_transport_result *result;
+   struct output_transport_identity *identity;
+-  bool *busy;
++  bool *busy,*start_owned,*clean_absent;
+   const char *token;
+   uint64_t id;
+   int action;
+@@ -3144,7 +3144,7 @@
+   else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
+   else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
+   else if (c->action==5) *retval=outputs_queue_state_get(c->id,c->owner,c->queue_writer,c->identity,c->busy);
+-  else if (c->action==4) *retval=outputs_transport_bound_state_get(c->id,c->owner,c->identity,c->busy);
++  else if (c->action==4) *retval=outputs_transport_bound_state_get(c->id,c->owner,c->identity,c->busy,c->start_owned,c->clean_absent);
+   else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
+   return COMMAND_END;
+ }
+@@ -3175,9 +3175,9 @@
+   return commands_exec_sync(cmdbase,transport_command,NULL,&c);
+ }
+ 
+-int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy)
+-{
+-  struct player_transport_command c={.id=id,.owner=owner,.identity=identity,.busy=busy,.action=4};
++int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *identity,bool *busy,bool *start_owned,bool *clean_absent)
++{
++  struct player_transport_command c={.id=id,.owner=owner,.identity=identity,.busy=busy,.start_owned=start_owned,.clean_absent=clean_absent,.action=4};
+   return commands_exec_sync(cmdbase,transport_command,NULL,&c);
+ }
+ 
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -255,7 +255,7 @@
+ 
+ 
+ int player_queue_state_get(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_transport_identity *,bool *);
+-int player_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *);
++int player_transport_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,bool *,bool *,bool *);
+ int player_room_volume_bound_state_get(uint64_t,const struct output_native_owner *,struct output_transport_identity *,struct output_room_volume_state *,bool *);
+ 
+ int player_start_state_get(const struct output_start_request *,struct output_start_state *);
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1153,7 +1153,7 @@
+   if (argc == 2 && !strcmp(argv[1], "--start35-streaming")) return start_streaming_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--rss-owner-red")) return rss_owner_cases(true);
+   if (argc == 2 && !strcmp(argv[1], "--rss-owner")) return rss_owner_cases(false);
+-  for(mode=11;mode<=25;mode++){if(mode>16 && mode!=24 && mode!=25)continue;fflush(NULL);pid_t child=fork();int status;assert(child>=0);if(!child){int result=start35_wire_case(mode);fflush(NULL);_exit(result);}assert(waitpid(child,&status,0)==child);fprintf(stderr,"START35/MOVE mode%d child status%d\n",mode,status);if(!WIFEXITED(status) || WEXITSTATUS(status))return 1;}
++  for(mode=11;mode<=25;mode++){if(mode>16 && mode!=18 && mode!=24 && mode!=25)continue;fflush(NULL);pid_t child=fork();int status;assert(child>=0);if(!child){int result=start35_wire_case(mode);fflush(NULL);_exit(result);}assert(waitpid(child,&status,0)==child);fprintf(stderr,"START35/MOVE mode%d child status%d\n",mode,status);if(!WIFEXITED(status) || WEXITSTATUS(status))return 1;}
+   if (rss_owner_cases(false)) return 1;
+   actual_player_startup_cases();
+   for (mode = OLD_START_200; mode <= OLD_START_REFUSED; mode++)
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -825,8 +825,8 @@
+ int player_transport_result_get(const char *token, struct output_transport_result *out)
+ { return outputs_transport_result_get(token,out); }
+ 
+-int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *out,bool *busy)
+-{ return outputs_transport_bound_state_get(id,owner,out,busy); }
++int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *out,bool *busy,bool *start_owned,bool *clean_absent)
++{ return outputs_transport_bound_state_get(id,owner,out,busy,start_owned,clean_absent); }
+ int player_room_volume_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *i,struct output_room_volume_state *v,bool *busy)
+ { return outputs_room_volume_bound_state_get(id,owner,i,v,busy); }
+ 
+@@ -1094,7 +1094,7 @@
+ {
+   struct output_device *a=add_device(1),*b=add_device(2); unsigned char session;
+   struct output_native_owner owner=burst_owner(),changed;
+-  struct output_transport_identity identity; bool busy; uint64_t generation;
++  struct output_transport_identity identity; bool busy,start_owned,clean_absent; uint64_t generation;
+   struct output_transport_request r,early,newer; struct output_transport_result first,last;
+   struct output_room_volume_request v; struct output_room_volume_result volume;
+   struct timespec expiry; int base;
+@@ -1103,19 +1103,20 @@
+   outputs_transport_input_changed(777,"/srv/media/spotify",true); assert(outputs_device_volume_register(a,27,-1)==0); base=a->volume;
+   r=burst_audio(&owner,1,"pause"); assert(outputs_transport_commit(&r,&first)==0);
+   assert(outputs_transport_busy() && outputs_transport_current(&first));
+-  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && !busy);
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0
++    && !busy && !start_owned && clean_absent);
+   r=burst_audio(&owner,2,"resume"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(!outputs_transport_current(&first) && outputs_transport_current(&last) && a->volume==base);
+   /* The same App's new Spotify session may read current state; every other
+    * owner field remains exact and stale offers keep their captured identity. */
+-#define FOREIGN(field) changed=owner; changed.field[0]='X'; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)==0 && busy)
++#define FOREIGN(field) changed=owner; changed.field[0]='X'; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && busy)
+   FOREIGN(account_user_id); FOREIGN(target_id); FOREIGN(room_id); FOREIGN(connection_id);
+   FOREIGN(alias_incarnation); FOREIGN(alias_registry);
+ #undef FOREIGN
+   changed=owner;strcpy(changed.session_id,"new-phone-session");
+-  assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)==0 && !busy);
+-  changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)==0 && busy);
+-  changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy)<0);
++  assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && !busy);
++  changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
++  changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)<0);
+   outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
+   early=burst_audio(&owner,3,"pause"); newer=burst_audio(&owner,4,"resume");
+   assert(outputs_transport_commit(&newer,&last)==0); assert(outputs_transport_commit(&early,&first)<0);
+@@ -1128,10 +1129,10 @@
+   r=burst_audio(&owner,7,"pause"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(outputs_transport_commit(&early,&first)<0); /* Expire/fresh same-route custody ABA. */
+   v=burst_volume(&owner,8,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
+-  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && busy);
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED && volume.contexts_drained);
+-  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && !busy && outputs_transport_busy());
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && !busy && outputs_transport_busy());
+   v=burst_volume(&owner,9,45); assert(outputs_room_volume_commit(&v,&volume)==0);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(a->volume==45 && outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED);
+@@ -1139,7 +1140,7 @@
+   assert(outputs_room_volume_cancel(v.token,v.native_reservation_id,&volume)==0 && volume.outcome==ROOM_VOLUME_UNKNOWN);
+   room_volume_find(v.token)->deadline.tv_sec-=2; transport_custody_expiry.tv_sec-=11;
+   assert(outputs_transport_busy()); /* Undrained context still quarantines even beyond custody expiry. */
+-  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy)==0 && busy);
++  assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   outputs_device_select(b,-1); assert(!b->selected);
+   outputs_room_volume_complete(v.token,false); assert(!outputs_transport_busy());
+   r=transport_fixture_request("pause"); r.bound=true; r.native_owner=owner; r.native_revision=UINT64_MAX;
+@@ -1195,8 +1196,13 @@
+   raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
+   hreq.path_parts[2]="1"; hreq.path_parts[4]="bound-state"; evbuffer_add(hreq.in_body,raw,strlen(raw)); free(raw);
+   assert(jsonapi_reply_transport_bound_state(&hreq)==HTTP_OK);
+-  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==6);
+-  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_transport_state.v2")); jparse_free(reply);
++  reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==8);
++  assert(!strcmp(jparse_str_from_obj(reply,"schema"),"podconnect.output_transport_state.v2"));
++  assert(json_object_object_get_ex(reply,"start_owned",&field) && json_object_is_type(field,json_type_boolean)
++    && !json_object_get_boolean(field));
++  assert(json_object_object_get_ex(reply,"clean_absent",&field) && json_object_is_type(field,json_type_boolean)
++    && json_object_get_boolean(field));
++  jparse_free(reply);
+   json_object_object_add(body,"native_prepare_id",json_object_new_string("dddddddddddddddddddddddddddddddd"));
+   json_object_object_add(body,"native_revision",json_object_new_string("20"));
+   json_object_object_add(body,"action",json_object_new_string("pause"));
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -235,8 +235,8 @@
+     struct output_native_owner fresh_owner=completed.committed_native_owner;
+     strcpy(fresh_owner.session_id,"new-phone-context");
+     strcpy(fresh_owner.connection_id,"new-phone-connection");
+-    struct output_transport_identity fresh_identity;
+-    assert(outputs_transport_bound_state_get(2,&fresh_owner,&fresh_identity,&controls_busy)==0 && !controls_busy
++    struct output_transport_identity fresh_identity; bool start_owned=false,clean_absent=false;
++    assert(outputs_transport_bound_state_get(2,&fresh_owner,&fresh_identity,&controls_busy,&start_owned,&clean_absent)==0 && !controls_busy
+       && fresh_identity.input_item_id==(uint64_t)next_item);
+     struct output_transport_request fresh_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=3};
+     struct output_transport_result fresh_audio_result;
+@@ -253,7 +253,7 @@
+     memset(stale_ordinal.native_prepare_id,'a',32);
+     assert(outputs_transport_prepare(&stale_ordinal,&fresh_audio_result)<0);
+     fresh_owner.alias_revision++;
+-    assert(outputs_transport_bound_state_get(2,&fresh_owner,&fresh_identity,&controls_busy)==0 && controls_busy);
++    assert(outputs_transport_bound_state_get(2,&fresh_owner,&fresh_identity,&controls_busy,&start_owned,&clean_absent)==0 && controls_busy);
+     fresh_owner.alias_revision--;
+     struct output_room_volume_request fresh_volume={.device_id=2,.percent=27,.bound=true,.native_revision=4};
+     struct output_room_volume_result fresh_volume_result;
+@@ -392,6 +392,75 @@
+     strcpy(same_app.connection_id,"new-phone-connection");
+     assert(outputs_start_bound_owner_current(&same_app,&same_route,false)
+       && outputs_start_bound_owner_current(&same_app,&same_route,true));
++    {
++      struct output_transport_identity observed;
++      bool busy,owned,absent;
++      assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++        && !busy && owned && !absent && transport_identity_equal(&observed,&same_route));
++      {
++        /* Native's retained pause has no C source stop. The C read must also
++         * survive a paused player flag while the actual FIFO and loaded source
++         * from this completed START remain current. */
++        enum play_status prior=player_state;
++        struct player_transport_command command={.id=1,.owner=&same_app,.identity=&observed,
++          .busy=&busy,.start_owned=&owned,.clean_absent=&absent,.action=4};
++        int retval=-1;
++        assert(pb_session.playing_now && pb_session.playing_now==pb_session.source_list
++          && pb_session.reading_now==pb_session.playing_now);
++        player_state=PLAY_PAUSED;
++        assert(transport_command(&command,&retval)==COMMAND_END && retval==0
++          && !busy && owned && !absent);
++        same_app.alias_revision++;
++        assert(transport_command(&command,&retval)==COMMAND_END && retval==0
++          && busy && !owned && !absent);
++        same_app.alias_revision--;
++        start_active->retirement.outcome=OUTPUT_RETIRE_PENDING;
++        assert(transport_command(&command,&retval)==COMMAND_END && retval==0
++          && !busy && !owned && !absent);
++        start_active->retirement.outcome=OUTPUT_RETIRE_NONE;
++        player_state=prior;
++      }
++      same_app.alias_revision++;
++      assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++        && busy && !owned && !absent);
++      same_app.alias_revision--;
++      start_journal.token[0]='x';
++      assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++        && !busy && !owned && !absent); /* stale durable owner cannot become clean absence */
++      start_journal.token[0]=f.start_result.command.token[0];
++      assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++        && !busy && owned && !absent);
++      {
++        uint64_t saved_epoch=start_active->result.input_epoch;
++        uint64_t saved_writer=start_active->result.command.writer_fd;
++        enum output_retirement_outcome saved_retirement=start_active->retirement.outcome;
++        struct output_transport_identity wrong_route=same_route;
++        wrong_route.session_epoch++;
++        assert(!start_route_owned(&same_app,&wrong_route));
++        start_active->result.command.writer_fd++;
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && busy && !owned && !absent);
++        start_active->result.command.writer_fd=saved_writer;
++        start_active->result.input_epoch++;
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && busy && !owned && !absent);
++        start_active->result.input_epoch=saved_epoch;
++        start_journal_fault=true;
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && busy && !owned && !absent);
++        start_journal_fault=false;
++        start_active->retirement.outcome=OUTPUT_RETIRE_PENDING;
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && !busy && !owned && !absent);
++        start_active->retirement.outcome=saved_retirement;
++        atomic_store(&start_gate,true);
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && busy && !owned && !absent);
++        atomic_store(&start_gate,false);
++        assert(outputs_transport_bound_state_get(1,&same_app,&observed,&busy,&owned,&absent)==0
++          && !busy && owned && !absent);
++      }
++    }
+     same_app.alias_revision++;
+     assert(!outputs_start_bound_owner_current(&same_app,&same_route,false));
+     struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -75,8 +75,8 @@
+   assert(outputs_device_session_add(1,(void *)0x1234)<0);
+   assert(outputs_start_complete(&r,&out)<0); /* No live owner after restart. */
+   assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
+-  struct output_transport_identity route;bool busy;
+-  assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy)<0);
++  struct output_transport_identity route;bool busy,start_owned,clean_absent;
++  assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
+   sqlite3_close(hdl);hdl=NULL;
+ }
+ static void exact_start_durable_gate(void)

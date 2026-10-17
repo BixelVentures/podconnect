@@ -854,6 +854,11 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				time.Sleep(200 * time.Millisecond)
 				continue // unknown bound selection cannot reclaim a positional primary
 			}
+			if holdReleasedBridgeRoute(room, gl, intent) {
+				prevActive = gl.Active
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			aliasRoutedThisTick := false
 
 			// Device-aliases routing: when the primary engine reports a newly-selected alias, point THIS

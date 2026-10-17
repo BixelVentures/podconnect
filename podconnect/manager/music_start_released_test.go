@@ -93,7 +93,7 @@ func releasedURIFixture(t *testing.T) *releasedStartFixture {
 				f.onRead = nil
 				callback()
 			}
-			body = fmt.Sprintf(`{"outputs":[{"id":"native-output-42","type":"AirPlay 2","selected":%t,"volume":%d,"needs_auth_key":false}]}`, f.selected, f.volume)
+			body = fmt.Sprintf(`{"outputs":[{"id":%q,"type":"AirPlay 2","selected":%t,"volume":%d,"needs_auth_key":false}]}`, room.HomepodID, f.selected, f.volume)
 		case req.Method == "PUT" && req.URL.Path == "/api/player/volume":
 			if req.URL.Query().Get("output_id") != room.HomepodID || req.URL.Query().Get("volume") != fmt.Sprint(startVolumePercent) {
 				t.Fatal("unbound output/volume")

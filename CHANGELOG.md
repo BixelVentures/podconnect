@@ -1,4 +1,14 @@
-## Speakers 0.26.23 / Control 0.10.16 — queue occurrence candidate, unpublished
+## Speakers 0.26.25 — released-route ownership candidate
+
+- Join the current receiver and OwnTone START owners before a released, playing route enters alias recovery. A current START or unknown owner holds the released marker and skips volume and output-selection writes; only explicit clean absence enters the existing guarded recovery.
+- Let a loaded, released paused session offer only Resume through the exact current room-transport owner. Recheck source state and both owner identities after preparation and before final commit. Preserve ordinary nonreleased MOVE transport and the existing Control 0.10.16 public response.
+- Add bounded current START proof to OwnTone's private bound-state reply and causal Native/manager regressions. Source review and focused inert tests passed; compiled native CI, immutable image publication, installation and physical playback acceptance remain open.
+
+## Speakers 0.26.24 — deterministic startup fixture release
+
+- Wait for the real OwnTone library worker's initialization before the queue fixture acquires its held database writer. The observer alarm and actual held-lock/player-admission assertions remain; production behavior is unchanged.
+
+## Speakers 0.26.23 / Control 0.10.16 — queue occurrence candidate
 
 - Add a distinct room queue purpose on the existing Native and OwnTone output owners. A read joins the current Native writer and C reader without staging a track; a selected opaque occurrence is staged on a detached list, pinned to the same route, then committed once through the guarded Native player. Duplicate songs retain separate occurrence IDs and manual queue order.
 - Add `get_room_queue_controls`, `prepare_room_queue`, and `control_room_queue` to the existing exact-account Control owner. Prepare is effect-free so the caller can recheck its current grant before commit. A stale owner, route, writer, occurrence or deadline rejects; an uncertain commit is consumed without retry. Existing queue and transport services retain their prior contracts.

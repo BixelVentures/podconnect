@@ -62,7 +62,7 @@ func roomTransportFixture(t *testing.T) *transportFixture {
 			if method != http.MethodPost || decodeQueueManagerJSON(body, &request) != nil || request.Owner != f.Native {
 				t.Errorf("Ccompatibility probe did not use actual native owner: %s", body)
 			}
-			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, f.Route, false, []string{"pause", "resume", "next", "previous"}, false})
+			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, f.Route, false, []string{"pause", "resume", "next", "previous"}, false, false, true})
 		case path == "/player/room_transport/bound-prepare":
 			var request map[string]any
 			if json.Unmarshal(body, &request) != nil {
@@ -164,6 +164,9 @@ func TestRoomTransportStateJoinsActualOwnersWithoutTokensOrEffects(t *testing.T)
 	transportStateHandler(out, httptest.NewRequest("GET", "/api/room-transport/state?"+q.Encode(), nil))
 	if out.Code != 200 || !strings.Contains(out.Body.String(), `"homepod_id":"42"`) {
 		t.Fatal(out.Code, out.Body.String())
+	}
+	if strings.Contains(out.Body.String(), "start_owned") || strings.Contains(out.Body.String(), "clean_absent") {
+		t.Fatal("private C proof leaked into Control's existing public schema")
 	}
 	if len(f.Writes) != 0 {
 		t.Fatal("read minted lease or wrote", f.Writes)
