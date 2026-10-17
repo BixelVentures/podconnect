@@ -5,6 +5,7 @@ package main
 // Actual route admission belongs to OwnTone; final native admission belongs to
 // the receiver actor and its guarded pipe/player mutator.
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 var transportActions = []string{"pause", "resume", "next", "previous"}
@@ -55,13 +57,24 @@ type receiverTransportState struct {
 	Physical bool                  `json:"physical_result_verified"`
 }
 type outputTransportState struct {
-	Schema   string                  `json:"schema"`
-	OK       bool                    `json:"ok"`
-	Identity outputTransportIdentity `json:"identity"`
-	Busy     bool                    `json:"busy"`
-	Actions  []string                `json:"actions"`
-	Physical bool                    `json:"physical_result_verified"`
+	Schema      string                  `json:"schema"`
+	OK          bool                    `json:"ok"`
+	Identity    outputTransportIdentity `json:"identity"`
+	Busy        bool                    `json:"busy"`
+	Actions     []string                `json:"actions"`
+	Physical    bool                    `json:"physical_result_verified"`
+	StartOwned  bool                    `json:"start_owned"`
+	CleanAbsent bool                    `json:"clean_absent"`
 }
+
+type currentStartRoute int
+
+const (
+	startRouteUnknown currentStartRoute = iota
+	startRouteOwned
+	startRouteCleanAbsent
+)
+
 type receiverTransportPrepare struct {
 	Schema    string `json:"schema"`
 	PrepareID string `json:"prepare_id"`
@@ -146,24 +159,158 @@ func transportClaimCurrent(claim startClaim, s roomTransportScope) bool {
 	next, ok := roomTransportClaim(s.Room, s.Target)
 	return ok && transportClaimMatches(next, s) && next.RT == claim.RT && next.Intent == claim.Intent && claim.RT.live.startIntentCurrent(claim.Intent) && sameAliasBinding(next.Proof.AliasBinding, claim.Proof.AliasBinding)
 }
-func readRoomTransport(ctx context.Context, s roomTransportScope) (startClaim, receiverTransportState, outputTransportState, error) {
+func transportRouteClaimSnapshotCurrent(claim startClaim, s roomTransportScope) bool {
+	if !claim.Released {
+		return transportClaimCurrent(claim, s)
+	}
+	next, ok := currentRoomTransportClaim(s.Room, s.Target)
+	return ok && next.Released && transportClaimMatches(next, s) && next.RT == claim.RT &&
+		next.Intent == claim.Intent && next.Paused == claim.Paused && claim.RT.live.startIntentCurrent(claim.Intent) &&
+		sameAliasBinding(next.Proof.AliasBinding, claim.Proof.AliasBinding)
+}
+
+// A released route is only a preliminary claim. The caller must join a fresh
+// receiver session with C's current START route before offering any action.
+func readRoomTransportState(ctx context.Context, s roomTransportScope) (startClaim, receiverTransportState, outputTransportState, currentStartRoute, error) {
 	var n receiverTransportState
 	var o outputTransportState
 	claim, ok := roomTransportClaim(s.Room, s.Target)
+	if !ok || claim.Released && claim.Proof.Mode != "same_session" {
+		claim, ok = currentRoomTransportClaim(s.Room, s.Target)
+	}
 	if !validTransportScope(s) || !ok || !transportClaimMatches(claim, s) {
-		return claim, n, o, fmt.Errorf("room transport unavailable")
+		return claim, n, o, startRouteUnknown, fmt.Errorf("room transport unavailable")
 	}
 	q := url.Values{"account_user_id": {s.Account}, "target_id": {s.Target}, "room_id": {s.Room}, "homepod_id": {s.Homepod}}
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_transport/bound-state?"+q.Encode(), nil)
 	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_transport_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validTransportActions(n.Actions) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
-		return claim, n, o, fmt.Errorf("native room transport unavailable")
+		return claim, n, o, startRouteUnknown, fmt.Errorf("native room transport unavailable")
 	}
 	boundState, _ := json.Marshal(map[string]any{"native_owner": n.Identity})
 	raw, err = roomTransportRPC(ctx, claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(s.Homepod)+"/transport/bound-state", boundState)
-	if err != nil || decodeQueueManagerJSON(raw, &o) != nil || o.Schema != "podconnect.output_transport_state.v2" || !o.OK || o.Physical || !validOutputTransportIdentity(o.Identity, s.Homepod) || o.Identity.InputDigest != configuredTransportInput(claim) || !validTransportActions(o.Actions) || !transportClaimCurrent(claim, s) {
-		return claim, n, o, fmt.Errorf("output room transport unavailable")
+	if err != nil || decodeQueueManagerJSON(raw, &o) != nil || o.Schema != "podconnect.output_transport_state.v2" || !o.OK || o.Physical || o.Busy || o.StartOwned && o.CleanAbsent || !validOutputTransportIdentity(o.Identity, s.Homepod) || o.Identity.InputDigest != configuredTransportInput(claim) || !validTransportActions(o.Actions) || !transportRouteClaimSnapshotCurrent(claim, s) {
+		return claim, n, o, startRouteUnknown, fmt.Errorf("output room transport unavailable")
+	}
+	if o.StartOwned {
+		return claim, n, o, startRouteOwned, nil
+	}
+	if o.CleanAbsent {
+		return claim, n, o, startRouteCleanAbsent, nil
+	}
+	return claim, n, o, startRouteUnknown, nil
+}
+
+func readRoomTransport(ctx context.Context, s roomTransportScope) (startClaim, receiverTransportState, outputTransportState, error) {
+	claim, n, o, state, err := readRoomTransportState(ctx, s)
+	if err != nil || claim.Released && state != startRouteOwned {
+		return claim, n, o, fmt.Errorf("room transport owner unavailable")
 	}
 	return claim, n, o, nil
+}
+
+func transportRouteClaimCurrent(ctx context.Context, claim startClaim, s roomTransportScope, expectedNative roomTransportIdentity, expectedRoute outputTransportIdentity) bool {
+	if !transportRouteClaimSnapshotCurrent(claim, s) {
+		return false
+	}
+	if !claim.Released {
+		return true
+	}
+	latest, n, o, state, err := readRoomTransportState(ctx, s)
+	return err == nil && state == startRouteOwned && latest.RT == claim.RT && latest.Intent == claim.Intent &&
+		latest.Paused == claim.Paused &&
+		n.Identity == expectedNative && o.Identity == expectedRoute &&
+		sameAliasBinding(latest.Proof.AliasBinding, claim.Proof.AliasBinding)
+}
+
+// The bridge does not know the account from a display name or selected output.
+// Read the native AP identity, then let the receiver's bound-state prove its
+// current session before C joins that exact owner to the current output route.
+func currentNativeAccount(ctx context.Context, base, engineID string) string {
+	raw, err := roomTransportRPC(ctx, base, http.MethodGet, "/status", nil)
+	if err != nil || len(raw) > 65536 || !utf8.Valid(raw) {
+		return ""
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return ""
+	}
+	seen := map[string]bool{}
+	account, observedEngine := "", ""
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] {
+			return ""
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return ""
+		}
+		if key == "username" && json.Unmarshal(value, &account) != nil {
+			return ""
+		}
+		if key == "device_id" && json.Unmarshal(value, &observedEngine) != nil {
+			return ""
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return ""
+	}
+	if _, err := decoder.Token(); err != io.EOF || observedEngine != engineID ||
+		len(account) > 160 || canonicalUsernameDigest(account) == "" {
+		return ""
+	}
+	return account
+}
+
+// This result is intentionally not cached: a positive only suppresses this
+// tick's legacy route writes while the persistent released marker remains.
+func bridgeCurrentStartRoute(ctx context.Context, primary *Room, status glStatus, intent glTransportIntent) currentStartRoute {
+	if primary == nil || primary.Idx != 0 || mgr == nil || status.AliasBinding == nil ||
+		!status.AliasBinding.valid() || !status.Active || status.Paused || status.Stopped ||
+		!fileExists(releasedPath(primary)) {
+		return startRouteUnknown
+	}
+	rt := mgr.runtime(primary.ID)
+	selected := roomByID(status.AliasBinding.RoomID)
+	if rt == nil || selected == nil || selected.HomepodID == "" || !rt.live.startIntentCurrent(intent) {
+		return startRouteUnknown
+	}
+	target := configuredEngineID(primary)
+	if target == "" {
+		return startRouteUnknown
+	}
+	account := currentNativeAccount(ctx, primary.Librespot, target)
+	if account == "" || !rt.live.startIntentCurrent(intent) {
+		return startRouteUnknown
+	}
+	scope := roomTransportScope{target, selected.ID, selected.HomepodID, account}
+	claim, native, route, state, err := readRoomTransportState(ctx, scope)
+	latest := roomByID(selected.ID)
+	if err != nil || !claim.Released || claim.RT != rt || claim.Intent != intent ||
+		claim.Proof.AliasBinding == nil || !sameAliasBinding(claim.Proof.AliasBinding, status.AliasBinding) ||
+		native.Identity.Account != account || route.Identity.Device != selected.HomepodID ||
+		latest == nil || latest.HomepodID != selected.HomepodID ||
+		!rt.live.startIntentCurrent(intent) ||
+		!fileExists(releasedPath(primary)) {
+		return startRouteUnknown
+	}
+	return state
+}
+
+// A released, playing primary may enter ordinary recovery only after explicit
+// clean absence. Owned and unknown keep the marker and skip every legacy write.
+func holdReleasedBridgeRoute(primary *Room, status glStatus, intent glTransportIntent) bool {
+	if primary == nil || primary.Idx != 0 || !fileExists(releasedPath(primary)) {
+		return false
+	}
+	if !status.Active || status.Paused || status.Stopped {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return bridgeCurrentStartRoute(ctx, primary, status, intent) != startRouteCleanAbsent
 }
 func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -184,7 +331,7 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	_, n, o, err := readRoomTransport(ctx, s)
+	claim, n, o, err := readRoomTransport(ctx, s)
 	if err != nil {
 		http.Error(w, "room transport unavailable", 409)
 		return
@@ -192,7 +339,7 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	actions := []string{}
 	if !o.Busy {
 		for _, a := range n.Actions {
-			if slices.Contains(o.Actions, a) {
+			if slices.Contains(o.Actions, a) && !(claim.Released && claim.Paused && a != "resume") {
 				actions = append(actions, a)
 			}
 		}
@@ -245,7 +392,9 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	claim, n, o, err := readRoomTransport(ctx, body.Scope)
-	if err != nil || n.Identity != body.Native || o.Identity != body.Route || o.Busy || !slices.Contains(n.Actions, body.Action) || !slices.Contains(o.Actions, body.Action) {
+	if err != nil || n.Identity != body.Native || o.Identity != body.Route || o.Busy ||
+		claim.Released && claim.Paused && body.Action != "resume" ||
+		!slices.Contains(n.Actions, body.Action) || !slices.Contains(o.Actions, body.Action) {
 		http.Error(w, "stale room transport", 409)
 		return
 	}
@@ -256,7 +405,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	var prepared receiverTransportPrepare
 	// Embedded structs are decoded by encoding/json, but strict field presence must
 	// validate their flattened identity independently of queue's struct walker.
-	if err != nil || decodeTransportPrepare(raw, &prepared) != nil || prepared.Schema != "podconnect.native_room_transport.v2" || !queueObservationPattern.MatchString(prepared.PrepareID) || prepared.roomTransportIdentity != body.Native || prepared.Action != body.Action || prepared.Percent != body.Percent || !transportDigest.MatchString(prepared.Digest) || prepared.Expires != 5000 || !validBoundNativeRevision(prepared.IntentRevision) || !transportClaimCurrent(claim, body.Scope) {
+	if err != nil || decodeTransportPrepare(raw, &prepared) != nil || prepared.Schema != "podconnect.native_room_transport.v2" || !queueObservationPattern.MatchString(prepared.PrepareID) || prepared.roomTransportIdentity != body.Native || prepared.Action != body.Action || prepared.Percent != body.Percent || !transportDigest.MatchString(prepared.Digest) || prepared.Expires != 5000 || !validBoundNativeRevision(prepared.IntentRevision) || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
 		http.Error(w, "native preparation unavailable", 409)
 		return
 	}
@@ -268,7 +417,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	raw, err = roomTransportRPC(ctx, claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(body.Scope.Homepod)+"/transport/bound-prepare", encoded)
 	var output outputTransportPrepare
 	remaining := 5000 - int(time.Since(started).Milliseconds())
-	if err != nil || decodeQueueManagerJSON(raw, &output) != nil || output.Schema != "podconnect.output_transport_prepare.v2" || !output.OK || !queueObservationPattern.MatchString(output.Token) || output.Identity != body.Route || output.Expires != 10000 || output.Owner != prepared.roomTransportIdentity || output.Revision != prepared.IntentRevision || remaining <= 0 || !transportClaimCurrent(claim, body.Scope) {
+	if err != nil || decodeQueueManagerJSON(raw, &output) != nil || output.Schema != "podconnect.output_transport_prepare.v2" || !output.OK || !queueObservationPattern.MatchString(output.Token) || output.Identity != body.Route || output.Expires != 10000 || output.Owner != prepared.roomTransportIdentity || output.Revision != prepared.IntentRevision || remaining <= 0 || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
 		http.Error(w, "output preparation unavailable", 409)
 		return
 	}
@@ -317,12 +466,16 @@ func transportCommitHandler(w http.ResponseWriter, r *http.Request) {
 		offer = nil
 	}
 	roomTransportStore.Unlock()
-	if offer == nil || !time.Now().Before(offer.Expires) || !transportClaimCurrent(offer.Claim, offer.Request.Scope) {
+	if offer == nil || !time.Now().Before(offer.Expires) {
 		http.Error(w, "stale room transport", 409)
 		return
 	}
 	ctx, cancel := context.WithDeadline(r.Context(), offer.Expires)
 	defer cancel()
+	if !transportRouteClaimCurrent(ctx, offer.Claim, offer.Request.Scope, offer.Request.Native, offer.Request.Route) {
+		http.Error(w, "stale room transport", 409)
+		return
+	}
 	encoded, _ := json.Marshal(map[string]any{"prepare_id": body.PrepareID, "own_tone_token": offer.Output.Token})
 	// This is the only possible-effect dispatch. Every result after it is native
 	// acceptance or unknown, never a safe rejection inferred from an HTTP error.

@@ -45,6 +45,7 @@ type startClaim struct {
 	Room     *Room
 	RT       *roomRuntime
 	Released bool
+	Paused   bool
 }
 
 type startLease struct {
@@ -156,7 +157,17 @@ func currentStartClaim(roomID, targetID string) (startClaim, bool) {
 	return currentStartClaimAllowReleased(roomID, targetID, false)
 }
 
+// Only the existing room-transport owner may inspect a released, still-playing
+// route. Its caller must join the current receiver and C owners before use.
+func currentRoomTransportClaim(roomID, targetID string) (startClaim, bool) {
+	return currentStartClaimWithRelease(roomID, targetID, true, true)
+}
+
 func currentStartClaimAllowReleased(roomID, targetID string, allowReleased bool) (startClaim, bool) {
+	return currentStartClaimWithRelease(roomID, targetID, allowReleased, false)
+}
+
+func currentStartClaimWithRelease(roomID, targetID string, allowReleased, allowPlayingReleased bool) (startClaim, bool) {
 	if mgr == nil || store == nil || roomID == "" || !engineIDPattern.MatchString(targetID) {
 		return startClaim{}, false
 	}
@@ -174,7 +185,7 @@ func currentStartClaimAllowReleased(roomID, targetID string, allowReleased bool)
 	if rt == nil {
 		return startClaim{}, false
 	}
-	return startClaimFor(primary, rt, rooms, roomID, targetID, allowReleased)
+	return startClaimFor(primary, rt, rooms, roomID, targetID, allowReleased, allowPlayingReleased)
 }
 
 func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, targetID string, allowReleased ...bool) (startClaim, bool) {
@@ -226,13 +237,14 @@ func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, target
 		// Login/volume makes Active true even after the native route was
 		// released. Only an explicitly paused, exact-current-alias route may
 		// reclaim as a fresh URI start. Unselected alone is not permission.
-		if released && status.Paused && status.AliasBinding.RoomID == roomID {
+		if released && status.Paused && status.AliasBinding.RoomID == roomID &&
+			(len(allowReleased) < 2 || !allowReleased[1]) {
 			mode = "fresh_start"
 		} else {
 			mode = "same_session"
 		}
 	}
-	if status.Active && released && !status.Paused {
+	if status.Active && released && !status.Paused && (len(allowReleased) < 2 || !allowReleased[1]) {
 		return startClaim{}, false
 	}
 	if mode == "same_session" && (!outputSelected || fileExists(releasedPath(primary))) &&
@@ -243,7 +255,7 @@ func startClaimFor(primary *Room, rt *roomRuntime, rooms []*Room, roomID, target
 		RoomID: roomID, HomepodID: selected.HomepodID, PolicyRevision: startRevision(targetID, selected, status.AliasBinding),
 		StartVolumePercent: startVolumePercent, AliasBinding: copyAliasBinding(status.AliasBinding), Mode: mode,
 		OutputVolume: volume, OutputSelected: outputSelected, Ready: true}
-	return startClaim{Proof: proof, Intent: intent, Room: selected, RT: rt, Released: released}, true
+	return startClaim{Proof: proof, Intent: intent, Room: selected, RT: rt, Released: released, Paused: status.Paused}, true
 }
 
 // A local resume has no Spotify URI and preserves manual volume in an ordinary

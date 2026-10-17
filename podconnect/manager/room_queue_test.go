@@ -84,7 +84,7 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 				t.Fatalf("C queue state omitted exact owner/writer: %s", body)
 			}
 			if f.OldC {
-				return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, f.Route, false, []string{"next"}, false})
+				return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, f.Route, false, []string{"next"}, false, false, true})
 			}
 			if f.BusyReadAfterStage && len(f.Writes) > 1 {
 				return json.Marshal(outputRoomQueueState{"podconnect.output_queue_state.v1", true, roomQueuePurpose, f.Route, true, []string{}, f.Owner, f.Writer, false})
