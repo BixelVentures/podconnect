@@ -1,3 +1,9 @@
+## Speakers 0.26.26 — terminal Next continuation draft, unpublished
+
+- Prepare an explicit final-track Next on a detached native cursor: honor context repeat before existing similar-music continuation, while explicit Next bypasses track repeat. Keep the actual context/history, manual queue order, bound output and manual volume.
+- Reject failed context/history reads without treating them as exhaustion. Retain current-owner, cancellation, expiry, one-use commit and uncertain-outcome protections; natural end-of-track behavior and Control 0.10.16 remain unchanged.
+- The underlying PR45 source passed independent review and Linux Native/OwnTone CI56. This version is an unreserved local proposal: final release metadata review, immutable ARM64/AMD64 images, publication, installation and physical acceptance remain pending. No GitHub Release is proposed for this Speakers-only change.
+
 ## Speakers 0.26.25 — released-route ownership candidate
 
 - Join the current receiver and OwnTone START owners before a released, playing route enters alias recovery. A current START or unknown owner holds the released marker and skips volume and output-selection writes; only explicit clean absence enters the existing guarded recovery.
