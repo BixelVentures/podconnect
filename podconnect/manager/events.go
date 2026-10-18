@@ -296,11 +296,16 @@ func (l *glLive) applySourceEvent(source glSource, typ string, data map[string]a
 			return
 		}
 		l.applyEventLocked(typ, data)
+	} else if typ == "connect_transfer" {
+		log.Printf("connect-recovery manager reason=source_retired")
 	}
 }
 
 func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 	if typ == "paused" || typ == "stopped" || typ == "inactive" || typ == "not_playing" || typ == "selected_alias" {
+		if l.connectRecovery != nil {
+			log.Printf("connect-recovery manager reason=event_cancelled")
+		}
 		l.connectRecovery = nil
 	}
 	if typ == "volume_action" {

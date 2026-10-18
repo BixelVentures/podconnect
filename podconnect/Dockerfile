@@ -61,6 +61,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/room-next-native.patch" \
   && git apply --check "/patches/connect-recovery-native.patch" \
   && git apply "/patches/connect-recovery-native.patch" \
+  && git apply --check "/patches/connect-recovery-diagnostics-native.patch" \
+  && git apply "/patches/connect-recovery-diagnostics-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -90,6 +92,8 @@ COPY patches/room-queue-owntone.patch /patches/room-queue-owntone.patch
 COPY patches/room-start-proof-owntone.patch /patches/room-start-proof-owntone.patch
 COPY patches/connect-recovery-owntone.patch /patches/connect-recovery-owntone.patch
 COPY patches/connect-recovery-owntone.sha256 /patches/connect-recovery-owntone.sha256
+COPY patches/connect-recovery-diagnostics-owntone.patch /patches/connect-recovery-diagnostics-owntone.patch
+COPY patches/connect-recovery-diagnostics-owntone.sha256 /patches/connect-recovery-diagnostics-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -115,6 +119,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-recovery-owntone.sha256 \
   && git apply --check /patches/connect-recovery-owntone.patch \
   && git apply /patches/connect-recovery-owntone.patch \
+  && sha256sum -c /patches/connect-recovery-diagnostics-owntone.sha256 \
+  && git apply --check /patches/connect-recovery-diagnostics-owntone.patch \
+  && git apply /patches/connect-recovery-diagnostics-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

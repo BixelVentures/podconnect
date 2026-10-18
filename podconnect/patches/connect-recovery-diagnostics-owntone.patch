@@ -1,0 +1,108 @@
+diff --git a/src/outputs.c b/src/outputs.c
+index 2fbd5f8..400534e 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -415,11 +415,21 @@ bool
+ outputs_connect_recovery_available(uint64_t id)
+ {
+   struct output_device *device=outputs_device_get(id), *scan;
+-  if (!id || !device || !device->advertised || device->type!=OUTPUT_TYPE_AIRPLAY
+-      || device->prevent_playback || outputs_transport_busy() || !start_route_clean_absent()) return false;
++  if (!id) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: invalid_output\n"); return false; }
++  if (!device) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unavailable\n"); return false; }
++  if (!device->advertised) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unadvertised\n"); return false; }
++  if (device->type!=OUTPUT_TYPE_AIRPLAY) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_type\n"); return false; }
++  if (device->prevent_playback) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: playback_prevented\n"); return false; }
++  if (outputs_transport_busy()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: transport_busy\n"); return false; }
++  if (!start_route_clean_absent()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: start_not_clean_absent\n"); return false; }
+   for (scan=outputs_device_list;scan;scan=scan->next)
+-    if (scan->busy || scan->attention_lease || scan->attention_retiring_session
+-        || scan->attention_restart_pending || scan->attention_restoring) return false;
++    {
++      if (scan->busy) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_busy\n"); return false; }
++      if (scan->attention_lease) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_lease\n"); return false; }
++      if (scan->attention_retiring_session) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_retiring\n"); return false; }
++      if (scan->attention_restart_pending) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restart_pending\n"); return false; }
++      if (scan->attention_restoring) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restoring\n"); return false; }
++    }
+   return true;
+ }
+ 
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+index 828b6e4..de04417 100644
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -173,11 +173,15 @@ struct output_definition output_airplay = {
+   .device_volume_set = unexpected_legacy_send,
+ };
+ 
++static bool connect_diagnostic_capture;
++static unsigned connect_diagnostic_count;
++static const char *connect_diagnostic_message;
+ void DPRINTF(int severity, int domain, const char *format, ...)
+ {
+-  (void)severity;
+-  (void)domain;
+-  (void)format;
++  if (connect_diagnostic_capture && !strncmp(format,"Connect recovery denied: ",strlen("Connect recovery denied: "))) {
++    assert(severity==E_LOG && domain==L_PLAYER && !strchr(format,'%'));
++    connect_diagnostic_count++; connect_diagnostic_message=format;
++  }
+ }
+ 
+ const char *player_pmap(void *pointer)
+@@ -342,6 +346,46 @@ static void connect_recovery_selection_query_contract(void)
+   puts("PASS PC28 real selection HTTP parser/libevent query: exact and decoded guard, invalid purpose/body/output reject; no unguarded fallback");
+ }
+ 
++/* PC29 tests log data at the real C owner predicate; logging never grants authority. */
++static void connect_diagnostic_expect(uint64_t id,const char *reason)
++{
++  connect_diagnostic_count=0; connect_diagnostic_message=NULL; connect_diagnostic_capture=true;
++  assert(outputs_connect_recovery_available(id)==(reason==NULL));
++  connect_diagnostic_capture=false;
++  if (reason) {
++    char expected[128]; snprintf(expected,sizeof(expected),"Connect recovery denied: %s\n",reason);
++    assert(connect_diagnostic_count==1 && !strcmp(connect_diagnostic_message,expected));
++  } else assert(connect_diagnostic_count==0);
++}
++static void connect_recovery_constant_diagnostics(void)
++{
++  struct output_device *a=add_device(1), *b=add_device(2);
++  int volume=a->volume; uint64_t base=a->base_revision,route=a->route_revision;
++  assert(start_route_clean_absent() && !outputs_transport_busy());
++  connect_diagnostic_expect(1,NULL);
++  connect_diagnostic_expect(0,"invalid_output");
++  connect_diagnostic_expect(999,"output_unavailable");
++  a->advertised=false; connect_diagnostic_expect(1,"output_unadvertised"); a->advertised=true;
++  a->type=OUTPUT_TYPE_DUMMY; connect_diagnostic_expect(1,"output_type"); a->type=OUTPUT_TYPE_AIRPLAY;
++  a->prevent_playback=true; connect_diagnostic_expect(1,"playback_prevented"); a->prevent_playback=false;
++  atomic_store(&start_owned_latch,true); connect_diagnostic_expect(1,"transport_busy"); atomic_store(&start_owned_latch,false);
++  start_journal_fault=true; connect_diagnostic_expect(1,"start_not_clean_absent"); start_journal_fault=false;
++  b->busy=true; connect_diagnostic_expect(1,"output_busy"); b->busy=false;
++  b->attention_lease=1; connect_diagnostic_expect(1,"attention_lease"); b->attention_lease=0;
++  b->attention_retiring_session=b; connect_diagnostic_expect(1,"attention_retiring"); b->attention_retiring_session=NULL;
++  b->attention_restart_pending=true; connect_diagnostic_expect(1,"attention_restart_pending"); b->attention_restart_pending=false;
++  b->attention_restoring=true; connect_diagnostic_expect(1,"attention_restoring"); b->attention_restoring=false;
++  /* Multiple failures retain the existing first-clause order and emit once. */
++  a->prevent_playback=true; atomic_store(&start_owned_latch,true); start_journal_fault=true;
++  connect_diagnostic_expect(1,"playback_prevented");
++  a->prevent_playback=false; atomic_store(&start_owned_latch,false); start_journal_fault=false;
++  connect_diagnostic_expect(1,NULL);
++  assert(a->volume==volume && a->base_revision==base && a->route_revision==route);
++  assert(!a->selected && !b->selected && !a->session && !b->session);
++  clear_devices();
++  puts("PASS PC29 actual C owner constant diagnostic reasons, first-denial order, allowed silence, no mutation");
++}
++
+ static void bases_and_legacy_selection(void)
+ {
+   struct output_device *a = add_device(1);
+@@ -1615,6 +1659,7 @@ int main(int argc,char **argv)
+   output_airplay.device_attention_recover=inert_attention;
+   connect_recovery_requires_clean_unowned_output();
+   connect_recovery_selection_query_contract();
++  connect_recovery_constant_diagnostics();
+   bases_and_legacy_selection();
+   manual_revision_and_old_lease();
+   failure_cannot_be_overwritten_or_cross_output();

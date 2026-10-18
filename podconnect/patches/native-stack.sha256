@@ -17,3 +17,4 @@ b589c71150427119fea5db1fd69570e1fb45475e1afdaacecd22fed283961c21  /patches/room-
 24604cbc9c106b5d84989f0f7550df5c94fad6efe306476a21e5ed7cfac3c1c1  /patches/room-queue-native.patch
 49bc06ac700a8cde8e8f2671671bdf30950142fba5310152a5e30bc6a395512a  /patches/room-next-native.patch
 91799383bf925768de04503ed0c7b061551cf68fff5c8f92b3d3a971b77584f1  /patches/connect-recovery-native.patch
+20777967d237dabd67b02e79b73e7bebaec688ea5ea7eb2a643f73b4d16601e2  /patches/connect-recovery-diagnostics-native.patch

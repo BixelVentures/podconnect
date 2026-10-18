@@ -697,16 +697,24 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 }
 
 func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, guard func() bool, protectStart ...bool) (bool, bool) {
+	recovery := len(protectStart) > 1 && protectStart[1]
+	diagnostic := func(reason string) {
+		if recovery {
+			log.Printf("connect-recovery route reason=%s", reason)
+		}
+	}
 	current := func() bool { return (guard == nil || guard()) && routeIntentCurrent(live, aliasId, revision) }
 	if !current() {
+		diagnostic("initial_stale")
 		return false, false
 	}
-	recovery := len(protectStart) > 1 && protectStart[1]
+	diagnostic("entered")
 	rooms := loadRooms()
 	var binding *aliasBinding
 	if live != nil {
 		status, currentRevision := live.routeSnapshot()
 		if status.SelAlias != aliasId || currentRevision != revision {
+			diagnostic("snapshot_stale")
 			return false, false
 		}
 		binding = status.AliasBinding
@@ -714,6 +722,7 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 	var target *Room
 	if binding != nil {
 		if !binding.valid() {
+			diagnostic("binding_invalid")
 			return false, false
 		}
 		for _, room := range rooms {
@@ -723,10 +732,12 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 			}
 		}
 		if target == nil {
+			diagnostic("bound_room_missing")
 			return false, false
 		}
 	} else {
 		if aliasId < 1 || aliasId > len(rooms) {
+			diagnostic("alias_out_of_range")
 			return false, current()
 		}
 		target = rooms[aliasId-1]
@@ -737,6 +748,7 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 	}
 	devs, ok := fetchOutputsFrom(primaryOwnTone)
 	if !ok || len(devs) == 0 {
+		diagnostic("outputs_unavailable")
 		return false, current()
 	}
 	if live != nil {
@@ -744,6 +756,7 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 	}
 	idx, _ := matchOutput(devs, target.HomepodID, target.HomepodName)
 	if idx < 0 {
+		diagnostic("output_not_found")
 		have := make([]string, 0, len(devs))
 		for _, d := range devs {
 			have = append(have, d.Name)
@@ -763,9 +776,11 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 		if target.HomepodID == "" || devs[idx].ID != target.HomepodID ||
 			!current() ||
 			!primeConfiguredStartVolume(primaryOwnTone, target.HomepodID, false, recovery) {
+			diagnostic("prime_rejected_or_stale")
 			return false, current()
 		}
 	}
+	diagnostic("prime_completed")
 	if att != nil && !att.nativeTargetForRoute(primaryOwnTone, devs[idx].ID, admitNative) {
 		return false, current()
 	}
@@ -781,20 +796,26 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 	// The claim is command admission, not HTTP sent/native ACK. Never hold the
 	// live mutex across network I/O. No catalog or other work follows admission.
 	if !current() {
+		diagnostic("pre_send_stale")
 		return false, false
 	}
 	if live != nil && !admitRoomAliasRoute(target, binding, live, aliasId, revision) {
+		diagnostic("alias_admission_rejected")
 		return false, false
 	}
+	diagnostic("selection_sent")
 	resp, err := cl.Do(req)
 	if err != nil {
+		diagnostic("selection_transport_error")
 		return false, current()
 	}
 	defer resp.Body.Close()
 	if !current() {
+		diagnostic("post_response_stale")
 		return false, false
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		diagnostic("selection_http_rejected")
 		log.Printf("alias-route: alias %d output selection failed; recovery remains pending", aliasId)
 		return false, true
 	}
@@ -806,9 +827,11 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 				return false, current()
 			}
 		} else if !checkedStartVolume(primaryOwnTone, target.HomepodID, recovery) {
+			diagnostic("post_volume_failed")
 			return false, current()
 		}
 		if !current() {
+			diagnostic("post_volume_stale")
 			return false, false
 		}
 	}
