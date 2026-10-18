@@ -25,16 +25,19 @@ func (l *glLive) acceptConnectRecoveryLocked(data map[string]any) {
 	if !ok || !valid || !present || id < 1 || id != math.Trunc(id) || id > float64(^uint32(0)) ||
 		ordinal < 1 || ordinal > 9007199254740991 || ordinal != math.Trunc(ordinal) ||
 		l.st.SelAlias != int(id) || binding == nil || !binding.valid() || !sameAliasBinding(binding, l.st.AliasBinding) {
+		log.Printf("connect-recovery manager reason=event_rejected")
 		return
 	}
 	if l.connectRecoverySeen == nil {
 		l.connectRecoverySeen = make(map[string]uint64)
 	}
 	if uint64(ordinal) <= l.connectRecoverySeen[binding.Incarnation] || (l.connectRecoverySeen[binding.Incarnation] == 0 && len(l.connectRecoverySeen) >= 32) {
+		log.Printf("connect-recovery manager reason=replay_or_capacity")
 		return
 	}
 	l.connectRecoverySeen[binding.Incarnation] = uint64(ordinal)
 	l.connectRecovery = &connectRecoveryIntent{run: l.runEpoch, phase: l.phaseEpoch, aliasRevision: l.aliasRevision, alias: int(id), binding: copyAliasBinding(binding), until: time.Now().Add(connectRecoveryWindow)}
+	log.Printf("connect-recovery manager reason=event_accepted")
 }
 
 func (l *glLive) consumeConnectRecovery() (*connectRecoveryIntent, bool) {
@@ -48,6 +51,7 @@ func (l *glLive) consumeConnectRecovery() (*connectRecoveryIntent, bool) {
 	// Expiry/changed source or alias consumes stale work, never revives it.
 	if l.sourceRetired || c.run != l.runEpoch || c.phase != l.phaseEpoch || c.aliasRevision != l.aliasRevision ||
 		c.alias != l.st.SelAlias || !sameAliasBinding(c.binding, l.st.AliasBinding) || !time.Now().Before(c.until) {
+		log.Printf("connect-recovery manager reason=stale_intent")
 		l.connectRecovery = nil
 		return nil, false
 	}
@@ -56,6 +60,7 @@ func (l *glLive) consumeConnectRecovery() (*connectRecoveryIntent, bool) {
 	}
 	c.transport = glTransportIntent{l.runEpoch, l.phaseEpoch, l.aliasRevision, l.transportRevision, l.st.SelAlias}
 	l.connectRecovery = nil // Consume before any catalogue read, prime or route send.
+	log.Printf("connect-recovery manager reason=intent_consumed")
 	return c, true
 }
 
@@ -73,6 +78,7 @@ func tryExplicitConnectRecovery(room *Room, live *glLive, att *attention) bool {
 		blocked := att.active || att.nativeBusy || att.nativePending || att.pendingRelease || att.custodyBlockedLocked() || len(att.nativeGrants) > 0
 		att.mu.Unlock()
 		if blocked {
+			log.Printf("connect-recovery manager reason=attention_owner")
 			return true
 		}
 	}
@@ -85,6 +91,10 @@ func tryExplicitConnectRecovery(room *Room, live *glLive, att *attention) bool {
 		// Every C volume/selection command independently rejected busy/unknown START.
 		// A failure (including timeout) leaves release intact and cannot retry this credit.
 		_ = os.Remove(releasedPath(room))
+		log.Printf("connect-recovery manager reason=route_accepted")
+	} else {
+		log.Printf("connect-recovery manager reason=route_not_committed")
 	}
+	log.Printf("connect-recovery manager reason=attempt_finished")
 	return true
 }

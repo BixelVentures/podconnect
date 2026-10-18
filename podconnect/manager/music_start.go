@@ -307,6 +307,11 @@ func preflightReleasedResume(primary *Room) bool {
 
 func primeConfiguredStartVolume(base, id string, requireSelected bool, recovery ...bool) bool {
 	client := &http.Client{Timeout: 3 * time.Second}
+	diagnostic := func(reason string) {
+		if len(recovery) > 0 && recovery[0] {
+			log.Printf("connect-recovery volume reason=%s", reason)
+		}
+	}
 	query := url.Values{"volume": {fmt.Sprint(startVolumePercent)}, "output_id": {id}}
 	if len(recovery) > 0 && recovery[0] {
 		query.Set("recovery", "connect")
@@ -315,15 +320,22 @@ func primeConfiguredStartVolume(base, id string, requireSelected bool, recovery 
 	if err != nil {
 		return false
 	}
+	diagnostic("sent")
 	resp, err := client.Do(req)
 	if err != nil {
+		diagnostic("transport_error")
 		return false
 	}
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		diagnostic("http_rejected")
 		return false
 	}
+	diagnostic("http_accepted")
 	vol, selected, ok := knownStartOutput(base, id)
+	if !ok || (requireSelected && !selected) || vol > startVolumePercent || vol < startVolumePercent-volTol {
+		diagnostic("readback_rejected")
+	}
 	return ok && (!requireSelected || selected) && vol <= startVolumePercent && vol >= startVolumePercent-volTol
 }
 

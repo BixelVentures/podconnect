@@ -1,0 +1,175 @@
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -234,7 +234,13 @@
+ }
+ 
+ func (p *AppPlayer) handlePlayerCommandWithSpclient(ctx context.Context, req dealer.RequestPayload, sp *spclient.Spclient) error {
++	if req.Command.Endpoint == "transfer" {
++		p.app.log.Infof("connect-recovery native reason=transfer_received")
++	}
+ 	if p.roomVolumeBusy() {
++		if req.Command.Endpoint == "transfer" {
++			p.app.log.Infof("connect-recovery native reason=room_volume_busy")
++		}
+ 		return ErrAliasConflict
+ 	}
+ 	p.invalidateRoomTransportGeneration()
+@@ -242,27 +248,32 @@
+ 	if req.Command.Endpoint == "transfer" && len(req.Command.Data) > 0 {
+ 		transferState = &connectpb.TransferState{}
+ 		if err := proto.Unmarshal(req.Command.Data, transferState); err != nil {
++			p.app.log.Infof("connect-recovery native reason=transfer_invalid")
+ 			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
+ 		}
+ 		if transferState.Playback == nil || transferState.Playback.CurrentTrack == nil ||
+ 			(transferState.Playback.CurrentTrack.Uri == "" && len(transferState.Playback.CurrentTrack.Gid) != 16) ||
+ 			transferState.CurrentSession == nil || transferState.CurrentSession.Context == nil ||
+ 			transferState.CurrentSession.PlayOrigin == nil || transferState.Options == nil || transferState.Queue == nil {
++			p.app.log.Infof("connect-recovery native reason=transfer_invalid")
+ 			return fmt.Errorf("incomplete TransferState: playback, current track, session context, play origin, options and queue are required")
+ 		}
+ 		for i, track := range transferState.Queue.Tracks {
+ 			if track == nil || (track.Uri == "" && len(track.Gid) != 16) {
++				p.app.log.Infof("connect-recovery native reason=transfer_invalid")
+ 				return fmt.Errorf("invalid TransferState queue track at index %d", i)
+ 			}
+ 		}
+ 		for i, page := range transferState.CurrentSession.Context.Pages {
+ 			if page == nil {
++				p.app.log.Infof("connect-recovery native reason=transfer_invalid")
+ 				return fmt.Errorf("invalid TransferState context page at index %d", i)
+ 			}
+ 			for j, track := range page.Tracks {
+ 				// Context comparators may consume GID even when a nonmatching URI is present.
+ 				if track == nil || (track.Uri == "" && len(track.Gid) != 16) ||
+ 					(len(track.Gid) != 0 && len(track.Gid) != 16) {
++					p.app.log.Infof("connect-recovery native reason=transfer_invalid")
+ 					return fmt.Errorf("invalid TransferState context track at page %d index %d", i, j)
+ 				}
+ 			}
+@@ -279,6 +290,7 @@
+ 	switch req.Command.Endpoint {
+ 	case "transfer":
+ 		if len(req.Command.Data) == 0 {
++			p.app.log.Infof("connect-recovery native reason=empty_transfer")
+ 			p.app.server.Emit(&ApiEvent{
+ 				Type: ApiEventTypeActive,
+ 			})
+@@ -289,6 +301,8 @@
+ 		err := p.handleTransferCommand(ctx, req, transferState, sp)
+ 		if err == nil {
+ 			p.emitConnectRecovery(req)
++		} else {
++			p.app.log.Infof("connect-recovery native reason=transfer_failed")
+ 		}
+ 		return err
+ 	case "play":
+diff --git a/daemon/connect_recovery.go b/daemon/connect_recovery.go
+--- a/daemon/connect_recovery.go
++++ b/daemon/connect_recovery.go
+@@ -18,6 +18,7 @@
+ 		len(req.Command.Data) == 0 || alias == nil || *alias == 0 ||
+ 		int(*alias) > len(p.app.cfg.DeviceAliases) || req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 ||
+ 		p.state == nil || p.state.device == nil || p.state.device.SelectedAliasId != *alias || p.spotConnId == "" {
++		p.app.log.Infof("connect-recovery native reason=%s", p.connectRecoveryOriginReason(req))
+ 		return
+ 	}
+ 	key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", req.SentByDeviceId, req.MessageId)))
+@@ -25,6 +26,7 @@
+ 	binding := p.aliasBindingLocked()
+ 	if p.aliasRetired || binding == nil || !binding.Ready || p.connectRecoveryOrdinal >= 9007199254740991 ||
+ 		p.connectRecoverySeen[key] || len(p.connectRecoverySeen) >= 1024 {
++		p.app.log.Infof("connect-recovery native reason=%s", p.connectRecoveryLedgerReason(key, binding))
+ 		p.aliasMu.Unlock()
+ 		return
+ 	}
+@@ -35,5 +37,42 @@
+ 	p.connectRecoveryOrdinal++
+ 	ordinal := p.connectRecoveryOrdinal
+ 	p.aliasMu.Unlock()
++	p.app.log.Infof("connect-recovery native reason=accepted")
+ 	p.app.server.Emit(&ApiEvent{Type: "connect_transfer", Data: map[string]any{"id": *alias, "alias_binding": binding, "ordinal": ordinal}})
+ }
++
++// Diagnostics only: never supplies an admission decision or exposes request data.
++func (p *AppPlayer) connectRecoveryOriginReason(req dealer.RequestPayload) string {
++	alias := req.TargetAliasId
++	if alias == nil {
++		alias = req.Command.TargetAliasId
++	}
++	switch {
++	case req.Command.Endpoint != "transfer":
++		return "not_transfer"
++	case req.Command.Options.SystemInitiated || req.Command.PlayOptions.SystemInitiated:
++		return "system_initiated"
++	case len(req.Command.Data) == 0:
++		return "empty_transfer"
++	case alias == nil || *alias == 0 || int(*alias) > len(p.app.cfg.DeviceAliases):
++		return "explicit_alias_missing"
++	case req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160:
++		return "sender_invalid"
++	case p.state == nil || p.state.device == nil || p.state.device.SelectedAliasId != *alias:
++		return "alias_not_current"
++	default:
++		return "connection_missing"
++	}
++}
++
++// Called under aliasMu, only after the unchanged ledger guard rejected.
++func (p *AppPlayer) connectRecoveryLedgerReason(key [32]byte, binding *ApiAliasBinding) string {
++	switch {
++	case p.aliasRetired || binding == nil || !binding.Ready:
++		return "owner_not_ready"
++	case p.connectRecoverySeen[key]:
++		return "duplicate_request"
++	default:
++		return "ledger_capacity"
++	}
++}
+diff --git a/daemon/connect_diagnostics_test.go b/daemon/connect_diagnostics_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/connect_diagnostics_test.go
+@@ -0,0 +1,41 @@
++package daemon
++
++import (
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	"strings"
++	"testing"
++)
++
++type recoveryDiagnosticLogger struct {
++	librespot.NullLogger
++	lines []string
++}
++
++func (l *recoveryDiagnosticLogger) Infof(format string, args ...interface{}) {
++	l.lines = append(l.lines, fmt.Sprintf(format, args...))
++}
++func TestConnectRecoveryDiagnosticOriginAndReplay(t *testing.T) {
++	p, s := localAliasPlayer(t)
++	p.spotConnId = "private-connection"
++	logger := &recoveryDiagnosticLogger{}
++	p.app.log = logger
++	r := recoveryRequest()
++	r.SentByDeviceId = "private-sender"
++	r.Command.Options.SystemInitiated = true
++	p.emitConnectRecovery(r)
++	if len(s.events) != 0 || len(logger.lines) != 1 || logger.lines[0] != "connect-recovery native reason=system_initiated" {
++		t.Fatal("system rejection lacks exact closed reason")
++	}
++	r.Command.Options.SystemInitiated = false
++	p.emitConnectRecovery(r)
++	p.emitConnectRecovery(r)
++	if len(s.events) != 1 || len(logger.lines) != 3 || logger.lines[1] != "connect-recovery native reason=accepted" || logger.lines[2] != "connect-recovery native reason=duplicate_request" {
++		t.Fatal("diagnostic changed one-shot or omitted admission/replay")
++	}
++	for _, line := range logger.lines {
++		if strings.Contains(line, "private") || len(strings.Fields(line)) != 3 {
++			t.Fatal("private/unbounded fields")
++		}
++	}
++}
