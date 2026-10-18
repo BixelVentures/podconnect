@@ -888,6 +888,13 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// The 200ms cadence + volume-cap guards below are unchanged — this is now a cheap memory read.
 			gl, intent := live.transportSnapshot()
 			aliasRevision := intent.aliasRevision
+			// Route release protects a shared HomePod from new claims, but it
+			// cannot strand an original voice duck's native cleanup custody.
+			// Only the attention owner may retire its already-admitted lease;
+			// this path never selects, primes, or reclaims the released output.
+			if room.Idx == 0 && fileExists(releasedPath(room)) && (!gl.Active || gl.Paused || gl.Stopped) {
+				att.settleInactiveOriginal(room.OwnTone)
+			}
 			if room.Idx == 0 && gl.AliasBinding != nil && !gl.AliasBinding.valid() {
 				att.expire(time.Now()) // retain pending restore until output identity is known
 				time.Sleep(200 * time.Millisecond)

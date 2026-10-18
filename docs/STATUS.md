@@ -1,4 +1,72 @@
-# Active lead decision · unpublished Speakers0.26.24 / unchanged Control0.10.16
+# Active lead decision · Speakers0.26.30 candidate / unchanged Control0.10.17
+
+Lead: this chat's native delivery owner, coordinated with the PodView main lead.
+Base: installed/published Speakers0.26.29, merge696d793e9bed5adef71b43c029e12768c9a2377f,
+treef9414e010b40973f3a7c3cb7f50f46d6ef79cc5c. No new candidate is published or installed.
+
+Observed field failure: installed PodVoice2.0.55 completed provider cleanup but its
+original attention release remained unsettled after HTTP200 responses at13:58:02–19
+CEST on2026-10-18. Speakers restarted later during its normal29 installation. That
+later restart cannot explain the first timeout; the historical native response
+bodies and concurrent released/paused state were not captured, so field causality
+remains unknown. Direct evidence and limits are retained in the operator receipts.
+
+Source hypothesis: roomBridge's released/inactive route hold precedes
+nativeReconcile and can prevent an already admitted inactive original attention
+lease from retiring. Reproduce this on the actual29 roomBridge owner before any
+runtime patch. The chain is Voice PE Stop/model close → provider and heartbeat
+retirement → original attention release → native lease/custody settlement → exact
+release receipt → PodVoice teardown/rearm → next wake. Check one owner on either
+side and concurrent engage, expiry, replacement, foreign output and restart paths.
+
+Preserve these invariants: released rooms cannot be reclaimed by routing; only
+the exact admitted original lease may retire; active/replacement owners and epochs
+remain fenced inside the owner lock; custody retirement requires its existing
+durable proof; unknown effects are never blindly replayed. Do not move the full
+nativeReconcile ahead of the hold. The correction may only advance the narrowly
+guarded inactive/original retirement path. No BEGIN/UPDATE, alias selection,
+start/volume priming, released-marker removal, foreign claim, provider, firmware,
+prompt, timeout, policy or UI changes. Existing29 diagnostics and28 patches remain.
+
+Plan: reuse the existing joined-child actual roomBridge regression and inert
+native HTTP fixture. Record exact29 RED, then focused GREEN for original release
+without restart and rejection/currentness/unknown-effect cases. Run formatting and
+the final manager race/vet checks once the reviewed diff settles. Independent
+adversarial source review is required before any push or release. Rollback before
+publication is the isolated candidate; installed55/29 remains the operational
+baseline. Any future installation reopens the affected physical acceptance. A
+regression or software fix does not establish the historical cause, actual sound,
+fast closing, next wake or complete end-to-end acceptance.
+
+Current result: the actual29 roomBridge regression reached causal RED: released
++paused remained pending after1.20s with zero native release PUTs and zero other
+writes. The unreleased positive control sent one native release and reached
+released; its assertion is being limited to attention settlement because the
+ordinary post-settlement bridge may perform unrelated permitted work. An initial
+loopback sandbox denial is infrastructure, not product evidence. The first release-only draft reached focused GREEN for the causal pair: exactly
+one original native release, zero other writes, and the released marker preserved.
+Initial independent review was HOLD on atomic command admission/direct effects
+and missing negative cases. The revised actual roomBridge fixture now passes9/9
+child modes (about2.0s), including original attention HTTP POST pending → GET
+released, released paused/stopped/idle settlement, active and foreign owner
+refusal, uncertainty without duplicate effects, and GET-time replacement, direct
+effect and duplicate-release revision guards. The durable positive case was additionally run on an isolated exact29 baseline
+with only the final regression file: RED after1.22s, pending with zero release
+PUTs and zero other writes. On30 it proves persisted original output and session
+retirement after journal reload, HTTP GET released, duplicate original POST
+durably released, and exactly one native release PUT. Independent adversarial
+rereview issued source GO for the four runtime files and this regression, closing
+the prior HOLD findings. Runtime/test bytes stayed frozen through the final manager gates: the full
+manager suite with the race detector passed (36.860s), and go vet passed. The
+reviewed four runtime-file and regression hashes match the tested files. Native
+patches, Dockerfile, workflows and Control remain unchanged against29; config
+changes only the Speakers version to0.26.30. Final publication and installation
+remain pending the main lead's combined delivery GO. The source GO and these gates
+do not establish physical sound, fast closing or next-wake acceptance. This reproduction proves the software gap, not the historical onset.
+
+---
+
+# Historical lead decision · unpublished Speakers0.26.24 / unchanged Control0.10.16
 
 The actual0.26.23 ARM publisher38945871257 failed in PC29 START_LOCKED: its fixture's BEGIN IMMEDIATE raced the real library initialization transaction before player admission. AMD23 has already published; immutable tags are preserved. Bump only the planned Speakers candidate to0.26.24 and amend the existing queue patch/checksum with a fixture-only library-worker readiness marker. The real library completes initscan before its command loop; the test marker therefore precedes fixture writer acquisition. The existing six-second observer alarm and actual held-lock/player-admission/cleanup assertions remain. No production source, timeout, Native/Control wire contract, grants or UI behavior changes. Control stays0.10.16; PodVoice2.0.36 accepts the unchanged queue_occurrence_v1 contract. Independent fixture/packaging review and actual compiled ARM publisher are required; prior failure is retained. Existing unchanged-source checks remain evidence only for those bytes. Green remains Speakers22/Control15/PV35 until the combined candidate is published and installed with backups and preserved policies. Physical music/robot/timer/provider acceptance remains open; rollback is the installed22/15/35 batch.
 

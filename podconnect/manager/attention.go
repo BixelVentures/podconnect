@@ -57,6 +57,7 @@ type attention struct {
 	sessionNonce        string
 	nativePending       bool
 	nativeBusy          bool
+	settlingOriginal    bool // fences new direct effects and duplicate revision changes during release-only custody
 	nativeGrants        map[string]*nativeAttentionGrant
 	nativeResults       map[string]nativeAttentionResult
 	nativeManualAttempt *nativeManualAttempt // Only the serial bridge mutates this.

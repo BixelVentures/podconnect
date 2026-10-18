@@ -573,7 +573,7 @@ func custodyMutationAdmission(w http.ResponseWriter) (func(), bool) {
 		return func() {}, true
 	}
 	a.mu.Lock()
-	if a.custodyBlockedLocked() {
+	if a.custodyBlockedLocked() || a.settlingOriginal {
 		a.mu.Unlock()
 		http.Error(w, "original attention restoration pending", http.StatusConflict)
 		return nil, false

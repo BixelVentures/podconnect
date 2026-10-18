@@ -95,7 +95,15 @@ func (a *attention) engageOwned(nonce string, expected attentionChallenge, begin
 func (a *attention) releaseOwned(nonce string, expected attentionChallenge) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if nonce == "" || nonce != a.sessionNonce || expected.Process != attentionManagerProcess() || expected.Revision != strconv.FormatUint(a.admissionRevision, 10) || a.nativeRevision == math.MaxUint64 || a.restoreRevision == math.MaxUint64 {
+	if nonce == "" || nonce != a.sessionNonce || expected.Process != attentionManagerProcess() || expected.Revision != strconv.FormatUint(a.admissionRevision, 10) {
+		return false
+	}
+	// The same original release may be retried while its native retirement is
+	// in flight. Acknowledge it as still pending without changing owner epochs.
+	if a.settlingOriginal && !a.active && a.pendingRelease {
+		return true
+	}
+	if a.nativeRevision == math.MaxUint64 || a.restoreRevision == math.MaxUint64 {
 		return false
 	}
 	a.restoreRevision++
@@ -293,20 +301,63 @@ func (a *attention) nativeReconcile(base, id string, targetOnly bool) bool {
 	return a.nativeReconcileWithAdmission(base, id, targetOnly, nil)
 }
 func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly bool, admitRoute func() bool) bool {
+	return a.nativeReconcileWithMode(base, id, targetOnly, admitRoute, false)
+}
+
+// A released room still owes retirement of its original native attention lease.
+// This path cannot begin, update, select, or volume-control an output: the exact
+// inactive owner is checked inside the attention lock and after each native read.
+func (a *attention) settleInactiveOriginal(base string) bool {
+	return a.nativeReconcileWithMode(base, "", false, nil, true)
+}
+
+func (a *attention) inactiveOriginalCurrent(base, nonce string, rev, restoreRev uint64, output string, grant *nativeAttentionGrant) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.inactiveOriginalCurrentLocked(base, nonce, rev, restoreRev, output, grant)
+}
+
+func (a *attention) inactiveOriginalCurrentLocked(base, nonce string, rev, restoreRev uint64, output string, grant *nativeAttentionGrant) bool {
+	if a.active || !a.pendingRelease || a.sessionNonce != nonce || a.nativeRevision != rev ||
+		a.restoreRevision != restoreRev || !a.settlingOriginal || a.custodyBlockedLocked() || a.directEffects != 0 ||
+		grant != nil && a.nativeGrants[output] != grant {
+		return false
+	}
+	if grant != nil && a.custody != nil {
+		s := a.custodySessionLocked()
+		if s == nil {
+			return false
+		}
+		o := s.Outputs[grant.Origin.RequestID]
+		if o == nil || o.Retired || o.Base != base || o.DeviceID != output || o.Origin != grant.Origin ||
+			o.Original.Process != grant.Identity.Process || o.Original.Incarnation != grant.Identity.Incarnation {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *attention) nativeReconcileWithMode(base, id string, targetOnly bool, admitRoute func() bool, releaseOnly bool) bool {
 	a.mu.Lock()
 	a.expireLocked(time.Now())
 	nonce, rev, restoreRev, active, level := a.sessionNonce, a.nativeRevision, a.restoreRevision, a.active, a.level
-	if a.nativeBusy || a.custodyBlockedLocked() {
+	if a.nativeBusy || a.custodyBlockedLocked() || releaseOnly && (active || !a.pendingRelease || nonce == "" || targetOnly || id != "" || a.directEffects != 0) {
 		a.mu.Unlock()
 		return false
 	}
 	a.nativeBusy = true
+	if releaseOnly {
+		a.settlingOriginal = true
+	}
 	if a.nativeGrants == nil {
 		a.nativeGrants = map[string]*nativeAttentionGrant{}
 	}
 	a.mu.Unlock()
 	defer func() {
 		a.mu.Lock()
+		if releaseOnly {
+			a.settlingOriginal = false
+		}
 		a.nativeBusy = false
 		a.nativePending = len(a.nativeGrants) > 0
 		if !a.active && !a.nativePending && a.custodyFinishLocked() {
@@ -320,7 +371,13 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 	// Poll exact pending/lost receipts; each terminal failure remains immutable.
 	for output, g := range a.nativeGrants {
 		if g.Uncertain || g.Result.Outcome == "pending" {
+			if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
+				return false
+			}
 			if a.observeNative(base, output, g) != nil {
+				return false
+			}
+			if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
 				return false
 			}
 		}
@@ -423,6 +480,9 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 	}
 	// A handoff restores every ORIGINAL lease except the actual selected output.
 	for output, g := range a.nativeGrants {
+		if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
+			return false
+		}
 		if active && output == id {
 			continue
 		}
@@ -430,14 +490,20 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 			return false
 		}
 		if g.Command.Action == "release" && a.nativeReleaseAccepted(g.Result) {
+			if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
+				return false
+			}
 			if !a.retireNativeGrant(output, g) {
 				return false
 			}
 			continue
 		}
 		var state nativeAttentionObservation
-		if nativeAttentionHTTP(base, output, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.Process != g.Identity.Process || state.Incarnation != g.Identity.Incarnation {
+		if nativeAttentionHTTP(base, output, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.Process != g.Identity.Process || state.Incarnation != g.Identity.Incarnation || releaseOnly && state.DeviceID != output {
 			a.detectNativeReplacement(base, output, g)
+			return false
+		}
+		if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
 			return false
 		}
 		if state.Lease == "0" {
@@ -448,6 +514,9 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 			// Native TTL may have restored this exact lease while manager was blocked.
 			var terminal nativeAttentionResult
 			if !nativeCurrency(state.LastRelease) || state.LastRelease == "0" || nativeAttentionHTTP(base, output, "/"+state.LastRelease+"?process="+url.QueryEscape(g.Identity.Process), http.MethodGet, nil, &terminal) != nil || !terminal.Identity.valid() || terminal.Identity.Process != g.Identity.Process || terminal.Identity.DeviceID != output || terminal.Operation != state.LastRelease || terminal.Identity.Lease != g.Identity.Lease || terminal.Identity.Incarnation != g.Identity.Incarnation || terminal.Action != "release" || !a.nativeReleaseAccepted(terminal) {
+				return false
+			}
+			if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
 				return false
 			}
 			a.mu.Lock()
@@ -467,19 +536,39 @@ func (a *attention) nativeReconcileWithAdmission(base, id string, targetOnly boo
 		if g.Command.Action == "release" && g.LastRestoreRevision == restoreRev && state.BaseRevision == g.Command.Expected.BaseRevision && state.Session == g.Command.Expected.Session {
 			return false
 		}
+		if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
+			return false
+		}
 		commandID := attentionUUID()
 		if commandID == "" {
 			return false
 		}
-		g.Command = nativeAttentionCommand{state.nativeAttentionIdentity, commandID, "release", 0, 0}
-		g.Result = nativeAttentionResult{}
-		g.Uncertain = true
-		g.Submitted = false
-		g.LastRestoreRevision = restoreRev
+		if releaseOnly {
+			a.mu.Lock()
+			if !a.inactiveOriginalCurrentLocked(base, nonce, rev, restoreRev, output, g) {
+				a.mu.Unlock()
+				return false
+			}
+			g.Command = nativeAttentionCommand{state.nativeAttentionIdentity, commandID, "release", 0, 0}
+			g.Result = nativeAttentionResult{}
+			g.Uncertain = true
+			g.Submitted = false
+			g.LastRestoreRevision = restoreRev
+			a.mu.Unlock()
+		} else {
+			g.Command = nativeAttentionCommand{state.nativeAttentionIdentity, commandID, "release", 0, 0}
+			g.Result = nativeAttentionResult{}
+			g.Uncertain = true
+			g.Submitted = false
+			g.LastRestoreRevision = restoreRev
+		}
 		if a.submitNative(base, output, g) != nil {
 			return false
 		}
 		if a.nativeReleaseAccepted(g.Result) {
+			if releaseOnly && !a.inactiveOriginalCurrent(base, nonce, rev, restoreRev, output, g) {
+				return false
+			}
 			if !a.retireNativeGrant(output, g) {
 				return false
 			}
