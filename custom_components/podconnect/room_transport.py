@@ -8,7 +8,7 @@ import time
 import uuid
 
 from .observations import current
-from .speakers import SpeakersError
+from .speakers import ROOM_READ_REASONS, SpeakersError
 
 ACTIONS = ("pause", "resume", "next", "previous")
 _NATIVE = {
@@ -125,7 +125,10 @@ class RoomTransport:
         try:
             state = await self.commands.data.speakers.room_transport_state(scope)
         except SpeakersError as exc:
-            raise CommandRejected("room_transport_unavailable") from exc
+            rejected = CommandRejected("room_transport_unavailable")
+            if exc.room_read_reason in ROOM_READ_REASONS:
+                rejected.room_read_reason = exc.room_read_reason
+            raise rejected from exc
         if self.scope(hass, entry, target, room, homepod) != scope:
             raise CommandRejected("native_account_unproven")
         latest = self.commands.controls(entry, target)

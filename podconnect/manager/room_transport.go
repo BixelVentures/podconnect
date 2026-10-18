@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -120,6 +121,26 @@ var roomTransportStore struct {
 	Busy  bool
 	Offer *roomTransportOffer
 }
+var errTransportClaim = errors.New("room transport unavailable")
+var errTransportReceiver = errors.New("native room transport unavailable")
+var errTransportOutput = errors.New("output room transport unavailable")
+var errTransportOwner = errors.New("room transport owner unavailable")
+
+func roomTransportReadReason(err error) string {
+	switch {
+	case errors.Is(err, errTransportClaim):
+		return "claim_unavailable"
+	case errors.Is(err, errTransportReceiver):
+		return "receiver_proof_unavailable"
+	case errors.Is(err, errTransportOutput):
+		return "output_proof_unavailable"
+	case errors.Is(err, errTransportOwner):
+		return "route_owner_unavailable"
+	default:
+		return ""
+	}
+}
+
 var roomTransportClaim = currentStartClaim
 var roomTransportRPC = doQueueNativeRPC
 
@@ -179,17 +200,17 @@ func readRoomTransportState(ctx context.Context, s roomTransportScope) (startCla
 		claim, ok = currentRoomTransportClaim(s.Room, s.Target)
 	}
 	if !validTransportScope(s) || !ok || !transportClaimMatches(claim, s) {
-		return claim, n, o, startRouteUnknown, fmt.Errorf("room transport unavailable")
+		return claim, n, o, startRouteUnknown, errTransportClaim
 	}
 	q := url.Values{"account_user_id": {s.Account}, "target_id": {s.Target}, "room_id": {s.Room}, "homepod_id": {s.Homepod}}
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_transport/bound-state?"+q.Encode(), nil)
 	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_transport_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validTransportActions(n.Actions) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
-		return claim, n, o, startRouteUnknown, fmt.Errorf("native room transport unavailable")
+		return claim, n, o, startRouteUnknown, errTransportReceiver
 	}
 	boundState, _ := json.Marshal(map[string]any{"native_owner": n.Identity})
 	raw, err = roomTransportRPC(ctx, claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(s.Homepod)+"/transport/bound-state", boundState)
 	if err != nil || decodeQueueManagerJSON(raw, &o) != nil || o.Schema != "podconnect.output_transport_state.v2" || !o.OK || o.Physical || o.Busy || o.StartOwned && o.CleanAbsent || !validOutputTransportIdentity(o.Identity, s.Homepod) || o.Identity.InputDigest != configuredTransportInput(claim) || !validTransportActions(o.Actions) || !transportRouteClaimSnapshotCurrent(claim, s) {
-		return claim, n, o, startRouteUnknown, fmt.Errorf("output room transport unavailable")
+		return claim, n, o, startRouteUnknown, errTransportOutput
 	}
 	if o.StartOwned {
 		return claim, n, o, startRouteOwned, nil
@@ -202,8 +223,11 @@ func readRoomTransportState(ctx context.Context, s roomTransportScope) (startCla
 
 func readRoomTransport(ctx context.Context, s roomTransportScope) (startClaim, receiverTransportState, outputTransportState, error) {
 	claim, n, o, state, err := readRoomTransportState(ctx, s)
-	if err != nil || claim.Released && state != startRouteOwned {
-		return claim, n, o, fmt.Errorf("room transport owner unavailable")
+	if err != nil {
+		return claim, n, o, err
+	}
+	if claim.Released && state != startRouteOwned {
+		return claim, n, o, errTransportOwner
 	}
 	return claim, n, o, nil
 }
@@ -333,7 +357,13 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	claim, n, o, err := readRoomTransport(ctx, s)
 	if err != nil {
-		http.Error(w, "room transport unavailable", 409)
+		if reason := roomTransportReadReason(err); reason != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error_kind": "room_transport_unavailable", "retry_allowed": false, "reason": reason})
+		} else {
+			http.Error(w, "room transport unavailable", 409)
+		}
 		return
 	}
 	actions := []string{}

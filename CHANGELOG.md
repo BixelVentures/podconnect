@@ -1,3 +1,9 @@
+## Speakers 0.26.27 / Control 0.10.17 — combined candidate, unpublished
+
+- Carry the reviewed terminal manual Next continuation from the unpublished Speakers 0.26.26 draft without changing its native source bytes.
+- On a failed room-transport read, Speakers returns one of four fixed diagnostic reasons with the existing HTTP 409, `room_transport_unavailable`, and no-retry contract. Control forwards only those reasons; malformed or legacy failures stay closed. Playback authority, owner proof, and command admission are unchanged.
+- This is an isolated source candidate. Official Linux native and Home Assistant framework checks, publication, installation, and physical acceptance remain open.
+
 ## Speakers 0.26.25 — released-route ownership candidate
 
 - Join the current receiver and OwnTone START owners before a released, playing route enters alias recovery. A current START or unknown owner holds the released marker and skips volume and output-selection writes; only explicit clean absence enters the existing guarded recovery.
