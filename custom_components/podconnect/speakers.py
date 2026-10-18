@@ -8,9 +8,27 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientTimeout
 
+ROOM_READ_REASONS = frozenset(
+    {
+        "claim_unavailable",
+        "receiver_proof_unavailable",
+        "output_proof_unavailable",
+        "route_owner_unavailable",
+    }
+)
+
 
 class SpeakersError(Exception):
     """Local contract is unavailable, unknown, or rejected."""
+
+    def __init__(self, message, *, room_read_reason=None):
+        super().__init__(message)
+        self.room_read_reason = (
+            room_read_reason
+            if isinstance(room_read_reason, str)
+            and room_read_reason in ROOM_READ_REASONS
+            else None
+        )
 
 
 def speakers_url(value: str) -> str:
@@ -43,7 +61,15 @@ class SpeakersClient:
         self._web = web
         self._base = speakers_url(base)
 
-    async def _request(self, method: str, path: str, body=None, *, budget: int = 5):
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        budget: int = 5,
+        room_read_reason: bool = False,
+    ):
         try:
             async with asyncio.timeout(budget):
                 async with self._web.request(
@@ -54,7 +80,13 @@ class SpeakersClient:
                     allow_redirects=False,
                     timeout=ClientTimeout(total=budget - 1),
                 ) as response:
-                    if response.status != 200:
+                    diagnostic = (
+                        room_read_reason
+                        and method == "GET"
+                        and path.startswith("/api/room-transport/state?")
+                        and response.status == 409
+                    )
+                    if response.status != 200 and not diagnostic:
                         raise SpeakersError(f"Speakers returned HTTP {response.status}")
                     raw = bytearray()
                     async for chunk in response.content.iter_chunked(8192):
@@ -70,7 +102,24 @@ class SpeakersClient:
                             result[key] = value
                         return result
 
-                    return json.loads(raw, object_pairs_hook=pairs)
+                    value = json.loads(raw, object_pairs_hook=pairs)
+                    if diagnostic:
+                        reason = None
+                        if (
+                            isinstance(value, dict)
+                            and set(value)
+                            == {"ok", "error_kind", "retry_allowed", "reason"}
+                            and value["ok"] is False
+                            and value["error_kind"] == "room_transport_unavailable"
+                            and value["retry_allowed"] is False
+                            and isinstance(value["reason"], str)
+                            and value["reason"] in ROOM_READ_REASONS
+                        ):
+                            reason = value["reason"]
+                        raise SpeakersError(
+                            "Speakers returned HTTP 409", room_read_reason=reason
+                        )
+                    return value
         except (ClientError, TimeoutError, ValueError) as err:
             # No response body, URL, or credential material enters the public error.
             raise SpeakersError("Speakers request failed; outcome unknown") from err
@@ -397,7 +446,9 @@ class SpeakersClient:
     async def room_transport_state(self, scope):
         """Read both native and exact OwnTone route capabilities; no legacy fallback."""
         return await self._request(
-            "GET", "/api/room-transport/state?" + urlencode(scope)
+            "GET",
+            "/api/room-transport/state?" + urlencode(scope),
+            room_read_reason=True,
         )
 
     async def prepare_room_transport(self, scope, native, route, action):

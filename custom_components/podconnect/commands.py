@@ -787,7 +787,17 @@ def register_command_services(hass):
                 call.data["homepod_id"],
             )
         except CommandRejected as exc:
-            return {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+            result = {"ok": False, "error_kind": str(exc), "retry_allowed": False}
+            from .speakers import ROOM_READ_REASONS
+
+            reason = getattr(exc, "room_read_reason", None)
+            if (
+                str(exc) == "room_transport_unavailable"
+                and isinstance(reason, str)
+                and reason in ROOM_READ_REASONS
+            ):
+                result["reason"] = reason
+            return result
 
     async def room_command(call):
         data = current(hass, call.data["config_entry_id"])
