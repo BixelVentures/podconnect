@@ -693,6 +693,15 @@ func routeAliasOutputForIntent(primaryOwnTone string, aliasId int, live *glLive,
 }
 
 func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, protectStart ...bool) (bool, bool) {
+	return routeAliasOutputWithGuard(primaryOwnTone, aliasId, live, revision, att, nil, protectStart...)
+}
+
+func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, guard func() bool, protectStart ...bool) (bool, bool) {
+	current := func() bool { return (guard == nil || guard()) && routeIntentCurrent(live, aliasId, revision) }
+	if !current() {
+		return false, false
+	}
+	recovery := len(protectStart) > 1 && protectStart[1]
 	rooms := loadRooms()
 	var binding *aliasBinding
 	if live != nil {
@@ -718,7 +727,7 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 		}
 	} else {
 		if aliasId < 1 || aliasId > len(rooms) {
-			return false, routeIntentCurrent(live, aliasId, revision)
+			return false, current()
 		}
 		target = rooms[aliasId-1]
 	}
@@ -728,7 +737,7 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 	}
 	devs, ok := fetchOutputsFrom(primaryOwnTone)
 	if !ok || len(devs) == 0 {
-		return false, routeIntentCurrent(live, aliasId, revision)
+		return false, current()
 	}
 	if live != nil {
 		live.observeNativeDevices(devs, nativeRequest)
@@ -740,7 +749,7 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 			have = append(have, d.Name)
 		}
 		log.Printf("alias-route: alias %d (%s) — HomePod %q not on primary OwnTone; available: %v", aliasId, target.Name, target.HomepodName, have)
-		return false, routeIntentCurrent(live, aliasId, revision)
+		return false, current()
 	}
 	var admitNative func() bool
 	if live != nil {
@@ -752,30 +761,37 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 		// The bridge is the audible route owner. Prime the *saved exact output*
 		// before native attention or selection; pipe_autostart can start at selection.
 		if target.HomepodID == "" || devs[idx].ID != target.HomepodID ||
-			!routeIntentCurrent(live, aliasId, revision) ||
-			!primeConfiguredStartVolume(primaryOwnTone, target.HomepodID, false) {
-			return false, routeIntentCurrent(live, aliasId, revision)
+			!current() ||
+			!primeConfiguredStartVolume(primaryOwnTone, target.HomepodID, false, recovery) {
+			return false, current()
 		}
 	}
 	if att != nil && !att.nativeTargetForRoute(primaryOwnTone, devs[idx].ID, admitNative) {
-		return false, routeIntentCurrent(live, aliasId, revision)
+		return false, current()
 	}
 	cl := &http.Client{Timeout: 4 * time.Second}
-	req, err := http.NewRequest(http.MethodPut, primaryOwnTone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":["`+devs[idx].ID+`"]}`))
+	selectionURL := primaryOwnTone + "/api/outputs/set"
+	if recovery {
+		selectionURL += "?recovery=connect"
+	}
+	req, err := http.NewRequest(http.MethodPut, selectionURL, bytes.NewBufferString(`{"outputs":["`+devs[idx].ID+`"]}`))
 	if err != nil {
-		return false, routeIntentCurrent(live, aliasId, revision)
+		return false, current()
 	}
 	// The claim is command admission, not HTTP sent/native ACK. Never hold the
 	// live mutex across network I/O. No catalog or other work follows admission.
+	if !current() {
+		return false, false
+	}
 	if live != nil && !admitRoomAliasRoute(target, binding, live, aliasId, revision) {
 		return false, false
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return false, routeIntentCurrent(live, aliasId, revision)
+		return false, current()
 	}
 	defer resp.Body.Close()
-	if !routeIntentCurrent(live, aliasId, revision) {
+	if !current() {
 		return false, false
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -787,12 +803,12 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 		if attentionActive {
 			volume, selected := selectedStartOutput(primaryOwnTone, target.HomepodID)
 			if !selected || volume > startVolumePercent {
-				return false, routeIntentCurrent(live, aliasId, revision)
+				return false, current()
 			}
-		} else if !checkedStartVolume(primaryOwnTone, target.HomepodID) {
-			return false, routeIntentCurrent(live, aliasId, revision)
+		} else if !checkedStartVolume(primaryOwnTone, target.HomepodID, recovery) {
+			return false, current()
 		}
-		if !routeIntentCurrent(live, aliasId, revision) {
+		if !current() {
 			return false, false
 		}
 	}
@@ -853,6 +869,11 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				att.expire(time.Now()) // retain pending restore until output identity is known
 				time.Sleep(200 * time.Millisecond)
 				continue // unknown bound selection cannot reclaim a positional primary
+			}
+			if tryExplicitConnectRecovery(room, live, att) {
+				prevActive = gl.Active
+				time.Sleep(200 * time.Millisecond)
+				continue
 			}
 			if holdReleasedBridgeRoute(room, gl, intent) {
 				prevActive = gl.Active

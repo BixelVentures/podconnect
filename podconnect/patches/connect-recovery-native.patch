@@ -1,0 +1,146 @@
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,6 +30,8 @@
+ )
+ 
+ type AppPlayer struct {
++	connectRecoveryOrdinal           uint64
++	connectRecoverySeen              map[[32]byte]bool
+ 	roomMoveReservation              *moveReservation
+ 	roomMoveQuarantined              bool
+ 	roomMoveSteps                    chan moveStep
+@@ -284,7 +286,11 @@
+ 			return nil
+ 		}
+ 
+-		return p.handleTransferCommand(ctx, req, transferState, sp)
++		err := p.handleTransferCommand(ctx, req, transferState, sp)
++		if err == nil {
++			p.emitConnectRecovery(req)
++		}
++		return err
+ 	case "play":
+ 		return p.handlePlayCommand(ctx, req, sp)
+ 	case "pause":
+diff --git a/daemon/connect_recovery.go b/daemon/connect_recovery.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/connect_recovery.go
+@@ -0,0 +1,39 @@
++package daemon
++
++import (
++	"crypto/sha256"
++	"fmt"
++	"github.com/devgianlu/go-librespot/dealer"
++)
++
++// Only an accepted authenticated dealer transfer with an explicit configured
++// alias publishes a one-use recovery intent. Local alias selection and status
++// publication never call this path. Duplicate request identities fail closed.
++func (p *AppPlayer) emitConnectRecovery(req dealer.RequestPayload) {
++	alias := req.TargetAliasId
++	if alias == nil {
++		alias = req.Command.TargetAliasId
++	}
++	if req.Command.Endpoint != "transfer" || req.Command.Options.SystemInitiated || req.Command.PlayOptions.SystemInitiated ||
++		len(req.Command.Data) == 0 || alias == nil || *alias == 0 ||
++		int(*alias) > len(p.app.cfg.DeviceAliases) || req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 ||
++		p.state == nil || p.state.device == nil || p.state.device.SelectedAliasId != *alias || p.spotConnId == "" {
++		return
++	}
++	key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", req.SentByDeviceId, req.MessageId)))
++	p.aliasMu.Lock()
++	binding := p.aliasBindingLocked()
++	if p.aliasRetired || binding == nil || !binding.Ready || p.connectRecoveryOrdinal >= 9007199254740991 ||
++		p.connectRecoverySeen[key] || len(p.connectRecoverySeen) >= 1024 {
++		p.aliasMu.Unlock()
++		return
++	}
++	if p.connectRecoverySeen == nil {
++		p.connectRecoverySeen = make(map[[32]byte]bool)
++	}
++	p.connectRecoverySeen[key] = true
++	p.connectRecoveryOrdinal++
++	ordinal := p.connectRecoveryOrdinal
++	p.aliasMu.Unlock()
++	p.app.server.Emit(&ApiEvent{Type: "connect_transfer", Data: map[string]any{"id": *alias, "alias_binding": binding, "ordinal": ordinal}})
++}
+diff --git a/daemon/connect_recovery_test.go b/daemon/connect_recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/connect_recovery_test.go
+@@ -0,0 +1,72 @@
++package daemon
++
++import (
++	"github.com/devgianlu/go-librespot/dealer"
++	"testing"
++)
++
++func recoveryRequest() dealer.RequestPayload {
++	var r dealer.RequestPayload
++	r.MessageId = 7
++	r.SentByDeviceId = "controller"
++	r.Command.Endpoint = "transfer"
++	r.Command.Data = []byte{1}
++	id := uint32(1)
++	r.TargetAliasId = &id
++	return r
++}
++func TestConnectRecoveryOnlyExplicitAcceptedRequest(t *testing.T) {
++	p, s := localAliasPlayer(t)
++	p.spotConnId = "connection-a"
++	r := recoveryRequest()
++	p.emitConnectRecovery(r)
++	if len(s.events) != 1 || s.events[0].Type != "connect_transfer" {
++		t.Fatal("missing explicit credit")
++	}
++	p.emitConnectRecovery(r)
++	p.spotConnId = "connection-b"
++	p.emitConnectRecovery(r)
++	if len(s.events) != 1 {
++		t.Fatal("duplicate/reconnected request replayed")
++	}
++	r.MessageId++
++	p.emitConnectRecovery(r)
++	if len(s.events) != 2 {
++		t.Fatal("fresh request lost")
++	}
++}
++func TestConnectRecoveryRejectsNonExplicitOrigins(t *testing.T) {
++	for _, mode := range []string{"pause", "play", "system_initiated", "system_play_options", "zero_alias", "no_alias", "no_payload", "no_sender", "retired", "wrong_alias", "capacity"} {
++		t.Run(mode, func(t *testing.T) {
++			p, s := localAliasPlayer(t)
++			p.spotConnId = "connection"
++			r := recoveryRequest()
++			switch mode {
++			case "pause", "play":
++				r.Command.Endpoint = mode
++			case "system_initiated":
++				r.Command.Options.SystemInitiated = true
++			case "system_play_options":
++				r.Command.PlayOptions.SystemInitiated = true
++			case "zero_alias":
++				*r.TargetAliasId = 0
++			case "no_alias":
++				r.TargetAliasId = nil
++			case "no_payload":
++				r.Command.Data = nil
++			case "no_sender":
++				r.SentByDeviceId = ""
++			case "retired":
++				p.aliasRetired = true
++			case "wrong_alias":
++				*r.TargetAliasId = 2
++			case "capacity":
++				p.connectRecoveryOrdinal = 9007199254740991
++			}
++			p.emitConnectRecovery(r)
++			if len(s.events) != 0 {
++				t.Fatal("nonexplicit origin minted credit")
++			}
++		})
++	}
++}
