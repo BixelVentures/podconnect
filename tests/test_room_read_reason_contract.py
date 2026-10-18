@@ -25,7 +25,25 @@ def load(name):
     return module
 
 
-speakers = load("speakers")
+try:
+    import aiohttp
+except ModuleNotFoundError as exc:
+    if exc.name != "aiohttp":
+        raise
+    aiohttp = None
+
+if aiohttp is None:
+
+    class ClientError(Exception):
+        pass
+
+    class ClientTimeout:
+        def __init__(self, *, total):
+            self.total = total
+
+    aiohttp_stub = types.ModuleType("aiohttp")
+    aiohttp_stub.ClientError = ClientError
+    aiohttp_stub.ClientTimeout = ClientTimeout
 
 
 class Rejected(Exception):
@@ -38,7 +56,19 @@ sys.modules[commands.__name__] = commands
 observation = types.ModuleType(PKG + ".observations")
 observation.current = lambda *args: None
 sys.modules[observation.__name__] = observation
-room = load("room_transport")
+if aiohttp is None:
+    _missing = object()
+    _original_aiohttp = sys.modules.get("aiohttp", _missing)
+    sys.modules["aiohttp"] = aiohttp_stub
+try:
+    speakers = load("speakers")
+    room = load("room_transport")
+finally:
+    if aiohttp is None:
+        if _original_aiohttp is _missing:
+            del sys.modules["aiohttp"]
+        else:
+            sys.modules["aiohttp"] = _original_aiohttp
 
 
 class Response:
