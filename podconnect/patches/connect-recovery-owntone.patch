@@ -184,10 +184,34 @@ index 3cb9b3a..2298417 100644
  int
  player_volume_setraw_speaker(uint64_t id, const char *volstr);
 diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
-index bc78c0c..3cfc282 100644
+index bc78c0c..828b6e4 100644
 --- a/tests/outputs_attention_owner.c
 +++ b/tests/outputs_attention_owner.c
-@@ -248,6 +248,57 @@ static void clear_devices(void)
+@@ -10,6 +10,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/queue.h>
++#include <event2/keyvalq_struct.h>
+ 
+ #include "../src/outputs.c"
+ #define db_speaker_get actual_db_speaker_get
+@@ -46,6 +48,14 @@ static void selection_fixture_json_free(json_object *object);
+ #undef free
+ #undef jparse_free
+ 
++/* Same adapter as httpd_libevhttp.c: this fixture links the real JSON API TU
++ * without the full HTTP server. Preserve libevent query lookup semantics. */
++const char *
++httpd_query_value_find(httpd_query *query, const char *key)
++{
++  return evhttp_find_header(query, key);
++}
++
+ static int selection_fixture_set(uint64_t *ids)
+ {
+   assert(ids && ids[0] == 1 && ids[1] == 42);
+@@ -248,6 +258,90 @@ static void clear_devices(void)
    transport_calls = 0;
  }
  
@@ -242,10 +266,43 @@ index bc78c0c..3cfc282 100644
 +  puts("PASS PC28 actual C owner: clean unselected allowed; START ownership/gate, unknown journal, custody, attention and wrong output denied without mutation");
 +}
 +
++static void connect_recovery_selection_query_contract(void)
++{
++  static const struct { const char *query,*body; int status; } cases[] = {
++    {"recovery=connect", "{\"outputs\":[\"1\"]}", HTTP_NOCONTENT},
++    {"recovery=%63onnect", "{\"outputs\":[\"1\"]}", HTTP_NOCONTENT},
++    {"recovery=other", "{\"outputs\":[\"1\"]}", HTTP_BADREQUEST},
++    {"recovery=", "{\"outputs\":[\"1\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"1\",\"2\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"01\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[1]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"1\"],\"extra\":true}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"999\"]}", HTTP_INTERNAL}
++  };
++  struct output_device *a=add_device(1);
++  size_t i;
++  for(i=0;i<ARRAY_SIZE(cases);i++) {
++    struct evkeyvalq query;
++    struct httpd_request request={0};
++    TAILQ_INIT(&query);
++    assert(evhttp_parse_query_str(cases[i].query,&query)==0);
++    request.query=&query; request.in_body=evbuffer_new(); assert(request.in_body);
++    assert(evbuffer_add(request.in_body,cases[i].body,strlen(cases[i].body))==0);
++    selection_fixture_calls=selection_fixture_ids_freed=selection_fixture_request_freed=0;
++    selection_fixture_ids=NULL;
++    assert(jsonapi_reply_outputs_set(&request)==cases[i].status);
++    assert(selection_fixture_calls==0); /* Distinguished query never falls through to normal selection. */
++    assert(!a->selected && !a->session); /* Adapter is inert; no actual output selection claim. */
++    evbuffer_free(request.in_body); evhttp_clear_headers(&query);
++  }
++  clear_devices();
++  puts("PASS PC28 real selection HTTP parser/libevent query: exact and decoded guard, invalid purpose/body/output reject; no unguarded fallback");
++}
++
  static void bases_and_legacy_selection(void)
  {
    struct output_device *a = add_device(1);
-@@ -816,6 +867,11 @@ static void durable_disk_failure_unknown_and_stale_generation(void)
+@@ -816,6 +910,11 @@ static void durable_disk_failure_unknown_and_stale_generation(void)
  
  /* The fixture directly routes existing synchronous player API adapters to the
   * actual output owner; HTTP parsing and owner state are the production TUs. */
@@ -257,11 +314,12 @@ index bc78c0c..3cfc282 100644
  int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
  { return outputs_transport_prepare(r,out); }
  int player_transport_commit(const struct output_transport_request *r, struct output_transport_result *out)
-@@ -1514,6 +1570,7 @@ int main(int argc,char **argv)
+@@ -1514,6 +1613,8 @@ int main(int argc,char **argv)
    }
    output_airplay.device_attention_recovery_prepare=recovery_prepare_edge;
    output_airplay.device_attention_recover=inert_attention;
 +  connect_recovery_requires_clean_unowned_output();
++  connect_recovery_selection_query_contract();
    bases_and_legacy_selection();
    manual_revision_and_old_lease();
    failure_cannot_be_overwritten_or_cross_output();
