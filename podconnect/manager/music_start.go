@@ -305,9 +305,12 @@ func preflightReleasedResume(primary *Room) bool {
 		final.Proof.OutputVolume <= startVolumePercent && final.Proof.OutputVolume >= startVolumePercent-volTol
 }
 
-func primeConfiguredStartVolume(base, id string, requireSelected bool) bool {
+func primeConfiguredStartVolume(base, id string, requireSelected bool, recovery ...bool) bool {
 	client := &http.Client{Timeout: 3 * time.Second}
 	query := url.Values{"volume": {fmt.Sprint(startVolumePercent)}, "output_id": {id}}
+	if len(recovery) > 0 && recovery[0] {
+		query.Set("recovery", "connect")
+	}
 	req, err := http.NewRequest(http.MethodPut, base+"/api/player/volume?"+query.Encode(), nil)
 	if err != nil {
 		return false
@@ -324,8 +327,8 @@ func primeConfiguredStartVolume(base, id string, requireSelected bool) bool {
 	return ok && (!requireSelected || selected) && vol <= startVolumePercent && vol >= startVolumePercent-volTol
 }
 
-func checkedStartVolume(base, id string) bool {
-	return primeConfiguredStartVolume(base, id, true)
+func checkedStartVolume(base, id string, recovery ...bool) bool {
+	return primeConfiguredStartVolume(base, id, true, recovery...)
 }
 
 // A non-current room may be chosen only while the engine is idle. The engine's

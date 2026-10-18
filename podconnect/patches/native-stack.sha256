@@ -16,3 +16,4 @@ bd0654a0ade4f8b62e38dc167bc201f67b118a3a1c6c73fc0f9ed38d37468c24  /patches/room-
 b589c71150427119fea5db1fd69570e1fb45475e1afdaacecd22fed283961c21  /patches/room-startcredit-reviewfix-native.patch
 24604cbc9c106b5d84989f0f7550df5c94fad6efe306476a21e5ed7cfac3c1c1  /patches/room-queue-native.patch
 49bc06ac700a8cde8e8f2671671bdf30950142fba5310152a5e30bc6a395512a  /patches/room-next-native.patch
+91799383bf925768de04503ed0c7b061551cf68fff5c8f92b3d3a971b77584f1  /patches/connect-recovery-native.patch

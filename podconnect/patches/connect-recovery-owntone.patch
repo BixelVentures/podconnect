@@ -1,0 +1,325 @@
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index f35743d..c1ffb89 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -2308,6 +2308,8 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
+   int nspk, i, ret;
+   int selection_ret = 0;
+   uint64_t *ids;
++  const char *recovery=hreq->query ? httpd_query_value_find(hreq->query,"recovery") : NULL;
++  if (recovery && strcmp(recovery,"connect")) return HTTP_BADREQUEST;
+ 
+   request = jparse_obj_from_evbuffer(hreq->in_body);
+   if (!request)
+@@ -2316,6 +2318,20 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
+       return HTTP_BADREQUEST;
+     }
+ 
++  if (recovery) {
++    uint64_t id; char canonical[32]; const char *text;
++    if (json_object_object_length(request)!=1
++        || jparse_array_from_obj(request,"outputs",&outputs)<0
++        || json_object_array_length(outputs)!=1
++        || !(output_id=json_object_array_get_idx(outputs,0))
++        || !json_object_is_type(output_id,json_type_string)) {
++      jparse_free(request); return HTTP_BADREQUEST;
++    }
++    text=json_object_get_string(output_id);
++    if (safe_atou64(text,&id)<0 || !id) { jparse_free(request); return HTTP_BADREQUEST; }
++    snprintf(canonical,sizeof(canonical),"%" PRIu64,id);
++    if (strcmp(text,canonical)) { jparse_free(request); return HTTP_BADREQUEST; }
++  }
+   DPRINTF(E_DBG, L_WEB, "Received select-outputs post request: %s\n", json_object_to_json_string(request));
+ 
+   ret = jparse_array_from_obj(request, "outputs", &outputs);
+@@ -2339,7 +2355,7 @@ jsonapi_reply_outputs_set(struct httpd_request *hreq)
+ 	}
+ 
+       if (ret == 0)
+-	selection_ret = player_speaker_set(ids);
++	selection_ret = recovery ? player_speaker_set_connect_recovery(ids) : player_speaker_set(ids);
+ 
+       free(ids);
+     }
+@@ -3330,6 +3346,19 @@ jsonapi_reply_player_volume(struct httpd_request *hreq)
+   int step;
+   int ret;
+ 
++  const char *recovery=hreq->query ? httpd_query_value_find(hreq->query,"recovery") : NULL;
++  if (recovery) {
++    char canonical[32];
++    param=httpd_query_value_find(hreq->query,"output_id");
++    param_volume=httpd_query_value_find(hreq->query,"volume");
++    if (strcmp(recovery,"connect") || !param || !param_volume || strcmp(param_volume,"35")
++        || httpd_query_value_find(hreq->query,"step") || safe_atou64(param,&output_id)<0 || !output_id)
++      return HTTP_BADREQUEST;
++    snprintf(canonical,sizeof(canonical),"%" PRIu64,output_id);
++    if (strcmp(param,canonical)) return HTTP_BADREQUEST;
++    return player_volume_set_connect_recovery(output_id,35)<0 ? HTTP_INTERNAL : HTTP_NOCONTENT;
++  }
++
+   volume = 0;
+   step = 0;
+ 
+diff --git a/src/outputs.c b/src/outputs.c
+index 964fc42..2fbd5f8 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -409,6 +409,20 @@ static void vol_adjust(void);
+ #include "outputs_start.inc.c"
+ #include "outputs_queue.inc.c"
+ 
++/* Called only on the output owner thread immediately before a distinguished
++ * Connect recovery mutation. No selected session is required to prove absence. */
++bool
++outputs_connect_recovery_available(uint64_t id)
++{
++  struct output_device *device=outputs_device_get(id), *scan;
++  if (!id || !device || !device->advertised || device->type!=OUTPUT_TYPE_AIRPLAY
++      || device->prevent_playback || outputs_transport_busy() || !start_route_clean_absent()) return false;
++  for (scan=outputs_device_list;scan;scan=scan->next)
++    if (scan->busy || scan->attention_lease || scan->attention_retiring_session
++        || scan->attention_restart_pending || scan->attention_restoring) return false;
++  return true;
++}
++
+ int
+ outputs_device_effective_volume(const struct output_device *device)
+ {
+diff --git a/src/outputs.h b/src/outputs.h
+index 8566655..ec7a276 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -141,6 +141,7 @@ int outputs_transport_commit(const struct output_transport_request *, struct out
+ int outputs_transport_result_get(const char *, struct output_transport_result *);
+ bool outputs_transport_current(const struct output_transport_result *);
+ bool outputs_transport_busy(void);
++bool outputs_connect_recovery_available(uint64_t);
+ void outputs_transport_input_changed(uint64_t item_id, const char *path, bool pipe_input);
+ 
+ /* Selected new content has its own route/source/35 authority. */
+diff --git a/src/player.c b/src/player.c
+index b3480b1..ce0ab6c 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -2759,6 +2759,16 @@ speaker_set(void *arg, int *retval)
+   return COMMAND_END;
+ }
+ 
++static enum command_state
++speaker_set_connect_recovery(void *arg, int *retval)
++{
++  struct speaker_set_param *p=arg;
++  if (!p->device_ids || p->device_ids[0]!=1
++      || !outputs_connect_recovery_available(p->device_ids[1]))
++    { *retval=-1; return COMMAND_END; }
++  return speaker_set(arg,retval);
++}
++
+ static enum command_state
+ speaker_enable(void *arg, int *retval)
+ {
+@@ -3351,6 +3361,15 @@ volume_setabs_speaker(void *arg, int *retval)
+   return COMMAND_END;
+ }
+ 
++static enum command_state
++volume_set_connect_recovery(void *arg, int *retval)
++{
++  struct speaker_attr_param *p=arg;
++  if (p->volume!=35 || !outputs_connect_recovery_available(p->spk_id))
++    { *retval=-1; return COMMAND_END; }
++  return volume_setabs_speaker(arg,retval);
++}
++
+ static enum command_state
+ volume_setraw_speaker(void *arg, int *retval)
+ {
+@@ -3731,6 +3750,13 @@ player_speaker_set(uint64_t *ids)
+   return ret;
+ }
+ 
++int
++player_speaker_set_connect_recovery(uint64_t *ids)
++{
++  struct speaker_set_param p={.device_ids=ids};
++  return commands_exec_sync(cmdbase,speaker_set_connect_recovery,speaker_generic_bh,&p);
++}
++
+ int
+ player_speaker_get_byid(struct player_speaker_info *spk, uint64_t id)
+ {
+@@ -3964,6 +3990,13 @@ player_volume_setabs_speaker(uint64_t id, int vol)
+   return ret;
+ }
+ 
++int
++player_volume_set_connect_recovery(uint64_t id, int vol)
++{
++  struct speaker_attr_param p={.spk_id=id,.volume=vol};
++  return commands_exec_sync(cmdbase,volume_set_connect_recovery,volume_generic_bh,&p);
++}
++
+ int
+ player_volume_setraw_speaker(uint64_t id, const char *volstr)
+ {
+diff --git a/src/player.h b/src/player.h
+index 3cb9b3a..2298417 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -118,6 +118,7 @@ player_speaker_enumerate(spk_enum_cb cb, void *arg);
+ 
+ int
+ player_speaker_set(uint64_t *ids);
++int player_speaker_set_connect_recovery(uint64_t *ids);
+ 
+ int
+ player_speaker_get_byid(struct player_speaker_info *spk, uint64_t id);
+@@ -196,6 +197,7 @@ player_volume_setrel_speaker(uint64_t id, int relvol);
+ 
+ int
+ player_volume_setabs_speaker(uint64_t id, int vol);
++int player_volume_set_connect_recovery(uint64_t id, int vol);
+ 
+ int
+ player_volume_setraw_speaker(uint64_t id, const char *volstr);
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+index bc78c0c..828b6e4 100644
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -10,6 +10,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/queue.h>
++#include <event2/keyvalq_struct.h>
+ 
+ #include "../src/outputs.c"
+ #define db_speaker_get actual_db_speaker_get
+@@ -46,6 +48,14 @@ static void selection_fixture_json_free(json_object *object);
+ #undef free
+ #undef jparse_free
+ 
++/* Same adapter as httpd_libevhttp.c: this fixture links the real JSON API TU
++ * without the full HTTP server. Preserve libevent query lookup semantics. */
++const char *
++httpd_query_value_find(httpd_query *query, const char *key)
++{
++  return evhttp_find_header(query, key);
++}
++
+ static int selection_fixture_set(uint64_t *ids)
+ {
+   assert(ids && ids[0] == 1 && ids[1] == 42);
+@@ -248,6 +258,90 @@ static void clear_devices(void)
+   transport_calls = 0;
+ }
+ 
++/* PC28: real output-owner predicate, with bounded controlled owner states.
++ * No AirPlay connection, source identity, ACK or physical result is invented. */
++static void connect_recovery_requires_clean_unowned_output(void)
++{
++  struct output_device *a=add_device(1), *b=add_device(2);
++  struct start_slot pending={0};
++  struct timespec saved_expiry=transport_custody_expiry;
++  int original_volume=a->volume;
++  uint64_t original_base=a->base_revision, original_route=a->route_revision;
++  assert(start_route_clean_absent() && !outputs_transport_busy());
++  assert(!a->selected && !a->session);
++  assert(outputs_connect_recovery_available(1)); /* Unselected output is recoverable. */
++  assert(!outputs_connect_recovery_available(0) && !outputs_connect_recovery_available(999));
++
++  atomic_store(&start_owned_latch,true);
++  assert(!outputs_connect_recovery_available(1));
++  atomic_store(&start_owned_latch,false);
++  atomic_store(&start_gate,true);
++  assert(!outputs_connect_recovery_available(1));
++  atomic_store(&start_gate,false);
++  start_active=&pending; assert(!outputs_connect_recovery_available(1)); start_active=NULL;
++  start_scope=&pending; assert(!outputs_connect_recovery_available(1)); start_scope=NULL;
++#define PC28_DENY_FLAG(field) do { field=true; assert(!outputs_connect_recovery_available(1)); field=false; } while(0)
++  PC28_DENY_FLAG(start_journal_fault);
++  PC28_DENY_FLAG(start_startup_quarantine);
++  PC28_DENY_FLAG(start_retired_reopen_pending);
++  PC28_DENY_FLAG(start_retired_stage_ready);
++  start_journal.token[0]='x'; assert(!outputs_connect_recovery_available(1)); start_journal.token[0]=0;
++  start_journal.payload="{}"; assert(!outputs_connect_recovery_available(1)); start_journal.payload=NULL;
++
++  assert(clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry)==0);
++  transport_custody_expiry.tv_sec+=60; transport_custody_live=true;
++  assert(!outputs_connect_recovery_available(1));
++  transport_custody_live=false; transport_custody_expiry=saved_expiry;
++  PC28_DENY_FLAG(a->prevent_playback);
++  PC28_DENY_FLAG(b->busy);
++  PC28_DENY_FLAG(b->attention_restart_pending);
++  PC28_DENY_FLAG(b->attention_restoring);
++#undef PC28_DENY_FLAG
++  b->attention_lease=1; assert(!outputs_connect_recovery_available(1)); b->attention_lease=0;
++  b->attention_retiring_session=b; assert(!outputs_connect_recovery_available(1)); b->attention_retiring_session=NULL;
++  a->advertised=false; assert(!outputs_connect_recovery_available(1)); a->advertised=true;
++  a->type=OUTPUT_TYPE_DUMMY; assert(!outputs_connect_recovery_available(1)); a->type=OUTPUT_TYPE_AIRPLAY;
++
++  assert(outputs_connect_recovery_available(1));
++  assert(a->volume==original_volume && a->base_revision==original_base && a->route_revision==original_route);
++  assert(!a->selected && !b->selected && !a->session && !b->session);
++  clear_devices();
++  puts("PASS PC28 actual C owner: clean unselected allowed; START ownership/gate, unknown journal, custody, attention and wrong output denied without mutation");
++}
++
++static void connect_recovery_selection_query_contract(void)
++{
++  static const struct { const char *query,*body; int status; } cases[] = {
++    {"recovery=connect", "{\"outputs\":[\"1\"]}", HTTP_NOCONTENT},
++    {"recovery=%63onnect", "{\"outputs\":[\"1\"]}", HTTP_NOCONTENT},
++    {"recovery=other", "{\"outputs\":[\"1\"]}", HTTP_BADREQUEST},
++    {"recovery=", "{\"outputs\":[\"1\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"1\",\"2\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"01\"]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[1]}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"1\"],\"extra\":true}", HTTP_BADREQUEST},
++    {"recovery=connect", "{\"outputs\":[\"999\"]}", HTTP_INTERNAL}
++  };
++  struct output_device *a=add_device(1);
++  size_t i;
++  for(i=0;i<ARRAY_SIZE(cases);i++) {
++    struct evkeyvalq query;
++    struct httpd_request request={0};
++    TAILQ_INIT(&query);
++    assert(evhttp_parse_query_str(cases[i].query,&query)==0);
++    request.query=&query; request.in_body=evbuffer_new(); assert(request.in_body);
++    assert(evbuffer_add(request.in_body,cases[i].body,strlen(cases[i].body))==0);
++    selection_fixture_calls=selection_fixture_ids_freed=selection_fixture_request_freed=0;
++    selection_fixture_ids=NULL;
++    assert(jsonapi_reply_outputs_set(&request)==cases[i].status);
++    assert(selection_fixture_calls==0); /* Distinguished query never falls through to normal selection. */
++    assert(!a->selected && !a->session); /* Adapter is inert; no actual output selection claim. */
++    evbuffer_free(request.in_body); evhttp_clear_headers(&query);
++  }
++  clear_devices();
++  puts("PASS PC28 real selection HTTP parser/libevent query: exact and decoded guard, invalid purpose/body/output reject; no unguarded fallback");
++}
++
+ static void bases_and_legacy_selection(void)
+ {
+   struct output_device *a = add_device(1);
+@@ -816,6 +910,11 @@ static void durable_disk_failure_unknown_and_stale_generation(void)
+ 
+ /* The fixture directly routes existing synchronous player API adapters to the
+  * actual output owner; HTTP parsing and owner state are the production TUs. */
++int player_speaker_set_connect_recovery(uint64_t *ids)
++{ return ids && ids[0]==1 && outputs_connect_recovery_available(ids[1]) ? 0 : -1; }
++int player_volume_set_connect_recovery(uint64_t id,int vol)
++{ return vol==35 && outputs_connect_recovery_available(id) ? 0 : -1; }
++
+ int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
+ { return outputs_transport_prepare(r,out); }
+ int player_transport_commit(const struct output_transport_request *r, struct output_transport_result *out)
+@@ -1514,6 +1613,8 @@ int main(int argc,char **argv)
+   }
+   output_airplay.device_attention_recovery_prepare=recovery_prepare_edge;
+   output_airplay.device_attention_recover=inert_attention;
++  connect_recovery_requires_clean_unowned_output();
++  connect_recovery_selection_query_contract();
+   bases_and_legacy_selection();
+   manual_revision_and_old_lease();
+   failure_cannot_be_overwritten_or_cross_output();
