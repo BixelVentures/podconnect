@@ -1,0 +1,670 @@
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -20,7 +20,6 @@
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"github.com/devgianlu/go-librespot/session"
+ 	"github.com/devgianlu/go-librespot/tracks"
+-	"google.golang.org/protobuf/proto"
+ )
+ 
+ const (
+@@ -276,18 +275,10 @@
+ 		offer.Snapshot.NativeRevision = revision
+ 	}
+ 	if request.Action == "next" || request.Action == "previous" {
+-		staged, err := p.state.tracks.PrepareTransport(ctx, request.Action == "previous", p.state.trackPosition())
++		staged, state, err := p.prepareRoomTransportTrack(ctx, request.Action == "previous", p.sess.Spclient())
+ 		if err != nil {
+ 			return nil, ErrAliasConflict
+ 		}
+-		state := proto.Clone(p.state.player).(*connectpb.PlayerState)
+-		if request.Action == "next" {
+-			state.IsPaused = false
+-		}
+-		state.Track = staged.CurrentTrack()
+-		state.PrevTracks = staged.PrevTracks()
+-		state.NextTracks = staged.NextTracks(ctx, nil)
+-		state.Index = staged.Index()
+ 		id, err := librespot.SpotifyIdFromUri(state.Track.Uri)
+ 		if err != nil {
+ 			return nil, ErrBadRequest
+--- /dev/null
++++ b/daemon/room_next.go
+@@ -0,0 +1,98 @@
++package daemon
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/base64"
++	"errors"
++	"fmt"
++	"strings"
++
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
++	"github.com/devgianlu/go-librespot/spclient"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++// resolveAutoplayContext prepares explicit Next through the existing native autoplay resolver.
++// It performs only the existing context read, never an audio/output mutation.
++func resolveAutoplayContext(ctx context.Context, sp *spclient.Spclient, contextURI string, list *tracks.List, playedURI string) (*connectpb.Context, error) {
++	var recent []string
++	if list != nil {
++		rows, err := list.AllTracksWithError(ctx)
++		if err != nil {
++			return nil, err
++		}
++		for _, track := range rows {
++			recent = append(recent, track.Uri)
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if len(recent) == 0 {
++		return nil, nil
++	}
++	return sp.ContextResolveAutoplay(ctx, &playerpb.AutoplayContextRequest{ContextUri: proto.String(contextURI), RecentTrackUri: recent}, playedURI)
++}
++
++func (p *AppPlayer) prepareRoomTransportTrack(ctx context.Context, previous bool, sp *spclient.Spclient) (*tracks.List, *connectpb.PlayerState, error) {
++	state := proto.Clone(p.state.player).(*connectpb.PlayerState)
++	staged, err := p.state.tracks.PrepareTransportWithRepeat(ctx, previous, p.state.trackPosition(), state.Options.GetRepeatingContext())
++	if err != nil {
++		if previous || !errors.Is(err, tracks.ErrNoNextTrack) || p.app.cfg.DisableAutoplay || strings.HasPrefix(state.ContextUri, "spotify:station:") {
++			return nil, nil, err
++		}
++		spotCtx, err := resolveAutoplayContext(ctx, sp, state.ContextUri, p.state.tracks, state.GetTrack().GetUri())
++		if err != nil {
++			return nil, nil, err
++		}
++		if spotCtx == nil {
++			return nil, nil, tracks.ErrNoNextTrack
++		}
++		staged, err = tracks.NewTrackListFromContext(ctx, p.app.log, sp, spotCtx)
++		if err != nil {
++			return nil, nil, err
++		}
++		if err = staged.Seek(ctx, func(*connectpb.ContextTrack) bool { return true }); err != nil {
++			return nil, nil, err
++		}
++		sessionID := make([]byte, 16)
++		if _, err := rand.Read(sessionID); err != nil {
++			return nil, nil, err
++		}
++		state.SessionId = base64.StdEncoding.EncodeToString(sessionID)
++		state.ContextUri, state.ContextUrl = spotCtx.Uri, spotCtx.Url
++		state.Restrictions, state.ContextRestrictions = spotCtx.Restrictions, spotCtx.Restrictions
++		if spotCtx.Restrictions != nil {
++			if len(spotCtx.Restrictions.DisallowTogglingShuffleReasons) > 0 {
++				state.Options.ShufflingContext = false
++			}
++			if len(spotCtx.Restrictions.DisallowTogglingRepeatTrackReasons) > 0 {
++				state.Options.RepeatingTrack = false
++			}
++			if len(spotCtx.Restrictions.DisallowTogglingRepeatContextReasons) > 0 {
++				state.Options.RepeatingContext = false
++			}
++		}
++		state.Suppressions = &connectpb.Suppressions{}
++		if state.ContextMetadata == nil {
++			state.ContextMetadata = map[string]string{}
++		}
++		for key, value := range spotCtx.Metadata {
++			state.ContextMetadata[key] = value
++		}
++		if err = staged.ToggleShuffle(ctx, state.Options.ShufflingContext); err != nil {
++			return nil, nil, fmt.Errorf("prepare autoplay shuffle: %w", err)
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, nil, err
++	}
++	if !previous {
++		state.IsPaused = false
++	}
++	state.Track, state.PrevTracks, state.NextTracks, state.Index = staged.CurrentTrack(), staged.PrevTracks(), staged.NextTracks(ctx, nil), staged.Index()
++	return staged, state, nil
++}
+--- /dev/null
++++ b/daemon/room_next_test.go
+@@ -0,0 +1,286 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"github.com/devgianlu/go-librespot/mpris"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/spclient"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++	"io"
++	"net/http"
++	"reflect"
++	"strings"
++	"testing"
++	"unsafe"
++
++	librespot "github.com/devgianlu/go-librespot"
++)
++
++const nextStation = "spotify:station:manual-next-fixture"
++const nextTrack = "spotify:track:0000000000000000000007"
++
++func nextFixture(t *testing.T) *AppPlayer {
++	p := pc13ExistingPlayer(t, true)
++	p.app.mpris = mpris.DummyServer{}
++	p.state.device.Volume = uint32(player.MaxStateVolume * 64 / 100)
++	return p
++}
++func nextSpclient(t *testing.T, calls *int, stationTrack string, during func()) *spclient.Spclient {
++	return pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		*calls++
++		if *calls > 1 {
++			t.Fatal("autoplay repeated its request")
++		}
++		if r.Method != "POST" || r.URL.Path != "/context-resolve/v1/autoplay" {
++			t.Fatalf("unexpected request %s %s", r.Method, r.URL)
++		}
++		b, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Fatal(err)
++		}
++		req := &playerpb.AutoplayContextRequest{}
++		if err = proto.Unmarshal(b, req); err != nil {
++			t.Fatal(err)
++		}
++		if req.GetContextUri() != pContext || len(req.RecentTrackUri) != 1 || req.RecentTrackUri[0] != oldTrack {
++			t.Fatalf("lost actual source/played history: %v", req)
++		}
++		if during != nil {
++			during()
++		}
++		body := fmt.Sprintf(`{"uri":%q,"metadata":{"provider_fixture":"real-context-read"},"pages":[{"tracks":[{"uri":%q}]}]}`, nextStation, stationTrack)
++		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
++	}))
++}
++
++const pContext = "spotify:playlist:0000000000000000000002"
++const oldTrack = "spotify:track:0000000000000000000003"
++
++func TestRoomTerminalNextStagesAutoplayWithoutChangingRetainedOwner(t *testing.T) {
++	p := nextFixture(t)
++	before := proto.Clone(p.state.player)
++	list := p.state.tracks
++	revision := list.TransportRevision()
++	volume := p.state.device.Volume
++	calls := 0
++	staged, state, err := p.prepareRoomTransportTrack(context.Background(), false, nextSpclient(t, &calls, nextTrack, nil))
++	if err != nil || staged == nil || state == nil {
++		t.Fatalf("terminal Next has no detached autoplay successor: %v", err)
++	}
++	if calls != 1 || state.ContextUri != nextStation || state.Track.Uri != nextTrack || state.Track.Provider != "autoplay" || state.Track.Metadata["autoplay.is_autoplay"] != "true" || state.IsPaused {
++		t.Fatalf("wrong staged station: %v", state)
++	}
++	if !proto.Equal(before, p.state.player) || p.state.tracks != list || list.TransportRevision() != revision || list.CurrentTrack().Uri != oldTrack || p.state.device.Volume != volume || (state.SessionId == "" || state.SessionId == p.state.player.SessionId) {
++		t.Fatal("preparation mutated retained cursor/owner/manual volume")
++	}
++}
++
++func TestRoomTerminalNextAutoplayOffStationAndCancelledDoNotResolve(t *testing.T) {
++	for _, mode := range []string{"off", "station", "cancelled"} {
++		t.Run(mode, func(t *testing.T) {
++			p := nextFixture(t)
++			calls := 0
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			if mode == "off" {
++				p.app.cfg.DisableAutoplay = true
++			}
++			if mode == "station" {
++				p.state.player.ContextUri = nextStation
++			}
++			if mode == "cancelled" {
++				cancel()
++			}
++			_, _, err := p.prepareRoomTransportTrack(ctx, false, nextSpclient(t, &calls, nextTrack, nil))
++			if err == nil || calls != 0 {
++				t.Fatalf("invalid station read: %v %d", err, calls)
++			}
++		})
++	}
++}
++
++func TestRoomTerminalNextCancelledDuringResolutionNeverPublishes(t *testing.T) {
++	p := nextFixture(t)
++	before := proto.Clone(p.state.player)
++	calls := 0
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	_, _, err := p.prepareRoomTransportTrack(ctx, false, nextSpclient(t, &calls, nextTrack, cancel))
++	if !errors.Is(err, context.Canceled) || calls != 1 || !proto.Equal(before, p.state.player) {
++		t.Fatalf("cancelled prepare published or retried: %v %d", err, calls)
++	}
++}
++
++func TestRoomTerminalNextContextRepeatAndManualQueuePrecedeAutoplay(t *testing.T) {
++	for _, mode := range []string{"context-repeat", "repeat-track-bypassed", "manual-queue"} {
++		t.Run(mode, func(t *testing.T) {
++			p := nextFixture(t)
++			calls := 0
++			p.state.player.Options.RepeatingContext = mode == "context-repeat"
++			p.state.player.Options.RepeatingTrack = mode == "repeat-track-bypassed"
++			if mode == "manual-queue" {
++				p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: nextTrack})
++			}
++			staged, state, err := p.prepareRoomTransportTrack(context.Background(), false, nextSpclient(t, &calls, nextTrack, nil))
++			if err != nil {
++				t.Fatal(err)
++			}
++			if mode != "repeat-track-bypassed" && state.SessionId != p.state.player.SessionId {
++				t.Fatal("ordinary next changed playback session")
++			}
++			if mode == "repeat-track-bypassed" {
++				if calls != 1 || state.ContextUri != nextStation {
++					t.Fatal("explicit Next repeated current track")
++				}
++			} else {
++				if calls != 0 || state.ContextUri != pContext {
++					t.Fatal("repeat/queued next unnecessarily resolved station")
++				}
++			}
++			expected := nextTrack
++			if mode == "context-repeat" {
++				expected = oldTrack
++			}
++			if staged.CurrentTrack().Uri != expected || p.state.tracks.CurrentTrack().Uri != oldTrack {
++				t.Fatal("detached repeat/manual order incorrect")
++			}
++		})
++	}
++}
++
++// Inert session fields only: no login/authenticated welcome, output or provider.
++// This test-only injection lets the actual natural EOF dispatcher use its normal
++// Spclient and event getters, without adding a production test seam.
++func nextSessionField(s *session.Session, name string, value any) {
++	v := reflect.ValueOf(s).Elem().FieldByName(name)
++	reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
++}
++
++type nextEvents struct {
++	player.EventManager
++	ends int
++}
++
++func (e *nextEvents) OnPlayerEnd(*player.Stream, int64) { e.ends++ }
++
++func TestNaturalEOFDispatchesOneActualStationContextCommit(t *testing.T) {
++	p := nextFixture(t)
++	calls := 0
++	events := &nextEvents{}
++	p.sess = &session.Session{}
++	// Invalid station media deliberately ends AFTER real resolver/list/context
++	// commit, before decoding/audio. Distinct from the exhausted valid URI.
++	nextSessionField(p.sess, "sp", nextSpclient(t, &calls, "invalid-station-media-boundary", nil))
++	nextSessionField(p.sess, "events", events)
++	volume, alias := p.state.device.Volume, p.state.device.SelectedAliasId
++	p.handlePlayerEvent(context.Background(), &player.Event{Type: player.EventTypeNotPlaying})
++	if events.ends != 1 || calls != 1 || p.state.player.ContextUri != nextStation || p.state.player.Track.Uri != "invalid-station-media-boundary" || p.state.player.Track.Provider != "autoplay" || p.state.player.Track.Metadata["autoplay.is_autoplay"] != "true" {
++		t.Fatalf("EOF did not reach one real station commit: ends=%d calls=%d state=%v", events.ends, calls, p.state.player)
++	}
++	if p.state.device.Volume != volume || p.state.device.SelectedAliasId != alias {
++		t.Fatal("EOF reset manual volume or room alias")
++	}
++}
++
++func TestSharedAutoplayNoPreviousTracksNeverInventsSeed(t *testing.T) {
++	calls := 0
++	ctx, err := resolveAutoplayContext(context.Background(), nextSpclient(t, &calls, nextTrack, nil), pContext, (*tracks.List)(nil), oldTrack)
++	if err != nil || ctx != nil || calls != 0 {
++		t.Fatal("invented context seed")
++	}
++}
++
++func TestRoomTerminalNextProviderRefusalDoesNotRetryOrMutate(t *testing.T) {
++	p := nextFixture(t)
++	before := proto.Clone(p.state.player)
++	calls := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		calls++
++		if calls > 1 {
++			t.Fatal("provider rejection retried")
++		}
++		return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("refused")), Request: r}, nil
++	}))
++	_, _, err := p.prepareRoomTransportTrack(context.Background(), false, sp)
++	if err == nil || calls != 1 || !proto.Equal(before, p.state.player) {
++		t.Fatalf("provider refusal mutated or retried: %v/%d", err, calls)
++	}
++}
++
++func TestNaturalEOFRepeatTrackStaysDistinctFromExplicitNext(t *testing.T) {
++	p := nextFixture(t)
++	events := &nextEvents{}
++	p.sess = &session.Session{}
++	calls := 0
++	nextSessionField(p.sess, "sp", nextSpclient(t, &calls, nextTrack, nil))
++	nextSessionField(p.sess, "events", events)
++	list, err := tracks.NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: pContext, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "invalid-repeated-media-boundary"}}}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = list.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); err != nil {
++		t.Fatal(err)
++	}
++	p.state.tracks = list
++	p.state.player.Track = list.CurrentTrack()
++	p.state.player.Options.RepeatingTrack = true
++	p.handlePlayerEvent(context.Background(), &player.Event{Type: player.EventTypeNotPlaying})
++	if events.ends != 1 || calls != 0 || p.state.player.ContextUri != pContext || p.state.player.Track.Uri != "invalid-repeated-media-boundary" {
++		t.Fatal("natural EOF incorrectly bypassed repeat-track or resolved autoplay")
++	}
++}
++
++func TestSharedAutoplayHistoryFailureNeverDispatchesStation(t *testing.T) {
++	requests := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if requests > 1 || r.Method != "GET" {
++			t.Fatalf("failed history triggered station or retry: %s %s", r.Method, r.URL)
++		}
++		return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("inert lazy page refusal")), Request: r}, nil
++	}))
++	list, err := tracks.NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, sp, &connectpb.Context{Uri: pContext, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: oldTrack}}, NextPageUrl: "hm://fixture/context-page/next"}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = list.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); err != nil {
++		t.Fatal(err)
++	}
++	station, err := resolveAutoplayContext(context.Background(), sp, pContext, list, oldTrack)
++	if err == nil || station != nil || requests != 1 || list.CurrentTrack().Uri != oldTrack {
++		t.Fatalf("partial history admitted: %v %d", err, requests)
++	}
++}
++
++func TestRoomTerminalNextFirstStationPageFailureDoesNotRetry(t *testing.T) {
++	p := nextFixture(t)
++	before := proto.Clone(p.state.player)
++	requests := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if requests > 2 {
++			t.Fatal("station first-page failure retried")
++		}
++		if requests == 1 {
++			if r.Method != "POST" {
++				t.Fatal("wrong resolver call")
++			}
++			body := fmt.Sprintf(`{"uri":%q,"pages":[{"page_url":"hm://fixture/station-first-page"}]}`, nextStation)
++			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
++		}
++		if r.Method != "GET" {
++			t.Fatal("wrong page read")
++		}
++		return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("inert first-page refusal")), Request: r}, nil
++	}))
++	_, _, err := p.prepareRoomTransportTrack(context.Background(), false, sp)
++	if err == nil || requests != 2 || !proto.Equal(before, p.state.player) {
++		t.Fatalf("failed station page hidden/retried/mutated: %v/%d", err, requests)
++	}
++}
+--- a/tracks/room_transport.go
++++ b/tracks/room_transport.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -24,6 +25,9 @@
+ 		}
+ 		pages.list[i].item = proto.Clone(pages.list[i].item).(*connectpb.ContextTrack)
+ 	}
++	if _, isolated := pages.pages.(preparationPages); !isolated {
++		pages.pages = preparationPages{source: pages.pages}
++	}
+ 	clone.tracks = &pages
+ 	clone.queue = make([]*connectpb.ContextTrack, len(tl.queue))
+ 	for i, track := range tl.queue {
+@@ -35,8 +39,15 @@
+ 	return &clone, nil
+ }
+ 
++var ErrNoNextTrack = errors.New("no next native occurrence")
++
+ // PrepareTransport stages a cursor without mutating the retained list.
+ func (tl *List) PrepareTransport(ctx context.Context, previous bool, positionMS int64) (*List, error) {
++	return tl.PrepareTransportWithRepeat(ctx, previous, positionMS, false)
++}
++
++// PrepareTransportWithRepeat retains ordinary context-repeat semantics on a detached list.
++func (tl *List) PrepareTransportWithRepeat(ctx context.Context, previous bool, positionMS int64, repeatContext bool) (*List, error) {
+ 	clone, err := tl.cloneForPreparation()
+ 	if err != nil {
+ 		return nil, err
+@@ -45,9 +56,25 @@
+ 		clone.invalidateQueueObservation()
+ 	} else if previous {
+ 		clone.GoPrev()
+-	} else if !clone.GoNext(ctx) {
+-		return nil, fmt.Errorf("no next native occurrence")
++	} else {
++		advanced, err := clone.goNext(ctx)
++		if err != nil {
++			return nil, err
++		}
++		if !advanced {
++			if err := ctx.Err(); err != nil {
++				return nil, err
++			}
++			if !repeatContext {
++				return nil, ErrNoNextTrack
++			}
++			clone.invalidateQueueObservation()
++			if err := clone.tracks.moveStart(ctx); err != nil {
++				return nil, err
++			}
++		}
+ 	}
++
+ 	if ctx.Err() != nil {
+ 		return nil, ctx.Err()
+ 	}
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -79,6 +79,15 @@
+ }
+ 
+ func (tl *List) AllTracks(ctx context.Context) []*connectpb.ProvidedTrack {
++	rows, err := tl.AllTracksWithError(ctx)
++	if err != nil {
++		tl.log.WithError(err).Error("failed fetching all tracks")
++	}
++	return rows
++}
++
++// AllTracksWithError keeps a failed history read distinct from a complete context.
++func (tl *List) AllTracksWithError(ctx context.Context) ([]*connectpb.ProvidedTrack, error) {
+ 	tracks := make([]*connectpb.ProvidedTrack, 0, tl.tracks.len())
+ 
+ 	iter := tl.tracks.iterStart()
+@@ -88,10 +97,10 @@
+ 	}
+ 
+ 	if err := iter.error(); err != nil {
+-		tl.log.WithError(err).Error("failed fetching all tracks")
+-	}
+-
+-	return tracks
++		return tracks, err
++	}
++
++	return tracks, nil
+ }
+ 
+ const MaxTracksInContext = 32
+@@ -218,6 +227,15 @@
+ }
+ 
+ func (tl *List) GoNext(ctx context.Context) bool {
++	advanced, err := tl.goNext(ctx)
++	if err != nil {
++		tl.log.WithError(err).Error("failed going to next track")
++	}
++	return advanced
++}
++
++// Keep exhaustion distinct from a failed page read for detached preparation.
++func (tl *List) goNext(ctx context.Context) (bool, error) {
+ 	tl.invalidateQueueObservation()
+ 	if tl.playingQueue {
+ 		tl.queue = tl.queue[1:]
+@@ -225,7 +243,7 @@
+ 
+ 	if len(tl.queue) > 0 {
+ 		tl.playingQueue = true
+-		return true
++		return true, nil
+ 	}
+ 
+ 	tl.playingQueue = false
+@@ -233,14 +251,14 @@
+ 	iter := tl.tracks.iterHere()
+ 	if iter.next(ctx) {
+ 		tl.tracks.move(iter)
+-		return true
+-	}
+-
+-	if err := iter.error(); err != nil {
+-		tl.log.WithError(err).Error("failed going to next track")
+-	}
+-
+-	return false
++		return true, nil
++	}
++
++	if err := iter.error(); err != nil {
++		return false, err
++	}
++
++	return false, nil
+ }
+ 
+ func (tl *List) GoPrev() bool {
+--- a/tracks/room_transport_test.go
++++ b/tracks/room_transport_test.go
+@@ -2,6 +2,8 @@
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"reflect"
+@@ -58,3 +60,93 @@
+ 		t.Fatal("prior-track staging changed retained cursor")
+ 	}
+ }
++
++func TestRoomTerminalNextContextRepeatIsDetachedAndManualQueueWins(t *testing.T) {
++	for _, manual := range []bool{false, true} {
++		t.Run(fmt.Sprint(manual), func(t *testing.T) {
++			rows := []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000001"}, {Uri: "spotify:track:0000000000000000000002"}}
++			list, err := NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: rows}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = list.TrySeek(context.Background(), func(row *connectpb.ContextTrack) bool { return row.Uri == rows[1].Uri }); err != nil {
++				t.Fatal(err)
++			}
++			if manual {
++				list.AddToQueue(&connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000009"})
++			}
++			revision, position := list.TransportRevision(), list.tracks.pos
++			prepared, err := list.PrepareTransportWithRepeat(context.Background(), false, 0, true)
++			if err != nil {
++				t.Fatal(err)
++			}
++			want := rows[0].Uri
++			if manual {
++				want = "spotify:track:0000000000000000000009"
++			}
++			if prepared.CurrentTrack().Uri != want || list.CurrentTrack().Uri != rows[1].Uri || list.TransportRevision() != revision || list.tracks.pos != position {
++				t.Fatal("repeat preparation changed retained order/cursor/revision")
++			}
++		})
++	}
++}
++
++func TestRoomTerminalNextOffAndCancelledHaveDistinctErrors(t *testing.T) {
++	list, err := NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000001"}}}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = list.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = list.PrepareTransportWithRepeat(context.Background(), false, 0, false); !errors.Is(err, ErrNoNextTrack) {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err = list.PrepareTransportWithRepeat(ctx, false, 0, true); !errors.Is(err, context.Canceled) {
++		t.Fatal("cancelled prepare looked like exhausted queue", err)
++	}
++}
++
++func TestRoomNextPageFailureIsNotExhaustion(t *testing.T) {
++	for _, repeat := range []bool{false, true} {
++		t.Run(fmt.Sprint(repeat), func(t *testing.T) {
++			list := occurrenceFixture(t)
++			list.tracks.pos = len(list.tracks.list) - 1
++			fault := errors.New("inert next-page failure")
++			list.tracks.pages = queuePreparePages(func(context.Context, int) ([]*connectpb.ContextTrack, error) { return nil, fault })
++			_, err := list.PrepareTransportWithRepeat(context.Background(), false, 0, repeat)
++			if !errors.Is(err, fault) || errors.Is(err, ErrNoNextTrack) {
++				t.Fatalf("page failure classified as exhaustion: %v", err)
++			}
++		})
++	}
++}
++
++func TestRoomNextLazyResolvedRowsAreDetached(t *testing.T) {
++	list := occurrenceFixture(t)
++	list.tracks.pos = len(list.tracks.list) - 1
++	row := &connectpb.ContextTrack{Uri: "spotify:track:4444444444444444444444", Metadata: map[string]string{"provider": "retained"}}
++	list.tracks.pages = queuePreparePages(func(context.Context, int) ([]*connectpb.ContextTrack, error) {
++		return []*connectpb.ContextTrack{row}, nil
++	})
++	prepared, err := list.PrepareTransportWithRepeat(context.Background(), false, 0, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	prepared.tracks.get().item.Metadata["provider"] = "staged"
++	if row.Metadata["provider"] != "retained" {
++		t.Fatal("next preparation aliases resolver-owned rows")
++	}
++}
++
++func TestAutoplayHistoryFailureIsNotCompleteRecentHistory(t *testing.T) {
++	list := occurrenceFixture(t)
++	fault := errors.New("inert history page failure")
++	list.tracks.pages = queuePreparePages(func(context.Context, int) ([]*connectpb.ContextTrack, error) { return nil, fault })
++	rows, err := list.AllTracksWithError(context.Background())
++	if len(rows) == 0 || !errors.Is(err, fault) {
++		t.Fatalf("partial history was reported complete: %d %v", len(rows), err)
++	}
++}

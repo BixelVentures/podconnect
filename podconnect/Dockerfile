@@ -57,6 +57,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/room-startcredit-reviewfix-native.patch" \
   && git apply --check "/patches/room-queue-native.patch" \
   && git apply "/patches/room-queue-native.patch" \
+  && git apply --check "/patches/room-next-native.patch" \
+  && git apply "/patches/room-next-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
