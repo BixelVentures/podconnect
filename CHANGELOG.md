@@ -1,3 +1,10 @@
+## Speakers 0.26.37 — content-free START failure diagnostic
+
+- Record only the finite failed START stage, last validated C phase, conservative error class and terminal outcome in the existing Native owner log. No content, identifiers or raw errors are logged.
+- Preserve source ownership, original cancellation/finish order, deadlines and UNKNOWN/no-replay behavior. Distinguish a Native consume failure from its subsequent cancellation cleanup; Control remains 0.10.19.
+- Supersedes the unmerged/unreleased 0.26.36 candidate after correcting its new consume-failure fixture's shared outcome assertion; production diagnostic behavior is unchanged.
+- This diagnostic does not fix the second fresh START failure observed on Green 0.26.35. Source review and static checks pass; official Linux execution, publication, installation and field acceptance remain separate pending gates.
+
 ## Speakers 0.26.35 — same-FIFO reader handoff
 
 - Keep a temporary read-only reference to the same FIFO during its synchronous reader replacement. This closes a demonstrated gap where the old input and watcher readers could both close while the existing Native writer was still active, causing EPIPE.
