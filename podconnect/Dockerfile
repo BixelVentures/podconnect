@@ -97,7 +97,9 @@ COPY patches/connect-recovery-owntone.sha256 /patches/connect-recovery-owntone.s
 COPY patches/connect-recovery-diagnostics-owntone.patch /patches/connect-recovery-diagnostics-owntone.patch
 COPY patches/connect-recovery-diagnostics-owntone.sha256 /patches/connect-recovery-diagnostics-owntone.sha256
 COPY patches/paused-route-owntone.patch /patches/paused-route-owntone.patch
+COPY patches/connect-recovery-busy-owntone.patch /patches/connect-recovery-busy-owntone.patch
 COPY patches/paused-route-owntone.sha256 /patches/paused-route-owntone.sha256
+COPY patches/connect-recovery-busy-owntone.sha256 /patches/connect-recovery-busy-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -129,6 +131,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/paused-route-owntone.sha256 \
   && git apply --check /patches/paused-route-owntone.patch \
   && git apply /patches/paused-route-owntone.patch \
+  && sha256sum -c /patches/connect-recovery-busy-owntone.sha256 \
+  && git apply --check /patches/connect-recovery-busy-owntone.patch \
+  && git apply /patches/connect-recovery-busy-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

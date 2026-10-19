@@ -1,0 +1,254 @@
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -438,27 +438,38 @@
+ 
+ /* Called only on the output owner thread immediately before a distinguished
+  * Connect recovery mutation. No selected session is required to prove absence. */
+-bool
+-outputs_connect_recovery_available(uint64_t id)
++int
++outputs_connect_recovery_status(uint64_t id)
+ {
+   struct output_device *device=outputs_device_get(id), *scan;
+-  if (!id) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: invalid_output\n"); return false; }
+-  if (!device) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unavailable\n"); return false; }
+-  if (!device->advertised) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unadvertised\n"); return false; }
+-  if (device->type!=OUTPUT_TYPE_AIRPLAY) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_type\n"); return false; }
+-  if (device->prevent_playback) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: playback_prevented\n"); return false; }
+-  if (outputs_transport_busy()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: transport_busy\n"); return false; }
+-  if (!start_route_clean_absent()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: start_not_clean_absent\n"); return false; }
++  if (!id) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: invalid_output\n"); return -1; }
++  if (!device) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unavailable\n"); return -1; }
++  if (!device->advertised) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unadvertised\n"); return -1; }
++  if (device->type!=OUTPUT_TYPE_AIRPLAY) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_type\n"); return -1; }
++  if (device->prevent_playback) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: playback_prevented\n"); return -1; }
++  if (outputs_transport_busy()) {
++    DPRINTF(E_LOG, L_PLAYER,"Connect recovery denied: transport_busy\n");
++    if (!start_route_clean_absent()) return -1;
++    for (scan=outputs_device_list;scan;scan=scan->next)
++      if (scan->busy || scan->attention_lease || scan->attention_retiring_session
++          || scan->attention_restart_pending || scan->attention_restoring) return -1;
++    return -2;
++  }
++  if (!start_route_clean_absent()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: start_not_clean_absent\n"); return -1; }
+   for (scan=outputs_device_list;scan;scan=scan->next)
+     {
+-      if (scan->busy) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_busy\n"); return false; }
+-      if (scan->attention_lease) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_lease\n"); return false; }
+-      if (scan->attention_retiring_session) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_retiring\n"); return false; }
+-      if (scan->attention_restart_pending) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restart_pending\n"); return false; }
+-      if (scan->attention_restoring) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restoring\n"); return false; }
+-    }
+-  return true;
+-}
++      if (scan->busy) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_busy\n"); return -1; }
++      if (scan->attention_lease) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_lease\n"); return -1; }
++      if (scan->attention_retiring_session) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_retiring\n"); return -1; }
++      if (scan->attention_restart_pending) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restart_pending\n"); return -1; }
++      if (scan->attention_restoring) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: attention_restoring\n"); return -1; }
++    }
++  return 0;
++}
++
++/* Compatibility predicate: only fully free owners are available. */
++bool outputs_connect_recovery_available(uint64_t id)
++{ return outputs_connect_recovery_status(id)==0; }
+ 
+ int
+ outputs_device_effective_volume(const struct output_device *device)
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -142,6 +142,8 @@
+ int outputs_transport_pause_confirm(uint64_t,const char *,const char *,uint64_t);
+ bool outputs_transport_current(const struct output_transport_result *);
+ bool outputs_transport_busy(void);
++/* 0 ready, -1 denied/unknown owner, -2 definitive pre-effect temporary custody. */
++int outputs_connect_recovery_status(uint64_t);
+ bool outputs_connect_recovery_available(uint64_t);
+ void outputs_transport_input_changed(uint64_t item_id, const char *path, bool pipe_input);
+ 
+--- a/src/player.c
++++ b/src/player.c
+@@ -3368,13 +3368,22 @@
+   return COMMAND_END;
+ }
+ 
++struct connect_recovery_volume_param {
++  struct speaker_attr_param speaker;
++  bool temporary_busy_no_effect;
++};
+ static enum command_state
+ volume_set_connect_recovery(void *arg, int *retval)
+ {
+-  struct speaker_attr_param *p=arg;
+-  if (p->volume!=35 || !outputs_connect_recovery_available(p->spk_id))
+-    { *retval=-1; return COMMAND_END; }
+-  return volume_setabs_speaker(arg,retval);
++  struct connect_recovery_volume_param *p=arg;
++  int admission;
++  if (p->speaker.volume!=35) { *retval=-1; return COMMAND_END; }
++  admission=outputs_connect_recovery_status(p->speaker.spk_id);
++  if (admission<0) {
++    p->temporary_busy_no_effect=admission==-2;
++    *retval=-1; return COMMAND_END;
++  }
++  return volume_setabs_speaker(&p->speaker,retval);
+ }
+ 
+ static enum command_state
+@@ -3998,10 +4007,15 @@
+ }
+ 
+ int
+-player_volume_set_connect_recovery(uint64_t id, int vol)
+-{
+-  struct speaker_attr_param p={.spk_id=id,.volume=vol};
+-  return commands_exec_sync(cmdbase,volume_set_connect_recovery,volume_generic_bh,&p);
++player_volume_set_connect_recovery(uint64_t id, int vol, bool *temporary_busy_no_effect)
++{
++  struct connect_recovery_volume_param p={.speaker={.spk_id=id,.volume=vol}};
++  int ret;
++  if (!temporary_busy_no_effect) return -1;
++  *temporary_busy_no_effect=false;
++  ret=commands_exec_sync(cmdbase,volume_set_connect_recovery,volume_generic_bh,&p);
++  *temporary_busy_no_effect=ret<0 && p.temporary_busy_no_effect;
++  return ret;
+ }
+ 
+ int
+--- a/src/player.h
++++ b/src/player.h
+@@ -197,7 +197,7 @@
+ 
+ int
+ player_volume_setabs_speaker(uint64_t id, int vol);
+-int player_volume_set_connect_recovery(uint64_t id, int vol);
++int player_volume_set_connect_recovery(uint64_t id, int vol, bool *temporary_busy_no_effect);
+ 
+ int
+ player_volume_setraw_speaker(uint64_t id, const char *volstr);
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -3348,7 +3348,7 @@
+ 
+   const char *recovery=hreq->query ? httpd_query_value_find(hreq->query,"recovery") : NULL;
+   if (recovery) {
+-    char canonical[32];
++    char canonical[32]; bool temporary_busy_no_effect=false;
+     param=httpd_query_value_find(hreq->query,"output_id");
+     param_volume=httpd_query_value_find(hreq->query,"volume");
+     if (strcmp(recovery,"connect") || !param || !param_volume || strcmp(param_volume,"35")
+@@ -3356,7 +3356,14 @@
+       return HTTP_BADREQUEST;
+     snprintf(canonical,sizeof(canonical),"%" PRIu64,output_id);
+     if (strcmp(param,canonical)) return HTTP_BADREQUEST;
+-    return player_volume_set_connect_recovery(output_id,35)<0 ? HTTP_INTERNAL : HTTP_NOCONTENT;
++    ret=player_volume_set_connect_recovery(output_id,35,&temporary_busy_no_effect);
++    if (temporary_busy_no_effect) {
++      /* Only the synchronous owner predicate emits this before any mutation.
++       * Generic errors and lost responses carry no replay permission. */
++      httpd_header_add(hreq->out_headers,"X-PodConnect-Recovery","temporary-busy-no-effect-v1");
++      return 409;
++    }
++    return ret<0 ? HTTP_INTERNAL : HTTP_NOCONTENT;
+   }
+ 
+   volume = 0;
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -55,6 +55,8 @@
+ {
+   return evhttp_find_header(query, key);
+ }
++void httpd_header_add(httpd_headers *headers,const char *key,const char *value)
++{ assert(headers); assert(evhttp_add_header(headers,key,value)==0); }
+ 
+ static int selection_fixture_set(uint64_t *ids)
+ {
+@@ -384,6 +386,48 @@
+   assert(!a->selected && !b->selected && !a->session && !b->session);
+   clear_devices();
+   puts("PASS PC29 actual C owner constant diagnostic reasons, first-denial order, allowed silence, no mutation");
++}
++
++
++/* PC33 reuses the real JSON API and C owner: a typed conflict proves no effect,
++ * while START/journal ownership is terminal and cannot earn retry permission. */
++static void connect_recovery_temporary_busy_contract(void)
++{
++  struct output_device *a=add_device(1);
++  struct evkeyvalq query,headers;
++  struct httpd_request request={0};
++  struct timespec saved=transport_custody_expiry;
++  int volume=a->volume; uint64_t base=a->base_revision,route=a->route_revision;
++  TAILQ_INIT(&query); TAILQ_INIT(&headers);
++  assert(evhttp_parse_query_str("recovery=connect&output_id=1&volume=35",&query)==0);
++  request.query=&query; request.out_headers=&headers;
++  assert(clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry)==0);
++  transport_custody_expiry.tv_sec+=60; transport_custody_live=true;
++  a->attention_lease=1;
++  assert(outputs_connect_recovery_status(1)==-1);
++  a->attention_lease=0;
++  assert(outputs_connect_recovery_status(1)==-2);
++  assert(jsonapi_reply_player_volume(&request)==409);
++  assert(!strcmp(evhttp_find_header(&headers,"X-PodConnect-Recovery"),"temporary-busy-no-effect-v1"));
++  evhttp_clear_headers(&headers);
++  atomic_store(&start_owned_latch,true);
++  assert(outputs_connect_recovery_status(1)==-1);
++  assert(jsonapi_reply_player_volume(&request)==HTTP_INTERNAL);
++  assert(!evhttp_find_header(&headers,"X-PodConnect-Recovery"));
++  atomic_store(&start_owned_latch,false);
++  start_journal_fault=true;
++  assert(outputs_connect_recovery_status(1)==-1);
++  assert(jsonapi_reply_player_volume(&request)==HTTP_INTERNAL);
++  assert(!evhttp_find_header(&headers,"X-PodConnect-Recovery"));
++  start_journal_fault=false;
++  transport_custody_live=false; transport_custody_expiry=saved;
++  assert(outputs_connect_recovery_status(1)==0);
++  assert(jsonapi_reply_player_volume(&request)==HTTP_NOCONTENT);
++  assert(!evhttp_find_header(&headers,"X-PodConnect-Recovery"));
++  assert(a->volume==volume && a->base_revision==base && a->route_revision==route);
++  assert(!a->selected && !a->session);
++  evhttp_clear_headers(&query); evhttp_clear_headers(&headers); clear_devices();
++  puts("PASS PC33 actual HTTP/C owner: temporary custody typed pre-effect conflict; START/journal terminal; drain returns ready; no mutation");
+ }
+ 
+ static void bases_and_legacy_selection(void)
+@@ -952,12 +996,27 @@
+   clear_devices();
+ }
+ 
++/* Keeping the real recovery-volume HTTP handler also links these ordinary
++ * player edges. This fixture must never enter them: fail closed, even with NDEBUG. */
++int player_speaker_get_byid(struct player_speaker_info *speaker,uint64_t id)
++{ (void)speaker;(void)id;assert(0 && "ordinary speaker lookup in recovery fixture");abort(); }
++int player_volume_setabs_speaker(uint64_t id,int volume)
++{ (void)id;(void)volume;assert(0 && "ordinary output volume in recovery fixture");abort(); }
++int player_volume_set(int volume)
++{ (void)volume;assert(0 && "ordinary master volume in recovery fixture");abort(); }
++int player_get_status(struct player_status *status)
++{ (void)status;assert(0 && "ordinary player status in recovery fixture");abort(); }
++
+ /* The fixture directly routes existing synchronous player API adapters to the
+  * actual output owner; HTTP parsing and owner state are the production TUs. */
+ int player_speaker_set_connect_recovery(uint64_t *ids)
+ { return ids && ids[0]==1 && outputs_connect_recovery_available(ids[1]) ? 0 : -1; }
+-int player_volume_set_connect_recovery(uint64_t id,int vol)
+-{ return vol==35 && outputs_connect_recovery_available(id) ? 0 : -1; }
++int player_volume_set_connect_recovery(uint64_t id,int vol,bool *temporary_busy_no_effect)
++{
++  int status=vol==35 ? outputs_connect_recovery_status(id) : -1;
++  *temporary_busy_no_effect=status==-2;
++  return status<0 ? -1 : 0;
++}
+ 
+ int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
+ { return outputs_transport_prepare(r,out); }
+@@ -1682,6 +1741,7 @@
+   connect_recovery_requires_clean_unowned_output();
+   connect_recovery_selection_query_contract();
+   connect_recovery_constant_diagnostics();
++  connect_recovery_temporary_busy_contract();
+   bases_and_legacy_selection();
+   manual_revision_and_old_lease();
+   failure_cannot_be_overwritten_or_cross_output();

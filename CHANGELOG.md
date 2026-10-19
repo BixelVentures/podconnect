@@ -1,3 +1,9 @@
+## Speakers 0.26.33 — accepted Connect transfer recovery candidate
+
+- Keep the same accepted Connect transfer pending within its existing five-second lifetime only after the native output owner explicitly proves a temporary refusal before any volume effect. Recheck the exact run, source, ordinal, alias and output ownership before routing.
+- Unknown requests, ordinary failures and failures after selection remain terminal. Persisted START ownership, quarantine and attention guards remain enforced; no automatic replay or new timeout.
+- Baseline Speakers0.26.32 and Control0.10.18 are published and installed on Green. This successor is a candidate: focused software checks and independent review are separate from official Linux CI, publication, installation and actual playback acceptance. Control remains0.10.18.
+
 ## Speakers 0.26.32 / Control 0.10.18 — candidate, unpublished
 
 - Speakers retains a still-owned paused HomePod session only after the actual guarded Native Pause succeeds and confirms its one-use C token. The existing stop timer re-proves current C START/source/reader/writer/route/session ownership; stale confirmation, competing C ownership, source loss and resumed playback retire retention. No automatic Resume, stale route identity or new timeout.

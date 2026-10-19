@@ -697,6 +697,10 @@ func routeAliasOutputForAttentionIntent(primaryOwnTone string, aliasId int, live
 }
 
 func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, guard func() bool, protectStart ...bool) (bool, bool) {
+	return routeAliasOutputWithGuardOutcome(primaryOwnTone, aliasId, live, revision, att, guard, nil, protectStart...)
+}
+
+func routeAliasOutputWithGuardOutcome(primaryOwnTone string, aliasId int, live *glLive, revision uint64, att *attention, guard func() bool, primeOutcome *startPrimeOutcome, protectStart ...bool) (bool, bool) {
 	recovery := len(protectStart) > 1 && protectStart[1]
 	diagnostic := func(reason string) {
 		if recovery {
@@ -773,9 +777,15 @@ func routeAliasOutputWithGuard(primaryOwnTone string, aliasId int, live *glLive,
 	if len(protectStart) > 0 && protectStart[0] {
 		// The bridge is the audible route owner. Prime the *saved exact output*
 		// before native attention or selection; pipe_autostart can start at selection.
-		if target.HomepodID == "" || devs[idx].ID != target.HomepodID ||
-			!current() ||
-			!primeConfiguredStartVolume(primaryOwnTone, target.HomepodID, false, recovery) {
+		if target.HomepodID == "" || devs[idx].ID != target.HomepodID || !current() {
+			diagnostic("prime_rejected_or_stale")
+			return false, current()
+		}
+		outcome := primeConfiguredStartVolumeOutcome(primaryOwnTone, target.HomepodID, false, recovery)
+		if primeOutcome != nil {
+			*primeOutcome = outcome
+		}
+		if outcome != startPrimeAccepted {
 			diagnostic("prime_rejected_or_stale")
 			return false, current()
 		}
@@ -900,7 +910,16 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				time.Sleep(200 * time.Millisecond)
 				continue // unknown bound selection cannot reclaim a positional primary
 			}
-			if tryExplicitConnectRecovery(room, live, att) {
+			if handled, completed := tryExplicitConnectRecoveryOutcome(room, live, att); handled {
+				// Seed history from the exact successful route receipt, not a
+				// possibly older snapshot or a new event after its completion.
+				if completed != nil {
+					lastAlias = completed.alias
+					lastAliasBinding = copyAliasBinding(completed.binding)
+					aliasRoutePending = false
+					capped = false
+					volCanon = -1
+				}
 				prevActive = gl.Active
 				time.Sleep(200 * time.Millisecond)
 				continue

@@ -92,6 +92,9 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/paused-route-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/paused-route-owntone.patch"
           git apply "$patch_dir/paused-route-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-recovery-busy-owntone.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/connect-recovery-busy-owntone.patch"
+          git apply "$patch_dir/connect-recovery-busy-owntone.patch"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
