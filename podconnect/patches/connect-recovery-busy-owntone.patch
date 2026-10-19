@@ -214,7 +214,22 @@
  }
  
  static void bases_and_legacy_selection(void)
-@@ -956,8 +1000,12 @@
+@@ -952,12 +996,27 @@
+   clear_devices();
+ }
+ 
++/* Keeping the real recovery-volume HTTP handler also links these ordinary
++ * player edges. This fixture must never enter them: fail closed, even with NDEBUG. */
++int player_speaker_get_byid(struct player_speaker_info *speaker,uint64_t id)
++{ (void)speaker;(void)id;assert(0 && "ordinary speaker lookup in recovery fixture");abort(); }
++int player_volume_setabs_speaker(uint64_t id,int volume)
++{ (void)id;(void)volume;assert(0 && "ordinary output volume in recovery fixture");abort(); }
++int player_volume_set(int volume)
++{ (void)volume;assert(0 && "ordinary master volume in recovery fixture");abort(); }
++int player_get_status(struct player_status *status)
++{ (void)status;assert(0 && "ordinary player status in recovery fixture");abort(); }
++
+ /* The fixture directly routes existing synchronous player API adapters to the
   * actual output owner; HTTP parsing and owner state are the production TUs. */
  int player_speaker_set_connect_recovery(uint64_t *ids)
  { return ids && ids[0]==1 && outputs_connect_recovery_available(ids[1]) ? 0 : -1; }
@@ -229,7 +244,7 @@
  
  int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
  { return outputs_transport_prepare(r,out); }
-@@ -1682,6 +1730,7 @@
+@@ -1682,6 +1741,7 @@
    connect_recovery_requires_clean_unowned_output();
    connect_recovery_selection_query_contract();
    connect_recovery_constant_diagnostics();
