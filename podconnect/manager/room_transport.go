@@ -161,7 +161,7 @@ func validTransportScope(s roomTransportScope) bool {
 	return engineIDPattern.MatchString(s.Target) && s.Room != "" && len(s.Room) <= 128 && s.Homepod != "" && len(s.Homepod) <= 128 && s.Account != "" && len(s.Account) <= 160
 }
 func validTransportIdentity(i roomTransportIdentity, s roomTransportScope) bool {
-	return i.Account == s.Account && i.Target == s.Target && i.Room == s.Room && i.Homepod == s.Homepod && i.Connection != "" && len(i.Connection) <= 160 && i.Session != "" && len(i.Session) <= 160 && i.Incarnation != "" && len(i.Incarnation) <= 160 && transportDigest.MatchString(i.Registry) && i.Revision < 1<<53
+	return i.Account == s.Account && i.Target == s.Target && i.Room == s.Room && i.Homepod == s.Homepod && i.Connection != "" && len(i.Connection) <= 255 && i.Session != "" && len(i.Session) <= 255 && i.Incarnation != "" && len(i.Incarnation) <= 160 && transportDigest.MatchString(i.Registry) && i.Revision < 1<<53
 }
 func validOutputTransportIdentity(i outputTransportIdentity, homepod string) bool {
 	return transportUUID.MatchString(i.Process) && i.Device == homepod && transportDecimal.MatchString(i.Device) && transportDecimal.MatchString(i.Incarnation) && transportDecimal.MatchString(i.Session) && transportDecimal.MatchString(i.Route) && transportDecimal.MatchString(i.Selection) && transportDecimal.MatchString(i.Input) && transportDecimal.MatchString(i.Item) && transportDigest.MatchString(i.InputDigest)

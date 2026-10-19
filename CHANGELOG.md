@@ -1,3 +1,9 @@
+## Speakers 0.26.31 — native receiver owner contract
+
+- Accept the existing Native and OwnTone connection/session identifier limit of255 bytes during exact-room transport reads; the manager previously rejected valid161–255-byte identifiers with `receiver_proof_unavailable`.
+- Preserve exact account, engine, room, HomePod, alias incarnation/registry, current receiver and output ownership checks. Oversized identifiers still reject. No routing, released-marker, replay, volume or Control contract changes.
+- Add causal manager read regressions and wrong-owner negative cases. The source-contract mismatch is reproduced; whether it caused the observed Green player failure remains unconfirmed. Publication, installation and physical acceptance are separate checks.
+
 ## Speakers 0.26.27 / Control 0.10.17 — combined candidate, unpublished
 
 - Carry the reviewed terminal manual Next continuation from the unpublished Speakers 0.26.26 draft without changing its native source bytes.
