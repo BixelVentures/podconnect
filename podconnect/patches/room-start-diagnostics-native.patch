@@ -178,7 +178,7 @@ index b985e92..eb86565 100644
  }
  func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index 8d0830b..99c5a73 100644
+index 8d0830b..0f96467 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -3,6 +3,7 @@ package daemon
@@ -340,3 +340,12 @@ index 8d0830b..99c5a73 100644
  			completedC := mode == "complete" || mode == "move-complete" || mode == "start-complete"
  			// This protocol fixture deliberately has no actual player worker or
  			// FIFO descriptor. A C COMPLETE alone can no longer credit START.
+@@ -284,7 +397,7 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+ 				}
+ 				cMu.Unlock()
+ 			}
+-			if receipt.State != "unknown" && mode != "wrong-content" {
++			if receipt.State != "unknown" && mode != "wrong-content" && mode != "consume-fails" {
+ 				t.Fatal("postgateuncertainty relabelled", receipt)
+ 			}
+ 		})
