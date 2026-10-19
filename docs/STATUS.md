@@ -1,4 +1,40 @@
-# Active lead decision · Speakers0.26.30 candidate / unchanged Control0.10.17
+# Active lead decision · Speakers0.26.31 candidate / unchanged Control0.10.17
+
+Base: published/installed Speakers0.26.30, merge7c51ecb4c15c182c0fcdf3904cf5d18120d9cf93,
+tree770abcc49afd5d4f472defcc8d4d6850833668ae. This source candidate is not published or installed.
+
+Observed19October: one PodView2.0.60 card Play selected Shallow on the configured
+Kitchen Spotify engine. A fresh provider observation showed that exact target
+playing, while the current native room read returned receiver_proof_unavailable
+and PodView retained its pending player. Actual identifier lengths and the exact
+native predicate/HTTP failure are not exposed by the captured normal UI/logs;
+field causality remains unconfirmed. No extra Play or receiver workaround follows
+from this source finding.
+
+Source defect: the Native bound-owner producer and OwnTone output owner accept
+connection/session identifiers through255 bytes, but the manager alone capped
+both at160. Real manager read fixtures reproduce rejection for161/255-byte native
+owners while160 passes. Align only those two manager limits with the existing
+255-byte contract. Keep exact account, target, room, HomePod, alias incarnation,
+registry, currentness, C route and no-replay checks;256 bytes and wrong owners
+still reject. The RELEASED marker is intentional and remains untouched.
+
+Scope: one existing manager validator, one causal regression file, Speakers
+version metadata and these changelog/status entries. Control0.10.17, Dockerfile,
+Native/OwnTone patches and their manifests, rootfs, workflows and policies retain
+exact30 bytes. Use the existing two-architecture branch prebuild and immutable
+source-subtree promotion procedure before advertising31 on main. No new release
+lane, service, fallback, admission, policy or integration release.
+
+The focused source regressions and independent manager suite/vet passed. The
+final candidate manager race suite passed (36.364s) and vet passed. Independent
+packaging review, publication and installation remain separate gates.
+Source review and tests do not establish actual Green playback, player recovery,
+physical sound, current owner transfer or household acceptance.
+
+---
+
+# Historical lead decision · Speakers0.26.30 candidate / unchanged Control0.10.17
 
 Lead: this chat's native delivery owner, coordinated with the PodView main lead.
 Base: installed/published Speakers0.26.29, merge696d793e9bed5adef71b43c029e12768c9a2377f,
