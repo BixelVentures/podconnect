@@ -22,7 +22,9 @@ from .const import SPOTIFY_API
 class SpotifyApiError(Exception):
     """Raised when a Spotify Web API request fails."""
 
-    def __init__(self, message: str, *, status: int | None = None, retry_after: int | None = None):
+    def __init__(
+        self, message: str, *, status: int | None = None, retry_after: int | None = None
+    ):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
@@ -79,8 +81,18 @@ class SpotifyApi:
                     retry_after = None
                     if resp.status == 429:
                         header = resp.headers.get("Retry-After", "")
-                        retry_after = max(10, min(3600, int(header))) if header.isascii() and header.isdigit() and len(header) <= 6 else 60
-                    raise SpotifyApiError("Spotify queue read failed", status=resp.status, retry_after=retry_after)
+                        retry_after = (
+                            max(10, min(3600, int(header)))
+                            if header.isascii()
+                            and header.isdigit()
+                            and len(header) <= 6
+                            else 60
+                        )
+                    raise SpotifyApiError(
+                        "Spotify queue read failed",
+                        status=resp.status,
+                        retry_after=retry_after,
+                    )
                 if resp.content_type != "application/json":
                     raise SpotifyApiError("Invalid queue content type")
                 raw = bytearray()
@@ -96,15 +108,17 @@ class SpotifyApi:
                     f"rate limited (retry-after={resp.headers.get('Retry-After')}s)"
                 )
             if resp.status >= 400:
-                raise SpotifyApiError(f"{method} {path} -> {resp.status}: {await resp.text()}")
+                raise SpotifyApiError(
+                    f"{method} {path} -> {resp.status}: {await resp.text()}"
+                )
             if resp.content_type == "application/json":
                 return await resp.json()
             return None
 
     # --- read ---
     async def current_user(self) -> dict[str, Any]:
-        """GET /me."""
-        return await self._request("GET", "/me")
+        """Bounded GET /me through this entry's existing OAuth session."""
+        return await self._request("GET", "/me", max_bytes=16384)
 
     async def playback_state(self) -> dict[str, Any] | None:
         """GET /me/player (None when nothing is playing)."""
@@ -131,9 +145,12 @@ class SpotifyApi:
         limit: int = 8,
     ) -> dict[str, Any]:
         """GET /search — returns {tracks,artists,albums,playlists: {items:[...]}}."""
-        return await self._request(
-            "GET", "/search", params={"q": query, "type": types, "limit": limit}
-        ) or {}
+        return (
+            await self._request(
+                "GET", "/search", params={"q": query, "type": types, "limit": limit}
+            )
+            or {}
+        )
 
     async def top_artists(self, limit: int = 20) -> list[dict[str, Any]]:
         """GET /me/top/artists (needs user-top-read)."""
@@ -191,7 +208,11 @@ class SpotifyApi:
             params={"device_id": device_id},
             json=body or None,
             **(
-                {"execution_guard": execution_guard, "async_execution_guard": async_execution_guard, "on_send": on_send}
+                {
+                    "execution_guard": execution_guard,
+                    "async_execution_guard": async_execution_guard,
+                    "on_send": on_send,
+                }
                 if execution_guard is not None
                 else {}
             ),
@@ -306,7 +327,15 @@ class SpotifyApi:
     ) -> None:
         """PUT /me/player — move playback to a device."""
         await self._request(
-            "PUT", "/me/player", json={"device_ids": [device_id], "play": play},
-            **({"execution_guard": execution_guard, "async_execution_guard": async_execution_guard}
-               if execution_guard is not None else {}),
+            "PUT",
+            "/me/player",
+            json={"device_ids": [device_id], "play": play},
+            **(
+                {
+                    "execution_guard": execution_guard,
+                    "async_execution_guard": async_execution_guard,
+                }
+                if execution_guard is not None
+                else {}
+            ),
         )
