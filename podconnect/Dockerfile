@@ -67,6 +67,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/paused-route-native.patch" \
   && git apply --check "/patches/vorbis-cleanup-native.patch" \
   && git apply "/patches/vorbis-cleanup-native.patch" \
+  && git apply --check "/patches/room-start-diagnostics-native.patch" \
+  && git apply "/patches/room-start-diagnostics-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 

@@ -1,0 +1,342 @@
+diff --git a/daemon/room_content_execute.go b/daemon/room_content_execute.go
+index b985e92..eb86565 100644
+--- a/daemon/room_content_execute.go
++++ b/daemon/room_content_execute.go
+@@ -74,11 +74,28 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 	op.mu.Unlock()
+ 	defer cancel()
+ 	defer op.discard()
+-	failed := func() {
++	// Error text, owner identity and selected content never enter this log.
++	// Step failure classes identify the observed boundary, not its root cause.
++	// Deadline/cancelled describes the commit context when known; a narrower
++	// critical deadline can still appear as a generic step failure.
++	cFailure := func(err error) string {
++		if err != nil {
++			return "c_step_failed"
++		}
++		return "terminal_c_phase"
++	}
++	failed := func(stage, errorClass, phaseBeforeCancel string) {
+ 		op.mu.Lock()
+ 		reply := op.CReceipt
+ 		possible := op.Possible
+ 		cancelled := op.Cancelled || ctx.Err() != nil
++		phase := "none"
++		if reply != nil {
++			phase = reply.Phase // Only cValid-accepted finite phases are retained.
++		}
++		if phaseBeforeCancel != "" {
++			phase = phaseBeforeCancel
++		}
+ 		op.mu.Unlock()
+ 		state := "unknown"
+ 		if !possible || (reply != nil && !reply.Possible && reply.Drained && (reply.Phase == "rejected_before_admission" || reply.Phase == "cancelled_before_admission" || reply.Phase == "expired_before_admission")) {
+@@ -87,23 +104,48 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 				state = "cancelled"
+ 			}
+ 		}
++		if phaseBeforeCancel == "" {
++			if ctx.Err() == context.DeadlineExceeded {
++				errorClass = "deadline"
++			} else if cancelled {
++				errorClass = "cancelled"
++			}
++		}
+ 		if possible {
+ 			op.cancelContent()
+ 		}
+ 		op.finish(state)
++		// Report the finite pre-cancel phase after the original cancel/finish order.
++		// Native consume preserves its original cancel-first order and supplies
++		// the finite phase captured before that cancellation. Log outside op.mu.
++		if op.Owner != nil && op.Owner.app != nil && op.Owner.app.log != nil {
++			op.Owner.app.log.Warnf("content_start_failed stage=%s last_c_phase=%s error_class=%s outcome=%s", stage, phase, errorClass, state)
++		}
+ 	}
+ 	if ctx.Err() != nil {
+-		failed()
++		failed("admission", "context_done", "")
+ 		return
+ 	}
+ 	prepared, err := op.cCall(ctx, "POST", "prepare", op.cPrepareBody())
+ 	if err != nil || prepared.Phase != "prepared" {
+-		failed()
++		failed("c_prepare", cFailure(err), "")
+ 		return
+ 	}
+ 	if _, err = server.roomTransportAsk(ctx, apiContentConsume, contentActorRequest{Operation: op, Context: ctx}); err != nil {
++		op.mu.Lock()
++		errorClass := "native_actor_failed"
++		if ctx.Err() == context.DeadlineExceeded {
++			errorClass = "deadline"
++		} else if op.Cancelled || ctx.Err() != nil {
++			errorClass = "cancelled"
++		}
++		phase := "none"
++		if op.CReceipt != nil {
++			phase = op.CReceipt.Phase
++		}
++		op.mu.Unlock()
+ 		op.cancelContent()
+-		failed()
++		failed("native_consume", errorClass, phase)
+ 		return
+ 	}
+ 	var priorMove *moveOperation
+@@ -111,7 +153,7 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 	if op.Owner.app != nil {
+ 		priorMove, priorStart, err = op.Owner.app.contentCustodySnapshot()
+ 		if err != nil {
+-			failed()
++			failed("custody_snapshot", "owner_changed", "")
+ 			return
+ 		}
+ 	}
+@@ -135,7 +177,7 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		reply, err = op.cPoll(critical, reply, "gate_closed_reader_ready")
+ 	}
+ 	if err != nil || reply.Pipe == nil {
+-		failed()
++		failed("c_commit", cFailure(err), "")
+ 		return
+ 	}
+ 	// C's exact gate-closed commit has replaced its active MOVE token before
+@@ -157,11 +199,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 	op.mu.Unlock()
+ 	op.Owner.aliasMu.Unlock()
+ 	if !current || err != nil {
+-		failed()
++		failed("custody_supersede", "owner_changed", "")
+ 		return
+ 	}
+ 	if err = op.actorStep(critical, "quiesce"); err != nil {
+-		failed()
++		failed("native_quiesce", "native_actor_failed", "")
+ 		return
+ 	}
+ 	op.mu.Lock()
+@@ -179,11 +221,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		reply, err = op.cPoll(critical, reply, "route_ready_closed")
+ 	}
+ 	if err != nil {
+-		failed()
++		failed("c_barrier", cFailure(err), "")
+ 		return
+ 	}
+ 	if err = op.actorStep(critical, "publish"); err != nil {
+-		failed()
++		failed("native_publish", "native_actor_failed", "")
+ 		return
+ 	}
+ 	reply, err = op.cCall(critical, "POST", "open", struct {
+@@ -193,11 +235,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		Actual      roomTransportIdentity `json:"committed_native_owner"`
+ 	}{prepared.Token, op.ReservationID, epoch, *op.Actual})
+ 	if err != nil || reply.Phase != "opened" {
+-		failed()
++		failed("c_open", cFailure(err), "")
+ 		return
+ 	}
+ 	if err = op.actorStep(critical, "resume"); err != nil {
+-		failed()
++		failed("native_resume", "native_actor_failed", "")
+ 		return
+ 	}
+ 	// Only this bookkeeping ACK can release the actor and report completion.
+@@ -210,7 +252,7 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		Drained     bool                  `json:"native_mutators_drained"`
+ 	}{prepared.Token, op.ReservationID, epoch, *op.Actual, true})
+ 	if err != nil || reply.Phase != "completed" {
+-		failed()
++		failed("c_complete", cFailure(err), "")
+ 		return
+ 	}
+ 	// C COMPLETE may block while the independent output loop closes on EOF or
+@@ -225,12 +267,12 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 	pipe, epoch = op.Pipe, op.Epoch
+ 	op.mu.Unlock()
+ 	if !current || op.Owner.app == nil {
+-		failed()
++		failed("writer_capture", "writer_missing", "")
+ 		return
+ 	}
+ 	writerFD := op.Owner.app.startWriterFD(op, pipe)
+ 	if writerFD == "" {
+-		failed()
++		failed("writer_current", "writer_missing", "")
+ 		return
+ 	}
+ 	err = op.Owner.player.VerifyStart35(ctx, selected, pipe, epoch, writerFD, func(mutate func()) error {
+@@ -253,7 +295,7 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		return nil
+ 	})
+ 	if err != nil {
+-		failed()
++		failed("final_custody", "owner_changed", "")
+ 	}
+ }
+ func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 8d0830b..99c5a73 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -3,6 +3,7 @@ package daemon
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+@@ -140,10 +141,45 @@ func TestStart35ActualConsumeFencesOwnerMutationAndOneUse(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Capture the real owner log without adding a new logger or protocol seam.
++type contentFailureLog struct {
++	librespot.NullLogger
++	mu    sync.Mutex
++	lines []string
++}
++
++func (l *contentFailureLog) Warnf(format string, args ...interface{}) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.lines = append(l.lines, fmt.Sprintf(format, args...))
++}
++
++// Expire at the exact HTTP exchange boundary, without a wall-clock race.
++type contentFailureDeadline struct {
++	context.Context
++	done chan struct{}
++	once sync.Once
++}
++
++func (c *contentFailureDeadline) Done() <-chan struct{} { return c.done }
++func (c *contentFailureDeadline) Err() error {
++	select {
++	case <-c.done:
++		return context.DeadlineExceeded
++	default:
++		return nil
++	}
++}
++func (c *contentFailureDeadline) expire() { c.once.Do(func() { close(c.done) }) }
++
+ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testing.T) {
+-	for _, mode := range []string{"complete", "wrong-pipe", "wrong-content", "open-fails", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
++	for _, mode := range []string{"complete", "consume-fails", "wrong-pipe", "wrong-content", "open-fails", "open-exchange-fails", "open-deadline", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, op := contentFixture(t)
++			log := &contentFailureLog{}
++			p.app.log = log
++			deadline := &contentFailureDeadline{Context: context.Background(), done: make(chan struct{})}
+ 			var priorMove *moveOperation
+ 			var priorStart *contentOperation
+ 			if strings.HasPrefix(mode, "move-") {
+@@ -164,6 +200,16 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+ 				cMu.Lock()
+ 				calls = append(calls, endpoint)
+ 				cMu.Unlock()
++				if endpoint == "open" && mode == "open-exchange-fails" {
++					w.WriteHeader(http.StatusServiceUnavailable)
++					_, _ = w.Write([]byte("private-diagnostic-sentinel"))
++					return
++				}
++				if endpoint == "open" && mode == "open-deadline" {
++					deadline.expire()
++					<-r.Context().Done()
++					return
++				}
+ 				var body map[string]json.RawMessage
+ 				_ = json.NewDecoder(r.Body).Decode(&body)
+ 				want := map[string]int{"prepare": 12, "commit": 9, "barrier": 6, "open": 4, "complete": 5, "cancel": 2}[endpoint]
+@@ -204,6 +250,10 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+ 			go func() {
+ 				defer close(done)
+ 				for request := range server.requests {
++					if mode == "consume-fails" {
++						request.Reply(nil, ErrAliasConflict)
++						continue
++					}
+ 					value, err := p.handleApiRequest(context.Background(), request)
+ 					request.Reply(value, err)
+ 				}
+@@ -246,11 +296,74 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+ 					}
+ 				}
+ 			}()
+-			op.commit(context.Background(), server)
++			commitContext := context.Context(context.Background())
++			if mode == "open-deadline" {
++				commitContext = deadline
++			}
++			op.commit(commitContext, server)
+ 			receipt := op.receipt("commit")
+ 			close(server.requests)
+ 			<-done
+ 			<-stopped
++			if mode == "consume-fails" {
++				log.mu.Lock()
++				lines := append([]string(nil), log.lines...)
++				log.mu.Unlock()
++				want := "content_start_failed stage=native_consume last_c_phase=prepared error_class=native_actor_failed outcome=cancelled"
++				if len(lines) != 1 || lines[0] != want {
++					t.Fatalf("actor failure relabelled by cleanup: got %q want %q", lines, want)
++				}
++				if !op.Cancelled || receipt.State != "cancelled" || len(nativeSteps) != 0 || p.app.startCustody != nil {
++					t.Fatal("consume failure changed cancellation, native steps or custody", receipt, nativeSteps)
++				}
++				op.commit(context.Background(), server)
++				cMu.Lock()
++				prepares := 0
++				for _, call := range calls {
++					if call == "prepare" {
++						prepares++
++					}
++					if call != "prepare" && call != "cancel" {
++						t.Fatal("failed consume advanced/replayed", calls)
++					}
++				}
++				if prepares != 1 {
++					t.Fatal("failed consume repeated preparation", calls)
++				}
++				cMu.Unlock()
++			}
++			if mode == "open-fails" || mode == "open-exchange-fails" || mode == "open-deadline" {
++				phase, class := "unknown", "terminal_c_phase"
++				if mode == "open-exchange-fails" {
++					phase, class = "route_ready_closed", "c_step_failed"
++				}
++				if mode == "open-deadline" {
++					phase, class = "route_ready_closed", "deadline"
++				}
++				want := fmt.Sprintf("content_start_failed stage=c_open last_c_phase=%s error_class=%s outcome=unknown", phase, class)
++				log.mu.Lock()
++				lines := append([]string(nil), log.lines...)
++				log.mu.Unlock()
++				if len(lines) != 1 || lines[0] != want {
++					t.Fatalf("finite owner diagnostic: got %q want %q", lines, want)
++				}
++				if strings.Join(nativeSteps, ",") != "quiesce,publish" {
++					t.Fatal("failed open resumed or skipped old source quiescence", nativeSteps)
++				}
++				if p.app.startCustody != op || receipt.State != "unknown" {
++					t.Fatal("post-commit failure lost custody or changed UNKNOWN", receipt)
++				}
++				op.commit(context.Background(), server)
++				cMu.Lock()
++				counts := map[string]int{}
++				for _, call := range calls {
++					counts[call]++
++				}
++				if counts["prepare"] != 1 || counts["commit"] != 1 || counts["barrier"] != 1 || counts["open"] != 1 || counts["complete"] != 0 {
++					t.Fatal("failed open completed/replayed", counts)
++				}
++				cMu.Unlock()
++			}
+ 			completedC := mode == "complete" || mode == "move-complete" || mode == "start-complete"
+ 			// This protocol fixture deliberately has no actual player worker or
+ 			// FIFO descriptor. A C COMPLETE alone can no longer credit START.
