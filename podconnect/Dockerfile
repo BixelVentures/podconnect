@@ -102,6 +102,8 @@ COPY patches/paused-route-owntone.patch /patches/paused-route-owntone.patch
 COPY patches/connect-recovery-busy-owntone.patch /patches/connect-recovery-busy-owntone.patch
 COPY patches/paused-route-owntone.sha256 /patches/paused-route-owntone.sha256
 COPY patches/connect-recovery-busy-owntone.sha256 /patches/connect-recovery-busy-owntone.sha256
+COPY patches/fifo-reader-handoff-owntone.patch /patches/fifo-reader-handoff-owntone.patch
+COPY patches/fifo-reader-handoff-owntone.sha256 /patches/fifo-reader-handoff-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -136,6 +138,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-recovery-busy-owntone.sha256 \
   && git apply --check /patches/connect-recovery-busy-owntone.patch \
   && git apply /patches/connect-recovery-busy-owntone.patch \
+  && sha256sum -c /patches/fifo-reader-handoff-owntone.sha256 \
+  && git apply --check /patches/fifo-reader-handoff-owntone.patch \
+  && git apply /patches/fifo-reader-handoff-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
