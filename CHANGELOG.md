@@ -1,3 +1,9 @@
+## Speakers 0.26.32 / Control 0.10.18 — candidate, unpublished
+
+- Speakers retains a still-owned paused HomePod session only after the actual guarded Native Pause succeeds and confirms its one-use C token. The existing stop timer re-proves current C START/source/reader/writer/route/session ownership; stale confirmation, competing C ownership, source loss and resumed playback retire retention. No automatic Resume, stale route identity or new timeout.
+- Control projects the first canonical Spotify playlist image as `playlist_cover` only when the optional advertised `include_artwork` argument is true. Legacy calls still receive exact URI/name rows; newer consumers negotiate the optional field through existing HA service discovery. Missing or invalid images leave playlists usable without artwork. No image fetch, private provider metadata or command-authority change.
+- Source/package review and controlled local checks are recorded separately from the mandatory official Linux Native/C and HA framework checks, immutable image prebuild, exact-source promotion, publication, installation and physical acceptance. None of those delivery gates is implied by this candidate entry.
+
 ## Speakers 0.26.31 — native receiver owner contract
 
 - Accept the existing Native and OwnTone connection/session identifier limit of255 bytes during exact-room transport reads; the manager previously rejected valid161–255-byte identifiers with `receiver_proof_unavailable`.

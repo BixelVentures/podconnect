@@ -1,0 +1,156 @@
+diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -26,6 +26,43 @@
+ 	PinRemainingMS  int    `json:"pin_remaining_ms"`
+ 	Outcome         string `json:"outcome"`
+ 	Physical        bool   `json:"physical_result_verified"`
++}
++type roomTransportPauseConfirmation struct {
++	Schema          string `json:"schema"`
++	OK              bool   `json:"ok"`
++	Token           string `json:"token"`
++	NativePrepareID string `json:"native_prepare_id"`
++	NativeRevision  string `json:"native_revision"`
++	Physical        *bool  `json:"physical_result_verified"`
++}
++
++func confirmBoundPause(ctx context.Context, client *http.Client, offer *nativeTransportOffer, token string) error {
++	confirmation := struct {
++		Token           string `json:"token"`
++		NativePrepareID string `json:"native_prepare_id"`
++		NativeRevision  string `json:"native_revision"`
++	}{token, offer.Snapshot.PrepareID, offer.NativeRevision}
++	body, _ := json.Marshal(confirmation)
++	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/bound-pause-confirm"
++	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return err
++	}
++	call.Header.Set("Content-Type", "application/json")
++	response, err := client.Do(call)
++	if err != nil {
++		return err
++	}
++	defer response.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(response.Body, 2049))
++	if err != nil || len(raw) > 2048 || response.StatusCode != http.StatusOK {
++		return ErrAliasConflict
++	}
++	var ack roomTransportPauseConfirmation
++	if strictVolumeJSON(raw, &ack) != nil || ack.Schema != "podconnect.output_transport_pause_confirmation.v1" || !ack.OK || ack.Token != token || ack.NativePrepareID != offer.Snapshot.PrepareID || ack.NativeRevision != offer.NativeRevision || ack.Physical == nil || *ack.Physical {
++		return ErrAliasConflict
++	}
++	return nil
+ }
+ 
+ func (s *ConcreteApiServer) roomTransportAsk(ctx context.Context, typ ApiRequestType, data any) (any, error) {
+@@ -210,5 +247,26 @@
+ 	}
+ 	// No public endpoint accepts this pointer. A real C ACK is required to enqueue.
+ 	data, err := s.roomTransportAsk(ctx, apiRoomTransportEffect, roomTransportEffectRequest{offer, ctx})
++	if offer.Bound && offer.Snapshot.Action == "pause" && err == nil {
++		// Only the private actor can report this actual guarded effect. COMMIT's
++		// earlier C ACK proves admission, not that the receiver has paused.
++		effect, marshalErr := json.Marshal(data)
++		var accepted struct {
++			Schema         string `json:"schema"`
++			AcceptedNative bool   `json:"accepted_native"`
++			PrepareID      string `json:"prepare_id"`
++			Physical       *bool  `json:"physical_result_verified"`
++		}
++		if marshalErr != nil || strictVolumeJSON(effect, &accepted) != nil || accepted.Schema != "podconnect.native_room_transport_commit.v2" || !accepted.AcceptedNative || accepted.PrepareID != offer.Snapshot.PrepareID || accepted.Physical == nil || *accepted.Physical {
++			roomTransportResponse(w, nil, ErrAliasConflict)
++			return
++		}
++		if err = confirmBoundPause(ctx, client, offer, request.OwnToneToken); err != nil {
++			// Effect may already have happened. The caller must keep UNKNOWN and
++			// must never replay this one-use transport operation.
++			roomTransportResponse(w, nil, err)
++			return
++		}
++	}
+ 	roomTransportResponse(w, data, err)
+ }
+diff --git a/daemon/room_burst_test.go b/daemon/room_burst_test.go
+--- a/daemon/room_burst_test.go
++++ b/daemon/room_burst_test.go
+@@ -193,7 +193,7 @@
+ }
+ 
+ func TestRoomBurstAudioHTTPRequiresActualExactBoundProof(t *testing.T) {
+-	for _, mode := range []string{"accepted", "foreign-revision", "foreign-owner", "downgrade", "old-endpoint"} {
++	for _, mode := range []string{"accepted", "foreign-revision", "foreign-owner", "downgrade", "old-endpoint", "effect-failure", "effect-unknown", "effect-missing-physical", "effect-null-physical", "confirm-failure", "stale-confirm", "confirm-missing-physical", "confirm-null-physical"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, offer := roomTransportAdmittedFixture(t)
+ 			revision, err := p.nextNativeIntent()
+@@ -203,7 +203,31 @@
+ 			offer.Bound = true
+ 			offer.NativeRevision = revision
+ 			offer.Snapshot.NativeRevision = revision
++			var confirmations atomic.Int32
+ 			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path == "/api/outputs/101/transport/bound-pause-confirm" {
++					confirmations.Add(1)
++					var request map[string]any
++					if json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 3 || request["token"] != strings.Repeat("c", 32) || request["native_prepare_id"] != offer.Snapshot.PrepareID || request["native_revision"] != revision {
++						t.Error("pause confirmation did not carry exact consumed capability")
++					}
++					if mode == "confirm-failure" {
++						w.WriteHeader(http.StatusConflict)
++						return
++					}
++					replyRevision := revision
++					if mode == "stale-confirm" {
++						replyRevision = "2"
++					}
++					reply := map[string]any{"schema": "podconnect.output_transport_pause_confirmation.v1", "ok": true, "token": strings.Repeat("c", 32), "native_prepare_id": offer.Snapshot.PrepareID, "native_revision": replyRevision, "physical_result_verified": false}
++					if mode == "confirm-missing-physical" {
++						delete(reply, "physical_result_verified")
++					} else if mode == "confirm-null-physical" {
++						reply["physical_result_verified"] = nil
++					}
++					_ = json.NewEncoder(w).Encode(reply)
++					return
++				}
+ 				if r.URL.Path != "/api/outputs/101/transport/bound-commit" {
+ 					t.Error("unbound fallback", r.URL.Path)
+ 				}
+@@ -245,7 +269,19 @@
+ 					switch req.Type {
+ 					case apiRoomTransportEffect:
+ 						effects.Add(1)
+-						req.Reply(map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": true, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}, nil)
++						if mode == "effect-failure" {
++							req.Reply(nil, ErrAliasConflict)
++						} else if mode == "effect-unknown" {
++							req.Reply(map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": false, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}, nil)
++						} else {
++							reply := map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": true, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}
++							if mode == "effect-missing-physical" {
++								delete(reply, "physical_result_verified")
++							} else if mode == "effect-null-physical" {
++								reply["physical_result_verified"] = nil
++							}
++							req.Reply(reply, nil)
++						}
+ 					default:
+ 						data, err := p.handleApiRequest(context.Background(), req)
+ 						req.Reply(data, err)
+@@ -260,7 +296,15 @@
+ 			server.handleRoomTransportCommit(out, httptest.NewRequest("POST", path, strings.NewReader(`{"prepare_id":"`+offer.Snapshot.PrepareID+`","own_tone_token":"`+strings.Repeat("c", 32)+`"}`)))
+ 			close(server.requests)
+ 			<-done
+-			if (mode == "accepted") != (out.Code == 200 && effects.Load() == 1) {
++			wantEffects := int32(1)
++			if mode == "foreign-revision" || mode == "foreign-owner" || mode == "downgrade" || mode == "old-endpoint" {
++				wantEffects = 0
++			}
++			wantConfirmations := int32(0)
++			if mode == "accepted" || mode == "confirm-failure" || mode == "stale-confirm" || mode == "confirm-missing-physical" || mode == "confirm-null-physical" {
++				wantConfirmations = 1
++			}
++			if (mode == "accepted") != (out.Code == 200) || effects.Load() != wantEffects || confirmations.Load() != wantConfirmations {
+ 				t.Fatal("wrong bound proof reached private effect", mode, out.Code, out.Body.String(), effects.Load())
+ 			}
+ 		})

@@ -10,7 +10,7 @@ ARTWORK_MAX_URL_LENGTH = 512
 _ARTWORK_PATH = re.compile(r"^/image/[A-Za-z0-9_-]{1,128}$")
 
 
-def _allowed_spotify_image_url(value: object) -> str | None:
+def _allowed_spotify_image_url(value: object, *, canonical: bool = False) -> str | None:
     if not isinstance(value, str) or not 1 <= len(value) <= ARTWORK_MAX_URL_LENGTH:
         return None
     try:
@@ -24,6 +24,7 @@ def _allowed_spotify_image_url(value: object) -> str | None:
             or parsed.query
             or parsed.fragment
             or not _ARTWORK_PATH.fullmatch(parsed.path)
+            or (canonical and value != f"https://{ARTWORK_HOST}{parsed.path}")
         ):
             return None
     except ValueError:
@@ -59,4 +60,20 @@ def spotify_album_artwork(track: object) -> dict | None:
         )
         if artwork is not None:
             return artwork
+    return None
+
+
+def spotify_playlist_artwork(playlist: object) -> dict | None:
+    """Project the first canonical Spotify playlist image, omitting provider metadata."""
+    if not isinstance(playlist, dict):
+        return None
+    images = playlist.get("images")
+    if not isinstance(images, list) or len(images) > 20:
+        return None
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        url = _allowed_spotify_image_url(image.get("url"), canonical=True)
+        if url is not None:
+            return {"kind": "playlist_cover", "provider": "spotify", "url": url}
     return None

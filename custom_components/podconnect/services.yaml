@@ -298,6 +298,11 @@ search_playlists:
           min: 1
           max: 20
           mode: box
+    include_artwork:
+      required: false
+      default: false
+      selector:
+        boolean:
 get_account_identifier_diagnostic:
   name: Compare account identifiers
   description: Explicit read-only native identifier diagnostic. Unknown identity relation; never grants playback or account authority.
