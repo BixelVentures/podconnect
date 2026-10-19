@@ -21,8 +21,13 @@ ROOM_READ_REASONS = frozenset(
 class SpeakersError(Exception):
     """Local contract is unavailable, unknown, or rejected."""
 
-    def __init__(self, message, *, room_read_reason=None):
+    def __init__(self, message, *, room_read_reason=None, content_read_reason=None):
         super().__init__(message)
+        self.content_read_reason = (
+            "native_account_claim_required"
+            if content_read_reason == "native_account_claim_required"
+            else None
+        )
         self.room_read_reason = (
             room_read_reason
             if isinstance(room_read_reason, str)
@@ -69,6 +74,7 @@ class SpeakersClient:
         *,
         budget: int = 5,
         room_read_reason: bool = False,
+        content_read_reason: bool = False,
     ):
         try:
             async with asyncio.timeout(budget):
@@ -86,7 +92,17 @@ class SpeakersClient:
                         and path.startswith("/api/room-transport/state?")
                         and response.status == 409
                     )
-                    if response.status != 200 and not diagnostic:
+                    content_diagnostic = (
+                        content_read_reason
+                        and method == "GET"
+                        and path.startswith("/api/room-content/state?")
+                        and response.status == 409
+                    )
+                    if (
+                        response.status != 200
+                        and not diagnostic
+                        and not content_diagnostic
+                    ):
                         raise SpeakersError(f"Speakers returned HTTP {response.status}")
                     raw = bytearray()
                     async for chunk in response.content.iter_chunked(8192):
@@ -103,6 +119,19 @@ class SpeakersClient:
                         return result
 
                     value = json.loads(raw, object_pairs_hook=pairs)
+                    if content_diagnostic:
+                        reason = None
+                        if (
+                            isinstance(value, dict)
+                            and set(value) == {"ok", "error_kind", "retry_allowed"}
+                            and value["ok"] is False
+                            and value["retry_allowed"] is False
+                            and value["error_kind"] == "native_account_claim_required"
+                        ):
+                            reason = "native_account_claim_required"
+                        raise SpeakersError(
+                            "Speakers returned HTTP 409", content_read_reason=reason
+                        )
                     if diagnostic:
                         reason = None
                         if (
@@ -322,7 +351,10 @@ class SpeakersClient:
 
     async def room_content_state(self, scope):
         return await self._request(
-            "GET", "/api/room-content/state?" + urlencode(scope), budget=9
+            "GET",
+            "/api/room-content/state?" + urlencode(scope),
+            budget=9,
+            content_read_reason=True,
         )
 
     async def prepare_room_content(self, scope, request):

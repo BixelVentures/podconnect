@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,6 +57,7 @@ var roomContentStore = struct {
 
 var contentURI = regexp.MustCompile(`^spotify:(track|playlist):[A-Za-z0-9]{22}$`)
 var roomContentRPC = doRoomContentRPC
+var errContentAccountClaimRequired = errors.New("native account claim required")
 
 // The native critical section has its own immutable twelve-second cutoff.
 // This HTTP limit never replaces that actual-owner fence or retries a send.
@@ -74,6 +77,18 @@ func doRoomContentRPC(ctx context.Context, base, method, path string, body []byt
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 65537))
+	if err == nil && len(raw) <= 65536 && response.StatusCode == http.StatusConflict && method == http.MethodGet && strings.HasPrefix(path, "/player/room_content/controls?") {
+		var refusal struct {
+			Schema string `json:"schema"`
+			OK     bool   `json:"ok"`
+			Error  string `json:"error_kind"`
+			Retry  bool   `json:"retry_allowed"`
+		}
+		fields, shapeErr := contentFields(raw, "schema", "ok", "error_kind", "retry_allowed")
+		if shapeErr == nil && bytes.Equal(bytes.TrimSpace(fields["ok"]), []byte("false")) && bytes.Equal(bytes.TrimSpace(fields["retry_allowed"]), []byte("false")) && decodeQueueManagerJSON(raw, &refusal) == nil && refusal.Schema == "podconnect.native_room_content_unavailable.v1" && !refusal.OK && refusal.Error == "native_account_claim_required" && !refusal.Retry {
+			return nil, errContentAccountClaimRequired
+		}
+	}
 	if err != nil || len(raw) > 65536 || response.StatusCode != 200 {
 		return nil, fmt.Errorf("content owner unavailable")
 	}

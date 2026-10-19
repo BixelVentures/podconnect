@@ -151,6 +151,90 @@ class ReadReasonContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0][1]["allow_redirects"], False)
         return result
 
+    async def test_content_claim_refusal_is_closed_and_get_only(self):
+        good = {
+            "ok": False,
+            "error_kind": "native_account_claim_required",
+            "retry_allowed": False,
+        }
+        for body, typed in [
+            (good, True),
+            ({**good, "extra": "private"}, False),
+            ({**good, "ok": None}, False),
+            ({**good, "retry_allowed": True}, False),
+            ({**good, "error_kind": "private"}, False),
+        ]:
+            for method, path, enabled in [
+                ("GET", "/api/room-content/state?a=b", True),
+                ("POST", "/api/room-content/state?a=b", True),
+                ("GET", "/other?a=b", True),
+                ("GET", "/api/room-content/state?a=b", False),
+            ]:
+                client = Client(json.dumps(body).encode())
+                reader = speakers.SpeakersClient(client, "http://inert.invalid")
+                with self.assertRaises(speakers.SpeakersError) as caught:
+                    if (
+                        method == "GET"
+                        and path == "/api/room-content/state?a=b"
+                        and enabled
+                    ):
+                        await reader.room_content_state({"a": "b"})
+                    else:
+                        await reader._request(method, path, content_read_reason=enabled)
+                self.assertEqual(
+                    getattr(caught.exception, "content_read_reason", None),
+                    "native_account_claim_required"
+                    if typed
+                    and method == "GET"
+                    and path.startswith("/api/room-content/state?")
+                    and enabled
+                    else None,
+                )
+                self.assertEqual(len(client.calls), 1)
+
+    async def test_content_actual_read_propagates_refusal_only_for_current_owner(self):
+        content = load("room_content")
+        body = {
+            "ok": False,
+            "error_kind": "native_account_claim_required",
+            "retry_allowed": False,
+        }
+        for replaced in (False, True):
+            reader = speakers.SpeakersClient(
+                Client(json.dumps(body).encode()), "http://inert.invalid"
+            )
+            data = types.SimpleNamespace(
+                speakers=reader,
+                observations=types.SimpleNamespace(
+                    playback=lambda entry: {
+                        "ok": True,
+                        "owner_epoch": "epoch",
+                        "poll_sequence": 7,
+                    }
+                ),
+            )
+            adapter = content.RoomContent(types.SimpleNamespace(data=data))
+            calls = []
+
+            def owner(*args, calls=calls, replaced=replaced):
+                calls.append(True)
+                if replaced and len(calls) > 1:
+                    raise Rejected("owner_replaced")
+                return {
+                    "account_user_id": "a",
+                    "target_id": "t",
+                    "room_id": "r",
+                    "homepod_id": "42",
+                }
+
+            adapter._owner = owner
+            with self.assertRaises(Rejected) as caught:
+                await adapter.read(None, "a", "t", "r", "42")
+            self.assertEqual(
+                str(caught.exception),
+                "owner_replaced" if replaced else "native_account_claim_required",
+            )
+
     async def test_four_closed_reasons_through_client_read_serializer(self):
         for reason in (
             "claim_unavailable",

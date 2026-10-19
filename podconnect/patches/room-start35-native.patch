@@ -184,7 +184,7 @@
  }
 --- /dev/null
 +++ b/daemon/room_content.go
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,464 @@
 +package daemon
 +
 +import (
@@ -209,6 +209,8 @@
 +	"github.com/devgianlu/go-librespot/tracks"
 +	"google.golang.org/protobuf/proto"
 +)
++
++var errContentAccountClaimRequired = fmt.Errorf("native account claim required")
 +
 +const start35Policy = "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
 +const (
@@ -420,8 +422,13 @@
 +func (p *AppPlayer) captureContent(scope roomVolumeScope) (*contentCapture, error) {
 +	actualAccount, authenticated := p.sess.BoundUsername()
 +	actualProcess, processOK := nativeContentProcess()
-+	if !processOK || !authenticated || p.app == nil || p.app.cfg == nil || p.sess == nil || p.player == nil || p.state == nil || p.state.player == nil || p.state.device == nil || !p.playbackReady() || actualAccount != scope.AccountUserID || scope.AccountUserID == "" || p.app.deviceId != scope.TargetID || p.spotConnId == "" || p.app.cfg.AudioBackend != "pipe" || p.app.cfg.AudioOutputPipeFormat != "s16le" || !p.app.cfg.ExternalVolume || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) {
++	if !processOK || !authenticated || p.app == nil || p.app.cfg == nil || p.sess == nil || p.player == nil || p.state == nil || p.state.player == nil || p.state.device == nil || !p.playbackReady() || scope.AccountUserID == "" || p.app.deviceId != scope.TargetID || p.spotConnId == "" || p.app.cfg.AudioBackend != "pipe" || p.app.cfg.AudioOutputPipeFormat != "s16le" || !p.app.cfg.ExternalVolume || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) {
 +		return nil, ErrAliasConflict
++	}
++	// A live authenticated account differs from the explicitly requested scope.
++	// This read refusal occurs before an offer, preparation or START effect.
++	if actualAccount != scope.AccountUserID {
++		return nil, errContentAccountClaimRequired
 +	}
 +	actualSource, sourceErr := p.player.Start35CurrentSource(context.Background())
 +	if sourceErr != nil {
@@ -1299,7 +1306,7 @@
 +}
 --- /dev/null
 +++ b/daemon/room_content_http.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,172 @@
 +package daemon
 +
 +import (
@@ -1352,6 +1359,11 @@
 +	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 +	defer cancel()
 +	value, err := s.roomTransportAsk(ctx, apiContentObserve, scope)
++	if err == errContentAccountClaimRequired {
++		w.WriteHeader(http.StatusConflict)
++		contentWrite(w, map[string]any{"schema": "podconnect.native_room_content_unavailable.v1", "ok": false, "error_kind": "native_account_claim_required", "retry_allowed": false})
++		return
++	}
 +	if err != nil {
 +		roomTransportResponse(w, nil, err)
 +		return
@@ -1529,7 +1541,7 @@
 +}
 --- /dev/null
 +++ b/daemon/room_content_test.go
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,438 @@
 +package daemon
 +
 +import (
@@ -1931,6 +1943,41 @@
 +	p.waitContentReservation(context.Background())
 +	if !p.roomContentQuarantined || !p.roomVolumeBusy() {
 +		t.Fatal("actor retirement lost quarantine")
++	}
++}
++
++func TestContentControlsExactAccountClaimRefusalIsPreEffect(t *testing.T) {
++	for _, mismatch := range []bool{true, false} {
++		server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			request := <-server.requests
++			if request.Type != apiContentObserve {
++				t.Error("effect dispatched instead of read")
++			}
++			if mismatch {
++				request.Reply(nil, errContentAccountClaimRequired)
++			} else {
++				request.Reply(nil, ErrAliasConflict)
++			}
++		}()
++		w := httptest.NewRecorder()
++		req := httptest.NewRequest("GET", "/player/room_content/controls?account_user_id=requested&target_id=engine&room_id=r0&homepod_id=42", nil)
++		server.handleContentControls(w, req)
++		<-done
++		if w.Code != 409 {
++			t.Fatal(w.Code)
++		}
++		typed := strings.Contains(w.Body.String(), "native_account_claim_required")
++		if typed != mismatch {
++			t.Fatal("wrong exact refusal classification", w.Body.String())
++		}
++		for _, private := range []string{"requested", "engine", "offer_id", "binding_id"} {
++			if strings.Contains(w.Body.String(), private) {
++				t.Fatal("private identity/authority leaked")
++			}
++		}
 +	}
 +}
 --- a/daemon/room_volume.go

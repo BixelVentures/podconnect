@@ -13,6 +13,7 @@ from custom_components.podconnect.room_content import valid_selected_receipt
 
 class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
     async def asyncSetUp(self):
+        self.content_read_refusal = None
         self.content_posts = []
         self.content_hold = False
         self.content_entered = asyncio.Event()
@@ -28,6 +29,29 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
         await super().asyncSetUp()
         self.holds.extend((self.content_release, self.content_commit_release))
         self.content_commands = self.entries[0].runtime_data.commands
+
+    async def test_content_claim_refusal_reaches_actual_service_without_effect(self):
+        self.content_read_refusal = {
+            "ok": False,
+            "error_kind": "native_account_claim_required",
+            "retry_allowed": False,
+        }
+        status, body = await self._service(
+            "get_room_content_controls",
+            {
+                "config_entry_id": "account-alpha",
+                "target_id": self.content_target,
+                "room_id": "room-beta",
+                "homepod_id": "456",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["service_response"],
+            {**self.content_read_refusal, "physical_result_verified": False},
+        )
+        self.assertEqual(self.content_posts, [])
+        self.assertEqual(self._writes(), [])
 
     def content_offer_value(self):
         return {
@@ -58,6 +82,8 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
 
     async def _backend(self, request):
         if request.path == "/api/room-content/state":
+            if self.content_read_refusal is not None:
+                return web.json_response(self.content_read_refusal, status=409)
             if request.query.get("target_id") != self.content_target:
                 return web.Response(status=409)
             return web.json_response(

@@ -415,6 +415,13 @@ class RoomContent:
                 scope
             )
         except SpeakersError as exc:
+            if self._owner(hass, request) != scope:
+                raise CommandRejected("native_account_unproven") from exc
+            if (
+                getattr(exc, "content_read_reason", None)
+                == "native_account_claim_required"
+            ):
+                raise CommandRejected("native_account_claim_required") from exc
             raise CommandRejected("native_start_unavailable") from exc
         if self._owner(hass, request) != scope:
             raise CommandRejected("native_account_unproven")

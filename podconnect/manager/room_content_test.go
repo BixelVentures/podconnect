@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -102,4 +103,39 @@ func TestContentStateRejectsMixedOwnerConfigurationAndUnavailableSchemas(t *test
 			t.Fatal("extra asserted authority accepted")
 		}
 	})
+}
+
+func TestContentAccountClaimRefusalIsClosedReadOnlyAndPreEffect(t *testing.T) {
+	good := `{"schema":"podconnect.native_room_content_unavailable.v1","ok":false,"error_kind":"native_account_claim_required","retry_allowed":false}`
+	for _, tc := range []struct {
+		name, method, path, body string
+		typed                    bool
+	}{
+		{"exact", "GET", "/player/room_content/controls?a=b", good, true},
+		{"post", "POST", "/player/room_content/controls?a=b", good, false},
+		{"other", "GET", "/player/room_content/result?a=b", good, false},
+		{"unknown", "GET", "/player/room_content/controls?a=b", strings.Replace(good, "native_account_claim_required", "unknown", 1), false},
+		{"extra", "GET", "/player/room_content/controls?a=b", strings.TrimSuffix(good, "}") + `,"extra":"private"}`, false},
+		{"null", "GET", "/player/room_content/controls?a=b", strings.Replace(good, `"ok":false`, `"ok":null`, 1), false},
+		{"retry", "GET", "/player/room_content/controls?a=b", strings.Replace(good, `"retry_allowed":false`, `"retry_allowed":true`, 1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { w.WriteHeader(409); _, _ = w.Write([]byte(tc.body)) }))
+			defer server.Close()
+			_, err := doRoomContentRPC(context.Background(), server.URL, tc.method, tc.path, nil)
+			if errors.Is(err, errContentAccountClaimRequired) != tc.typed {
+				t.Fatal("wrong refusal class", err)
+			}
+		})
+	}
+	_, binding := contentStateFixture(t)
+	roomContentRPC = func(context.Context, string, string, string, []byte) ([]byte, error) {
+		return nil, errContentAccountClaimRequired
+	}
+	q := url.Values{"account_user_id": {binding.Scope.Account}, "target_id": {binding.Scope.Target}, "room_id": {binding.Scope.Room}, "homepod_id": {binding.Scope.Homepod}}
+	w := httptest.NewRecorder()
+	roomContentStateHandler(w, httptest.NewRequest("GET", "/api/room-content/state?"+q.Encode(), nil))
+	if w.Code != 409 || strings.TrimSpace(w.Body.String()) != `{"error_kind":"native_account_claim_required","ok":false,"retry_allowed":false}` {
+		t.Fatal(w.Code, w.Body.String())
+	}
 }

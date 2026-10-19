@@ -5,6 +5,7 @@ package main
 // fallback. Effect handlers are registered only with the complete owner slice.
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -63,6 +64,9 @@ func readRoomContent(ctx context.Context, scope roomTransportScope) (roomContent
 	q := url.Values{"account_user_id": {scope.Account}, "target_id": {scope.Target}, "room_id": {scope.Room}, "homepod_id": {scope.Homepod}}
 	started := time.Now()
 	raw, err := roomContentRPC(ctx, binding.NativeURL, http.MethodGet, "/player/room_content/controls?"+q.Encode(), nil)
+	if errors.Is(err, errContentAccountClaimRequired) && roomContentBindingCurrent(binding) {
+		return binding, state, err
+	}
 	fields, shapeErr := contentFields(raw, "schema", "ready", "scope", "actions", "start_offer", "physical_result_verified", "alias_registry", "input_path_digest", "own_tone_url")
 	if err != nil || shapeErr != nil || decodeQueueManagerJSON(raw, &state) != nil || decodeQueueManagerJSON(fields["scope"], &state.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &state.Offer) != nil || state.Schema != "podconnect.native_room_content_controls.v1" || !state.Ready || state.Physical || state.Scope != scope || !validRoomContentOffer(state.Offer) || !validRoomContentActions(state.Actions) || state.Registry != binding.Registry || state.InputDigest != binding.PipeDigest || state.OutputURL != binding.OutputURL || !roomContentBindingCurrent(binding) {
 		return binding, state, fmt.Errorf("actual native content destination unavailable")
@@ -97,6 +101,11 @@ func roomContentStateHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	_, state, err := readRoomContent(ctx, scope)
+	if errors.Is(err, errContentAccountClaimRequired) {
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]any{"ok": false, "error_kind": "native_account_claim_required", "retry_allowed": false})
+		return
+	}
 	if err != nil {
 		http.Error(w, "content unavailable", 409)
 		return
