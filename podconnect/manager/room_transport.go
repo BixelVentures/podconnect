@@ -329,6 +329,11 @@ func holdReleasedBridgeRoute(primary *Room, status glStatus, intent glTransportI
 	if primary == nil || primary.Idx != 0 || !fileExists(releasedPath(primary)) {
 		return false
 	}
+	if mgr != nil {
+		if rt := mgr.runtime(primary.ID); rt != nil && rt.live.holdsConnectRecoveryFence() {
+			return true
+		}
+	}
 	if !status.Active || status.Paused || status.Stopped {
 		return true
 	}

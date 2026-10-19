@@ -305,8 +305,23 @@ func preflightReleasedResume(primary *Room) bool {
 		final.Proof.OutputVolume <= startVolumePercent && final.Proof.OutputVolume >= startVolumePercent-volTol
 }
 
+type startPrimeOutcome uint8
+
+const (
+	startPrimeRejected startPrimeOutcome = iota
+	startPrimeAccepted
+	startPrimeTemporaryBusy
+)
+
 func primeConfiguredStartVolume(base, id string, requireSelected bool, recovery ...bool) bool {
+	return primeConfiguredStartVolumeOutcome(base, id, requireSelected, recovery...) == startPrimeAccepted
+}
+
+func primeConfiguredStartVolumeOutcome(base, id string, requireSelected bool, recovery ...bool) startPrimeOutcome {
 	client := &http.Client{Timeout: 3 * time.Second}
+	if len(recovery) > 0 && recovery[0] {
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	diagnostic := func(reason string) {
 		if len(recovery) > 0 && recovery[0] {
 			log.Printf("connect-recovery volume reason=%s", reason)
@@ -318,25 +333,34 @@ func primeConfiguredStartVolume(base, id string, requireSelected bool, recovery 
 	}
 	req, err := http.NewRequest(http.MethodPut, base+"/api/player/volume?"+query.Encode(), nil)
 	if err != nil {
-		return false
+		return startPrimeRejected
 	}
 	diagnostic("sent")
 	resp, err := client.Do(req)
 	if err != nil {
 		diagnostic("transport_error")
-		return false
+		return startPrimeRejected
 	}
 	resp.Body.Close()
+	if len(recovery) > 0 && recovery[0] && resp.StatusCode == http.StatusConflict &&
+		len(resp.Header.Values("X-PodConnect-Recovery")) == 1 &&
+		resp.Header.Get("X-PodConnect-Recovery") == "temporary-busy-no-effect-v1" {
+		diagnostic("temporary_busy_no_effect")
+		return startPrimeTemporaryBusy
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		diagnostic("http_rejected")
-		return false
+		return startPrimeRejected
 	}
 	diagnostic("http_accepted")
 	vol, selected, ok := knownStartOutput(base, id)
 	if !ok || (requireSelected && !selected) || vol > startVolumePercent || vol < startVolumePercent-volTol {
 		diagnostic("readback_rejected")
 	}
-	return ok && (!requireSelected || selected) && vol <= startVolumePercent && vol >= startVolumePercent-volTol
+	if ok && (!requireSelected || selected) && vol <= startVolumePercent && vol >= startVolumePercent-volTol {
+		return startPrimeAccepted
+	}
+	return startPrimeRejected
 }
 
 func checkedStartVolume(base, id string, recovery ...bool) bool {

@@ -21,26 +21,27 @@ import (
 
 // glLive is the thread-safe latest go-librespot state for one room, plus a track-change signal.
 type glLive struct {
-	connectRecovery     *connectRecoveryIntent
-	connectRecoverySeen map[string]uint64
-	mu                  sync.Mutex
-	st                  glStatus
-	trackURI            string
-	trackChangeSeq      uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
-	aliasRevision       uint64 // observed alias/source intent; unchanged status polls do not bump it
-	transportRevision   uint64 // transport observations, including accepted polling changes
-	routeDispatchSeq    uint64 // mutex-owned command admission, not native acceptance
-	sourceStop          <-chan struct{}
-	sourceRetired       bool
-	runEpoch            uint64
-	phaseEpoch          uint64
-	nextRequest         uint64
-	acceptedRequest     uint64
-	wireRevision        [3]uint64 // transport, volume, selected alias
-	manualOrdinal       uint64
-	manualIncarnation   string
-	manualAction        *nativeManualAction
-	manualObservation   *nativeManualObservation
+	connectRecovery      *connectRecoveryIntent
+	connectRecoveryFence *connectRecoveryIntent
+	connectRecoverySeen  map[string]uint64
+	mu                   sync.Mutex
+	st                   glStatus
+	trackURI             string
+	trackChangeSeq       uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	aliasRevision        uint64 // observed alias/source intent; unchanged status polls do not bump it
+	transportRevision    uint64 // transport observations, including accepted polling changes
+	routeDispatchSeq     uint64 // mutex-owned command admission, not native acceptance
+	sourceStop           <-chan struct{}
+	sourceRetired        bool
+	runEpoch             uint64
+	phaseEpoch           uint64
+	nextRequest          uint64
+	acceptedRequest      uint64
+	wireRevision         [3]uint64 // transport, volume, selected alias
+	manualOrdinal        uint64
+	manualIncarnation    string
+	manualAction         *nativeManualAction
+	manualObservation    *nativeManualObservation
 }
 
 // Get returns a copy of the latest glStatus (safe to use without holding the lock).
