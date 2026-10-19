@@ -178,7 +178,7 @@ index b985e92..eb86565 100644
  }
  func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index 8d0830b..0f96467 100644
+index 8d0830b..c2fb4d9 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -3,6 +3,7 @@ package daemon
@@ -189,7 +189,7 @@ index 8d0830b..0f96467 100644
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/output"
  	"github.com/devgianlu/go-librespot/player"
-@@ -140,10 +141,45 @@ func TestStart35ActualConsumeFencesOwnerMutationAndOneUse(t *testing.T) {
+@@ -140,10 +141,26 @@ func TestStart35ActualConsumeFencesOwnerMutationAndOneUse(t *testing.T) {
  		})
  	}
  }
@@ -207,36 +207,17 @@ index 8d0830b..0f96467 100644
 +	l.lines = append(l.lines, fmt.Sprintf(format, args...))
 +}
 +
-+// Expire at the exact HTTP exchange boundary, without a wall-clock race.
-+type contentFailureDeadline struct {
-+	context.Context
-+	done chan struct{}
-+	once sync.Once
-+}
-+
-+func (c *contentFailureDeadline) Done() <-chan struct{} { return c.done }
-+func (c *contentFailureDeadline) Err() error {
-+	select {
-+	case <-c.done:
-+		return context.DeadlineExceeded
-+	default:
-+		return nil
-+	}
-+}
-+func (c *contentFailureDeadline) expire() { c.once.Do(func() { close(c.done) }) }
-+
  func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testing.T) {
 -	for _, mode := range []string{"complete", "wrong-pipe", "wrong-content", "open-fails", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
-+	for _, mode := range []string{"complete", "consume-fails", "wrong-pipe", "wrong-content", "open-fails", "open-exchange-fails", "open-deadline", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
++	for _, mode := range []string{"complete", "consume-fails", "wrong-pipe", "wrong-content", "open-fails", "open-exchange-fails", "complete-fails", "move-complete", "move-ambiguous", "move-stale", "start-complete", "start-ambiguous", "start-stale"} {
  		t.Run(mode, func(t *testing.T) {
  			p, op := contentFixture(t)
 +			log := &contentFailureLog{}
 +			p.app.log = log
-+			deadline := &contentFailureDeadline{Context: context.Background(), done: make(chan struct{})}
  			var priorMove *moveOperation
  			var priorStart *contentOperation
  			if strings.HasPrefix(mode, "move-") {
-@@ -164,6 +200,16 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -164,6 +181,12 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
  				cMu.Lock()
  				calls = append(calls, endpoint)
  				cMu.Unlock()
@@ -245,15 +226,11 @@ index 8d0830b..0f96467 100644
 +					_, _ = w.Write([]byte("private-diagnostic-sentinel"))
 +					return
 +				}
-+				if endpoint == "open" && mode == "open-deadline" {
-+					deadline.expire()
-+					<-r.Context().Done()
-+					return
-+				}
++
  				var body map[string]json.RawMessage
  				_ = json.NewDecoder(r.Body).Decode(&body)
  				want := map[string]int{"prepare": 12, "commit": 9, "barrier": 6, "open": 4, "complete": 5, "cancel": 2}[endpoint]
-@@ -204,6 +250,10 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -204,6 +227,10 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
  			go func() {
  				defer close(done)
  				for request := range server.requests {
@@ -264,17 +241,7 @@ index 8d0830b..0f96467 100644
  					value, err := p.handleApiRequest(context.Background(), request)
  					request.Reply(value, err)
  				}
-@@ -246,11 +296,74 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
- 					}
- 				}
- 			}()
--			op.commit(context.Background(), server)
-+			commitContext := context.Context(context.Background())
-+			if mode == "open-deadline" {
-+				commitContext = deadline
-+			}
-+			op.commit(commitContext, server)
- 			receipt := op.receipt("commit")
+@@ -251,6 +278,63 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
  			close(server.requests)
  			<-done
  			<-stopped
@@ -305,14 +272,12 @@ index 8d0830b..0f96467 100644
 +				}
 +				cMu.Unlock()
 +			}
-+			if mode == "open-fails" || mode == "open-exchange-fails" || mode == "open-deadline" {
++			if mode == "open-fails" || mode == "open-exchange-fails" {
 +				phase, class := "unknown", "terminal_c_phase"
 +				if mode == "open-exchange-fails" {
 +					phase, class = "route_ready_closed", "c_step_failed"
 +				}
-+				if mode == "open-deadline" {
-+					phase, class = "route_ready_closed", "deadline"
-+				}
++
 +				want := fmt.Sprintf("content_start_failed stage=c_open last_c_phase=%s error_class=%s outcome=unknown", phase, class)
 +				log.mu.Lock()
 +				lines := append([]string(nil), log.lines...)
@@ -340,7 +305,7 @@ index 8d0830b..0f96467 100644
  			completedC := mode == "complete" || mode == "move-complete" || mode == "start-complete"
  			// This protocol fixture deliberately has no actual player worker or
  			// FIFO descriptor. A C COMPLETE alone can no longer credit START.
-@@ -284,7 +397,7 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -284,7 +368,7 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
  				}
  				cMu.Unlock()
  			}

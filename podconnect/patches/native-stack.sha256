@@ -20,4 +20,4 @@ b589c71150427119fea5db1fd69570e1fb45475e1afdaacecd22fed283961c21  /patches/room-
 20777967d237dabd67b02e79b73e7bebaec688ea5ea7eb2a643f73b4d16601e2  /patches/connect-recovery-diagnostics-native.patch
 942e7b9b3304fc172976a9d1472d0eaad8cc6ae3a2e6ddf573d67b53b637637d  /patches/paused-route-native.patch
 34c6b69a2b5cb0b60d1d839068026fac34d0bea859bf85006a6d8ca30573beec  /patches/vorbis-cleanup-native.patch
-0197e2e04c5de3c6a18bf5f16b576165e5439c473e8c6c0e71fba580b654acdc  /patches/room-start-diagnostics-native.patch
+3d4b34ae199ce78802bb8830f27bba389c8656dd1c6482249768b28531f4dfe8  /patches/room-start-diagnostics-native.patch
