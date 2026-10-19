@@ -1,3 +1,9 @@
+## Speakers 0.26.34 — Vorbis source retirement cleanup
+
+- Correct the native Vorbis decoder cleanup order when retiring a displaced audio source: clear Block, then DSP, then Info. The Speakers 0.26.33 log recorded a SIGSEGV in `vorbis_dsp_clear` during that retirement path.
+- Preserve the existing source/START ownership, cancellation, repeated-close and partial-initialization guards. Control remains 0.10.19.
+- Add real libvorbis cleanup regressions to the existing native Linux test/vet gate. Official Linux execution, immutable image publication, Green installation and physical playback acceptance remain pending; this source change alone does not prove them.
+
 ## Control 0.10.19 — 2026-10-19
 - Extend the existing operator identifier diagnostic with a bounded fresh Spotify profile read and separate stored/fresh/native byte-comparison enums. No profile or identifier is returned, no identity is rewritten, and playback authority remains unchanged.
 - Speakers remains 0.26.33; this integration update diagnoses stale stored profile IDs without treating AP/Web API identifiers as equivalent.
