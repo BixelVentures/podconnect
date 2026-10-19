@@ -1,0 +1,391 @@
+diff --git a/src/outputs_transport_custody.inc.c b/src/outputs_transport_custody.inc.c
+--- a/src/outputs_transport_custody.inc.c
++++ b/src/outputs_transport_custody.inc.c
+@@ -4,6 +4,10 @@
+ static struct timespec transport_custody_expiry;
+ static uint64_t transport_admission_generation=1, transport_custody_revision;
+ static bool transport_custody_live, transport_custody_lost, transport_generation_exhausted;
++/* Confirmed native Pause retains resources, never transport mutation authority. */
++static struct output_native_owner transport_pause_owner;
++static struct output_transport_identity transport_pause_identity;
++static uint64_t transport_pause_revision;
+ 
+ static bool native_owner_equal(const struct output_native_owner *a,const struct output_native_owner *b)
+ {
+@@ -95,6 +99,7 @@
+   if (!transport_custody_live || expiry.tv_sec>transport_custody_expiry.tv_sec
+       || (expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec>transport_custody_expiry.tv_nsec))
+     transport_custody_expiry=expiry;
++  transport_pause_retained=false; /* A competing accepted command retires old pause custody. */
+   transport_custody_owner=*owner; transport_custody_identity=*identity; transport_custody_revision=revision;
+   transport_custody_live=true; transport_custody_lost=false; transport_generation_advance();
+   return true;
+@@ -122,3 +127,21 @@
+   *clean_absent=!*busy && !*start_owned && start_route_clean_absent();
+   return 0;
+ }
++
++/* Called on the existing output owner before its delayed STOP. No cached route
++ * can keep a session alive after its actual source/owner/session ceases to match. */
++static bool transport_pause_owned(uint64_t id)
++{
++  struct output_transport_identity actual;
++  if (!transport_pause_retained || id!=transport_pause_identity.device_id) return false;
++  if (transport_generation_exhausted || transport_custody_lost
++      || !native_owner_equal(&transport_pause_owner,&transport_custody_owner)
++      || transport_pause_revision!=transport_custody_revision
++      || transport_identity_get(id,&actual)<0
++      || !transport_identity_equal(&actual,&transport_pause_identity)
++      || !start_route_owned(&transport_pause_owner,&actual)) {
++    transport_pause_retained=false;
++    return false;
++  }
++  return true;
++}
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -155,7 +155,7 @@
+ {
+   struct output_transport_result result;
+   struct timespec expiry;
+-  bool used;
++  bool used, pause_confirmed;
+   uint64_t admission_generation,queue_reader_epoch;
+ };
+ static struct transport_slot transport_slots[OUTPUT_TRANSPORT_SLOTS];
+@@ -164,6 +164,7 @@
+ static uint64_t transport_selection_revision = 1;
+ static uint64_t transport_input_generation = 1;
+ static uint64_t transport_input_item;
++static bool transport_pause_retained;
+ static char transport_input_path_digest[65];
+ 
+ static unsigned
+@@ -190,6 +191,7 @@
+ static void
+ transport_selection_changed(void)
+ {
++  transport_pause_retained=false;
+   if (transport_selection_revision != UINT64_MAX) transport_selection_revision++;
+ }
+ 
+@@ -199,6 +201,7 @@
+   unsigned char digest[32];
+   static const char hex[]="0123456789abcdef";
+   size_t i;
++  transport_pause_retained=false;
+   if (transport_input_generation != UINT64_MAX) transport_input_generation++;
+   transport_input_item = item_id;
+   memset(transport_input_path_digest,0,sizeof(transport_input_path_digest));
+@@ -342,7 +345,8 @@
+   }
+   slot->expiry.tv_sec += OUTPUT_TRANSPORT_TTL_MS / 1000;
+   slot->admission_generation=transport_admission_generation;slot->queue_reader_epoch=queue_reader_epoch;
+-  slot->used=false; slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS;
++  slot->used=false; slot->pause_confirmed=false;
++  slot->result.remaining_ms=OUTPUT_TRANSPORT_TTL_MS;
+   *result=slot->result;
+   return 0;
+ }
+@@ -402,6 +406,29 @@
+   return 0;
+ }
+ 
++int outputs_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
++{
++  struct transport_slot *slot;
++  if (!token || !prepare || !revision) return -1;
++  slot=transport_find(token);
++  if (!slot || slot->pause_confirmed) return -1;
++  slot->pause_confirmed=true; /* No replay, including a rejected old completion. */
++  if (!slot->used || !slot->result.command.bound || slot->result.outcome!=0
++      || strcmp(slot->result.command.action,"pause")
++      || slot->result.command.device_id!=id
++      || strcmp(slot->result.command.native_prepare_id,prepare)
++      || slot->result.command.native_revision!=revision
++      || !transport_remaining(&slot->expiry)
++      || !transport_custody_current(&slot->result.command.native_owner,
++          &slot->result.identity,revision)
++      || !start_route_owned(&slot->result.command.native_owner,&slot->result.identity)) return -1;
++  transport_pause_owner=slot->result.command.native_owner;
++  transport_pause_identity=slot->result.identity;
++  transport_pause_revision=revision;
++  transport_pause_retained=true;
++  return 0;
++}
++
+ #include "outputs_room_volume.inc.c"
+ static void base_revision_advance(struct output_device *);
+ static void vol_adjust(void);
+@@ -1171,6 +1198,12 @@
+   struct output_device *device = arg;
+   output_status_cb cb = callback_get(device);
+ 
++  if (device->session!=device->stop_timer_session
++      || device->session_epoch!=device->stop_timer_session_epoch) return;
++  if (transport_pause_owned(device->id)) {
++    if (event_add(device->stop_timer, &outputs_stop_timeout)==0) return;
++    transport_pause_retained=false; /* A missing next proof cannot retain resources. */
++  }
+   outputs_device_stop(device, cb);
+ }
+ 
+@@ -2046,6 +2079,8 @@
+ 
+   outputs[device->type]->device_cb_set(device, callback_add(device, cb));
+ 
++  device->stop_timer_session=device->session;
++  device->stop_timer_session_epoch=device->session_epoch;
+   event_add(device->stop_timer, &outputs_stop_timeout);
+ 
+   return 1;
+@@ -2238,6 +2273,7 @@
+ outputs_stop_delayed_cancel(void)
+ {
+   struct output_device *device;
++  transport_pause_retained=false; /* Actual playback restart retires the old pause. */
+ 
+   for (device = outputs_device_list; device; device = device->next)
+     event_del(device->stop_timer);
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -139,6 +139,7 @@
+ int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_result_get(const char *, struct output_transport_result *);
++int outputs_transport_pause_confirm(uint64_t,const char *,const char *,uint64_t);
+ bool outputs_transport_current(const struct output_transport_result *);
+ bool outputs_transport_busy(void);
+ bool outputs_connect_recovery_available(uint64_t);
+@@ -464,6 +465,8 @@
+   int metadata_fd;
+ 
+   struct event *stop_timer;
++  void *stop_timer_session;
++  uint64_t stop_timer_session_epoch;
+ 
+   // Opaque pointers to device and session data
+   void *extra_device_info;
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -585,6 +585,7 @@
+   }
+   start_startup_quarantine=false;
+   s->result.possible_effect=true; /* Before the first irreversible gate/source effect. */
++  transport_pause_retained=false;
+   start_active=s;s->writer_pending=true;s->result.phase=OUTPUT_START_GATE_DRAINING;start_gate_set(true);transport_generation_advance();
+   if(!r->move_existing_session){start_retire_sessions();outputs_metadata_purge();}
+   s->deadline_ev=evtimer_new(evbase_player,start_expire,s);
+diff --git a/src/player.c b/src/player.c
+--- a/src/player.c
++++ b/src/player.c
+@@ -3139,8 +3139,8 @@
+   struct output_transport_result *result;
+   struct output_transport_identity *identity;
+   bool *busy,*start_owned,*clean_absent;
+-  const char *token;
+-  uint64_t id;
++  const char *token,*prepare;
++  uint64_t id,revision;
+   int action;
+ };
+ static enum command_state
+@@ -3150,7 +3150,8 @@
+   if (c->action!=2 && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
+       || pb_session.reading_now!=pb_session.playing_now))
+     { *retval=-1; return COMMAND_END; }
+-  if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
++  if (c->action==6) *retval=outputs_transport_pause_confirm(c->id,c->token,c->prepare,c->revision);
++  else if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
+   else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
+   else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
+   else if (c->action==5) *retval=outputs_queue_state_get(c->id,c->owner,c->queue_writer,c->identity,c->busy);
+@@ -3158,6 +3159,12 @@
+   else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
+   return COMMAND_END;
+ }
++int player_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
++{
++  struct player_transport_command c={.id=id,.token=token,.prepare=prepare,.revision=revision,.action=6};
++  return commands_exec_sync(cmdbase,transport_command,NULL,&c);
++}
++
+ int player_transport_prepare(const struct output_transport_request *r, struct output_transport_result *out)
+ {
+   struct player_transport_command c={.request=r,.result=out,.action=0};
+diff --git a/src/player.h b/src/player.h
+--- a/src/player.h
++++ b/src/player.h
+@@ -245,6 +245,7 @@
+ int player_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int player_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int player_transport_result_get(const char *, struct output_transport_result *);
++int player_transport_pause_confirm(uint64_t,const char *,const char *,uint64_t);
+ int player_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+ 
+ 
+diff --git a/src/httpd_jsonapi_transport_bound.inc.c b/src/httpd_jsonapi_transport_bound.inc.c
+--- a/src/httpd_jsonapi_transport_bound.inc.c
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -81,3 +81,25 @@
+  out:
+   jparse_free(body); return ret;
+ }
++
++static int jsonapi_reply_transport_pause_confirm(struct httpd_request *hreq)
++{
++  json_object *body=transport_parse_body_limit(hreq->in_body,1024),*reply;
++  char token[33],prepare[33];uint64_t id,revision;int ret=HTTP_BADREQUEST;
++  if (!body || json_object_object_length(body)!=3
++      || safe_atou64(hreq->path_parts[2],&id)<0
++      || !transport_json_string(body,"token",token,sizeof(token)) || !transport_hex(token,32)
++      || !transport_json_string(body,"native_prepare_id",prepare,sizeof(prepare)) || !transport_hex(prepare,32)
++      || transport_native_counter(body,"native_revision",&revision)<0 || !revision || revision==UINT64_MAX) goto out;
++  ret=409;
++  if (player_transport_pause_confirm(id,token,prepare,revision)<0) goto out;
++  reply=json_object_new_object();
++  json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_transport_pause_confirmation.v1"));
++  json_object_object_add(reply,"ok",json_object_new_boolean(true));
++  json_object_object_add(reply,"token",json_object_new_string(token));
++  json_object_object_add(reply,"native_prepare_id",json_object_new_string(prepare));
++  attention_json_u64(reply,"native_revision",revision);
++  json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));
++  jparse_free(body);return transport_json_reply(hreq,reply);
++ out:if(body)jparse_free(body);return ret;
++}
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -5177,6 +5177,7 @@
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/(start|move)/retire/(prepare|complete)$", jsonapi_reply_retirement_write },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/(start|move)/retire/result/[a-f0-9]+$", jsonapi_reply_retirement_result },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-state$", jsonapi_reply_transport_bound_state },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-pause-confirm$", jsonapi_reply_transport_pause_confirm },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-(prepare|commit)$", jsonapi_reply_transport_write },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/bound-result/[a-f0-9]+$", jsonapi_reply_transport_result },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/bound-state$", jsonapi_reply_room_volume_state },
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -56,6 +56,63 @@
+       assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
+       puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
+ }
++/* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
++ * success. Admission alone cannot retain; only the exact post-effect receipt. */
++static void confirmed_pause_custody_case(struct output_device *device,
++    const struct output_native_owner *owner,const struct output_transport_identity *route)
++{
++  struct output_transport_request request={.device_id=1,.bound=true,.percent=-1,.native_revision=51};
++  struct output_transport_result prepared,result;
++  struct output_native_owner prior_owner=transport_custody_owner;
++  struct output_transport_identity prior_identity=transport_custody_identity;
++  struct timespec prior_expiry=transport_custody_expiry;
++  uint64_t prior_generation=transport_admission_generation,prior_revision=transport_custody_revision;
++  bool prior_live=transport_custody_live,prior_lost=transport_custody_lost;
++  strcpy(request.action,"pause");memset(request.native_prepare_id,'d',32);
++  memset(request.args_digest,'e',64);request.native_owner=*owner;
++  strcpy(request.expected_input_path_digest,route->input_path_digest);
++  assert(outputs_transport_prepare(&request,&prepared)==0);
++  strcpy(request.token,prepared.command.token);
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(!transport_pause_retained); /* C commit precedes actual native effect. */
++  assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
++  assert(!transport_pause_retained);
++  request.native_revision=52;request.native_prepare_id[0]='e';
++  assert(outputs_transport_prepare(&request,&prepared)==0);
++  strcpy(request.token,prepared.command.token);
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)==0);
++  assert(transport_pause_owned(1));
++  assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
++  assert(transport_pause_owned(1)); /* Duplicate confirmation cannot mutate custody. */
++  void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);
++  stop_timer_cb(0,0,device);
++  assert(device->session==session && transport_pause_owned(1)
++    && event_pending(device->stop_timer,EV_TIMEOUT,NULL));
++  device->session_epoch++; /* A delayed old stop never owns a replacement session. */
++  stop_timer_cb(0,0,device);assert(device->session==session);
++  device->session_epoch=epoch;
++  outputs_stop_delayed_cancel();
++  assert(!transport_pause_retained); /* C playback restart consumes old Pause permission. */
++  request.native_revision=53;request.native_prepare_id[0]='f';
++  assert(outputs_transport_prepare(&request,&prepared)==0);
++  strcpy(request.token,prepared.command.token);
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,53)==0);
++  struct start_slot *prior_start=start_active;
++  struct start_slot next_start=*prior_start;
++  next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
++  start_active=&next_start;
++  assert(!transport_pause_owned(1) && !transport_pause_retained);
++  start_active=prior_start;
++  assert(!transport_pause_owned(1)); /* Lost proof cannot revive by ABA. */
++  event_del(device->stop_timer);
++  transport_custody_owner=prior_owner;transport_custody_identity=prior_identity;
++  transport_custody_expiry=prior_expiry;transport_admission_generation=prior_generation;
++  transport_custody_revision=prior_revision;transport_custody_live=prior_live;transport_custody_lost=prior_lost;
++}
++
+ static int start35_wire_case(int mode)
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+@@ -393,6 +450,7 @@
+     strcpy(same_app.connection_id,"new-phone-connection");
+     assert(outputs_start_bound_owner_current(&same_app,&same_route,false)
+       && outputs_start_bound_owner_current(&same_app,&same_route,true));
++    confirmed_pause_custody_case(f.device,&same_app,&same_route);
+     {
+       struct output_transport_identity observed;
+       bool busy,owned,absent;
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -967,6 +967,8 @@
+ { return outputs_transport_state_get(id,out,busy); }
+ int player_transport_result_get(const char *token, struct output_transport_result *out)
+ { return outputs_transport_result_get(token,out); }
++int player_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
++{ return outputs_transport_pause_confirm(id,token,prepare,revision); }
+ 
+ int player_transport_bound_state_get(uint64_t id,const struct output_native_owner *owner,struct output_transport_identity *out,bool *busy,bool *start_owned,bool *clean_absent)
+ { return outputs_transport_bound_state_get(id,owner,out,busy,start_owned,clean_absent); }
+@@ -1637,6 +1639,26 @@
+   puts("PASS actual deployed EUID/EGID999 versus root Native process: checked proc scope proves sole writer, denies false absence, restores authority, then proves CloseDone");
+ }
+ 
++static void exact_pause_confirmation_http_contract(void)
++{
++  const char *bodies[]={
++    "{}",
++    "{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"native_prepare_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"native_revision\":\"01\"}",
++    "{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"native_prepare_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"native_revision\":\"1\",\"paused\":true}",
++    "{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"native_prepare_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"native_revision\":\"1\"}",
++    "{\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"native_prepare_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"native_revision\":\"1\"}"
++  };
++  for(size_t i=0;i<ARRAY_SIZE(bodies);i++){
++    struct httpd_request hreq={0};
++    hreq.path_parts[2]="1";hreq.path_parts[4]="bound-pause-confirm";
++    hreq.in_body=evbuffer_new();hreq.out_body=evbuffer_new();
++    evbuffer_add(hreq.in_body,bodies[i],strlen(bodies[i]));
++    assert(jsonapi_reply_transport_pause_confirm(&hreq)==(i+1==ARRAY_SIZE(bodies)?409:HTTP_BADREQUEST));
++    assert(!transport_pause_retained);
++    evbuffer_free(hreq.in_body);evbuffer_free(hreq.out_body);
++  }
++}
++
+ int main(int argc,char **argv)
+ {
+   if(argc==2 && !strcmp(argv[1],"--deployed-uid-proc")){
+@@ -1680,6 +1702,7 @@
+   durable_disk_failure_unknown_and_stale_generation();
+   exact_transport_route_pin_owner();
+   exact_transport_http_contract();
++  exact_pause_confirmation_http_contract();
+   exact_room_volume_owner();
+   exact_room_volume_http_contract();
+   exact_same_owner_burst();

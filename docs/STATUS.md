@@ -1,3 +1,77 @@
+# Combined local candidate · Speakers0.26.32 / Control0.10.18 · 19 October 2026
+
+Sole local assembly owner: this PodVoice delivery agent, coordinated with the root
+lead. Fresh remote main remains `621b024ee3d4071655fd3017afcf14e01bd1d433`, tree
+`19bb22b65b61cf10ac60829b5f59b8ecbb0e65b4`; fresh default-branch versions are
+Speakers0.26.31 and Control0.10.17, and Control0.10.18 tag is absent. The extracted
+baseline index independently reproduces the exact main tree before applying changes.
+
+This local successor combines independently reviewed PC51 paused-route source with
+the optional Control playlist-cover projection. Native/C source bytes retain their
+reviewed patch hashes; Control projection preserves independent optional DTO behavior,
+owner/config-entry/epoch fields and existing command admission. The existing
+search service defaults include_artwork to false, preserving exact URI/name rows
+for older consumers. Its descriptor explicitly advertises required:false and
+default:false; newer consumers send the optional flag only after current HA service
+discovery confirms that optional field. Invalid or absent images do not invalidate
+playlists; no artwork is fetched here. Versions are planned
+build32/18, not released. No remote branch, PR, tag, publication or installation is
+performed by this assembly. Do not overwrite existing tags/images.
+
+Next gates are official Linux manager/Native/C, HA boundary/framework CI on the exact
+combined candidate, both-architecture immutable32 prebuild and source-label readback,
+then same-subtree promotion; Control needs its own exact0.10.18 GitHub Release. One
+coordinated Green update/normal-flow acceptance follows only after those gates. Mobile
+and new product features are outside this local source assembly.
+
+# Active PC51 paused-route decision · 19 October 2026
+
+Actual installed Speakers0.26.31/PodVoice2.0.63 readback: one UI Play produced
+Spotify playing on the intended target and native transport controls. One Pause
+produced Spotify paused, followed by native output_proof_unavailable. Actual
+OwnTone log reports source insufficiency/suspension at14:12:24 and real C
+bound-state HTTP409 from14:12:36. This excludes manager-only proof loss; exact
+retirement remains a supported causal hypothesis, not complete field attribution.
+C pb_suspend's real flush callback schedules the existing ten-second output stop.
+The current proof correctly requires a live exact session, FIFO reader and writer.
+
+Lead chooses the smallest guarded retention owner instead of pretending a retired
+session is current or adding broad fresh-START fallback. C commit alone is merely
+admission: lasting retention may only follow the existing private Native actor's
+actual successful guarded Pause effect and one exact consumed C-token confirmation.
+Failed/no-effect Pause cannot confirm; confirmation ACK loss after actual successful
+effect may retain the proven live owner while caller outcome remains unknown and
+unreplayed. Confirmation is one-shot/unexpired, with exact prepare/revision/owner/
+route; stale or changed source is rejected. Existing stop-timer ticks re-prove the
+same live C session/START/durable FIFO-reader/writer/route, and loss clears retention
+permanently before normal cleanup. Retention authorizes no command or alias grant:
+Native-only alias revocation still denies fresh control, but physical resources may
+remain paused until actual C retirement. Do not claim C can observe in-memory Native
+alias changes. Competing admitted C transport clears retention; no new timeout, automatic resume, WebAPI fallback, volume/gain or permissions.
+
+Planned causal tests: real suspend/flush/timer chain; successful native confirmation
+retains exact live pause and allows truthful Resume; no confirmation on native
+failure/unknown; wrong/replayed/expired/stale token/revision/source/owner rejected;
+old paused completion/timer cannot affect replacement session; normal stop after
+writer/source/revocation/competitor loss. Review actual Native+C handshake together.
+This isolated successor does not modify frozen PodVoice64 or installed31. No
+release/install/acoustic acceptance is claimed. Rollback is unchanged exact31.
+
+Source result: the production stop-timer callback fails the focused expected hold
+on the unchanged baseline and passes with confirmed-custody guarding. Controlled
+production-body checks cover no admission-only hold, expired/wrong/uncommitted/
+stale/replayed confirmation, source/route/competing custody loss, failed timer rearm,
+and delayed stop after session-epoch replacement. They use inert dependency seams,
+not real FIFO/RTSP proof. Existing real START/wire and HTTP owner fixtures now cover
+the actual constructed START reader/writer/session, confirmation ordering, retained
+stop timer, competing START projection and strict malformed/forged confirmation.
+Full Linux C/Native fixture execution remains pending official CI: the local Docker
+inventory command never returned and was terminated alone; no daemon restart or
+new build environment was created. Local patch application/whitespace validation
+passes. Native post-effect receipt source is being independently reviewed with the
+same C endpoint. Neither source review nor these controlled checks establishes
+actual paused HomePod Resume on Green.
+
 # Active lead decision · Speakers0.26.31 candidate / unchanged Control0.10.17
 
 Base: published/installed Speakers0.26.30, merge7c51ecb4c15c182c0fcdf3904cf5d18120d9cf93,

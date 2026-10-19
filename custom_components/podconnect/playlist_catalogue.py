@@ -7,13 +7,14 @@ import voluptuous as vol
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 
+from .artwork import spotify_playlist_artwork
 from .const import DOMAIN
 from .observations import current
 
 PLAYLIST = re.compile(r"^spotify:playlist:[A-Za-z0-9]{22}$")
 
 
-def project_playlists(raw, account, epoch, query, limit):
+def project_playlists(raw, account, epoch, query, limit, *, include_artwork=False):
     rows = raw.get("playlists", {}).get("items") if isinstance(raw, dict) else None
     if not isinstance(rows, list) or len(rows) > 20:
         raise HomeAssistantError("Malformed playlist search")
@@ -30,7 +31,12 @@ def project_playlists(raw, account, epoch, query, limit):
             or not 1 <= len(row["name"]) <= 256
         ):
             raise HomeAssistantError("Malformed playlist search")
-        result.append({"uri": row["uri"], "name": row["name"]})
+        projected = {"uri": row["uri"], "name": row["name"]}
+        if include_artwork:
+            artwork = spotify_playlist_artwork(row)
+            if artwork is not None:
+                projected["artwork"] = artwork
+        result.append(projected)
     body = {
         "ok": True,
         "schema": "podconnect.search_playlists.v1",
@@ -55,13 +61,16 @@ def register_playlist_search(hass, library_owner, query_validator, limit_validat
         account, query, limit = (
             call.data[key] for key in ("config_entry_id", "query", "limit")
         )
+        include_artwork = call.data["include_artwork"]
         entry, owner = library_owner(hass, account)
         epoch = owner.coordinator.owner_epoch
         raw = await owner.api.search(query, types="playlist", limit=limit)
         current(hass, entry.entry_id, owner)
         if owner.coordinator.owner_epoch != epoch:
             raise HomeAssistantError("Playlist owner replaced")
-        return project_playlists(raw, account, epoch, query, limit)
+        return project_playlists(
+            raw, account, epoch, query, limit, include_artwork=include_artwork
+        )
 
     hass.services.async_register(
         DOMAIN,
@@ -74,6 +83,7 @@ def register_playlist_search(hass, library_owner, query_validator, limit_validat
                 ),
                 vol.Required("query"): query_validator,
                 vol.Optional("limit", default=3): limit_validator,
+                vol.Optional("include_artwork", default=False): bool,
             }
         ),
         supports_response=SupportsResponse.ONLY,
