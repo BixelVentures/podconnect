@@ -1,0 +1,222 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 8de2305..d48a854 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -243,7 +243,7 @@ airplay_callback_owner_SOURCES = ../tests/airplay_callback_owner.c \
+ airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
+ 	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
+ airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
+-airplay_callback_owner_LDFLAGS = -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
++airplay_callback_owner_LDFLAGS = -Wl,--wrap=close -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
+ EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
+ airplay_callback_owner_LDADD = $(owntone_LDADD) -lm
+ 
+diff --git a/src/input.h b/src/input.h
+index e353b96..559b4a7 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -140,6 +140,9 @@ struct input_definition
+   // Return playback timing sync
+   int (*ts_get)(struct timespec *ts, struct input_source *source);
+ 
++  // Duplicate the backend's current FIFO reader without reading or changing it.
++  // Called on the input thread; the caller owns and closes the returned FD.
++  int (*fifo_hold)(struct input_source *);
+   int (*fifo_barrier)(struct input_source *,bool,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+   int (*fifo_retire)(struct input_source *,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ 
+diff --git a/src/input_fifo_barrier.inc.c b/src/input_fifo_barrier.inc.c
+index dc15ee2..61db68c 100644
+--- a/src/input_fifo_barrier.inc.c
++++ b/src/input_fifo_barrier.inc.c
+@@ -110,26 +110,44 @@ struct input_fifo_start_command {uint32_t item_id;const char *path;struct timesp
+ static enum command_state input_fifo_start_exact(void *arg,int *retval)
+ {
+   struct input_fifo_start_command *c=arg;struct db_queue_item *qi;
++  struct input_fifo_identity prior={0},identity={0};struct stat held,named;
++  int keeper=-1,ret=-1;
+   *retval=-1;
+   if(!input_fifo_deadline(&c->deadline))return COMMAND_END;
+   qi=db_queue_fetch_byitemid(c->item_id);
+   if(!qi)return COMMAND_END;
+-  if(qi->data_kind!=DATA_KIND_PIPE || !qi->path || strcmp(qi->path,c->path) || !input_fifo_deadline(&c->deadline)){
+-    free_queue_item(qi,0);return COMMAND_END;
++  if(qi->data_kind!=DATA_KIND_PIPE || !qi->path || strcmp(qi->path,c->path) || !input_fifo_deadline(&c->deadline))goto done;
++  /* A live native writer is quiesced only after C's reader-ready receipt.
++   * Keep this same FIFO readable across old input + watcher reset closures.
++   * This local FD reads nothing and conveys no source or output authority. */
++  if(input_now_reading.open && input_now_reading.type==INPUT_TYPE_PIPE
++      && input_now_reading.path && !strcmp(input_now_reading.path,c->path)){
++    if(!inputs[input_now_reading.type]->fifo_hold)goto done;
++    keeper=inputs[input_now_reading.type]->fifo_hold(&input_now_reading);
++    if(keeper<0 || fstat(keeper,&held)<0 || !S_ISFIFO(held.st_mode)
++        || stat(c->path,&named)<0 || !S_ISFIFO(named.st_mode)
++        || named.st_dev!=held.st_dev || named.st_ino!=held.st_ino
++        || !input_fifo_deadline(&c->deadline))goto done;
++    prior.device=(uint64_t)held.st_dev;prior.inode=(uint64_t)held.st_ino;
+   }
+   /* The actual input-thread mutator checks after queue and database latency.
+    * It never falls back to a later queue item or starts an output session. */
+   if(input_now_reading.open)stop();
+-  if(!input_fifo_deadline(&c->deadline)){free_queue_item(qi,0);return COMMAND_END;}
+-  int ret=setup(&input_now_reading,qi,0);free_queue_item(qi,0);
+-  if(ret<0)return COMMAND_END;
+-  struct input_fifo_identity identity={0};
++  if(!input_fifo_deadline(&c->deadline))goto done;
++  ret=setup(&input_now_reading,qi,0);
++  if(ret<0)goto done;
+   if(!inputs[input_now_reading.type]->fifo_barrier
+-      || inputs[input_now_reading.type]->fifo_barrier(&input_now_reading,false,0,0,&c->deadline,&identity)<0){stop();return COMMAND_END;}
+-  if(!input_fifo_deadline(&c->deadline)){stop();return COMMAND_END;}
++      || inputs[input_now_reading.type]->fifo_barrier(&input_now_reading,false,0,0,&c->deadline,&identity)<0
++      || (keeper>=0 && (identity.device!=prior.device || identity.inode!=prior.inode))){stop();goto done;}
++  if(!input_fifo_deadline(&c->deadline)){stop();goto done;}
+   event_add(input_open_timeout_ev,&input_open_timeout);event_active(input_ev,0,0);
+-  *retval=ret;return COMMAND_END;
++  *retval=ret;
++ done:
++  free_queue_item(qi,0);
++  if(keeper>=0)close(keeper);
++  return COMMAND_END;
+ }
++
+ int input_start_fifo_exact(uint32_t item,const char *path,const struct timespec *deadline)
+ {
+   if(!path || !deadline)return -1;
+diff --git a/src/inputs/pipe.c b/src/inputs/pipe.c
+index b34ecdc..1721b30 100644
+--- a/src/inputs/pipe.c
++++ b/src/inputs/pipe.c
+@@ -1190,6 +1190,7 @@ struct input_definition input_pipe =
+   .play = play,
+   .stop = stop,
+   .metadata_get = metadata_get,
++  .fifo_hold = fifo_hold,
+   .fifo_barrier = fifo_barrier,
+   .fifo_retire = fifo_retire,
+   .init = init,
+diff --git a/src/inputs/pipe_fifo_barrier.inc.c b/src/inputs/pipe_fifo_barrier.inc.c
+index 9ee1e21..2551432 100644
+--- a/src/inputs/pipe_fifo_barrier.inc.c
++++ b/src/inputs/pipe_fifo_barrier.inc.c
+@@ -1,3 +1,11 @@
++/* Resource hold only: no read, autostop change or event registration. */
++static int fifo_hold(struct input_source *source)
++{
++  struct pipe *pipe=source->input_ctx;
++  if(!pipe || pipe->fd<0)return -1;
++  return fcntl(pipe->fd,F_DUPFD_CLOEXEC,0);
++}
++
+ /* Raw PCM pipe source only. The actual private fd and source evbuf are owned
+  * by this input thread. Writer quiescence is an earlier native owner proof. */
+ static int fifo_barrier(struct input_source *source,bool drain,uint64_t expected_device,uint64_t expected_inode,
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index adedf24..5d83d43 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -46,6 +46,30 @@ static int fixture_service_bind(struct net_socket *socket, unsigned short *port,
+ #include "../src/outputs/streaming.c"
+ #include "../src/player.c"
+ 
++/* The input command closes its real old reader before opening the successor.
++ * Schedule the pipe watcher's independent reset-close in that exact interval.
++ * No C output/session result is substituted; the FIFO write is a real syscall. */
++static atomic_int fixture_handoff_old_reader = -1;
++static atomic_int fixture_handoff_watcher = -1;
++static atomic_int fixture_handoff_writer = -1;
++static atomic_int fixture_handoff_write_result = -2;
++static atomic_int fixture_handoff_write_errno;
++int __real_close(int);
++int __wrap_close(int fd)
++{
++  int result=__real_close(fd),saved_errno=errno;
++  int expected=fd;
++  if(fd>=0 && atomic_compare_exchange_strong(&fixture_handoff_old_reader,&expected,-1)){
++    int watcher=atomic_exchange(&fixture_handoff_watcher,-1);
++    assert(watcher>=0 && __real_close(watcher)==0);
++    errno=0;
++    ssize_t written=write(atomic_load(&fixture_handoff_writer),"p",1);
++    atomic_store(&fixture_handoff_write_errno,errno);
++    atomic_store(&fixture_handoff_write_result,(int)written);
++  }
++  errno=saved_errno;return result;
++}
++
+ /* Test-only scheduling point after the real FULL journal write has returned.
+  * Production still executes the unmodified db_start_guard_save body. */
+ static int *fixture_post_full_writer;
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index b6a693d..1b42649 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1,6 +1,7 @@
+ /* Reuses the existing private AP2 receiver and actual input command owner.
+  * The FIFO writer is a finite local test thread, never a Spotify/provider. */
+ #include <fcntl.h>
++#include <signal.h>
+ #include "../src/input.h"
+ struct start_fifo_writer {int fd;ssize_t written;};
+ static void *start_fifo_finish(void *arg)
+@@ -113,6 +114,53 @@ static void confirmed_pause_custody_case(struct output_device *device,
+   transport_custody_revision=prior_revision;transport_custody_live=prior_live;transport_custody_lost=prior_lost;
+ }
+ 
++/* Existing input-thread command used by start_reader_install. The production
++ * watcher is independently between close and reopen; the wrapper controls that
++ * scheduling point while retaining a real old input and writer descriptor. */
++static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
++{
++  struct timespec deadline;struct input_fifo_identity before={0},after={0};
++  struct stat identity,st;int old=-1,count=0;
++  int writer=open(path,O_WRONLY|O_NONBLOCK),watcher=open(path,O_RDONLY|O_NONBLOCK);
++  assert(writer>=0 && watcher>=0 && fstat(writer,&identity)==0);
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec+=4;
++  assert(input_fifo_owner_get(item,path,true,identity.st_dev,identity.st_ino,&deadline,&before)==0);
++  for(int fd=0;fd<4096;fd++){
++    if(fd==watcher || fd==writer || fstat(fd,&st)<0 || !S_ISFIFO(st.st_mode)
++        || st.st_dev!=identity.st_dev || st.st_ino!=identity.st_ino)continue;
++    int flags=fcntl(fd,F_GETFL);
++    if(flags>=0 && (flags&O_ACCMODE)==O_RDONLY){old=fd;count++;}
++  }
++  assert(count==1 && old>=0);
++  void (*prior_signal)(int)=signal(SIGPIPE,SIG_IGN);assert(prior_signal!=SIG_ERR);
++  atomic_store(&fixture_handoff_watcher,watcher);
++  atomic_store(&fixture_handoff_writer,writer);
++  atomic_store(&fixture_handoff_write_result,-2);
++  atomic_store(&fixture_handoff_old_reader,old);
++  assert(input_start_fifo_exact(item,path,&deadline)>=0);
++  assert(atomic_load(&fixture_handoff_old_reader)==-1
++      && atomic_load(&fixture_handoff_watcher)==-1);
++  int written=atomic_load(&fixture_handoff_write_result);
++  fprintf(stderr,"live FIFO reader handoff write=%d errno=%d\n",written,
++      atomic_load(&fixture_handoff_write_errno));
++  assert(written==1); /* No EPIPE during input + watcher reader replacement. */
++  assert(input_fifo_owner_get(item,path,false,0,0,&deadline,&after)==0
++      && after.device==before.device && after.inode==before.inode
++      && after.epoch==before.epoch);
++  assert(input_fifo_owner_get(item,path,true,before.device,before.inode,&deadline,&after)==0
++      && after.epoch>before.epoch);
++  struct timespec expired={0};
++  uint64_t epoch=after.epoch;
++  assert(input_start_fifo_exact(item,path,&expired)<0);
++  assert(input_start_fifo_exact(item,"/not-the-owned-fifo",&deadline)<0);
++  assert(input_fifo_owner_get(item,path,false,0,0,&deadline,&after)==0
++      && after.device==before.device && after.inode==before.inode && after.epoch==epoch);
++  assert(write(writer,"p",1)==1); /* Rejected requests cannot close the live reader. */
++  assert(signal(SIGPIPE,prior_signal)!=SIG_ERR);
++  close(writer);
++  puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
++}
++
+ static int start35_wire_case(int mode)
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+@@ -565,6 +613,7 @@ static int start35_wire_case(int mode)
+     struct input_fifo_identity closed_stage={0};
+     assert(input_fifo_stage_release(r->expected_input_path,&closed_stage)<0);
+     close(replacement);
++    fifo_live_reader_handoff_case(item,r->expected_input_path);
+     puts("PASS actual START35 two-phase FULL retirement and direct guarded successor: known witness, nonblocking writer admission, real reader replaces staged FD before reader-ready");
+   }
+   if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}

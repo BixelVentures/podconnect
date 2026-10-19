@@ -1,3 +1,9 @@
+## Speakers 0.26.35 — same-FIFO reader handoff
+
+- Keep a temporary read-only reference to the same FIFO during its synchronous reader replacement. This closes a demonstrated gap where the old input and watcher readers could both close while the existing Native writer was still active, causing EPIPE.
+- Preserve FIFO path/inode identity, source ownership, epochs, cancellation and deadlines. The keeper reads no bytes and grants no output authority; UNKNOWN playback requests are not replayed. Control remains 0.10.19.
+- Green 0.26.34 reported EPIPE followed by insufficient data, but its exact failing phase is unknown. Local causal probes reproduce the source hazard; official Linux regression execution, image publication, Green installation and live playback proof remain pending.
+
 ## Speakers 0.26.34 — Vorbis source retirement cleanup
 
 - Correct the native Vorbis decoder cleanup order when retiring a displaced audio source: clear Block, then DSP, then Info. The Speakers 0.26.33 log recorded a SIGSEGV in `vorbis_dsp_clear` during that retirement path.
