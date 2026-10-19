@@ -10,9 +10,16 @@ _HEX40 = re.compile(r"[a-f0-9]{40}\Z")
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
 _GENERATION = re.compile(r"[1-9][0-9]{0,19}\Z")
 _FIELDS = {
-    "schema", "method", "domain", "identifier_sha256", "engine_device_id",
-    "run_generation", "connection_generation", "observation_sequence",
-    "observed_at_unix_ms", "expires_at_unix_ms",
+    "schema",
+    "method",
+    "domain",
+    "identifier_sha256",
+    "engine_device_id",
+    "run_generation",
+    "connection_generation",
+    "observation_sequence",
+    "observed_at_unix_ms",
+    "expires_at_unix_ms",
 }
 
 
@@ -55,17 +62,67 @@ def compare_account_identifiers(identity, stored_me_id, expected_engine_id, *, n
         or row["engine_device_id"] != expected_engine_id
         or not isinstance(row["identifier_sha256"], str)
         or _HEX64.fullmatch(row["identifier_sha256"]) is None
-        or any(not isinstance(row[key], str) or _GENERATION.fullmatch(row[key]) is None
-               for key in ("run_generation", "connection_generation", "observation_sequence"))
+        or any(
+            not isinstance(row[key], str) or _GENERATION.fullmatch(row[key]) is None
+            for key in (
+                "run_generation",
+                "connection_generation",
+                "observation_sequence",
+            )
+        )
     ):
         return result
     observed, expires = row["observed_at_unix_ms"], row["expires_at_unix_ms"]
     if (
-        type(observed) is not int or type(expires) is not int
+        type(observed) is not int
+        or type(expires) is not int
         or not 0 < observed <= now_ms < expires < 2**53
         or expires - observed != 5000
     ):
         return result
-    equal = hmac.compare_digest(hashlib.sha256(encoded).hexdigest(), row["identifier_sha256"])
-    return {"comparison": "identifiers_equal" if equal else "identifiers_different",
-            "identity_relation": "unknown"}
+    equal = hmac.compare_digest(
+        hashlib.sha256(encoded).hexdigest(), row["identifier_sha256"]
+    )
+    return {
+        "comparison": "identifiers_equal" if equal else "identifiers_different",
+        "identity_relation": "unknown",
+    }
+
+
+def compare_fresh_profile_identifiers(
+    identity, stored_me_id, profile, expected_engine_id, *, now_ms
+):
+    """Content-free byte comparisons only; /me.account_id is never an AP identity.
+
+    Both native comparisons reuse the existing exact engine/generation/freshness
+    validation. No provider value, identifier or digest escapes this function.
+    """
+    result = {
+        "comparison": "unknown",
+        "identity_relation": "unknown",
+        "stored_vs_fresh_web_id": "unknown",
+        "native_vs_fresh_web_id": "unknown",
+    }
+    if not isinstance(profile, dict):
+        return result
+    fresh_id = profile.get("id")
+    fresh = compare_account_identifiers(
+        identity, fresh_id, expected_engine_id, now_ms=now_ms
+    )
+    stored = compare_account_identifiers(
+        identity, stored_me_id, expected_engine_id, now_ms=now_ms
+    )
+    if fresh["comparison"] == "unavailable" or stored["comparison"] == "unavailable":
+        return result
+    equal = hmac.compare_digest(
+        hashlib.sha256(stored_me_id.encode("utf-8")).digest(),
+        hashlib.sha256(fresh_id.encode("utf-8")).digest(),
+    )
+    result.update(
+        comparison=stored["comparison"],
+        native_vs_fresh_web_id=fresh["comparison"],
+        stored_vs_fresh_web_id="identifiers_equal"
+        if equal
+        else "identifiers_different",
+    )
+    return result

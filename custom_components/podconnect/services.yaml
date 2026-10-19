@@ -305,7 +305,7 @@ search_playlists:
         boolean:
 get_account_identifier_diagnostic:
   name: Compare account identifiers
-  description: Explicit read-only native identifier diagnostic. Unknown identity relation; never grants playback or account authority.
+  description: Explicit read-only comparison of stored and fresh Web API id with fresh native identifier bytes. Uses the same OAuth entry; account_id is never compared to native identity. Content-free enums only, identity relation remains unknown; never changes identity, playback or account authority.
   fields:
     config_entry_id:
       required: true

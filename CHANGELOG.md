@@ -1,3 +1,7 @@
+## Control 0.10.19 — 2026-10-19
+- Extend the existing operator identifier diagnostic with a bounded fresh Spotify profile read and separate stored/fresh/native byte-comparison enums. No profile or identifier is returned, no identity is rewritten, and playback authority remains unchanged.
+- Speakers remains 0.26.33; this integration update diagnoses stale stored profile IDs without treating AP/Web API identifiers as equivalent.
+
 ## Speakers 0.26.33 — accepted Connect transfer recovery candidate
 
 - Keep the same accepted Connect transfer pending within its existing five-second lifetime only after the native output owner explicitly proves a temporary refusal before any volume effect. Recheck the exact run, source, ordinal, alias and output ownership before routing.
