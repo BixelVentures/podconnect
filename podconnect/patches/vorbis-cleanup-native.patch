@@ -1,0 +1,107 @@
+diff --git a/vorbis/decoder.go b/vorbis/decoder.go
+index 17aa254..05cd1a4 100644
+--- a/vorbis/decoder.go
++++ b/vorbis/decoder.go
+@@ -139,9 +139,10 @@ func (d *Decoder) decoderStateCleanup() {
+ 		d.comment.Free()
+ 	}
+ 
+-	if d.info.Ref() != nil {
+-		vorbis.InfoClear(&d.info)
+-		d.info.Free()
++	// Block borrows DSP, and DSP borrows Info. Retire dependants first.
++	if d.block.Ref() != nil {
++		vorbis.BlockClear(&d.block)
++		d.block.Free()
+ 	}
+ 
+ 	if d.dspState.Ref() != nil {
+@@ -149,9 +150,9 @@ func (d *Decoder) decoderStateCleanup() {
+ 		d.dspState.Free()
+ 	}
+ 
+-	if d.block.Ref() != nil {
+-		vorbis.BlockClear(&d.block)
+-		d.block.Free()
++	if d.info.Ref() != nil {
++		vorbis.InfoClear(&d.info)
++		d.info.Free()
+ 	}
+ 
+ 	d.packet.Free()
+diff --git a/vorbis/decoder_cleanup_test.go b/vorbis/decoder_cleanup_test.go
+new file mode 100644
+index 0000000..e3357e1
+--- /dev/null
++++ b/vorbis/decoder_cleanup_test.go
+@@ -0,0 +1,70 @@
++package vorbis
++
++import (
++	"bytes"
++	"io"
++	"testing"
++
++	libvorbis "github.com/xlab/vorbis-go/vorbis"
++)
++
++// The DSP keeps its Info pointer, and Block keeps its DSP pointer. Exercise
++// real codec allocations through the same Close path as displaced player sources.
++func TestDecoderCloseRespectsCodecOwnership(t *testing.T) {
++	for _, started := range []bool{false, true} {
++		name := "before_first_read"
++		if started {
++			name = "after_block_initialization"
++		}
++		t.Run(name, func(t *testing.T) {
++			for i := 0; i < 8; i++ {
++				d := &Decoder{stopChan: make(chan struct{})}
++				libvorbis.OggSyncInit(&d.syncState)
++				libvorbis.InfoInit(&d.info)
++				if ret := libvorbis.EncodeInitVbr(&d.info, 2, 44100, 0.2); ret != 0 {
++					t.Fatalf("initialize real Vorbis codec setup: %d", ret)
++				}
++				if ret := libvorbis.SynthesisInit(&d.dspState, &d.info); ret != 0 {
++					t.Fatalf("initialize real decoder DSP: %d", ret)
++				}
++				if started {
++					if ret := libvorbis.BlockInit(&d.dspState, &d.block); ret != 0 {
++						t.Fatalf("initialize real decoder block: %d", ret)
++					}
++					d.started = true
++				}
++				d.Close()
++				if d.block.Ref() != nil || d.dspState.Ref() != nil || d.info.Ref() != nil {
++					t.Fatal("codec cleanup retained a C allocation")
++				}
++				d.Close()
++				if n, err := d.Read(make([]float32, 1)); n != 0 || err == nil {
++					t.Fatalf("closed decoder accepted another read: n=%d err=%v", n, err)
++				}
++			}
++		})
++	}
++}
++
++func TestDecoderMalformedHeaderCleanup(t *testing.T) {
++	for _, size := range []int{0, DataChunkSize} {
++		input := io.NewSectionReader(bytes.NewReader(make([]byte, size)), 0, int64(size))
++		decoder, err := New(nil, input, nil, 1)
++		if err == nil || decoder != nil {
++			t.Fatalf("malformed header unexpectedly initialized decoder: decoder=%v err=%v", decoder, err)
++		}
++	}
++}
++
++func TestDecoderCloseBeforeDSPInitialization(t *testing.T) {
++	d := &Decoder{stopChan: make(chan struct{})}
++	libvorbis.OggSyncInit(&d.syncState)
++	libvorbis.OggStreamInit(&d.streamState, 1)
++	libvorbis.InfoInit(&d.info)
++	libvorbis.CommentInit(&d.comment)
++	d.Close()
++	d.Close()
++	if d.info.Ref() != nil || d.comment.Ref() != nil || d.streamState.Ref() != nil {
++		t.Fatal("partial decoder cleanup retained a C allocation")
++	}
++}
