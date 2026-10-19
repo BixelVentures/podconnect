@@ -241,8 +241,8 @@ diff --git a/src/httpd_jsonapi_transport_bound.inc.c b/src/httpd_jsonapi_transpo
 +  char token[33],prepare[33];uint64_t id,revision;int ret=HTTP_BADREQUEST;
 +  if (!body || json_object_object_length(body)!=3
 +      || safe_atou64(hreq->path_parts[2],&id)<0
-+      || !transport_json_string(body,"token",token,sizeof(token)) || !transport_hex(token,32)
-+      || !transport_json_string(body,"native_prepare_id",prepare,sizeof(prepare)) || !transport_hex(prepare,32)
++      || !transport_json_string(body,"token",token,sizeof(token)) || !queue_wire_hex(token,32)
++      || !transport_json_string(body,"native_prepare_id",prepare,sizeof(prepare)) || !queue_wire_hex(prepare,32)
 +      || transport_native_counter(body,"native_revision",&revision)<0 || !revision || revision==UINT64_MAX) goto out;
 +  ret=409;
 +  if (player_transport_pause_confirm(id,token,prepare,revision)<0) goto out;
