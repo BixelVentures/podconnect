@@ -106,6 +106,8 @@ COPY patches/paused-route-owntone.sha256 /patches/paused-route-owntone.sha256
 COPY patches/connect-recovery-busy-owntone.sha256 /patches/connect-recovery-busy-owntone.sha256
 COPY patches/fifo-reader-handoff-owntone.patch /patches/fifo-reader-handoff-owntone.patch
 COPY patches/fifo-reader-handoff-owntone.sha256 /patches/fifo-reader-handoff-owntone.sha256
+COPY patches/start-starvation-owner-owntone.patch /patches/start-starvation-owner-owntone.patch
+COPY patches/start-starvation-owner-owntone.sha256 /patches/start-starvation-owner-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -143,6 +145,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/fifo-reader-handoff-owntone.sha256 \
   && git apply --check /patches/fifo-reader-handoff-owntone.patch \
   && git apply /patches/fifo-reader-handoff-owntone.patch \
+  && sha256sum -c /patches/start-starvation-owner-owntone.sha256 \
+  && git apply --check /patches/start-starvation-owner-owntone.patch \
+  && git apply /patches/start-starvation-owner-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

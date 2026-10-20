@@ -1,3 +1,9 @@
+## Speakers 0.26.38 — preserve START route ownership during gated starvation
+
+- Keep draining the exact FIFO and processing EOF while the START output gate is closed. Intentional writer quiescence must not invoke legacy starvation suspend/flush/resume and replace the pending route callback.
+- Preserve normal open-gate starvation recovery, genuine host-timer overrun safety, existing eight-second C deadline, Native ownership and UNKNOWN/no-replay behavior. Control remains 0.10.19.
+- Extend the existing actual AP/FIFO successor regression through gated starvation, exact35 route/open/completion and the ordinary starvation control. Source review and exact-body reproduction establish the callback-owner defect; mandatory Linux execution, release, installation and corrected field acceptance remain separate pending gates.
+
 ## Speakers 0.26.37 — content-free START failure diagnostic
 
 - Record only the finite failed START stage, last validated C phase, conservative error class and terminal outcome in the existing Native owner log. No content, identifiers or raw errors are logged.
