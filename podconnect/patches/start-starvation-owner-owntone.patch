@@ -1,0 +1,94 @@
+diff --git a/src/player.c b/src/player.c
+index 942717f..450acf3 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -1377,6 +1377,15 @@ playback_cb(int fd, short what, void *arg)
+ 	}
+     }
+ 
++  /* A closed START gate intentionally withholds the new writer until route
++   * readiness. Keep draining and processing EOF above, but do not let ordinary
++   * starvation flush/rebind the START-owned session or arm legacy resume. */
++  if (outputs_start_gate_closed())
++    {
++      pb_session.read_deficit = 0;
++      return;
++    }
++
+   if (pb_session.read_deficit_max && pb_session.read_deficit > pb_session.read_deficit_max)
+     {
+       DPRINTF(E_LOG, L_PLAYER, "Source is not providing sufficient data, temporarily suspending playback (deficit=%zu/%zu bytes)\n",
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index 1b42649..c17bf2d 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2,10 +2,38 @@
+  * The FIFO writer is a finite local test thread, never a Spotify/provider. */
+ #include <fcntl.h>
+ #include <signal.h>
++#include <poll.h>
+ #include "../src/input.h"
+ struct start_fifo_writer {int fd;ssize_t written;};
+ static void *start_fifo_finish(void *arg)
+ {struct start_fifo_writer *w=arg;char bytes[4096]={0};w->written=write(w->fd,bytes,sizeof(bytes));return NULL;}
++/* The writer remains live but paused, as at the observed second START.
++ * Cross the real deficit boundary on one real timer/FIFO read while the actual
++ * AP constructor is waiting for its private receiver response. */
++static void start_route_starvation_tick(struct recovery_wire_fixture *f,bool gated)
++{
++  struct airplay_session *session=f->device->session;
++  struct media_quality *quality=malloc(sizeof(*quality));
++  struct itimerspec tick={.it_value={0,1}};
++  struct pollfd ready={.fd=pb_timer_fd,.events=POLLIN};
++  int callback=session ? session->callback_id : -1;
++  uint64_t epoch=f->device->session_epoch,revision=session ? session->callback_revision : 0;
++  assert(quality && session && outputs_start_gate_closed()==gated);
++  if(gated)assert(callback>=0 && outputs_cb_register[callback].cb==start_connected);
++  *quality=f->device->quality;session_update_read_quality(quality);
++  assert(pb_session.bufsize && pb_session.read_deficit_max && player_state==PLAY_PLAYING);
++  pb_session.read_deficit=pb_session.read_deficit_max;
++  assert(!timerfd_settime(pb_timer_fd,0,&tick,NULL) && poll(&ready,1,1000)==1);
++  playback_cb(pb_timer_fd,EV_READ,NULL);
++  if(gated){
++    assert(player_state==PLAY_PLAYING && !pb_session.read_deficit
++      && f->device->session==session && f->device->session_epoch==epoch
++      && session->callback_id==callback && session->callback_revision==revision
++      && outputs_cb_register[callback].cb==start_connected);
++    assert(pb_timer_start()==0);
++  }else assert(player_state==PLAY_PAUSED); /* Normal starvation still recovers. */
++}
++
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+ {
+   struct recovery_wire_fixture *f=active_recovery_wire;
+@@ -612,9 +640,29 @@ static int start35_wire_case(int mode)
+       && !start_retired_stage_path[0] && !start_retired_stage_ready);
+     struct input_fifo_identity closed_stage={0};
+     assert(input_fifo_stage_release(r->expected_input_path,&closed_stage)<0);
++    /* The prior test stopped at reader-ready. Drive the fresh successor through
++     * its real FIFO barrier and complete AP route after the starvation tick. */
++    if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}
++    pair_cipher_free(f.cipher);f.cipher=NULL;pair_setup_free(f.pair);f.pair=NULL;
++    evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++    f.pair_messages=0;f.volumes=0;f.teardowns=0;f.phase=0;
++    assert(outputs_start_source_current(successor.token,NULL,&deadline));
++    assert(input_fifo_owner_get(item,r->expected_input_path,false,0,0,&deadline,&fd)==0);
++    successor.writer_source_epoch=1;successor.pipe_device=fd.device;successor.pipe_inode=fd.inode;
++    successor.writer_quiescent=true;f.start_command=successor;
++    assert(outputs_start_barrier_begin(&successor,&f.start_result)==0);
++    assert(start_input_barrier(&successor)==0);
++    assert(outputs_start_result_get(1,successor.token,&f.start_result)==0
++      && f.start_result.phase==OUTPUT_START_PREPARING_ROUTE && f.start_result.gate_closed);
++    start_route_starvation_tick(&f,true);
++    event_del(f.poll);event_del(f.deadline);
++    assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++    assert(!f.failed && f.start_result.phase==OUTPUT_START_COMPLETED && f.volumes==1
++      && !outputs_start_gate_closed() && f.device->session);
++    start_route_starvation_tick(&f,false);
+     close(replacement);
+     fifo_live_reader_handoff_case(item,r->expected_input_path);
+-    puts("PASS actual START35 two-phase FULL retirement and direct guarded successor: known witness, nonblocking writer admission, real reader replaces staged FD before reader-ready");
++    puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
+   }
+   if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
+  cleanup:
