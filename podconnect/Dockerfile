@@ -75,6 +75,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/connect-output-admission-diagnostics-native.patch" \
   && git apply --check "/patches/connect-closed-prior-native.patch" \
   && git apply "/patches/connect-closed-prior-native.patch" \
+  && git apply --check "/patches/connect-output-failure-native.patch" \
+  && git apply "/patches/connect-output-failure-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
