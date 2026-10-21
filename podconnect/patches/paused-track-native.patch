@@ -1,0 +1,354 @@
+diff --git a/daemon/room_burst_test.go b/daemon/room_burst_test.go
+index 692aaa7..9067e2f 100644
+--- a/daemon/room_burst_test.go
++++ b/daemon/room_burst_test.go
+@@ -9,6 +9,9 @@ import (
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
++
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ )
+ 
+ func burstVolumeFixture(t *testing.T) (*AppPlayer, *roomVolumeOperation) {
+@@ -193,120 +196,130 @@ func TestRoomBurstUnknownForeignAndUndrainedProofKeepOriginalPark(t *testing.T)
+ }
+ 
+ func TestRoomBurstAudioHTTPRequiresActualExactBoundProof(t *testing.T) {
+-	for _, mode := range []string{"accepted", "foreign-revision", "foreign-owner", "downgrade", "old-endpoint", "effect-failure", "effect-unknown", "effect-missing-physical", "effect-null-physical", "confirm-failure", "stale-confirm", "confirm-missing-physical", "confirm-null-physical"} {
+-		t.Run(mode, func(t *testing.T) {
+-			p, offer := roomTransportAdmittedFixture(t)
+-			revision, err := p.nextNativeIntent()
+-			if err != nil {
+-				t.Fatal(err)
++	for _, action := range []string{"pause", "next", "previous", "playing-next"} {
++		for _, mode := range []string{"accepted", "foreign-revision", "foreign-owner", "downgrade", "old-endpoint", "effect-failure", "effect-unknown", "effect-missing-physical", "effect-null-physical", "confirm-failure", "stale-confirm", "confirm-missing-physical", "confirm-null-physical"} {
++			if action == "playing-next" && mode != "accepted" && mode != "effect-failure" {
++				continue
+ 			}
+-			offer.Bound = true
+-			offer.NativeRevision = revision
+-			offer.Snapshot.NativeRevision = revision
+-			var confirmations atomic.Int32
+-			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-				if r.URL.Path == "/api/outputs/101/transport/bound-pause-confirm" {
+-					confirmations.Add(1)
+-					var request map[string]any
+-					if json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 3 || request["token"] != strings.Repeat("c", 32) || request["native_prepare_id"] != offer.Snapshot.PrepareID || request["native_revision"] != revision {
+-						t.Error("pause confirmation did not carry exact consumed capability")
+-					}
+-					if mode == "confirm-failure" {
+-						w.WriteHeader(http.StatusConflict)
++			t.Run(action+"/"+mode, func(t *testing.T) {
++				p, offer := roomTransportAdmittedFixture(t)
++				if action != "pause" {
++					offer.Snapshot.Action = strings.TrimPrefix(action, "playing-")
++					offer.PreparedStream = &player.Stream{}
++					offer.PreparedState = &connectpb.PlayerState{IsPaused: action != "playing-next"}
++				}
++				revision, err := p.nextNativeIntent()
++				if err != nil {
++					t.Fatal(err)
++				}
++				offer.Bound = true
++				offer.NativeRevision = revision
++				offer.Snapshot.NativeRevision = revision
++				var confirmations atomic.Int32
++				owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					if r.URL.Path == "/api/outputs/101/transport/bound-pause-confirm" {
++						confirmations.Add(1)
++						var request map[string]any
++						if json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 3 || request["token"] != strings.Repeat("c", 32) || request["native_prepare_id"] != offer.Snapshot.PrepareID || request["native_revision"] != revision {
++							t.Error("pause confirmation did not carry exact consumed capability")
++						}
++						if mode == "confirm-failure" {
++							w.WriteHeader(http.StatusConflict)
++							return
++						}
++						replyRevision := revision
++						if mode == "stale-confirm" {
++							replyRevision = "2"
++						}
++						reply := map[string]any{"schema": "podconnect.output_transport_pause_confirmation.v1", "ok": true, "token": strings.Repeat("c", 32), "native_prepare_id": offer.Snapshot.PrepareID, "native_revision": replyRevision, "physical_result_verified": false}
++						if mode == "confirm-missing-physical" {
++							delete(reply, "physical_result_verified")
++						} else if mode == "confirm-null-physical" {
++							reply["physical_result_verified"] = nil
++						}
++						_ = json.NewEncoder(w).Encode(reply)
+ 						return
+ 					}
+-					replyRevision := revision
+-					if mode == "stale-confirm" {
+-						replyRevision = "2"
++					if r.URL.Path != "/api/outputs/101/transport/bound-commit" {
++						t.Error("unbound fallback", r.URL.Path)
++					}
++					raw := map[string]json.RawMessage{}
++					_ = json.NewDecoder(r.Body).Decode(&raw)
++					if len(raw) != 7 {
++						t.Error("audio Ccommit not closed7")
++					}
++					var got roomTransportIdentity
++					var gotRevision string
++					if strictVolumeJSON(raw["native_owner"], &got) != nil || got != offer.Snapshot.roomTransportIdentity || json.Unmarshal(raw["native_revision"], &gotRevision) != nil || gotRevision != revision {
++						t.Error("audio Ccommit actual actor binding absent")
++					}
++					ack := roomTransportOutputACK{"podconnect.output_transport_commit.v2", true, strings.Repeat("c", 32), offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, 10000, "accepted", false}
++					boundOwner := offer.Snapshot.roomTransportIdentity
++					boundRevision := revision
++					if mode == "foreign-owner" {
++						boundOwner.ConnectionID = "foreign"
+ 					}
+-					reply := map[string]any{"schema": "podconnect.output_transport_pause_confirmation.v1", "ok": true, "token": strings.Repeat("c", 32), "native_prepare_id": offer.Snapshot.PrepareID, "native_revision": replyRevision, "physical_result_verified": false}
+-					if mode == "confirm-missing-physical" {
+-						delete(reply, "physical_result_verified")
+-					} else if mode == "confirm-null-physical" {
+-						reply["physical_result_verified"] = nil
++					if mode == "foreign-revision" {
++						boundRevision = "2"
++					}
++					var reply any = boundOwnerPayload(ack, boundOwner, boundRevision)
++					if mode == "downgrade" {
++						ack.Schema = "podconnect.output_transport_commit.v1"
++						reply = ack
+ 					}
+ 					_ = json.NewEncoder(w).Encode(reply)
+-					return
+-				}
+-				if r.URL.Path != "/api/outputs/101/transport/bound-commit" {
+-					t.Error("unbound fallback", r.URL.Path)
+-				}
+-				raw := map[string]json.RawMessage{}
+-				_ = json.NewDecoder(r.Body).Decode(&raw)
+-				if len(raw) != 7 {
+-					t.Error("audio Ccommit not closed7")
+-				}
+-				var got roomTransportIdentity
+-				var gotRevision string
+-				if strictVolumeJSON(raw["native_owner"], &got) != nil || got != offer.Snapshot.roomTransportIdentity || json.Unmarshal(raw["native_revision"], &gotRevision) != nil || gotRevision != revision {
+-					t.Error("audio Ccommit actual actor binding absent")
+-				}
+-				ack := roomTransportOutputACK{"podconnect.output_transport_commit.v2", true, strings.Repeat("c", 32), offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, 10000, "accepted", false}
+-				boundOwner := offer.Snapshot.roomTransportIdentity
+-				boundRevision := revision
+-				if mode == "foreign-owner" {
+-					boundOwner.ConnectionID = "foreign"
+-				}
+-				if mode == "foreign-revision" {
+-					boundRevision = "2"
+-				}
+-				var reply any = boundOwnerPayload(ack, boundOwner, boundRevision)
+-				if mode == "downgrade" {
+-					ack.Schema = "podconnect.output_transport_commit.v1"
+-					reply = ack
+-				}
+-				_ = json.NewEncoder(w).Encode(reply)
+-			}))
+-			defer owner.Close()
+-			offer.OwnToneURL = owner.URL
+-			p.app.cfg.RoomTransportOwnToneURL = owner.URL
+-			server := &ConcreteApiServer{requests: make(chan ApiRequest)}
+-			var effects atomic.Int32
+-			done := make(chan struct{})
+-			go func() {
+-				defer close(done)
+-				for req := range server.requests {
+-					switch req.Type {
+-					case apiRoomTransportEffect:
+-						effects.Add(1)
+-						if mode == "effect-failure" {
+-							req.Reply(nil, ErrAliasConflict)
+-						} else if mode == "effect-unknown" {
+-							req.Reply(map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": false, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}, nil)
+-						} else {
+-							reply := map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": true, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}
+-							if mode == "effect-missing-physical" {
+-								delete(reply, "physical_result_verified")
+-							} else if mode == "effect-null-physical" {
+-								reply["physical_result_verified"] = nil
++				}))
++				defer owner.Close()
++				offer.OwnToneURL = owner.URL
++				p.app.cfg.RoomTransportOwnToneURL = owner.URL
++				server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++				var effects atomic.Int32
++				done := make(chan struct{})
++				go func() {
++					defer close(done)
++					for req := range server.requests {
++						switch req.Type {
++						case apiRoomTransportEffect:
++							effects.Add(1)
++							if mode == "effect-failure" {
++								req.Reply(nil, ErrAliasConflict)
++							} else if mode == "effect-unknown" {
++								req.Reply(map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": false, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}, nil)
++							} else {
++								reply := map[string]any{"schema": "podconnect.native_room_transport_commit.v2", "accepted_native": true, "prepare_id": offer.Snapshot.PrepareID, "physical_result_verified": false}
++								if mode == "effect-missing-physical" {
++									delete(reply, "physical_result_verified")
++								} else if mode == "effect-null-physical" {
++									reply["physical_result_verified"] = nil
++								}
++								req.Reply(reply, nil)
+ 							}
+-							req.Reply(reply, nil)
++						default:
++							data, err := p.handleApiRequest(context.Background(), req)
++							req.Reply(data, err)
+ 						}
+-					default:
+-						data, err := p.handleApiRequest(context.Background(), req)
+-						req.Reply(data, err)
+ 					}
++				}()
++				path := "/player/room_transport/bound-commit"
++				if mode == "old-endpoint" {
++					path = "/player/room_transport/commit"
+ 				}
+-			}()
+-			path := "/player/room_transport/bound-commit"
+-			if mode == "old-endpoint" {
+-				path = "/player/room_transport/commit"
+-			}
+-			out := httptest.NewRecorder()
+-			server.handleRoomTransportCommit(out, httptest.NewRequest("POST", path, strings.NewReader(`{"prepare_id":"`+offer.Snapshot.PrepareID+`","own_tone_token":"`+strings.Repeat("c", 32)+`"}`)))
+-			close(server.requests)
+-			<-done
+-			wantEffects := int32(1)
+-			if mode == "foreign-revision" || mode == "foreign-owner" || mode == "downgrade" || mode == "old-endpoint" {
+-				wantEffects = 0
+-			}
+-			wantConfirmations := int32(0)
+-			if mode == "accepted" || mode == "confirm-failure" || mode == "stale-confirm" || mode == "confirm-missing-physical" || mode == "confirm-null-physical" {
+-				wantConfirmations = 1
+-			}
+-			if (mode == "accepted") != (out.Code == 200) || effects.Load() != wantEffects || confirmations.Load() != wantConfirmations {
+-				t.Fatal("wrong bound proof reached private effect", mode, out.Code, out.Body.String(), effects.Load())
+-			}
+-		})
++				out := httptest.NewRecorder()
++				server.handleRoomTransportCommit(out, httptest.NewRequest("POST", path, strings.NewReader(`{"prepare_id":"`+offer.Snapshot.PrepareID+`","own_tone_token":"`+strings.Repeat("c", 32)+`"}`)))
++				close(server.requests)
++				<-done
++				wantEffects := int32(1)
++				if mode == "foreign-revision" || mode == "foreign-owner" || mode == "downgrade" || mode == "old-endpoint" {
++					wantEffects = 0
++				}
++				wantConfirmations := int32(0)
++				if action != "playing-next" && (mode == "accepted" || mode == "confirm-failure" || mode == "stale-confirm" || mode == "confirm-missing-physical" || mode == "confirm-null-physical") {
++					wantConfirmations = 1
++				}
++				if (mode == "accepted") != (out.Code == 200) || effects.Load() != wantEffects || confirmations.Load() != wantConfirmations {
++					t.Fatal("wrong bound proof reached private effect", mode, out.Code, out.Body.String(), effects.Load())
++				}
++			})
++		}
+ 	}
+ }
+diff --git a/daemon/room_next.go b/daemon/room_next.go
+index 140459c..6f36aaa 100644
+--- a/daemon/room_next.go
++++ b/daemon/room_next.go
+@@ -90,8 +90,10 @@ func (p *AppPlayer) prepareRoomTransportTrack(ctx context.Context, previous bool
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, nil, err
+ 	}
+-	if !previous {
+-		state.IsPaused = false
++	// Paused route custody is tied to the current Native/C session. Autoplay
++	// creates a new session, which cannot borrow the old paused writer owner.
++	if state.IsPaused && state.SessionId != p.state.player.SessionId {
++		return nil, nil, ErrAliasConflict
+ 	}
+ 	state.Track, state.PrevTracks, state.NextTracks, state.Index = staged.CurrentTrack(), staged.PrevTracks(), staged.NextTracks(ctx, nil), staged.Index()
+ 	return staged, state, nil
+diff --git a/daemon/room_next_test.go b/daemon/room_next_test.go
+index cd69574..087efa2 100644
+--- a/daemon/room_next_test.go
++++ b/daemon/room_next_test.go
+@@ -284,3 +284,47 @@ func TestRoomTerminalNextFirstStationPageFailureDoesNotRetry(t *testing.T) {
+ 		t.Fatalf("failed station page hidden/retried/mutated: %v/%d", err, requests)
+ 	}
+ }
++
++func TestPausedTerminalNextNeverStagesForeignSessionUnderOldRoute(t *testing.T) {
++	p := nextFixture(t)
++	p.state.player.IsPaused = true
++	before := proto.Clone(p.state.player)
++	calls := 0
++	staged, state, err := p.prepareRoomTransportTrack(context.Background(), false, nextSpclient(t, &calls, nextTrack, nil))
++	if !errors.Is(err, ErrAliasConflict) || staged != nil || state != nil || calls != 1 {
++		t.Fatalf("paused foreign session admitted: %v, %v", err, state)
++	}
++	if !proto.Equal(before, p.state.player) {
++		t.Fatal("paused terminal rejection mutated the live owner")
++	}
++}
++
++func TestPausedSameSessionTrackSwitchKeepsNativePause(t *testing.T) {
++	for _, previous := range []bool{false, true} {
++		p := nextFixture(t)
++		list, err := tracks.NewTrackListFromContext(context.Background(), &librespot.NullLogger{}, nil,
++			&connectpb.Context{Uri: pContext, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: oldTrack}, {Uri: nextTrack}}}}})
++		if err != nil {
++			t.Fatal(err)
++		}
++		current := oldTrack
++		want := nextTrack
++		if previous {
++			current, want = nextTrack, oldTrack
++		}
++		if err = list.TrySeek(context.Background(), func(track *connectpb.ContextTrack) bool { return track.Uri == current }); err != nil {
++			t.Fatal(err)
++		}
++		p.state.tracks = list
++		p.state.player.Track = list.CurrentTrack()
++		p.state.player.IsPaused = true
++		before := proto.Clone(p.state.player)
++		staged, state, err := p.prepareRoomTransportTrack(context.Background(), previous, nil)
++		if err != nil || staged == nil || state == nil || state.Track.Uri != want || !state.IsPaused || state.SessionId != before.(*connectpb.PlayerState).SessionId {
++			t.Fatalf("same-session paused switch changed pause or owner: previous=%v err=%v state=%v", previous, err, state)
++		}
++		if !proto.Equal(before, p.state.player) || list.CurrentTrack().Uri != current {
++			t.Fatal("paused staging mutated live source")
++		}
++	}
++}
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+index 197ca0e..259580d 100644
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -279,6 +279,12 @@ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request
+ 		if err != nil {
+ 			return nil, ErrAliasConflict
+ 		}
++		// C's completed START and paused retention remain bound to the same
++		// session. A terminal autoplay successor creates a new session and
++		// cannot inherit that paused route without a separate owner handoff.
++		if state.IsPaused && state.SessionId != p.state.player.SessionId {
++			return nil, ErrAliasConflict
++		}
+ 		id, err := librespot.SpotifyIdFromUri(state.Track.Uri)
+ 		if err != nil {
+ 			return nil, ErrBadRequest
+diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+index 336a6fb..d6a06f2 100644
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -247,9 +247,11 @@ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *
+ 	}
+ 	// No public endpoint accepts this pointer. A real C ACK is required to enqueue.
+ 	data, err := s.roomTransportAsk(ctx, apiRoomTransportEffect, roomTransportEffectRequest{offer, ctx})
+-	if offer.Bound && offer.Snapshot.Action == "pause" && err == nil {
++	if offer.Bound && err == nil && (offer.Snapshot.Action == "pause" ||
++		(offer.PreparedStream != nil && offer.PreparedState != nil && offer.PreparedState.IsPaused &&
++			(offer.Snapshot.Action == "next" || offer.Snapshot.Action == "previous"))) {
+ 		// Only the private actor can report this actual guarded effect. COMMIT's
+-		// earlier C ACK proves admission, not that the receiver has paused.
++		// earlier C ACK proves admission, not that the receiver remains paused.
+ 		effect, marshalErr := json.Marshal(data)
+ 		var accepted struct {
+ 			Schema         string `json:"schema"`

@@ -363,10 +363,10 @@ func TestReleasedPausedRoomTransportNeedsFreshJoinedStartOwner(t *testing.T) {
 	stateRead := httptest.NewRecorder()
 	transportStateHandler(stateRead, httptest.NewRequest(http.MethodGet,
 		fmt.Sprintf("/api/room-transport/state?target_id=%s&room_id=r0&homepod_id=42&account_user_id=native-user", f.id), nil))
-	if stateRead.Code != http.StatusOK || !strings.Contains(stateRead.Body.String(), `"actions":["resume"]`) {
-		t.Fatalf("released paused route offered other actions: %d %s", stateRead.Code, stateRead.Body.String())
+	if stateRead.Code != http.StatusOK || !strings.Contains(stateRead.Body.String(), `"actions":["resume","next","previous"]`) {
+		t.Fatalf("released paused route lost supported track actions: %d %s", stateRead.Code, stateRead.Body.String())
 	}
-	for _, action := range []string{"pause", "next", "previous"} {
+	for _, action := range []string{"pause"} {
 		request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0})
 		result := httptest.NewRecorder()
 		transportPrepareHandler(result, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
@@ -405,5 +405,69 @@ func TestReleasedPausedRoomTransportNeedsFreshJoinedStartOwner(t *testing.T) {
 	status, intent := f.rt.live.transportSnapshot()
 	if !holdReleasedBridgeRoute(f.room, status, intent) || len(f.effects) != 0 || !fileExists(releasedPath(f.room)) {
 		t.Fatal("paused room control read allowed alias recovery or erased marker")
+	}
+}
+
+func TestReleasedPausedTrackControlsKeepCurrentOwnerAndNoReplay(t *testing.T) {
+	for _, action := range []string{"next", "previous"} {
+		for _, unknown := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_unknown_%v", action, unknown), func(t *testing.T) {
+				f, scope, owner, route := releasedRoomRouteFixture(t)
+				status := f.rt.live.Get()
+				status.Paused = true
+				f.rt.live.set(status)
+				oldRPC := roomTransportRPC
+				t.Cleanup(func() { roomTransportRPC = oldRPC })
+				var effects int
+				roomTransportRPC = func(_ context.Context, _, _, path string, body []byte) ([]byte, error) {
+					switch {
+					case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
+						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, false})
+					case path == "/api/outputs/42/transport/bound-state":
+						return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, transportActions, false, true, false})
+					case path == "/player/room_transport/bound-prepare":
+						var request struct {
+							Account, Target, Room, Homepod string
+							Action                         string `json:"action"`
+							Percent                        int    `json:"volume_percent"`
+						}
+						if json.Unmarshal(body, &request) != nil || request.Action != action || request.Percent != 0 {
+							t.Fatal("wrong paused-track preparation", string(body))
+						}
+						return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, action, 0, strings.Repeat("b", 64), 5000, "1"})
+					case path == "/api/outputs/42/transport/bound-prepare":
+						return json.Marshal(outputTransportPrepare{"podconnect.output_transport_prepare.v2", true, strings.Repeat("c", 32), *route, *owner, "1", 10000})
+					case path == "/player/room_transport/bound-commit":
+						effects++
+						if unknown {
+							return nil, fmt.Errorf("unknown post-send outcome")
+						}
+						return []byte(`{"schema":"podconnect.native_room_transport_commit.v2","accepted_native":true,"prepare_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","physical_result_verified":false}`), nil
+					default:
+						return nil, fmt.Errorf("unexpected paused track endpoint %s", path)
+					}
+				}
+				request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0})
+				prepared := httptest.NewRecorder()
+				transportPrepareHandler(prepared, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
+				if prepared.Code != http.StatusOK {
+					t.Fatalf("owned paused %s unavailable: %d %s", action, prepared.Code, prepared.Body.String())
+				}
+				result := transportCommit(t)
+				expected := `"outcome":"accepted"`
+				if unknown {
+					expected = `"outcome":"unknown"`
+				}
+				if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), expected) || effects != 1 {
+					t.Fatal("wrong single guarded outcome", result.Code, result.Body.String(), effects)
+				}
+				if result := transportCommit(t); result.Code != http.StatusConflict || effects != 1 {
+					t.Fatal("paused track command replayed", result.Code, effects)
+				}
+				if !f.rt.live.Get().Paused || len(f.effects) != 0 || !fileExists(releasedPath(f.room)) {
+					t.Fatal("manager resumed playback or reclaimed route")
+				}
+			})
+		}
 	}
 }

@@ -374,7 +374,7 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	actions := []string{}
 	if !o.Busy {
 		for _, a := range n.Actions {
-			if slices.Contains(o.Actions, a) && !(claim.Released && claim.Paused && a != "resume") {
+			if slices.Contains(o.Actions, a) && !(claim.Released && claim.Paused && a == "pause") {
 				actions = append(actions, a)
 			}
 		}
@@ -428,7 +428,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	claim, n, o, err := readRoomTransport(ctx, body.Scope)
 	if err != nil || n.Identity != body.Native || o.Identity != body.Route || o.Busy ||
-		claim.Released && claim.Paused && body.Action != "resume" ||
+		claim.Released && claim.Paused && body.Action == "pause" ||
 		!slices.Contains(n.Actions, body.Action) || !slices.Contains(o.Actions, body.Action) {
 		http.Error(w, "stale room transport", 409)
 		return
