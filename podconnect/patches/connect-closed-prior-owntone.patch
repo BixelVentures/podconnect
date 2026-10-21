@@ -1,0 +1,338 @@
+diff --git a/src/httpd_jsonapi_retirement.inc.c b/src/httpd_jsonapi_retirement.inc.c
+index 65743fc..3111c01 100644
+--- a/src/httpd_jsonapi_retirement.inc.c
++++ b/src/httpd_jsonapi_retirement.inc.c
+@@ -59,7 +59,8 @@ static int jsonapi_reply_retirement_write(struct httpd_request *hreq)
+   bool prepare=!strcmp(hreq->path_parts[5],"prepare");
+   r.move_existing_session=!strcmp(hreq->path_parts[3],"move");
+   if(!body || safe_atou64(hreq->path_parts[2],&r.device_id)<0 || !r.device_id
+-      || json_object_object_length(body)!=(prepare?8:7)
++      || (prepare ? (json_object_object_length(body)!=8 && json_object_object_length(body)!=9)
++          : json_object_object_length(body)!=7)
+       || !transport_json_string(body,prepare?"completed_token":"retirement_token",
+           prepare?r.completed_token:r.retirement_token,33)
+       || !retirement_hex(prepare?r.completed_token:r.retirement_token)
+@@ -69,6 +70,12 @@ static int jsonapi_reply_retirement_write(struct httpd_request *hreq)
+       || transport_native_counter(body,"writer_source_epoch",&r.writer_source_epoch)<0 || !r.writer_source_epoch
+       || retirement_pipe_parse(body,&r.pipe_device,&r.pipe_inode)<0)goto out;
+   if(prepare){
++    json_object *closed;
++    if(json_object_object_get_ex(body,"writer_already_closed",&closed)){
++      if(r.move_existing_session || json_object_object_length(body)!=9
++          || !json_object_is_type(closed,json_type_boolean) || !json_object_get_boolean(closed))goto out;
++      r.writer_already_closed=true;
++    }else if(json_object_object_length(body)!=8)goto out;
+     if(!transport_json_string(body,"native_incarnation",r.native_incarnation,33)
+         || !retirement_hex(r.native_incarnation)
+         || transport_native_counter(body,"writer_fd",&r.writer_fd)<0 || r.writer_fd>INT_MAX
+diff --git a/src/input.h b/src/input.h
+index 559b4a7..3e28f69 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -110,6 +110,7 @@ int input_fifo_owner_get(uint32_t,const char *,bool,uint64_t,uint64_t,const stru
+ /* Return 0 after FIFO EOF, 1 after EAGAIN, or -1 on failed retirement.
+  * The caller must prove that no native writer remains for an EAGAIN result. */
+ int input_fifo_retire(uint32_t,const char *,uint64_t,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
++int input_fifo_retire_empty(const char *,uint64_t,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ 
+ struct input_definition
+ {
+diff --git a/src/input_fifo_barrier.inc.c b/src/input_fifo_barrier.inc.c
+index 61db68c..e0d4886 100644
+--- a/src/input_fifo_barrier.inc.c
++++ b/src/input_fifo_barrier.inc.c
+@@ -106,6 +106,32 @@ int input_fifo_retire(uint32_t item,const char *path,uint64_t device,uint64_t in
+   return commands_exec_sync(cmdbase,input_fifo_retire_exact,NULL,&command);
+ }
+ 
++/* Exact empty-owner alternative after the original native writer has gone.
++ * The named FIFO is checked on the input command base; no new reader is
++ * opened and no source callback can interleave with the epoch/PCM drain. */
++static enum command_state input_fifo_retire_empty_exact(void *arg,int *retval)
++{
++  struct input_fifo_retire_command *c=arg;struct stat st;
++  *retval=-1;
++  if(!c || !c->out || !input_fifo_deadline(&c->deadline) || input_now_reading.open
++      || input_fifo_staged_fd>=0 || input_fifo_epoch!=c->epoch || input_fifo_epoch==UINT64_MAX
++      || stat(c->path,&st)<0 || !S_ISFIFO(st.st_mode)
++      || (uint64_t)st.st_dev!=c->device || (uint64_t)st.st_ino!=c->inode)return COMMAND_END;
++  flush(NULL);
++  input_fifo_epoch++;
++  c->out->device=c->device;c->out->inode=c->inode;c->out->epoch=input_fifo_epoch;
++  *retval=input_fifo_deadline(&c->deadline) ? 0 : -1;
++  return COMMAND_END;
++}
++int input_fifo_retire_empty(const char *path,uint64_t device,uint64_t inode,uint64_t expected_epoch,
++    const struct timespec *deadline,struct input_fifo_identity *out)
++{
++  if(!path || !deadline || !out)return -1;
++  struct input_fifo_retire_command command={.path=path,.device=device,.inode=inode,
++    .epoch=expected_epoch,.deadline=*deadline,.out=out};
++  return commands_exec_sync(cmdbase,input_fifo_retire_empty_exact,NULL,&command);
++}
++
+ struct input_fifo_start_command {uint32_t item_id;const char *path;struct timespec deadline;};
+ static enum command_state input_fifo_start_exact(void *arg,int *retval)
+ {
+diff --git a/src/outputs.h b/src/outputs.h
+index 1fb00b1..22a56de 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -204,7 +204,7 @@ struct output_retirement_request {
+   uint64_t device_id,writer_source_epoch,writer_fd,pipe_device,pipe_inode,input_epoch;
+   char completed_token[33],retirement_token[33],native_reservation_id[33],native_incarnation[33];
+   struct output_native_process native_process;
+-  bool move_existing_session,native_close_done;
++  bool move_existing_session,native_close_done,writer_already_closed;
+ };
+ struct output_retirement_result {
+   struct output_retirement_request command;
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+index ff9429d..c2e9706 100644
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -861,6 +861,48 @@ static bool start_retirement_source_current(struct start_slot *s,struct output_t
+       || !transport_identity_equal(route,&s->result.route_identity))return false;
+   return start_retirement_reader(s,route);
+ }
++static bool start_retirement_closed_source_current(struct start_slot *s,bool pending,bool *reader_current)
++{
++  struct output_device *d,*scan;struct output_transport_identity route;
++  struct stat named;char digest[65];unsigned selected=0;
++  if(!s || s!=start_active || s->cancelled || s->writer_pending
++      || s->result.command.move_existing_session || s->result.phase!=OUTPUT_START_COMPLETED
++      || s->retirement.outcome!=OUTPUT_RETIRE_NONE || !outputs_start_source_owned()
++      || outputs_start_gate_closed() || start_startup_quarantine || start_journal_fault
++      || start_journal_retirement_outcome!=(pending?OUTPUT_RETIRE_PENDING:OUTPUT_RETIRE_NONE)
++      || !start_journal.payload || !start_journal_payload_valid()
++      || strcmp(start_journal.token,s->result.command.token)
++      || strcmp(start_journal.c_process,outputs_process)
++      || !start_contexts_drained() || transport_pin || room_volume_pin_busy()
++      || room_volume_undrained() || !start_pipe_registered(&s->result.command,digest)
++      || strcmp(digest,s->result.command.expected_input_path_digest)
++      || stat(s->result.command.expected_input_path,&named)<0 || !S_ISFIFO(named.st_mode)
++      || (uint64_t)named.st_dev!=s->result.pipe_device
++      || (uint64_t)named.st_ino!=s->result.pipe_inode
++      || !(d=outputs_device_get(s->result.command.device_id)) || !d->selected
++      || d->incarnation!=s->result.target_incarnation
++      || (d->session && (d->session!=s->session || d->session_epoch!=s->target_epoch)))return false;
++  for(scan=outputs_device_list;scan;scan=scan->next){
++    if(scan->selected)selected++;
++    if(scan->session && (scan!=d || scan->session!=s->session))return false;
++  }
++  if(selected!=1)return false;
++  if(d->session && transport_identity_get(d->id,&route)==0
++      && transport_identity_equal(&route,&s->result.route_identity)
++      && start_retirement_reader(s,&route)){
++    *reader_current=true;return true;
++  }
++  if(!d->session && transport_input_item==s->result.route_identity.input_item_id
++      && transport_input_generation==s->result.route_identity.input_generation
++      && !strcmp(transport_input_path_digest,s->result.route_identity.input_path_digest)
++      && start_retirement_reader(s,&s->result.route_identity)){
++    *reader_current=true;return true;
++  }
++  if(d->route_revision!=s->result.route_identity.route_revision
++      || transport_selection_revision!=s->result.route_identity.selection_revision
++      || transport_input_item || transport_input_path_digest[0])return false;
++  *reader_current=false;return true;
++}
+ static void start_retirement_observe(struct start_slot *s,struct output_retirement_result *out)
+ {
+   struct start_retirement *t=&s->retirement;
+@@ -892,10 +934,78 @@ static void start_retirement_observe(struct start_slot *s,struct output_retireme
+   out->ok=(out->outcome==OUTPUT_RETIRE_PENDING && out->reader_ready_closed && out->durable_pending)
+     || (out->outcome==OUTPUT_RETIRE_RETIRED_KNOWN && out->retired_witness);
+ }
++static int start_retirement_prepare_closed(const struct output_retirement_request *r,
++    struct output_retirement_result *out)
++{
++  struct start_slot *s;struct start_retirement *t;
++  struct input_fifo_identity reader={0};struct timespec deadline;char uuid[37];size_t i,j=0;
++  bool has_reader=false,rechecked=false;int drained;
++  if(!r || !out || !(s=start_find(r->completed_token))
++      || s->result.command.device_id!=r->device_id || r->move_existing_session
++      || !transport_hex(r->native_reservation_id,32) || !transport_hex(r->native_incarnation,32)
++      || strcmp(r->native_reservation_id,s->result.command.native_reservation_id)==0
++      || strcmp(r->native_incarnation,s->result.command.native_incarnation)
++      || strcmp(r->native_process.boot_id,s->result.command.native_process.boot_id)
++      || r->native_process.pid!=s->result.command.native_process.pid
++      || r->native_process.proc_start_ticks!=s->result.command.native_process.proc_start_ticks
++      || r->writer_source_epoch!=s->result.writer_source_epoch
++      || r->writer_fd!=s->result.command.writer_fd
++      || r->input_epoch!=s->result.input_epoch || r->pipe_device!=s->result.pipe_device
++      || r->pipe_inode!=s->result.pipe_inode
++      || !start_retirement_closed_source_current(s,false,&has_reader)
++      || start_all_writers_closed(&r->native_process,r->pipe_device,r->pipe_inode)!=1)return -1;
++  t=&s->retirement;
++  if(clock_gettime(CLOCK_MONOTONIC,&t->deadline)<0)return -1;
++  t->deadline.tv_sec+=8;t->outcome=OUTPUT_RETIRE_PENDING;
++  memcpy(t->reservation,r->native_reservation_id,33);
++  memcpy(t->native_incarnation,r->native_incarnation,33);
++  t->writer_source_epoch=r->writer_source_epoch;t->writer_fd=r->writer_fd;
++  t->pipe_device=r->pipe_device;t->pipe_inode=r->pipe_inode;
++  t->input_item_id=s->result.route_identity.input_item_id;
++  t->admitted_input_epoch=r->input_epoch;t->input_epoch=r->input_epoch;
++  outputs_attention_uuid(uuid);
++  for(i=0;i<36;i++)if(uuid[i]!='-')t->token[j++]=uuid[i];
++  t->token[j]=0;
++  if(start_journal_save(s)<0)goto unknown;
++  t->outcome=OUTPUT_RETIRE_NONE;
++  rechecked=start_retirement_window(t)
++    && start_retirement_closed_source_current(s,true,&has_reader)
++    && start_all_writers_closed(&r->native_process,r->pipe_device,r->pipe_inode)==1;
++  t->outcome=OUTPUT_RETIRE_PENDING;
++  if(!rechecked)goto unknown;
++  start_gate_set(true);
++  if(clock_gettime(CLOCK_MONOTONIC,&deadline)<0)goto unknown;
++  deadline.tv_sec++;
++  if(deadline.tv_sec>t->deadline.tv_sec
++      || (deadline.tv_sec==t->deadline.tv_sec && deadline.tv_nsec>t->deadline.tv_nsec))deadline=t->deadline;
++  drained=has_reader
++    ? input_fifo_retire(t->input_item_id,s->result.command.expected_input_path,t->pipe_device,t->pipe_inode,
++        t->admitted_input_epoch,&deadline,&reader)
++    : input_fifo_retire_empty(s->result.command.expected_input_path,t->pipe_device,t->pipe_inode,
++        t->admitted_input_epoch,&deadline,&reader);
++  if(drained<0 || reader.device!=t->pipe_device || reader.inode!=t->pipe_inode
++      || reader.epoch<=t->admitted_input_epoch
++      || start_all_writers_closed(&r->native_process,t->pipe_device,t->pipe_inode)!=1)goto unknown;
++  t->input_epoch=reader.epoch;
++  outputs_transport_input_changed(0,NULL,false);outputs_metadata_purge();start_retire_sessions();
++  if(!start_contexts_drained() || !start_retirement_window(t))goto unknown;
++  t->reader_ready_closed=true; /* Exact old input is stopped; terminal still needs a fresh staged reader. */
++  t->outcome=OUTPUT_RETIRE_RETIRED_KNOWN;
++  if(start_journal_save(s)<0)goto unknown;
++  atomic_store(&start_owned_latch,false);start_retired_reopen_pending=true;
++  if(!outputs_start_retired_stage_reader()){
++    start_retirement_observe(s,out);return 0; /* Durable retirement, no fresh-reader witness. */
++  }
++  start_retirement_observe(s,out);return 0;
++ unknown:
++  t->outcome=OUTPUT_RETIRE_UNKNOWN;start_gate_set(true);
++  start_retirement_observe(s,out);return 0;
++}
+ int outputs_retirement_prepare(const struct output_retirement_request *r,struct output_retirement_result *out)
+ {
+   struct start_slot *s;struct start_retirement *t;struct output_transport_identity route;
+   struct input_fifo_identity reader={0};struct timespec deadline;char uuid[37];size_t i,j=0;
++  if(r && r->writer_already_closed)return start_retirement_prepare_closed(r,out);
+   if(!r || !out || !(s=start_find(r->completed_token)) || s->result.command.device_id!=r->device_id
+       || s->result.command.move_existing_session!=r->move_existing_session
+       || !transport_hex(r->native_reservation_id,32) || !transport_hex(r->native_incarnation,32)
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 5d83d43..b138b22 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -853,7 +853,7 @@ static void recovery_wire_poll(int fd,short what,void *arg)
+   struct recovery_wire_fixture *f=arg;struct timeval soon={0,1000};(void)fd;(void)what;
+   if(f->mode>=11){
+     if(outputs_start_result_get(1,f->start_command.token,&f->start_result)<0){recovery_wire_fail(f,"START retained owner missing");return;}
+-    if(f->mode==11 || f->mode==18 || f->mode==21){
++    if(f->mode==11 || f->mode==18 || f->mode==21 || f->mode==26 || f->mode==27 || f->mode==28){
+       if(f->start_result.phase!=OUTPUT_START_ROUTE_READY){evtimer_add(f->poll,&soon);return;}
+       if(!f->start_result.gate_closed || f->volumes!=1 || f->device->volume!=35 || !f->start_result.contexts_drained
+           || !f->device->session || attention_emission_current(f->device->session,NULL)){
+@@ -1169,6 +1169,9 @@ int main(int argc, char **argv)
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-wire")) return start35_wire_case(17);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-wire")) return start35_wire_case(18);
++  if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-wire")) return start35_wire_case(26);
++  if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-no-session-wire")) return start35_wire_case(27);
++  if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-empty-wire")) return start35_wire_case(28);
+   if (argc == 2 && !strcmp(argv[1], "--move-post-full-writer")) return start35_wire_case(19);
+   if (argc == 2 && !strcmp(argv[1], "--move-post-full-generation")) return start35_wire_case(20);
+   if (argc == 2 && !strcmp(argv[1], "--start-post-full-writer")) return start35_wire_case(21);
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index 38d4c00..049cab8 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -508,7 +508,7 @@ static int start35_wire_case(int mode)
+   assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
+   outputs_write(NULL,0,0,NULL,NULL); /* Actual ALL-backend gate precedes buffer dereference. */
+   assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
+-  if(mode==18){
++  if(mode==18 || mode==26 || mode==27 || mode==28){
+     player_tick_interval.tv_nsec=50000000;
+     pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
+     assert(pb_timer_fd>=0);
+@@ -527,11 +527,70 @@ static int start35_wire_case(int mode)
+   assert(outputs_start_barrier_begin(r,&f.start_result)==0);
+   assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&deadline,&fd)==0 && fd.epoch);
+   outputs_transport_input_changed(item,fifo,true);assert(outputs_start_barrier_done(r->token,fd.epoch)==0);
+-  if(mode==18) session_update_read_start(0); /* Same loaded-source bookkeeping as pb_session_start after actual FIFO open. */
++  if(mode==18 || mode==26 || mode==27 || mode==28) session_update_read_start(0); /* Same loaded-source bookkeeping as pb_session_start after actual FIFO open. */
+   assert(f.device->session && !attention_emission_current(f.device->session,NULL) && packet_send(f.device->session,NULL)<0);
+   if(mode==21)fixture_post_full_writer=&writer;
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+   assert(f.poll && f.deadline && !evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++  if(!f.failed && (mode==26 || mode==27 || mode==28)){
++    struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
++      .native_process=r->native_process,.writer_source_epoch=f.start_result.writer_source_epoch,
++      .writer_fd=(uint64_t)writer,.pipe_device=fd.device,.pipe_inode=fd.inode,
++      .input_epoch=f.start_result.input_epoch,.writer_already_closed=true};
++    struct output_retirement_result retirement;
++    memcpy(retire.completed_token,r->token,33);memcpy(retire.native_incarnation,r->native_incarnation,33);
++    memset(retire.native_reservation_id,'1',32);
++    assert(outputs_retirement_prepare(&retire,&retirement)<0); /* An open writer cannot be orphaned. */
++    close(writer);writer=-1;
++    retire.writer_already_closed=false;
++    assert(outputs_retirement_prepare(&retire,&retirement)<0); /* Original prepare cannot mistake FD loss for CloseDone. */
++    retire.writer_already_closed=true;
++    if(mode==27){
++      start_retire_sessions();
++      assert(!f.device->session);
++      clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++      assert(input_fifo_owner_get(item,fifo,false,0,0,&deadline,&fd)==0
++        && fd.epoch==retire.input_epoch);
++    }
++    struct output_retirement_request wrong=retire;
++    wrong.pipe_inode++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++    wrong=retire;wrong.completed_token[0]='f';assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++    wrong=retire;wrong.native_process.proc_start_ticks++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++    if(f.device->session){
++      const void *original=start_active->session;
++      start_active->session=&retirement;
++      assert(outputs_retirement_prepare(&retire,&retirement)<0); /* Foreign live session cannot borrow old custody. */
++      start_active->session=original;
++    }
++    if(mode==28){
++      input_stop();
++      clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++      assert(input_fifo_owner_get(item,fifo,false,0,0,&deadline,&fd)<0);
++      outputs_transport_input_changed(0,NULL,false);
++      assert(input_start_fifo_exact(item,fifo,&deadline)>=0);
++      outputs_transport_input_changed(item,fifo,true);
++      assert(outputs_retirement_prepare(&retire,&retirement)<0); /* New input source is not the old reader. */
++      input_stop();
++      assert(input_fifo_owner_get(item,fifo,false,0,0,&deadline,&fd)<0);
++      outputs_transport_input_changed(0,NULL,false);
++      f.device->route_revision++;
++      assert(outputs_retirement_prepare(&retire,&retirement)<0); /* New route cannot borrow old START. */
++      f.device->route_revision--;
++      transport_selection_revision++;
++      assert(outputs_retirement_prepare(&retire,&retirement)<0); /* New selection cannot borrow old START. */
++      transport_selection_revision--;
++    }
++    assert(outputs_retirement_prepare(&retire,&retirement)==0 && retirement.ok
++      && retirement.outcome==OUTPUT_RETIRE_RETIRED_KNOWN && retirement.durable_terminal
++      && retirement.retired_witness && retirement.reader_ready_closed && retirement.contexts_drained
++      && retirement.gate_closed && retirement.input_epoch>retirement.admitted_input_epoch);
++    assert(!outputs_start_source_owned() && !f.device->session);
++    assert(outputs_retirement_prepare(&retire,&retirement)<0); /* One-use retirement; never replays. */
++    int replacement=open(fifo,O_WRONLY|O_NONBLOCK);assert(replacement>=0);
++    assert(outputs_start_gate_closed());close(replacement);
++    puts("PASS closed prior START writer retires exact old FIFO/session once and stages fresh reader without reopening emission");
++    goto cleanup;
++  }
+   if(!f.failed && mode==18){
+     struct output_native_owner same_app=f.start_result.command.committed_native_owner;
+     struct output_transport_identity same_route=f.start_result.route_identity;
+@@ -679,7 +738,7 @@ static int start35_wire_case(int mode)
+   }
+   if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
+  cleanup:
+-  if(mode==18 && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
++  if((mode==18 || mode==26 || mode==27 || mode==28) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if(input_ready)input_deinit();
+   if(worker_ready)worker_deinit();

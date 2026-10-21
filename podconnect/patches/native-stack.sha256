@@ -23,3 +23,4 @@ b589c71150427119fea5db1fd69570e1fb45475e1afdaacecd22fed283961c21  /patches/room-
 3d4b34ae199ce78802bb8830f27bba389c8656dd1c6482249768b28531f4dfe8  /patches/room-start-diagnostics-native.patch
 2f38ff353d33a8c774854f7c2a546e3ba7106f613f04c7f172fc1a7fa9f1597c  /patches/paused-track-native.patch
 a93e7e6b5899ee999f3e26b6e4c7780a1a648c28b804fb75964ef6ef470ff83f  /patches/connect-output-admission-diagnostics-native.patch
+501152138ab0d3d9bba7b5495f185428a8adf9f58de7d0f9d94d7c6283d1e8e0  /patches/connect-closed-prior-native.patch
