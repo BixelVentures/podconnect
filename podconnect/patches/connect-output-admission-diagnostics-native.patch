@@ -1,0 +1,106 @@
+diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"time"
+ )
+@@ -83,25 +84,29 @@
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+ 	if app.queueWriterBusyLocked() {
+-		return nil, ErrAliasConflict
++		return nil, fmt.Errorf("output admission queue_busy: %w", ErrAliasConflict)
+ 	}
+-	if app.moveCustodyUnknown || app.retirementPending != nil || app.startCustody != nil {
+-		allowed := !app.moveCustodyUnknown && app.retirementPending == nil && app.startCustody != nil &&
+-			app.startOutputPermit == app.startCustody && app.startCustody.Owner == owner
+-		if allowed {
++	if app.moveCustodyUnknown {
++		return nil, fmt.Errorf("output admission custody_unknown: %w", ErrAliasConflict)
++	}
++	if app.retirementPending != nil {
++		return nil, fmt.Errorf("output admission retirement_pending: %w", ErrAliasConflict)
++	}
++	if app.startCustody != nil {
++		if app.startOutputPermit == app.startCustody && app.startCustody.Owner == owner {
+ 			return app.openRegisteredOutputLocked(owner, create)
+ 		}
+-		return nil, ErrAliasConflict
++		return nil, fmt.Errorf("output admission start_custody: %w", ErrAliasConflict)
+ 	}
+ 	if err := app.revokeCompletedMoveCustodyLocked(nil); err != nil {
+-		return nil, err
++		return nil, fmt.Errorf("output admission move_retirement_unproven: %w", err)
+ 	}
+ 	return app.openRegisteredOutputLocked(owner, create)
+ }
+ 
+ func (app *App) openRegisteredOutputLocked(owner *AppPlayer, create func() (output.Output, error)) (output.Output, error) {
+ 	if app.openedWriterGeneration == ^uint64(0) {
+-		return nil, ErrAliasConflict
++		return nil, fmt.Errorf("output admission writer_generation_exhausted: %w", ErrAliasConflict)
+ 	}
+ 	out, err := create()
+ 	if err != nil {
+diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
+--- a/daemon/room_move_custody_test.go
++++ b/daemon/room_move_custody_test.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+@@ -20,6 +21,45 @@
+ func attemptCustodyOutput(app *App, owner *AppPlayer) error {
+ 	_, err := app.withNewOutput(owner, func() (output.Output, error) { return nil, nil })
+ 	return err
++}
++
++func TestFreshPlayerWriterReportsExactCustodyRefusalWithoutOpeningFIFO(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		arrange func(*App, *AppPlayer)
++	}{
++		{"custody_unknown", func(app *App, _ *AppPlayer) { app.moveCustodyUnknown = true }},
++		{"retirement_pending", func(app *App, owner *AppPlayer) { app.retirementPending = &retirementAttempt{owner: owner} }},
++		{"start_custody", func(app *App, owner *AppPlayer) {
++			app.startCustody = &contentOperation{Owner: owner, State: "complete", Terminal: true, CReceipt: &contentCReceipt{Phase: "completed"}}
++		}},
++		{"writer_generation_exhausted", func(app *App, _ *AppPlayer) { app.openedWriterGeneration = ^uint64(0) }},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			app := &App{}
++			owner := &AppPlayer{app: app}
++			created := false
++			worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: filepath.Join(t.TempDir(), "must-not-open.fifo"), AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++				return app.withNewOutput(owner, func() (output.Output, error) {
++					created = true
++					return create()
++				})
++			}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			owner.player = worker
++			tc.arrange(app, owner)
++			err = worker.SetPrimaryStream(&contentInertSource{}, false, false)
++			if !errors.Is(err, ErrAliasConflict) || !strings.Contains(err.Error(), "output admission "+tc.name) {
++				t.Fatalf("missing exact pre-open refusal: %v", err)
++			}
++			if created {
++				t.Fatal("refused ownership created an output")
++			}
++		})
++	}
+ }
+ 
+ func completedMoveCustody(owner *AppPlayer, baseURL string) *moveOperation {
