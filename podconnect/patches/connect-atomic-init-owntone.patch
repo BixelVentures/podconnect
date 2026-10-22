@@ -1,0 +1,25 @@
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -21,8 +21,8 @@
+   struct event *deadline_ev;
+ };
+ static struct start_slot start_slots[START_SLOTS],*start_active,*start_scope;
+-static atomic_bool start_gate=ATOMIC_VAR_INIT(false);
+-static atomic_uint_fast64_t start_metadata_epoch=ATOMIC_VAR_INIT(1);
++static atomic_bool start_gate=false;
++static atomic_uint_fast64_t start_metadata_epoch=1;
+ 
+ static bool start_window(const struct start_slot *s)
+ {
+diff --git a/src/outputs_start_journal.inc.c b/src/outputs_start_journal.inc.c
+--- a/src/outputs_start_journal.inc.c
++++ b/src/outputs_start_journal.inc.c
+@@ -1,6 +1,6 @@
+ /* Durable evidence is separate from attention and contains no lease authority. */
+ static struct db_start_guard start_journal;
+-static atomic_bool start_owned_latch=ATOMIC_VAR_INIT(false);
++static atomic_bool start_owned_latch=false;
+ static bool start_journal_fault,start_startup_quarantine;
+ /* A terminal retirement is old-source closure evidence, never emission authority.
+  * Fresh configured PIPE admission consumes this permission in the player owner. */

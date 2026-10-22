@@ -122,6 +122,8 @@ COPY patches/paused-track-owntone.patch /patches/paused-track-owntone.patch
 COPY patches/paused-track-owntone.sha256 /patches/paused-track-owntone.sha256
 COPY patches/connect-closed-prior-owntone.patch /patches/connect-closed-prior-owntone.patch
 COPY patches/connect-closed-prior-owntone.sha256 /patches/connect-closed-prior-owntone.sha256
+COPY patches/connect-atomic-init-owntone.patch /patches/connect-atomic-init-owntone.patch
+COPY patches/connect-atomic-init-owntone.sha256 /patches/connect-atomic-init-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -168,6 +170,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-closed-prior-owntone.sha256 \
   && git apply --check /patches/connect-closed-prior-owntone.patch \
   && git apply /patches/connect-closed-prior-owntone.patch \
+  && sha256sum -c /patches/connect-atomic-init-owntone.sha256 \
+  && git apply --check /patches/connect-atomic-init-owntone.patch \
+  && git apply /patches/connect-atomic-init-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

@@ -1,3 +1,8 @@
+## Speakers 0.26.40 — OwnTone C build compatibility
+
+- Replace three static START atomic initializer spellings with equivalent C constant initializers. The official pinned OwnTone build for 0.26.39 failed while compiling `src/outputs.o` because its headers did not define `ATOMIC_VAR_INIT`; the Native job passed, and the C owner modes did not run.
+- Preserve the guarded transfer and transport behavior in 0.26.39 and Control 0.10.19. The 0.26.39 images were already published under their immutable version; this correction uses a new 0.26.40 candidate. Official C execution, Green installation and audible playback remain unverified for this correction.
+
 ## Speakers 0.26.39 — guarded transfer recovery and transport continuity
 
 - Preserve paused playback through guarded Next/Previous transport handling.
