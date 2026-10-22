@@ -8,7 +8,7 @@ name: Publish add-on image
 # arm64 under QEMU produced corrupt layers ("invalid tar header") on the real device.
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/pc51-paused-track"]
     paths:
       - "podconnect/Dockerfile"
       - "podconnect/build.yaml"

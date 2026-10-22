@@ -50,8 +50,11 @@ What's new: ...
 
 For Control0.10.12 / Speakers0.26.19, prepare the complete `podconnect/` subtree
 (including the proposed add-on version) on a reviewed branch. Run the image workflow
-there with `workflow_dispatch` before merging the add-on version into main. The
-build labels each immutable per-architecture image with
+there before merging the add-on version into main. The reviewed candidate branch
+`codex/pc51-paused-track` starts that same workflow automatically on a matching push;
+other branches retain `workflow_dispatch`. This allows the GitHub plugin to initiate
+the existing prebuild without a browser login or a separate publisher. Inspect the
+actual run before any retry if its outcome is unknown. The build labels each immutable per-architecture image with
 `io.bixelventures.podconnect.source-tree = git rev-parse HEAD:podconnect` and its
 exact `aarch64`/`amd64` identity. Record each architecture's registry digest.
 
