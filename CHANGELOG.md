@@ -1,3 +1,9 @@
+## Speakers 0.26.39 — guarded transfer recovery and transport continuity
+
+- Preserve paused playback through guarded Next/Previous transport handling.
+- Reject Play, Pause and Seek when no output exists after a failed stream open; do not acknowledge transport changes that never happened.
+- Retire only a proven closed prior output owner before an explicit fresh transfer; current-owner output failures retire through the existing owner lifecycle, while stale failures remain inert. These software changes do not establish the cause of the reported field audio failures or prove audible playback.
+
 ## Speakers 0.26.38 — preserve START route ownership during gated starvation
 
 - Keep draining the exact FIFO and processing EOF while the START output gate is closed. Intentional writer quiescence must not invoke legacy starvation suspend/flush/resume and replace the pending route callback.

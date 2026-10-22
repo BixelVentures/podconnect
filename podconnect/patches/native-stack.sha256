@@ -25,3 +25,4 @@ b589c71150427119fea5db1fd69570e1fb45475e1afdaacecd22fed283961c21  /patches/room-
 a93e7e6b5899ee999f3e26b6e4c7780a1a648c28b804fb75964ef6ef470ff83f  /patches/connect-output-admission-diagnostics-native.patch
 501152138ab0d3d9bba7b5495f185428a8adf9f58de7d0f9d94d7c6283d1e8e0  /patches/connect-closed-prior-native.patch
 265e7ba87df8b97ce7c47086f0da34b1914091bd78dd6aed43969cdbf5016f5d  /patches/connect-output-failure-native.patch
+d83009c9c16df5b3e88739564dd018b72801027cbea9316ad9fc638ddbf073da  /patches/connect-no-output-transport-native.patch

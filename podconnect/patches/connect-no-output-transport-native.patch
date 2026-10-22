@@ -1,0 +1,152 @@
+diff --git a/player/player.go b/player/player.go
+index 0ce74c6..032cc9b 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -401,7 +401,7 @@ loop:
+ 						p.ev <- Event{Type: EventTypeResume}
+ 					}
+ 				} else {
+-					cmd.resp <- nil
++					cmd.resp <- fmt.Errorf("no output device for playback")
+ 				}
+ 			case playerCmdPause:
+ 				if out != nil {
+@@ -412,7 +412,7 @@ loop:
+ 						p.ev <- Event{Type: EventTypePause}
+ 					}
+ 				} else {
+-					cmd.resp <- nil
++					cmd.resp <- fmt.Errorf("no output device for pause")
+ 				}
+ 			case playerCmdStop:
+ 				if outputFailurePending {
+@@ -444,7 +444,7 @@ loop:
+ 						cmd.resp <- nil
+ 					}
+ 				} else {
+-					cmd.resp <- nil
++					cmd.resp <- fmt.Errorf("no output device for seek")
+ 				}
+ 			case playerCmdPosition:
+ 				pos := source.PositionMs()
+diff --git a/player/no_output_transport_test.go b/player/no_output_transport_test.go
+new file mode 100644
+index 0000000..53b7d6f
+--- /dev/null
++++ b/player/no_output_transport_test.go
+@@ -0,0 +1,48 @@
++package player
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++)
++
++func TestNoOutputTransportFailsButPausedPipeTransportStillWorks(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "output.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	worker, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++		AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer worker.Close()
++	if worker.Play() == nil || worker.Pause() == nil || worker.SeekMs(100) == nil {
++		t.Fatal("output-free transport acknowledged an effect")
++	}
++	if err := worker.SetPrimaryStream(&emptyFailurePCM{}, true, false); err != nil {
++		t.Fatal(err)
++	}
++	if err := worker.SeekMs(100); err != nil {
++		t.Fatal("real paused output lost seek", err)
++	}
++	if err := worker.Play(); err != nil {
++		t.Fatal("real paused output lost resume", err)
++	}
++	if err := worker.Pause(); err != nil {
++		t.Fatal("real output lost pause", err)
++	}
++	worker.Stop()
++	worker.Stop() // Explicit Stop remains idempotent without an output.
++	if worker.Play() == nil || worker.Pause() == nil || worker.SeekMs(100) == nil {
++		t.Fatal("stopped output acknowledged a later transport effect")
++	}
++}
+diff --git a/daemon/connect_false_play_test.go b/daemon/connect_false_play_test.go
+new file mode 100644
+index 0000000..fb4252b
+--- /dev/null
++++ b/daemon/connect_false_play_test.go
+@@ -0,0 +1,61 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"github.com/devgianlu/go-librespot/session"
++	"google.golang.org/protobuf/proto"
++)
++
++func TestRejectedOutputOpenCannotAcknowledgeLaterDealerResume(t *testing.T) {
++	creates, publications := 0, 0
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++		WithNewOutput: func(func() (output.Output, error)) (output.Output, error) {
++			creates++
++			return nil, ErrAliasConflict
++		}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer worker.Close()
++	owner := pc13ExistingPlayer(t, true)
++	owner.player = worker
++	owner.primaryStream = &player.Stream{Source: &contentInertSource{}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Duration: proto.Int32(300000)})}
++	owner.state.player.IsPaused = true
++	owner.state.player.PlaybackSpeed = 0
++	owner.sess = &session.Session{}
++	nextSessionField(owner.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		publications++
++		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++	owner.spotConnId = "current-owner"
++	owner.hasInitialConnectState = true
++	owner.prefetchTimer = time.NewTimer(time.Hour)
++	defer owner.prefetchTimer.Stop()
++	if err := worker.SetPrimaryStream(owner.primaryStream.Source, true, false); !errors.Is(err, ErrAliasConflict) || creates != 1 {
++		t.Fatalf("failed output-open setup = %v, creates=%d", err, creates)
++	}
++	for _, endpoint := range []string{"resume", "pause", "seek_to"} {
++		var request dealer.RequestPayload
++		request.Command.Endpoint = endpoint
++		if endpoint == "seek_to" {
++			request.Command.Relative = "beginning"
++			request.Command.Position = 12000
++		}
++		if err := owner.handlePlayerCommandWithSpclient(context.Background(), request, nil); err == nil {
++			t.Fatalf("dealer %s acknowledged a prepared stream with no real output", endpoint)
++		}
++	}
++	if publications != 0 || !owner.state.player.IsPaused || owner.state.player.PlaybackSpeed != 0 || owner.state.player.PositionAsOfTimestamp != 456 || creates != 1 {
++		t.Fatal("failed transport published state/position or retried output creation")
++	}
++}
