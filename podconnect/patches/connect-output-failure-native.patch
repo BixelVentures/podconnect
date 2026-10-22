@@ -1,0 +1,677 @@
+diff --git a/daemon/controls.go b/daemon/controls.go
+index 1ea7156..cb00e9c 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -109,6 +109,28 @@ func (p *AppPlayer) emitMprisUpdate(playbackStatus mpris.PlaybackStatus) {
+ }
+ 
+ func (p *AppPlayer) handlePlayerEvent(ctx context.Context, ev *player.Event) {
++	if ev.Type == player.EventTypeOutputFailed {
++		// The worker serializes this claim with every new output install. A late
++		// failure from an older output cannot retire a newer stream or alias.
++		if p.player == nil || !p.player.ClaimOutputFailure(ev.OutputEpoch, func() {
++			p.aliasMu.Lock()
++			p.roomVolumeClosing = true
++			p.aliasRetired = true
++			p.aliasMu.Unlock()
++		}) {
++			return
++		}
++		p.invalidateRoomTransportGeneration()
++		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++		defer cancel()
++		if err := p.stopPlayback(ctx); err != nil {
++			p.app.log.WithError(err).Error("failed stopping after output loss")
++		}
++		if !p.app.cfg.ZeroconfEnabled {
++			p.Close() // No logout owner exists; join teardown before Run returns.
++		}
++		return
++	}
+ 	p.aliasMu.Lock()
+ 	quarantined := p.roomContentQuarantined
+ 	p.aliasMu.Unlock()
+diff --git a/player/events.go b/player/events.go
+index 92436e8..2432814 100644
+--- a/player/events.go
++++ b/player/events.go
+@@ -15,10 +15,12 @@ const (
+ 	EventTypePause
+ 	EventTypeStop
+ 	EventTypeNotPlaying
++	EventTypeOutputFailed
+ )
+ 
+ type Event struct {
+-	Type EventType
++	Type        EventType
++	OutputEpoch uint64 // Only output-failure events carry the worker's failed output owner.
+ }
+ 
+ type EventManager interface {
+diff --git a/player/player.go b/player/player.go
+index 4802cb5..0ce74c6 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -90,11 +90,17 @@ type playerCmd struct {
+ 	start   *start35Command
+ 	move    *roomMoveCommand
+ 	guarded *guardedTransportCommand
++	claim   *outputFailureClaim
+ 	typ     playerCmdType
+ 	data    any
+ 	resp    chan any
+ }
+ 
++type outputFailureClaim struct {
++	epoch uint64
++	seal  func()
++}
++
+ type playerCmdDataSet struct {
+ 	source  librespot.AudioSource
+ 	primary bool
+@@ -247,6 +253,9 @@ func (p *Player) manageLoop() {
+ 
+ 	// initial volume is 1
+ 	volume := float32(1)
++	var outputEpoch uint64
++	var failureSealed bool
++	var outputFailurePending bool
+ 
+ 	// init main source
+ 	source := p.source
+@@ -255,6 +264,34 @@ loop:
+ 	for {
+ 		select {
+ 		case cmd := <-p.cmd:
++			if cmd.claim != nil {
++				current := cmd.claim.epoch != 0 && cmd.claim.epoch == outputEpoch && out == nil && outputFailurePending && !failureSealed
++				if current {
++					failureSealed = true
++					if cmd.claim.seal != nil {
++						cmd.claim.seal()
++					}
++				}
++				cmd.resp <- current
++				continue
++			}
++			if failureSealed {
++				err := fmt.Errorf("output failure owner retired")
++				switch {
++				case cmd.move != nil:
++					cmd.resp <- roomMoveResult{Err: err}
++					continue
++				case cmd.start != nil:
++					cmd.resp <- start35Result{Err: err}
++					continue
++				case cmd.guarded != nil:
++					cmd.resp <- err
++					continue
++				case cmd.typ == playerCmdSet || cmd.typ == playerCmdPlay || cmd.typ == playerCmdPause || cmd.typ == playerCmdSeek:
++					cmd.resp <- err
++					continue
++				}
++			}
+ 			if cmd.move != nil {
+ 				result, err := p.applyRoomMove(cmd.move, &out, source)
+ 				result.Err = err
+@@ -262,7 +299,19 @@ loop:
+ 				continue
+ 			}
+ 			if cmd.start != nil {
++				if cmd.start.phase == "quiesce" && out == nil && outputEpoch == ^uint64(0) {
++					cmd.resp <- start35Result{Err: fmt.Errorf("output epoch exhausted")}
++					continue
++				}
++				before := out == nil
++				if before && outputFailurePending {
++					_ = source.TakeDone() // Old EOFs cannot advance a replacement output.
++				}
+ 				result, err := p.applyStart35(cmd.start, &out, source, volume)
++				if before && out != nil {
++					outputEpoch++
++					outputFailurePending = false
++				}
+ 				if out != nil {
+ 					outErr = out.Error()
+ 				}
+@@ -289,19 +338,36 @@ loop:
+ 
+ 				// create a new output device if needed
+ 				if out == nil {
++					if outputEpoch == ^uint64(0) {
++						cmd.resp <- fmt.Errorf("output epoch exhausted")
++						break
++					}
+ 					var err error
+-					out, err = p.newOutput(source, volume)
++					if outputFailurePending {
++						_ = source.TakeDone()
++						// The old primary still sits in the switching source. A
++						// replacement must not read it before SetPrimary below.
++						if p.newPausedOutput == nil {
++							cmd.resp <- fmt.Errorf("failed output replacement requires paused output")
++							break
++						}
++						out, err = p.newPausedOutput(source, volume)
++					} else {
++						out, err = p.newOutput(source, volume)
++					}
+ 					if err != nil {
+ 						cmd.resp <- err
+ 						break
+ 					}
+ 
+ 					outErr = out.Error()
++					outputEpoch++
+ 					p.log.Debugf("created new output device")
+ 				}
+ 
+ 				// set source
+ 				source.SetPrimary(data.source)
++				outputFailurePending = false
+ 				if data.paused {
+ 					if err := out.Pause(); err != nil {
+ 						cmd.resp <- err
+@@ -349,6 +415,10 @@ loop:
+ 					cmd.resp <- nil
+ 				}
+ 			case playerCmdStop:
++				if outputFailurePending {
++					_ = source.TakeDone()
++				}
++				outputFailurePending = false
+ 				if out != nil {
+ 					_ = out.Close()
+ 					out = nil
+@@ -356,6 +426,11 @@ loop:
+ 
+ 					p.log.Tracef("closed output device because of stop command")
+ 				}
++				if outputEpoch == ^uint64(0) {
++					failureSealed = true
++				} else {
++					outputEpoch++ // A queued older failure may never retire a later manual Stop.
++				}
+ 
+ 				cmd.resp <- struct{}{}
+ 				p.ev <- Event{Type: EventTypeStop}
+@@ -406,10 +481,21 @@ loop:
+ 
+ 			p.log.Tracef("cleared closed output device")
+ 
+-			// FIXME: this is called even if not needed, like when autoplay starts
+-			p.ev <- Event{Type: EventTypeStop}
++			if err != nil {
++				outputFailurePending = true
++				p.ev <- Event{Type: EventTypeOutputFailed, OutputEpoch: outputEpoch}
++			} else {
++				p.ev <- Event{Type: EventTypeStop}
++			}
+ 		case <-source.Done():
+-			for count := source.TakeDone(); count > 0; count-- {
++			count := source.TakeDone()
++			if outputFailurePending {
++				// A failed output dominates its queued EOF fanout. Sending these
++				// events could fill the event channel while its owner waits for
++				// the serialized failure claim and Stop.
++				continue
++			}
++			for ; count > 0; count-- {
+ 				p.ev <- Event{Type: EventTypeNotPlaying}
+ 			}
+ 		}
+@@ -437,6 +523,18 @@ func (p *Player) Receive() <-chan Event {
+ 	return p.ev
+ }
+ 
++// ClaimOutputFailure runs on the output worker after all earlier commands.
++// A newer output or manual Stop invalidates the queued failure; an accepted
++// claim seals this worker before the owner begins its normal teardown.
++func (p *Player) ClaimOutputFailure(epoch uint64, seal func()) bool {
++	resp := make(chan any, 1)
++	if !p.sendCommand(playerCmd{claim: &outputFailureClaim{epoch: epoch, seal: seal}, resp: resp}) {
++		return false
++	}
++	result, ok := p.commandResult(resp)
++	return ok && result.(bool)
++}
++
+ func (p *Player) Close() {
+ 	p.closeOnce.Do(func() { p.cmd <- playerCmd{typ: playerCmdClose} })
+ 	<-p.closeDone
+diff --git a/player/output_failure_test.go b/player/output_failure_test.go
+new file mode 100644
+index 0000000..ee9bffe
+--- /dev/null
++++ b/player/output_failure_test.go
+@@ -0,0 +1,175 @@
++package player
++
++import (
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type heldFailurePCM struct {
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++	reads   atomic.Int32
++}
++
++func (s *heldFailurePCM) Read(samples []float32) (int, error) {
++	s.reads.Add(1)
++	s.once.Do(func() { close(s.entered) })
++	<-s.release
++	samples[0] = 0.25
++	return 1, nil
++}
++func (*heldFailurePCM) PositionMs() int64         { return 0 }
++func (*heldFailurePCM) SetPositionMs(int64) error { return nil }
++
++type emptyFailurePCM struct{}
++
++func (*emptyFailurePCM) Read([]float32) (int, error) { return 0, nil }
++func (*emptyFailurePCM) PositionMs() int64           { return 0 }
++func (*emptyFailurePCM) SetPositionMs(int64) error   { return nil }
++
++func failureOutputEvent(t *testing.T, p *Player) Event {
++	t.Helper()
++	deadline := time.After(2 * time.Second)
++	for {
++		select {
++		case ev := <-p.Receive():
++			if ev.Type == EventTypeOutputFailed {
++				if ev.OutputEpoch == 0 {
++					t.Fatal("real output error lacked its worker epoch")
++				}
++				return ev
++			}
++		case <-deadline:
++			t.Fatal("closed FIFO reader did not produce a worker output failure")
++		}
++	}
++}
++
++func TestPipeEPIPEFailureClaimFencesOldOwnerAndRejectsStaleEvent(t *testing.T) {
++	for _, tc := range []struct {
++		name      string
++		newOutput bool
++		burst     bool
++	}{
++		{name: "current_failure"},
++		{name: "new_output_precedes_failure_dispatch", newOutput: true},
++		{name: "queued_eofs_cannot_block_failure_claim", burst: true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "output.fifo")
++			if err := syscall.Mkfifo(path, 0600); err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			var creates atomic.Int32
++			p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++				AudioOutputPipe: path, AudioOutputPipeFormat: "s16le",
++				WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++					out, err := create()
++					if creates.Add(1) == 2 {
++						// If replacement starts unpaused, this interval lets its
++						// goroutine read the failed old primary before SetPrimary.
++						time.Sleep(20 * time.Millisecond)
++					}
++					return out, err
++				}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer p.Close()
++			source := &heldFailurePCM{entered: make(chan struct{}), release: make(chan struct{})}
++			if err := p.SetPrimaryStream(source, true, false); err != nil {
++				t.Fatal(err)
++			}
++			if err := p.Play(); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case <-source.entered:
++			case <-time.After(time.Second):
++				t.Fatal("output did not read the held PCM source")
++			}
++			if err := reader.Close(); err != nil {
++				t.Fatal(err)
++			}
++			close(source.release)
++			failed := failureOutputEvent(t, p)
++			if got := source.reads.Load(); got != 1 {
++				t.Fatalf("failed output unexpectedly reread its source: %d", got)
++			}
++			if tc.newOutput {
++				replacementReader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer replacementReader.Close()
++				if err := p.SetPrimaryStream(&emptyFailurePCM{}, true, false); err != nil {
++					t.Fatal("fresh output could not open before stale event dispatch", err)
++				}
++				if got := source.reads.Load(); got != 1 {
++					t.Fatalf("replacement read the failed old primary before source switch: %d", got)
++				}
++				if p.ClaimOutputFailure(failed.OutputEpoch, nil) {
++					t.Fatal("stale error claimed a newer output")
++				}
++				p.Stop()
++				if p.ClaimOutputFailure(failed.OutputEpoch, nil) {
++					t.Fatal("stale error claimed a later manual Stop")
++				}
++				return
++			}
++			if tc.burst {
++				// A coalesced source wake can represent more EOFs than the
++				// event buffer. The daemon is waiting on Claim while this worker
++				// must never block fanning out obsolete NotPlaying events.
++				p.source.pendingDone.Store(256)
++				p.source.done <- struct{}{}
++				processed := time.After(time.Second)
++				for p.source.pendingDone.Load() != 0 {
++					select {
++					case <-processed:
++						t.Fatal("worker did not take the queued EOF burst")
++					default:
++						time.Sleep(time.Millisecond)
++					}
++				}
++				claimed := make(chan bool, 1)
++				go func() { claimed <- p.ClaimOutputFailure(failed.OutputEpoch, nil) }()
++				select {
++				case ok := <-claimed:
++					if !ok {
++						t.Fatal("current failure claim was rejected after EOF burst")
++					}
++				case <-time.After(time.Second):
++					t.Fatal("EOF fanout blocked the output worker before failure claim")
++				}
++				p.Stop()
++				return
++			}
++			claims := 0
++			if !p.ClaimOutputFailure(failed.OutputEpoch, func() { claims++ }) || claims != 1 {
++				t.Fatal("current real EPIPE was not claimed exactly once")
++			}
++			if p.ClaimOutputFailure(failed.OutputEpoch, nil) {
++				t.Fatal("failure owner was claimed twice")
++			}
++			if err := p.SetPrimaryStream(&emptyFailurePCM{}, true, false); err == nil {
++				t.Fatal("sealed failed owner opened another output")
++			}
++			p.Stop()
++		})
++	}
++}
+diff --git a/daemon/room_output_failure_test.go b/daemon/room_output_failure_test.go
+new file mode 100644
+index 0000000..6e48327
+--- /dev/null
++++ b/daemon/room_output_failure_test.go
+@@ -0,0 +1,247 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++)
++
++type failedOutputSource struct{}
++
++func (*failedOutputSource) Read([]float32) (int, error) {
++	return 0, fmt.Errorf("synthetic decoder failure")
++}
++
++func TestStaleOutputFailureDoesNotRetireFreshOutput(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "output.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++		AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer worker.Close()
++	if err := worker.SetPrimaryStream(&failedOutputSource{}, false, false); err != nil {
++		t.Fatal(err)
++	}
++	var failed player.Event
++	select {
++	case failed = <-worker.Receive():
++	case <-time.After(2 * time.Second):
++		t.Fatal("missing player event")
++	}
++	for failed.Type != player.EventTypeOutputFailed {
++		select {
++		case failed = <-worker.Receive():
++		case <-time.After(2 * time.Second):
++			t.Fatal("missing actual output failure")
++		}
++	}
++	replacementReader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer replacementReader.Close()
++	if err := worker.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++		t.Fatal("fresh output rejected before stale event dispatch", err)
++	}
++	owner := &AppPlayer{player: worker}
++	owner.handlePlayerEvent(context.Background(), &failed)
++	if owner.aliasRetired || owner.roomVolumeClosing || owner.roomTransportGeneration != 0 || worker.Closed() {
++		t.Fatal("late error retired a newer output or touched its owner generation")
++	}
++}
++func (*failedOutputSource) PositionMs() int64         { return 0 }
++func (*failedOutputSource) SetPositionMs(int64) error { return nil }
++
++type failureSessionEvents struct{ player.EventManager }
++
++func (*failureSessionEvents) Close() {}
++
++func TestCurrentOutputFailureRetiresOwnerBeforeFreshExplicitTransfer(t *testing.T) {
++	var writer output.MovePipeIdentity
++	var normal, closed, inactive int
++	retirement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]json.RawMessage
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Error(err)
++			http.Error(w, "bad body", http.StatusBadRequest)
++			return
++		}
++		if len(body) == 8 {
++			normal++
++			http.Error(w, "old writer is already closed", http.StatusConflict)
++			return
++		}
++		if len(body) != 9 || string(body["writer_already_closed"]) != "true" {
++			t.Errorf("unexpected retirement body: %#v", body)
++			http.Error(w, "bad body", http.StatusConflict)
++			return
++		}
++		closed++
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		reply := retirementReply("start", "prepare", reservation, writer)
++		reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer retirement.Close()
++	app, old, _ := retirementOwnerFixture(t, retirement.URL, "start")
++	writer = app.openedWriter
++	pipePath, err := os.Readlink("/proc/self/fd/" + writer.FD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	log := &librespot.NullLogger{}
++	app.log, app.cfg, app.server = log, &Config{ZeroconfEnabled: true}, &aliasTestServer{}
++	old.state = pc13ExistingPlayer(t, true).state
++	old.sess = &session.Session{}
++	nextSessionField(old.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		if r.Method != http.MethodPut || !strings.HasSuffix(r.URL.Path, "/inactive") || r.Header.Get("X-Spotify-Connection-Id") != "failure-owner" {
++			t.Errorf("unexpected inactive request %s %s", r.Method, r.URL)
++		}
++		inactive++
++		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++	nextSessionField(old.sess, "events", &failureSessionEvents{})
++	nextSessionField(old.sess, "dealer", dealer.NewDealer(log, &http.Client{}, nil, nil))
++	nextSessionField(old.sess, "ap", ap.NewAccesspoint(log, nil, "fixture"))
++	old.spotConnId = "failure-owner"
++	old.logout = make(chan *AppPlayer, 1)
++	old.prefetchTimer = time.NewTimer(time.Hour)
++	defer old.prefetchTimer.Stop()
++	app.startCustody.Capture.Player = old.player
++	app.startCustody.Capture.Session = old.sess
++	currentSource, err := old.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := old.player.Start35(context.Background(), "resume", nil, currentSource, output.PipeIdentity{}, "1", func(mutate func()) error { mutate(); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	if err := old.player.SetPrimaryStream(&failedOutputSource{}, false, false); err != nil {
++		t.Fatal(err)
++	}
++	var failed player.Event
++	deadline := time.After(2 * time.Second)
++waitFailure:
++	for {
++		select {
++		case ev := <-old.player.Receive():
++			if ev.Type == player.EventTypeOutputFailed {
++				failed = ev
++				break waitFailure
++			}
++		case <-deadline:
++			t.Fatal("actual player output error did not reach daemon event channel")
++		}
++	}
++	before := old.roomTransportGeneration
++	old.roomContentQuarantined = true // A genuine output failure must pass this older early return.
++	old.handlePlayerEvent(context.Background(), &failed)
++	if !old.aliasRetired || !old.roomVolumeClosing || old.roomTransportGeneration != before+1 || old.state.active || inactive != 1 {
++		t.Fatal("current output failure did not retire the alias and publish inactive once")
++	}
++	select {
++	case got := <-old.logout:
++		if got != old {
++			t.Fatal("logout selected a different owner")
++		}
++	default:
++		t.Fatal("failed owner was not handed to existing logout path")
++	}
++	old.Close() // The existing Zeroconf supervisor joins this exact owner.
++	if !old.player.Closed() || old.roomCloseDone == nil || normal == 0 || !app.moveCustodyUnknown || app.startCustody == nil {
++		t.Fatal("failed current owner did not become a closed quarantined prior owner")
++	}
++	fresh := &AppPlayer{app: app, sess: &session.Session{}, state: &State{device: &connectpb.DeviceInfo{}},
++		spotConnId: "fresh", aliasRegistry: []ApiAlias{{ID: 1, RoomID: "room"}},
++		aliasIncarnation: "incarnation", aliasFingerprint: "registry", aliasRevision: 1}
++	newWorker, err := player.NewPlayer(&player.Options{Log: log, AudioBackend: "pipe", AudioOutputPipe: pipePath,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			return app.withNewOutput(fresh, create)
++		}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer newWorker.Close()
++	fresh.player = newWorker
++	alias := uint32(1)
++	req := dealer.RequestPayload{TargetAliasId: &alias, SentByDeviceId: "phone"}
++	req.Command.Endpoint, req.Command.Data = "transfer", []byte{1}
++	if err := fresh.retirePriorStartForDealerTransfer(context.Background(), req); err != nil {
++		t.Fatal("fresh explicit transfer did not obtain closed-prior terminal proof", err)
++	}
++	if err := fresh.player.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++		t.Fatal("fresh authenticated owner did not open its real FIFO", err)
++	}
++	if closed != 1 || app.openedWriterOwner != fresh || app.openedWriterGeneration < 2 || app.startCustody != nil || app.moveCustodyUnknown {
++		t.Fatal("closed-prior terminal did not admit exactly one fresh writer")
++	}
++}
++
++func TestNonZeroconfOutputFailureClosesItsOwnRunOwner(t *testing.T) {
++	retirement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		http.Error(w, "old writer already closed", http.StatusConflict)
++	}))
++	defer retirement.Close()
++	app, old, _ := retirementOwnerFixture(t, retirement.URL, "start")
++	log := &librespot.NullLogger{}
++	app.log, app.cfg, app.server = log, &Config{ZeroconfEnabled: false}, &aliasTestServer{}
++	old.state = pc13ExistingPlayer(t, true).state
++	old.sess = &session.Session{}
++	nextSessionField(old.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++	nextSessionField(old.sess, "events", &failureSessionEvents{})
++	nextSessionField(old.sess, "dealer", dealer.NewDealer(log, &http.Client{}, nil, nil))
++	nextSessionField(old.sess, "ap", ap.NewAccesspoint(log, nil, "fixture"))
++	old.prefetchTimer = time.NewTimer(time.Hour)
++	defer old.prefetchTimer.Stop()
++	currentSource, err := old.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := old.player.Start35(context.Background(), "resume", nil, currentSource, output.PipeIdentity{}, "1", func(mutate func()) error { mutate(); return nil }); err != nil {
++		t.Fatal(err)
++	}
++	if err := old.player.SetPrimaryStream(&failedOutputSource{}, false, false); err != nil {
++		t.Fatal(err)
++	}
++	var failed player.Event
++	deadline := time.After(2 * time.Second)
++	for failed.Type != player.EventTypeOutputFailed {
++		select {
++		case failed = <-old.player.Receive():
++		case <-deadline:
++			t.Fatal("actual output failure was not emitted")
++		}
++	}
++	old.handlePlayerEvent(context.Background(), &failed)
++	if !old.player.Closed() || old.roomCloseDone == nil || !old.aliasRetired || len(old.stop) != 1 || old.state.active {
++		t.Fatal("non-Zeroconf output failure did not join this owner and signal Run exit")
++	}
++}

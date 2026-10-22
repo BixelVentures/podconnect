@@ -1,0 +1,39 @@
+diff --git a/src/outputs.c b/src/outputs.c
+index b3f195e..afb35a3 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -414,7 +414,9 @@ int outputs_transport_pause_confirm(uint64_t id,const char *token,const char *pr
+   if (!slot || slot->pause_confirmed) return -1;
+   slot->pause_confirmed=true; /* No replay, including a rejected old completion. */
+   if (!slot->used || !slot->result.command.bound || slot->result.outcome!=0
+-      || strcmp(slot->result.command.action,"pause")
++      || (strcmp(slot->result.command.action,"pause")
++          && strcmp(slot->result.command.action,"next")
++          && strcmp(slot->result.command.action,"previous"))
+       || slot->result.command.device_id!=id
+       || strcmp(slot->result.command.native_prepare_id,prepare)
+       || slot->result.command.native_revision!=revision
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index c17bf2d..38d4c00 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -129,6 +129,19 @@ static void confirmed_pause_custody_case(struct output_device *device,
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,53)==0);
++  const char *paused_switches[]={"next","previous"};
++  for (size_t i=0;i<ARRAY_SIZE(paused_switches);i++) {
++    strcpy(request.action,paused_switches[i]);request.native_revision=54+i;
++    request.native_prepare_id[0]='a'+i;request.args_digest[0]='a'+i;
++    assert(outputs_transport_prepare(&request,&prepared)==0);
++    strcpy(request.token,prepared.command.token);
++    assert(outputs_transport_commit(&request,&result)==0);
++    assert(!transport_pause_retained); /* New stream cannot inherit admission-only custody. */
++    assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)==0);
++    assert(transport_pause_owned(1));
++    assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
++    assert(transport_pause_owned(1));
++  }
+   struct start_slot *prior_start=start_active;
+   struct start_slot next_start=*prior_start;
+   next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */

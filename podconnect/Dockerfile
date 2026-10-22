@@ -69,6 +69,16 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/vorbis-cleanup-native.patch" \
   && git apply --check "/patches/room-start-diagnostics-native.patch" \
   && git apply "/patches/room-start-diagnostics-native.patch" \
+  && git apply --check "/patches/paused-track-native.patch" \
+  && git apply "/patches/paused-track-native.patch" \
+  && git apply --check "/patches/connect-output-admission-diagnostics-native.patch" \
+  && git apply "/patches/connect-output-admission-diagnostics-native.patch" \
+  && git apply --check "/patches/connect-closed-prior-native.patch" \
+  && git apply "/patches/connect-closed-prior-native.patch" \
+  && git apply --check "/patches/connect-output-failure-native.patch" \
+  && git apply "/patches/connect-output-failure-native.patch" \
+  && git apply --check "/patches/connect-no-output-transport-native.patch" \
+  && git apply "/patches/connect-no-output-transport-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -108,6 +118,12 @@ COPY patches/fifo-reader-handoff-owntone.patch /patches/fifo-reader-handoff-ownt
 COPY patches/fifo-reader-handoff-owntone.sha256 /patches/fifo-reader-handoff-owntone.sha256
 COPY patches/start-starvation-owner-owntone.patch /patches/start-starvation-owner-owntone.patch
 COPY patches/start-starvation-owner-owntone.sha256 /patches/start-starvation-owner-owntone.sha256
+COPY patches/paused-track-owntone.patch /patches/paused-track-owntone.patch
+COPY patches/paused-track-owntone.sha256 /patches/paused-track-owntone.sha256
+COPY patches/connect-closed-prior-owntone.patch /patches/connect-closed-prior-owntone.patch
+COPY patches/connect-closed-prior-owntone.sha256 /patches/connect-closed-prior-owntone.sha256
+COPY patches/connect-atomic-init-owntone.patch /patches/connect-atomic-init-owntone.patch
+COPY patches/connect-atomic-init-owntone.sha256 /patches/connect-atomic-init-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -148,6 +164,15 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/start-starvation-owner-owntone.sha256 \
   && git apply --check /patches/start-starvation-owner-owntone.patch \
   && git apply /patches/start-starvation-owner-owntone.patch \
+  && sha256sum -c /patches/paused-track-owntone.sha256 \
+  && git apply --check /patches/paused-track-owntone.patch \
+  && git apply /patches/paused-track-owntone.patch \
+  && sha256sum -c /patches/connect-closed-prior-owntone.sha256 \
+  && git apply --check /patches/connect-closed-prior-owntone.patch \
+  && git apply /patches/connect-closed-prior-owntone.patch \
+  && sha256sum -c /patches/connect-atomic-init-owntone.sha256 \
+  && git apply --check /patches/connect-atomic-init-owntone.patch \
+  && git apply /patches/connect-atomic-init-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
@@ -155,6 +180,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && { make check || { cat src/test-suite.log; exit 1; }; } \
   && src/airplay_callback_owner --queue-wire \
   && src/airplay_callback_owner --queue-connect-wire \
+  && src/airplay_callback_owner --start-retire-closed-wire \
+  && src/airplay_callback_owner --start-retire-closed-no-session-wire \
+  && src/airplay_callback_owner --start-retire-closed-empty-wire \
   && make install \
   && cd / && rm -rf /src
 

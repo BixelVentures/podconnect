@@ -1,0 +1,464 @@
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -413,6 +413,54 @@
+ 	}
+ }
+ 
++// A fresh explicit phone transfer may replace only a completed START owned by
++// an already joined, different AppPlayer. C must retire that original closed
++// writer before this command changes Spotify state or opens a successor FIFO.
++func (p *AppPlayer) retirePriorStartForDealerTransfer(ctx context.Context, req dealer.RequestPayload) error {
++	if p.app == nil {
++		return nil
++	}
++	p.app.moveCustodyMu.Lock()
++	prior := p.app.startCustody != nil && p.app.startCustody.Owner != p
++	p.app.moveCustodyMu.Unlock()
++	if !prior {
++		return nil // Current-owner and ordinary transfers retain their existing path.
++	}
++	alias := req.TargetAliasId
++	if alias == nil {
++		alias = req.Command.TargetAliasId
++	}
++	if ctx.Err() != nil || p.player == nil || p.player.Closed() || p.sess == nil ||
++		p.state == nil || p.state.device == nil ||
++		req.Command.Endpoint != "transfer" || req.Command.Options.SystemInitiated ||
++		req.Command.PlayOptions.SystemInitiated || len(req.Command.Data) == 0 ||
++		req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 || alias == nil || *alias == 0 {
++		return ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	valid := !p.aliasRetired && p.spotConnId != "" && int(*alias) <= len(p.aliasRegistry) &&
++		p.aliasRegistry[*alias-1].ID == *alias && p.aliasRegistry[*alias-1].RoomID != ""
++	incarnation, fingerprint, revision, connection := p.aliasIncarnation, p.aliasFingerprint, p.aliasRevision, p.spotConnId
++	selected := p.state.device.SelectedAliasId
++	p.aliasMu.Unlock()
++	if !valid {
++		return ErrAliasConflict
++	}
++	if err := p.app.retireClosedPriorStartFor(ctx, p); err != nil {
++		return err
++	}
++	p.aliasMu.Lock()
++	current := !p.aliasRetired && p.aliasIncarnation == incarnation && p.aliasFingerprint == fingerprint &&
++		p.aliasRevision == revision && p.spotConnId == connection &&
++		p.state.device.SelectedAliasId == selected && int(*alias) <= len(p.aliasRegistry) &&
++		p.aliasRegistry[*alias-1].ID == *alias && p.aliasRegistry[*alias-1].RoomID != ""
++	p.aliasMu.Unlock()
++	if ctx.Err() != nil || p.player.Closed() || !current {
++		return ErrAliasConflict
++	}
++	return nil
++}
++
+ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.RequestPayload, transferState *connectpb.TransferState, sp *spclient.Spclient) error {
+ 	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, transferState.CurrentSession.Context)
+ 	if err != nil {
+@@ -429,6 +477,9 @@
+ 	// shuffle the context if needed
+ 	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
+ 		return fmt.Errorf("failed shuffling context")
++	}
++	if err := p.retirePriorStartForDealerTransfer(ctx, req); err != nil {
++		return err
+ 	}
+ 
+ 	p.commitPlayerCommand(req)
+diff --git a/daemon/room_retirement.go b/daemon/room_retirement.go
+--- a/daemon/room_retirement.go
++++ b/daemon/room_retirement.go
+@@ -27,6 +27,7 @@
+ 	inputEpoch  string
+ 	retirement  string
+ 	prepared    bool
++	closedPrior bool
+ 	startSource *contentOperation
+ 	moveSource  *moveOperation
+ }
+@@ -259,3 +260,107 @@
+ 	app.retirementPending = nil
+ 	app.openedWriter = output.MovePipeIdentity{}
+ }
++
++// A closed prior AppPlayer cannot use the normal prepare-before-Close path:
++// its original FIFO writer is already gone. Only C can establish an exact
++// terminal witness for that old completed START before a successor may write.
++func (app *App) retireClosedPriorStartFor(ctx context.Context, current *AppPlayer) error {
++	if ctx.Err() != nil {
++		return ErrAliasConflict
++	}
++	app.moveCustodyMu.Lock()
++	op := app.startCustody
++	if op == nil || op.Owner == nil || op.Owner == current {
++		app.moveCustodyMu.Unlock()
++		return ErrAliasConflict
++	}
++	old := op.Owner
++	app.moveCustodyMu.Unlock()
++
++	old.roomCloseMu.Lock()
++	done := old.roomCloseDone
++	old.roomCloseMu.Unlock()
++	if done == nil || old.player == nil || !old.player.Closed() {
++		return ErrAliasConflict
++	}
++	select {
++	case <-done:
++	default:
++		return ErrAliasConflict
++	}
++
++	app.moveCustodyMu.Lock()
++	if ctx.Err() != nil || app.startCustody != op || app.moveCustody != nil || app.startOutputPermit != nil ||
++		app.openedWriterOwner != old || app.queueWriterBusyLocked() ||
++		(app.retirementPending != nil && (app.retirementPending.closedPrior || app.retirementPending.owner != old || app.retirementPending.startSource != op)) {
++		app.moveCustodyMu.Unlock()
++		return ErrAliasConflict
++	}
++	op.mu.Lock()
++	valid := op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed" &&
++		op.Capture != nil && op.Capture.Player == old.player && op.Capture.Session == old.sess &&
++		op.CReceipt.WriterEpoch == op.Epoch && op.CReceipt.Pipe != nil &&
++		*op.CReceipt.Pipe == (outputPipeIdentity{Device: app.openedWriter.Device, Inode: app.openedWriter.Inode, Type: app.openedWriter.Type})
++	var a retirementAttempt
++	if valid {
++		a = retirementAttempt{owner: old, purpose: "start", closedPrior: true, baseURL: op.Capture.OwnTone,
++			deviceID: op.Target.DeviceID, completed: op.CReceipt.Token,
++			incarnation: op.Capture.Incarnation, process: op.Capture.Process,
++			writerEpoch: op.Epoch, inputEpoch: op.CReceipt.InputEpoch, startSource: op,
++			writer: app.openedWriter}
++	}
++	op.mu.Unlock()
++	process, currentProcess := nativeContentProcess()
++	if !valid || !currentProcess || process != a.process || !volumeHex32.MatchString(a.completed) ||
++		!volumeHex32.MatchString(a.incarnation) || !volumeCounter(a.writerEpoch) || a.writerEpoch == "0" ||
++		!volumeCounter(a.inputEpoch) || a.inputEpoch == "0" || !volumeCounter(a.writer.FD) ||
++		a.writer.Type != "fifo" || !volumeCounter(a.writer.Device) ||
++		!volumeCounter(a.writer.Inode) || a.writer.Inode == "0" || !roomTransportURL(a.baseURL) {
++		app.moveCustodyMu.Unlock()
++		return ErrAliasConflict
++	}
++	reservation, err := randomQueueID(16)
++	if err != nil {
++		app.moveCustodyMu.Unlock()
++		return ErrAliasConflict
++	}
++	a.reservation = reservation
++	writerGeneration := app.openedWriterGeneration
++	app.retirementPending = &a // Fences all other new writers throughout the C await.
++	app.moveCustodyMu.Unlock()
++
++	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
++	defer cancel()
++	var reply retirementReceipt
++	err = retirementHTTP(ctx, "POST", a.endpoint("prepare"), struct {
++		Completed           string             `json:"completed_token"`
++		Reservation         string             `json:"native_reservation_id"`
++		Incarnation         string             `json:"native_incarnation"`
++		Process             contentProcess     `json:"native_process"`
++		Epoch               string             `json:"writer_source_epoch"`
++		FD                  string             `json:"writer_fd"`
++		Pipe                outputPipeIdentity `json:"pipe_identity"`
++		InputEpoch          string             `json:"expected_input_epoch"`
++		WriterAlreadyClosed bool               `json:"writer_already_closed"`
++	}{a.completed, a.reservation, a.incarnation, a.process, a.writerEpoch, a.writer.FD,
++		outputPipeIdentity{Device: a.writer.Device, Inode: a.writer.Inode, Type: a.writer.Type}, a.inputEpoch, true}, &reply)
++	a.retirement = reply.RetirementToken
++	terminal := err == nil && reply.Outcome == "retired" &&
++		volumeHex32.MatchString(a.retirement) && a.validTerminal(reply, "prepare")
++
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	if app.retirementPending != &a || app.startCustody != op || app.moveCustody != nil ||
++		app.startOutputPermit != nil || app.queueWriterBusyLocked() ||
++		app.openedWriterOwner != old || app.openedWriter != a.writer ||
++		app.openedWriterGeneration != writerGeneration || !terminal {
++		app.moveCustodyUnknown = true
++		return ErrAliasConflict
++	}
++	app.startCustody = nil
++	app.retirementPending = nil
++	app.moveCustodyUnknown = false
++	app.openedWriter = output.MovePipeIdentity{}
++	app.openedWriterOwner = nil
++	return nil
++}
+diff --git a/daemon/room_retirement_test.go b/daemon/room_retirement_test.go
+--- a/daemon/room_retirement_test.go
++++ b/daemon/room_retirement_test.go
+@@ -17,8 +17,11 @@
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
+ )
+ 
+ type retirementHeldRead struct {
+@@ -98,6 +101,241 @@
+ 		r.Outcome, r.InputEpoch, r.ContextsDrained, r.DurableTerminal, r.RetiredWitness = "retired", "2", true, true, true
+ 	}
+ 	return r
++}
++
++func TestClosedPriorSTARTRequiresExactTerminalBeforeFreshWriter(t *testing.T) {
++	var app *App
++	var writer output.MovePipeIdentity
++	var normal, orphan atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/api/outputs/102/start/retire/prepare" {
++			t.Errorf("unexpected endpoint %s", r.URL.Path)
++			http.Error(w, "endpoint", http.StatusNotFound)
++			return
++		}
++		var body map[string]json.RawMessage
++		if json.NewDecoder(r.Body).Decode(&body) != nil {
++			t.Error("bad retirement body")
++			return
++		}
++		if len(body) == 8 {
++			normal.Add(1)
++			http.Error(w, "old writer unavailable", http.StatusConflict)
++			return
++		}
++		if len(body) != 9 || string(body["writer_already_closed"]) != "true" {
++			t.Errorf("closed prior request changed normal contract: %#v", body)
++			http.Error(w, "bad body", http.StatusConflict)
++			return
++		}
++		orphan.Add(1)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		reply := retirementReply("start", "prepare", reservation, writer)
++		reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	var old *AppPlayer
++	app, old, _ = retirementOwnerFixture(t, server.URL, "start")
++	writer = app.openedWriter
++	pipePath, err := os.Readlink("/proc/self/fd/" + writer.FD)
++	if err != nil {
++		t.Fatal("cannot identify original FIFO", err)
++	}
++	oldGeneration := app.openedWriterGeneration
++	app.startCustody.Capture.Player = old.player
++	old.Close()
++	if normal.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil || !old.player.Closed() {
++		t.Fatal("failed normal prepare did not retain closed old START custody")
++	}
++	fresh := &AppPlayer{app: app}
++	cancelled, cancel := context.WithCancel(context.Background())
++	cancel()
++	if app.retireClosedPriorStartFor(cancelled, fresh) == nil || orphan.Load() != 0 || app.startCustody == nil {
++		t.Fatal("cancelled transfer sent a new retirement request")
++	}
++	if err := app.retireClosedPriorStartFor(context.Background(), fresh); err != nil {
++		t.Fatal("exact closed-prior terminal was refused", err)
++	}
++	if orphan.Load() != 1 || app.moveCustodyUnknown || app.startCustody != nil || app.retirementPending != nil {
++		t.Fatal("terminal did not retire only the old custody")
++	}
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++		AudioOutputPipe: pipePath, AudioOutputPipeFormat: "s16le",
++		WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			return app.withNewOutput(fresh, create)
++		}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer worker.Close()
++	fresh.player = worker
++	if err := worker.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++		t.Fatal("fresh player did not open its FIFO writer", err)
++	}
++	if app.openedWriterOwner != fresh || app.openedWriterGeneration != oldGeneration+1 ||
++		app.openedWriter.Device != writer.Device || app.openedWriter.Inode != writer.Inode ||
++		app.openedWriter.Type != "fifo" {
++		t.Fatal("terminal did not admit a fresh writer for the same named FIFO")
++	}
++	opened, err := os.Stat("/proc/self/fd/" + app.openedWriter.FD)
++	if err != nil || opened.Mode()&os.ModeNamedPipe == 0 {
++		t.Fatal("fresh writer descriptor is not an open FIFO", err)
++	}
++}
++
++func TestClosedPriorSTARTUnknownNeverRetriesOrAdmitsWriter(t *testing.T) {
++	var writer output.MovePipeIdentity
++	var orphan atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]json.RawMessage
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		if len(body) == 8 {
++			http.Error(w, "old writer unavailable", http.StatusConflict)
++			return
++		}
++		orphan.Add(1)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		reply := retirementReply("start", "prepare", reservation, writer)
++		// A complete-looking witness must not override an explicit UNKNOWN.
++		reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "unknown", "2", true, true, true
++		_ = json.NewEncoder(w).Encode(reply)
++	}))
++	defer server.Close()
++	app, old, _ := retirementOwnerFixture(t, server.URL, "start")
++	writer = app.openedWriter
++	app.startCustody.Capture.Player = old.player
++	old.Close()
++	fresh := &AppPlayer{app: app}
++	if app.retireClosedPriorStartFor(context.Background(), fresh) == nil || app.retireClosedPriorStartFor(context.Background(), fresh) == nil {
++		t.Fatal("unknown closed-prior outcome escaped quarantine")
++	}
++	if orphan.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
++		t.Fatal("unknown outcome retried or admitted a new FIFO writer")
++	}
++}
++
++func TestClosedPriorSTARTLateTerminalCannotClearNewWriterGeneration(t *testing.T) {
++	for _, mode := range []string{"writer_generation", "start_permit", "queue_writer"} {
++		t.Run(mode, func(t *testing.T) {
++			entered, release := make(chan struct{}), make(chan struct{})
++			var writer output.MovePipeIdentity
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body map[string]json.RawMessage
++				_ = json.NewDecoder(r.Body).Decode(&body)
++				if len(body) == 8 {
++					http.Error(w, "old writer unavailable", http.StatusConflict)
++					return
++				}
++				close(entered)
++				<-release
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				reply := retirementReply("start", "prepare", reservation, writer)
++				reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer server.Close()
++			app, old, _ := retirementOwnerFixture(t, server.URL, "start")
++			writer = app.openedWriter
++			app.startCustody.Capture.Player = old.player
++			old.Close()
++			fresh := &AppPlayer{app: app}
++			result := make(chan error, 1)
++			go func() { result <- app.retireClosedPriorStartFor(context.Background(), fresh) }()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				close(release)
++				t.Fatal("closed-prior request did not enter C")
++			}
++			app.moveCustodyMu.Lock()
++			switch mode {
++			case "writer_generation":
++				app.openedWriterGeneration++
++			case "start_permit":
++				app.startOutputPermit = app.startCustody
++			case "queue_writer":
++				app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{
++					&nativeTransportOffer{}: {Until: time.Now().Add(time.Minute)},
++				}
++			}
++			app.moveCustodyMu.Unlock()
++			close(release)
++			if err := <-result; err == nil || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
++				t.Fatal("late terminal credited a changed admission owner")
++			}
++		})
++	}
++}
++
++func TestClosedPriorSTARTTerminalCannotAuthorizeStaleTransfer(t *testing.T) {
++	for _, mode := range []string{"alias_changed", "current_closed", "context_cancelled"} {
++		t.Run(mode, func(t *testing.T) {
++			entered, release := make(chan struct{}), make(chan struct{})
++			var writer output.MovePipeIdentity
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body map[string]json.RawMessage
++				_ = json.NewDecoder(r.Body).Decode(&body)
++				if len(body) == 8 {
++					http.Error(w, "old writer unavailable", http.StatusConflict)
++					return
++				}
++				close(entered)
++				<-release
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				reply := retirementReply("start", "prepare", reservation, writer)
++				reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer server.Close()
++			app, old, _ := retirementOwnerFixture(t, server.URL, "start")
++			writer = app.openedWriter
++			app.startCustody.Capture.Player = old.player
++			old.Close()
++			worker, err := player.NewPlayer(&player.Options{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			fresh := &AppPlayer{app: app, player: worker, sess: &session.Session{},
++				state: &State{device: &connectpb.DeviceInfo{}}, spotConnId: "current",
++				aliasRegistry: []ApiAlias{{ID: 1, RoomID: "room"}}, aliasIncarnation: "incarnation",
++				aliasFingerprint: "registry", aliasRevision: 1}
++			alias := uint32(1)
++			req := dealer.RequestPayload{TargetAliasId: &alias, SentByDeviceId: "phone"}
++			req.Command.Endpoint, req.Command.Data = "transfer", []byte{1}
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			result := make(chan error, 1)
++			go func() { result <- fresh.retirePriorStartForDealerTransfer(ctx, req) }()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				close(release)
++				t.Fatal("closed-prior transfer did not enter C")
++			}
++			switch mode {
++			case "alias_changed":
++				fresh.aliasMu.Lock()
++				fresh.aliasRevision++
++				fresh.aliasMu.Unlock()
++			case "current_closed":
++				fresh.player.Close()
++			case "context_cancelled":
++				cancel()
++			}
++			close(release)
++			if err := <-result; err == nil || fresh.state.lastCommand != nil ||
++				(mode != "context_cancelled" && app.startCustody != nil) ||
++				(mode == "context_cancelled" && app.startCustody != nil && !app.moveCustodyUnknown) {
++				t.Fatalf("late terminal authorized stale current transfer: %v", err)
++			}
++		})
++	}
+ }
+ 
+ func TestRoomKnownRetirementGatesBeforeCloseAndWitnessesBeforeReplacement(t *testing.T) {
+diff --git a/player/player.go b/player/player.go
+--- a/player/player.go
++++ b/player/player.go
+@@ -442,6 +442,16 @@
+ 	<-p.closeDone
+ }
+ 
++// Closed reports the worker's joined output/source teardown without initiating it.
++func (p *Player) Closed() bool {
++	select {
++	case <-p.closeDone:
++		return true
++	default:
++		return false
++	}
++}
++
+ func (p *Player) sendCommand(cmd playerCmd) bool {
+ 	select {
+ 	case <-p.closeDone:

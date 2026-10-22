@@ -1,0 +1,23 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -42,8 +42,8 @@
+ #undef calloc
+ #undef free
+ #undef db_speaker_get
+-#undef db_speaker_save
+ #include "../src/outputs/streaming.c"
+ #include "../src/player.c"
++#undef db_speaker_save
+ 
+ /* The input command closes its real old reader before opening the successor.
+@@ -1161,7 +1161,9 @@
+ int main(int argc, char **argv)
+ {
+   int mode;
+   if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
++  gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
+   if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
+     { recovery_salt_red = true; return recovery_wire_case(0); }
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
