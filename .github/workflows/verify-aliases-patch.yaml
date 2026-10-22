@@ -7,11 +7,13 @@ on:
     paths:
       - "podconnect/patches/**"
       - "podconnect/Dockerfile"
+      - ".github/fixtures/**"
       - ".github/workflows/verify-aliases-patch.yaml"
   pull_request:
     paths:
       - "podconnect/patches/**"
       - "podconnect/Dockerfile"
+      - ".github/fixtures/**"
   workflow_dispatch:
 
 jobs:
@@ -110,6 +112,11 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-atomic-init-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/connect-atomic-init-owntone.patch"
           git apply "$patch_dir/connect-atomic-init-owntone.patch"
+          # Fixture-only macro scope; no production OwnTone source or Docker image change.
+          fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
+          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
+          git apply --check "$fixture_dir/airplay-callback-owner-db-save.patch"
+          git apply "$fixture_dir/airplay-callback-owner-db-save.patch"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
