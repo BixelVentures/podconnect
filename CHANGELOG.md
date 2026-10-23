@@ -1,3 +1,9 @@
+## 0.26.41
+
+- Failed track loads now retire their exact playback owner and stop the false advancing playback state. Restricted or unsupported tracks still use the existing bounded skip to the next playable track.
+- Keep Pause and Stop responsive when the Spotify audio FIFO is full and its reader is not consuming. Interrupt and join the current writer without reclaiming another route or automatically replaying playback.
+- Preserve the unwritten audio on ordinary resume, and discard old buffered audio at an explicit source change or seek while retaining the prior paused state.
+
 ## Speakers 0.26.40 — OwnTone C build compatibility
 
 - Replace three static START atomic initializer spellings with equivalent C constant initializers. The official pinned OwnTone build for 0.26.39 failed while compiling `src/outputs.o` because its headers did not define `ATOMIC_VAR_INIT`; the Native job passed, and the C owner modes did not run.

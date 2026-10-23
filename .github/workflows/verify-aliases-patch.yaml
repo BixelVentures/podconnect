@@ -41,7 +41,7 @@ jobs:
           done
           git apply --check -p2 "$patch_dir/room-retirement-native.patch"
           git apply -p2 "$patch_dir/room-retirement-native.patch"
-          for patch in room-startcredit-handoff-native.patch room-startcredit-reviewfix-native.patch room-queue-native.patch room-next-native.patch connect-recovery-native.patch connect-recovery-diagnostics-native.patch paused-route-native.patch vorbis-cleanup-native.patch room-start-diagnostics-native.patch paused-track-native.patch connect-output-admission-diagnostics-native.patch connect-closed-prior-native.patch connect-output-failure-native.patch connect-no-output-transport-native.patch; do
+          for patch in room-startcredit-handoff-native.patch room-startcredit-reviewfix-native.patch room-queue-native.patch room-next-native.patch connect-recovery-native.patch connect-recovery-diagnostics-native.patch paused-route-native.patch vorbis-cleanup-native.patch room-start-diagnostics-native.patch paused-track-native.patch connect-output-admission-diagnostics-native.patch connect-closed-prior-native.patch connect-output-failure-native.patch connect-no-output-transport-native.patch pipe-control-liveness-native.patch connect-load-failure-native.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done

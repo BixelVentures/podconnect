@@ -26,3 +26,5 @@ a93e7e6b5899ee999f3e26b6e4c7780a1a648c28b804fb75964ef6ef470ff83f  /patches/conne
 501152138ab0d3d9bba7b5495f185428a8adf9f58de7d0f9d94d7c6283d1e8e0  /patches/connect-closed-prior-native.patch
 265e7ba87df8b97ce7c47086f0da34b1914091bd78dd6aed43969cdbf5016f5d  /patches/connect-output-failure-native.patch
 d83009c9c16df5b3e88739564dd018b72801027cbea9316ad9fc638ddbf073da  /patches/connect-no-output-transport-native.patch
+fa07060f5896fdef44473ee078ed79e186b9947ef95be688790f2c9c27258f54  /patches/pipe-control-liveness-native.patch
+2582413970e6399ccbbcc01cc6be0db13f88ed255e7f1f328134400068c1d739  /patches/connect-load-failure-native.patch

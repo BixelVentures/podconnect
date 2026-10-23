@@ -1,0 +1,417 @@
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -7,6 +7,7 @@
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"math"
+ 	"strconv"
+ 	"strings"
+@@ -132,7 +133,7 @@
+ 		return
+ 	}
+ 	p.aliasMu.Lock()
+-	quarantined := p.roomContentQuarantined
++	quarantined := p.roomContentQuarantined || p.aliasRetired || p.roomVolumeClosing
+ 	p.aliasMu.Unlock()
+ 	if quarantined {
+ 		return
+@@ -335,6 +336,10 @@
+ }
+ 
+ func (p *AppPlayer) loadCurrentTrack(ctx context.Context, paused, drop bool) error {
++	return p.loadCurrentTrackAttempt(ctx, paused, drop, false)
++}
++
++func (p *AppPlayer) loadCurrentTrackAttempt(ctx context.Context, paused, drop, allowUnplayableFallback bool) (loadErr error) {
+ 	if p.primaryStream != nil {
+ 		p.sess.Events().OnPrimaryStreamUnload(p.primaryStream, p.player.PositionMs())
+ 
+@@ -347,6 +352,40 @@
+ 	} else if spotId.Type() != librespot.SpotifyIdTypeTrack && spotId.Type() != librespot.SpotifyIdTypeEpisode {
+ 		return fmt.Errorf("unsupported spotify type: %s", spotId.Type())
+ 	}
++
++	// A prepared decoder or retained old output is not a successfully loaded
++	// context. On failure seal only this actor, then use its normal Stop and
++	// logout retirement before discarding a prepared source. A later actor owns
++	// its own state, worker and session and cannot be cleaned up by this defer.
++	state, worker, session := p.state, p.player, p.sess
++	playerState := state.player
++	var prepared *player.Stream
++	defer func() {
++		if allowUnplayableFallback && (errors.Is(loadErr, librespot.ErrMediaRestricted) || errors.Is(loadErr, librespot.ErrNoSupportedFormats)) {
++			return
++		}
++		if loadErr == nil || p.state != state || p.state.player != playerState || p.player != worker || p.sess != session {
++			return
++		}
++		p.aliasMu.Lock()
++		p.aliasRetired = true
++		p.roomVolumeClosing = true
++		p.aliasMu.Unlock()
++		p.invalidateRoomTransportGeneration()
++		if err := p.stopPlayback(ctx); err != nil {
++			p.app.log.WithError(err).Error("failed stopping after track load failure")
++		}
++		// Stop has joined the output writer/read before a possibly adopted
++		// decoder is closed. Production ownedAudioSource closes idempotently.
++		if prepared != nil {
++			if closer, ok := prepared.Source.(io.Closer); ok {
++				_ = closer.Close()
++			}
++		}
++		if !p.app.cfg.ZeroconfEnabled {
++			p.Close()
++		}
++	}()
+ 
+ 	trackPosition := p.state.trackPosition()
+ 	p.app.log.WithField("uri", spotId.Uri()).
+@@ -374,7 +413,6 @@
+ 		p.secondaryStream = nil
+ 		prefetched = true
+ 	} else {
+-		p.secondaryStream = nil
+ 		prefetched = false
+ 
+ 		var err error
+@@ -382,8 +420,10 @@
+ 		if err != nil {
+ 			return fmt.Errorf("failed creating stream for %s: %w", spotId, err)
+ 		}
+-	}
+-
++		p.secondaryStream = nil
++	}
++
++	prepared = p.primaryStream
+ 	if err := p.player.SetPrimaryStream(p.primaryStream.Source, paused, drop); err != nil {
+ 		return fmt.Errorf("failed setting stream for %s: %w", spotId, err)
+ 	}
+@@ -736,7 +776,7 @@
+ 	}
+ 
+ 	// load current track into stream
+-	if err := p.loadCurrentTrack(ctx, !hasNextTrack, drop); errors.Is(err, librespot.ErrMediaRestricted) || errors.Is(err, librespot.ErrNoSupportedFormats) {
++	if err := p.loadCurrentTrackAttempt(ctx, !hasNextTrack, drop, !forceNext); errors.Is(err, librespot.ErrMediaRestricted) || errors.Is(err, librespot.ErrNoSupportedFormats) {
+ 		p.app.log.WithError(err).Infof("skipping unplayable media: %s", uri)
+ 		if forceNext {
+ 			// we failed in finding another track to play, just stop
+--- a/daemon/connect_false_play_test.go
++++ b/daemon/connect_false_play_test.go
+@@ -1,19 +1,31 @@
+ package daemon
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
++	"io"
+ 	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
+ 	"testing"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/dealer"
++	evtimpl "github.com/devgianlu/go-librespot/events/impl"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	extmetadatapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	audiofilespb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata/audiofiles"
+ 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+ 	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/tracks"
+ 	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
+ )
+ 
+ func TestRejectedOutputOpenCannotAcknowledgeLaterDealerResume(t *testing.T) {
+@@ -59,3 +71,281 @@
+ 		t.Fatal("failed transport published state/position or retried output creation")
+ 	}
+ }
++
++// Extends the existing no-output/dealer fixture; inert provider HTTP responses,
++// actual daemon loadCurrentTrack/NewStream and actual Player output admission.
++func TestPC58FailedLoadRetiresActorAndFreezesState(t *testing.T) {
++	for _, mode := range []string{"newstream_initial", "newstream_retained_output", "output_admission_initial"} {
++		t.Run(mode, func(t *testing.T) {
++			ctx := context.Background()
++			log := &librespot.NullLogger{}
++			events, _ := (evtimpl.Impl{}).NewEventManager(log, nil, nil, nil, "")
++			var publications []*connectpb.PutStateRequest
++			metadataRequests, creates, inactive := 0, 0, 0
++			var failedPrepared *contentInertSource
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				if strings.HasSuffix(r.URL.Path, "/inactive") {
++					inactive++
++					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++				}
++				if r.Method == http.MethodPut {
++					var v connectpb.PutStateRequest
++					b, _ := io.ReadAll(r.Body)
++					if err := proto.Unmarshal(b, &v); err == nil {
++						publications = append(publications, &v)
++					}
++					return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++				}
++				metadataRequests++
++				return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header), Request: r}, nil
++			}))
++			path := filepath.Join(t.TempDir(), "pcm.fifo")
++			if err := syscall.Mkfifo(path, 0600); err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			worker, err := player.NewPlayer(&player.Options{Log: log, Spclient: sp, Events: events, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++				creates++
++				if mode == "output_admission_initial" {
++					return nil, ErrAliasConflict
++				}
++				return create()
++			}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			p := pc13ExistingPlayer(t, false)
++			p.player = worker
++			p.state.reset()
++			p.state.device.SelectedAliasId = 1
++			p.app.cfg.DeviceName = "local fixture"
++			p.app.cfg.ZeroconfEnabled = true
++			p.logout = make(chan *AppPlayer, 1)
++			p.sess = &session.Session{}
++			nextSessionField(p.sess, "sp", sp)
++			nextSessionField(p.sess, "events", events)
++			p.spotConnId = "fixture-owner"
++			p.hasInitialConnectState = true
++			p.prefetchTimer = time.NewTimer(time.Hour)
++			defer p.prefetchTimer.Stop()
++			if mode == "newstream_retained_output" {
++				old := &contentInertSource{}
++				if err := worker.SetPrimaryStream(old, true, false); err != nil {
++					t.Fatal(err)
++				}
++				p.primaryStream = &player.Stream{Source: old, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Duration: proto.Int32(300000)})}
++			}
++			track := "spotify:track:0000000000000000000003"
++			req := pc13PlayRequest(t)
++			req.Command.Options.InitiallyPaused = false
++			req.Command.Context = &connectpb.Context{Uri: pc13ContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: track}}}}}
++			if mode == "output_admission_initial" {
++				id, _ := librespot.SpotifyIdFromUri(track)
++				failedPrepared = &contentInertSource{}
++				p.secondaryStream = &player.Stream{Source: failedPrepared, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Gid: id.Id(), Name: proto.String("fixture-track"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture-album"), Date: &metadatapb.Date{}}})}
++			}
++			err = p.handlePlayerCommandWithSpclient(ctx, req, sp)
++			if err == nil {
++				t.Fatal("fixture failed to reach intended load failure")
++			}
++
++			loadFailure := err.Error()
++			if p.state.player.IsPlaying || p.state.player.IsBuffering || p.state.active || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing {
++				t.Fatal("failed committed load retained playing state or actor authority", p.state.player)
++			}
++			if len(publications) != 1 || !publications[0].Device.PlayerState.IsPlaying || !publications[0].Device.PlayerState.IsBuffering {
++				t.Fatal("expected existing pre-effect buffering publication", len(publications))
++			}
++			p.state.player.Timestamp = time.Now().Add(-2 * time.Second).UnixMilli()
++			position := p.state.trackPosition()
++			if position != 0 {
++				t.Fatal("failed position advanced", position)
++			}
++			var next dealer.RequestPayload
++			next.Command.Endpoint = "resume"
++			nextErr := p.handlePlayerCommandWithSpclient(ctx, next, sp)
++			if !errors.Is(nextErr, ErrAliasConflict) {
++				t.Fatal("failed actor admitted later resume", nextErr)
++			}
++			if inactive != 1 {
++				t.Fatal("inactive publication not attempted exactly once", inactive)
++			}
++			if failedPrepared != nil && failedPrepared.closes.Load() != 1 {
++				t.Fatal("unadopted prepared decoder not closed once", failedPrepared.closes.Load())
++			}
++			if len(p.logout) != 1 || <-p.logout != p {
++				t.Fatal("normal logout not requested exactly once")
++			}
++			if err := worker.Pause(); err == nil {
++				t.Fatal("failed actor retained an output")
++			}
++			p.handlePlayerEvent(ctx, &player.Event{Type: player.EventTypePlay})
++			p.handlePlayerEvent(ctx, &player.Event{Type: player.EventTypePause})
++			if p.state.player.IsPlaying || p.state.player.IsPaused || len(publications) != 1 {
++				t.Fatal("queued old event revived failed actor")
++			}
++			if mode == "newstream_retained_output" && creates != 1 {
++				t.Fatal("old worker output retried")
++			}
++
++			// A different authenticated actor can use the normal output owner only
++			// after the failed writer has been stopped. No retry belongs to old p.
++			fresh := pc13ExistingPlayer(t, false)
++			fresh.state.reset()
++			fresh.app = p.app
++			fresh.prodInfo = &ProductInfo{}
++			fresh.sess = p.sess
++			fresh.spotConnId = "fresh-owner"
++			fresh.hasInitialConnectState = true
++			fresh.prefetchTimer = time.NewTimer(time.Hour)
++			defer fresh.prefetchTimer.Stop()
++			nextWorker, err := player.NewPlayer(&player.Options{Log: log, Spclient: sp, Events: events, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++				return fresh.app.withNewOutput(fresh, create)
++			}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer nextWorker.Close()
++			fresh.player = nextWorker
++			id, _ := librespot.SpotifyIdFromUri(track)
++			fresh.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Gid: id.Id(), Name: proto.String("fixture-track"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture-album"), Date: &metadatapb.Date{}}})}
++			req.Command.Options.InitiallyPaused = true
++			if err := fresh.handlePlayerCommandWithSpclient(ctx, req, sp); err != nil {
++				t.Fatal("next fresh explicit command rejected", err)
++			}
++			if fresh.primaryStream == nil || !fresh.state.player.IsPlaying || fresh.state.player.IsBuffering || !fresh.state.player.IsPaused || fresh.app.openedWriterOwner != fresh {
++				t.Fatal("fresh command did not own its real paused FIFO output")
++			}
++			beforeFresh := fresh.primaryStream
++			p.handlePlayerEvent(ctx, &player.Event{Type: player.EventTypePlay})
++			if fresh.primaryStream != beforeFresh || fresh.aliasRetired || fresh.roomVolumeClosing || fresh.app.openedWriterOwner != fresh {
++				t.Fatal("late failed actor event affected fresh owner")
++			}
++			t.Logf("failure=%s; next old resume=%v; stopped=true position=%d; metadata requests=%d output creates=%d; fresh output accepted", loadFailure, nextErr, position, metadataRequests, creates)
++		})
++	}
++}
++
++func TestPC58UnplayableFallbackRetainsContextOrStopsOnce(t *testing.T) {
++	for _, restricted := range []bool{true, false} {
++		for _, success := range []bool{true, false} {
++			name := "unsupported"
++			if restricted {
++				name = "restricted"
++			}
++			if success {
++				name += "_then_valid"
++			} else {
++				name += "_all_unplayable"
++			}
++			t.Run(name, func(t *testing.T) {
++				ctx := context.Background()
++				log := &librespot.NullLogger{}
++				events, _ := (evtimpl.Impl{}).NewEventManager(log, nil, nil, nil, "")
++				first, second := "spotify:track:0000000000000000000003", "spotify:track:0000000000000000000004"
++				media := func(uri string) *metadatapb.Track {
++					id, _ := librespot.SpotifyIdFromUri(uri)
++					return &metadatapb.Track{Gid: id.Id(), Name: proto.String("fixture-track"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture-album"), Date: &metadatapb.Date{}}}
++				}
++				inactive, metadata := 0, 0
++				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++					if strings.HasSuffix(r.URL.Path, "/inactive") {
++						inactive++
++						return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++					}
++					if r.Method == http.MethodPut {
++						return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++					}
++					metadata++
++					b, _ := io.ReadAll(r.Body)
++					var query extmetadatapb.BatchedEntityRequest
++					if err := proto.Unmarshal(b, &query); err != nil {
++						t.Fatal(err)
++					}
++					entity := query.EntityRequest[0]
++					kind := entity.Query[0].ExtensionKind
++					var body proto.Message
++					if kind == extmetadatapb.ExtensionKind_TRACK_V4 {
++						track := media(entity.EntityUri)
++						if restricted {
++							track.Restriction = []*metadatapb.Restriction{{CountryRestriction: &metadatapb.Restriction_CountriesAllowed{CountriesAllowed: ""}}}
++						}
++						body = track
++					} else {
++						body = &audiofilespb.AudioFilesExtensionResponse{}
++					}
++					data, _ := anypb.New(body)
++					raw, _ := proto.Marshal(&extmetadatapb.BatchedExtensionResponse{ExtendedMetadata: []*extmetadatapb.EntityExtensionDataArray{{ExtensionKind: kind, ExtensionData: []*extmetadatapb.EntityExtensionData{{EntityUri: entity.EntityUri, Header: &extmetadatapb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data}}}}})
++					return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(raw)), Header: make(http.Header), Request: r}, nil
++				}))
++				path := filepath.Join(t.TempDir(), "pcm.fifo")
++				if err := syscall.Mkfifo(path, 0600); err != nil {
++					t.Fatal(err)
++				}
++				reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer reader.Close()
++				country := "DK"
++				worker, err := player.NewPlayer(&player.Options{Log: log, Spclient: sp, Events: events, CountryCode: &country, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer worker.Close()
++				p := pc13ExistingPlayer(t, true)
++				p.player = worker
++				p.app.cfg.ZeroconfEnabled = true
++				p.app.cfg.DisableAutoplay = true
++				p.logout = make(chan *AppPlayer, 1)
++				p.sess = &session.Session{}
++				nextSessionField(p.sess, "sp", sp)
++				nextSessionField(p.sess, "events", events)
++				p.spotConnId = "fixture-owner"
++				p.hasInitialConnectState = true
++				p.prodInfo = &ProductInfo{}
++				p.prefetchTimer = time.NewTimer(time.Hour)
++				defer p.prefetchTimer.Stop()
++				list, err := tracks.NewTrackListFromContext(ctx, log, nil, &connectpb.Context{Uri: pc13ContextURI, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: first}, {Uri: second}}}}})
++				if err != nil {
++					t.Fatal(err)
++				}
++				if err := list.TrySeek(ctx, func(*connectpb.ContextTrack) bool { return true }); err != nil {
++					t.Fatal(err)
++				}
++				p.state.tracks = list
++				p.state.player.Track = list.CurrentTrack()
++				p.state.player.Options = &connectpb.ContextPlayerOptions{RepeatingTrack: true}
++				p.state.player.IsPaused = false
++				if success {
++					p.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: librespot.NewMediaFromTrack(media(second))}
++				}
++				hasNext, err := p.advanceNext(ctx, false, true)
++				if success {
++					if err != nil || !hasNext || p.aliasRetired || p.roomVolumeClosing || p.state.tracks != list || p.primaryStream == nil || p.state.player.Track.Uri != second || !p.state.player.IsPlaying || p.state.player.IsBuffering || inactive != 0 || len(p.logout) != 0 {
++						t.Fatal("recoverable skip destroyed context or failed valid successor", hasNext, err)
++					}
++				} else {
++					if err == nil || hasNext || !p.aliasRetired || !p.roomVolumeClosing || p.state.player.IsPlaying || p.state.player.IsBuffering || p.primaryStream != nil || inactive != 1 || len(p.logout) != 1 {
++						t.Fatal("exhausted fallback did not terminalize once", hasNext, err, inactive)
++					}
++				}
++				expected := 1
++				if !restricted {
++					expected = 2
++				}
++				if !success {
++					expected *= 2
++				}
++				if metadata != expected {
++					t.Fatal("unexpected typed metadata attempts", metadata, expected)
++				}
++			})
++		}
++	}
++}
