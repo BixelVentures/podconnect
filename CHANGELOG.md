@@ -1,3 +1,9 @@
+## Control 0.10.20 — account playlist catalogue
+
+- Add the response-only get_user_playlists service for the selected configured Spotify account: at most20 owned or followed playlists from the first page, with explicit coverage and whether more pages exist. Return actual playlist names, URIs and optional Spotify covers; create no DailyMix/daylist or playback authority.
+- Preserve exact account/runtime/owner-epoch guards across OAuth and provider reads, an eight-second/256KiB bound, and no rate-limit retry or redirect following. Existing account permissions and sign-in are unchanged.
+- This Control release pairs with the reviewed PodVoice77/UI catalogue consumer. Speakers remains0.26.43 with byte-identical Native/C source; publication, installation and real catalogue/UI acceptance are separate gates.
+
 ## Speakers 0.26.43 — explicit paused Connect Resume candidate
 
 - Correlate the initial paused observation with its accepted transfer. A fresh authenticated explicit Resume can supply one bounded route credit for the current owner; ordinary Pause, source changes and stale events cancel or refuse it.

@@ -6,6 +6,7 @@ on:
       - "tests/test_*.py"
       - "tests/ha_framework/**"
       - ".github/workflows/verify-ha-control.yaml"
+      - "scripts/publish_control_release.py"
   push:
     branches: [main]
     paths:
@@ -13,6 +14,7 @@ on:
       - "tests/test_*.py"
       - "tests/ha_framework/**"
       - ".github/workflows/verify-ha-control.yaml"
+      - "scripts/publish_control_release.py"
 jobs:
   boundary-tests:
     runs-on: ubuntu-latest
@@ -38,3 +40,28 @@ jobs:
             --workdir /repo --entrypoint python \
             ghcr.io/home-assistant/home-assistant@sha256:56690a89c79a0de98035e1719f8324a92d5859c1192ff45adb0230ea81cb42a5 \
             -B -m unittest discover -s tests/ha_framework -p 'test_*.py' -v
+
+  publish-control:
+    timeout-minutes: 5
+    needs: [boundary-tests, framework-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.boundary-tests.result == 'success' && needs.framework-tests.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: podconnect-control-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Publish exact verified Control version change
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_BEFORE: ${{ github.event.before }}
+        run: python scripts/publish_control_release.py
