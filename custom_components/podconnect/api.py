@@ -70,7 +70,11 @@ class SpotifyApi:
             headers={"Authorization": f"Bearer {token}"},
             params=params or None,
             json=json,
-            **({"allow_redirects": False} if execution_guard is not None else {}),
+            **(
+                {"allow_redirects": False}
+                if execution_guard is not None or async_execution_guard is not None
+                else {}
+            ),
         ) as resp:
             if execution_guard is not None and resp.status != 204:
                 raise SpotifyApiError(
@@ -137,6 +141,23 @@ class SpotifyApi:
         """GET /me/playlists — the user's playlists."""
         data = await self._request("GET", "/me/playlists", params={"limit": limit})
         return (data or {}).get("items", [])
+
+    async def user_playlists(
+        self,
+        limit: int,
+        *,
+        owner_guard: Callable[[], Awaitable[None]],
+    ) -> dict[str, Any]:
+        """Read one bounded first page through this entry's existing OAuth owner."""
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise SpotifyApiError("Invalid playlist limit")
+        return await self._request(
+            "GET",
+            "/me/playlists",
+            params={"limit": limit, "offset": 0},
+            max_bytes=262144,
+            async_execution_guard=owner_guard,
+        )
 
     async def search(
         self,

@@ -937,3 +937,20 @@ prepare_room_queue:
 control_room_queue:
   name: Udfør rummets forberedte køvalg
   description: Brug den samme kommandoidentitet og et kortlivet engangs-ID; ukendt resultat må ikke gentages.
+
+get_user_playlists:
+  name: Read this account's Spotify playlists
+  description: First page of owned or followed playlists from one configured Spotify account. At most20 results; source_has_more explicitly reports additional pages. No playback or generated mixes.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        text:
+    limit:
+      required: false
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 20
+          mode: box
