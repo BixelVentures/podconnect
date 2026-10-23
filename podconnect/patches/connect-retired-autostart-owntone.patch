@@ -1,0 +1,72 @@
+--- a/src/player.c
++++ b/src/player.c
+@@ -2170,7 +2170,6 @@
+ static enum command_state
+ playback_start_id(void *arg, int *retval)
+ {
+-  if (outputs_transport_busy()) { *retval=-1; return COMMAND_END; }
+   struct query_params qp = { .type = Q_ITEMS };
+   struct db_queue_item *queue_item = NULL;
+   union player_arg *cmdarg = arg;
+@@ -2179,6 +2178,16 @@
+   int ret;
+ 
+   *retval = -1;
++
++  if (outputs_transport_busy())
++    {
++      struct media_file_info *mfi = player_state == PLAY_STOPPED ? db_file_fetch_byid(cmdarg->id) : NULL;
++      bool retired_pipe = mfi && mfi->data_kind == DATA_KIND_PIPE && mfi->path
++        && outputs_start_retired_normal_autostart_ready(mfi->path);
++      free_mfi(mfi, 0);
++      if (!retired_pipe)
++        return COMMAND_END;
++    }
+ 
+   if (player_state == PLAY_STOPPED)
+     {
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -227,6 +227,7 @@
+ bool outputs_start_gate_closed(void);
+ bool outputs_start_retired_normal_staging(const char *);
+ bool outputs_start_retired_normal_ready(const char *);
++bool outputs_start_retired_normal_autostart_ready(const char *path);
+ bool outputs_start_retired_stage_reader(void);
+ bool outputs_start_retired_stage_release_for_start(void);
+ bool outputs_start_retired_normal_admit(uint32_t,const char *);
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -90,10 +90,18 @@
+ }
+ static bool start_route_clean_absent(void)
+ {
+-  return !start_active && !start_scope && !outputs_start_source_owned()
+-    && !outputs_start_gate_closed() && !start_journal_fault && !start_startup_quarantine
+-    && !start_retired_reopen_pending && !start_retired_stage_ready
+-    && !start_journal.token[0] && !start_journal.payload;
++  if (start_active || start_scope || outputs_start_source_owned() || outputs_start_gate_closed()
++      || start_journal_fault || start_startup_quarantine || start_retired_reopen_pending
++      || start_retired_stage_ready)
++    return false;
++  if (!start_journal.token[0] && !start_journal.payload)
++    return true;
++  /* A consumed terminal record is a retirement tombstone, not a live START.
++   * Keep its durable proof; normal admission already joined the exact reader
++   * before opening the gate. A newer/unknown record or runtime slot wins. */
++  return start_journal.token[0] && start_journal.payload && start_journal_payload_valid()
++    && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN
++    && start_journal_retirement_reopen_consumed;
+ }
+ static bool start_completed_writer_current(const struct start_slot *s)
+ {
+@@ -276,6 +284,9 @@
+ }
+ bool outputs_start_retired_normal_ready(const char *path)
+ {return start_retired_stage_ready && outputs_start_retired_normal_staging(path);}
++/* Ordinary autostart cannot consume unrelated retained transport custody. */
++bool outputs_start_retired_normal_autostart_ready(const char *path)
++{return !start_active && !transport_custody_busy() && outputs_start_retired_normal_ready(path);}
+ 
+ bool outputs_start_retired_stage_reader(void)
+ {

@@ -1,0 +1,169 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -769,7 +769,7 @@
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct((f->mode==16 || f->mode==17 || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23 || f->mode==24 || f->mode==25) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
++    float mapped=airplay_volume_from_pct((f->mode==16 || (f->mode==17 && f->phase!=4) || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23 || f->mode==24 || f->mode==25) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
+     char expected[64];
+     snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+     if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+@@ -1169,6 +1169,8 @@
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
+   if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
++  if (argc == 2 && !strcmp(argv[1], "--move-retire-live-wire"))
++    { retired_keep_live_slot=true; return start35_wire_case(17); }
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-wire")) return start35_wire_case(17);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-wire")) return start35_wire_case(18);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-wire")) return start35_wire_case(26);
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -32,6 +32,35 @@
+       && outputs_cb_register[callback].cb==start_connected);
+     assert(pb_timer_start()==0);
+   }else assert(player_state==PLAY_PAUSED); /* Normal starvation still recovers. */
++}
++
++/* Exercise the ordinary public command chain on the existing player owner.
++ * The private receiver still validates real SET_PARAMETER and AP2 setup. */
++static bool retired_keep_live_slot;
++struct retired_connect_flow {
++  struct recovery_wire_fixture *fixture;
++  atomic_bool done;
++  int start, prime, selection;
++  bool temporary_busy;
++};
++static void *retired_connect_commands(void *arg)
++{
++  struct retired_connect_flow *flow=arg;
++  uint64_t ids[]={1,2};
++  flow->start=player_playback_start_byid(1);
++  if(flow->start>=0)flow->prime=player_volume_set_connect_recovery(2,35,&flow->temporary_busy);
++  if(flow->start>=0 && flow->prime>=0)flow->selection=player_speaker_set_connect_recovery(ids);
++  atomic_store(&flow->done,true);
++  return NULL;
++}
++static void retired_connect_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct retired_connect_flow *flow=arg;struct timeval soon={0,1000};
++  (void)fd;(void)what;
++  if(atomic_load(&flow->done)){
++    pb_timer_stop();event_base_loopbreak(flow->fixture->base);return;
++  }
++  evtimer_add(flow->fixture->poll,&soon);
+ }
+ 
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+@@ -211,6 +240,7 @@
+   struct input_fifo_identity fd={0};struct timespec deadline;struct media_file_info mfi={0};struct query_params qp={.type=Q_ITEMS};
+   assert(file>=0 && placeholder>=0);close(file);close(placeholder);assert(unlink(fifo)==0 && mkfifo(fifo,0600)==0);
+   assert(evthread_use_pthreads()==0);active_recovery_wire=&f;f.base=event_base_new();assert(f.base);evbase_player=f.base;
++  if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
+   cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
+   cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
+   if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
+@@ -464,24 +494,88 @@
+         && retirement.input_epoch>retirement.admitted_input_epoch && !target->session);
+       assert(!outputs_start_source_owned());
+       assert(start_journal_payload_valid());
+-      struct input_fifo_identity released={0};
+-      assert(input_fifo_stage_release(r->expected_input_path,&released)==0);
+-      start_active=NULL; /* Model loss of all C runtime slots at restart. */
+-      start_journal_startup();
+-      assert(start_retired_reopen_pending && outputs_start_gate_closed()
+-        && !outputs_start_source_owned() && outputs_start_retired_stage_reader());
+-      assert(outputs_retirement_result_get(2,true,retire.retirement_token,&retirement)==0
+-        && retirement.retired_witness && retirement.reader_ready_closed
+-        && retirement.durable_terminal && retirement.gate_closed);
++      if(retired_keep_live_slot){
++        /* Retain the actual old slot; expire only the unrelated temporary
++         * command lease, as required before ordinary normal admission. */
++        transport_custody_expiry.tv_sec=0;
++        assert(!transport_custody_busy() && start_active);
++      }else{
++        struct input_fifo_identity released={0};
++        assert(input_fifo_stage_release(r->expected_input_path,&released)==0);
++        start_active=NULL; /* Model loss of all C runtime slots at restart. */
++        transport_custody_live=false;transport_custody_lost=false;
++        session_stop();status_update(PLAY_STOPPED,LISTENER_PLAYER);
++        start_journal_startup();
++        assert(start_retired_reopen_pending && outputs_start_gate_closed()
++          && !outputs_start_source_owned() && outputs_start_retired_stage_reader());
++        assert(outputs_retirement_result_get(2,true,retire.retirement_token,&retirement)==0
++          && retirement.retired_witness && retirement.reader_ready_closed
++          && retirement.durable_terminal && retirement.gate_closed);
++      }
+       int replacement=open(r->expected_input_path,O_WRONLY|O_NONBLOCK);
+       assert(replacement>=0); /* Real new Native open succeeds before C playback. */
+-      struct db_queue_item *fresh=db_queue_fetch_byitemid(item);
+-      assert(fresh && pb_session_start(fresh,0)>=0);
+-      free_queue_item(fresh,0);
+-      assert(!outputs_start_gate_closed()
++      assert(outputs_start_retired_normal_ready(r->expected_input_path));
++      if(retired_keep_live_slot){
++        struct start_slot *retired_slot=start_active;
++        uint64_t generation=transport_input_generation,input_item=transport_input_item;
++        bool old_selected=old->selected,target_selected=target->selected;
++        int volume=target->volume;union player_arg normal={.id=1};int rejected=0;
++        assert(playback_start_id(&normal,&rejected)==COMMAND_END && rejected<0
++          && outputs_connect_recovery_status(2)==-1 && start_active==retired_slot
++          && outputs_start_gate_closed() && !outputs_start_source_owned()
++          && transport_input_generation==generation && transport_input_item==input_item
++          && old->selected==old_selected && target->selected==target_selected
++          && !old->session && !target->session && target->volume==volume
++          && start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN
++          && !start_journal_retirement_reopen_consumed);
++        close(replacement);
++        puts("PASS retained in-memory retired MOVE slot rejects ordinary by-ID autostart/prime before source, selection, volume or journal mutation");
++        goto cleanup;
++      }
++      union player_arg wrong={.id=2};int denied=0;
++      assert(playback_start_id(&wrong,&denied)==COMMAND_END && denied<0);
++      transport_custody_live=true;clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry);
++      transport_custody_expiry.tv_sec+=30;
++      wrong.id=1;
++      assert(playback_start_id(&wrong,&denied)==COMMAND_END && denied<0);
++      transport_custody_live=false;
++      outputs_device_deselect(old);outputs_device_deselect(target);
++      assert(!old->selected && !target->selected && !old->session && !target->session);
++      if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}pair_cipher_free(f.cipher);f.cipher=NULL;
++      pair_setup_free(f.pair);f.pair=NULL;evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++      f.phase=4;f.volumes=0;f.teardowns=0;
++      player_tick_interval.tv_nsec=50000000;
++      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
++      assert(pb_timer_fd>=0);
++      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
++      assert(pb_timer_ev);
++      cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++      struct retired_connect_flow flow={.fixture=&f,.start=-99,.prime=-99,.selection=-99};
++      pthread_t connect_thread;
++      event_free(f.poll);f.poll=evtimer_new(f.base,retired_connect_poll,&flow);assert(f.poll);
++      assert(!pthread_create(&connect_thread,NULL,retired_connect_commands,&flow));
++      assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++      assert(!f.failed && atomic_load(&flow.done) && !pthread_join(connect_thread,NULL));
++      fprintf(stderr,"retired real command chain: autostart=%d prime35=%d selection=%d volumeWrites=%d\n",flow.start,flow.prime,flow.selection,f.volumes);
++      assert(flow.start>=0 && flow.prime>=0 && flow.selection>=0 && !flow.temporary_busy);
++      assert(!outputs_start_gate_closed() && start_route_clean_absent()
++        && start_journal_retirement_reopen_consumed && !outputs_start_source_owned()
++        && player_state==PLAY_PLAYING && target->selected && target->session
++        && target->state==OUTPUT_STATE_CONNECTED && !old->selected && !old->session
++        && target->volume==35 && f.volumes==1);
++      void *normal_session=target->session;uint64_t normal_epoch=target->session_epoch;
++      uint64_t normal_route=target->route_revision;int normal_volume=target->volume;
++      assert(outputs_start_cancel(completed.token,completed.native_reservation_id,&observed)==0);
++      assert(!outputs_start_gate_closed() && target->selected && target->session==normal_session
++        && target->session_epoch==normal_epoch && target->route_revision==normal_route
++        && target->volume==normal_volume && !old->selected && !old->session
++        && start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN
+         && start_journal_retirement_reopen_consumed && !outputs_start_source_owned());
++      puts("PASS delayed retired MOVE cancel cannot close gate or retire/change fresh normal AP2 route");
++      event_del(f.deadline);commands_base_free(cmdbase);cmdbase=NULL;
++      event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);
+       close(replacement);
+-      puts("PASS actual MOVE two-phase FULL retirement and fresh normal FIFO: old reader/PCM/AP2 drained, durable startup witness, staged FD permits new nonblocking writer, real player source proves reader and consumes reopen before gate");
++      puts("PASS actual MOVE FULL retirement/restart → exact normal autostart public command → Connect prime35 → one real selected AP2 route; missing input/unrelated custody denied; terminal journal retained, no START ownership credit");
+       goto cleanup;
+     }
+     close(writer);writer=-1;
