@@ -1,0 +1,393 @@
+--- a/player/events.go
++++ b/player/events.go
+@@ -19,8 +19,9 @@
+ )
+ 
+ type Event struct {
+-	Type        EventType
+-	OutputEpoch uint64 // Only output-failure events carry the worker's failed output owner.
++	Type               EventType
++	InitialLoadOrdinal uint64 // Only successful primary-load observations carry their caller receipt.
++	OutputEpoch        uint64 // Only output-failure events carry the worker's failed output owner.
+ }
+ 
+ type EventManager interface {
+--- a/player/player.go
++++ b/player/player.go
+@@ -102,10 +102,11 @@
+ }
+ 
+ type playerCmdDataSet struct {
+-	source  librespot.AudioSource
+-	primary bool
+-	paused  bool
+-	drop    bool
++	source             librespot.AudioSource
++	primary            bool
++	initialLoadOrdinal uint64
++	paused             bool
++	drop               bool
+ }
+ 
+ type Options struct {
+@@ -406,9 +407,9 @@
+ 				cmd.resp <- nil
+ 
+ 				if data.paused {
+-					p.ev <- Event{Type: EventTypePause}
++					p.ev <- Event{Type: EventTypePause, InitialLoadOrdinal: data.initialLoadOrdinal}
+ 				} else {
+-					p.ev <- Event{Type: EventTypePlay}
++					p.ev <- Event{Type: EventTypePlay, InitialLoadOrdinal: data.initialLoadOrdinal}
+ 				}
+ 			case playerCmdPlay:
+ 				if out != nil {
+@@ -677,8 +678,21 @@
+ }
+ 
+ func (p *Player) SetPrimaryStream(source librespot.AudioSource, paused, drop bool) error {
++	return p.setPrimaryStream(source, paused, drop, 0)
++}
++
++// The caller receipt identifies only this load's later initial observation.
++// Command acknowledgement and queued event ordering remain unchanged.
++func (p *Player) SetPrimaryStreamObserved(source librespot.AudioSource, paused, drop bool, ordinal uint64) error {
++	if ordinal == 0 || ordinal > 9007199254740991 {
++		return fmt.Errorf("invalid initial load receipt")
++	}
++	return p.setPrimaryStream(source, paused, drop, ordinal)
++}
++
++func (p *Player) setPrimaryStream(source librespot.AudioSource, paused, drop bool, ordinal uint64) error {
+ 	resp := make(chan any)
+-	if !p.sendCommand(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop}, resp: resp}) {
++	if !p.sendCommand(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: true, paused: paused, drop: drop, initialLoadOrdinal: ordinal}, resp: resp}) {
+ 		return fmt.Errorf("player closed")
+ 	}
+ 	result, ok := p.commandResult(resp)
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -30,6 +30,7 @@
+ )
+ 
+ type AppPlayer struct {
++	primaryLoadOrdinal               uint64
+ 	connectRecoveryOrdinal           uint64
+ 	connectRecoverySeen              map[[32]byte]bool
+ 	roomMoveReservation              *moveReservation
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -164,10 +164,11 @@
+ 		p.app.server.Emit(&ApiEvent{
+ 			Type: ApiEventTypePlaying,
+ 			Data: ApiEventDataPlaying{
+-				ContextUri: p.state.player.ContextUri,
+-				Uri:        p.state.player.Track.Uri,
+-				Resume:     false,
+-				PlayOrigin: p.state.playOrigin(),
++				InitialLoadOrdinal: ev.InitialLoadOrdinal,
++				ContextUri:         p.state.player.ContextUri,
++				Uri:                p.state.player.Track.Uri,
++				Resume:             false,
++				PlayOrigin:         p.state.playOrigin(),
+ 			},
+ 		})
+ 	case player.EventTypeResume:
+@@ -183,10 +184,11 @@
+ 		p.app.server.Emit(&ApiEvent{
+ 			Type: ApiEventTypePlaying,
+ 			Data: ApiEventDataPlaying{
+-				ContextUri: p.state.player.ContextUri,
+-				Uri:        p.state.player.Track.Uri,
+-				Resume:     true,
+-				PlayOrigin: p.state.playOrigin(),
++				InitialLoadOrdinal: ev.InitialLoadOrdinal,
++				ContextUri:         p.state.player.ContextUri,
++				Uri:                p.state.player.Track.Uri,
++				Resume:             true,
++				PlayOrigin:         p.state.playOrigin(),
+ 			},
+ 		})
+ 	case player.EventTypePause:
+@@ -209,9 +211,10 @@
+ 		p.app.server.Emit(&ApiEvent{
+ 			Type: ApiEventTypePaused,
+ 			Data: ApiEventDataPaused{
+-				ContextUri: p.state.player.ContextUri,
+-				Uri:        p.state.player.Track.Uri,
+-				PlayOrigin: p.state.playOrigin(),
++				InitialLoadOrdinal: ev.InitialLoadOrdinal,
++				ContextUri:         p.state.player.ContextUri,
++				Uri:                p.state.player.Track.Uri,
++				PlayOrigin:         p.state.playOrigin(),
+ 			},
+ 		})
+ 	case player.EventTypeNotPlaying:
+@@ -424,7 +427,11 @@
+ 	}
+ 
+ 	prepared = p.primaryStream
+-	if err := p.player.SetPrimaryStream(p.primaryStream.Source, paused, drop); err != nil {
++	if p.primaryLoadOrdinal >= 9007199254740991 {
++		return fmt.Errorf("initial load receipt exhausted")
++	}
++	p.primaryLoadOrdinal++
++	if err := p.player.SetPrimaryStreamObserved(p.primaryStream.Source, paused, drop, p.primaryLoadOrdinal); err != nil {
+ 		return fmt.Errorf("failed setting stream for %s: %w", spotId, err)
+ 	}
+ 
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -353,10 +353,11 @@
+ type ApiEventDataVolume ApiResponseVolume
+ 
+ type ApiEventDataPlaying struct {
+-	ContextUri string `json:"context_uri"`
+-	Uri        string `json:"uri"`
+-	Resume     bool   `json:"resume"`
+-	PlayOrigin string `json:"play_origin"`
++	InitialLoadOrdinal uint64 `json:"initial_load_ordinal,omitempty"`
++	ContextUri         string `json:"context_uri"`
++	Uri                string `json:"uri"`
++	Resume             bool   `json:"resume"`
++	PlayOrigin         string `json:"play_origin"`
+ }
+ 
+ type ApiEventDataWillPlay struct {
+@@ -372,9 +373,10 @@
+ }
+ 
+ type ApiEventDataPaused struct {
+-	ContextUri string `json:"context_uri"`
+-	Uri        string `json:"uri"`
+-	PlayOrigin string `json:"play_origin"`
++	InitialLoadOrdinal uint64 `json:"initial_load_ordinal,omitempty"`
++	ContextUri         string `json:"context_uri"`
++	Uri                string `json:"uri"`
++	PlayOrigin         string `json:"play_origin"`
+ }
+ 
+ type ApiEventDataStopped struct {
+--- a/daemon/connect_recovery.go
++++ b/daemon/connect_recovery.go
+@@ -38,7 +38,12 @@
+ 	ordinal := p.connectRecoveryOrdinal
+ 	p.aliasMu.Unlock()
+ 	p.app.log.Infof("connect-recovery native reason=accepted")
+-	p.app.server.Emit(&ApiEvent{Type: "connect_transfer", Data: map[string]any{"id": *alias, "alias_binding": binding, "ordinal": ordinal}})
++	data := map[string]any{"id": *alias, "alias_binding": binding, "ordinal": ordinal}
++	if p.primaryLoadOrdinal != 0 {
++		data["initial_load_ordinal"] = p.primaryLoadOrdinal
++		data["initial_paused"] = p.state.player.IsPaused
++	}
++	p.app.server.Emit(&ApiEvent{Type: "connect_transfer", Data: data})
+ }
+ 
+ // Diagnostics only: never supplies an admission decision or exposes request data.
+--- a/daemon/connect_false_play_test.go
++++ b/daemon/connect_false_play_test.go
+@@ -3,7 +3,9 @@
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"os"
+@@ -16,6 +18,7 @@
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/dealer"
+ 	evtimpl "github.com/devgianlu/go-librespot/events/impl"
++	"github.com/devgianlu/go-librespot/mpris"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -349,3 +352,186 @@
+ 		}
+ 	}
+ }
++
++// A paused transfer and its actual queued worker observation share one load
++// receipt. Older Play/Resume observations remain FIFO-ordered; genuine later
++// Pause has no initial receipt and must remain a cancelling observation.
++func TestPausedConnectInitialReceiptPreservesWorkerOrder(t *testing.T) {
++	for _, choice := range []struct{ prior, cancel bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
++		prior, cancel := choice.prior, choice.cancel
++		t.Run(fmt.Sprintf("prior_play_resume_%t_cancel_%t", prior, cancel), func(t *testing.T) {
++			ctx := context.Background()
++			log := &librespot.NullLogger{}
++			events, _ := (evtimpl.Impl{}).NewEventManager(log, nil, nil, nil, "")
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++			}))
++			path := filepath.Join(t.TempDir(), "pcm.fifo")
++			if err := syscall.Mkfifo(path, 0600); err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			worker, err := player.NewPlayer(&player.Options{Log: log, Spclient: sp, Events: events, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			p := pc13ExistingPlayer(t, false)
++			p.player = worker
++			p.prodInfo = &ProductInfo{}
++			p.app.mpris = mpris.DummyServer{}
++			p.state.reset()
++			p.state.device.SelectedAliasId = 1
++			p.app.cfg.DeviceAliases = []string{"Kitchen"}
++			p.app.cfg.DeviceAliasRoomIDs = []string{"r0"}
++			p.app.cfg.DeviceAliasHomePodIDs = []string{"42"}
++			p.app.cfg.ZeroconfEnabled = true
++			p.initAliasRegistry()
++			p.sess = &session.Session{}
++			nextSessionField(p.sess, "sp", sp)
++			nextSessionField(p.sess, "events", events)
++			p.spotConnId = "fixture-owner"
++			p.hasInitialConnectState = true
++			p.prefetchTimer = time.NewTimer(time.Hour)
++			defer p.prefetchTimer.Stop()
++			if prior {
++				if err = worker.SetPrimaryStreamObserved(&contentInertSource{}, false, false, 1); err != nil {
++					t.Fatal(err)
++				}
++				if err = worker.Play(); err != nil {
++					t.Fatal(err)
++				}
++				p.primaryLoadOrdinal = 1
++			}
++			track := "spotify:track:0000000000000000000003"
++			id, _ := librespot.SpotifyIdFromUri(track)
++			p.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Gid: id.Id(), Name: proto.String("fixture-track"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture-album"), Date: &metadatapb.Date{}}})}
++			state := pc13TransferState()
++			state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: track}
++			state.Playback.IsPaused = true
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: track}}}}
++			req := recoveryRequest()
++			req.Command.Data, err = proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = p.handlePlayerCommandWithSpclient(ctx, req, sp); err != nil {
++				t.Fatal(err)
++			}
++			server := p.app.server.(*aliasTestServer)
++			credit := server.events[len(server.events)-1]
++			data, ok := credit.Data.(map[string]any)
++			if credit.Type != "connect_transfer" || !ok || data["initial_load_ordinal"] != p.primaryLoadOrdinal || data["initial_paused"] != true {
++				t.Fatal("accepted paused transfer missing exact load receipt", credit)
++			}
++			p.aliasMu.Lock()
++			binding := p.aliasBindingLocked()
++			p.aliasMu.Unlock()
++			initialStatus := map[string]any{"active": p.state.active, "paused": p.state.player.IsPaused, "stopped": !p.state.player.IsPlaying, "selected_alias_id": p.state.device.SelectedAliasId, "alias_binding": binding}
++			// Queue genuine user Pause before any of the initial worker events dispatch.
++			var command dealer.RequestPayload
++			command.Command.Endpoint = "pause"
++			if cancel {
++				if err = p.handlePlayerCommandWithSpclient(ctx, command, sp); err != nil {
++					t.Fatal(err)
++				}
++			}
++			count := 1
++			if prior {
++				count = 3
++			}
++			for i := 0; i < count; i++ {
++				select {
++				case event := <-worker.Receive():
++					if i == count-1 {
++						if event.Type != player.EventTypePause || event.InitialLoadOrdinal != p.primaryLoadOrdinal {
++							t.Fatal("current initial observation lost receipt", event)
++						}
++					} else if i == 0 && event.InitialLoadOrdinal != 1 {
++						t.Fatal("prior initial observation lost distinct receipt", event)
++					} else if i == 1 && event.InitialLoadOrdinal != 0 {
++						t.Fatal("ordinary Resume impersonated initial load", event)
++					}
++					p.handlePlayerEvent(ctx, &event)
++				case <-time.After(time.Second):
++					t.Fatal("missing actual FIFO-ordered worker observation")
++				}
++			}
++			last := server.events[len(server.events)-1]
++			paused, ok := last.Data.(ApiEventDataPaused)
++			if last.Type != ApiEventTypePaused || !ok || paused.InitialLoadOrdinal != p.primaryLoadOrdinal || !p.state.player.IsPaused {
++				t.Fatal("initial Pause wire receipt/state wrong", last)
++			}
++			if cancel {
++
++				select {
++				case event := <-worker.Receive():
++					if event.InitialLoadOrdinal != 0 {
++						t.Fatal("genuine Pause impersonated initial load")
++					}
++					p.handlePlayerEvent(ctx, &event)
++				case <-time.After(time.Second):
++					t.Fatal("missing genuine queued Pause")
++				}
++				last = server.events[len(server.events)-1]
++				paused, ok = last.Data.(ApiEventDataPaused)
++				if last.Type != ApiEventTypePaused || !ok || paused.InitialLoadOrdinal != 0 {
++					t.Fatal("genuine Pause lost ordinary cancellation", last)
++				}
++			}
++
++			command.Command.Endpoint = "resume"
++			if err = p.handlePlayerCommandWithSpclient(ctx, command, sp); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case event := <-worker.Receive():
++				if event.InitialLoadOrdinal != 0 {
++					t.Fatal("genuine Resume impersonated load")
++				}
++				p.handlePlayerEvent(ctx, &event)
++			case <-time.After(time.Second):
++				t.Fatal("missing explicit Resume")
++			}
++			if p.state.player.IsPaused || server.events[len(server.events)-1].Type != ApiEventTypePlaying {
++				t.Fatal("explicit Resume failed")
++			}
++			rawWire, marshalErr := json.Marshal(server.events)
++			if marshalErr != nil {
++				t.Fatal(marshalErr)
++			}
++			var wire []struct {
++				Type string         `json:"type"`
++				Data map[string]any `json:"data"`
++			}
++			if err = json.Unmarshal(rawWire, &wire); err != nil {
++				t.Fatal(err)
++			}
++			matchingPause := 0
++			for _, event := range wire {
++				if event.Type == "paused" && event.Data["initial_load_ordinal"] == float64(p.primaryLoadOrdinal) {
++					matchingPause++
++				}
++			}
++			if matchingPause != 1 {
++				t.Fatal("actual JSON initial receipt missing/duplicated", string(rawWire))
++			}
++			if dir := os.Getenv("PC58_CONNECT_TRACE_DIR"); dir != "" {
++				if err = os.MkdirAll(dir, 0700); err != nil {
++					t.Fatal(err)
++				}
++				raw, marshalErr := json.MarshalIndent(map[string]any{"initial_status": initialStatus, "events": server.events}, "", "  ")
++				if marshalErr != nil {
++					t.Fatal(marshalErr)
++				}
++				if err = os.WriteFile(filepath.Join(dir, fmt.Sprintf("prior-%t-cancel-%t.json", prior, cancel)), append(raw, '\n'), 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++		})
++	}
++}

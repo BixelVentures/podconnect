@@ -11,12 +11,16 @@ import (
 const connectRecoveryWindow = 5 * time.Second
 
 type connectRecoveryIntent struct {
-	transport                 glTransportIntent
-	run, phase, aliasRevision uint64
-	ordinal                   uint64
-	alias                     int
-	binding                   *aliasBinding
-	until                     time.Time
+	loadOrdinal                 uint64
+	resumeOrdinal               uint64
+	awaitResume                 bool
+	awaitInitial, initialPaused bool
+	transport                   glTransportIntent
+	run, phase, aliasRevision   uint64
+	ordinal                     uint64
+	alias                       int
+	binding                     *aliasBinding
+	until                       time.Time
 }
 
 func (l *glLive) acceptConnectRecoveryLocked(data map[string]any) {
@@ -29,6 +33,31 @@ func (l *glLive) acceptConnectRecoveryLocked(data map[string]any) {
 		log.Printf("connect-recovery manager reason=event_rejected")
 		return
 	}
+	kind, kindPresent := data["kind"]
+	if kindPresent && kind != "resume" {
+		log.Printf("connect-recovery manager reason=event_rejected")
+		return
+	}
+	resumeOrdinal, resumePresent := numField(data, "resume_ordinal")
+	_, resumeField := data["resume_ordinal"]
+	primaryLoad, primaryPresent := numField(data, "primary_load_ordinal")
+	_, primaryField := data["primary_load_ordinal"]
+	if kind == "resume" && (!resumePresent || resumeOrdinal != ordinal || !primaryPresent ||
+		primaryLoad < 1 || primaryLoad > 9007199254740991 || primaryLoad != math.Trunc(primaryLoad)) {
+		log.Printf("connect-recovery manager reason=event_rejected")
+		return
+	}
+	if kind != "resume" && (resumeField || primaryField) {
+		log.Printf("connect-recovery manager reason=event_rejected")
+		return
+	}
+	loadOrdinal, loadPresent := numField(data, "initial_load_ordinal")
+	_, loadField := data["initial_load_ordinal"]
+	initialPaused, pausedPresent := data["initial_paused"].(bool)
+	if kind == "resume" && loadField || loadField && (!loadPresent || loadOrdinal < 1 || loadOrdinal > 9007199254740991 || loadOrdinal != math.Trunc(loadOrdinal) || !pausedPresent) {
+		log.Printf("connect-recovery manager reason=event_rejected")
+		return
+	}
 	if l.connectRecoverySeen == nil {
 		l.connectRecoverySeen = make(map[string]uint64)
 	}
@@ -38,6 +67,21 @@ func (l *glLive) acceptConnectRecoveryLocked(data map[string]any) {
 	}
 	l.connectRecoverySeen[binding.Incarnation] = uint64(ordinal)
 	l.connectRecovery = &connectRecoveryIntent{run: l.runEpoch, phase: l.phaseEpoch, aliasRevision: l.aliasRevision, alias: int(id), ordinal: uint64(ordinal), binding: copyAliasBinding(binding), until: time.Now().Add(connectRecoveryWindow)}
+	if kind == "resume" {
+		l.connectRecovery.loadOrdinal = uint64(primaryLoad)
+		l.connectRecovery.resumeOrdinal = uint64(resumeOrdinal)
+		l.connectRecovery.awaitResume = true
+		l.st.Paused = false
+		l.wireRevision[0]++
+		l.transportRevision++
+	} else if loadPresent {
+		l.connectRecovery.loadOrdinal = uint64(loadOrdinal)
+		l.connectRecovery.awaitInitial = true
+		l.connectRecovery.initialPaused = initialPaused
+		l.st.Paused = initialPaused
+		l.wireRevision[0]++
+		l.transportRevision++
+	}
 	// This accepted transfer owns the following released bridge ticks too.
 	// Spending/expiring the credit cannot turn a later status poll into authority.
 	l.connectRecoveryFence = l.connectRecovery
@@ -59,7 +103,7 @@ func (l *glLive) consumeConnectRecovery() (*connectRecoveryIntent, bool) {
 		l.connectRecovery = nil
 		return nil, false
 	}
-	if !l.st.Active || l.st.Paused || l.st.Stopped {
+	if c.awaitInitial || c.awaitResume || !l.st.Active || l.st.Paused || l.st.Stopped {
 		return nil, false
 	}
 	current := glTransportIntent{l.runEpoch, l.phaseEpoch, l.aliasRevision, l.transportRevision, l.st.SelAlias}
