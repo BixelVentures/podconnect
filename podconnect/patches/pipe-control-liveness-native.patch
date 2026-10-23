@@ -296,7 +296,7 @@ diff --git a/player/player.go b/player/player.go
  					}
  					var err error
 -					if outputFailurePending {
-+					if outputFailurePending || (data.drop && p.newPausedOutput != nil) {
++					if outputFailurePending || p.newPausedOutput != nil {
  						_ = source.TakeDone()
  						// The old primary still sits in the switching source. A
  						// replacement must not read it before SetPrimary below.
@@ -977,3 +977,52 @@ new file mode 100644
 +		})
 +	}
 +}
+diff --git a/player/output_failure_test.go b/player/output_failure_test.go
+--- a/player/output_failure_test.go
++++ b/player/output_failure_test.go
+@@ -1,6 +1,8 @@
+ package player
+ 
+ import (
++	"context"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"sync"
+@@ -75,11 +77,34 @@
+ 			}
+ 			defer reader.Close()
+ 			var creates atomic.Int32
+-			p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++			var p *Player
++			p, err = NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
+ 				AudioOutputPipe: path, AudioOutputPipeFormat: "s16le",
+ 				WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
+ 					out, err := create()
+-					if creates.Add(1) == 2 {
++					if err != nil {
++						return out, err
++					}
++					created := creates.Add(1)
++					if created == 1 {
++						actual := out.(output.MovePipeOutput)
++						ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++						defer cancel()
++						err = actual.WithStartLock(ctx, func(_ output.PipeIdentity, _ func(bool)) error {
++							if !actual.PausedUnderStartLock() {
++								return fmt.Errorf("first pipe must be born paused before source publication")
++							}
++							return nil
++						})
++						if err != nil {
++							// Only failed old creation needs cancellation: its source-less
++							// reader may already hold the output lock before publication.
++							p.source.CancelRead()
++							_ = out.Close()
++							return nil, err
++						}
++					}
++					if created == 2 {
+ 						// If replacement starts unpaused, this interval lets its
+ 						// goroutine read the failed old primary before SetPrimary.
+ 						time.Sleep(20 * time.Millisecond)
