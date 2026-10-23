@@ -1,0 +1,979 @@
+diff --git a/output/driver-pipe.go b/output/driver-pipe.go
+--- a/output/driver-pipe.go
++++ b/output/driver-pipe.go
+@@ -12,15 +12,20 @@
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
++	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ )
+ 
+ type pipeOutput struct {
+-	startFenced  atomic.Bool
+-	reader       librespot.Float32Reader
+-	file         *os.File
+-	openedWriter MovePipeIdentity
++	startFenced    atomic.Bool
++	controlPending atomic.Bool
++	control        sync.Mutex
++	pendingPCM     []byte
++	pendingErr     error
++	reader         librespot.Float32Reader
++	file           *os.File
++	openedWriter   MovePipeIdentity
+ 
+ 	lock sync.Mutex
+ 	cond *sync.Cond
+@@ -85,11 +90,9 @@
+ 		return nil, fmt.Errorf("failed to open fifo: %w", err)
+ 	}
+ 
+-	// Restore blocking mode now that we are sure we have a reader.
+-	if err := syscall.SetNonblock(int(out.file.Fd()), false); err != nil {
+-		_ = out.file.Close()
+-		return nil, fmt.Errorf("failed to set blocking mode on fifo: %w", err)
+-	}
++	// Keep the original nonblocking descriptor pollable. Control requests can
++	// interrupt a capacity wait without closing the reader or bypassing this
++	// output's writer join.
+ 	info, err := out.file.Stat()
+ 	if err != nil {
+ 		_ = out.file.Close()
+@@ -121,7 +124,7 @@
+ 	for {
+ 		out.lock.Lock()
+ 
+-		for (out.paused || out.startFenced.Load()) && !out.closed {
++		for (out.paused || out.startFenced.Load() || out.controlPending.Load()) && !out.closed {
+ 			out.cond.Wait()
+ 		}
+ 
+@@ -130,83 +133,132 @@
+ 			break
+ 		}
+ 
+-		n, err := out.reader.Read(floats)
+-
+-		// A start fence can be installed while an old network read holds lock.
+-		// No bytes from that delayed read may enter a later input barrier.
+-		if out.startFenced.Load() {
+-			out.paused = true
++		if len(out.pendingPCM) == 0 && out.pendingErr == nil {
++			n, err := out.reader.Read(floats)
++			out.pendingErr = err
++			// START fencing may race an old source read. Its bytes may not cross
++			// the boundary, including a suffix retained by an ordinary Pause.
++			if out.startFenced.Load() {
++				out.pendingPCM = nil
++				out.pendingErr = nil
++				out.paused = true
++				out.lock.Unlock()
++				continue
++			}
++			if !out.externalVolume {
++				volume := out.volume * out.volume
++				for i := 0; i < n; i++ {
++					floats[i] *= volume
++				}
++			}
++			if n > 0 {
++				out.pendingPCM = bytes[:out.transform(floats[:n], bytes)]
++			}
++		}
++		if out.controlPending.Load() {
+ 			out.lock.Unlock()
+ 			continue
+ 		}
+-
+-		// Apply volume.
+-		if !out.externalVolume {
+-			// Map volume (in percent) to what is perceived as linear by
+-			// humans. This is the same as math.Pow(out.volume, 2) but simpler.
+-			volume := out.volume * out.volume
+-
+-			for i := 0; i < n; i++ {
+-				floats[i] *= volume
+-			}
+-		}
+-
+-		if n > 0 {
+-			nn := out.transform(floats[:n], bytes)
+-			_, err := out.file.Write(bytes[:nn])
++		if len(out.pendingPCM) > 0 {
++			n, err := out.file.Write(out.pendingPCM)
++			out.pendingPCM = out.pendingPCM[n:]
+ 			if err != nil {
++				if out.controlPending.Load() && errors.Is(err, os.ErrDeadlineExceeded) {
++					// The command joins this returned write under the same mutex.
++					// Pause retains only its unwritten suffix; Drop/Close discard it.
++					out.lock.Unlock()
++					continue
++				}
+ 				out.err <- err
+ 				out.closed = true
+ 				out.lock.Unlock()
+ 				break
+ 			}
+ 		}
+-
+-		if errors.Is(err, io.EOF) {
+-			// Reached EOF, move to a "paused" state.
++		if errors.Is(out.pendingErr, io.EOF) {
+ 			out.paused = true
+-		} else if err != nil {
+-			// Got some other error. Close the output and report the error.
+-			out.err <- err
++		} else if out.pendingErr != nil {
++			out.err <- out.pendingErr
+ 			out.closed = true
+ 			out.lock.Unlock()
+ 			break
+ 		}
+ 
++		out.pendingErr = nil
+ 		out.lock.Unlock()
+ 	}
+ 
+ 	_ = out.Close()
+ }
+ 
++// A control announces its boundary before joining the audio mutex. Keeping
++// Resume in this same control order prevents it clearing another command's
++// cancellation deadline and allowing a blocked write to start again.
++func (out *pipeOutput) lockControl() error {
++	out.control.Lock()
++	out.controlPending.Store(true)
++	if !out.fileClosed {
++		if err := out.file.SetWriteDeadline(time.Now()); err != nil && !errors.Is(err, os.ErrClosed) {
++			out.controlPending.Store(false)
++			out.control.Unlock()
++			return err
++		}
++	}
++	out.lock.Lock()
++	return nil
++}
++func (out *pipeOutput) unlockControl() error {
++	var err error
++	if !out.fileClosed {
++		err = out.file.SetWriteDeadline(time.Time{})
++	}
++	out.controlPending.Store(false)
++	out.cond.Broadcast()
++	out.lock.Unlock()
++	out.control.Unlock()
++	return err
++}
+ func (out *pipeOutput) Pause() error {
+-	out.lock.Lock()
+-	defer out.lock.Unlock()
+-
++	if err := out.lockControl(); err != nil {
++		return err
++	}
++	if !out.closed {
++		out.paused = true
++	}
++	return out.unlockControl()
++}
++func (out *pipeOutput) Resume() error {
++	if err := out.lockControl(); err != nil {
++		return err
++	}
++	if !out.closed {
++		out.paused = false
++	}
++	return out.unlockControl()
++}
++func (out *pipeOutput) Drop() error {
++	if err := out.lockControl(); err != nil {
++		return err
++	}
++	out.pendingPCM = nil
++	out.pendingErr = nil
++	return out.unlockControl()
++}
++
++// WithSourceChange joins the current writer before discarding its unwritten
++// suffix and mutating the source. Seek preserves the current paused state;
++// source replacement can publish its requested state under this same lock.
++func (out *pipeOutput) WithSourceChange(apply func(func(bool)) error) error {
++	if err := out.lockControl(); err != nil {
++		return err
++	}
+ 	if out.closed {
+-		return nil
+-	}
+-
+-	out.paused = true
+-	out.cond.Signal()
+-	return nil
+-}
+-
+-func (out *pipeOutput) Resume() error {
+-	out.lock.Lock()
+-	defer out.lock.Unlock()
+-
+-	if out.closed {
+-		return nil
+-	}
+-
+-	out.paused = false
+-	out.cond.Signal()
+-	return nil
+-}
+-
+-func (out *pipeOutput) Drop() error {
+-	return nil
++		return errors.Join(fmt.Errorf("pipe output closed"), out.unlockControl())
++	}
++	out.pendingPCM = nil
++	out.pendingErr = nil
++	err := apply(func(paused bool) { out.paused = paused })
++	return errors.Join(err, out.unlockControl())
+ }
+ 
+ func (out *pipeOutput) DelayMs() (int64, error) {
+@@ -228,16 +280,18 @@
+ }
+ 
+ func (out *pipeOutput) Close() error {
+-	out.lock.Lock()
+-	defer out.lock.Unlock()
++	if err := out.lockControl(); err != nil {
++		return err
++	}
+ 	var closeErr error
+ 	if !out.fileClosed && out.file != nil {
+ 		closeErr = out.file.Close()
+ 		out.fileClosed = true
+ 	}
+ 	out.closed = true
+-	out.cond.Signal()
+-	return closeErr
++	out.pendingPCM = nil
++	out.pendingErr = nil
++	return errors.Join(closeErr, out.unlockControl())
+ }
+ 
+ // WithTransportLock is the actual paused-state mutation boundary. Acquiring the
+diff --git a/output/start35.go b/output/start35.go
+--- a/output/start35.go
++++ b/output/start35.go
+@@ -28,6 +28,10 @@
+ 	if out.closed {
+ 		return fmt.Errorf("start pipe closed")
+ 	}
++	if out.startFenced.Load() {
++		out.pendingPCM = nil
++		out.pendingErr = nil
++	}
+ 	info, err := out.file.Stat()
+ 	if err != nil {
+ 		return err
+@@ -37,5 +41,13 @@
+ 		return fmt.Errorf("actual descriptor is not FIFO")
+ 	}
+ 	identity := PipeIdentity{strconv.FormatUint(uint64(stat.Dev), 10), strconv.FormatUint(uint64(stat.Ino), 10), "fifo"}
+-	return apply(identity, func(paused bool) { out.paused = paused; out.startFenced.Store(paused); out.cond.Broadcast() })
++	return apply(identity, func(paused bool) {
++		if paused {
++			out.pendingPCM = nil
++			out.pendingErr = nil
++		}
++		out.paused = paused
++		out.startFenced.Store(paused)
++		out.cond.Broadcast()
++	})
+ }
+diff --git a/player/player.go b/player/player.go
+--- a/player/player.go
++++ b/player/player.go
+@@ -343,7 +343,7 @@
+ 						break
+ 					}
+ 					var err error
+-					if outputFailurePending {
++					if outputFailurePending || (data.drop && p.newPausedOutput != nil) {
+ 						_ = source.TakeDone()
+ 						// The old primary still sits in the switching source. A
+ 						// replacement must not read it before SetPrimary below.
+@@ -365,8 +365,26 @@
+ 					p.log.Debugf("created new output device")
+ 				}
+ 
+-				// set source
+-				source.SetPrimary(data.source)
++				// Pipe source mutation and old-suffix discard share the writer join.
++				if data.drop && p.newPausedOutput != nil {
++					pipe, ok := out.(interface {
++						WithSourceChange(func(func(bool)) error) error
++					})
++					if !ok {
++						cmd.resp <- fmt.Errorf("pipe output lacks source mutation boundary")
++						break
++					}
++					if err := pipe.WithSourceChange(func(setPaused func(bool)) error {
++						setPaused(true) // Existing Pause/Resume below publishes the requested state.
++						source.SetPrimary(data.source)
++						return nil
++					}); err != nil {
++						cmd.resp <- err
++						break
++					}
++				} else {
++					source.SetPrimary(data.source)
++				}
+ 				outputFailurePending = false
+ 				if data.paused {
+ 					if err := out.Pause(); err != nil {
+@@ -380,7 +398,7 @@
+ 					}
+ 				}
+ 
+-				if data.drop {
++				if data.drop && p.newPausedOutput == nil {
+ 					_ = out.Drop()
+ 				}
+ 
+@@ -436,7 +454,16 @@
+ 				p.ev <- Event{Type: EventTypeStop}
+ 			case playerCmdSeek:
+ 				if out != nil {
+-					if err := source.SetPositionMs(cmd.data.(int64)); err != nil {
++					if p.newPausedOutput != nil {
++						pipe, ok := out.(interface {
++							WithSourceChange(func(func(bool)) error) error
++						})
++						if !ok {
++							cmd.resp <- fmt.Errorf("pipe output lacks source mutation boundary")
++							break
++						}
++						cmd.resp <- pipe.WithSourceChange(func(_ func(bool)) error { return source.SetPositionMs(cmd.data.(int64)) })
++					} else if err := source.SetPositionMs(cmd.data.(int64)); err != nil {
+ 						cmd.resp <- err
+ 					} else if err = out.Drop(); err != nil {
+ 						cmd.resp <- err
+diff --git a/output/room_move_close_test.go b/output/room_move_close_test.go
+--- a/output/room_move_close_test.go
++++ b/output/room_move_close_test.go
+@@ -1,7 +1,6 @@
+ package output
+ 
+ import (
+-	"io"
+ 	"os"
+ 	"sync"
+ 	"testing"
+@@ -22,30 +21,23 @@
+ 		out.lock.Lock()
+ 		close(writing)
+ 		_, _ = write.Write(make([]byte, 1024*1024))
++		close(writerDone)
+ 		out.lock.Unlock()
+-		close(writerDone)
+ 	}()
+ 	<-writing
+ 	closeDone := make(chan struct{})
+ 	go func() { _ = out.Close(); close(closeDone) }()
+ 	select {
+ 	case <-closeDone:
+-		t.Fatal("Close returned before actual writer joined")
+-	case <-time.After(20 * time.Millisecond):
++		select {
++		case <-writerDone:
++		default:
++			t.Fatal("Close returned before the actual writer joined")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("Close did not interrupt and join the owned writer")
+ 	}
+-	drainDone := make(chan struct{})
+-	go func() { _, _ = io.Copy(io.Discard, read); close(drainDone) }()
+-	select {
+-	case <-writerDone:
+-	case <-time.After(2 * time.Second):
+-		t.Fatal("writer did not drain")
+-	}
+-	select {
+-	case <-closeDone:
+-	case <-time.After(2 * time.Second):
+-		t.Fatal("Close did not join writer")
+-	}
+-	<-drainDone
++
+ 	if _, err := write.Stat(); err == nil {
+ 		t.Fatal("old writer descriptor remains open")
+ 	}
+diff --git a/output/pipe_liveness_test.go b/output/pipe_liveness_test.go
+new file mode 100644
+--- /dev/null
++++ b/output/pipe_liveness_test.go
+@@ -0,0 +1,302 @@
++package output
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"runtime"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// Extends the existing actual startPipeFixture/full-FIFO setup with the missing
++// no-consumer liveness case using the actual output worker and kernel FIFO.
++func TestPC58KeeperReaderAllowsBoundedCommandLiveness(t *testing.T) {
++	for _, command := range []string{"Pause", "Close"} {
++		t.Run(command, func(t *testing.T) {
++			reader := &startRead{entered: make(chan struct{})}
++			out, read, path := startPipeFixture(t, reader)
++			writer, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			for {
++				_, err = syscall.Write(writer, make([]byte, 4096))
++				if err == syscall.EAGAIN {
++					break
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++			}
++			syscall.Close(writer)
++			if err = out.Resume(); err != nil {
++				t.Fatal(err)
++			}
++			<-reader.entered
++			// Verify the actual worker reached file.Write while the exact FIFO is full.
++			// The retained read descriptor is deliberately open and never consumed here.
++			deadline := time.Now().Add(time.Second)
++			var stack []byte
++			for time.Now().Before(deadline) {
++				dump := make([]byte, 1<<20)
++				n := runtime.Stack(dump, true)
++				for _, goroutine := range bytes.Split(dump[:n], []byte("\n\n")) {
++					if bytes.Contains(goroutine, []byte("(*pipeOutput).outputLoop")) && bytes.Contains(goroutine, []byte("(*File).Write")) {
++						stack = append([]byte(nil), goroutine...)
++					}
++				}
++				if stack != nil {
++					break
++				}
++				time.Sleep(time.Millisecond)
++			}
++			done := make(chan error, 1)
++			go func() {
++				if command == "Pause" {
++					done <- out.Pause()
++				} else {
++					done <- out.Close()
++				}
++			}()
++			returned := false
++			timedOut := false
++			select {
++			case err = <-done:
++				returned = true
++			case <-time.After(200 * time.Millisecond):
++				timedOut = true
++			}
++			// Cleanup only after the no-consumer deadline. Fence prevents another chunk;
++			// draining now releases the same original kernel write and its mutex.
++			out.FenceStart()
++			buffer := make([]byte, 65536)
++			until := time.Now().Add(2 * time.Second)
++			for !returned && time.Now().Before(until) {
++				_, _ = syscall.Read(int(read.Fd()), buffer)
++				select {
++				case err = <-done:
++					returned = true
++				default:
++				}
++				time.Sleep(time.Millisecond)
++			}
++			if !returned {
++				t.Fatal("fixture cleanup could not join command after controlled drain")
++			}
++			if stack == nil {
++				t.Fatal("worker kernel write not observed")
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			fmt.Fprintf(os.Stdout, "%s held FIFO fd=%s reader-open=true reads=%d blocked-stack:\n%s\n", command, out.openedWriter.FD, reader.reads.Load(), stack)
++			// A control request must join without an
++			// external consumer draining the pipe. Cleanup does not erase a failure.
++			if timedOut {
++				t.Error("command exceeded 200ms while keeper reader remained open with no consumer; returned only after controlled drain")
++			}
++		})
++	}
++}
++
++type pc58SingleChunk struct{ reads int }
++
++func (s *pc58SingleChunk) Read(samples []float32) (int, error) {
++	s.reads++
++	if s.reads > 1 {
++		return 0, io.EOF
++	}
++	for i := range samples {
++		samples[i] = 0.25
++	}
++	return len(samples), io.EOF
++}
++func pc58WaitWrite(t *testing.T) {
++	t.Helper()
++	until := time.Now().Add(time.Second)
++	for time.Now().Before(until) {
++		dump := make([]byte, 1<<20)
++		n := runtime.Stack(dump, true)
++		for _, g := range bytes.Split(dump[:n], []byte("\n\n")) {
++			if bytes.Contains(g, []byte("(*pipeOutput).outputLoop")) && bytes.Contains(g, []byte("(*File).Write")) {
++				return
++			}
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Fatal("actual FIFO write did not wait")
++}
++func TestPC58PauseRetainsOnlyUnwrittenSuffixAndFenceDiscardsIt(t *testing.T) {
++	for _, boundary := range []string{"resume", "drop", "start"} {
++		t.Run(boundary, func(t *testing.T) {
++			source := &pc58SingleChunk{}
++			out, read, path := startPipeFixture(t, source)
++			fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			filled := 0
++			for {
++				n, e := syscall.Write(fd, make([]byte, 4096))
++				if n > 0 {
++					filled += n
++				}
++				if e == syscall.EAGAIN {
++					break
++				}
++				if e != nil {
++					t.Fatal(e)
++				}
++			}
++			syscall.Close(fd)
++			freed := make([]byte, 4096)
++			if n, e := syscall.Read(int(read.Fd()), freed); e != nil || n != len(freed) {
++				t.Fatal(n, e)
++			}
++			if err = out.Resume(); err != nil {
++				t.Fatal(err)
++			}
++			pc58WaitWrite(t)
++			if err = out.Pause(); err != nil {
++				t.Fatal(err)
++			}
++			remaining := len(out.pendingPCM)
++			total := 4 * 4096
++			written := total - remaining
++			if remaining <= 0 {
++				t.Fatal("fixture did not interrupt pending PCM")
++			}
++			// Drain only after Pause has joined, then resume with the same real FD.
++			got := make([]byte, 0)
++			buffer := make([]byte, 65536)
++			for {
++				n, e := syscall.Read(int(read.Fd()), buffer)
++				if n > 0 {
++					got = append(got, buffer[:n]...)
++				}
++				if e == syscall.EAGAIN {
++					break
++				}
++				if e != nil {
++					t.Fatal(e)
++				}
++			}
++			filler := filled - len(freed)
++			if len(got) != filler+written {
++				t.Fatal("partial write accounting", len(got), filler, written)
++			}
++			got = got[filler:]
++			before := out.openedWriter
++			switch boundary {
++			case "drop":
++				if err = out.Drop(); err != nil {
++					t.Fatal(err)
++				}
++			case "start":
++				out.FenceStart()
++				if err = out.WithStartLock(context.Background(), func(_ PipeIdentity, pause func(bool)) error { pause(true); return nil }); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if boundary == "start" {
++				err = out.WithStartLock(context.Background(), func(_ PipeIdentity, pause func(bool)) error { pause(false); return nil })
++			} else {
++				err = out.Resume()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			until := time.Now().Add(time.Second)
++			for time.Now().Before(until) {
++				n, e := syscall.Read(int(read.Fd()), buffer)
++				if n > 0 {
++					got = append(got, buffer[:n]...)
++				}
++				if e != nil && e != syscall.EAGAIN {
++					t.Fatal(e)
++				}
++				paused := false
++				if out.lock.TryLock() {
++					paused = out.paused
++					out.lock.Unlock()
++				}
++				if paused {
++					for {
++						n, e := syscall.Read(int(read.Fd()), buffer)
++						if n > 0 {
++							got = append(got, buffer[:n]...)
++						}
++						if e == syscall.EAGAIN {
++							break
++						}
++						if e != nil {
++							t.Fatal(e)
++						}
++					}
++					break
++				}
++				time.Sleep(time.Millisecond)
++			}
++			expected := written
++			if boundary == "resume" {
++				expected = total
++			}
++			if len(got) != expected {
++				t.Fatalf("%s emitted %d bytes, want %d", boundary, len(got), expected)
++			}
++			for i := 0; i < len(got); i += 4 {
++				if !bytes.Equal(got[i:i+4], []byte{0, 0, 128, 62}) {
++					t.Fatal("PCM prefix replayed or corrupted")
++				}
++			}
++			if out.openedWriter != before {
++				t.Fatal("command replaced owned descriptor")
++			}
++			select {
++			case e := <-out.Error():
++				t.Fatal("requested control became output failure", e)
++			default:
++			}
++		})
++	}
++}
++func TestPC58PendingPauseCannotBeClearedByConcurrentResume(t *testing.T) {
++	out, _, _ := startPipeFixture(t, &startRead{})
++	out.lock.Lock()
++	paused := make(chan error, 1)
++	go func() { paused <- out.Pause() }()
++	until := time.Now().Add(time.Second)
++	for !out.controlPending.Load() && time.Now().Before(until) {
++		time.Sleep(time.Millisecond)
++	}
++	if !out.controlPending.Load() {
++		out.lock.Unlock()
++		t.Fatal("pause never announced")
++	}
++	resumed := make(chan error, 1)
++	go func() { resumed <- out.Resume() }()
++	select {
++	case <-resumed:
++		out.lock.Unlock()
++		t.Fatal("Resume crossed pending Pause")
++	default:
++	}
++	out.lock.Unlock()
++	for _, done := range []chan error{paused, resumed} {
++		select {
++		case e := <-done:
++			if e != nil {
++				t.Fatal(e)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("ordered control did not join")
++		}
++	}
++	if err := out.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/output/start35_linux_test.go b/output/start35_linux_test.go
+--- a/output/start35_linux_test.go
++++ b/output/start35_linux_test.go
+@@ -3,14 +3,12 @@
+ package output
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/binary"
+ 	"fmt"
+ 	"io"
+-	"os"
+ 	"runtime"
+-	"strconv"
+-	"strings"
+ 	"syscall"
+ 	"testing"
+ 	"time"
+@@ -68,29 +66,29 @@
+ 	if err = out.Resume(); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	tid := <-reader.tid
+-	// Kernel-visible syscall admission proves the writer passed Read and the
+-	// post-Read fence. A reader-entered notification alone does not prove Write.
+-	syscallPath := fmt.Sprintf("/proc/self/task/%d/syscall", tid)
++	<-reader.tid
++	// The explicitly nonblocking writer now waits in Go's poller. Observe this
++	// exact output's File.Write capacity wait, after the full owned FIFO passed
++	// Read and the post-Read fence; a reader notification alone is insufficient.
+ 	deadline := time.Now().Add(time.Second)
+ 	blocked := false
++	worker := []byte(fmt.Sprintf("(*pipeOutput).outputLoop(%p)", out))
+ 	for time.Now().Before(deadline) {
+-		raw, e := os.ReadFile(syscallPath)
+-		if e != nil {
+-			t.Fatal(e)
+-		}
+-		fields := strings.Fields(string(raw))
+-		if len(fields) > 1 && fields[0] == strconv.Itoa(syscall.SYS_WRITE) {
+-			fd, e := strconv.ParseUint(fields[1], 0, 64)
+-			if e == nil && fd == uint64(out.file.Fd()) {
++		dump := make([]byte, 1<<20)
++		n := runtime.Stack(dump, true)
++		for _, goroutine := range bytes.Split(dump[:n], []byte("\n\n")) {
++			if bytes.Contains(goroutine, worker) && bytes.Contains(goroutine, []byte("(*File).Write")) && bytes.Contains(goroutine, []byte("runtime_pollWait")) {
+ 				blocked = true
+ 				break
+ 			}
+ 		}
++		if blocked {
++			break
++		}
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if !blocked {
+-		t.Fatal("actual native writer was not observed blocked inside kernel Write on exact FIFO fd")
++		t.Fatal("exact owned FIFO writer was not observed waiting inside File.Write")
+ 	}
+ 	out.FenceStart()
+ 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+diff --git a/player/pipe_liveness_test.go b/player/pipe_liveness_test.go
+new file mode 100644
+--- /dev/null
++++ b/player/pipe_liveness_test.go
+@@ -0,0 +1,196 @@
++package player
++
++import (
++	"io"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
++)
++
++type replacementPCM struct {
++	reads   atomic.Int32
++	entered chan struct{}
++}
++
++func (s *replacementPCM) Read(samples []float32) (int, error) {
++	if s.reads.Add(1) == 1 {
++		close(s.entered)
++		for i := range samples {
++			samples[i] = 0.5
++		}
++		return len(samples), io.EOF
++	}
++	return 0, io.EOF
++}
++func (*replacementPCM) PositionMs() int64         { return 0 }
++func (*replacementPCM) SetPositionMs(int64) error { return nil }
++
++type replacementOutput struct {
++	output.Output
++	next    *replacementPCM
++	dropped bool
++	bad     bool
++}
++
++func (o *replacementOutput) WithSourceChange(apply func(func(bool)) error) error {
++	return o.Output.(interface {
++		WithSourceChange(func(func(bool)) error) error
++	}).WithSourceChange(func(setPaused func(bool)) error {
++		if o.next != nil {
++			o.bad = o.next.reads.Load() != 0
++			o.dropped = true
++		}
++		return apply(setPaused)
++	})
++}
++func (o *replacementOutput) Drop() error {
++	if o.next != nil {
++		o.bad = o.next.reads.Load() != 0
++		o.dropped = true
++	}
++	return o.Output.Drop()
++}
++func (o *replacementOutput) Resume() error {
++	err := o.Output.Resume()
++	// Force the former Resume-before-Drop ordering to expose a consumed new
++	// chunk. The corrected caller drops while still paused, so never waits here.
++	if o.next != nil && !o.dropped {
++		select {
++		case <-o.next.entered:
++		case <-time.After(time.Second):
++		}
++	}
++	return err
++}
++func TestPipeReplacementDropsOldSuffixBeforeReadingNewSource(t *testing.T) {
++	var actual *replacementOutput
++	path := queueFIFO(t)
++	p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		out, err := create()
++		if err != nil {
++			return nil, err
++		}
++		actual = &replacementOutput{Output: out}
++		return actual, nil
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	if err = p.SetPrimaryStream(&queueEOFSource{1}, true, false); err != nil {
++		t.Fatal(err)
++	}
++	next := &replacementPCM{entered: make(chan struct{})}
++	actual.next = next
++	if err = p.SetPrimaryStream(next, false, true); err != nil {
++		t.Fatal(err)
++	}
++	if actual.bad || !actual.dropped {
++		t.Fatal("new source consumed before old suffix was discarded")
++	}
++	select {
++	case <-next.entered:
++	case <-time.After(time.Second):
++		t.Fatal("replacement never resumed")
++	}
++	fd, e := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer syscall.Close(fd)
++	got := make([]byte, 0)
++	buffer := make([]byte, 8192)
++	until := time.Now().Add(time.Second)
++	for len(got) < 8192 && time.Now().Before(until) {
++		n, e := syscall.Read(fd, buffer)
++		if n > 0 {
++			got = append(got, buffer[:n]...)
++		}
++		if e != nil && e != syscall.EAGAIN {
++			t.Fatal(e)
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if len(got) != 8192 {
++		t.Fatalf("first replacement chunk lost: got %d bytes", len(got))
++	}
++	for i := 0; i < len(got); i += 2 {
++		if got[i] != 0 || got[i+1] != 64 {
++			t.Fatal("old or corrupted PCM crossed source replacement")
++		}
++	}
++
++}
++
++type seekPCM struct {
++	reads   atomic.Int32
++	seeked  atomic.Bool
++	entered chan struct{}
++	after   chan struct{}
++}
++
++func (s *seekPCM) Read(samples []float32) (int, error) {
++	if s.reads.Add(1) == 1 {
++		close(s.entered)
++	}
++	if s.seeked.Load() {
++		select {
++		case <-s.after:
++		default:
++			close(s.after)
++		}
++	}
++	for i := range samples {
++		samples[i] = 0.25
++	}
++	return len(samples), nil
++}
++func (*seekPCM) PositionMs() int64           { return 0 }
++func (s *seekPCM) SetPositionMs(int64) error { s.seeked.Store(true); return nil }
++func TestPipeSeekPreservesPausedStateAndDoesNotWaitForConsumer(t *testing.T) {
++	for _, paused := range []bool{true, false} {
++		t.Run(map[bool]string{true: "paused", false: "playing"}[paused], func(t *testing.T) {
++			p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: queueFIFO(t), AudioOutputPipeFormat: "s16le", ExternalVolume: true})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer p.Close()
++			source := &seekPCM{entered: make(chan struct{}), after: make(chan struct{})}
++			if err = p.SetPrimaryStream(source, paused, true); err != nil {
++				t.Fatal(err)
++			}
++			if !paused {
++				select {
++				case <-source.entered:
++				case <-time.After(time.Second):
++					t.Fatal("active source did not read")
++				}
++			}
++			done := make(chan error, 1)
++			go func() { done <- p.SeekMs(500) }()
++			select {
++			case err = <-done:
++				if err != nil {
++					t.Fatal(err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("seek blocked without FIFO consumer")
++			}
++			if paused {
++				if source.reads.Load() != 0 {
++					t.Fatal("paused seek read or resumed source")
++				}
++			} else {
++				select {
++				case <-source.after:
++				case <-time.After(time.Second):
++					t.Fatal("playing seek lost resumed output state")
++				}
++			}
++		})
++	}
++}
