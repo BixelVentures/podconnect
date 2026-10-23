@@ -112,11 +112,17 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-atomic-init-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/connect-atomic-init-owntone.patch"
           git apply "$patch_dir/connect-atomic-init-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-retired-autostart-owntone.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/connect-retired-autostart-owntone.patch"
+          git apply "$patch_dir/connect-retired-autostart-owntone.patch"
           # Fixture-only macro scope; no production OwnTone source or Docker image change.
           fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
           git apply --check "$fixture_dir/airplay-callback-owner-db-save.patch"
           git apply "$fixture_dir/airplay-callback-owner-db-save.patch"
+          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-retired-autostart-ci.sha256" | sha256sum -c -
+          git apply --check "$fixture_dir/connect-retired-autostart-ci.patch"
+          git apply "$fixture_dir/connect-retired-autostart-ci.patch"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -143,6 +149,8 @@ jobs:
           sudo -n src/outputs_attention_owner --deployed-uid-proc
           sudo -n src/airplay_callback_owner --queue-wire
           sudo -n src/airplay_callback_owner --queue-connect-wire
+          sudo -n src/airplay_callback_owner --move-retire-wire
+          sudo -n src/airplay_callback_owner --move-retire-live-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire

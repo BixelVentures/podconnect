@@ -128,6 +128,8 @@ COPY patches/connect-closed-prior-owntone.patch /patches/connect-closed-prior-ow
 COPY patches/connect-closed-prior-owntone.sha256 /patches/connect-closed-prior-owntone.sha256
 COPY patches/connect-atomic-init-owntone.patch /patches/connect-atomic-init-owntone.patch
 COPY patches/connect-atomic-init-owntone.sha256 /patches/connect-atomic-init-owntone.sha256
+COPY patches/connect-retired-autostart-owntone.patch /patches/connect-retired-autostart-owntone.patch
+COPY patches/connect-retired-autostart-owntone.sha256 /patches/connect-retired-autostart-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -177,6 +179,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-atomic-init-owntone.sha256 \
   && git apply --check /patches/connect-atomic-init-owntone.patch \
   && git apply /patches/connect-atomic-init-owntone.patch \
+  && sha256sum -c /patches/connect-retired-autostart-owntone.sha256 \
+  && git apply --check /patches/connect-retired-autostart-owntone.patch \
+  && git apply /patches/connect-retired-autostart-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

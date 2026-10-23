@@ -1,3 +1,9 @@
+## Speakers 0.26.42 — terminal START continuation candidate
+
+- Carry the existing retired-known FIFO reader permission through ordinary by-ID Connect autostart after C restart and the exact fresh-input/route-prime join. Retained in-memory START slots remain refused.
+- Preserve the durable journal, current owner and route checks, nonterminal/unknown quarantine, and unrelated custody or attention refusals. Control remains 0.10.19.
+- This candidate is held for final C regression results, independent review and the actual Green journal branch. Publication, installation and audible playback are not established.
+
 ## 0.26.41
 
 - Failed track loads now retire their exact playback owner and stop the false advancing playback state. Restricted or unsupported tracks still use the existing bounded skip to the next playable track.
