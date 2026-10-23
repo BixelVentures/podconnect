@@ -1,0 +1,19 @@
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -451,10 +451,14 @@
+   if (device->prevent_playback) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: playback_prevented\n"); return -1; }
+   if (outputs_transport_busy()) {
+     DPRINTF(E_LOG, L_PLAYER,"Connect recovery denied: transport_busy\n");
+-    if (!start_route_clean_absent()) return -1;
++    /* A fresh canonical retired reader is waiting for actual PCM/autostart.
++     * This is only pre-effect busy, never staging or clean absence authority. */
++    bool retired_wait=outputs_start_retired_normal_autostart_ready(NULL);
++    if (!start_route_clean_absent() && !retired_wait) return -1;
+     for (scan=outputs_device_list;scan;scan=scan->next)
+       if (scan->busy || scan->attention_lease || scan->attention_retiring_session
+-          || scan->attention_restart_pending || scan->attention_restoring) return -1;
++          || scan->attention_restart_pending || scan->attention_restoring
++          || (retired_wait && scan->session)) return -1;
+     return -2;
+   }
+   if (!start_route_clean_absent()) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: start_not_clean_absent\n"); return -1; }

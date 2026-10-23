@@ -1,0 +1,447 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -353,6 +353,7 @@
+ type ApiEventDataVolume ApiResponseVolume
+ 
+ type ApiEventDataPlaying struct {
++	ResumeOrdinal      uint64 `json:"resume_ordinal,omitempty"`
+ 	InitialLoadOrdinal uint64 `json:"initial_load_ordinal,omitempty"`
+ 	ContextUri         string `json:"context_uri"`
+ 	Uri                string `json:"uri"`
+diff --git a/daemon/connect_false_play_test.go b/daemon/connect_false_play_test.go
+--- a/daemon/connect_false_play_test.go
++++ b/daemon/connect_false_play_test.go
+@@ -535,3 +535,220 @@
+ 		})
+ 	}
+ }
++
++// Same actual dealer/worker/FIFO adapter as the paused transfer regression.
++// The resume operation receipt is distinct from its primary-load receipt.
++func TestExplicitConnectResumeAuthorityUsesActualWorkerReceipt(t *testing.T) {
++	for _, mode := range []string{"accepted", "zero_alias", "duplicate", "system", "wrong_alias", "wrong_session", "cancelled", "unready", "queued_initial", "genuine_pause", "zero_message", "missing_sender", "generic_play", "conflicting_aliases", "quarantined", "retired_after_ack", "source_changed_after_ack"} {
++		t.Run(mode, func(t *testing.T) {
++			ctx := context.Background()
++			log := &librespot.NullLogger{}
++			events, _ := (evtimpl.Impl{}).NewEventManager(log, nil, nil, nil, "")
++			var afterACK func()
++			sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				if afterACK != nil {
++					afterACK()
++				}
++				return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++			}))
++			path := filepath.Join(t.TempDir(), "pcm.fifo")
++			if err := syscall.Mkfifo(path, 0600); err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			worker, err := player.NewPlayer(&player.Options{Log: log, Spclient: sp, Events: events, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			p := pc13ExistingPlayer(t, false)
++			p.player = worker
++			p.prodInfo = &ProductInfo{}
++			p.app.mpris = mpris.DummyServer{}
++			p.state.reset()
++			p.state.device.SelectedAliasId = 1
++			p.app.cfg.DeviceAliases = []string{"Kitchen"}
++			p.app.cfg.DeviceAliasRoomIDs = []string{"r0"}
++			p.app.cfg.DeviceAliasHomePodIDs = []string{"42"}
++			p.app.cfg.ZeroconfEnabled = true
++			p.initAliasRegistry()
++			p.sess = &session.Session{}
++			nextSessionField(p.sess, "sp", sp)
++			nextSessionField(p.sess, "events", events)
++			p.spotConnId = "fixture-owner"
++			p.hasInitialConnectState = true
++			p.prefetchTimer = time.NewTimer(time.Hour)
++			defer p.prefetchTimer.Stop()
++			track := "spotify:track:0000000000000000000003"
++			id, _ := librespot.SpotifyIdFromUri(track)
++			p.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Gid: id.Id(), Name: proto.String("fixture-track"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture-album"), Date: &metadatapb.Date{}}})}
++			state := pc13TransferState()
++			state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: track}
++			state.Playback.IsPaused = true
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: track}}}}
++			req := recoveryRequest()
++			req.Command.Data, err = proto.Marshal(state)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err = p.handlePlayerCommandWithSpclient(ctx, req, sp); err != nil {
++				t.Fatal(err)
++			}
++
++			p.hasSpotConnId, p.hasInitialConnectState = true, true
++			p.playbackReadyCh = make(chan struct{})
++			close(p.playbackReadyCh)
++			server := p.app.server.(*aliasTestServer)
++			binding := p.aliasBinding()
++			initialStatus := map[string]any{"active": true, "paused": true, "stopped": false, "selected_alias_id": 1, "alias_binding": binding}
++			var resume dealer.RequestPayload
++			resume.MessageId = 8
++			resume.SentByDeviceId = "controller"
++			resume.Command.Endpoint = "resume"
++			resume.Command.SessionId = p.state.player.SessionId
++			commandCtx := ctx
++			shouldGrant := true
++			switch mode {
++			case "zero_message":
++				resume.MessageId = 0
++				shouldGrant = false
++			case "missing_sender":
++				resume.SentByDeviceId = ""
++				shouldGrant = false
++			case "generic_play":
++				shouldGrant = false
++			case "conflicting_aliases":
++				one, two := uint32(1), uint32(2)
++				resume.TargetAliasId, resume.Command.TargetAliasId = &one, &two
++				shouldGrant = false
++			case "quarantined":
++				p.roomContentQuarantined = true
++				shouldGrant = false
++			case "retired_after_ack":
++				afterACK = func() { p.aliasMu.Lock(); p.aliasRetired = true; p.aliasMu.Unlock() }
++				shouldGrant = false
++			case "source_changed_after_ack":
++				afterACK = func() { p.primaryLoadOrdinal++ }
++				shouldGrant = false
++			case "zero_alias":
++				zero := uint32(0)
++				resume.TargetAliasId = &zero
++			case "system":
++				resume.Command.Options.SystemInitiated = true
++				shouldGrant = false
++			case "wrong_alias":
++				other := uint32(2)
++				resume.TargetAliasId = &other
++				shouldGrant = false
++			case "wrong_session":
++				resume.Command.Options.SessionId = "not-current"
++				shouldGrant = false
++			case "cancelled":
++				var cancel context.CancelFunc
++				commandCtx, cancel = context.WithCancel(ctx)
++				cancel()
++				shouldGrant = false
++			case "unready":
++				p.hasInitialConnectState = false
++				shouldGrant = false
++			}
++			if mode != "queued_initial" {
++				select {
++				case event := <-worker.Receive():
++					p.handlePlayerEvent(ctx, &event)
++				case <-time.After(time.Second):
++					t.Fatal("missing initial observation")
++				}
++			}
++			before := len(server.events)
++			if mode == "generic_play" {
++				err = p.play(ctx)
++			} else {
++				err = p.handlePlayerCommandWithSpclient(commandCtx, resume, sp)
++			}
++			grants := 0
++			var ordinal uint64
++			for _, event := range server.events[before:] {
++				if data, ok := event.Data.(map[string]any); ok && event.Type == "connect_transfer" && data["kind"] == "resume" {
++					grants++
++					ordinal, _ = data["resume_ordinal"].(uint64)
++					if data["primary_load_ordinal"] != p.primaryLoadOrdinal || data["ordinal"] != ordinal || ordinal == 0 {
++						t.Fatal("uncorrelated Resume grant", data)
++					}
++				}
++			}
++			if shouldGrant && (err != nil || grants != 1) {
++				t.Fatal("fresh authenticated Resume missing", err, grants)
++			}
++			if !shouldGrant && grants != 0 {
++				t.Fatal("invalid/non-user Resume minted authority")
++			}
++			if !shouldGrant {
++				return
++			}
++			if mode == "duplicate" {
++				// The same command is refused even though playback has already resumed.
++				if err = p.handlePlayerCommandWithSpclient(ctx, resume, sp); err == nil {
++					t.Fatal("duplicate command accepted")
++				}
++				if len(server.events) != before+1 {
++					t.Fatal("duplicate emitted authority")
++				}
++			}
++			if mode == "genuine_pause" {
++				var pause dealer.RequestPayload
++				pause.Command.Endpoint = "pause"
++				if err = p.handlePlayerCommandWithSpclient(ctx, pause, sp); err != nil {
++					t.Fatal(err)
++				}
++			}
++			if mode == "queued_initial" {
++				select {
++				case event := <-worker.Receive():
++					if event.InitialLoadOrdinal != p.primaryLoadOrdinal || event.ResumeOrdinal != 0 {
++						t.Fatal("old initial receipt changed", event)
++					}
++					p.handlePlayerEvent(ctx, &event)
++				case <-time.After(time.Second):
++					t.Fatal("missing queued old initial")
++				}
++			}
++			select {
++			case event := <-worker.Receive():
++				if event.Type != player.EventTypeResume || event.ResumeOrdinal != ordinal || event.InitialLoadOrdinal != 0 {
++					t.Fatal("wrong Resume operation receipt", event)
++				}
++				p.handlePlayerEvent(ctx, &event)
++			case <-time.After(time.Second):
++				t.Fatal("missing exact Resume observation")
++			}
++			if mode == "genuine_pause" {
++				select {
++				case event := <-worker.Receive():
++					if event.Type != player.EventTypePause || event.ResumeOrdinal != 0 {
++						t.Fatal("Pause impersonated Resume")
++					}
++					p.handlePlayerEvent(ctx, &event)
++				case <-time.After(time.Second):
++					t.Fatal("missing genuine Pause")
++				}
++			}
++			if dir := os.Getenv("PC58_RESUME_TRACE_DIR"); dir != "" {
++				if err = os.MkdirAll(dir, 0700); err != nil {
++					t.Fatal(err)
++				}
++				raw, marshalErr := json.MarshalIndent(map[string]any{"initial_status": initialStatus, "events": server.events}, "", "  ")
++				if marshalErr != nil {
++					t.Fatal(marshalErr)
++				}
++				if err = os.WriteFile(filepath.Join(dir, mode+".json"), raw, 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++		})
++	}
++}
+diff --git a/daemon/connect_recovery.go b/daemon/connect_recovery.go
+--- a/daemon/connect_recovery.go
++++ b/daemon/connect_recovery.go
+@@ -1,6 +1,7 @@
+ package daemon
+ 
+ import (
++	"context"
+ 	"crypto/sha256"
+ 	"fmt"
+ 	"github.com/devgianlu/go-librespot/dealer"
+@@ -81,3 +82,101 @@
+ 		return "ledger_capacity"
+ 	}
+ }
++
++// Only the authenticated dealer command path calls this method. An absent/zero
++// request alias means the proved current binding, never a positional fallback.
++// Generic REST/MPRIS/worker observations continue through play(ctx) without credit.
++func (p *AppPlayer) handleExplicitConnectResume(ctx context.Context, req dealer.RequestPayload) error {
++	p.app.log.Infof("connect-recovery native reason=resume_received")
++	if req.MessageId == 0 {
++		p.app.log.Infof("connect-recovery native reason=resume_no_credit_zero_id")
++	}
++	if !req.Command.Options.SystemInitiated && !req.Command.PlayOptions.SystemInitiated &&
++		req.SentByDeviceId != "" && len(req.SentByDeviceId) <= 160 && req.MessageId != 0 {
++		key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", req.SentByDeviceId, req.MessageId)))
++		p.aliasMu.Lock()
++		duplicate := p.connectRecoverySeen[key]
++		p.aliasMu.Unlock()
++		if duplicate {
++			return ErrAliasConflict
++		}
++	}
++	if req.Command.Options.SystemInitiated || req.Command.PlayOptions.SystemInitiated ||
++		req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 || req.MessageId == 0 ||
++		p.state == nil || p.state.player == nil || p.state.device == nil ||
++		!p.state.active || !p.state.player.IsPaused || p.primaryStream == nil ||
++		p.primaryLoadOrdinal == 0 || !p.playbackReady() {
++		p.commitPlayerCommand(req)
++		return p.play(ctx)
++	}
++	state, playerState, deviceState := p.state, p.state.player, p.state.device
++	worker, session, stream := p.player, p.sess, p.primaryStream
++	load, connection := p.primaryLoadOrdinal, p.spotConnId
++	selected, sessionID, contextURI := deviceState.SelectedAliasId, playerState.SessionId, playerState.ContextUri
++	if selected == 0 || connection == "" || sessionID == "" || contextURI == "" || worker == nil || worker.Closed() || session == nil {
++		return ErrAliasConflict
++	}
++	for _, alias := range []*uint32{req.TargetAliasId, req.Command.TargetAliasId} {
++		if alias != nil && *alias != 0 && *alias != selected {
++			return ErrAliasConflict
++		}
++	}
++	for _, requested := range []string{req.Command.SessionId, req.Command.Options.SessionId} {
++		if requested != "" && requested != sessionID {
++			return ErrAliasConflict
++		}
++	}
++	p.aliasMu.Lock()
++	binding := p.aliasBindingLocked()
++	revision := p.aliasRevision
++	key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", req.SentByDeviceId, req.MessageId)))
++	if p.aliasRetired || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted ||
++		p.roomMoveQuarantined || p.roomContentQuarantined || binding == nil || !binding.Ready || binding.RoomID == "" ||
++		int(selected) > len(p.app.cfg.DeviceAliases) || p.connectRecoveryOrdinal >= 9007199254740991 ||
++		p.connectRecoverySeen[key] || len(p.connectRecoverySeen) >= 1024 {
++		p.aliasMu.Unlock()
++		return ErrAliasConflict
++	}
++	if p.connectRecoverySeen == nil {
++		p.connectRecoverySeen = make(map[[32]byte]bool)
++	}
++	// Reserve before dispatch. Failure/duplicate can never reuse this operation
++	// receipt, but reservation alone publishes no route authority.
++	p.connectRecoverySeen[key] = true
++	p.connectRecoveryOrdinal++
++	ordinal := p.connectRecoveryOrdinal
++	p.aliasMu.Unlock()
++	current := func() bool {
++		if ctx.Err() != nil || !p.playbackReady() || p.state != state || p.state.player != playerState ||
++			p.state.device != deviceState || p.player != worker || worker.Closed() || p.sess != session ||
++			p.primaryStream != stream || p.primaryLoadOrdinal != load || p.spotConnId != connection ||
++			playerState.SessionId != sessionID || playerState.ContextUri != contextURI {
++			return false
++		}
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		now := p.aliasBindingLocked()
++		return !p.aliasRetired && !p.aliasRevisionExhausted && !p.roomTransportGenerationExhausted &&
++			!p.roomMoveQuarantined && !p.roomContentQuarantined && p.aliasRevision == revision && deviceState.SelectedAliasId == selected &&
++			now != nil && *now == *binding
++	}
++	if !current() {
++		return ErrAliasConflict
++	}
++	p.commitPlayerCommand(req)
++	if !current() {
++		return ErrAliasConflict
++	}
++	if err := p.playObserved(ctx, ordinal); err != nil {
++		return err
++	}
++	if !current() || playerState.IsPaused {
++		return ErrAliasConflict
++	}
++	p.app.log.Infof("connect-recovery native reason=resume_accepted")
++	p.app.server.Emit(&ApiEvent{Type: "connect_transfer", Data: map[string]any{
++		"kind": "resume", "id": selected, "alias_binding": binding, "ordinal": ordinal,
++		"resume_ordinal": ordinal, "primary_load_ordinal": load,
++	}})
++	return nil
++}
+diff --git a/daemon/controls.go b/daemon/controls.go
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -165,6 +165,7 @@
+ 			Type: ApiEventTypePlaying,
+ 			Data: ApiEventDataPlaying{
+ 				InitialLoadOrdinal: ev.InitialLoadOrdinal,
++				ResumeOrdinal:      ev.ResumeOrdinal,
+ 				ContextUri:         p.state.player.ContextUri,
+ 				Uri:                p.state.player.Track.Uri,
+ 				Resume:             false,
+@@ -185,6 +186,7 @@
+ 			Type: ApiEventTypePlaying,
+ 			Data: ApiEventDataPlaying{
+ 				InitialLoadOrdinal: ev.InitialLoadOrdinal,
++				ResumeOrdinal:      ev.ResumeOrdinal,
+ 				ContextUri:         p.state.player.ContextUri,
+ 				Uri:                p.state.player.Track.Uri,
+ 				Resume:             true,
+@@ -546,6 +548,10 @@
+ }
+ 
+ func (p *AppPlayer) play(ctx context.Context) error {
++	return p.playObserved(ctx, 0)
++}
++
++func (p *AppPlayer) playObserved(ctx context.Context, ordinal uint64) error {
+ 	if p.primaryStream == nil {
+ 		return fmt.Errorf("no primary stream")
+ 	}
+@@ -557,7 +563,7 @@
+ 		return fmt.Errorf("failed seeking before play: %w", err)
+ 	}
+ 
+-	if err := p.player.Play(); err != nil {
++	if err := p.player.PlayObserved(ordinal); err != nil {
+ 		return fmt.Errorf("failed starting playback: %w", err)
+ 	}
+ 
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -284,7 +284,7 @@
+ 	p.app.log.Debugf("handling %s player command from %s", req.Command.Endpoint, req.SentByDeviceId)
+ 
+ 	// Preparation failure must retain the previous command and output owner.
+-	if req.Command.Endpoint != "play" && (req.Command.Endpoint != "transfer" || len(req.Command.Data) == 0) {
++	if req.Command.Endpoint != "play" && req.Command.Endpoint != "resume" && (req.Command.Endpoint != "transfer" || len(req.Command.Data) == 0) {
+ 		p.commitPlayerCommand(req)
+ 	}
+ 
+@@ -311,7 +311,7 @@
+ 	case "pause":
+ 		return p.pause(ctx)
+ 	case "resume":
+-		return p.play(ctx)
++		return p.handleExplicitConnectResume(ctx, req)
+ 	case "seek_to":
+ 		var position int64
+ 		if req.Command.Relative == "current" {
+diff --git a/player/events.go b/player/events.go
+--- a/player/events.go
++++ b/player/events.go
+@@ -20,6 +20,7 @@
+ 
+ type Event struct {
+ 	Type               EventType
++	ResumeOrdinal      uint64 // Only a successful explicitly observed Play carries this caller receipt.
+ 	InitialLoadOrdinal uint64 // Only successful primary-load observations carry their caller receipt.
+ 	OutputEpoch        uint64 // Only output-failure events carry the worker's failed output owner.
+ }
+diff --git a/player/player.go b/player/player.go
+--- a/player/player.go
++++ b/player/player.go
+@@ -417,7 +417,8 @@
+ 						cmd.resp <- err
+ 					} else {
+ 						cmd.resp <- nil
+-						p.ev <- Event{Type: EventTypeResume}
++						ordinal, _ := cmd.data.(uint64)
++						p.ev <- Event{Type: EventTypeResume, ResumeOrdinal: ordinal}
+ 					}
+ 				} else {
+ 					cmd.resp <- fmt.Errorf("no output device for playback")
+@@ -611,8 +612,13 @@
+ }
+ 
+ func (p *Player) Play() error {
++	return p.PlayObserved(0)
++}
++
++// PlayObserved correlates only this successful Resume observation to its caller.
++func (p *Player) PlayObserved(ordinal uint64) error {
+ 	resp := make(chan any, 1)
+-	if !p.sendCommand(playerCmd{typ: playerCmdPlay, resp: resp}) {
++	if !p.sendCommand(playerCmd{typ: playerCmdPlay, data: ordinal, resp: resp}) {
+ 		return fmt.Errorf("player closed")
+ 	}
+ 	result, ok := p.commandResult(resp)

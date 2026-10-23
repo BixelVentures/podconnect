@@ -1,3 +1,9 @@
+## Speakers 0.26.43 — explicit paused Connect Resume candidate
+
+- Correlate the initial paused observation with its accepted transfer. A fresh authenticated explicit Resume can supply one bounded route credit for the current owner; ordinary Pause, source changes and stale events cancel or refuse it.
+- Preserve no-effect temporary busy while the exact fresh retired FIFO reader awaits actual PCM. The production watcher must admit that reader before volume35 and current-room selection can construct the route. No pre-PCM selection or automatic Play is introduced.
+- Keep Control 0.10.19, existing deadlines, unknown-owner quarantine and the reviewed42 terminal continuation. Software regressions and source composition do not establish publication, installation or audible HomePod acceptance.
+
 ## Speakers 0.26.42 — terminal START continuation candidate
 
 - Carry the existing retired-known FIFO reader permission through ordinary by-ID Connect autostart after C restart and the exact fresh-input/route-prime join. Retained in-memory START slots remain refused.

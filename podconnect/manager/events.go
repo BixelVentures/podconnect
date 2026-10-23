@@ -303,7 +303,48 @@ func (l *glLive) applySourceEvent(source glSource, typ string, data map[string]a
 }
 
 func (l *glLive) applyEventLocked(typ string, data map[string]any) {
-	if typ == "paused" || typ == "stopped" || typ == "inactive" || typ == "not_playing" || typ == "selected_alias" {
+	initialObservation := false
+	if c := l.connectRecovery; c != nil && c.resumeOrdinal != 0 && (typ == "playing" || typ == "paused") {
+		load, validLoad := numField(data, "initial_load_ordinal")
+		_, loadPresent := data["initial_load_ordinal"]
+		ordinal, valid := numField(data, "resume_ordinal")
+		_, present := data["resume_ordinal"]
+		switch {
+		case loadPresent && validLoad && load >= 1 && load <= float64(c.loadOrdinal) && load == math.Trunc(load) && !present:
+			return // The explicit newer Resume supersedes any queued initial-load observation.
+		case loadPresent:
+			l.connectRecovery = nil
+		case present && (!valid || ordinal < 1 || ordinal > 9007199254740991 || ordinal != math.Trunc(ordinal)):
+			l.connectRecovery = nil
+		case present && uint64(ordinal) < c.resumeOrdinal:
+			return
+		case present && uint64(ordinal) == c.resumeOrdinal && typ == "playing" && data["resume"] == true:
+			if !c.awaitResume {
+				return
+			}
+			c.awaitResume = false
+		case present:
+			l.connectRecovery = nil
+		}
+	} else if c := l.connectRecovery; c != nil && c.loadOrdinal != 0 && (typ == "playing" || typ == "paused") {
+		ordinal, valid := numField(data, "initial_load_ordinal")
+		_, present := data["initial_load_ordinal"]
+		switch {
+		case present && (!valid || ordinal < 1 || ordinal > 9007199254740991 || ordinal != math.Trunc(ordinal)):
+			l.connectRecovery = nil // Malformed provenance cannot preserve authority.
+		case present && uint64(ordinal) < c.loadOrdinal:
+			return // An older load cannot change this transfer's transport truth.
+		case present && uint64(ordinal) == c.loadOrdinal && (typ == "paused") == c.initialPaused:
+			if !c.awaitInitial {
+				return
+			}
+			c.awaitInitial = false
+			initialObservation = true
+		case present:
+			l.connectRecovery = nil // Newer/different load is not this accepted transfer.
+		}
+	}
+	if (typ == "paused" && !initialObservation) || typ == "stopped" || typ == "inactive" || typ == "not_playing" || typ == "selected_alias" {
 		if l.connectRecovery != nil {
 			log.Printf("connect-recovery manager reason=event_cancelled")
 		}

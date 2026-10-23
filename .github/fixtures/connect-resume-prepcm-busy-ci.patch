@@ -1,0 +1,151 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1169,6 +1169,8 @@
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
+   if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
++  if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
++    { retired_resume_wait=true; return start35_wire_case(17); }
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-live-wire"))
+     { retired_keep_live_slot=true; return start35_wire_case(17); }
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-wire")) return start35_wire_case(17);
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -36,7 +36,8 @@
+ 
+ /* Exercise the ordinary public command chain on the existing player owner.
+  * The private receiver still validates real SET_PARAMETER and AP2 setup. */
+-static bool retired_keep_live_slot;
++static bool retired_keep_live_slot,retired_resume_wait;
++extern struct input_definition input_pipe;
+ struct retired_connect_flow {
+   struct recovery_wire_fixture *fixture;
+   atomic_bool done;
+@@ -61,6 +62,73 @@
+     pb_timer_stop();event_base_loopbreak(flow->fixture->base);return;
+   }
+   evtimer_add(flow->fixture->poll,&soon);
++}
++
++struct retired_resume_flow {
++  struct recovery_wire_fixture *fixture;
++  atomic_bool done;
++  bool temporary,select_route;
++  int prime,selection;
++};
++static void *retired_resume_prime(void *arg)
++{
++  struct retired_resume_flow *flow=arg;uint64_t ids[]={1,2};
++  flow->prime=player_volume_set_connect_recovery(2,35,&flow->temporary);
++  if(flow->prime>=0 && flow->select_route)flow->selection=player_speaker_set_connect_recovery(ids);
++  atomic_store(&flow->done,true);return NULL;
++}
++static void *retired_resume_input_close(void *arg)
++{struct retired_resume_flow *flow=arg;input_deinit();atomic_store(&flow->done,true);return NULL;}
++struct retired_resume_wait {
++  struct retired_resume_flow flow;
++  pthread_t thread;
++  struct timespec began;
++  const char *saved_payload;
++  int writer,phase,base_volume;
++  uint64_t base_revision,route_revision,input_generation;
++};
++static void retired_resume_wait_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct retired_resume_wait *wait=arg;struct recovery_wire_fixture *f=wait->flow.fixture;
++  struct timeval soon={0,1000};struct timespec now;char pcm[4096]={0};
++  (void)fd;(void)what;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
++  if(wait->phase==0){
++    assert(outputs_start_gate_closed() && start_retired_reopen_pending
++      && !start_journal_retirement_reopen_consumed && !outputs_start_source_owned()
++      && !strcmp(start_journal.payload,wait->saved_payload) && !start_route_clean_absent()
++      && !f->device->selected && !f->device->session && !airplay_sessions
++      && f->volumes==0 && player_state==PLAY_STOPPED && f->device->volume==wait->base_volume
++      && f->device->base_revision==wait->base_revision && f->device->route_revision==wait->route_revision
++      && transport_input_generation==wait->input_generation);
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)<0);
++    long elapsed=(now.tv_sec-wait->began.tv_sec)*1000+(now.tv_nsec-wait->began.tv_nsec)/1000000;
++    if(elapsed>5200){
++      assert(!pthread_create(&wait->thread,NULL,retired_resume_prime,&wait->flow));wait->phase=1;
++    }
++  }else if(wait->phase==1 && atomic_load(&wait->flow.done)){
++    assert(!pthread_join(wait->thread,NULL));
++    fprintf(stderr,"explicit Resume prePCM prime=%d temporary=%d\n",wait->flow.prime,wait->flow.temporary);
++    assert(wait->flow.prime<0 && wait->flow.temporary && !f->device->selected
++      && !f->device->session && outputs_start_gate_closed()
++      && !start_journal_retirement_reopen_consumed && !strcmp(start_journal.payload,wait->saved_payload)
++      && f->device->volume==wait->base_volume && f->device->base_revision==wait->base_revision
++      && f->device->route_revision==wait->route_revision && transport_input_generation==wait->input_generation);
++    assert(write(wait->writer,pcm,sizeof(pcm))==(ssize_t)sizeof(pcm));wait->phase=2;
++  }else if(wait->phase==2 && player_state==PLAY_PLAYING && !outputs_start_gate_closed()){
++    pb_timer_stop(); /* Route proof, no unwanted private test PCM. */
++    wait->flow.temporary=false;wait->flow.select_route=true;atomic_store(&wait->flow.done,false);
++    assert(!pthread_create(&wait->thread,NULL,retired_resume_prime,&wait->flow));wait->phase=3;
++  }else if(wait->phase==3 && atomic_load(&wait->flow.done)){
++    assert(!pthread_join(wait->thread,NULL) && wait->flow.prime>=0 && wait->flow.selection>=0
++      && !wait->flow.temporary && f->device->selected && f->device->session
++      && f->device->state==OUTPUT_STATE_CONNECTED && f->device->volume==35 && f->volumes==1
++      && !outputs_start_gate_closed() && start_journal_retirement_reopen_consumed
++      && start_route_clean_absent());
++    event_base_loopbreak(f->base);return;
++  }else if(wait->phase==4 && atomic_load(&wait->flow.done)){
++    event_base_loopbreak(f->base);return;
++  }
++  evtimer_add(f->poll,&soon);
+ }
+ 
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+@@ -502,6 +570,11 @@
+       }else{
+         struct input_fifo_identity released={0};
+         assert(input_fifo_stage_release(r->expected_input_path,&released)==0);
++        if(retired_resume_wait){
++          cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++          input_pipe.deinit();cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",true);
++          assert(input_pipe.init()==0); /* Actual pipe watcher, same drained input owner. */
++        }
+         start_active=NULL; /* Model loss of all C runtime slots at restart. */
+         transport_custody_live=false;transport_custody_lost=false;
+         session_stop();status_update(PLAY_STOPPED,LISTENER_PLAYER);
+@@ -549,7 +622,40 @@
+       assert(pb_timer_fd>=0);
+       pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
+       assert(pb_timer_ev);
+-      cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++      if(!cmdbase)cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++      if(retired_resume_wait){
++        assert(outputs_connect_recovery_status(2)==-2 && !outputs_connect_recovery_available(2));
++#define RETIRED_WAIT_DENY(flag) do { flag=true;assert(outputs_connect_recovery_status(2)==-1);flag=false; } while(0)
++        RETIRED_WAIT_DENY(target->busy);RETIRED_WAIT_DENY(old->attention_restart_pending);
++        RETIRED_WAIT_DENY(old->attention_restoring);RETIRED_WAIT_DENY(start_journal_fault);
++        RETIRED_WAIT_DENY(start_startup_quarantine);
++#undef RETIRED_WAIT_DENY
++        old->attention_lease=1;assert(outputs_connect_recovery_status(2)==-1);old->attention_lease=0;
++        old->attention_retiring_session=old;assert(outputs_connect_recovery_status(2)==-1);old->attention_retiring_session=NULL;
++        atomic_store(&start_owned_latch,true);assert(outputs_connect_recovery_status(2)==-1);atomic_store(&start_owned_latch,false);
++        start_active=start_find(completed.token);assert(start_active && outputs_connect_recovery_status(2)==-1);start_active=NULL;
++        char *canonical=start_journal.payload;start_journal.payload="{}";
++        assert(outputs_connect_recovery_status(2)==-1);start_journal.payload=canonical;
++        transport_custody_live=true;clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry);transport_custody_expiry.tv_sec+=30;
++        assert(outputs_connect_recovery_status(2)==-1);transport_custody_live=false;
++        assert(outputs_connect_recovery_status(2)==-2);
++        struct retired_resume_wait wait={.flow={.fixture=&f,.prime=-99,.selection=-99},
++          .writer=replacement,.saved_payload=strdup(start_journal.payload),.base_volume=target->volume,
++          .base_revision=target->base_revision,.route_revision=target->route_revision,.input_generation=transport_input_generation};
++        assert(wait.saved_payload && !clock_gettime(CLOCK_MONOTONIC,&wait.began));
++        struct timeval resume_bound={10,0};
++        event_free(f.poll);f.poll=evtimer_new(f.base,retired_resume_wait_poll,&wait);assert(f.poll);
++        assert(!evtimer_add(f.deadline,&resume_bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++        assert(!f.failed && wait.phase==3 && target->selected && target->session);
++        puts("PASS >5s paused zeroPCM causes zero flags/base/session; explicit Resume prePCM prime is typed no-effect busy; real EV_READ/by-ID42 opens journal then retry primes35/selects one actual AP2 route");
++        free((char *)wait.saved_payload);
++        wait.phase=4;atomic_store(&wait.flow.done,false);
++        assert(!pthread_create(&wait.thread,NULL,retired_resume_input_close,&wait.flow));
++        assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++        assert(!f.failed && atomic_load(&wait.flow.done) && !pthread_join(wait.thread,NULL));input_ready=false;
++        commands_base_free(cmdbase);cmdbase=NULL;event_del(f.deadline);
++        event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);close(replacement);goto cleanup;
++      }
+       struct retired_connect_flow flow={.fixture=&f,.start=-99,.prime=-99,.selection=-99};
+       pthread_t connect_thread;
+       event_free(f.poll);f.poll=evtimer_new(f.base,retired_connect_poll,&flow);assert(f.poll);

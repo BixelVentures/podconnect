@@ -83,6 +83,10 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/pipe-control-liveness-native.patch" \
   && git apply --check "/patches/connect-load-failure-native.patch" \
   && git apply "/patches/connect-load-failure-native.patch" \
+  && git apply --check "/patches/connect-paused-load-receipt-native.patch" \
+  && git apply "/patches/connect-paused-load-receipt-native.patch" \
+  && git apply --check "/patches/connect-explicit-resume-native.patch" \
+  && git apply "/patches/connect-explicit-resume-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -130,6 +134,8 @@ COPY patches/connect-atomic-init-owntone.patch /patches/connect-atomic-init-ownt
 COPY patches/connect-atomic-init-owntone.sha256 /patches/connect-atomic-init-owntone.sha256
 COPY patches/connect-retired-autostart-owntone.patch /patches/connect-retired-autostart-owntone.patch
 COPY patches/connect-retired-autostart-owntone.sha256 /patches/connect-retired-autostart-owntone.sha256
+COPY patches/connect-resume-prepcm-busy-owntone.patch /patches/connect-resume-prepcm-busy-owntone.patch
+COPY patches/connect-resume-prepcm-busy-owntone.sha256 /patches/connect-resume-prepcm-busy-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -182,6 +188,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-retired-autostart-owntone.sha256 \
   && git apply --check /patches/connect-retired-autostart-owntone.patch \
   && git apply /patches/connect-retired-autostart-owntone.patch \
+  && sha256sum -c /patches/connect-resume-prepcm-busy-owntone.sha256 \
+  && git apply --check /patches/connect-resume-prepcm-busy-owntone.patch \
+  && git apply /patches/connect-resume-prepcm-busy-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
