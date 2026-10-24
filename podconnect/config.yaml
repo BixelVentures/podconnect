@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.26.45"
+version: "0.26.46"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -11,6 +11,7 @@ arch:
 init: false              # the Debian base image's s6-overlay is PID 1
 startup: application
 boot: manual
+timeout: 70              # outer stop budget; normal exit returns immediately
 host_network: true       # required: Spotify Connect + AirPlay discovery (mDNS) need the LAN
 host_dbus: false         # we run our own dbus + avahi inside the container
 watchdog: "tcp://[HOST]:3689"   # auto-restart the add-on if OwnTone's API stops responding

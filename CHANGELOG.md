@@ -1,3 +1,10 @@
+## Speakers 0.26.46 — current-owner restart and first transfer (candidate)
+
+- Admit ordinary Connect routing only from the current fresh transfer credit; preserve no-write state before a transfer and the existing owner/namespace guards.
+- Compose the reviewed Native initial prepared-stream bootstrap and App.Close writer/decoder JOIN with ordered manager Native-before-C shutdown and pair replacement; one unpublished cumulative overlay retains the first32 stable patches.
+- Bound manager teardown inside55s, s6 manager kill at60s and outer Home Assistant stop at70s; successful cleanup returns immediately, with no added playback or speech wait.
+- Preserve unknown journal quarantine, current-owner admission and Control0.10.21. C20 production stays unchanged; source/fixture checks, official CI, install and physical acceptance remain separate.
+
 ## Speakers 0.26.45 — acknowledge current pause without transport feedback
 
 - Acknowledge an exact consumed ordinary bound Pause without granting protected START resource retention; preserve current route, custody, expiry and unknown-owner guards.

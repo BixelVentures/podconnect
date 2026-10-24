@@ -7,7 +7,8 @@ import (
 )
 
 func TestConnectRecoveryDiagnosticsFiniteAndClosed(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	var out bytes.Buffer
 	previous := log.Writer()
@@ -70,7 +71,8 @@ func TestConnectRecoveryCancellationLoggedOnce(t *testing.T) {
 	}
 }
 func TestConnectRecoveryOwnershipChangeHasTerminalPhase(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	var out bytes.Buffer
 	previous := log.Writer()

@@ -87,6 +87,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/connect-paused-load-receipt-native.patch" \
   && git apply --check "/patches/connect-explicit-resume-native.patch" \
   && git apply "/patches/connect-explicit-resume-native.patch" \
+  && git apply --check "/patches/connect-prepared-start-shutdown-native.patch" \
+  && git apply "/patches/connect-prepared-start-shutdown-native.patch" \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 

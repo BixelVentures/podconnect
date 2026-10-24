@@ -31,8 +31,34 @@ func announceConnect(t *testing.T, f *releasedStartFixture, ordinal float64, loa
 	l.applySourceEvent(source, "connect_transfer", data)
 	return source
 }
+
+// Older recovery fixtures must supply the same owner-addressed read as production.
+func installConnectRouteRead(t *testing.T, f *releasedStartFixture, owner *roomTransportIdentity, route *outputTransportIdentity) {
+	t.Helper()
+	old := roomTransportRPC
+	t.Cleanup(func() { roomTransportRPC = old })
+	roomTransportRPC = func(_ context.Context, _, method, path string, body []byte) ([]byte, error) {
+		switch {
+		case path == "/status":
+			return []byte(fmt.Sprintf(`{"username":"native-user","device_id":%q}`, f.id)), nil
+		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
+		case path == "/api/outputs/42/transport/bound-state":
+			var supplied struct {
+				Owner roomTransportIdentity `json:"native_owner"`
+			}
+			if json.Unmarshal(body, &supplied) != nil || supplied.Owner != *owner {
+				t.Fatal("unbound C state read")
+			}
+			return nil, fmt.Errorf("HTTP409: unselected ordinary output has no bound identity")
+		}
+		return nil, fmt.Errorf("unexpected read %s %s", method, path)
+	}
+}
+
 func TestExplicitConnectRecoveryOneShot(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	old := http.DefaultTransport
 	http.DefaultTransport = startTransport(func(r *http.Request) (*http.Response, error) {
@@ -55,7 +81,8 @@ func TestExplicitConnectRecoveryOneShot(t *testing.T) {
 func TestExplicitConnectRecoveryInvalidations(t *testing.T) {
 	for _, mode := range []string{"no_event", "poll", "old_source", "reseed_changed", "paused", "expired", "failed_prime", "superseded_during_read", "superseded_during_prime", "attention"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			f.selected = false
 			l := &f.rt.live
 			if mode != "no_event" && mode != "poll" {
@@ -110,7 +137,8 @@ func TestExplicitConnectRecoveryInvalidations(t *testing.T) {
 	}
 }
 func TestConnectRecoveryConsumedTransportOwnerCannotChange(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	l := &f.rt.live
 	announceConnect(t, f, 1)
 	credit, ok := l.consumeConnectRecovery()
@@ -146,7 +174,8 @@ func temporaryBusyReply() *http.Response {
 	return &http.Response{StatusCode: http.StatusConflict, Header: http.Header{"X-Podconnect-Recovery": []string{"temporary-busy-no-effect-v1"}}, Body: io.NopCloser(strings.NewReader(""))}
 }
 func TestExplicitConnectRecoveryBusyKeepsSameCreditUntilDrain(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	announceConnect(t, f, 1)
 	original := f.rt.live.connectRecovery
@@ -178,9 +207,10 @@ func TestExplicitConnectRecoveryBusyKeepsSameCreditUntilDrain(t *testing.T) {
 	}
 }
 func TestExplicitConnectRecoveryBusyInvalidatedBeforeNextTick(t *testing.T) {
-	for _, mode := range []string{"expiry", "paused", "source", "alias", "transport", "attention", "released"} {
+	for _, mode := range []string{"expiry", "paused", "source", "alias", "transport", "attention"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			f.selected = false
 			announceConnect(t, f, 1)
 			calls := interceptRecoveryPrime(t, func(_ *http.Request) *http.Response { return temporaryBusyReply() })
@@ -199,18 +229,12 @@ func TestExplicitConnectRecoveryBusyInvalidatedBeforeNextTick(t *testing.T) {
 				l.mu.Lock()
 				l.transportRevision++
 				l.mu.Unlock()
-			case "released":
-				_ = os.Remove(releasedPath(f.room))
 			}
 			var att *attention
 			if mode == "attention" {
 				att = &attention{nativeBusy: true}
 			}
 			tryExplicitConnectRecovery(f.room, l, att)
-			if mode == "released" {
-				_ = os.WriteFile(releasedPath(f.room), []byte("1"), 0600)
-				tryExplicitConnectRecovery(f.room, l, nil)
-			}
 			if *calls != 1 || len(f.effects) != 0 || f.selected || !fileExists(releasedPath(f.room)) {
 				t.Fatal("stale busy replay", *calls, f.effects)
 			}
@@ -220,7 +244,8 @@ func TestExplicitConnectRecoveryBusyInvalidatedBeforeNextTick(t *testing.T) {
 func TestExplicitConnectRecoveryOnlyExactBusyResponseMayRemainPending(t *testing.T) {
 	for _, mode := range []string{"500", "untyped409", "wrongheader", "duplicateheader", "timeout_after_send", "start_owner"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			f.selected = false
 			announceConnect(t, f, 1)
 			previous := http.DefaultTransport
@@ -256,7 +281,8 @@ func TestExplicitConnectRecoveryOnlyExactBusyResponseMayRemainPending(t *testing
 	}
 }
 func TestExplicitConnectRecoveryNewTransferCannotRestoreOldCredit(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	announceConnect(t, f, 1)
 	old := f.rt.live.connectRecovery
@@ -275,7 +301,7 @@ func TestExplicitConnectRecoveryNewTransferCannotRestoreOldCredit(t *testing.T) 
 func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 	mode := os.Getenv("PC33_CONNECT_BRIDGE_CHILD")
 	if mode == "" {
-		for _, m := range []string{"unknown", "expired_busy", "pause_resume", "fresh_ordinal", "busy_drain", "paused_handoff", "paused_user_cancel", "resume_late", "resume_queued", "resume_cancel", "resume_unknown", "resume_busy"} {
+		for _, m := range []string{"bound_selected_observation", "stopped_bound_transfer", "idle_bound_transfer", "completed_start", "unknown", "expired_busy", "pause_resume", "fresh_ordinal", "busy_drain", "paused_handoff", "paused_user_cancel", "resume_late", "resume_queued", "resume_cancel", "resume_unknown", "resume_busy"} {
 			t.Run(m, func(t *testing.T) {
 				limit := 6 * time.Second
 				if strings.HasPrefix(m, "resume_") {
@@ -297,10 +323,21 @@ func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 		return
 	}
 	f, _, owner, route := releasedRoomRouteFixture(t)
-	f.selected = false
+	f.selected = mode == "completed_start" || mode == "bound_selected_observation"
+	if mode == "completed_start" {
+		f.volume = 35
+	}
 	status := f.rt.live.Get()
 	status.VolPct = 35
+	if mode == "idle_bound_transfer" || mode == "stopped_bound_transfer" {
+		status.Active = mode == "stopped_bound_transfer"
+		status.Stopped = mode == "stopped_bound_transfer"
+		_ = os.Remove(releasedPath(f.room))
+	}
 	f.rt.live.set(status)
+	if mode == "bound_selected_observation" {
+		_ = os.Remove(releasedPath(f.room))
+	}
 	// Optional joined execution uses untouched JSON emitted by the real Native
 	// dealer/worker/FIFO case in this same candidate; no event/identity rewrites.
 	type wireEvent struct {
@@ -389,16 +426,19 @@ func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 			f.rt.live.applyEvent("playing", map[string]any{"initial_load_ordinal": float64(1)})
 			f.rt.live.applyEvent("playing", nil)
 		}
-	} else {
+	} else if mode != "idle_bound_transfer" && mode != "stopped_bound_transfer" && mode != "bound_selected_observation" {
 		announceConnect(t, f, 1)
 	}
-	var primes, selections, connectPrimes, preselectionPrimes atomic.Int32
+	var primes, selections, connectPrimes, preselectionPrimes, allWrites atomic.Int32
 	var permit atomic.Bool
-	if mode == "paused_handoff" || mode == "paused_user_cancel" {
+	if mode == "paused_handoff" || mode == "paused_user_cancel" || (mode == "idle_bound_transfer" || mode == "stopped_bound_transfer") {
 		permit.Store(true)
 	}
 	previous := http.DefaultTransport
 	http.DefaultTransport = startTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet {
+			allWrites.Add(1)
+		}
 		if r.Method == "PUT" && r.URL.Path == "/api/player/volume" {
 			primes.Add(1)
 			if r.URL.Query().Get("recovery") == "connect" {
@@ -442,12 +482,33 @@ func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
 			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
 		case path == "/api/outputs/42/transport/bound-state":
-			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, false, true})
+			if mode != "completed_start" {
+				return nil, fmt.Errorf("HTTP409: no current selected bound output")
+			}
+			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, true, false})
 		default:
 			return nil, fmt.Errorf("unexpected native endpoint %s", path)
 		}
 	}
 	go roomBridge(f.room, &boolFlag{}, &f.rt.live, &attention{})
+	if mode == "bound_selected_observation" {
+		time.Sleep(650 * time.Millisecond)
+		if allWrites.Load() != 0 {
+			t.Fatal("bound observed route issued a write", allWrites.Load())
+		}
+		os.Exit(0)
+	}
+	if mode == "idle_bound_transfer" || mode == "stopped_bound_transfer" {
+		time.Sleep(650 * time.Millisecond)
+		if allWrites.Load() != 0 {
+			t.Fatal("idle bound alias issued a write", allWrites.Load())
+		}
+		active := f.rt.live.Get()
+		active.Active = true
+		active.Stopped = false
+		f.rt.live.set(active)
+		announceConnect(t, f, 1)
+	}
 	if mode == "paused_handoff" || mode == "paused_user_cancel" {
 		time.Sleep(450 * time.Millisecond) // More than two actual bridge ticks.
 		if primes.Load() != 0 || selections.Load() != 0 || !fileExists(releasedPath(f.room)) {
@@ -481,6 +542,20 @@ func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 			}
 			os.Exit(0)
 		}
+	}
+	if mode == "completed_start" {
+		deadline := time.Now().Add(2 * time.Second)
+		for fileExists(releasedPath(f.room)) && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if fileExists(releasedPath(f.room)) {
+			t.Fatal("completed START not observed")
+		}
+		time.Sleep(650 * time.Millisecond)
+		if allWrites.Load() != 0 {
+			t.Fatal("completed START next tick issued a write", allWrites.Load())
+		}
+		os.Exit(0)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for primes.Load() == 0 && time.Now().Before(deadline) {
@@ -530,7 +605,8 @@ func TestActualConnectRecoveryBridgeNeverReplaysSpentTransfer(t *testing.T) {
 func TestExplicitConnectRecoveryAttentionDuringAwaitCannotSelectOrRemainPending(t *testing.T) {
 	for _, phase := range []string{"read", "prime", "typed_busy"} {
 		t.Run(phase, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			f.selected = false
 			announceConnect(t, f, 1)
 			att := &attention{}
@@ -556,7 +632,8 @@ func TestExplicitConnectRecoveryAttentionDuringAwaitCannotSelectOrRemainPending(
 	}
 }
 func TestExplicitConnectRecoverySuccessfulRemovalRetiresOnlyItsOwnFence(t *testing.T) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	announceConnect(t, f, 1)
 	handled, done := tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil)
@@ -573,7 +650,8 @@ func TestExplicitConnectRecoverySuccessfulRemovalRetiresOnlyItsOwnFence(t *testi
 func TestConnectRecoveryInitialReceiptBounds(t *testing.T) {
 	for _, mode := range []string{"missing", "older", "genuine_pause_before", "genuine_pause_after", "wrong_state", "newer", "malformed", "expired", "duplicate_then_resume"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			l := &f.rt.live
 			l.applyEvent("paused", nil)
 			announceConnect(t, f, 1, 2)
@@ -636,7 +714,8 @@ func TestConnectRecoveryInitialReceiptBounds(t *testing.T) {
 // Uses the existing child-process roomBridge adapter and actual Native wire
 // receipts when supplied; no extra command, provider or transport authority.
 func runExplicitResumeBridgeCase(t *testing.T, mode string) {
-	f, _, _, _ := releasedRoomRouteFixture(t)
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
 	f.selected = false
 	status := f.rt.live.Get()
 	status.VolPct, status.Paused = 35, true
@@ -819,7 +898,8 @@ func runExplicitResumeBridgeCase(t *testing.T, mode string) {
 func TestConnectRecoveryResumeReceiptBounds(t *testing.T) {
 	for _, mode := range []string{"match", "missing", "older", "newer", "malformed", "wrong_state", "genuine_pause", "expired", "changed_alias", "old_source"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _, _ := releasedRoomRouteFixture(t)
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
 			l := &f.rt.live
 			raw, _ := json.Marshal(l.Get().AliasBinding)
 			var binding map[string]any
@@ -869,5 +949,112 @@ func TestConnectRecoveryResumeReceiptBounds(t *testing.T) {
 				t.Fatal("operation receipt replayed")
 			}
 		})
+	}
+}
+
+// Counterfactual: a fresh authenticated transfer must reach the existing protected
+// route path even when the legacy release marker is absent. This does not model
+// C journal eligibility or claim that C must accept the request.
+func TestExplicitConnectWithoutLegacyMarkerReachesProtectedPath(t *testing.T) {
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
+	f.selected = false
+	if err := os.Remove(releasedPath(f.room)); err != nil {
+		t.Fatal(err)
+	}
+	old := http.DefaultTransport
+	protected := 0
+	http.DefaultTransport = startTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method == "PUT" {
+			if r.URL.Query().Get("recovery") != "connect" {
+				t.Fatal("unguarded transfer mutation")
+			}
+			protected++
+		}
+		return old.RoundTrip(r)
+	})
+	announceConnect(t, f, 1)
+	expected := f.rt.live.Get().AliasBinding
+	handled, done := tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil)
+	if !handled || done == nil || done.alias != 1 || done.ordinal != 1 || !sameAliasBinding(done.binding, expected) || !f.selected || f.volume != 35 || f.rt.live.connectRecoveryFence != nil || f.rt.live.connectRecovery != nil || fileExists(releasedPath(f.room)) || protected != 3 || strings.Join(f.effects, ",") != "prime,select,prime" {
+		t.Fatalf("missing exact completed route: handled=%t receipt=%+v protected_calls=%d effects=%v", handled, done, protected, f.effects)
+	}
+	before := len(f.effects)
+	if handled, receipt := tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil); handled || receipt != nil || len(f.effects) != before || protected != 3 {
+		t.Fatal("subsequent tick replayed completed transfer")
+	}
+}
+
+func TestConnectFenceWithoutLegacyMarkerBlocksFallback(t *testing.T) {
+	for _, mode := range []string{"unknown", "expired", "spent", "foreign_run", "foreign_phase", "foreign_binding"} {
+		t.Run(mode, func(t *testing.T) {
+			f, _, owner, route := releasedRoomRouteFixture(t)
+			installConnectRouteRead(t, f, owner, route)
+			f.selected = false
+			if err := os.Remove(releasedPath(f.room)); err != nil {
+				t.Fatal(err)
+			}
+			announceConnect(t, f, 1)
+			switch mode {
+			case "unknown":
+				f.failSelect = true
+				if handled, done := tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil); !handled || done != nil {
+					t.Fatal("unknown route accepted")
+				}
+			case "expired":
+				f.rt.live.connectRecovery.until = time.Now().Add(-time.Second)
+				tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil)
+			case "spent":
+				f.rt.live.consumeConnectRecovery()
+			case "foreign_run":
+				f.rt.live.connectRecoveryFence.run++
+			case "foreign_phase":
+				f.rt.live.connectRecoveryFence.phase++
+			case "foreign_binding":
+				f.rt.live.connectRecoveryFence.binding = copyAliasBinding(f.rt.live.connectRecoveryFence.binding)
+				f.rt.live.connectRecoveryFence.binding.Incarnation = "foreign"
+			}
+			status, intent := f.rt.live.transportSnapshot()
+			before := len(f.effects)
+			got := holdReleasedBridgeRoute(f.room, status, intent)
+			want := mode == "unknown" || mode == "expired" || mode == "spent"
+			if got != want || len(f.effects) != before {
+				t.Fatalf("fence hold=%t want=%t effects=%v", got, want, f.effects)
+			}
+		})
+	}
+}
+
+func TestExplicitConnectBusyCreditSurvivesLegacyMarkerRemoval(t *testing.T) {
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	installConnectRouteRead(t, f, owner, route)
+	f.selected = false
+	announceConnect(t, f, 1)
+	original := f.rt.live.connectRecovery
+	busy := true
+	calls := interceptRecoveryPrime(t, func(_ *http.Request) *http.Response {
+		if busy {
+			return temporaryBusyReply()
+		}
+		return nil
+	})
+	if !tryExplicitConnectRecovery(f.room, &f.rt.live, nil) || f.rt.live.connectRecovery != original || len(f.effects) != 0 {
+		t.Fatal("busy credit lost")
+	}
+	deadline, intent := original.until, original.transport
+	if err := os.Remove(releasedPath(f.room)); err != nil {
+		t.Fatal(err)
+	}
+	if !tryExplicitConnectRecovery(f.room, &f.rt.live, nil) || f.rt.live.connectRecovery != original || original.until != deadline || original.transport != intent || *calls != 2 || len(f.effects) != 0 {
+		t.Fatal("marker removal changed pending credit")
+	}
+	busy = false
+	handled, done := tryExplicitConnectRecoveryOutcome(f.room, &f.rt.live, nil)
+	if !handled || done != original || !f.selected || f.rt.live.connectRecoveryFence != nil || strings.Join(f.effects, ",") != "prime,select,prime" || *calls != 4 {
+		t.Fatal("same credit did not complete exactly once", f.effects)
+	}
+	tryExplicitConnectRecovery(f.room, &f.rt.live, nil)
+	if *calls != 4 || len(f.effects) != 3 {
+		t.Fatal("completed credit replayed")
 	}
 }
