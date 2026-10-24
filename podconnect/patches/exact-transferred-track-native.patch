@@ -1,8 +1,7 @@
 diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
-index 1e4dc10..7021759 100644
 --- a/daemon/context_commit_test.go
 +++ b/daemon/context_commit_test.go
-@@ -728,12 +728,13 @@ func TestDealerOuter404ThenPreparedContextCommitsAliasAndNextCommand(t *testing.
+@@ -728,12 +728,13 @@
  	}
  }
  
@@ -17,7 +16,7 @@ index 1e4dc10..7021759 100644
  	state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"}
  	state.Playback.PositionAsOfTimestamp = 8487
  	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}, NextPageUrl: "hm://fixture/later"}}
-@@ -748,10 +749,45 @@ func TestDealerTransferLaterPage404CannotFallbackToCachedFirstTrack(t *testing.T
+@@ -748,10 +749,45 @@
  		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header), Request: r}, nil
  	}))
  	err := p.handleTransferCommand(context.Background(), req, state, sp)
@@ -65,10 +64,9 @@ index 1e4dc10..7021759 100644
 +	}
 +}
 diff --git a/daemon/controls.go b/daemon/controls.go
-index b998090..4d217d3 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -405,7 +405,10 @@ func (p *AppPlayer) loadCurrentTrackWithStart(ctx context.Context, paused, drop,
+@@ -405,7 +405,10 @@
  	p.app.log.WithField("uri", spotId.Uri()).
  		Debugf("loading %s (paused: %t, position: %dms)", spotId.Type(), paused, trackPosition)
  
@@ -81,10 +79,9 @@ index b998090..4d217d3 100644
  	p.state.player.IsBuffering = true
  	p.state.player.IsPaused = paused
 diff --git a/daemon/player.go b/daemon/player.go
-index dd771d9..8d26b62 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -471,9 +471,22 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
+@@ -471,8 +471,21 @@
  	// Lazy context preparation must succeed before changing the command or output owner.
  	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(transferState.CurrentSession.Context.Uri)
  	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
@@ -101,31 +98,37 @@ index dd771d9..8d26b62 100644
 +	injected, err := ctxTracks.SeekTransferred(ctx, transferState.Playback.CurrentTrack)
 +	if err != nil {
  		return fmt.Errorf("failed seeking to track: %w", err)
- 	}
++	}
 +	if injected && transferState.Options.ShufflingContext {
 +		return fmt.Errorf("cannot preserve shuffled transfer after unavailable context page")
-+	}
+ 	}
  	if ctxTracks.CurrentTrack().Uri != currentTrack.Uri {
  		return fmt.Errorf("failed seeking to track: current media identity changed")
- 	}
-@@ -546,12 +559,6 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
+@@ -545,12 +558,6 @@
+ 		}
  		p.state.queueID = max(p.state.queueID, n)
  	}
- 
+-
 -	// add all tracks from queue
 -	for _, track := range transferState.Queue.Tracks {
 -		ctxTracks.AddToQueue(track)
 -	}
 -	ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
--
+ 
  	p.state.tracks = ctxTracks
  	p.state.player.Track = ctxTracks.CurrentTrack()
- 	p.state.player.PrevTracks = ctxTracks.PrevTracks()
 diff --git a/daemon/room_content.go b/daemon/room_content.go
-index cf02404..9f370d1 100644
 --- a/daemon/room_content.go
 +++ b/daemon/room_content.go
-@@ -522,6 +522,17 @@ func (p *AppPlayer) startPreparedDealerTransfer(ctx context.Context, paused bool
+@@ -109,6 +109,7 @@
+ 	preparedDealer     bool
+ 	preparedPaused     bool
+ 	initialLoadOrdinal uint64
++	writerGeneration   uint64 // Snapshot of the one registered START output open.
+ 
+ 	CancelSent                                                                  bool
+ 	Actual                                                                      *roomTransportIdentity
+@@ -522,6 +523,17 @@
  	if capture.Source != nil || capture.Primary != p.primaryStream || capture.SessionID == "" || capture.TargetAlias != capture.SelectedAlias {
  		return nil, ErrAliasConflict
  	}
@@ -144,10 +147,9 @@ index cf02404..9f370d1 100644
  	if err != nil {
  		return nil, err
 diff --git a/daemon/room_content_execute.go b/daemon/room_content_execute.go
-index ce8c665..04b0494 100644
 --- a/daemon/room_content_execute.go
 +++ b/daemon/room_content_execute.go
-@@ -2,8 +2,10 @@ package daemon
+@@ -2,8 +2,10 @@
  
  import (
  	"context"
@@ -158,7 +160,7 @@ index ce8c665..04b0494 100644
  	"time"
  )
  
-@@ -89,6 +91,8 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+@@ -89,6 +91,8 @@
  		reply := op.CReceipt
  		possible := op.Possible
  		cancelled := op.Cancelled || ctx.Err() != nil
@@ -167,7 +169,7 @@ index ce8c665..04b0494 100644
  		phase := "none"
  		if reply != nil {
  			phase = reply.Phase // Only cValid-accepted finite phases are retained.
-@@ -119,7 +123,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+@@ -119,7 +123,11 @@
  		// Native consume preserves its original cancel-first order and supplies
  		// the finite phase captured before that cancellation. Log outside op.mu.
  		if op.Owner != nil && op.Owner.app != nil && op.Owner.app.log != nil {
@@ -180,7 +182,7 @@ index ce8c665..04b0494 100644
  		}
  	}
  	if ctx.Err() != nil {
-@@ -306,7 +314,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+@@ -306,7 +314,11 @@
  		return nil
  	})
  	if err != nil {
@@ -194,10 +196,17 @@ index ce8c665..04b0494 100644
  }
  func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index 345ede4..930f81b 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -14,6 +14,7 @@ import (
+@@ -6,6 +6,7 @@
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/dealer"
+ 	evtimpl "github.com/devgianlu/go-librespot/events/impl"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+@@ -14,6 +15,7 @@
  	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
  	"github.com/devgianlu/go-librespot/tracks"
  	"google.golang.org/protobuf/proto"
@@ -205,22 +214,23 @@ index 345ede4..930f81b 100644
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -30,12 +31,33 @@ import (
+@@ -30,12 +32,33 @@
  	"unsafe"
  )
  
 -type contentInertSource struct{ closes atomic.Int32 }
+-
+-func (*contentInertSource) Read([]float32) (int, error) { return 0, nil }
+-func (*contentInertSource) PositionMs() int64           { return 0 }
+-func (*contentInertSource) SetPositionMs(int64) error   { return nil }
+-func (s *contentInertSource) Close() error              { s.closes.Add(1); return nil }
 +type contentInertSource struct {
 +	closes    atomic.Int32
 +	finite    bool
 +	remaining int
 +	eofFile   string
 +}
- 
--func (*contentInertSource) Read([]float32) (int, error) { return 0, nil }
--func (*contentInertSource) PositionMs() int64           { return 0 }
--func (*contentInertSource) SetPositionMs(int64) error   { return nil }
--func (s *contentInertSource) Close() error              { s.closes.Add(1); return nil }
++
 +func (s *contentInertSource) Read(p []float32) (int, error) {
 +	if !s.finite {
 +		return 0, nil
@@ -244,7 +254,7 @@ index 345ede4..930f81b 100644
  
  // Locally admitted/staged owner fixture only. Does not fake an authenticated
  // provider session or exercise production account admission; actual player/FIFO
-@@ -562,21 +584,40 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+@@ -562,21 +585,40 @@
  // synthetic AP welcome seeds only the existing account getter; no provider
  // authentication, HomePod or physical audio is claimed by this regression.
  func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
@@ -266,6 +276,11 @@ index 345ede4..930f81b 100644
 -			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 -			if err != nil {
 -				t.Fatal(err)
+-			}
+-			defer reader.Close()
+-			stat, _ := reader.Stat()
+-			kernel := stat.Sys().(*syscall.Stat_t)
+-			identity := outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
 +			external := strings.HasPrefix(mode, "actual-c-")
 +			path := os.Getenv("PC_NATIVE_START_PIPE")
 +			var identity outputPipeIdentity
@@ -288,16 +303,12 @@ index 345ede4..930f81b 100644
 +				}
 +				p.app.cfg.DeviceAliasHomePodIDs[1] = "1"
 +				p.aliasRegistry[1].HomePodID = "1"
- 			}
--			defer reader.Close()
--			stat, _ := reader.Stat()
--			kernel := stat.Sys().(*syscall.Stat_t)
--			identity := outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
++			}
 +
  			p.app.cfg.AudioOutputPipe = path
  			p.state.device.SelectedAliasId = 2
  			p.hasSpotConnId, p.hasInitialConnectState = true, true
-@@ -585,7 +626,8 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -585,7 +627,8 @@
  			p.roomContentReservation = nil
  			p.roomNativeIntent = 0
  			p.primaryLoadOrdinal = 1
@@ -307,7 +318,7 @@ index 345ede4..930f81b 100644
  			// The test seeds existing getter fields, never a production admission hook.
  			access := ap.NewAccesspoint(&librespot.NullLogger{}, nil, "fixture")
  			left, right := net.Pipe()
-@@ -601,9 +643,14 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -601,9 +644,14 @@
  			set("welcome", reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")}))
  			nextSessionField(p.sess, "ap", access)
  			var creates atomic.Int32
@@ -323,7 +334,7 @@ index 345ede4..930f81b 100644
  			}})
  			if err != nil {
  				t.Fatal(err)
-@@ -612,94 +659,148 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -612,102 +660,183 @@
  			p.player = worker
  			stream := &player.Stream{Source: &contentInertSource{}, PlaybackId: []byte{1, 2, 3}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Duration: proto.Int32(300000)})}
  			p.primaryStream = stream
@@ -377,6 +388,21 @@ index 345ede4..930f81b 100644
 -					_ = json.Unmarshal(body["expected_input_path_digest"], &receipt.InputDigest)
 -					if receipt.Intended.SessionID != sessionID || receipt.Intended.AliasRevision != p.aliasRevision {
 -						t.Error("transfer semantic session/alias reset")
+-					}
+-					if mode == "cancel" {
+-						cancel()
+-					}
+-					if mode == "alias-aba" {
+-						p.aliasMu.Lock()
+-						p.aliasRevision += 2
+-						p.aliasMu.Unlock()
+-					}
+-				} else {
+-					_ = json.Unmarshal(body["native_reservation_id"], &receipt.ReservationID)
+-					receipt.Possible, receipt.GateClosed, receipt.PinRemaining = true, true, 14000
+-					receipt.Pipe = &identity
+-					receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
+-					if endpoint == "commit" && mode == "unknown" {
 +			var owner *httptest.Server
 +			if !external {
 +				owner = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -392,9 +418,7 @@ index 345ede4..930f81b 100644
 +							w.WriteHeader(http.StatusConflict)
 +							return
 +						}
- 					}
--					if mode == "cancel" {
--						cancel()
++					}
 +					if endpoint == "state" {
 +						if mode == "late-generation" {
 +							p.app.moveCustodyMu.Lock()
@@ -407,11 +431,7 @@ index 345ede4..930f81b 100644
 +						}
 +						_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}})
 +						return
- 					}
--					if mode == "alias-aba" {
--						p.aliasMu.Lock()
--						p.aliasRevision += 2
--						p.aliasMu.Unlock()
++					}
 +					if endpoint == "prepare" {
 +						if creates.Load() != 0 {
 +							t.Error("writer opened before C prepare")
@@ -460,18 +480,10 @@ index 345ede4..930f81b 100644
 +							receipt.GateClosed = false
 +							receipt.Actual = &receipt.Intended
 +						}
- 					}
--				} else {
--					_ = json.Unmarshal(body["native_reservation_id"], &receipt.ReservationID)
--					receipt.Possible, receipt.GateClosed, receipt.PinRemaining = true, true, 14000
--					receipt.Pipe = &identity
--					receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
--					if endpoint == "commit" && mode == "unknown" {
++					}
 +					if endpoint == "complete" && mode == "complete-fails" {
  						receipt.Phase = "unknown"
-+						receipt.GateClosed = true
-+						receipt.Actual = nil
- 					}
+-					}
 -					if endpoint == "commit" && mode == "foreign-pipe" {
 -						wrong := identity
 -						wrong.Inode = "1"
@@ -488,9 +500,7 @@ index 345ede4..930f81b 100644
 -					if endpoint == "open" || endpoint == "complete" {
 -						receipt.GateClosed = false
 -						receipt.Actual = &receipt.Intended
-+					if endpoint == "complete" && mode == "writer-lost" {
-+						worker.Stop()
- 					}
+-					}
 -				}
 -				if endpoint == "complete" && mode == "complete-fails" {
 -					receipt.Phase = "unknown"
@@ -505,6 +515,13 @@ index 345ede4..930f81b 100644
 -			}))
 -			defer owner.Close()
 -			p.app.cfg.RoomTransportOwnToneURL = owner.URL
+-			if mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
++						receipt.GateClosed = true
++						receipt.Actual = nil
++					}
++					if endpoint == "complete" && mode == "writer-lost" {
++						worker.Stop()
++					}
 +					receipt.Schema = "podconnect.output_start_" + endpoint + ".v1"
 +					_ = json.NewEncoder(w).Encode(receipt)
 +				}))
@@ -540,13 +557,16 @@ index 345ede4..930f81b 100644
 +				p.app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{&nativeTransportOffer{}: {Owner: p, Until: time.Now().Add(time.Hour)}}
 +				preexisting = true
 +			}
- 			if mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
++			if mode == "actual-c-eof" || mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
  				// Same shipped load caller must retire its own op.Prepared publication.
  				p.primaryStream = nil
-@@ -707,7 +808,31 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				p.secondaryStream = stream
  				p.primaryLoadOrdinal = 0
  				events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
  				nextSessionField(p.sess, "events", events)
++				if mode == "actual-c-eof" {
++					nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++				}
 +				var lazyReads atomic.Int32
 +				var bufferingPublished bool
  				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
@@ -575,7 +595,7 @@ index 345ede4..930f81b 100644
  					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
  				}))
  				nextSessionField(p.sess, "sp", sp)
-@@ -729,20 +854,47 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -729,20 +858,47 @@
  					transfer.Playback.IsPaused = paused
  					transfer.CurrentSession.OriginalSessionId = proto.String(sessionID)
  					transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
@@ -624,7 +644,7 @@ index 345ede4..930f81b 100644
  					t.Fatal("prepared START failed", err, calls)
  				}
  				if p.primaryStream != stream || (!strings.HasPrefix(mode, "dealer-") && p.state.tracks != tracks) || p.state.player.SessionId != sessionID || p.state.player.PositionAsOfTimestamp < position || p.state.player.PositionAsOfTimestamp > position+1000 || p.state.player.IsPaused != paused || creates.Load() != 1 || p.app.startCustody == nil || p.roomContentReservation != nil {
-@@ -760,10 +912,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -760,10 +916,10 @@
  				case <-time.After(time.Second):
  					t.Fatal("no real initial load observation")
  				}
@@ -637,7 +657,7 @@ index 345ede4..930f81b 100644
  					if err := worker.Play(); err != nil {
  						t.Fatal("explicit later resume failed", err)
  					}
-@@ -773,23 +925,76 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -773,23 +929,108 @@
  					}
  				}
  			} else {
@@ -650,6 +670,12 @@ index 345ede4..930f81b 100644
 -				if mode == "complete-fails" || mode == "writer-lost" {
 -					if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 {
 -						t.Fatal("failed published START retained active actor")
+-					}
+-					if p.app.startCustody == nil || p.app.startCustody.State == "complete" {
+-						t.Fatal("failed post-open result upgraded or lost custody")
+-					}
+-				} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
+-					t.Fatal("rejected attempt reset content")
 +				if mode == "actual-c-eof" {
 +					if err == nil {
 +						t.Fatal("EOF unexpectedly final-credited")
@@ -657,6 +683,38 @@ index 345ede4..930f81b 100644
 +					op := p.app.startCustody
 +					if op == nil || op.State != "unknown" || !p.roomContentQuarantined {
 +						t.Fatal("EOF did not preserve quarantine")
++					}
++					if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 || p.roomRetirement == nil {
++						t.Fatal("failed outer load did not seal actor and prepare exact retirement before Stop")
++					}
++					attempt := p.roomRetirement
++					oldGeneration := p.app.openedWriterGeneration
++					p.Close()
++					if !worker.Closed() || p.app.startCustody != nil || p.app.retirementPending != nil || p.app.moveCustodyUnknown || op.State != "unknown" {
++						t.Fatal("failed playback cleanup did not join writer and exact C terminal without credit")
++					}
++					next := &AppPlayer{app: p.app}
++					nextWorker, e := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++						return p.app.withNewOutput(next, create)
++					}})
++					if e != nil {
++						t.Fatal(e)
++					}
++					defer nextWorker.Close()
++					next.player = nextWorker
++					if e = nextWorker.SetPrimaryStream(&contentInertSource{}, true, false); e != nil {
++						t.Fatal("next paused writer refused", e)
++					}
++					nextWriter := p.app.openedWriter
++					p.app.completeRetirementFor(attempt) // delayed old completion after successor open
++					if p.app.openedWriterOwner != next || p.app.openedWriterGeneration != oldGeneration+1 || p.app.openedWriter != nextWriter || p.app.moveCustodyUnknown {
++						t.Fatal("old cleanup crossed the successor writer generation")
++					}
++					fresh := *op.Capture
++					fresh.OldOwner = nil
++					fresh.Incarnation = strings.Repeat("d", 32)
++					if _, e = fresh.readCState(ctx); e != nil {
++						t.Fatal("retired predecessor still blocks next proper START", e)
 +					}
 +					log.mu.Lock()
 +					lines := append([]string(nil), log.lines...)
@@ -679,9 +737,7 @@ index 345ede4..930f81b 100644
 +
 +					if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
 +						t.Fatal("unadmitted writer opened", mode, calls)
- 					}
--					if p.app.startCustody == nil || p.app.startCustody.State == "complete" {
--						t.Fatal("failed post-open result upgraded or lost custody")
++					}
 +					if mode == "complete-fails" || mode == "writer-lost" {
 +						if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 {
 +							t.Fatal("failed published START retained active actor")
@@ -691,9 +747,7 @@ index 345ede4..930f81b 100644
 +						}
 +					} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
 +						t.Fatal("rejected attempt reset content")
- 					}
--				} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
--					t.Fatal("rejected attempt reset content")
++					}
 +				}
 +			}
 +			if external {
@@ -727,11 +781,625 @@ index 345ede4..930f81b 100644
 +		t.Fatal("default selected-content START lost real predecessor transition")
 +	}
 +}
+diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -70,6 +70,11 @@
+ 		return ErrAliasConflict
+ 	}
+ 	app.startOutputPermit = op
++	if app.openedWriterOwner == op.Owner {
++		op.mu.Lock()
++		op.writerGeneration = app.openedWriterGeneration
++		op.mu.Unlock()
++	}
+ 	return nil
+ }
+ 
+@@ -122,6 +127,11 @@
+ 	}
+ 	app.openedWriterOwner = owner
+ 	app.openedWriterGeneration++
++	if op := app.startOutputPermit; op != nil && app.startCustody == op && op.Owner == owner {
++		op.mu.Lock()
++		op.writerGeneration = app.openedWriterGeneration
++		op.mu.Unlock()
++	}
+ 	return out, nil
+ }
+ 
+diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
+--- a/daemon/room_move_custody_test.go
++++ b/daemon/room_move_custody_test.go
+@@ -168,6 +168,9 @@
+ 	if err := attemptCustodyOutput(app, other); err == nil {
+ 		t.Fatal("other AppPlayer used START quiesce permit")
+ 	}
++	if op.writerGeneration == 0 || op.writerGeneration != app.openedWriterGeneration {
++		t.Fatal("START did not capture its registered output generation")
++	}
+ 	app.releaseStartOutput(op)
+ 	op.State, op.Terminal = "complete", true
+ 	if err := attemptCustodyOutput(app, owner); err == nil {
+@@ -179,6 +182,17 @@
+ 	if app.startCustody != op {
+ 		t.Fatal("completion erased START C route custody")
+ 	}
++	// A later START can quiesce this same live writer without opening another.
++	op.CReceipt = &contentCReceipt{Phase: "completed"}
++	reused := &contentOperation{Owner: owner, State: "committing"}
++	if err := app.supersedeContentCustody(nil, op, reused); err != nil {
++		t.Fatal(err)
++	}
++	generation := app.openedWriterGeneration
++	if err := app.permitStartOutput(reused); err != nil || reused.writerGeneration != generation || app.openedWriterGeneration != generation {
++		t.Fatal("reused START writer lost its original registered generation", err)
++	}
++	app.releaseStartOutput(reused)
+ }
+ 
+ func TestStart35UnknownCustodyBlocksActualSuccessorFIFO(t *testing.T) {
+diff --git a/daemon/room_retirement.go b/daemon/room_retirement.go
+--- a/daemon/room_retirement.go
++++ b/daemon/room_retirement.go
+@@ -23,6 +23,7 @@
+ 	incarnation string
+ 	process     contentProcess
+ 	writer      output.MovePipeIdentity
++	generation  uint64
+ 	writerEpoch string
+ 	inputEpoch  string
+ 	retirement  string
+@@ -109,6 +110,38 @@
+ 		reply.ReaderReady && reply.ContextsDrained && reply.DurableTerminal && reply.RetiredWitness
+ }
+ 
++// Called only for teardown, with moveCustodyMu and op.mu held. A failed
++// semantic START may still own its exact C-completed physical writer. This
++// grants no playback credit and never authorizes a successor or an UNKNOWN C.
++func (app *App) failedStartRetirementCurrentLocked(op *contentOperation, owner *AppPlayer) bool {
++	return op != nil && owner != nil && op.Owner == owner && op.Terminal && op.State == "unknown" && op.Published &&
++		op.Capture != nil && op.Capture.Player == owner.player && op.Capture.Session == owner.sess &&
++		op.Actual != nil && *op.Actual == op.Intended && op.CReceipt != nil && op.CReceipt.Phase == "completed" &&
++		op.CReceipt.OK && !op.CReceipt.Physical && op.CReceipt.Drained && op.CReceipt.Possible &&
++		op.CReceipt.Actual != nil && *op.CReceipt.Actual == op.Intended && op.CReceipt.Target == op.Target &&
++		app.startCustody == op && app.moveCustody == nil && app.startOutputPermit == nil && !app.queueWriterBusyLocked() &&
++		app.openedWriterOwner == owner && op.writerGeneration != 0 && app.openedWriterGeneration == op.writerGeneration && app.openedWriter.PipeIdentity == op.Pipe
++}
++
++// Revalidate the same teardown after each C await. No lock is held over I/O.
++func (app *App) retirementCurrentLocked(a *retirementAttempt) bool {
++	if a == nil || a.owner == nil || app.retirementPending != a || app.openedWriterOwner != a.owner ||
++		app.openedWriter != a.writer || app.openedWriterGeneration != a.generation {
++		return false
++	}
++	if a.purpose == "start" {
++		if app.startCustody != a.startSource || a.startSource == nil || app.moveCustody != nil ||
++			app.startOutputPermit != nil || app.queueWriterBusyLocked() {
++			return false
++		}
++		op := a.startSource
++		op.mu.Lock()
++		defer op.mu.Unlock()
++		return op.State == "complete" || app.failedStartRetirementCurrentLocked(op, a.owner)
++	}
++	return a.purpose == "move" && app.moveCustody == a.moveSource
++}
++
+ func (app *App) prepareCompletedRetirementFor(owner *AppPlayer) *retirementAttempt {
+ 	app.moveCustodyMu.Lock()
+ 	if app.moveCustodyUnknown || app.retirementPending != nil {
+@@ -120,7 +153,8 @@
+ 	case app.startCustody != nil && app.startCustody.Owner == owner:
+ 		op := app.startCustody
+ 		op.mu.Lock()
+-		if op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.Capture != nil {
++		if op.Terminal && (op.State == "complete" || app.failedStartRetirementCurrentLocked(op, owner)) &&
++			op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.Capture != nil {
+ 			a = retirementAttempt{owner: owner, purpose: "start", baseURL: op.Capture.OwnTone, deviceID: op.Target.DeviceID,
+ 				completed: op.CReceipt.Token, incarnation: op.Capture.Incarnation, process: op.Capture.Process,
+ 				writerEpoch: op.Epoch, inputEpoch: op.CReceipt.InputEpoch, startSource: op}
+@@ -167,7 +201,7 @@
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+ 	}
+-	a.reservation, a.writer = reservation, app.openedWriter
++	a.reservation, a.writer, a.generation = reservation, app.openedWriter, app.openedWriterGeneration
+ 	app.retirementPending = &a
+ 	app.moveCustodyMu.Unlock()
+ 
+@@ -195,8 +229,10 @@
+ 		return nil
+ 	}
+ 	app.moveCustodyMu.Lock()
+-	if app.retirementPending != &a || app.moveCustodyUnknown {
+-		app.moveCustodyUnknown = true
++	if app.moveCustodyUnknown || !app.retirementCurrentLocked(&a) {
++		if app.retirementPending == &a {
++			app.moveCustodyUnknown = true
++		}
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+ 	}
+@@ -220,6 +256,15 @@
+ func (app *App) completeRetirementFor(a *retirementAttempt) {
+ 	if a == nil || !a.prepared {
+ 		return
++	}
++	app.moveCustodyMu.Lock()
++	current := app.retirementCurrentLocked(a) && a.owner.player != nil && a.owner.player.Closed()
++	if !current && app.retirementPending == a {
++		app.moveCustodyUnknown = true
++	}
++	app.moveCustodyMu.Unlock()
++	if !current {
++		return // Never send native_close_done before this exact worker joined.
+ 	}
+ 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+ 	defer cancel()
+@@ -245,8 +290,10 @@
+ 	}
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+-	if app.retirementPending != a || !valid {
+-		app.moveCustodyUnknown = true
++	if !valid || !app.retirementCurrentLocked(a) {
++		if app.retirementPending == a {
++			app.moveCustodyUnknown = true
++		}
+ 		return
+ 	}
+ 	if a.purpose == "start" && app.startCustody == a.startSource && app.startCustody != nil && app.startCustody.Owner == a.owner {
+@@ -297,7 +344,8 @@
+ 		return ErrAliasConflict
+ 	}
+ 	op.mu.Lock()
+-	valid := op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed" &&
++	valid := op.Terminal && (op.State == "complete" || app.failedStartRetirementCurrentLocked(op, old)) &&
++		op.CReceipt != nil && op.CReceipt.Phase == "completed" &&
+ 		op.Capture != nil && op.Capture.Player == old.player && op.Capture.Session == old.sess &&
+ 		op.CReceipt.WriterEpoch == op.Epoch && op.CReceipt.Pipe != nil &&
+ 		*op.CReceipt.Pipe == (outputPipeIdentity{Device: app.openedWriter.Device, Inode: app.openedWriter.Inode, Type: app.openedWriter.Type})
+@@ -354,7 +402,9 @@
+ 		app.startOutputPermit != nil || app.queueWriterBusyLocked() ||
+ 		app.openedWriterOwner != old || app.openedWriter != a.writer ||
+ 		app.openedWriterGeneration != writerGeneration || !terminal {
+-		app.moveCustodyUnknown = true
++		if app.retirementPending == &a {
++			app.moveCustodyUnknown = true
++		}
+ 		return ErrAliasConflict
+ 	}
+ 	app.startCustody = nil
+diff --git a/daemon/room_retirement_test.go b/daemon/room_retirement_test.go
+--- a/daemon/room_retirement_test.go
++++ b/daemon/room_retirement_test.go
+@@ -104,84 +104,101 @@
+ }
+ 
+ func TestClosedPriorSTARTRequiresExactTerminalBeforeFreshWriter(t *testing.T) {
+-	var app *App
+-	var writer output.MovePipeIdentity
+-	var normal, orphan atomic.Int32
+-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		if r.URL.Path != "/api/outputs/102/start/retire/prepare" {
+-			t.Errorf("unexpected endpoint %s", r.URL.Path)
+-			http.Error(w, "endpoint", http.StatusNotFound)
+-			return
+-		}
+-		var body map[string]json.RawMessage
+-		if json.NewDecoder(r.Body).Decode(&body) != nil {
+-			t.Error("bad retirement body")
+-			return
+-		}
+-		if len(body) == 8 {
+-			normal.Add(1)
+-			http.Error(w, "old writer unavailable", http.StatusConflict)
+-			return
+-		}
+-		if len(body) != 9 || string(body["writer_already_closed"]) != "true" {
+-			t.Errorf("closed prior request changed normal contract: %#v", body)
+-			http.Error(w, "bad body", http.StatusConflict)
+-			return
+-		}
+-		orphan.Add(1)
+-		var reservation string
+-		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
+-		reply := retirementReply("start", "prepare", reservation, writer)
+-		reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
+-		_ = json.NewEncoder(w).Encode(reply)
+-	}))
+-	defer server.Close()
+-	var old *AppPlayer
+-	app, old, _ = retirementOwnerFixture(t, server.URL, "start")
+-	writer = app.openedWriter
+-	pipePath, err := os.Readlink("/proc/self/fd/" + writer.FD)
+-	if err != nil {
+-		t.Fatal("cannot identify original FIFO", err)
+-	}
+-	oldGeneration := app.openedWriterGeneration
+-	app.startCustody.Capture.Player = old.player
+-	old.Close()
+-	if normal.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil || !old.player.Closed() {
+-		t.Fatal("failed normal prepare did not retain closed old START custody")
+-	}
+-	fresh := &AppPlayer{app: app}
+-	cancelled, cancel := context.WithCancel(context.Background())
+-	cancel()
+-	if app.retireClosedPriorStartFor(cancelled, fresh) == nil || orphan.Load() != 0 || app.startCustody == nil {
+-		t.Fatal("cancelled transfer sent a new retirement request")
+-	}
+-	if err := app.retireClosedPriorStartFor(context.Background(), fresh); err != nil {
+-		t.Fatal("exact closed-prior terminal was refused", err)
+-	}
+-	if orphan.Load() != 1 || app.moveCustodyUnknown || app.startCustody != nil || app.retirementPending != nil {
+-		t.Fatal("terminal did not retire only the old custody")
+-	}
+-	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
+-		AudioOutputPipe: pipePath, AudioOutputPipeFormat: "s16le",
+-		WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
+-			return app.withNewOutput(fresh, create)
+-		}})
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer worker.Close()
+-	fresh.player = worker
+-	if err := worker.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
+-		t.Fatal("fresh player did not open its FIFO writer", err)
+-	}
+-	if app.openedWriterOwner != fresh || app.openedWriterGeneration != oldGeneration+1 ||
+-		app.openedWriter.Device != writer.Device || app.openedWriter.Inode != writer.Inode ||
+-		app.openedWriter.Type != "fifo" {
+-		t.Fatal("terminal did not admit a fresh writer for the same named FIFO")
+-	}
+-	opened, err := os.Stat("/proc/self/fd/" + app.openedWriter.FD)
+-	if err != nil || opened.Mode()&os.ModeNamedPipe == 0 {
+-		t.Fatal("fresh writer descriptor is not an open FIFO", err)
++	for _, failed := range []bool{false, true} {
++		name := "semantic_complete"
++		if failed {
++			name = "semantic_unknown"
++		}
++		t.Run(name, func(t *testing.T) {
++			var app *App
++			var writer output.MovePipeIdentity
++			var normal, orphan atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path != "/api/outputs/102/start/retire/prepare" {
++					t.Errorf("unexpected endpoint %s", r.URL.Path)
++					http.Error(w, "endpoint", http.StatusNotFound)
++					return
++				}
++				var body map[string]json.RawMessage
++				if json.NewDecoder(r.Body).Decode(&body) != nil {
++					t.Error("bad retirement body")
++					return
++				}
++				if len(body) == 8 {
++					normal.Add(1)
++					http.Error(w, "old writer unavailable", http.StatusConflict)
++					return
++				}
++				if len(body) != 9 || string(body["writer_already_closed"]) != "true" {
++					t.Errorf("closed prior request changed normal contract: %#v", body)
++					http.Error(w, "bad body", http.StatusConflict)
++					return
++				}
++				orphan.Add(1)
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				reply := retirementReply("start", "prepare", reservation, writer)
++				reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer server.Close()
++			var old *AppPlayer
++			app, old, _ = retirementOwnerFixture(t, server.URL, "start")
++			writer = app.openedWriter
++			pipePath, err := os.Readlink("/proc/self/fd/" + writer.FD)
++			if err != nil {
++				t.Fatal("cannot identify original FIFO", err)
++			}
++			oldGeneration := app.openedWriterGeneration
++			app.startCustody.Capture.Player = old.player
++			if failed {
++				op := app.startCustody
++				op.State, op.Published, op.Pipe = "unknown", true, writer.PipeIdentity
++				op.writerGeneration = app.openedWriterGeneration
++				op.CReceipt.OK, op.CReceipt.Drained, op.CReceipt.Possible, op.CReceipt.Target = true, true, true, op.Target
++				actual := roomTransportIdentity{AccountUserID: "account", TargetID: "engine", RoomID: "room", HomePodID: "102"}
++				op.Intended, op.Actual, op.CReceipt.Actual = actual, &actual, &actual
++			}
++			old.Close()
++			if normal.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil || !old.player.Closed() {
++				t.Fatal("failed normal prepare did not retain closed old START custody")
++			}
++			fresh := &AppPlayer{app: app}
++			cancelled, cancel := context.WithCancel(context.Background())
++			cancel()
++			if app.retireClosedPriorStartFor(cancelled, fresh) == nil || orphan.Load() != 0 || app.startCustody == nil {
++				t.Fatal("cancelled transfer sent a new retirement request")
++			}
++			if err := app.retireClosedPriorStartFor(context.Background(), fresh); err != nil {
++				t.Fatal("exact closed-prior terminal was refused", err)
++			}
++			if orphan.Load() != 1 || app.moveCustodyUnknown || app.startCustody != nil || app.retirementPending != nil {
++				t.Fatal("terminal did not retire only the old custody")
++			}
++			worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe",
++				AudioOutputPipe: pipePath, AudioOutputPipeFormat: "s16le",
++				WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++					return app.withNewOutput(fresh, create)
++				}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			fresh.player = worker
++			if err := worker.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++				t.Fatal("fresh player did not open its FIFO writer", err)
++			}
++			if app.openedWriterOwner != fresh || app.openedWriterGeneration != oldGeneration+1 ||
++				app.openedWriter.Device != writer.Device || app.openedWriter.Inode != writer.Inode ||
++				app.openedWriter.Type != "fifo" {
++				t.Fatal("terminal did not admit a fresh writer for the same named FIFO")
++			}
++			opened, err := os.Stat("/proc/self/fd/" + app.openedWriter.FD)
++			if err != nil || opened.Mode()&os.ModeNamedPipe == 0 {
++				t.Fatal("fresh writer descriptor is not an open FIFO", err)
++			}
++
++		})
+ 	}
+ }
+ 
+@@ -218,7 +235,7 @@
+ }
+ 
+ func TestClosedPriorSTARTLateTerminalCannotClearNewWriterGeneration(t *testing.T) {
+-	for _, mode := range []string{"writer_generation", "start_permit", "queue_writer"} {
++	for _, mode := range []string{"writer_generation", "start_permit", "queue_writer", "successor_attempt"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			entered, release := make(chan struct{}), make(chan struct{})
+ 			var writer output.MovePipeIdentity
+@@ -261,10 +278,18 @@
+ 				app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{
+ 					&nativeTransportOffer{}: {Until: time.Now().Add(time.Minute)},
+ 				}
++			case "successor_attempt":
++				app.retirementPending = &retirementAttempt{}
++				app.moveCustodyUnknown = false
+ 			}
+ 			app.moveCustodyMu.Unlock()
+ 			close(release)
+-			if err := <-result; err == nil || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
++			err := <-result
++			if mode == "successor_attempt" {
++				if err == nil || app.moveCustodyUnknown || app.retirementPending == nil {
++					t.Fatal("late closed-prior terminal poisoned a different attempt")
++				}
++			} else if err == nil || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
+ 				t.Fatal("late terminal credited a changed admission owner")
+ 			}
+ 		})
+@@ -342,11 +367,15 @@
+ 	for _, scenario := range []struct {
+ 		purpose string
+ 		stop    bool
+-	}{{"start", false}, {"move", false}, {"start", true}, {"move", true}} {
++		failed  bool
++	}{{"start", false, false}, {"move", false, false}, {"start", true, false}, {"move", true, false}, {"start", true, true}} {
+ 		purpose := scenario.purpose
+ 		name := purpose
+ 		if scenario.stop {
+ 			name += "_phone_stop"
++		}
++		if scenario.failed {
++			name += "_failed_native_final_custody"
+ 		}
+ 		t.Run(name, func(t *testing.T) {
+ 			var app *App
+@@ -403,6 +432,18 @@
+ 			var owner *AppPlayer
+ 			app, owner, writerFD = retirementOwnerFixture(t, server.URL, purpose)
+ 			writer = app.openedWriter
++			var failed *contentOperation
++			if scenario.failed {
++				failed = app.startCustody
++				failed.State, failed.Published = "unknown", true
++				failed.writerGeneration = app.openedWriterGeneration
++				failed.Pipe = writer.PipeIdentity
++				failed.CReceipt.OK, failed.CReceipt.Drained, failed.CReceipt.Possible = true, true, true
++				failed.CReceipt.Target = failed.Target
++				failed.Capture.Player, failed.Capture.Session = owner.player, owner.sess
++				actual := roomTransportIdentity{AccountUserID: "account", TargetID: "engine", RoomID: "room", HomePodID: "102"}
++				failed.Intended, failed.Actual, failed.CReceipt.Actual = actual, &actual, &actual
++			}
+ 			if scenario.stop {
+ 				owner.beginStopRetirement()
+ 				if owner.roomRetirement == nil {
+@@ -418,6 +459,9 @@
+ 			}
+ 			if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err != nil {
+ 				t.Fatal("known terminal did not release old source custody", err)
++			}
++			if failed != nil && (failed.State != "unknown" || !failed.Terminal) {
++				t.Fatal("physical cleanup credited failed playback")
+ 			}
+ 		})
+ 	}
+@@ -565,3 +609,166 @@
+ 		t.Fatal("held raw read was not cancelled after exact C gate and retired by witness")
+ 	}
+ }
++
++func TestFailedSTARTRetirementRejectsUnprovenPhysicalOwner(t *testing.T) {
++	for _, mode := range []string{"c_unknown", "bad_token", "foreign_operation", "foreign_writer", "writer_generation", "foreign_worker", "foreign_session", "foreign_pipe", "unpublished", "move_custody", "start_permit", "queue_custody"} {
++		t.Run(mode, func(t *testing.T) {
++			var calls atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				calls.Add(1)
++				w.WriteHeader(http.StatusConflict)
++			}))
++			defer server.Close()
++			app, owner, _ := retirementOwnerFixture(t, server.URL, "start")
++			defer owner.player.Close()
++			op := app.startCustody
++			op.State, op.Published, op.Pipe = "unknown", true, app.openedWriter.PipeIdentity
++			op.writerGeneration = app.openedWriterGeneration
++			op.Capture.Player, op.Capture.Session = owner.player, owner.sess
++			actual := roomTransportIdentity{AccountUserID: "account", TargetID: "engine", RoomID: "room", HomePodID: "102"}
++			op.Intended, op.Actual, op.CReceipt.Actual = actual, &actual, &actual
++			op.CReceipt.OK, op.CReceipt.Drained, op.CReceipt.Possible, op.CReceipt.Target = true, true, true, op.Target
++			switch mode {
++			case "c_unknown":
++				op.CReceipt.Phase = "unknown"
++			case "bad_token":
++				op.CReceipt.Token = "malformed"
++			case "foreign_operation":
++				app.startCustody = &contentOperation{Owner: &AppPlayer{}}
++			case "foreign_writer":
++				app.openedWriterOwner = &AppPlayer{}
++			case "writer_generation":
++				app.openedWriterGeneration++ // Same owner/FIFO/FD cannot borrow an earlier open.
++			case "foreign_worker":
++				op.Capture.Player = &player.Player{}
++			case "foreign_session":
++				op.Capture.Session = &session.Session{}
++			case "foreign_pipe":
++				op.Pipe.Inode = "999999"
++			case "unpublished":
++				op.Published = false
++			case "move_custody":
++				app.moveCustody = &moveOperation{}
++			case "start_permit":
++				app.startOutputPermit = op
++			case "queue_custody":
++				app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{&nativeTransportOffer{}: {Owner: owner, Until: time.Now().Add(time.Hour)}}
++			}
++			if app.prepareCompletedRetirementFor(owner) != nil || calls.Load() != 0 || op.State != "unknown" {
++				t.Fatal("unproved failed START borrowed retirement authority", calls.Load())
++			}
++		})
++	}
++}
++
++func TestFailedSTARTRetirementRequiresJoinedWorkerAndIgnoresLateAttempt(t *testing.T) {
++	var writer output.MovePipeIdentity
++	var completes atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]json.RawMessage
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		var reservation string
++		_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++		phase := "prepare"
++		if strings.HasSuffix(r.URL.Path, "/complete") {
++			completes.Add(1)
++			phase = "complete"
++		}
++		_ = json.NewEncoder(w).Encode(retirementReply("start", phase, reservation, writer))
++	}))
++	defer server.Close()
++	app, owner, _ := retirementOwnerFixture(t, server.URL, "start")
++	defer owner.player.Close()
++	writer = app.openedWriter
++	a := app.prepareCompletedRetirementFor(owner)
++	if a == nil {
++		t.Fatal("could not admit existing completed START teardown")
++	}
++	app.completeRetirementFor(a)
++	if completes.Load() != 0 || !app.moveCustodyUnknown || app.retirementPending != a {
++		t.Fatal("unjoined worker asserted native_close_done")
++	}
++	// A later exact owner can already have replaced the old attempt. The old
++	// callback must neither send C effects nor poison that successor's state.
++	app.moveCustodyMu.Lock()
++	app.retirementPending = nil
++	app.startCustody = nil
++	app.openedWriterOwner = &AppPlayer{}
++	app.openedWriterGeneration++
++	app.moveCustodyUnknown = false
++	app.moveCustodyMu.Unlock()
++	app.completeRetirementFor(a)
++	if completes.Load() != 0 || app.moveCustodyUnknown || app.retirementPending != nil {
++		t.Fatal("late old retirement changed the successor")
++	}
++}
++
++func TestSTARTRetirementAwaitCannotClearOrPoisonSuccessor(t *testing.T) {
++	for _, phase := range []string{"prepare", "complete"} {
++		t.Run(phase, func(t *testing.T) {
++			entered, release := make(chan struct{}), make(chan struct{})
++			var once sync.Once
++			defer once.Do(func() { close(release) })
++			var writer output.MovePipeIdentity
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body map[string]json.RawMessage
++				_ = json.NewDecoder(r.Body).Decode(&body)
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				actualPhase := "prepare"
++				if strings.HasSuffix(r.URL.Path, "/complete") {
++					actualPhase = "complete"
++				}
++				if actualPhase == phase {
++					close(entered)
++					<-release
++				}
++				_ = json.NewEncoder(w).Encode(retirementReply("start", actualPhase, reservation, writer))
++			}))
++			defer server.Close()
++			app, owner, _ := retirementOwnerFixture(t, server.URL, "start")
++			defer owner.player.Close()
++			writer = app.openedWriter
++			var a *retirementAttempt
++			if phase == "complete" {
++				a = app.prepareCompletedRetirementFor(owner)
++				if a == nil {
++					t.Fatal("prepare failed")
++				}
++				owner.player.Close()
++			}
++			done := make(chan struct{})
++			go func() {
++				if phase == "prepare" {
++					_ = app.prepareCompletedRetirementFor(owner)
++				} else {
++					app.completeRetirementFor(a)
++				}
++				close(done)
++			}()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				t.Fatal("C await not entered")
++			}
++			next := &AppPlayer{}
++			nextOp := &contentOperation{Owner: next}
++			nextAttempt := &retirementAttempt{owner: next}
++			app.moveCustodyMu.Lock()
++			app.startCustody, app.retirementPending = nextOp, nextAttempt
++			app.openedWriterOwner = next
++			app.openedWriterGeneration++
++			generation := app.openedWriterGeneration
++			app.moveCustodyMu.Unlock()
++			once.Do(func() { close(release) })
++			select {
++			case <-done:
++			case <-time.After(time.Second):
++				t.Fatal("old await did not join")
++			}
++			if app.moveCustodyUnknown || app.startCustody != nextOp || app.retirementPending != nextAttempt || app.openedWriterOwner != next || app.openedWriterGeneration != generation {
++				t.Fatal("late old C receipt cleared or poisoned the successor")
++			}
++		})
++	}
++}
 diff --git a/player/start35.go b/player/start35.go
-index 09928bf..2d663c6 100644
 --- a/player/start35.go
 +++ b/player/start35.go
-@@ -2,6 +2,7 @@ package player
+@@ -2,6 +2,7 @@
  
  import (
  	"context"
@@ -739,10 +1407,11 @@ index 09928bf..2d663c6 100644
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/output"
-@@ -10,6 +11,22 @@ import (
+@@ -9,6 +10,22 @@
+ 	"sync"
  	"time"
  )
- 
++
 +type start35VerificationError string
 +
 +func (e start35VerificationError) Error() string { return string(e) }
@@ -758,11 +1427,10 @@ index 09928bf..2d663c6 100644
 +	}
 +	return "worker_failed"
 +}
-+
+ 
  type start35Command struct {
  	ctx                context.Context
- 	phase              string
-@@ -66,7 +83,7 @@ func (p *Player) VerifyStart35(ctx context.Context, expected librespot.AudioSour
+@@ -66,7 +83,7 @@
  // exact requested pause state, source and writer survived C COMPLETE.
  func (p *Player) VerifyStart35Prepared(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, paused bool, ordinal uint64, guard output.TransportGuard) error {
  	if ordinal == 0 || ordinal > 9007199254740991 {
@@ -771,7 +1439,7 @@ index 09928bf..2d663c6 100644
  	}
  	return p.verifyStart35(ctx, expected, pipe, epoch, writerFD, paused, ordinal, guard)
  }
-@@ -141,11 +158,28 @@ func (p *Player) applyStart35(command *start35Command, out *output.Output, sourc
+@@ -141,11 +158,28 @@
  				return e
  			}
  			defer lock.Unlock()
@@ -779,12 +1447,13 @@ index 09928bf..2d663c6 100644
 -				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD ||
 -				writer.FencedUnderStartLock() || writer.PausedUnderStartLock() != command.paused {
 -				return fmt.Errorf("start writer/source changed")
+-			}
 +			if command.ctx.Err() != nil {
 +				return command.ctx.Err()
 +			}
 +			if source.source[source.which] != command.expected {
 +				return start35VerificationError("source_changed")
- 			}
++			}
 +			if identity != command.pipe {
 +				return start35VerificationError("pipe_changed")
 +			}
@@ -805,10 +1474,9 @@ index 09928bf..2d663c6 100644
  		})
  		if err == nil && command.initialLoadOrdinal != 0 {
 diff --git a/player/start35_verify_test.go b/player/start35_verify_test.go
-index 2d1c78b..1b9e29e 100644
 --- a/player/start35_verify_test.go
 +++ b/player/start35_verify_test.go
-@@ -106,14 +106,15 @@ func TestStart35HeldCCompleteCannotCreditClosedWriter(t *testing.T) {
+@@ -106,14 +106,15 @@
  		pipe   output.PipeIdentity
  		epoch  string
  		fd     string
@@ -829,7 +1497,7 @@ index 2d1c78b..1b9e29e 100644
  			t.Fatal("stale source/FIFO/epoch/FD credited")
  		}
  	}
-@@ -240,8 +241,8 @@ func TestStart35HeldCCompleteCannotCreditNaturalEOFPause(t *testing.T) {
+@@ -240,8 +241,8 @@
  		t.Fatal(err)
  	}
  	credited := false
@@ -841,13 +1509,13 @@ index 2d1c78b..1b9e29e 100644
  }
  
 diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
-index 368bb12..bda0825 100644
 --- a/spclient/context_resolver.go
 +++ b/spclient/context_resolver.go
-@@ -13,6 +13,17 @@ import (
+@@ -12,6 +12,17 @@
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
  	"golang.org/x/exp/maps"
  )
- 
++
 +// ContextPageStatusError preserves the page response classification without
 +// treating a context failure as authority for any different current track.
 +type ContextPageStatusError struct {
@@ -858,11 +1526,10 @@ index 368bb12..bda0825 100644
 +func (e *ContextPageStatusError) Error() string {
 +	return fmt.Sprintf("invalid status code from page at %s: %d", e.URL, e.StatusCode)
 +}
-+
+ 
  type ContextResolver struct {
  	log librespot.Logger
- 
-@@ -122,7 +133,7 @@ func (r *ContextResolver) loadPage(ctx context.Context, url string) (*connectpb.
+@@ -122,7 +133,7 @@
  	defer func() { _ = resp.Body.Close() }()
  
  	if resp.StatusCode != 200 {
@@ -872,10 +1539,9 @@ index 368bb12..bda0825 100644
  
  	respBytes, err := io.ReadAll(resp.Body)
 diff --git a/tracks/paged-list.go b/tracks/paged-list.go
-index 054e3fe..8e44910 100644
 --- a/tracks/paged-list.go
 +++ b/tracks/paged-list.go
-@@ -71,6 +71,8 @@ type pagedList[T any] struct {
+@@ -71,6 +71,8 @@
  	pages librespot.PageResolver[T]
  	list  []pagedListItem[T]
  	pos   int
@@ -884,10 +1550,12 @@ index 054e3fe..8e44910 100644
  }
  
  func newPagedList[T any](log librespot.Logger, pages librespot.PageResolver[T]) *pagedList[T] {
-@@ -102,6 +104,15 @@ func (l *pagedList[T]) moveStart(ctx context.Context) error {
- 	return nil
- }
+@@ -100,6 +102,15 @@
  
+ 	l.pos = 0
+ 	return nil
++}
++
 +// moveInjected preserves cached context entries but never assigns the supplied
 +// track a context-page position. The original failed page is not retried by
 +// immediate publication or a detached observation on this prepared list.
@@ -895,12 +1563,10 @@ index 054e3fe..8e44910 100644
 +	l.list = append([]pagedListItem[T]{{item, -1, -1}}, l.list...)
 +	l.pos = 0
 +	l.injectedFetchErr = fetchErr
-+}
-+
+ }
+ 
  func (l *pagedList[T]) move(iter *pagedListInterator[T]) {
- 	if iter.err != nil {
- 		panic("cannot move to errored paged list iterator")
-@@ -182,6 +193,9 @@ func (l *pagedList[T]) fetchNextPage(ctx context.Context) (int, error) {
+@@ -182,6 +193,9 @@
  		pageIdx = curr.pageIdx + 1
  	}
  
@@ -911,10 +1577,9 @@ index 054e3fe..8e44910 100644
  	if err != nil {
  		return pageIdx, err
 diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
-index ea4e3f0..39550b6 100644
 --- a/tracks/room_transport_test.go
 +++ b/tracks/room_transport_test.go
-@@ -6,7 +6,10 @@ import (
+@@ -6,7 +6,10 @@
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
@@ -925,7 +1590,7 @@ index ea4e3f0..39550b6 100644
  	"testing"
  )
  
-@@ -150,3 +153,120 @@ func TestAutoplayHistoryFailureIsNotCompleteRecentHistory(t *testing.T) {
+@@ -150,3 +153,120 @@
  		t.Fatalf("partial history was reported complete: %d %v", len(rows), err)
  	}
  }
@@ -1047,10 +1712,9 @@ index ea4e3f0..39550b6 100644
 +	}
 +}
 diff --git a/tracks/tracks.go b/tracks/tracks.go
-index f01c862..3325363 100644
 --- a/tracks/tracks.go
 +++ b/tracks/tracks.go
-@@ -2,14 +2,17 @@ package tracks
+@@ -2,14 +2,17 @@
  
  import (
  	"context"
@@ -1068,10 +1732,12 @@ index f01c862..3325363 100644
  )
  
  type List struct {
-@@ -60,6 +63,49 @@ func (tl *List) TrySeek(ctx context.Context, f func(track *connectpb.ContextTrac
- 	return nil
- }
+@@ -58,6 +61,49 @@
+ 	}
  
+ 	return nil
++}
++
 +// SeekTransferred keeps the authenticated dealer's supplied current track when
 +// a later context page is unavailable. It never substitutes cached first media.
 +// The bool distinguishes a detached track so callers cannot claim shuffled
@@ -1113,12 +1779,10 @@ index f01c862..3325363 100644
 +	}
 +	tl.tracks.moveInjected(detached, err)
 +	return true, nil
-+}
-+
+ }
+ 
  func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) error {
- 	tl.invalidateQueueObservation()
- 	iter := tl.tracks.iterStart()
-@@ -184,6 +230,9 @@ func (tl *List) Index() *connectpb.ContextIndex {
+@@ -184,6 +230,9 @@
  	}
  
  	curr := tl.tracks.get()
@@ -1128,14 +1792,14 @@ index f01c862..3325363 100644
  	return &connectpb.ContextIndex{Page: uint32(curr.pageIdx), Track: uint32(curr.itemIdx)}
  }
  
-@@ -320,6 +369,10 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
+@@ -318,6 +367,10 @@
+ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
+ 	if shuffle == tl.shuffled {
  		return nil
- 	}
- 
-+	if tl.tracks.injectedFetchErr != nil {
-+		return fmt.Errorf("cannot shuffle unavailable transferred context: %w", tl.tracks.injectedFetchErr)
 +	}
 +
++	if tl.tracks.injectedFetchErr != nil {
++		return fmt.Errorf("cannot shuffle unavailable transferred context: %w", tl.tracks.injectedFetchErr)
+ 	}
+ 
  	tl.invalidateQueueObservation()
- 	if shuffle {
- 		// fetch all tracks

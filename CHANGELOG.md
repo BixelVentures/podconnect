@@ -1,3 +1,14 @@
+## Speakers 0.26.51
+
+- Apply the retirement-only correction for an exact failed, C-completed START
+  before its Native writer closes. A failed initial load receives no playback credit.
+- Preserve UNKNOWN refusal, current-owner/writer-generation fences and the existing
+  prepare → writer close/join → complete contract. C runtime, manager and Control21
+  remain unchanged; no EOF allowance, retry or automatic playback is added.
+- Reviewed causal regression covers the actual failure defer, C retirement, joined
+  writer teardown and a later same-App writer. Official CI and physical acceptance
+  remain open. Root owns the combined PodVoice82/Speakers51 delivery.
+
 ## Speakers 0.26.50
 
 - Add finite diagnostics to the existing final START custody verifier; preserve

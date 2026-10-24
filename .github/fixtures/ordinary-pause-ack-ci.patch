@@ -1,8 +1,7 @@
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
-index 74f9635..803dda4 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
-@@ -45,6 +45,8 @@ static int fixture_service_bind(struct net_socket *socket, unsigned short *port,
+@@ -45,6 +45,8 @@
  #include "../src/outputs/streaming.c"
  #include "../src/player.c"
  #undef db_speaker_save
@@ -11,7 +10,7 @@ index 74f9635..803dda4 100644
  
  /* The input command closes its real old reader before opening the successor.
   * Schedule the pipe watcher's independent reset-close in that exact interval.
-@@ -595,6 +597,7 @@ struct recovery_wire_fixture {
+@@ -595,6 +597,7 @@
  
  static struct recovery_wire_fixture *active_recovery_wire;
  static bool recovery_receiver_entropy, recovery_salt_red;
@@ -19,7 +18,7 @@ index 74f9635..803dda4 100644
  static int start_partial_writes,start_partial_bytes;
  int __real_evbuffer_write(struct evbuffer *,int);
  int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
-@@ -785,6 +788,13 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+@@ -785,6 +788,13 @@
      if(f->mode==9 && f->volumes==2)code=503;
      if(f->mode==12)cseq++;
      if(f->mode==13)code=503;
@@ -33,7 +32,7 @@ index 74f9635..803dda4 100644
    } else if(!strncmp(header,"TEARDOWN ",9)) {
      enum output_attention_recovery_state state;struct output_attention_proof proof;
      f->teardowns++;
-@@ -1166,7 +1176,10 @@ int main(int argc, char **argv)
+@@ -1166,7 +1176,10 @@
    gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
    if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
      { recovery_salt_red = true; return recovery_wire_case(0); }
@@ -45,10 +44,9 @@ index 74f9635..803dda4 100644
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index a5bc2e8..e437db7 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
-@@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
+@@ -195,6 +195,415 @@
        assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
        puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
  }
@@ -464,7 +462,7 @@ index a5bc2e8..e437db7 100644
  /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
   * success. Admission alone cannot retain; only the exact post-effect receipt. */
  static void confirmed_pause_custody_case(struct output_device *device,
-@@ -252,6 +661,7 @@ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -252,6 +661,7 @@
      assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
      assert(transport_pause_owned(1));
    }
@@ -472,10 +470,12 @@ index a5bc2e8..e437db7 100644
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -312,6 +722,101 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
+@@ -310,6 +720,115 @@
+   assert(signal(SIGPIPE,prior_signal)!=SIG_ERR);
+   close(writer);
    puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
- }
- 
++}
++
 +/* The existing real AP2/FIFO fixture also accepts the actual Native test
 + * process over loopback. Only the HTTP backend adapter is test code: the linked
 + * strict production handler and synchronous player owner execute every step. */
@@ -483,7 +483,7 @@ index a5bc2e8..e437db7 100644
 +  struct recovery_wire_fixture *fixture;
 +  struct event_base *http_base;
 +  struct evhttp *http;
-+  atomic_bool done,completed;
++  atomic_bool done,completed,retired;
 +};
 +static void native_start_http(struct evhttp_request *request,void *arg)
 +{
@@ -508,19 +508,25 @@ index a5bc2e8..e437db7 100644
 +    assert(path);
 +    while((part=strsep(&rest,"/")) && count<ARRAY_SIZE(actual.path_parts)-1)
 +      if(*part)actual.path_parts[count++]=part;
-+    bool result=count==6 && !strcmp(actual.path_parts[4],"result");
-+    if((count==5 || result) && !strcmp(actual.path_parts[0],"api")
++    bool retirement=count>=6 && !strcmp(actual.path_parts[4],"retire");
++    bool result=retirement ? count==7 && !strcmp(actual.path_parts[5],"result")
++      : count==6 && !strcmp(actual.path_parts[4],"result");
++    if((count==5 || result || (retirement && count==6)) && !strcmp(actual.path_parts[0],"api")
 +        && !strcmp(actual.path_parts[1],"outputs") && !strcmp(actual.path_parts[2],"1")
 +        && !strcmp(actual.path_parts[3],"start")
 +        && evhttp_request_get_command(request)==(result?EVHTTP_REQ_GET:EVHTTP_REQ_POST)){
++      const char *pattern=retirement ? (result?"/retire/result/":"/retire/(prepare|")
++        : (result?"/start/result/":"/start/(state|");
 +      for(struct httpd_uri_map *route=httpd_jsonapi.handlers;route->regexp;route++){
-+        if(strstr(route->regexp,result?"/start/result/":"/start/(state|")){
++        if(strstr(route->regexp,pattern)){
 +          status=route->handler(&actual);break;
 +        }
 +      }
 +    }
 +    if(status==200 && count==5 && !strcmp(actual.path_parts[4],"complete"))
 +      atomic_store(&wire->completed,true);
++    if(status==200 && retirement && count==6 && !strcmp(actual.path_parts[5],"complete"))
++      atomic_store(&wire->retired,true);
 +    fprintf(stderr,"ACTUAL Native→C %s status=%d body=%.*s\n",uri,status,
 +      (int)evbuffer_get_length(response),(char *)evbuffer_pullup(response,-1));
 +    evhttp_send_reply(request,status,status==200?"OK":"Rejected",response);
@@ -539,7 +545,15 @@ index a5bc2e8..e437db7 100644
 +  struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
 +  struct timeval soon={0,1000};(void)fd;(void)events;
 +  if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
-+  if(!atomic_load(&wire->completed) || !start_active
++  if(atomic_load(&wire->retired)){
++    if(!atomic_load(&wire->completed) || start_active || outputs_start_source_owned()
++        || start_journal_retirement_outcome!=OUTPUT_RETIRE_RETIRED_KNOWN
++        || !outputs_start_gate_closed() || !start_retired_stage_ready
++        || f->device->selected || f->device->session || f->volumes!=1){
++      recovery_wire_fail(f,"failed Native START did not retire exact C source and stage fresh reader");return;
++    }
++    puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
++  }else if(!atomic_load(&wire->completed) || !start_active
 +      || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
 +      || !f->device->session || f->device->volume!=35 || f->volumes!=1){
 +    recovery_wire_fail(f,"actual Native did not finish after real C COMPLETED/route35");return;
@@ -569,15 +583,14 @@ index a5bc2e8..e437db7 100644
 +  event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
 +  evhttp_free(wire.http);event_base_free(wire.http_base);
 +  commands_base_free(cmdbase);cmdbase=NULL;
-+}
-+
+ }
+ 
  static int start35_wire_case(int mode)
- {
-   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-@@ -345,6 +850,17 @@ static int start35_wire_case(int mode)
+@@ -344,6 +863,17 @@
+     sqlite3 *shift=NULL;assert(sqlite3_open(database,&shift)==SQLITE_OK);
      char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
      assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
-   }
++  }
 +  if(mode==29){
 +    keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
 +    airplay_control_svc.socket.fd4=f.udp_fd;
@@ -588,11 +601,10 @@ index a5bc2e8..e437db7 100644
 +    pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
 +    pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
 +    native_start_wire_run(&f,fifo);goto cleanup;
-+  }
+   }
    if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
      struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
-     struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
-@@ -384,7 +900,8 @@ static int start35_wire_case(int mode)
+@@ -384,7 +914,8 @@
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -602,7 +614,7 @@ index a5bc2e8..e437db7 100644
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -431,7 +948,10 @@ static int start35_wire_case(int mode)
+@@ -431,7 +962,10 @@
        struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -614,7 +626,7 @@ index a5bc2e8..e437db7 100644
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
-@@ -1043,7 +1563,11 @@ static int start35_wire_case(int mode)
+@@ -1043,7 +1577,11 @@
    }
    if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
   cleanup:
@@ -628,10 +640,9 @@ index a5bc2e8..e437db7 100644
    if(input_ready)input_deinit();
    if(worker_ready)worker_deinit();
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 2ea29b0..29eac14 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -35,9 +35,50 @@ static void start_gate_strict_http(const struct output_start_request *r)
+@@ -35,9 +35,50 @@
    const char *cases[][2]={{"\"boot_id\":","\"unknown\":0,\"boot_id\":"},{"\"pid\":","\"pid\":\"1\",\"pid\":"},{"\"homepod_id\":","\"homepod_id\":\"1\",\"homepod_id\":"},{"\"room_id\":","\"unknown\":0,\"room_id\":"},{"\"native_revision\":\"100\"","\"native_revision\":true"},{"\"start_volume_percent\":35","\"start_volume_percent\":\"35\""}};
    for(size_t i=0;i<ARRAY_SIZE(cases);i++){changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);}
    changed=malloc(strlen(raw)+4);sprintf(changed,"%s {}",raw);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);
@@ -682,7 +693,7 @@ index 2ea29b0..29eac14 100644
    puts("PASS actual START HTTP state5/8 prepare12/common27; nested process/owner duplicate and unknown keys, wrong types/trailing JSON reject before admission");
  }
  static int start_gate_unused_volume(struct output_device *d,const struct output_room_volume_result *r)
-@@ -60,15 +101,35 @@ static struct output_start_request start_gate_fixture_request(const char *path,c
+@@ -60,15 +101,35 @@
    strcpy(r.expected_input_path,path);strcpy(r.policy_revision,OUTPUT_START_POLICY);
    gcry_md_hash_buffer(GCRY_MD_SHA256,hash,path,strlen(path));for(i=0;i<32;i++)sprintf(r.expected_input_path_digest+2*i,"%02x",hash[i]);return r;
  }
@@ -720,7 +731,7 @@ index 2ea29b0..29eac14 100644
    assert(start_process_current(process)==!expect_retired);
    d=outputs_device_get(1);assert(d && !d->selected);
    outputs_device_select(d,-1);assert(!d->selected);
-@@ -77,12 +138,39 @@ static void start_gate_process_successor(const struct output_native_process *pro
+@@ -77,12 +138,39 @@
    assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
    struct output_transport_identity route;bool busy,start_owned,clean_absent;
    assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
@@ -761,7 +772,7 @@ index 2ea29b0..29eac14 100644
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -92,6 +180,7 @@ static void exact_start_durable_gate(void)
+@@ -92,6 +180,7 @@
    assert(pipe(pipes)==0);native=fork();assert(native>=0);
    if(!native){close(pipes[1]);char byte;(void)read(pipes[0],&byte,1);_exit(0);}
    close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
@@ -769,7 +780,7 @@ index 2ea29b0..29eac14 100644
    struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
    /* Both pre-open unknown and a post-open/completed record must keep a restarted
     * C owner shut while the distinct, actually live native process remains. */
-@@ -114,11 +203,15 @@ static void exact_start_durable_gate(void)
+@@ -114,11 +203,15 @@
        sqlite3_close(hdl);_exit(0);
      }
      assert(waitpid(owner,&status,0)==owner && WIFEXITED(status) && WEXITSTATUS(status)==0);
@@ -787,10 +798,11 @@ index 2ea29b0..29eac14 100644
    assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    /* Conditional journal replacement cannot steal a newer transaction. */
    struct db_start_guard retained={0},wrong={0};assert(db_start_guard_load(&retained)==1);wrong=retained;memset(wrong.token,'f',32);
-@@ -127,5 +220,5 @@ static void exact_start_durable_gate(void)
+@@ -127,5 +220,5 @@
    assert(db_start_guard_save(&retained,&retained)<0);
    assert(attention_sql(sqlite3_mprintf("PRAGMA synchronous=FULL"))==0);free(retained.payload);
    clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);
 -  puts("PASS actual file-backed C owner successor processes: unknown/post-open/completed retain quarantine with live old native process; actual process retirement does not open gate; conditional/FULL journal failures reject");
+-}
 +  puts("PASS file-backed C successors: live old Native rejects fresh START; actual old Native death with replaced saved PID namespace retains valid quarantine and denies fresh START; same namespace actual death or different saved kernel boot permits guarded START prepare/commit without generic selection; conditional/FULL journal failures reject");
- }
++}
