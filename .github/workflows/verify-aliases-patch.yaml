@@ -121,6 +121,9 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-retired-owner-detach-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/connect-retired-owner-detach-owntone.patch"
           git apply "$patch_dir/connect-retired-owner-detach-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/ordinary-pause-ack-owntone.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/ordinary-pause-ack-owntone.patch"
+          git apply "$patch_dir/ordinary-pause-ack-owntone.patch"
           # Fixture-only macro scope; no production OwnTone source or Docker image change.
           fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
@@ -135,6 +138,9 @@ jobs:
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-retired-owner-detach-ci.sha256" | sha256sum -c -
           git apply --check "$fixture_dir/connect-retired-owner-detach-ci.patch"
           git apply "$fixture_dir/connect-retired-owner-detach-ci.patch"
+          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/ordinary-pause-ack-ci.sha256" | sha256sum -c -
+          git apply --check "$fixture_dir/ordinary-pause-ack-ci.patch"
+          git apply "$fixture_dir/ordinary-pause-ack-ci.patch"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -160,6 +166,7 @@ jobs:
           sudo -n make check
           sudo -n src/outputs_attention_owner --deployed-uid-proc
           sudo -n src/airplay_callback_owner --queue-wire
+          sudo -n timeout 25 src/airplay_callback_owner --move-pause-resume-wire
           sudo -n src/airplay_callback_owner --queue-connect-wire
           sudo -n src/airplay_callback_owner --move-retire-wire
           sudo -n src/airplay_callback_owner --move-retire-live-wire

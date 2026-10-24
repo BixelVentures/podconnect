@@ -108,6 +108,25 @@ func (l *glLive) nativeManualSupported() bool {
 	defer l.mu.Unlock()
 	return l.manualObservation != nil
 }
+
+// Current bound-contract capability suppresses legacy effects only. It is not
+// route proof, permission to dispatch, or acknowledgement of a Native command.
+func (l *glLive) nativeBoundTransportSupportedLocked(intent glTransportIntent) bool {
+	observed := l.manualObservation
+	return observed != nil && !l.sourceRetired && observed.Identity.valid() &&
+		observed.Run == l.runEpoch && observed.Phase == l.phaseEpoch &&
+		observed.AliasRevision == l.aliasRevision && observed.Alias == l.st.SelAlias &&
+		sameAliasBinding(&observed.Binding, l.st.AliasBinding) && observed.Binding.valid() &&
+		intent.run == l.runEpoch && intent.phase == l.phaseEpoch &&
+		intent.aliasRevision == l.aliasRevision && intent.transportRevision == l.transportRevision && intent.alias == l.st.SelAlias
+}
+func (l *glLive) nativeBoundTransportSupported(intent glTransportIntent) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.observeStopLocked()
+	return l.nativeBoundTransportSupportedLocked(intent)
+}
+
 func (l *glLive) admitManualEventLocked(data map[string]any) {
 	l.observeStopLocked()
 	if l.sourceRetired || l.st.AliasBinding == nil || !l.st.AliasBinding.valid() {

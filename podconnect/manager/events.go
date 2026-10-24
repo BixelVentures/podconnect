@@ -95,6 +95,9 @@ func (l *glLive) admitTransport(intent glTransportIntent, current *transState, n
 		intent.alias != l.st.SelAlias || (l.st.AliasBinding != nil && !l.st.AliasBinding.valid()) {
 		return false
 	}
+	if l.nativeBoundTransportSupportedLocked(intent) {
+		return false
+	}
 	*current = next
 	return true
 }

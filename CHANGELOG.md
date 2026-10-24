@@ -1,3 +1,13 @@
+## Speakers 0.26.45 — acknowledge current pause without transport feedback
+
+- Acknowledge an exact consumed ordinary bound Pause without granting protected START resource retention; preserve current route, custody, expiry and unknown-owner guards.
+- Retain only the proved completed MOVE owner during a bound Pause; reject a changed writer, reader, route, custody or successor.
+- Carry the same paused START/MOVE owner through an exact successful volume operation, including a held delayed-stop race; failed, drained or unknown operations gain no owner or replay authority.
+- Preserve an exact bound Resume owner across an already armed STOP until actual PCM restarts playback and cancels that timer; foreign or changed owners cannot inherit retention.
+- Keep the current Native bound transport as the logical play/pause owner. Suppress the legacy C/Spotify feedback loop when that capability is present, and log acknowledgement only after successful legacy HTTP completion.
+- Correct the existing Native START fixture to join its original asynchronous missing-writer cancellation before asserting replay adds no requests. Native production patch hunks and Control0.10.21 stay unchanged.
+- Cover the ordinary same-writer pause, real delayed STOP and PCM/AP2 resume in the existing C receiver fixture. Physical sound/volume/timeline acceptance remains pending; software proof alone is not an audible result.
+
 ## Speakers 0.26.44 — retire closed routes before the next Connect
 
 - Complete exact protected START retirement in the same C process: revoke only its old selected route and custody, retain the durable journal and replay guards, and admit the next normal FIFO source without starting or autoselecting an output before the current room is primed and selected.

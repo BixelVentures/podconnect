@@ -1,0 +1,483 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -595,6 +595,7 @@
+ 
+ static struct recovery_wire_fixture *active_recovery_wire;
+ static bool recovery_receiver_entropy, recovery_salt_red;
++static bool completed_move_real_resume;
+ static int start_partial_writes,start_partial_bytes;
+ int __real_evbuffer_write(struct evbuffer *,int);
+ int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
+@@ -785,6 +786,13 @@
+     if(f->mode==9 && f->volumes==2)code=503;
+     if(f->mode==12)cseq++;
+     if(f->mode==13)code=503;
++  } else if(!strncmp(header,"FLUSH ",6)) {
++    /* Only the mode17 adapter or explicit mode24 real-resume flag drives PCM.
++     * Keep the encrypted matching-CSeq reply and reject an invented flush. */
++    if((f->mode!=17 && !(f->mode==24 && completed_move_real_resume))
++        || (f->mode==17 && f->phase!=4) || bytes || !f->device->session
++        || !strstr(header,"\r\nRTP-Info: seq="))
++      {recovery_wire_fail(f,"unexpected ordinary FLUSH");goto done;}
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+     f->teardowns++;
+@@ -1167,6 +1175,8 @@
+   if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
+     { recovery_salt_red = true; return recovery_wire_case(0); }
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
++  if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
++    { completed_move_real_resume=true; return start35_wire_case(24); }
+   if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -195,6 +195,415 @@
+       assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
+       puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
+ }
++/* Volume serializes the same actor, but never changes its paused timeline. */
++static void paused_owner_volume_case(struct output_device *device,
++    const struct output_native_owner *owner,uint64_t revision)
++{
++  void *session=device->session;uint64_t epoch=device->session_epoch;
++  for (int unknown=0;unknown<2;unknown++) {
++    struct output_room_volume_request request={.device_id=device->id,.bound=true,
++      .percent=device->volume,.native_revision=revision+unknown};
++    struct output_room_volume_result prepared,result;bool busy;
++    assert(transport_pause_owned(device->id));request.native_owner=*owner;
++    memset(request.native_prepare_id,'1'+unknown,32);memset(request.args_digest,'3'+unknown,64);
++    assert(outputs_room_volume_bound_state_get(device->id,owner,&request.expected_identity,
++      &request.expected_volume_state,&busy)==0 && !busy);
++    strcpy(request.expected_input_path_digest,request.expected_identity.input_path_digest);
++    assert(outputs_room_volume_prepare(&request,&prepared)==0);request=prepared.command;
++    memset(request.native_reservation_id,'5'+unknown,32);
++    assert(outputs_room_volume_commit(&request,&result)==0
++      && (result.outcome==ROOM_VOLUME_PENDING || result.outcome==ROOM_VOLUME_ADMITTED_PENDING));
++    assert(transport_pause_retained && transport_pause_revision==request.native_revision);
++    assert(room_volume_undrained() && transport_pause_owned(device->id));
++    assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);
++    stop_timer_cb(0,0,device); /* Exact armed STOP arrives while own volume is held. */
++    assert(device->session==session && device->session_epoch==epoch && transport_pause_owned(device->id)
++      && event_pending(device->stop_timer,EV_TIMEOUT,NULL));event_del(device->stop_timer);
++    if(unknown) {
++      while(!result.possible_effect && !result.contexts_drained) {
++        assert(event_base_loop(evbase_player,EVLOOP_ONCE)==0);
++        assert(outputs_room_volume_result_get(request.token,&result)==0);
++      }
++      assert(result.possible_effect && !result.contexts_drained);
++      assert(outputs_room_volume_cancel(request.token,request.native_reservation_id,&result)==0
++        && result.outcome==ROOM_VOLUME_UNKNOWN && transport_pause_owned(device->id));
++    }
++    while(!result.contexts_drained) {
++      assert(event_base_loop(evbase_player,EVLOOP_ONCE)==0);
++      assert(outputs_room_volume_result_get(request.token,&result)==0);
++    }
++    assert(result.outcome==(unknown?ROOM_VOLUME_UNKNOWN:ROOM_VOLUME_PROTOCOL_ACCEPTED));
++    assert(transport_pause_owned(device->id) && device->session==session);
++    assert(outputs_room_volume_commit(&request,&result)<0); /* Neither accepted nor unknown can replay. */
++  }
++  /* A USED but already-drained slot must not borrow an unrelated live context. */
++  struct room_volume_slot saved=room_volume_slots[ROOM_VOLUME_SLOTS-1];
++  struct room_volume_slot *foreign=&room_volume_slots[ROOM_VOLUME_SLOTS-1];
++  assert(!foreign->result.command.token[0]);memset(foreign,0,sizeof(*foreign));
++  memset(foreign->result.command.token,'f',32);foreign->used=true;foreign->result.command.bound=true;
++  foreign->result.command.native_owner=*owner;strcpy(foreign->result.command.native_owner.session_id,"foreign-pending-context");
++  foreign->result.command.native_revision=transport_pause_revision;
++  foreign->result.identity=transport_pause_identity;
++  assert(room_volume_undrained()
++    && !room_volume_pause_custody_current(owner,&transport_pause_identity,transport_pause_revision));
++  if(start_active->result.command.move_existing_session) {
++    assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  }
++  *foreign=saved;
++  if(start_active->result.command.move_existing_session) {
++    struct output_transport_request pause={.device_id=device->id,.bound=true,.percent=-1,.native_revision=revision+2};
++    struct output_transport_result prepared,result;pause.native_owner=*owner;strcpy(pause.action,"pause");
++    memset(pause.native_prepare_id,'e',32);memset(pause.args_digest,'d',64);
++    strcpy(pause.expected_input_path_digest,transport_pause_identity.input_path_digest);
++    assert(!transport_pause_owned(device->id)); /* Clearing the foreign context never revives old retention. */
++    assert(outputs_transport_prepare(&pause,&prepared)==0);pause=prepared.command;
++    assert(outputs_transport_commit(&pause,&result)==0);
++    assert(outputs_transport_pause_confirm(device->id,pause.token,pause.native_prepare_id,pause.native_revision)==0
++      && transport_pause_owned(device->id));
++  }
++  puts("PASS paused exact owner survives actual volume ACK, held-volume armed STOP and terminal UNKNOWN without replay; drained USED slot cannot borrow foreign pending context");
++}
++
++/* Resume admission is not yet PCM: retain only the same already-paused owner. */
++static void resume_pause_carry_case(struct output_device *device,const struct output_native_owner *owner)
++{
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1};
++  struct output_transport_result prepared,result;struct output_transport_identity route;
++  uint64_t revision=transport_custody_revision;void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(transport_identity_get(device->id,&route)==0);
++  for(int mode=0;mode<4;mode++) {
++    assert(transport_pause_owned(device->id));
++    request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++    strcpy(request.action,"resume");memset(request.native_prepare_id,'0'+mode,32);memset(request.args_digest,'a',64);
++    strcpy(request.expected_input_path_digest,route.input_path_digest);
++    if(mode==1)strcpy(request.native_owner.session_id,"foreign-resume-context");
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    if(mode==2)device->session_epoch++;
++    if(mode==3) {
++      struct timespec deadline;struct input_fifo_identity reader={0};input_stop();
++      clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++      assert(input_fifo_owner_get(route.input_item_id,start_active->result.command.expected_input_path,false,0,0,&deadline,&reader)<0);
++    }
++    int accepted=outputs_transport_commit(&request,&result);
++    if(mode<2)assert(accepted==0);else assert(accepted<0);
++    if(mode==0) {
++      assert(transport_pause_retained && transport_pause_revision==request.native_revision
++        && transport_pause_owned(device->id));
++      assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);stop_timer_cb(0,0,device);
++      assert(device->session==session && device->session_epoch==epoch && transport_pause_owned(device->id)
++        && event_pending(device->stop_timer,EV_TIMEOUT,NULL));event_del(device->stop_timer);
++    }else {
++      assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++      if(mode==2)device->session_epoch--;
++      if(mode==3) {
++        struct timespec deadline;clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++        assert(input_start_fifo_exact(route.input_item_id,start_active->result.command.expected_input_path,&deadline)>=0);
++      }
++      assert(outputs_transport_commit(&request,&result)<0 && !transport_pause_owned(device->id));
++      request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++      strcpy(request.action,"pause");memset(request.native_prepare_id,'a'+mode,32);
++      assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++      assert(outputs_transport_commit(&request,&result)==0);
++      assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0
++        && transport_pause_owned(device->id));
++    }
++  }
++  puts("PASS same-owner Resume admission retains armed STOP before PCM; foreign owner/changed route/lost reader cannot carry or replay old pause");
++}
++
++/* Completed MOVE retains only its exact real writer/reader/AP2 owner. */
++static void completed_move_pause_confirmation_case(struct output_device *device,
++    const struct output_native_owner *owner,int *writer)
++{
++  struct output_transport_identity route;bool busy,start_owned,clean_absent;
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1,.native_revision=41};
++  struct output_transport_result prepared,result;
++  assert(outputs_transport_bound_state_get(device->id,owner,&route,&busy,&start_owned,&clean_absent)==0
++    && !busy && !start_owned && !clean_absent && outputs_start_move_source_transition_current());
++  strcpy(request.action,"pause");memset(request.native_prepare_id,'7',32);
++  memset(request.args_digest,'8',64);request.native_owner=*owner;
++  strcpy(request.expected_input_path_digest,route.input_path_digest);
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)==0);
++  assert(transport_pause_retained && transport_pause_owned(device->id));
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)<0);
++  void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);
++  stop_timer_cb(0,0,device);
++  assert(device->session==session && device->session_epoch==epoch
++    && transport_pause_owned(device->id) && event_pending(device->stop_timer,EV_TIMEOUT,NULL));
++  event_del(device->stop_timer);
++  request.native_revision=42;request.native_prepare_id[0]='8';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  struct output_transport_request successor=request;
++  successor.native_revision=43;successor.native_prepare_id[0]='9';successor.token[0]=0;
++  assert(outputs_transport_prepare(&successor,&prepared)==0);successor=prepared.command;
++  assert(outputs_transport_commit(&successor,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,successor.token,successor.native_prepare_id,43)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,42)<0);
++  assert(transport_custody_current(owner,&route,43) && transport_pause_owned(device->id));
++  request.native_revision=44;request.native_prepare_id[0]='a';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  device->session_epoch++;
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,44)<0);
++  device->session_epoch--;
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,44)<0);
++  assert(!transport_pause_retained);
++  request.native_revision=45;request.native_prepare_id[0]='b';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,45)==0);
++  input_stop(); /* Existing FIFO command owner closes the real old reader. */
++  struct timespec deadline;struct input_fifo_identity reader={0};
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(route.input_item_id,start_active->result.command.expected_input_path,false,0,0,&deadline,&reader)<0);
++  assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  assert(input_start_fifo_exact(route.input_item_id,start_active->result.command.expected_input_path,&deadline)>=0);
++  assert(!transport_pause_owned(device->id)); /* Reader ABA never revives old retention. */
++  request.native_revision=46;request.native_prepare_id[0]='c';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,46)==0);
++  paused_owner_volume_case(device,owner,47);
++  resume_pause_carry_case(device,owner);
++  close(*writer);*writer=-1; /* Kernel-observed writer close retires retention. */
++  assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  puts("PASS completed MOVE Pause retains exact AP2 owner at delayed STOP; duplicate/old custody/changed session/reader loss/writer close cannot revive");
++}
++
++/* Ordinary Connect has a real current route/reader but no START retention. */
++static void ordinary_pause_confirmation_case(struct output_device *device,
++    const struct output_native_owner *owner)
++{
++  struct output_transport_identity route;bool busy,start_owned,clean_absent;
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1,.native_revision=41};
++  struct output_transport_result prepared,result;
++  assert(outputs_transport_bound_state_get(device->id,owner,&route,&busy,&start_owned,&clean_absent)==0
++    && !busy && !start_owned && clean_absent);
++  strcpy(request.action,"pause");memset(request.native_prepare_id,'7',32);
++  memset(request.args_digest,'8',64);request.native_owner=*owner;
++  strcpy(request.expected_input_path_digest,route.input_path_digest);
++  assert(outputs_transport_prepare(&request,&prepared)==0);strcpy(request.token,prepared.command.token);
++  assert(outputs_transport_commit(&request,&result)==0 && result.outcome==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)==0);
++  assert(!transport_pause_retained && !transport_pause_owned(device->id));
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)<0);
++  assert(!transport_pause_retained);
++  /* A later accepted command owns custody; the old completion cannot retain it. */
++  request.native_revision=42;request.native_prepare_id[0]='8';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  struct output_transport_request successor=request;
++  successor.native_revision=43;successor.native_prepare_id[0]='9';successor.token[0]=0;
++  strcpy(successor.action,"resume");
++  assert(outputs_transport_prepare(&successor,&prepared)==0);successor=prepared.command;
++  assert(outputs_transport_commit(&successor,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,42)<0);
++  assert(transport_custody_current(owner,&route,43) && !transport_pause_retained);
++  /* No delayed completion can cross route replacement, expiry or unknown START. */
++  for (int mode=0;mode<3;mode++) {
++    request.native_revision=44+mode;request.native_prepare_id[0]='a'+mode;request.token[0]=0;
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    assert(outputs_transport_commit(&request,&result)==0);
++    struct transport_slot *slot=transport_find(request.token);assert(slot);
++    struct timespec expiry=slot->expiry;
++    if(mode==0)device->session_epoch++;
++    if(mode==1)slot->expiry.tv_sec=0;
++    if(mode==2)start_startup_quarantine=true;
++    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++    if(mode==0)device->session_epoch--;
++    if(mode==1)slot->expiry=expiry;
++    if(mode==2)start_startup_quarantine=false;
++    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++    assert(!transport_pause_retained && !transport_pause_owned(device->id));
++  }
++  puts("PASS ordinary exact effect ACK without START retention; duplicate, successor custody, changed route, expired and unknown START confirmations cannot revive");
++}
++
++struct ordinary_resume_flow {
++  struct recovery_wire_fixture *fixture;
++  int writer,phase;pthread_t thread;atomic_bool done;ssize_t written;
++  struct player_source *source;struct input_fifo_identity reader;
++  bool retain;const struct output_native_owner *owner;void *session;
++  uint64_t epoch,route;struct timespec paused_at;
++  struct output_room_volume_request volume;struct output_room_volume_result volume_result;
++};
++static void *ordinary_resume_pcm(void *arg)
++{
++  struct ordinary_resume_flow *flow=arg;
++  char pcm[400000]={0};size_t offset=0;
++  while(offset<sizeof(pcm)) {
++    ssize_t n=write(flow->writer,pcm+offset,sizeof(pcm)-offset);
++    if(n<0 && errno==EINTR)continue;
++    if(n<=0)break;
++    offset+=n;
++  }
++  flow->written=offset;atomic_store(&flow->done,true);return NULL;
++}
++static void real_move_transport(struct ordinary_resume_flow *flow,const char *action,uint64_t revision)
++{
++  struct recovery_wire_fixture *f=flow->fixture;
++  struct output_transport_request q={.device_id=f->device->id,.bound=true,.percent=-1,.native_revision=revision};
++  struct output_transport_result prepared,result;q.native_owner=*flow->owner;
++  strcpy(q.action,action);memset(q.native_prepare_id,'7',32);memset(q.args_digest,'8',64);
++  strcpy(q.expected_input_path_digest,transport_input_path_digest);
++  assert(outputs_transport_prepare(&q,&prepared)==0);q=prepared.command;
++  assert(outputs_transport_commit(&q,&result)==0 && result.outcome==0);
++  if(!strcmp(action,"pause"))
++    assert(outputs_transport_pause_confirm(f->device->id,q.token,q.native_prepare_id,revision)==0
++      && transport_pause_owned(f->device->id));
++}
++static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct ordinary_resume_flow *flow=arg;struct recovery_wire_fixture *f=flow->fixture;
++  struct timeval soon={0,1000};(void)fd;(void)what;
++  if(flow->phase==-2 && atomic_load(&flow->done)) {
++    assert(!pthread_join(flow->thread,NULL) && flow->written==400000);
++    atomic_store(&flow->done,false);assert(pb_timer_start()==0);flow->phase=-1;
++  }else if(flow->phase==-1 && f->device->session
++      && ((struct airplay_session *)f->device->session)->state==AIRPLAY_STATE_STREAMING) {
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)==1);
++    if(flow->retain) {
++      real_move_transport(flow,"pause",10);
++      struct output_room_volume_request *v=&flow->volume;bool busy;
++      *v=(struct output_room_volume_request){.device_id=f->device->id,.bound=true,
++        .percent=f->device->volume,.native_revision=11,.native_owner=*flow->owner};
++      memset(v->native_prepare_id,'1',32);memset(v->args_digest,'3',64);
++      assert(outputs_room_volume_bound_state_get(f->device->id,flow->owner,&v->expected_identity,
++        &v->expected_volume_state,&busy)==0 && !busy);
++      strcpy(v->expected_input_path_digest,v->expected_identity.input_path_digest);
++      struct output_room_volume_result prepared;
++      assert(outputs_room_volume_prepare(v,&prepared)==0);*v=prepared.command;
++      memset(v->native_reservation_id,'5',32);
++      assert(outputs_room_volume_commit(v,&flow->volume_result)==0 && transport_pause_owned(f->device->id));
++      flow->phase=-3;
++    }else flow->phase=0;
++    puts("PASS pre-pause actual FIFO PCM reaches AP2 STREAMING and UDP peer");
++  }else if(flow->phase==-3) {
++    assert(outputs_room_volume_result_get(flow->volume.token,&flow->volume_result)==0
++      && transport_pause_owned(f->device->id));
++    if(flow->volume_result.contexts_drained) {
++      assert(flow->volume_result.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED
++        && f->device->session==flow->session && f->device->session_epoch==flow->epoch);
++      puts("PASS completed MOVE paused same-owner bound volume actual protocol ACK retains exact AP2 owner");
++      flow->phase=0;
++    }
++  }else if(flow->phase==0 && player_state==PLAY_PAUSED && !player_flush_pending) {
++    assert(f->device->session && event_pending(f->device->stop_timer,EV_TIMEOUT,NULL)
++      && f->device->stop_timer_session==f->device->session
++      && f->device->stop_timer_session_epoch==f->device->session_epoch);
++    assert(!clock_gettime(CLOCK_MONOTONIC,&flow->paused_at));flow->phase=1;
++  }else if(flow->phase==1) {
++    bool resume=!f->device->session;
++    if(flow->retain) {
++      struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
++      long elapsed=(now.tv_sec-flow->paused_at.tv_sec)*1000+(now.tv_nsec-flow->paused_at.tv_nsec)/1000000;
++      if(elapsed<10200)goto again;
++      struct timeval expires,now_tv;assert(!gettimeofday(&now_tv,NULL));
++      int pending=event_pending(f->device->stop_timer,EV_TIMEOUT,&expires);
++      assert(pending
++        && expires.tv_sec-now_tv.tv_sec>=8
++        && f->device->session==flow->session && f->device->session_epoch==flow->epoch
++        && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
++      puts("PASS real ten-second completed MOVE STOP timer rearms exact retained AP2 session after bound volume");
++      real_move_transport(flow,"resume",12);
++      /* The already-armed STOP may run after C ACK and before Native PCM. */
++      assert(event_pending(f->device->stop_timer,EV_TIMEOUT,NULL)
++        && f->device->stop_timer_session==flow->session
++        && f->device->stop_timer_session_epoch==flow->epoch);
++      stop_timer_cb(0,0,f->device);
++      assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
++        && ((struct airplay_session *)flow->session)->state!=AIRPLAY_STATE_TEARDOWN
++        && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
++      puts("PASS exact Resume C ACK retains same AP2 at already-armed STOP before first same-writer PCM");
++      resume=true;
++    }
++    if(resume) {
++      assert(f->device->selected && player_state==PLAY_PAUSED && pb_session.playing_now==flow->source);
++      if(!flow->retain) {
++        if(f->peer){bufferevent_free(f->peer);f->peer=NULL;}
++        pair_cipher_free(f->cipher);f->cipher=NULL;pair_setup_free(f->pair);f->pair=NULL;
++        evbuffer_drain(f->plain,evbuffer_get_length(f->plain));assert(!outputs_transport_busy());
++      }
++      char packet[2048];while(recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT)>0){}
++      assert(!pthread_create(&flow->thread,NULL,ordinary_resume_pcm,flow));flow->phase=2;
++    }
++  }else if(flow->phase==2 && atomic_load(&flow->done) && player_state==PLAY_PLAYING
++      && f->device->session
++      && ((struct airplay_session *)f->device->session)->state==AIRPLAY_STATE_STREAMING) {
++    struct timespec deadline;struct input_fifo_identity actual={0};
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)==1);
++    pb_timer_stop();assert(!pthread_join(flow->thread,NULL) && flow->written==400000);
++    clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++    assert(input_fifo_owner_get(flow->source->item_id,flow->source->path,false,0,0,&deadline,&actual)==0);
++    assert(actual.device==flow->reader.device && actual.inode==flow->reader.inode
++      && actual.epoch==flow->reader.epoch && pb_session.playing_now==flow->source
++      && f->device->selected && !transport_pause_retained);
++    if(flow->retain)assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
++      && f->device->route_revision==flow->route && outputs_start_move_source_transition_current());
++    else assert(start_route_clean_absent());
++    flow->phase=3;event_base_loopbreak(f->base);return;
++  }
++ again:
++  evtimer_add(f->poll,&soon);
++}
++static void ordinary_pause_resume_case(struct recovery_wire_fixture *f,int writer)
++{
++  struct ordinary_resume_flow flow={.fixture=f,.writer=writer,.source=pb_session.playing_now,.phase=-2};
++  struct timespec deadline;struct timeval soon={0,1000},bound={20,0};
++  assert(flow.source && player_state==PLAY_PLAYING && start_route_clean_absent());
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(flow.source->item_id,flow.source->path,false,0,0,&deadline,&flow.reader)==0);
++  int flags=fcntl(writer,F_GETFL);assert(flags>=0 && fcntl(writer,F_SETFL,flags&~O_NONBLOCK)==0);
++  /* Real absence of PCM crosses the existing playback callback's deficit
++   * boundary. Run its actual FLUSH and delayed-STOP before returning PCM. */
++  /* This existing wire fixture initializes only the AirPlay backend. Real
++   * playback additionally needs the normal outputs_init buffer allocation. */
++  for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) {
++    assert(!output_buffer.data[i].evbuf);
++    output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);
++  }
++  keep_alive_timer=evtimer_new(f->base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++  assert(!pthread_create(&flow.thread,NULL,ordinary_resume_pcm,&flow));
++  event_free(f->poll);f->poll=evtimer_new(f->base,ordinary_resume_poll,&flow);assert(f->poll);
++  assert(!evtimer_add(f->deadline,&bound) && !evtimer_add(f->poll,&soon));event_base_dispatch(f->base);
++  assert(!f->failed && flow.phase==3 && fcntl(writer,F_SETFL,flags)==0);
++  puts("PASS ordinary pause real deficit/FLUSH/delayed STOP then same-writer PCM resumes actual input callback/AP2 route with same reader epoch and loaded source");
++}
++
++static void completed_move_real_pause_resume_case(struct recovery_wire_fixture *f,int writer,
++    const struct output_native_owner *owner)
++{
++  struct db_queue_item *item=db_queue_fetch_byitemid(transport_input_item);assert(item);
++  session_start(source_create(item,0));free_queue_item(item,0);session_update_read_start(0);
++  player_tick_interval.tv_nsec=50000000;
++  pb_write_deficit_max=PLAYER_WRITE_BEHIND_MAX*1000000/player_tick_interval.tv_nsec; /* Existing player_init formula. */
++  pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++  pb_timer_ev=event_new(f->base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++  cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
++  int result=-1;assert(playback_start_bh(NULL,&result)==COMMAND_END && result==0);pb_timer_stop();
++  struct ordinary_resume_flow flow={.fixture=f,.writer=writer,.source=pb_session.playing_now,.phase=-2,
++    .retain=true,.owner=owner,.session=f->device->session,.epoch=f->device->session_epoch,.route=f->device->route_revision};
++  struct timespec deadline;struct timeval soon={0,1000},bound={20,0};
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(flow.source->item_id,flow.source->path,false,0,0,&deadline,&flow.reader)==0);
++  int flags=fcntl(writer,F_GETFL);assert(flags>=0 && fcntl(writer,F_SETFL,flags&~O_NONBLOCK)==0);
++  for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) {
++    assert(!output_buffer.data[i].evbuf);output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);
++  }
++  keep_alive_timer=evtimer_new(f->base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++  assert(!pthread_create(&flow.thread,NULL,ordinary_resume_pcm,&flow));
++  event_free(f->poll);f->poll=evtimer_new(f->base,ordinary_resume_poll,&flow);assert(f->poll);
++  assert(!evtimer_add(f->deadline,&bound) && !evtimer_add(f->poll,&soon));event_base_dispatch(f->base);
++  assert(!f->failed && flow.phase==3 && fcntl(writer,F_SETFL,flags)==0);
++  puts("PASS completed MOVE actual FIFO PCM→Pause→bound volume ACK→real ten-second STOP rearm→same-writer Resume PCM/UDP with SAME AP2 session/epoch/route and loaded input owner");
++  event_del(f->deadline);commands_base_free(cmdbase);cmdbase=NULL;
++  event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);
++}
++
+ /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
+  * success. Admission alone cannot retain; only the exact post-effect receipt. */
+ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -252,6 +661,7 @@
+     assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
+     assert(transport_pause_owned(1));
+   }
++  paused_owner_volume_case(device,owner,56);
+   struct start_slot *prior_start=start_active;
+   struct start_slot next_start=*prior_start;
+   next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
+@@ -384,7 +794,8 @@
+       struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
+         .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
+       proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
+-      queue_actual_same_reader(old,&r->old_native_owner,&proof,fifo);goto cleanup;
++      queue_actual_same_reader(old,&r->old_native_owner,&proof,fifo);
++      ordinary_pause_confirmation_case(old,&r->old_native_owner);goto cleanup;
+     }
+     assert(!start_journal.token[0]);
+     assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
+@@ -431,7 +842,10 @@
+       struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
+         .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
+       proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
+-      queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);goto cleanup;
++      queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);
++      if(completed_move_real_resume)completed_move_real_pause_resume_case(&f,writer,&r->committed_native_owner);
++      else completed_move_pause_confirmation_case(target,&r->committed_native_owner,&writer);
++      goto cleanup;
+     }
+     struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
+     struct output_transport_result stale_audio_result;
