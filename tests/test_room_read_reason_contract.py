@@ -86,6 +86,10 @@ finally:
         else:
             sys.modules["aiohttp"] = _original_aiohttp
 
+# Keep actual loaded identities after the scoped dependency patch restores modules.
+sys.modules[speakers.__name__] = speakers
+sys.modules[room.__name__] = room
+
 
 class Response:
     status = 409
