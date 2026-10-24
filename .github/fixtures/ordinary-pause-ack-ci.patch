@@ -45,7 +45,7 @@ index 74f9635..803dda4 100644
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index a5bc2e8..7504509 100644
+index a5bc2e8..e437db7 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
@@ -472,7 +472,7 @@ index a5bc2e8..7504509 100644
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -312,6 +722,95 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
+@@ -312,6 +722,101 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
    puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
  }
  
@@ -491,6 +491,12 @@ index a5bc2e8..7504509 100644
 +  const char *uri=evhttp_request_get_uri(request);
 +  struct evbuffer *response=evbuffer_new();
 +  assert(response);
++  /* Done seals test admission before the player event loop is stopped. A late
++   * Native cancellation must not synchronously wait on that stopped owner. */
++  if(atomic_load(&wire->done)){
++    evhttp_send_reply(request,409,"Fixture completed",response);
++    evbuffer_free(response);return;
++  }
 +  if(!strcmp(uri,"/fixture/done")){
 +    evbuffer_add_printf(response,"{}");
 +    evhttp_send_reply(request,200,"OK",response);
@@ -568,7 +574,7 @@ index a5bc2e8..7504509 100644
  static int start35_wire_case(int mode)
  {
    struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-@@ -345,6 +844,17 @@ static int start35_wire_case(int mode)
+@@ -345,6 +850,17 @@ static int start35_wire_case(int mode)
      char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
      assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
    }
@@ -586,7 +592,7 @@ index a5bc2e8..7504509 100644
    if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
      struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
      struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
-@@ -384,7 +894,8 @@ static int start35_wire_case(int mode)
+@@ -384,7 +900,8 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -596,7 +602,7 @@ index a5bc2e8..7504509 100644
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -431,7 +942,10 @@ static int start35_wire_case(int mode)
+@@ -431,7 +948,10 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -608,7 +614,7 @@ index a5bc2e8..7504509 100644
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
-@@ -1043,7 +1557,11 @@ static int start35_wire_case(int mode)
+@@ -1043,7 +1563,11 @@ static int start35_wire_case(int mode)
    }
    if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
   cleanup:
