@@ -55,12 +55,16 @@ def _item(value):
         artists = value.get("artists")
         if not isinstance(artists, list) or len(artists) > 20:
             raise ValueError("invalid artists")
-        labels = [_text(artist.get("name")) for artist in artists if isinstance(artist, dict)]
+        labels = [
+            _text(artist.get("name")) for artist in artists if isinstance(artist, dict)
+        ]
         if len(labels) != len(artists):
             raise ValueError("invalid artist")
     else:
         show = value.get("show")
-        labels = [_text(show["name"])] if isinstance(show, dict) and show.get("name") else []
+        labels = (
+            [_text(show["name"])] if isinstance(show, dict) and show.get("name") else []
+        )
     projected = {
         "type": kind,
         "uri": uri,
@@ -128,9 +132,16 @@ class ObservationReader:
         playback = data.get("playback")
         try:
             if playback is None:
-                projected = {"state": "no_active_playback", "target": None, "item": None}
+                projected = {
+                    "state": "no_active_playback",
+                    "target": None,
+                    "item": None,
+                }
             else:
-                if not isinstance(playback, dict) or type(playback.get("is_playing")) is not bool:
+                if (
+                    not isinstance(playback, dict)
+                    or type(playback.get("is_playing")) is not bool
+                ):
                     raise ValueError("invalid playback")
                 device = playback.get("device")
                 if not isinstance(device, dict):
@@ -145,31 +156,44 @@ class ObservationReader:
                 projected = {
                     "state": "playing" if playback["is_playing"] else "paused",
                     "target": {
-                        "kind": "spotify_device", "target_id": device_id,
+                        "kind": "spotify_device",
+                        "target_id": device_id,
                         "name": _text(device.get("name"), nullable=True),
-                    } if device_id is not None else None,
+                    }
+                    if device_id is not None
+                    else None,
                     "item": _item(playback.get("item")),
                     "progress_ms": _number(playback.get("progress_ms")),
                     "provider_changed_at_ms": _number(playback.get("timestamp")),
                     "shuffle": shuffle,
                     "repeat": repeat,
                 }
-            return _bounded({
-                "ok": True, "schema": "podconnect.playback.v1",
-                "config_entry_id": entry_id, "owner_epoch": coordinator.owner_epoch,
-                "poll_sequence": sequence,
-                "observation": {
-                    "status": "fresh", "observed_at": observed.isoformat(),
-                    "age_ms": int(age * 1000), "max_age_ms": int(PLAYBACK_MAX_AGE_S * 1000),
-                    "source": "spotify_web_api",
-                },
-                "playback": projected, "physical_result_verified": False,
-            })
+            return _bounded(
+                {
+                    "ok": True,
+                    "schema": "podconnect.playback.v1",
+                    "config_entry_id": entry_id,
+                    "owner_epoch": coordinator.owner_epoch,
+                    "poll_sequence": sequence,
+                    "observation": {
+                        "status": "fresh",
+                        "observed_at": observed.isoformat(),
+                        "age_ms": int(age * 1000),
+                        "max_age_ms": int(PLAYBACK_MAX_AGE_S * 1000),
+                        "source": "spotify_web_api",
+                    },
+                    "playback": projected,
+                    "physical_result_verified": False,
+                }
+            )
         except (ValueError, TypeError, KeyError):
             return _error("malformed_response")
 
     async def queue(self, entry_id, limit, is_current):
-        if self._queue_cache is not None and time.monotonic() - self._queue_cached_at < self._queue_cache_ttl:
+        if (
+            self._queue_cache is not None
+            and time.monotonic() - self._queue_cached_at < self._queue_cache_ttl
+        ):
             return self._queue_view(self._queue_cache, limit)
         if self._queue_busy or time.monotonic() < self._queue_next_read_at:
             return _error("busy")
@@ -194,18 +218,33 @@ class ObservationReader:
                 if item is None:
                     raise ValueError("invalid queue row")
                 items.append({"option_id": f"{snapshot_id}:{index}", **item})
-            result = _bounded({
-                "ok": True, "schema": "podconnect.queue.v1", "config_entry_id": entry_id,
-                "owner_epoch": self.coordinator.owner_epoch, "snapshot_id": snapshot_id,
-                "observed_at": dt_util.utcnow().isoformat(), "scope": "account",
-                "coverage": "provider_response", "relation_to_playback": "not_atomic",
-                "currently_playing": _item(raw.get("currently_playing")), "items": items,
-                "returned_count": len(items), "truncated": len(rows) > len(items),
-            })
+            result = _bounded(
+                {
+                    "ok": True,
+                    "schema": "podconnect.queue.v1",
+                    "config_entry_id": entry_id,
+                    "owner_epoch": self.coordinator.owner_epoch,
+                    "snapshot_id": snapshot_id,
+                    "observed_at": dt_util.utcnow().isoformat(),
+                    "scope": "account",
+                    "coverage": "provider_response",
+                    "relation_to_playback": "not_atomic",
+                    "currently_playing": _item(raw.get("currently_playing")),
+                    "items": items,
+                    "returned_count": len(items),
+                    "truncated": len(rows) > len(items),
+                }
+            )
         except SpotifyApiError as err:
             if err.status == 429 and err.retry_after is not None:
                 cache_ttl = max(QUEUE_CACHE_S, min(3600, err.retry_after))
-            result = _error({401: "authentication_required", 403: "forbidden", 429: "rate_limited"}.get(err.status, "unavailable"))
+            result = _error(
+                {
+                    401: "authentication_required",
+                    403: "forbidden",
+                    429: "rate_limited",
+                }.get(err.status, "unavailable")
+            )
         except (ClientError, TimeoutError):
             result = _error("unavailable")
         except (ValueError, TypeError, KeyError):
@@ -237,7 +276,12 @@ def register_observation_services(hass):
     async def playback(call):
         entry_id = call.data["config_entry_id"]
         data = current(hass, entry_id)
-        return data.observations.playback(entry_id)
+        result = data.observations.playback(entry_id)
+        if not call.data.get("include_output", False) or not result.get("ok"):
+            return result
+        return await data.commands.room_transport.playback_output(
+            hass, entry_id, result
+        )
 
     async def queue(call):
         entry_id = call.data["config_entry_id"]
@@ -246,10 +290,28 @@ def register_observation_services(hass):
             entry_id, call.data.get("limit", 20), lambda: current(hass, entry_id, data)
         )
 
-    account = {vol.Required("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))}
+    account = {
+        vol.Required("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))
+    }
+    playback_schema = {**account, vol.Optional("include_output", default=False): bool}
     for name, handler, schema in (
-        ("get_playback_snapshot", playback, account),
-        ("get_queue", queue, {**account, vol.Optional("limit", default=20): vol.All(_limit, vol.Range(min=1, max=20))}),
+        ("get_playback_snapshot", playback, playback_schema),
+        (
+            "get_queue",
+            queue,
+            {
+                **account,
+                vol.Optional("limit", default=20): vol.All(
+                    _limit, vol.Range(min=1, max=20)
+                ),
+            },
+        ),
     ):
         if not hass.services.has_service(DOMAIN, name):
-            hass.services.async_register(DOMAIN, name, handler, schema=vol.Schema(schema), supports_response=SupportsResponse.ONLY)
+            hass.services.async_register(
+                DOMAIN,
+                name,
+                handler,
+                schema=vol.Schema(schema),
+                supports_response=SupportsResponse.ONLY,
+            )

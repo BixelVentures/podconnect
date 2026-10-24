@@ -164,6 +164,14 @@ get_playback_snapshot:
       selector:
         config_entry:
           integration: podconnect
+    include_output:
+      name: Include observed native output
+      description: Optional passive Native/C output correlation. Adds playback.v2 output; grants no action or physical-result proof.
+      required: false
+      default: false
+      selector:
+        boolean:
+
 get_queue:
   name: Get observed queue
   description: Read the selected account's Spotify queue. Preserves source order and duplicates; each occurrence ID belongs to this observation only. Not an atomic speaker/playback snapshot.

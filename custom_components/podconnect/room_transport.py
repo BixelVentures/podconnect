@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import hashlib
+import json
 import re
 import time
 import uuid
 
-from .observations import current
+from homeassistant.exceptions import HomeAssistantError
+
+from .observations import PLAYBACK_MAX_AGE_S, _bounded, current
 from .speakers import ROOM_READ_REASONS, SpeakersError
 
 ACTIONS = ("pause", "resume", "next", "previous")
@@ -117,11 +122,32 @@ class RoomTransport:
             "homepod_id": homepod,
         }
 
-    async def read(self, hass, entry, target, room, homepod):
+    def observation_source(self, hass, entry):
+        from .commands import CommandRejected
+
+        data = current(hass, entry, self.commands.data)
+        if not self.commands._refresh_owner_current(hass, entry):
+            raise CommandRejected("owner_replaced")
+        observed = data.observations.playback(entry)
+        if not observed.get("ok"):
+            raise CommandRejected("stale_observation")
+        raw = data.coordinator.data
+        config = hass.config_entries.async_get_entry(entry)
+        return (
+            config.unique_id,
+            observed["owner_epoch"],
+            observed["poll_sequence"],
+            raw["playback_observed_at"],
+            raw["playback_observed_monotonic"],
+            copy.deepcopy(raw["playback"]),
+        )
+
+    async def observe(self, hass, entry, target, room, homepod):
+        """Validate passive Native/C facts without requiring a permitted action."""
         from .commands import CommandRejected
 
         scope = self.scope(hass, entry, target, room, homepod)
-        before = self.commands.controls(entry, target)
+        before = self.observation_source(hass, entry)
         try:
             state = await self.commands.data.speakers.room_transport_state(scope)
         except SpeakersError as exc:
@@ -131,21 +157,148 @@ class RoomTransport:
             raise rejected from exc
         if self.scope(hass, entry, target, room, homepod) != scope:
             raise CommandRejected("native_account_unproven")
-        latest = self.commands.controls(entry, target)
-        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
+        if self.observation_source(hass, entry) != before:
             raise CommandRejected("stale_observation")
         if (
             not _snapshot(
                 state, "podconnect.room_transport_state.v1", {"actions"}, scope
             )
             or not isinstance(state["actions"], list)
-            or not state["actions"]
             or any(
                 not isinstance(action, str) or action not in ACTIONS
                 for action in state["actions"]
             )
             or len(state["actions"]) != len(set(state["actions"]))
         ):
+            raise CommandRejected("room_transport_unavailable")
+        return state
+
+    async def playback_output(self, hass, entry, observed):
+        """One read-only resolver; the deadline is an observation, never a lease."""
+        from .commands import CommandRejected
+
+        def aggregate(reason, binding=None):
+            value = {
+                **observed,
+                "schema": "podconnect.playback.v2",
+                "output": {
+                    "status": "observed" if binding is not None else "unavailable",
+                    "reason": reason,
+                    "binding": binding,
+                },
+            }
+            try:
+                return _bounded(value)
+            except (ValueError, TypeError):
+                return {"ok": False, "error_kind": "malformed_response"}
+
+        if observed["playback"]["state"] == "no_active_playback":
+            return aggregate("route_unavailable")
+        target = observed["playback"]["target"]
+        if target is None or self.commands.data.speakers is None:
+            return aggregate("route_unavailable")
+        started, started_wall = time.monotonic(), time.time()
+        current_guard = None
+
+        def unavailable():
+            # A failed awaited read cannot publish an older account projection.
+            try:
+                if current_guard is None:
+                    return {"ok": False, "error_kind": "unavailable"}
+                current_guard()
+            except (
+                CommandRejected,
+                HomeAssistantError,
+                ValueError,
+                TypeError,
+                KeyError,
+            ):
+                return {"ok": False, "error_kind": "unavailable"}
+            return aggregate("route_unavailable")
+
+        try:
+            source = self.observation_source(hass, entry)
+            account_until = source[4] + PLAYBACK_MAX_AGE_S
+            deadline = min(account_until, started + 5)
+            valid_until = min(
+                source[3].timestamp() + PLAYBACK_MAX_AGE_S, started_wall + 5
+            )
+
+            def guard():
+                if self.observation_source(hass, entry) != source:
+                    raise CommandRejected("stale_observation")
+                if time.monotonic() >= deadline or time.time() >= valid_until:
+                    raise CommandRejected("stale_observation")
+
+            current_guard = guard
+            speakers = self.commands.data.speakers
+            async with asyncio.timeout(5):
+                catalog = await speakers.aliases()
+                guard()
+                outputs = await speakers.outputs()
+                guard()
+                selected = [row for row in outputs["devices"] if row["selected"]]
+                if len(selected) > 1:
+                    return aggregate("ambiguous_output")
+                if (
+                    not outputs["owntone_up"]
+                    or not selected
+                    or selected[0]["needs_auth"]
+                ):
+                    return aggregate("route_unavailable")
+                room, homepod = catalog["binding"]["room_id"], selected[0]["id"]
+                state = await self.observe(
+                    hass, entry, target["target_id"], room, homepod
+                )
+                guard()
+                native = state["native"]
+                if (
+                    native["alias_incarnation"] != catalog["binding"]["incarnation"]
+                    or native["alias_registry"] != catalog["binding"]["registry"]
+                ):
+                    return aggregate("owner_changed")
+                # Poll sequence/progress fence this publication above, but do not
+                # turn the same physical route into a new identity each poll.
+                identity = [entry, source[1], native, state["route"]]
+                binding_id = hashlib.sha256(
+                    json.dumps(
+                        identity,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode()
+                ).hexdigest()
+                guard()
+                return aggregate(
+                    None,
+                    {
+                        "target_id": target["target_id"],
+                        "native_room_id": native["room_id"],
+                        "homepod_id": state["route"]["device_id"],
+                        "binding_id": binding_id,
+                        "valid_until": valid_until,
+                    },
+                )
+        except CommandRejected as exc:
+            if str(exc) in {
+                "owner_replaced",
+                "stale_observation",
+                "native_account_unproven",
+            }:
+                return {"ok": False, "error_kind": "unavailable"}
+            return unavailable()
+        except (SpeakersError, TimeoutError, ValueError, TypeError, KeyError):
+            return unavailable()
+
+    async def read(self, hass, entry, target, room, homepod):
+        from .commands import CommandRejected
+
+        before = self.commands.controls(entry, target)
+        state = await self.observe(hass, entry, target, room, homepod)
+        latest = self.commands.controls(entry, target)
+        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
+            raise CommandRejected("stale_observation")
+        if not state["actions"]:
             raise CommandRejected("room_transport_unavailable")
         return {
             **latest,

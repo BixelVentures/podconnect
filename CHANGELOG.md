@@ -1,3 +1,14 @@
+## Speakers 0.26.44 — retire closed routes before the next Connect
+
+- Complete exact protected START retirement in the same C process: revoke only its old selected route and custody, retain the durable journal and replay guards, and admit the next normal FIFO source without starting or autoselecting an output before the current room is primed and selected.
+- Preserve the live paused Native context during idle. Remove the unbound automatic physical release; manual Release now returns an explicit unsupported response before any playback or output effect. Removing an alias still tears down only its captured runtime.
+- Keep the Native32 engine unchanged. Source regressions and review do not establish delivery or audible acceptance of every music flow.
+
+## Control 0.10.21 — current output observation
+
+- Add optional include_output to get_playback_snapshot. The closed playback.v2 response joins account metadata to the current Native alias and C output facts; the default playback.v1 response remains unchanged.
+- Preserve account owner, poll, body and original freshness checks across passive reads and failure paths. Ambiguous, changed or unavailable output has no binding; passive output facts grant no playback controls or physical-release claim.
+
 ## Control 0.10.20 — account playlist catalogue
 
 - Add the response-only get_user_playlists service for the selected configured Spotify account: at most20 owned or followed playlists from the first page, with explicit coverage and whether more pages exist. Return actual playlist names, URIs and optional Spotify covers; create no DailyMix/daylist or playback authority.

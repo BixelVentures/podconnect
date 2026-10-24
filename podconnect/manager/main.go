@@ -654,18 +654,6 @@ func releasedPath(r *Room) string { return filepath.Join(dataDir, "rooms", r.ID,
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
-// releaseHomePod frees the HomePod for other AirPlay senders (Mofibo, Apple Music, …): deselect all
-// of the room's OwnTone outputs and drop the room's flag so selection won't immediately re-grab it.
-func releaseHomePod(room *Room) {
-	cl := &http.Client{Timeout: 3 * time.Second}
-	req, _ := http.NewRequest(http.MethodPut, room.OwnTone+"/api/outputs/set", bytes.NewBufferString(`{"outputs":[]}`))
-	if r, e := cl.Do(req); e == nil {
-		r.Body.Close()
-	}
-	_ = os.MkdirAll(filepath.Dir(releasedPath(room)), 0o755)
-	_ = os.WriteFile(releasedPath(room), []byte("1"), 0o644)
-}
-
 // routeAliasOutput is the device-aliases router: when the user picks alias N in Spotify's Connect
 // menu, point the (single, primary) OwnTone at room N's HomePod so the audio follows the choice. Alias
 // ids are 1-based and indexed into connectAliases() order (= the room list order). Returns whether it
@@ -875,19 +863,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 	prevActive := false      // edge-detect a NEW session (inactive->active) for the one-shot never-loud cap
 	capped := false          // this session's fresh-cap already handled (volume settled <= ceiling)
 	prearmNext := time.Now() // throttle for the idle "hold the HomePod output low" safety guard
-	// Grace is read LIVE (per-room override or global default) on a short cache so a panel settings
-	// change takes effect without an add-on restart. Refreshed at most every ~10s to keep rooms.json
-	// reads off the 200ms hot loop.
-	grace := time.Duration(roomGrace(room)) * time.Minute
-	graceNext := time.Now().Add(10 * time.Second)
-	var idleSince time.Time
 	for {
-		if time.Now().After(graceNext) {
-			if rm := roomByID(room.ID); rm != nil {
-				grace = time.Duration(roomGrace(rm)) * time.Minute
-			}
-			graceNext = time.Now().Add(10 * time.Second)
-		}
 		if !att.reconcileCustody() {
 			time.Sleep(200 * time.Millisecond)
 			continue
@@ -1007,11 +983,9 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				capped = false
 			}
 
-			// Grace-release ("deling"): hold the HomePod through brief interruptions (still
-			// playing, so Siri/notifications recover), but free it after sustained idle so other
-			// apps can use it — and reclaim it the moment Spotify resumes.
+			// Pause/idle retains the Native writer and its context. The manager
+			// has no exact-owner release API and must never deselect outputs here.
 			if playing {
-				idleSince = time.Time{}
 				if released {
 					// Pre-prime the configured output while still released. Pipe
 					// autostart may run before the next bridge tick once it is selected.
@@ -1081,15 +1055,6 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					capped = false // re-arm both engine and output before the reclaimed first audio
 					log.Printf("[%s]: reclaim requested; restore target %d%%", room.Name, restore)
 					released = false
-				}
-			} else {
-				if idleSince.IsZero() {
-					idleSince = time.Now()
-				}
-				if !released && time.Since(idleSince) > grace {
-					releaseHomePod(room)
-					log.Printf("[%s]: released HomePod after %v idle — free for other apps", room.Name, grace)
-					released = true
 				}
 			}
 
@@ -2489,21 +2454,13 @@ func speakerReleaseHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if custodyMutationBlocked(w) {
-		return
-	}
-	done, admitted := custodyMutationAdmission(w)
-	if !admitted {
-		return
-	}
-	defer done()
-	for _, rm := range targetRooms(r) {
-		librespotTransport(rm.Librespot, "pause") // stop Spotify so the bridge doesn't instantly reclaim
-		releaseHomePod(rm)
-		store.setReleased(rm.ID, true)
-	}
-	log.Printf("HomePod released on request — free for other apps")
-	writeJSON(w, map[string]bool{"ok": true})
+	// A bare pause or empty-output PUT is not successor-bound. Refuse before
+	// either effect; Native exact-owner retirement remains its existing owner.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok": false, "error": "release_unsupported", "outcome": "rejected", "retryable": false,
+	})
 }
 
 func speakerSelectHandler(w http.ResponseWriter, r *http.Request) {

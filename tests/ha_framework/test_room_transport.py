@@ -2,7 +2,10 @@
 
 import asyncio
 import copy
+import time
 import unittest
+from datetime import timedelta
+from unittest.mock import patch
 
 import voluptuous as vol
 from aiohttp import web
@@ -11,6 +14,14 @@ from test_commands import CommandFrameworkTests
 
 class RoomTransportFrameworkTests(CommandFrameworkTests):
     async def asyncSetUp(self):
+        self.output_observation = False
+        self.output_reads = []
+        self.output_selected = ["123"]
+        self.output_hold = False
+        self.output_hold_path = "/api/room-transport/state"
+        self.output_failure_status = 200
+        self.output_entered = asyncio.Event()
+        self.output_release = asyncio.Event()
         self.room_posts = []
         self.room_reads = []
         self.room_hold = False
@@ -25,25 +36,27 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         self.prepare_corrupt = None
         self.ttl = 5000
         await super().asyncSetUp()
-        self.holds.extend((self.room_release, self.room_commit_release))
+        self.holds.extend(
+            (self.room_release, self.room_commit_release, self.output_release)
+        )
 
     def native(self):
         return {
             "account_user_id": self.entries[0].unique_id,
             "target_id": "spotify-one",
-            "room_id": "room-alpha",
-            "homepod_id": "123",
+            "room_id": getattr(self, "output_room", "room-alpha"),
+            "homepod_id": getattr(self, "output_homepod", "123"),
             "connection_id": "connection-a",
             "session_id": "session-a",
             "alias_incarnation": "incarnation-a",
             "alias_registry": "registry-a",
-            "alias_revision": 7,
+            "alias_revision": getattr(self, "output_revision", 7),
         }
 
     def route(self):
         return {
             "process": "12345678-1234-4234-8234-123456789abc",
-            "device_id": "123",
+            "device_id": getattr(self, "output_homepod", "123"),
             "device_incarnation": "1",
             "session_epoch": "2",
             "route_revision": "3",
@@ -54,6 +67,50 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         }
 
     async def _backend(self, request):
+        if self.output_observation and request.path in {
+            "/api/room-switch",
+            "/api/state",
+            "/api/room-transport/state",
+        }:
+            self.output_reads.append(request.path)
+            self.assertEqual(request.method, "GET")
+            self.assertNotIn("Authorization", request.headers)
+            if request.path == self.output_hold_path and self.output_hold:
+                self.output_entered.set()
+                await self.output_release.wait()
+            if self.output_failure_status != 200:
+                return web.Response(status=self.output_failure_status)
+            if request.path == "/api/room-switch":
+                native = self.native()
+                return web.json_response(
+                    {
+                        "binding": {
+                            "ready": True,
+                            "incarnation": native["alias_incarnation"],
+                            "registry": native["alias_registry"],
+                            "room_id": native["room_id"],
+                        },
+                        "aliases": [
+                            {"id": 1, "room_id": "room-alpha", "name": "SAME NAME"},
+                            {"id": 2, "room_id": "room-beta", "name": "SAME NAME"},
+                        ],
+                    }
+                )
+            if request.path == "/api/state":
+                return web.json_response(
+                    {
+                        "owntone_up": True,
+                        "devices": [
+                            {
+                                "id": ident,
+                                "name": "SAME NAME",
+                                "selected": True,
+                                "needs_auth": False,
+                            }
+                            for ident in self.output_selected
+                        ],
+                    }
+                )
         if request.path == "/api/room-transport/state":
             self.room_reads.append(dict(request.query))
             value = {
@@ -380,10 +437,268 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         self.assertEqual(len(self.room_posts), 8)
         self.assertEqual(self._writes(), [])
 
+    async def output_snapshot(self, include=True):
+        self.output_observation = True
+        return await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {"config_entry_id": "account-alpha", "include_output": include},
+            blocking=True,
+            return_response=True,
+        )
+
+    async def test_playback_output_default_v1_remains_closed_and_read_free(self):
+        value = await self.output_snapshot(False)
+        self.assertEqual(
+            set(value),
+            {
+                "ok",
+                "schema",
+                "config_entry_id",
+                "owner_epoch",
+                "poll_sequence",
+                "observation",
+                "playback",
+                "physical_result_verified",
+            },
+        )
+        self.assertEqual(value["schema"], "podconnect.playback.v1")
+        self.assertEqual(self.output_reads, [])
+        for invalid in (1, "true", None):
+            with self.subTest(value=invalid), self.assertRaises(vol.Invalid):
+                await self.output_snapshot(invalid)
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_exact_v2_preserves_original_metadata_and_has_no_effects(
+        self,
+    ):
+        data = self.entries[0].runtime_data
+        snapshots = []
+        original = data.observations.playback
+
+        def capture(entry):
+            value = original(entry)
+            snapshots.append(copy.deepcopy(value))
+            return value
+
+        with patch.object(data.observations, "playback", capture):
+            value = await self.output_snapshot()
+        self.assertEqual(set(value), set(snapshots[0]) | {"output"})
+        self.assertEqual(
+            {**value, "schema": "podconnect.playback.v1"} | {},
+            {**snapshots[0], "output": value["output"]},
+        )
+        output = value["output"]
+        self.assertEqual(set(output), {"status", "reason", "binding"})
+        self.assertEqual((output["status"], output["reason"]), ("observed", None))
+        binding = output["binding"]
+        self.assertEqual(
+            set(binding),
+            {"target_id", "native_room_id", "homepod_id", "binding_id", "valid_until"},
+        )
+        self.assertEqual(
+            (binding["target_id"], binding["native_room_id"], binding["homepod_id"]),
+            ("spotify-one", "room-alpha", "123"),
+        )
+        self.assertRegex(binding["binding_id"], "^[a-f0-9]{64}$")
+        self.assertGreater(binding["valid_until"], time.time())
+        self.assertLessEqual(binding["valid_until"], time.time() + 5)
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual(self.native_prepares, 0)
+        self.assertEqual(self.native_commits, 0)
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_valid_actionless_facts_do_not_create_controls(self):
+        self.state_corrupt = lambda state: state.update(actions=[])
+        provider = self.entries[0].runtime_data.coordinator.data["playback"]
+        provider["actions"] = {
+            "disallows": {
+                "pausing": True,
+                "resuming": True,
+                "skipping_next": True,
+                "skipping_prev": True,
+            }
+        }
+        provider["device"]["supports_volume"] = False
+        value = await self.output_snapshot()
+        self.assertEqual(value["output"]["status"], "observed")
+        controls = await self.room_offer()
+        self.assertFalse(controls["ok"])
+        self.assertEqual(controls["error_kind"], "room_transport_unavailable")
+        self.assertEqual(self.room_posts, [])
+
+    async def test_playback_output_resolves_actual_alias_on_shared_target_without_names(
+        self,
+    ):
+        alpha = await self.output_snapshot()
+        self.output_room, self.output_homepod, self.output_revision = (
+            "room-beta",
+            "456",
+            8,
+        )
+        self.output_selected = ["456"]
+        beta = await self.output_snapshot()
+        self.assertEqual(beta["output"]["status"], "observed")
+        self.assertEqual(
+            beta["output"]["binding"]["target_id"],
+            alpha["output"]["binding"]["target_id"],
+        )
+        self.assertEqual(beta["output"]["binding"]["native_room_id"], "room-beta")
+        self.assertEqual(beta["output"]["binding"]["homepod_id"], "456")
+        self.assertNotEqual(
+            beta["output"]["binding"]["binding_id"],
+            alpha["output"]["binding"]["binding_id"],
+        )
+        self.assertNotIn("/api/rooms", self.output_reads)
+
+    async def test_playback_output_absent_and_ambiguous_do_not_choose_first(self):
+        for selected, reason in (
+            ([], "route_unavailable"),
+            (["123", "456"], "ambiguous_output"),
+        ):
+            self.output_selected = selected
+            self.output_reads.clear()
+            value = await self.output_snapshot()
+            self.assertEqual(
+                value["output"],
+                {"status": "unavailable", "reason": reason, "binding": None},
+            )
+            self.assertNotIn("/api/room-transport/state", self.output_reads)
+
+    async def test_playback_output_binding_is_route_identity_not_poll_or_progress(self):
+        first = await self.output_snapshot()
+        coordinator = self.entries[0].runtime_data.coordinator
+        coordinator.data["poll_sequence"] += 1
+        coordinator.data["playback"]["progress_ms"] = 1500
+        second = await self.output_snapshot()
+        self.assertGreater(second["poll_sequence"], first["poll_sequence"])
+        self.assertEqual(
+            second["output"]["binding"]["binding_id"],
+            first["output"]["binding"]["binding_id"],
+        )
+        original = self.native
+        self.native = lambda: {**original(), "session_id": "new-session"}
+        third = await self.output_snapshot()
+        self.assertNotEqual(
+            third["output"]["binding"]["binding_id"],
+            first["output"]["binding"]["binding_id"],
+        )
+        self.native = original
+        self.state_corrupt = lambda state: state["route"].update(input_generation="9")
+        fourth = await self.output_snapshot()
+        self.assertNotEqual(
+            fourth["output"]["binding"]["binding_id"],
+            first["output"]["binding"]["binding_id"],
+        )
+
+    async def test_playback_output_account_changes_during_await_cannot_mix(self):
+        coordinator = self.entries[0].runtime_data.coordinator
+        baseline = copy.deepcopy(coordinator.data)
+        for change in ("poll", "body", "expiry", "owner"):
+            coordinator.data = copy.deepcopy(baseline)
+            self.output_entered.clear()
+            self.output_release.clear()
+            self.output_hold = True
+            task = self._task(self.output_snapshot())
+            await asyncio.wait_for(self.output_entered.wait(), timeout=2)
+            if change == "poll":
+                coordinator.data["poll_sequence"] += 1
+            elif change == "body":
+                coordinator.data["playback"]["progress_ms"] += 1
+            elif change == "expiry":
+                coordinator.data["playback_observed_monotonic"] -= 16
+            else:
+                coordinator.owner_epoch = "new-Control-owner"
+            self.output_release.set()
+            value = await task
+            self.assertEqual(value, {"ok": False, "error_kind": "unavailable"})
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_changed_native_owner_is_not_a_binding(self):
+        self.state_corrupt = lambda state: state["native"].update(
+            alias_incarnation="new-native-owner"
+        )
+        value = await self.output_snapshot()
+        self.assertEqual(
+            value["output"],
+            {"status": "unavailable", "reason": "owner_changed", "binding": None},
+        )
+
+    async def test_playback_output_idle_errors_and_original_ttl_are_not_renewed(self):
+        coordinator = self.entries[0].runtime_data.coordinator
+        saved = copy.deepcopy(coordinator.data)
+        coordinator.data["playback"] = None
+        empty = await self.output_snapshot()
+        self.assertEqual(empty["playback"]["state"], "no_active_playback")
+        self.assertEqual(
+            empty["output"],
+            {"status": "unavailable", "reason": "route_unavailable", "binding": None},
+        )
+        self.assertEqual(self.output_reads, [])
+        coordinator.last_update_success = False
+        self.assertEqual(
+            await self.output_snapshot(), {"ok": False, "error_kind": "unavailable"}
+        )
+        coordinator.last_update_success = True
+        coordinator.data = saved
+        coordinator.data["playback_observed_monotonic"] -= 14
+        coordinator.data["playback_observed_at"] -= timedelta(seconds=14)
+        value = await self.output_snapshot()
+        self.assertLessEqual(
+            value["output"]["binding"]["valid_until"],
+            coordinator.data["playback_observed_at"].timestamp() + 15,
+        )
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_error_after_account_replacement_cannot_publish_metadata(
+        self,
+    ):
+        self.output_failure_status = 500
+        current = await self.output_snapshot()
+        self.assertEqual(
+            current["output"],
+            {"status": "unavailable", "reason": "route_unavailable", "binding": None},
+        )
+        self.output_hold, self.output_hold_path = True, "/api/room-switch"
+        entry = self.entries[0]
+        original = entry.runtime_data
+        task = self._task(self.output_snapshot())
+        await asyncio.wait_for(self.output_entered.wait(), timeout=2)
+        try:
+            entry.runtime_data = copy.copy(original)
+            self.output_release.set()
+            self.assertEqual(await task, {"ok": False, "error_kind": "unavailable"})
+        finally:
+            entry.runtime_data = original
+            self.output_release.set()
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_timeout_after_source_expiry_cannot_publish_metadata(
+        self,
+    ):
+        data = self.entries[0].runtime_data
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.holds.append(release)
+
+        async def held_timeout():
+            entered.set()
+            await release.wait()
+            raise TimeoutError
+
+        with patch.object(data.speakers, "aliases", held_timeout):
+            task = self._task(self.output_snapshot())
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            data.coordinator.data["playback_observed_monotonic"] -= 16
+            release.set()
+            self.assertEqual(await task, {"ok": False, "error_kind": "unavailable"})
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual(self.calls, [])
+
 
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(
         RoomTransportFrameworkTests(name)
         for name in loader.getTestCaseNames(RoomTransportFrameworkTests)
-        if name.startswith("test_room_")
+        if name.startswith(("test_room_", "test_playback_output_"))
     )

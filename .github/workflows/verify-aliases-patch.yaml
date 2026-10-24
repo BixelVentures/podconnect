@@ -118,6 +118,9 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-resume-prepcm-busy-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/connect-resume-prepcm-busy-owntone.patch"
           git apply "$patch_dir/connect-resume-prepcm-busy-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/connect-retired-owner-detach-owntone.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/connect-retired-owner-detach-owntone.patch"
+          git apply "$patch_dir/connect-retired-owner-detach-owntone.patch"
           # Fixture-only macro scope; no production OwnTone source or Docker image change.
           fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
@@ -129,6 +132,9 @@ jobs:
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-resume-prepcm-busy-ci.sha256" | sha256sum -c -
           git apply --check "$fixture_dir/connect-resume-prepcm-busy-ci.patch"
           git apply "$fixture_dir/connect-resume-prepcm-busy-ci.patch"
+          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-retired-owner-detach-ci.sha256" | sha256sum -c -
+          git apply --check "$fixture_dir/connect-retired-owner-detach-ci.patch"
+          git apply "$fixture_dir/connect-retired-owner-detach-ci.patch"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -158,6 +164,7 @@ jobs:
           sudo -n src/airplay_callback_owner --move-retire-wire
           sudo -n src/airplay_callback_owner --move-retire-live-wire
           sudo -n src/airplay_callback_owner --move-retire-resume-prime-wire
+          sudo -n src/airplay_callback_owner --start-retire-normal-reconnect-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire
