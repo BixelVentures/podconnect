@@ -1,0 +1,464 @@
+diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
+--- a/daemon/context_commit_test.go
++++ b/daemon/context_commit_test.go
+@@ -728,12 +728,13 @@
+ 	}
+ }
+ 
+-func TestDealerTransferLaterPage404CannotFallbackToCachedFirstTrack(t *testing.T) {
++func TestDealerTransferLaterPage404CannotInventShuffledContinuation(t *testing.T) {
+ 	p := pc13ExistingPlayer(t, true)
+ 	p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
+ 	oldTracks, primary, secondary := p.state.tracks, p.primaryStream, p.secondaryStream
+ 	before := proto.Clone(p.state.player)
+ 	state := pc13TransferState()
++	state.Options.ShufflingContext = true
+ 	state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"}
+ 	state.Playback.PositionAsOfTimestamp = 8487
+ 	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}, NextPageUrl: "hm://fixture/later"}}
+@@ -748,10 +749,45 @@
+ 		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header), Request: r}, nil
+ 	}))
+ 	err := p.handleTransferCommand(context.Background(), req, state, sp)
+-	if err == nil || !strings.Contains(err.Error(), "failed seeking to track") || !strings.Contains(err.Error(), "404") {
++	if err == nil || !strings.Contains(err.Error(), "cannot preserve shuffled transfer") {
+ 		t.Fatalf("missing strict seek failure: %v", err)
+ 	}
+ 	if requests != 1 || !proto.Equal(before, p.state.player) || p.state.tracks != oldTracks || p.primaryStream != primary || p.secondaryStream != secondary || p.state.lastTransferTimestamp != 123 || p.state.device.SelectedAliasId != 2 || len(p.app.server.(*aliasTestServer).events) != 0 {
+ 		t.Fatal("lazy-page failure committed wrong cached content or changed owner")
+ 	}
+ }
++
++func TestDealerTransferQueueCurrentCannotReplaceRequestedMedia(t *testing.T) {
++	for _, mode := range []string{"foreign-uri", "foreign-uid", "empty"} {
++		t.Run(mode, func(t *testing.T) {
++			p := pc13ExistingPlayer(t, true)
++			p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
++			before := proto.Clone(p.state.player)
++			oldTracks, primary, secondary := p.state.tracks, p.primaryStream, p.secondaryStream
++			state := pc13TransferState()
++			target := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000003", Uid: "current"}
++			state.Playback.CurrentTrack = target
++			state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{target}}}
++			current := proto.Clone(target).(*connectpb.ContextTrack)
++			if mode == "foreign-uri" {
++				current.Uri = "spotify:track:0000000000000000000004"
++			}
++			if mode == "foreign-uid" {
++				current.Uid = "foreign"
++			}
++			state.Queue = &connectpb.Queue{IsPlayingQueue: true, Tracks: []*connectpb.ContextTrack{current}}
++			if mode == "empty" {
++				state.Queue.Tracks = nil
++			}
++			req := pc13PlayRequest(t)
++			req.Command.Endpoint = "transfer"
++			err := p.handleTransferCommand(context.Background(), req, state, nil)
++			if err == nil || !strings.Contains(err.Error(), "queue current") {
++				t.Fatalf("inconsistent queued current accepted: %v", err)
++			}
++			if !proto.Equal(before, p.state.player) || p.state.tracks != oldTracks || p.primaryStream != primary || p.secondaryStream != secondary || p.state.lastTransferTimestamp != 123 || len(p.app.server.(*aliasTestServer).events) != 0 {
++				t.Fatal("invalid queued current changed retained owner")
++			}
++		})
++	}
++}
+diff --git a/daemon/player.go b/daemon/player.go
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -471,8 +471,21 @@
+ 	// Lazy context preparation must succeed before changing the command or output owner.
+ 	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(transferState.CurrentSession.Context.Uri)
+ 	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
+-	if err := ctxTracks.Seek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
++	// Prepare the supplied queue locally before any old owner or semantic state
++	// changes. An inconsistent queued current track cannot override the transfer.
++	if transferState.Queue.IsPlayingQueue && len(transferState.Queue.Tracks) == 0 {
++		return fmt.Errorf("missing transferred queue current")
++	}
++	for _, track := range transferState.Queue.Tracks {
++		ctxTracks.AddToQueue(proto.Clone(track).(*connectpb.ContextTrack))
++	}
++	ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
++	injected, err := ctxTracks.SeekTransferred(ctx, transferState.Playback.CurrentTrack)
++	if err != nil {
+ 		return fmt.Errorf("failed seeking to track: %w", err)
++	}
++	if injected && transferState.Options.ShufflingContext {
++		return fmt.Errorf("cannot preserve shuffled transfer after unavailable context page")
+ 	}
+ 	if ctxTracks.CurrentTrack().Uri != currentTrack.Uri {
+ 		return fmt.Errorf("failed seeking to track: current media identity changed")
+@@ -545,12 +558,6 @@
+ 		}
+ 		p.state.queueID = max(p.state.queueID, n)
+ 	}
+-
+-	// add all tracks from queue
+-	for _, track := range transferState.Queue.Tracks {
+-		ctxTracks.AddToQueue(track)
+-	}
+-	ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
+ 
+ 	p.state.tracks = ctxTracks
+ 	p.state.player.Track = ctxTracks.CurrentTrack()
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -14,6 +14,7 @@
+ 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ 	"google.golang.org/protobuf/proto"
++	"io"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -562,7 +563,7 @@
+ // synthetic AP welcome seeds only the existing account getter; no provider
+ // authentication, HomePod or physical audio is claimed by this regression.
+ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+-	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
++	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, _ := contentFixture(t)
+ 			path := filepath.Join(t.TempDir(), "prepared.fifo")
+@@ -617,7 +618,7 @@
+ 			position := int64(8487)
+ 			p.state.player.PositionAsOfTimestamp = position
+ 			p.state.player.Timestamp = time.Now().UnixMilli()
+-			paused := mode == "paused" || mode == "dealer-paused"
++			paused := mode == "paused" || mode == "dealer-paused" || mode == "dealer-lazy404-paused"
+ 			p.state.setPaused(paused)
+ 			ctx, cancel := context.WithCancel(context.Background())
+ 			defer cancel()
+@@ -707,7 +708,15 @@
+ 				p.primaryLoadOrdinal = 0
+ 				events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
+ 				nextSessionField(p.sess, "events", events)
++				var lazyReads atomic.Int32
+ 				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++					if r.Method == http.MethodGet {
++						lazyReads.Add(1)
++						if !strings.HasPrefix(mode, "dealer-lazy404") || r.URL.Path != "/fixture/later" {
++							t.Errorf("unexpected source read %s", r.URL)
++						}
++						return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("missing")), Header: make(http.Header), Request: r}, nil
++					}
+ 					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
+ 				}))
+ 				nextSessionField(p.sess, "sp", sp)
+@@ -729,11 +738,19 @@
+ 					transfer.Playback.IsPaused = paused
+ 					transfer.CurrentSession.OriginalSessionId = proto.String(sessionID)
+ 					transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
++					if strings.HasPrefix(mode, "dealer-lazy404") {
++						transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000004"}}, NextPageUrl: "hm://fixture/later"}}
++					}
+ 					req := pc13PlayRequest(t)
+ 					req.Command.Endpoint = "transfer"
+ 					req.TargetAliasId = proto.Uint32(2)
+ 					req.Command.Data, _ = proto.Marshal(transfer)
+ 					err = p.handleTransferCommand(ctx, req, transfer, sp)
++					if strings.HasPrefix(mode, "dealer-lazy404") && err == nil {
++						if lazyReads.Load() != 1 || p.state.player.Track.Uri != transfer.Playback.CurrentTrack.Uri || p.state.player.ContextUri != transfer.CurrentSession.Context.Uri || p.state.player.Index.Page != 0 || p.state.player.Index.Track != 0 {
++							t.Fatal("fallback lost exact requested track/context or retried unavailable page", lazyReads.Load())
++						}
++					}
+ 				} else {
+ 					err = p.loadCurrentTrackWithStart(ctx, false, true, false, true)
+ 				}
+diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
+--- a/spclient/context_resolver.go
++++ b/spclient/context_resolver.go
+@@ -12,6 +12,17 @@
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"golang.org/x/exp/maps"
+ )
++
++// ContextPageStatusError preserves the page response classification without
++// treating a context failure as authority for any different current track.
++type ContextPageStatusError struct {
++	URL        string
++	StatusCode int
++}
++
++func (e *ContextPageStatusError) Error() string {
++	return fmt.Sprintf("invalid status code from page at %s: %d", e.URL, e.StatusCode)
++}
+ 
+ type ContextResolver struct {
+ 	log librespot.Logger
+@@ -122,7 +133,7 @@
+ 	defer func() { _ = resp.Body.Close() }()
+ 
+ 	if resp.StatusCode != 200 {
+-		return nil, fmt.Errorf("invalid status code from page at %s: %d", url, resp.StatusCode)
++		return nil, &ContextPageStatusError{URL: url, StatusCode: resp.StatusCode}
+ 	}
+ 
+ 	respBytes, err := io.ReadAll(resp.Body)
+diff --git a/tracks/paged-list.go b/tracks/paged-list.go
+--- a/tracks/paged-list.go
++++ b/tracks/paged-list.go
+@@ -71,6 +71,8 @@
+ 	pages librespot.PageResolver[T]
+ 	list  []pagedListItem[T]
+ 	pos   int
++	// Set only for an exact transferred track after its observed later-page404.
++	injectedFetchErr error
+ }
+ 
+ func newPagedList[T any](log librespot.Logger, pages librespot.PageResolver[T]) *pagedList[T] {
+@@ -100,6 +102,15 @@
+ 
+ 	l.pos = 0
+ 	return nil
++}
++
++// moveInjected preserves cached context entries but never assigns the supplied
++// track a context-page position. The original failed page is not retried by
++// immediate publication or a detached observation on this prepared list.
++func (l *pagedList[T]) moveInjected(item T, fetchErr error) {
++	l.list = append([]pagedListItem[T]{{item, -1, -1}}, l.list...)
++	l.pos = 0
++	l.injectedFetchErr = fetchErr
+ }
+ 
+ func (l *pagedList[T]) move(iter *pagedListInterator[T]) {
+@@ -182,6 +193,9 @@
+ 		pageIdx = curr.pageIdx + 1
+ 	}
+ 
++	if l.injectedFetchErr != nil {
++		return pageIdx, l.injectedFetchErr
++	}
+ 	items, err := l.pages.Page(ctx, pageIdx)
+ 	if err != nil {
+ 		return pageIdx, err
+diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
+--- a/tracks/room_transport_test.go
++++ b/tracks/room_transport_test.go
+@@ -6,7 +6,10 @@
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/spclient"
++	"google.golang.org/protobuf/proto"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ )
+ 
+@@ -150,3 +153,120 @@
+ 		t.Fatalf("partial history was reported complete: %d %v", len(rows), err)
+ 	}
+ }
++
++func TestTransferredTrackLater404IsDetachedAndDoesNotRetry(t *testing.T) {
++	for _, queued := range []bool{false, true} {
++		t.Run(fmt.Sprint(queued), func(t *testing.T) {
++			ctx := context.Background()
++			first := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000001", Uid: "cached"}
++			target := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000009", Uid: "requested", Metadata: map[string]string{"from": "transfer"}}
++			list, err := NewTrackListFromContext(ctx, &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{first}}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			missing := &spclient.ContextPageStatusError{URL: "hm://fixture/later", StatusCode: 404}
++			pageCalls := make(map[int]int)
++			list.tracks.pages = queuePreparePages(func(_ context.Context, index int) ([]*connectpb.ContextTrack, error) {
++				pageCalls[index]++
++				if pageCalls[index] > 1 {
++					t.Error("repeated failed context read", index)
++				}
++				if index == 0 {
++					return []*connectpb.ContextTrack{first}, nil
++				}
++				return nil, missing
++			})
++			if queued {
++				list.AddToQueue(proto.Clone(target).(*connectpb.ContextTrack))
++			}
++			next := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000008", Uid: "next"}
++			list.AddToQueue(next)
++			list.SetPlayingQueue(queued)
++			beforeQueue := append([]*connectpb.ContextTrack(nil), list.queue...)
++			injected, err := list.SeekTransferred(ctx, target)
++			if err != nil || !injected || list.CurrentTrack().Uri != target.Uri || list.CurrentTrack().Uid != target.Uid || list.tracks.get().pageIdx != -1 || list.tracks.get().itemIdx != -1 || list.Index().Page != 0 || list.Index().Track != 0 {
++				t.Fatal("exact detached transferred current lost", injected, err)
++			}
++			if list.tracks.get().item == target || list.tracks.get().item.Metadata["from"] != "transfer" {
++				t.Fatal("injected track shares caller storage or lost metadata")
++			}
++			if !reflect.DeepEqual(beforeQueue, list.queue) || list.playingQueue != queued {
++				t.Fatal("supplied queue changed")
++			}
++			if err := list.ToggleShuffle(ctx, true); err == nil || list.shuffled {
++				t.Fatal("unavailable detached context claimed shuffle")
++			}
++			upcoming := list.NextTracks(ctx, nil)
++			if len(upcoming) != 2 || upcoming[0].Uri != next.Uri || upcoming[1].Uri != first.Uri {
++				t.Fatal("queue/cached context order invented", upcoming)
++			}
++			if _, err = list.AllTracksWithError(ctx); !errors.Is(err, missing) {
++				t.Fatal("failed continuation falsely complete", err)
++			}
++			prepared, err := list.PrepareTransport(ctx, false, 0)
++			if err != nil || prepared.CurrentTrack().Uri != next.Uri || list.CurrentTrack().Uri != target.Uri || prepared.tracks.injectedFetchErr != list.tracks.injectedFetchErr {
++				t.Fatal("detached next borrowed/mutated original cursor or retried", err)
++			}
++		})
++	}
++}
++
++func TestTransferredTrackRefusesOtherFailuresCancelAndForeignQueue(t *testing.T) {
++	for _, mode := range []string{"403", "429", "500", "cancel", "first-page404", "foreign-queue-uri", "foreign-queue-uid"} {
++		t.Run(mode, func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			first := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000001"}
++			target := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000009", Uid: "requested"}
++			list, err := NewTrackListFromContext(ctx, &librespot.NullLogger{}, nil, &connectpb.Context{Uri: "spotify:playlist:0000000000000000000001", Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{first}}}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			pageCalls := 0
++			var responseStatus = 404
++			list.tracks.pages = queuePreparePages(func(_ context.Context, index int) ([]*connectpb.ContextTrack, error) {
++				pageCalls++
++				if strings.HasPrefix(mode, "foreign-queue") {
++					t.Error("foreign queue caused context I/O")
++				}
++				if mode == "first-page404" {
++					return nil, &spclient.ContextPageStatusError{URL: "hm://fixture/first", StatusCode: 404}
++				}
++				if index == 0 {
++					return []*connectpb.ContextTrack{first}, nil
++				}
++				if mode == "cancel" {
++					cancel()
++				}
++				return nil, &spclient.ContextPageStatusError{URL: "hm://fixture/later", StatusCode: responseStatus}
++			})
++			if strings.HasPrefix(mode, "foreign-queue") {
++				wrong := proto.Clone(target).(*connectpb.ContextTrack)
++				if mode == "foreign-queue-uri" {
++					wrong.Uri = first.Uri
++				} else {
++					wrong.Uid = "foreign"
++				}
++				list.AddToQueue(wrong)
++				list.SetPlayingQueue(true)
++			} else {
++				if mode == "403" {
++					responseStatus = 403
++				}
++				if mode == "429" {
++					responseStatus = 429
++				}
++				if mode == "500" {
++					responseStatus = 500
++				}
++			}
++			injected, err := list.SeekTransferred(ctx, target)
++			if strings.HasPrefix(mode, "foreign-queue") && pageCalls != 0 {
++				t.Fatal("foreign current spent context reads")
++			}
++			if err == nil || injected || list.tracks.injectedFetchErr != nil || list.tracks.pos != -1 {
++				t.Fatal("negative context/queue gained current track", mode, injected, err)
++			}
++		})
++	}
++}
+diff --git a/tracks/tracks.go b/tracks/tracks.go
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -2,14 +2,17 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"slices"
++	"strings"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"github.com/devgianlu/go-librespot/spclient"
+ 	"golang.org/x/exp/rand"
++	"google.golang.org/protobuf/proto"
+ )
+ 
+ type List struct {
+@@ -58,6 +61,49 @@
+ 	}
+ 
+ 	return nil
++}
++
++// SeekTransferred keeps the authenticated dealer's supplied current track when
++// a later context page is unavailable. It never substitutes cached first media.
++// The bool distinguishes a detached track so callers cannot claim shuffled
++// context continuity. Existing generic TrySeek and control paths are unchanged.
++func (tl *List) SeekTransferred(ctx context.Context, track *connectpb.ContextTrack) (bool, error) {
++	if err := ctx.Err(); err != nil {
++		return false, err
++	}
++	if track == nil {
++		return false, fmt.Errorf("missing transferred track")
++	}
++	target := librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), track)
++	if target.Uri == "" {
++		return false, fmt.Errorf("missing transferred media identity")
++	}
++	match := func(row *connectpb.ContextTrack) bool {
++		return row != nil && librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), row).Uri == target.Uri
++	}
++	if tl.playingQueue && (len(tl.queue) == 0 || !match(tl.queue[0]) || (track.Uid != "" && tl.queue[0].Uid != track.Uid)) {
++		return false, fmt.Errorf("transferred queue current identity differs")
++	}
++	err := tl.Seek(ctx, match)
++	if err == nil {
++		return false, nil
++	}
++	if ctx.Err() != nil {
++		return false, ctx.Err()
++	}
++	var status *spclient.ContextPageStatusError
++	if len(tl.tracks.list) == 0 || !errors.As(err, &status) || status.StatusCode != 404 {
++		return false, err
++	}
++	detached := proto.Clone(track).(*connectpb.ContextTrack)
++	if strings.HasPrefix(tl.ctx.Uri(), "spotify:station:") {
++		if detached.Metadata == nil {
++			detached.Metadata = make(map[string]string)
++		}
++		detached.Metadata["autoplay.is_autoplay"] = "true"
++	}
++	tl.tracks.moveInjected(detached, err)
++	return true, nil
+ }
+ 
+ func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) error {
+@@ -184,6 +230,9 @@
+ 	}
+ 
+ 	curr := tl.tracks.get()
++	if curr.pageIdx < 0 {
++		return &connectpb.ContextIndex{}
++	}
+ 	return &connectpb.ContextIndex{Page: uint32(curr.pageIdx), Track: uint32(curr.itemIdx)}
+ }
+ 
+@@ -318,6 +367,10 @@
+ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
+ 	if shuffle == tl.shuffled {
+ 		return nil
++	}
++
++	if tl.tracks.injectedFetchErr != nil {
++		return fmt.Errorf("cannot shuffle unavailable transferred context: %w", tl.tracks.injectedFetchErr)
+ 	}
+ 
+ 	tl.invalidateQueueObservation()

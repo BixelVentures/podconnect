@@ -1,3 +1,11 @@
+## Speakers 0.26.47 (candidate)
+
+- Reviewed bounded Native exact supplied-track handling for unavailable later context
+  pages, preserving strict identity and existing START/owner fences.
+- Station continuation remains incomplete; this does not claim all radio playback fixed.
+- Speakers46 manager/C runtime, Control21 and the existing33 Native patches stay unchanged.
+- No publication, installation or physical acceptance is claimed for this candidate.
+
 ## Speakers 0.26.46 — current-owner restart and first transfer (candidate)
 
 - Admit ordinary Connect routing only from the current fresh transfer credit; preserve no-write state before a transfer and the existing owner/namespace guards.
