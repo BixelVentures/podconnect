@@ -1,3 +1,12 @@
+## Speakers 0.26.48
+
+- Correct the existing publisher/CI negative-token fixture so its invalid token is
+  guaranteed distinct from the minted valid token. The47 AMD64 publisher failure is
+  retained as failed; this successor requires its own official CI/publication.
+- Runtime bytes are identical to47: C, Native34, manager and Control21 are unchanged.
+  Root skips47 installation and delivers one combined48 after its required gates. Station continuation
+  and physical acceptance remain open; this fixture correction claims neither.
+
 ## Speakers 0.26.47 (candidate)
 
 - Reviewed bounded Native exact supplied-track handling for unavailable later context
