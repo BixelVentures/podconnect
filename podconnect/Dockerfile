@@ -136,6 +136,8 @@ COPY patches/connect-retired-autostart-owntone.patch /patches/connect-retired-au
 COPY patches/connect-retired-autostart-owntone.sha256 /patches/connect-retired-autostart-owntone.sha256
 COPY patches/connect-resume-prepcm-busy-owntone.patch /patches/connect-resume-prepcm-busy-owntone.patch
 COPY patches/connect-resume-prepcm-busy-owntone.sha256 /patches/connect-resume-prepcm-busy-owntone.sha256
+COPY patches/connect-retired-owner-detach-owntone.patch /patches/connect-retired-owner-detach-owntone.patch
+COPY patches/connect-retired-owner-detach-owntone.sha256 /patches/connect-retired-owner-detach-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -191,6 +193,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/connect-resume-prepcm-busy-owntone.sha256 \
   && git apply --check /patches/connect-resume-prepcm-busy-owntone.patch \
   && git apply /patches/connect-resume-prepcm-busy-owntone.patch \
+  && sha256sum -c /patches/connect-retired-owner-detach-owntone.sha256 \
+  && git apply --check /patches/connect-retired-owner-detach-owntone.patch \
+  && git apply /patches/connect-retired-owner-detach-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

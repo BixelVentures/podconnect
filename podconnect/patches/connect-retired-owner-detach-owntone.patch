@@ -1,0 +1,145 @@
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -7,6 +7,8 @@
+   uint64_t writer_source_epoch,writer_fd,pipe_device,pipe_inode,input_item_id,admitted_input_epoch,input_epoch;
+   struct timespec deadline;
+   bool reader_ready_closed,reopen_consumed;
++  struct output_transport_identity route_identity;
++  uint64_t closed_selection_revision;
+ };
+ struct start_slot {
+   struct output_start_result result;
+@@ -288,6 +290,64 @@
+ bool outputs_start_retired_normal_autostart_ready(const char *path)
+ {return !start_active && !transport_custody_busy() && outputs_start_retired_normal_ready(path);}
+ 
++/* Terminal retirement is the one owner transition that can revoke its old
++ * selected route and detach runtime authority. Retain the historical token,
++ * receipt and FULL tombstone; a delayed old cancel then remains read-only. */
++static bool start_retired_owner_detach(void)
++{
++  struct start_slot *s=start_active;
++  struct output_device *d,*scan;
++  struct start_retirement *t;
++  bool custody;
++  uint64_t route_revision,selection_revision;
++  if(!s){
++    if(start_scope || transport_custody_busy())return false;
++    for(scan=outputs_device_list;scan;scan=scan->next)
++      if(scan->selected || scan->session || scan->busy || scan->attention_lease
++          || scan->attention_retiring_session || scan->attention_restart_pending
++          || scan->attention_restoring)return false;
++    return true;
++  }
++  t=&s->retirement;
++  if((start_scope && start_scope!=s) || s->cancelled || s->writer_pending
++      || s->result.phase!=OUTPUT_START_COMPLETED || t->outcome!=OUTPUT_RETIRE_RETIRED_KNOWN
++      || start_journal_retirement_outcome!=OUTPUT_RETIRE_RETIRED_KNOWN
++      || start_journal_retirement_reopen_consumed || !start_retired_stage_ready
++      || !outputs_start_gate_closed() || outputs_start_source_owned()
++      || !start_journal_payload_valid() || strcmp(start_journal.token,s->result.command.token)
++      || strcmp(start_journal.c_process,outputs_process) || !start_contexts_drained()
++      || transport_pin || room_volume_pin_busy() || room_volume_undrained()
++      || transport_generation_exhausted || transport_admission_generation==UINT64_MAX
++      || start_all_writers_closed(&s->result.command.native_process,t->pipe_device,t->pipe_inode)!=1
++      || !(d=outputs_device_get(s->result.command.device_id)) || d->session || !d->selected
++      || d->incarnation!=s->result.target_incarnation || s->target_epoch==UINT64_MAX
++      || d->session_epoch!=s->target_epoch+1 || d->route_revision!=t->route_identity.route_revision
++      || transport_selection_revision!=t->closed_selection_revision
++      || d->route_revision==UINT64_MAX || transport_selection_revision==UINT64_MAX
++      || d->busy || d->attention_lease || d->attention_retiring_session
++      || d->attention_restart_pending || d->attention_restoring)return false;
++  for(scan=outputs_device_list;scan;scan=scan->next)
++    if(scan->session || (scan->selected && scan!=d) || scan->busy || scan->attention_lease
++        || scan->attention_retiring_session || scan->attention_restart_pending
++        || scan->attention_restoring)return false;
++  custody=transport_custody_busy();
++  if(custody && (transport_custody_lost
++      || !native_owner_completed_continuity(&transport_custody_owner,&s->result.command.committed_native_owner)
++      || !transport_identity_equal(&transport_custody_identity,&t->route_identity)))return false;
++  /* Every rejection precedes any selected-route/custody mutation. All state
++   * below belongs to this event-loop owner and cannot cross a successor. */
++  route_revision=d->route_revision;selection_revision=transport_selection_revision;
++  outputs_device_deselect(d);
++  if(d->selected || d->route_revision!=route_revision+1
++      || transport_selection_revision!=selection_revision+1)return false;
++  if(custody){transport_custody_live=false;transport_custody_lost=true;transport_generation_advance();}
++  if(s->deadline_ev){event_free(s->deadline_ev);s->deadline_ev=NULL;}
++  s->session=NULL;s->old_session=NULL;
++  if(start_scope==s)start_scope=NULL;
++  start_active=NULL;
++  return true;
++}
++
+ bool outputs_start_retired_stage_reader(void)
+ {
+   json_object *o,*v;const char *saved;char path[4096];struct stat st;
+@@ -304,7 +364,9 @@
+       || input_fifo_stage_reader(path,&staged)<0 || staged.device!=(uint64_t)st.st_dev
+       || staged.inode!=(uint64_t)st.st_ino || !outputs_start_retired_normal_staging(path))goto done;
+   memcpy(start_retired_stage_path,path,strlen(path)+1);
+-  start_retired_stage_ready=true;valid=true;
++  start_retired_stage_ready=true;
++  if(!start_retired_owner_detach()){start_retired_stage_ready=false;start_retired_stage_path[0]=0;goto done;}
++  valid=true;
+  done:
+   if(!valid && staged.device){struct input_fifo_identity discarded={0};
+     input_fifo_stage_release(path,&discarded);}
+@@ -972,6 +1034,7 @@
+   memcpy(t->native_incarnation,r->native_incarnation,33);
+   t->writer_source_epoch=r->writer_source_epoch;t->writer_fd=r->writer_fd;
+   t->pipe_device=r->pipe_device;t->pipe_inode=r->pipe_inode;
++  t->route_identity=s->result.route_identity;
+   t->input_item_id=s->result.route_identity.input_item_id;
+   t->admitted_input_epoch=r->input_epoch;t->input_epoch=r->input_epoch;
+   outputs_attention_uuid(uuid);
+@@ -999,6 +1062,7 @@
+       || start_all_writers_closed(&r->native_process,t->pipe_device,t->pipe_inode)!=1)goto unknown;
+   t->input_epoch=reader.epoch;
+   outputs_transport_input_changed(0,NULL,false);outputs_metadata_purge();start_retire_sessions();
++  t->closed_selection_revision=transport_selection_revision;
+   if(!start_contexts_drained() || !start_retirement_window(t))goto unknown;
+   t->reader_ready_closed=true; /* Exact old input is stopped; terminal still needs a fresh staged reader. */
+   t->outcome=OUTPUT_RETIRE_RETIRED_KNOWN;
+@@ -1038,6 +1102,7 @@
+   memcpy(t->native_incarnation,r->native_incarnation,33);
+   t->writer_source_epoch=r->writer_source_epoch;t->writer_fd=r->writer_fd;
+   t->pipe_device=r->pipe_device;t->pipe_inode=r->pipe_inode;
++  t->route_identity=route;
+   t->input_item_id=route.input_item_id;t->admitted_input_epoch=r->input_epoch;t->input_epoch=r->input_epoch;
+   outputs_attention_uuid(uuid);
+   for(i=0;i<36;i++)if(uuid[i]!='-')t->token[j++]=uuid[i];
+@@ -1095,6 +1160,7 @@
+       || start_all_writers_closed(&r->native_process,t->pipe_device,t->pipe_inode)!=1)goto unknown;
+   t->input_epoch=reader.epoch;
+   outputs_transport_input_changed(0,NULL,false);outputs_metadata_purge();start_retire_sessions();
++  t->closed_selection_revision=transport_selection_revision;
+   if(!start_contexts_drained())goto unknown;
+   t->outcome=OUTPUT_RETIRE_RETIRED_KNOWN;
+   if(start_journal_save(s)<0)goto unknown;
+--- a/src/player.c
++++ b/src/player.c
+@@ -2073,6 +2073,10 @@
+   struct output_device *device;
+   uint32_t seek_ms;
+   int ret;
++  bool retired_normal = player_state == PLAY_STOPPED && queue_item && queue_item->path
++    && queue_item->data_kind == DATA_KIND_PIPE
++    && outputs_start_retired_normal_autostart_ready(queue_item->path);
++
+ 
+   if (outputs_transport_busy() && (queue_item || player_state == PLAY_STOPPED)
+       && !(player_state==PLAY_STOPPED && queue_item && queue_item->path && queue_item->data_kind==DATA_KIND_PIPE
+@@ -2130,6 +2134,12 @@
+ 	  return COMMAND_END;
+ 	}
+     }
++
++  /* A known retired source admits only the fresh reader. Saved selection and
++   * autoselect are not the new authenticated room's route authority: wait for
++   * its current distinguished prime and selected-set admission. */
++  if (retired_normal)
++    { *retval = 0; return COMMAND_END; }
+ 
+   // Start sessions on selected devices. We shouldn't see any callbacks to
+   // device_shutdown_cb, since the unselected devices shouldn't have sessions.

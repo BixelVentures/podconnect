@@ -82,14 +82,14 @@ func (m *roomManager) ensureRunning(r *Room) {
 	go rt.supervise()
 }
 
-// removeRoom tears a room down: deselect its HomePod, kill both child groups, stop the supervise
+// removeRoom tears a room down: kill its exact runtime child groups, stop the supervise
 // goroutine, and drop it from rooms.json. Safe to call for an unknown id (just updates the store).
 func (m *roomManager) removeRoom(id string) error {
-	rm, err := m.store.removeRoom(id)
+	_, err := m.store.removeRoom(id)
 	if err != nil {
 		return err
 	}
-	releaseHomePod(rm) // deselect so the HomePod is free for other senders
+	// Existing runtime teardown owns retirement; never send an unbound output PUT.
 
 	m.mu.Lock()
 	rt := m.runtimes[id]
