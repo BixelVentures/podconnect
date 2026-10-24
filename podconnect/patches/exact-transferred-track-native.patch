@@ -1,7 +1,8 @@
 diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
+index 1e4dc10..7021759 100644
 --- a/daemon/context_commit_test.go
 +++ b/daemon/context_commit_test.go
-@@ -728,12 +728,13 @@
+@@ -728,12 +728,13 @@ func TestDealerOuter404ThenPreparedContextCommitsAliasAndNextCommand(t *testing.
  	}
  }
  
@@ -16,7 +17,7 @@ diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
  	state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"}
  	state.Playback.PositionAsOfTimestamp = 8487
  	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}, NextPageUrl: "hm://fixture/later"}}
-@@ -748,10 +749,45 @@
+@@ -748,10 +749,45 @@ func TestDealerTransferLaterPage404CannotFallbackToCachedFirstTrack(t *testing.T
  		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header), Request: r}, nil
  	}))
  	err := p.handleTransferCommand(context.Background(), req, state, sp)
@@ -64,9 +65,10 @@ diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
 +	}
 +}
 diff --git a/daemon/player.go b/daemon/player.go
+index dd771d9..8d26b62 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -471,8 +471,21 @@
+@@ -471,9 +471,22 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
  	// Lazy context preparation must succeed before changing the command or output owner.
  	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(transferState.CurrentSession.Context.Uri)
  	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
@@ -83,29 +85,53 @@ diff --git a/daemon/player.go b/daemon/player.go
 +	injected, err := ctxTracks.SeekTransferred(ctx, transferState.Playback.CurrentTrack)
 +	if err != nil {
  		return fmt.Errorf("failed seeking to track: %w", err)
-+	}
+ 	}
 +	if injected && transferState.Options.ShufflingContext {
 +		return fmt.Errorf("cannot preserve shuffled transfer after unavailable context page")
- 	}
++	}
  	if ctxTracks.CurrentTrack().Uri != currentTrack.Uri {
  		return fmt.Errorf("failed seeking to track: current media identity changed")
-@@ -545,12 +558,6 @@
- 		}
+ 	}
+@@ -546,12 +559,6 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
  		p.state.queueID = max(p.state.queueID, n)
  	}
--
+ 
 -	// add all tracks from queue
 -	for _, track := range transferState.Queue.Tracks {
 -		ctxTracks.AddToQueue(track)
 -	}
 -	ctxTracks.SetPlayingQueue(transferState.Queue.IsPlayingQueue)
- 
+-
  	p.state.tracks = ctxTracks
  	p.state.player.Track = ctxTracks.CurrentTrack()
+ 	p.state.player.PrevTracks = ctxTracks.PrevTracks()
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index cf02404..9f370d1 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -522,6 +522,17 @@ func (p *AppPlayer) startPreparedDealerTransfer(ctx context.Context, paused bool
+ 	if capture.Source != nil || capture.Primary != p.primaryStream || capture.SessionID == "" || capture.TargetAlias != capture.SelectedAlias {
+ 		return nil, ErrAliasConflict
+ 	}
++	p.app.moveCustodyMu.Lock()
++	fresh := p.app.openedWriterGeneration == 0 && p.app.openedWriterOwner == nil &&
++		p.app.startCustody == nil && p.app.moveCustody == nil && !p.app.moveCustodyUnknown &&
++		p.app.retirementPending == nil && p.app.startOutputPermit == nil && !p.app.queueWriterBusyLocked()
++	p.app.moveCustodyMu.Unlock()
++	if !fresh {
++		return nil, ErrAliasConflict
++	}
++	// The transferred semantic session is the intended first writer, not a
++	// predecessor. C independently checks any durable prior-process ownership.
++	capture.OldOwner = nil
+ 	target, err := capture.readCState(ctx)
+ 	if err != nil {
+ 		return nil, err
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 345ede4..709cace 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,7 @@ import (
  	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
  	"github.com/devgianlu/go-librespot/tracks"
  	"google.golang.org/protobuf/proto"
@@ -113,16 +139,16 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -562,7 +563,7 @@
+@@ -562,7 +563,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
  // synthetic AP welcome seeds only the existing account getter; no provider
  // authentication, HomePod or physical audio is claimed by this regression.
  func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
 -	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
-+	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
++	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation"} {
  		t.Run(mode, func(t *testing.T) {
  			p, _ := contentFixture(t)
  			path := filepath.Join(t.TempDir(), "prepared.fifo")
-@@ -617,7 +618,7 @@
+@@ -617,7 +618,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			position := int64(8487)
  			p.state.player.PositionAsOfTimestamp = position
  			p.state.player.Timestamp = time.Now().UnixMilli()
@@ -131,7 +157,62 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			p.state.setPaused(paused)
  			ctx, cancel := context.WithCancel(context.Background())
  			defer cancel()
-@@ -707,7 +708,15 @@
+@@ -631,7 +632,20 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				calls = append(calls, endpoint)
+ 				var body map[string]json.RawMessage
+ 				_ = json.NewDecoder(r.Body).Decode(&body)
++				if endpoint == "state" || endpoint == "prepare" || endpoint == "commit" {
++					if string(body["old_native_owner"]) != "null" {
++						t.Error("fresh physical writer named a semantic predecessor")
++						w.WriteHeader(http.StatusConflict)
++						return
++					}
++				}
+ 				if endpoint == "state" {
++					if mode == "late-generation" {
++						p.app.moveCustodyMu.Lock()
++						p.app.openedWriterGeneration = 1
++						p.app.openedWriterOwner = &AppPlayer{}
++						p.app.moveCustodyMu.Unlock()
++					}
+ 					if creates.Load() != 0 {
+ 						t.Error("writer opened before C state")
+ 					}
+@@ -700,6 +714,33 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			}))
+ 			defer owner.Close()
+ 			p.app.cfg.RoomTransportOwnToneURL = owner.URL
++			preexisting := false
++			switch mode {
++			case "prior-generation":
++				p.app.openedWriterGeneration = 1
++				preexisting = true
++			case "foreign-owner":
++				p.app.openedWriterOwner = &AppPlayer{}
++				preexisting = true
++			case "start-custody":
++				p.app.startCustody = &contentOperation{Owner: &AppPlayer{}}
++				preexisting = true
++			case "move-custody":
++				p.app.moveCustody = &moveOperation{Owner: &AppPlayer{}}
++				preexisting = true
++			case "unknown-custody":
++				p.app.moveCustodyUnknown = true
++				preexisting = true
++			case "pending-retirement":
++				p.app.retirementPending = &retirementAttempt{}
++				preexisting = true
++			case "start-permit":
++				p.app.startOutputPermit = &contentOperation{}
++				preexisting = true
++			case "queue-custody":
++				p.app.queueWriterFences = map[*nativeTransportOffer]queueWriterFence{&nativeTransportOffer{}: {Owner: p, Until: time.Now().Add(time.Hour)}}
++				preexisting = true
++			}
+ 			if mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
+ 				// Same shipped load caller must retire its own op.Prepared publication.
+ 				p.primaryStream = nil
+@@ -707,7 +748,15 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  				p.primaryLoadOrdinal = 0
  				events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
  				nextSessionField(p.sess, "events", events)
@@ -147,7 +228,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
  				}))
  				nextSessionField(p.sess, "sp", sp)
-@@ -729,11 +738,19 @@
+@@ -729,11 +778,19 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					transfer.Playback.IsPaused = paused
  					transfer.CurrentSession.OriginalSessionId = proto.String(sessionID)
  					transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
@@ -167,14 +248,50 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  				} else {
  					err = p.loadCurrentTrackWithStart(ctx, false, true, false, true)
  				}
+@@ -776,6 +833,13 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				if err == nil {
+ 					t.Fatal("adverse START admitted", mode)
+ 				}
++				if preexisting && (len(calls) != 0 || creates.Load() != 0) {
++					t.Fatal("extant custody was bypassed before C request", mode, calls)
++				}
++				if mode == "late-generation" && (creates.Load() != 0 || p.app.openedWriterGeneration != 1 || p.app.openedWriterOwner == nil) {
++					t.Fatal("late writer generation overwritten")
++				}
++
+ 				if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
+ 					t.Fatal("unadmitted writer opened", mode, calls)
+ 				}
+@@ -793,3 +857,21 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestPreparedDealerKeepsDefaultSTARTPredecessorBody(t *testing.T) {
++	_, op := contentFixture(t)
++	body, err := json.Marshal(op.cPrepareBody())
++	if err != nil {
++		t.Fatal(err)
++	}
++	var decoded struct {
++		Old      *roomTransportIdentity `json:"old_native_owner"`
++		Intended roomTransportIdentity  `json:"intended_native_owner"`
++	}
++	if err = json.Unmarshal(body, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if decoded.Old == nil || decoded.Old.SessionID == decoded.Intended.SessionID || decoded.Intended.AliasRevision != decoded.Old.AliasRevision+1 || op.Capture.OldOwner != decoded.Old && *op.Capture.OldOwner != *decoded.Old {
++		t.Fatal("default selected-content START lost real predecessor transition")
++	}
++}
 diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
+index 368bb12..bda0825 100644
 --- a/spclient/context_resolver.go
 +++ b/spclient/context_resolver.go
-@@ -12,6 +12,17 @@
- 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -13,6 +13,17 @@ import (
  	"golang.org/x/exp/maps"
  )
-+
+ 
 +// ContextPageStatusError preserves the page response classification without
 +// treating a context failure as authority for any different current track.
 +type ContextPageStatusError struct {
@@ -185,10 +302,11 @@ diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
 +func (e *ContextPageStatusError) Error() string {
 +	return fmt.Sprintf("invalid status code from page at %s: %d", e.URL, e.StatusCode)
 +}
- 
++
  type ContextResolver struct {
  	log librespot.Logger
-@@ -122,7 +133,7 @@
+ 
+@@ -122,7 +133,7 @@ func (r *ContextResolver) loadPage(ctx context.Context, url string) (*connectpb.
  	defer func() { _ = resp.Body.Close() }()
  
  	if resp.StatusCode != 200 {
@@ -198,9 +316,10 @@ diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
  
  	respBytes, err := io.ReadAll(resp.Body)
 diff --git a/tracks/paged-list.go b/tracks/paged-list.go
+index 054e3fe..8e44910 100644
 --- a/tracks/paged-list.go
 +++ b/tracks/paged-list.go
-@@ -71,6 +71,8 @@
+@@ -71,6 +71,8 @@ type pagedList[T any] struct {
  	pages librespot.PageResolver[T]
  	list  []pagedListItem[T]
  	pos   int
@@ -209,12 +328,10 @@ diff --git a/tracks/paged-list.go b/tracks/paged-list.go
  }
  
  func newPagedList[T any](log librespot.Logger, pages librespot.PageResolver[T]) *pagedList[T] {
-@@ -100,6 +102,15 @@
- 
- 	l.pos = 0
+@@ -102,6 +104,15 @@ func (l *pagedList[T]) moveStart(ctx context.Context) error {
  	return nil
-+}
-+
+ }
+ 
 +// moveInjected preserves cached context entries but never assigns the supplied
 +// track a context-page position. The original failed page is not retried by
 +// immediate publication or a detached observation on this prepared list.
@@ -222,10 +339,12 @@ diff --git a/tracks/paged-list.go b/tracks/paged-list.go
 +	l.list = append([]pagedListItem[T]{{item, -1, -1}}, l.list...)
 +	l.pos = 0
 +	l.injectedFetchErr = fetchErr
- }
- 
++}
++
  func (l *pagedList[T]) move(iter *pagedListInterator[T]) {
-@@ -182,6 +193,9 @@
+ 	if iter.err != nil {
+ 		panic("cannot move to errored paged list iterator")
+@@ -182,6 +193,9 @@ func (l *pagedList[T]) fetchNextPage(ctx context.Context) (int, error) {
  		pageIdx = curr.pageIdx + 1
  	}
  
@@ -236,9 +355,10 @@ diff --git a/tracks/paged-list.go b/tracks/paged-list.go
  	if err != nil {
  		return pageIdx, err
 diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
+index ea4e3f0..39550b6 100644
 --- a/tracks/room_transport_test.go
 +++ b/tracks/room_transport_test.go
-@@ -6,7 +6,10 @@
+@@ -6,7 +6,10 @@ import (
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
@@ -249,7 +369,7 @@ diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
  	"testing"
  )
  
-@@ -150,3 +153,120 @@
+@@ -150,3 +153,120 @@ func TestAutoplayHistoryFailureIsNotCompleteRecentHistory(t *testing.T) {
  		t.Fatalf("partial history was reported complete: %d %v", len(rows), err)
  	}
  }
@@ -371,9 +491,10 @@ diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
 +	}
 +}
 diff --git a/tracks/tracks.go b/tracks/tracks.go
+index f01c862..3325363 100644
 --- a/tracks/tracks.go
 +++ b/tracks/tracks.go
-@@ -2,14 +2,17 @@
+@@ -2,14 +2,17 @@ package tracks
  
  import (
  	"context"
@@ -391,12 +512,10 @@ diff --git a/tracks/tracks.go b/tracks/tracks.go
  )
  
  type List struct {
-@@ -58,6 +61,49 @@
- 	}
- 
+@@ -60,6 +63,49 @@ func (tl *List) TrySeek(ctx context.Context, f func(track *connectpb.ContextTrac
  	return nil
-+}
-+
+ }
+ 
 +// SeekTransferred keeps the authenticated dealer's supplied current track when
 +// a later context page is unavailable. It never substitutes cached first media.
 +// The bool distinguishes a detached track so callers cannot claim shuffled
@@ -438,10 +557,12 @@ diff --git a/tracks/tracks.go b/tracks/tracks.go
 +	}
 +	tl.tracks.moveInjected(detached, err)
 +	return true, nil
- }
- 
++}
++
  func (tl *List) Seek(ctx context.Context, f func(*connectpb.ContextTrack) bool) error {
-@@ -184,6 +230,9 @@
+ 	tl.invalidateQueueObservation()
+ 	iter := tl.tracks.iterStart()
+@@ -184,6 +230,9 @@ func (tl *List) Index() *connectpb.ContextIndex {
  	}
  
  	curr := tl.tracks.get()
@@ -451,14 +572,14 @@ diff --git a/tracks/tracks.go b/tracks/tracks.go
  	return &connectpb.ContextIndex{Page: uint32(curr.pageIdx), Track: uint32(curr.itemIdx)}
  }
  
-@@ -318,6 +367,10 @@
- func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
- 	if shuffle == tl.shuffled {
+@@ -320,6 +369,10 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
  		return nil
-+	}
-+
-+	if tl.tracks.injectedFetchErr != nil {
-+		return fmt.Errorf("cannot shuffle unavailable transferred context: %w", tl.tracks.injectedFetchErr)
  	}
  
++	if tl.tracks.injectedFetchErr != nil {
++		return fmt.Errorf("cannot shuffle unavailable transferred context: %w", tl.tracks.injectedFetchErr)
++	}
++
  	tl.invalidateQueueObservation()
+ 	if shuffle {
+ 		// fetch all tracks

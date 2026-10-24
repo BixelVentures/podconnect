@@ -132,6 +132,43 @@ is frozen source pending official CI/publication/installation and bounded physic
 acceptance; no provider/device actions by integration or audible success claimed.
 
 
+Lead continuation — bootstrap predecessor49, planned build. Speakers48 is published
+for both architectures and installed on Green according to root readback; exact merge
+cef68d2b4d9137ed2905d4873ec84b5d3ba01a4a/treebbd8cf05b342adcf2fdf1d45fee20f4406d1cc61
+is the unchanged baseline. A subsequent correctly targeted paused transfer passes the
+prior radio-page boundary but receives C prepare409. This does not establish output
+or lifecycle success and does not change the unknown historical journal classification.
+
+Affected chain: supplied transfer -> Native initial prepared stream -> predecessor
+request identity -> existing C prepare/commit owner checks -> writer/FIFO/current-route
+receipt. Source owner PC13 is investigating the proven bootstrap self-predecessor
+request boundary; C owner independently reviews the request contract and real-C causal
+regression. The minimal hypothesis is a Native request correction, not relaxed C
+admission. Exact successor/current-owner, paused transfer and negative stale/foreign
+cases must remain fenced. No Control, manager, C runtime, UI, permission, timeout or
+journal changes are planned. Integration owns only the reviewed Native overlay and
+existing Docker/checksum/CI binding plus49 release metadata once the frozen GO packet
+arrives. No speculative runtime edit, freeze, publication or device action is allowed.
+Final independent Native+C SOURCE/PIN/EVIDENCE GO covers f613d0c9 and C fixture
+5eff69bb. Unchanged C20 HTTP admission reproduces ready=true with semantic self-
+predecessor409 versus absent physical predecessor200; live custody, UNKNOWN, pending
+writer and stale process still return409. Native fresh bootstrap proof requires
+initial generation, no opened owner and no START/MOVE/unknown/pending/permit/queue
+custody, then omits only the private C predecessor. Semantic session/alias/source
+revalidation and late-generation CAS remain unchanged. Offline cached Linux
+TestPreparedDealer race passes21.326s, including paused/playing FIFO bootstrap,
+default predecessor preservation, eight extant-owner negatives and late generation.
+
+Integration folds this exact two-file delta into existing Native34 (ae6fa242), cleanly
+replayed from33 to all final source bytes; first33 stay exact. Existing Docker/CI path
+is unchanged; all34 checksums, affected formatting and whitespace pass. Existing C CI
+overlay permanently covers the HTTP regression; clean replay preserves all229 runtime
+C/H files. Manager/Control/PV are unchanged. Prior passed checks remain evidence for
+unchanged bytes. Candidate source is frozen; root owns final official CI, publication,
+install/readback and bounded physical acceptance. Station continuation remains open;
+no live audio, persisted field-journal recovery or general lifecycle success claimed.
+
+
 ## Active lead decision — preserve paused Native ownership and reject unsafe release, 24 October 2026
 
 Lead: /root; implementation: weather_budget. Direct source evidence: releaseHomePod ignores empty-output PUT failure then writes released; idle and manual release report unconditional success. Field released=true with selected=true is not physical release proof. Earlier acknowledgement-only draft is withdrawn: even atomic current-owner/marker commit cannot stop an unbound output PUT deselecting a successor during the request.
