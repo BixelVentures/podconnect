@@ -21,17 +21,3 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
    if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
      { recovery_salt_red = true; return recovery_wire_case(0); }
    if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
-diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
---- a/tests/start35_wire_owner.inc.c
-+++ b/tests/start35_wire_owner.inc.c
-@@ -554,7 +554,9 @@
-     }
-     struct output_retirement_request wrong=retire;
-     wrong.pipe_inode++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
--    wrong=retire;wrong.completed_token[0]='f';assert(outputs_retirement_prepare(&wrong,&retirement)<0);
-+    wrong=retire;wrong.completed_token[0]=retire.completed_token[0]=='0'?'1':'0';
-+    assert(strcmp(wrong.completed_token,retire.completed_token)!=0);
-+    assert(outputs_retirement_prepare(&wrong,&retirement)<0);
-     wrong=retire;wrong.native_process.proc_start_ticks++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
-     if(f.device->session){
-       const void *original=start_active->session;

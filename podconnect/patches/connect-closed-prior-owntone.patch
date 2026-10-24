@@ -243,7 +243,7 @@ index 5d83d43..b138b22 100644
    if (argc == 2 && !strcmp(argv[1], "--move-post-full-generation")) return start35_wire_case(20);
    if (argc == 2 && !strcmp(argv[1], "--start-post-full-writer")) return start35_wire_case(21);
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 38d4c00..049cab8 100644
+index 38d4c00..4629cfe 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -508,7 +508,7 @@ static int start35_wire_case(int mode)
@@ -255,7 +255,7 @@ index 38d4c00..049cab8 100644
      player_tick_interval.tv_nsec=50000000;
      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
      assert(pb_timer_fd>=0);
-@@ -527,11 +527,70 @@ static int start35_wire_case(int mode)
+@@ -527,11 +527,72 @@ static int start35_wire_case(int mode)
    assert(outputs_start_barrier_begin(r,&f.start_result)==0);
    assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&deadline,&fd)==0 && fd.epoch);
    outputs_transport_input_changed(item,fifo,true);assert(outputs_start_barrier_done(r->token,fd.epoch)==0);
@@ -287,7 +287,9 @@ index 38d4c00..049cab8 100644
 +    }
 +    struct output_retirement_request wrong=retire;
 +    wrong.pipe_inode++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
-+    wrong=retire;wrong.completed_token[0]='f';assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++    wrong=retire;wrong.completed_token[0]=retire.completed_token[0]=='0'?'1':'0';
++    assert(strcmp(wrong.completed_token,retire.completed_token)!=0);
++    assert(outputs_retirement_prepare(&wrong,&retirement)<0);
 +    wrong=retire;wrong.native_process.proc_start_ticks++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
 +    if(f.device->session){
 +      const void *original=start_active->session;
@@ -327,7 +329,7 @@ index 38d4c00..049cab8 100644
    if(!f.failed && mode==18){
      struct output_native_owner same_app=f.start_result.command.committed_native_owner;
      struct output_transport_identity same_route=f.start_result.route_identity;
-@@ -679,7 +738,7 @@ static int start35_wire_case(int mode)
+@@ -679,7 +740,7 @@ static int start35_wire_case(int mode)
    }
    if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
   cleanup:
