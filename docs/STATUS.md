@@ -899,3 +899,81 @@ The frozen merged082ea95f5a2901877e1f798f6d9588eafdc4174cd4607dac69918dd0ca249f5
 All four production components are composed into ONE cumulative C19→C20 ordinary-pause-ack-owntone overlay19f28d56816c56c99d992ec70826605f9c9d00d552169cb0ef0dcf7ea18b5bae. Four direct CI components plus the final merged peer fixture compose into ONE CI overlayf1f3ee4b39d05e800882471cdb08d90ab2140066b9e74050d7bc50caccdc7968. Docker and official Linux CI retain identical20 production-overlay order after unchanged19 predecessors and five CI-only overlays; the new move-pause-resume-wire runs once with timeout25. All261 C production source pins reproduce manifestf1ace337091ddd5fac3ae7dd3e28d692f7a5f4e302517d84b616f70426e46204; only the reviewed four C files differ from C19. Native32 production and31 predecessor patch hashes are unchanged; the sole changed Native patch contains the previously reviewed cancellation-fixture correction. Frozen manager five-file pins, Control0.10.21 and every unrelated source/config byte are retained.
 
 Planned Speakers0.26.45 is now ready only for independent exact export/composition closure and the mandatory official candidate CI. No remote mutation, manual CI dispatch, provider/HA/device command, restart or installation occurred in packaging. Root owns the combined PodVoice81/Speakers45 delivery; physical sound, volume, timeline and all three acceptance cycles remain open on the installed candidate. Source, CI, publication, installation and physical acceptance stay separate.
+
+
+Lead continuation — failed START retirement51, planned build, NOT accepted.
+Lead root; Native source/test owner native_idle_owner; repo integration owner
+sol61_connect_c_resume; independent adversarial source and composition review required.
+The exact base is main32d09ee6340a263f493cd0a1b90eb8c210a70622 /
+treefefe7c4014b1810b9bb5ca0fcf9b7d30ec8420ea, including the50 late-HTTP fixture
+teardown fence and per-architecture publisher cache. Installed50 startup recovery is
+separate: its replacement Native actor answered one passive status read while stopped.
+That read is no Connect, output or acoustic acceptance.
+
+Direct controlled evidence on exact50 shows a finite source EOF after C COMPLETE:
+C's strict HTTP/player/FIFO/AP2 transaction completes, then Native correctly denies
+initial playback credit because the actual output is paused. The failed Native
+operation remains UNKNOWN. The existing load-failure defer seals this exact actor
+and calls stopPlayback -> beginStopRetirement before closing its writer, but normal
+retirement currently requires Native semantic State=complete. It therefore rejects
+that failed actor despite its retained strict C-completed physical receipt. This
+cleanup coupling is a concrete source fault; attribution of the installed49 final
+custody failure remains unproven.
+
+Authorized chain: failed exact published START -> teardown-only current custody
+check -> existing C retirement prepare/FULL closed gate -> actual writer/decoder
+close and join -> existing C terminal completion -> exact old custody release ->
+later authenticated owner admission. Preserve semantic UNKNOWN/no initial-load
+credit, generic UNKNOWN refusal and all C admission. Bind the failed operation,
+closing actor/player/session, registered writer/pipe and generation; recheck after
+awaits so delayed cleanup cannot touch a successor. Missing/unknown C completion,
+foreign custody, changed writer/generation, prepare failure and incomplete terminal
+proof remain fenced. The existing closed-prior path must independently prove an
+already closed old writer, not infer death from an alias or an elapsed timer.
+
+One falsifiable hypothesis: the semantic-completion requirement prevents a valid,
+retirement-only physical cleanup and strands future Connect admission after a
+legitimate failed load. Reuse the existing real Native+C fixture and actual load
+caller: EOF -> final verification refusal -> failure defer -> retirement prepare
+before Stop -> close/join -> terminal retirement, then a fresh owner; add the nearby
+stale/foreign/UNKNOWN/persist-failure negatives. Reuse passed unchanged checks.
+Non-goals: EOF playback allowance, automatic next/play/retry, timeout tuning, a new
+protocol/worker/endpoint, startup-auth recovery, C production/admission, manager,
+Control or UI changes. No field retry, journal reset or device/provider effect.
+
+Final source and controlled evidence: independent reviewer sol61_review74_final
+supplies SOURCE and evidence GO for production3511cc139213b879ecb390608a0e6d510bb7384583639ac927830a1ba98f9af3
+and full six-file Native packetb6f68030991f5b28a070c49f22df19396f5e5206b5903a32bd8090319d1b3bd7.
+The correction admits only retirement cleanup of the exact failed published
+C-completed START with current player/session/registered writer and captured
+writer generation; it does not change semantic UNKNOWN or playback credit.
+Original RED is retained. Focused race regression PASS1.062s covers UNKNOWN,
+malformed/foreign custody, worker/generation drift, unjoined writers and delayed
+prepare/completion against a successor. Exact actual Native+C outer-load-failure
+regression PASS Native0/C0 in2.21s: C pending/FULL precedes Stop/Close and join;
+terminal completion/FULL advances the input epoch, then the same authenticated App
+opens a paused successor writer at generation+1. Delayed old completion has no
+effect and the next proper C START state is ready. This proves a guarded writer
+successor, not a second authenticated Spotify transfer or acoustics. Normal paused
+and playing real-C proofs are reused because playback guards are unchanged.
+Evidence receipt472edb86e0ed47f7f88cff48ca4a75d9ff49fbdb71e8d2d678be559bd88847c8
+binds the source, race binary and actual logs. Installed49 failure attribution
+remains unknown; no field EOF diagnosis is claimed.
+
+Exact packaging folds this source into existing Native34 cumulative overlay
+c72790365d270fc32bdbc174f53d2e2d611360305f005c5ccb30ddb2a3b06fba;
+all220 Native C/Go/header source files byte-match the final owner source after replay
+and all33 predecessor overlays remain unchanged. Existing C CI overlay becomes
+820599e04df0737e8f54669d95397de7af303051dbcd27f16f4487db24301dbc
+by applying reviewed fixture-only4ad108de2d8a894ff22d5024f42052ee6a9c0a82539a7fa18d850e745b2bf117
+after exact final50 complete CI fixture. Earlier tests and the late-HTTP teardown
+fence are preserved. All229 C production files, manager, Control21, Docker build
+inputs and the per-architecture cache workflow are unchanged. No patch slot or
+protocol is added. Cumulative Native and C fixture replay, source pins and diff
+whitespace checks pass; no broad local gate is rerun.
+
+Speakers0.26.51 is frozen for final independent composition/hash closure and the
+mandatory official CI. Rollback is this Native successor overlay, its inert fixture
+and release metadata. No remote mutation, provider/HA/device action, publication,
+installation or host reboot occurs in packaging. Root owns one combined PV82/PC51
+delivery; official CI, installation and physical acceptance stay separate and open.
