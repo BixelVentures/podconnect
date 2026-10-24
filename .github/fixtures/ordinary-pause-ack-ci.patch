@@ -1,7 +1,8 @@
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 74f9635..e16752d 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
-@@ -595,6 +595,7 @@
+@@ -595,6 +595,7 @@ struct recovery_wire_fixture {
  
  static struct recovery_wire_fixture *active_recovery_wire;
  static bool recovery_receiver_entropy, recovery_salt_red;
@@ -9,7 +10,7 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
  static int start_partial_writes,start_partial_bytes;
  int __real_evbuffer_write(struct evbuffer *,int);
  int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
-@@ -785,6 +786,13 @@
+@@ -785,6 +786,13 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
      if(f->mode==9 && f->volumes==2)code=503;
      if(f->mode==12)cseq++;
      if(f->mode==13)code=503;
@@ -23,7 +24,7 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
    } else if(!strncmp(header,"TEARDOWN ",9)) {
      enum output_attention_recovery_state state;struct output_attention_proof proof;
      f->teardowns++;
-@@ -1167,6 +1175,8 @@
+@@ -1167,6 +1175,8 @@ int main(int argc, char **argv)
    if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
      { recovery_salt_red = true; return recovery_wire_case(0); }
    if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
@@ -33,9 +34,10 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index a5bc2e8..70552a5 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
-@@ -195,6 +195,415 @@
+@@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
        assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
        puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
  }
@@ -451,7 +453,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
  /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
   * success. Admission alone cannot retain; only the exact post-effect receipt. */
  static void confirmed_pause_custody_case(struct output_device *device,
-@@ -252,6 +661,7 @@
+@@ -252,6 +661,7 @@ static void confirmed_pause_custody_case(struct output_device *device,
      assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
      assert(transport_pause_owned(1));
    }
@@ -459,7 +461,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -384,7 +794,8 @@
+@@ -384,7 +794,8 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -469,7 +471,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -431,7 +842,10 @@
+@@ -431,7 +842,10 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -481,9 +483,62 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+index 2ea29b0..29eac14 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -60,15 +60,35 @@
+@@ -35,9 +35,50 @@ static void start_gate_strict_http(const struct output_start_request *r)
+   const char *cases[][2]={{"\"boot_id\":","\"unknown\":0,\"boot_id\":"},{"\"pid\":","\"pid\":\"1\",\"pid\":"},{"\"homepod_id\":","\"homepod_id\":\"1\",\"homepod_id\":"},{"\"room_id\":","\"unknown\":0,\"room_id\":"},{"\"native_revision\":\"100\"","\"native_revision\":true"},{"\"start_volume_percent\":35","\"start_volume_percent\":\"35\""}};
+   for(size_t i=0;i<ARRAY_SIZE(cases);i++){changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);}
+   changed=malloc(strlen(raw)+4);sprintf(changed,"%s {}",raw);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);
++  /* Exact fresh prepared-transfer request from the field: semantic current
++   * owner was also supplied as its own physical predecessor. Availability
++   * reads do not validate that proposed old/new session+alias lineage. */
++  struct output_start_request self=*r;struct output_start_state available;
++  self.old_owner_present=true;self.old_native_owner=self.intended_native_owner;
++  assert(outputs_start_state_get(&self,&available)==0 && available.ready);
++  json_object_object_add(body,"old_native_owner",start_journal_owner(&r->intended_native_owner));
++  changed=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  fprintf(stderr,"FIXTURE bootstrap semantic self-owner: state ready=true, old session/revision equal intended\n");
++  int bootstrap_status=start_gate_http(&h,"prepare",changed);
++  fprintf(stderr,"FIXTURE semantic self-predecessor prepare HTTP=%d\n",bootstrap_status);
++  assert(bootstrap_status==409);free(changed);
++  json_object_object_add(body,"old_native_owner",NULL);
++  /* Omitting a nonexistent predecessor is not a waiver of current custody,
++   * pending writer, UNKNOWN journal or kernel process identity refusals. */
++  bool saved_live=transport_custody_live;struct output_native_owner saved_owner=transport_custody_owner;
++  struct timespec saved_expiry=transport_custody_expiry;
++  transport_custody_live=true;transport_custody_owner=r->intended_native_owner;
++  assert(clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry)==0);transport_custody_expiry.tv_sec+=10;
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);
++  transport_custody_live=saved_live;transport_custody_owner=saved_owner;transport_custody_expiry=saved_expiry;
++  bool saved_fault=start_journal_fault;start_journal_fault=true;
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);start_journal_fault=saved_fault;
++  struct start_slot blocked={0},*saved_active=start_active;bool saved_gate=outputs_start_gate_closed();
++  blocked.writer_pending=true;blocked.result.phase=OUTPUT_START_UNKNOWN;
++  start_active=&blocked;atomic_store(&start_gate,true);
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);
++  start_active=saved_active;atomic_store(&start_gate,saved_gate);
++  json_object_object_add(process,"proc_start_ticks",json_object_new_string("0"));
++  /* Zero is malformed, so use a different positive counter to reach the C owner. */
++  attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks+1);
++  changed=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"prepare",changed)==409);free(changed);
++  attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks);
++  struct stat named;assert(stat(r->expected_input_path,&named)==0 && S_ISFIFO(named.st_mode));
++  assert(start_all_writers_closed(&r->native_process,named.st_dev,named.st_ino)==1);
++  assert(!outputs_start_source_owned() && outputs_start_state_get(r,&available)==0 && available.ready);
+   assert(start_gate_http(&h,"prepare",raw)==HTTP_OK);reply=jparse_obj_from_evbuffer(h.out_body);assert(reply && json_object_object_length(reply)==27);
+   struct start_slot *slot=start_find(jparse_str_from_obj(reply,"token"));assert(slot && slot->result.phase==OUTPUT_START_PREPARED);slot->deadline.tv_sec-=9;
+   json_object_put(reply);free(raw);json_object_put(body);evbuffer_free(h.in_body);evbuffer_free(h.out_body);
++  puts("PASS bootstrap C/state ready then self-predecessor409; absent actual predecessor200 with no configured FIFO writer; live custody, UNKNOWN journal/pending writer and stale process still409");
+   puts("PASS actual START HTTP state5/8 prepare12/common27; nested process/owner duplicate and unknown keys, wrong types/trailing JSON reject before admission");
+ }
+ static int start_gate_unused_volume(struct output_device *d,const struct output_room_volume_result *r)
+@@ -60,15 +101,35 @@ static struct output_start_request start_gate_fixture_request(const char *path,c
    strcpy(r.expected_input_path,path);strcpy(r.policy_revision,OUTPUT_START_POLICY);
    gcry_md_hash_buffer(GCRY_MD_SHA256,hash,path,strlen(path));for(i=0;i<32;i++)sprintf(r.expected_input_path_digest+2*i,"%02x",hash[i]);return r;
  }
@@ -521,7 +576,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    assert(start_process_current(process)==!expect_retired);
    d=outputs_device_get(1);assert(d && !d->selected);
    outputs_device_select(d,-1);assert(!d->selected);
-@@ -77,12 +97,39 @@
+@@ -77,12 +138,39 @@ static void start_gate_process_successor(const struct output_native_process *pro
    assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
    struct output_transport_identity route;bool busy,start_owned,clean_absent;
    assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
@@ -562,7 +617,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -92,6 +139,7 @@
+@@ -92,6 +180,7 @@ static void exact_start_durable_gate(void)
    assert(pipe(pipes)==0);native=fork();assert(native>=0);
    if(!native){close(pipes[1]);char byte;(void)read(pipes[0],&byte,1);_exit(0);}
    close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
@@ -570,7 +625,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
    /* Both pre-open unknown and a post-open/completed record must keep a restarted
     * C owner shut while the distinct, actually live native process remains. */
-@@ -114,11 +162,15 @@
+@@ -114,11 +203,15 @@ static void exact_start_durable_gate(void)
        sqlite3_close(hdl);_exit(0);
      }
      assert(waitpid(owner,&status,0)==owner && WIFEXITED(status) && WEXITSTATUS(status)==0);
@@ -588,7 +643,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    /* Conditional journal replacement cannot steal a newer transaction. */
    struct db_start_guard retained={0},wrong={0};assert(db_start_guard_load(&retained)==1);wrong=retained;memset(wrong.token,'f',32);
-@@ -127,5 +179,5 @@
+@@ -127,5 +220,5 @@ static void exact_start_durable_gate(void)
    assert(db_start_guard_save(&retained,&retained)<0);
    assert(attention_sql(sqlite3_mprintf("PRAGMA synchronous=FULL"))==0);free(retained.payload);
    clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);

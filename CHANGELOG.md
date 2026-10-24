@@ -1,3 +1,13 @@
+## Speakers 0.26.49
+
+- Correct only the Native bootstrap physical-predecessor request when no prior
+  physical writer/custody exists; preserve semantic current-owner/alias fences.
+- Add the existing C HTTP fixture regression for self-predecessor409 versus eligible
+  absent-predecessor200, retaining active/UNKNOWN/stale-owner refusals. C runtime,
+  manager, Control21 and PodView remain unchanged.
+- Independent Native/C source review and exact cumulative replay pass. Station continuation and physical acceptance
+  remain open; no publication/installation or audible success claimed.
+
 ## Speakers 0.26.48
 
 - Correct the existing publisher/CI negative-token fixture so its invalid token is
