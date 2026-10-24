@@ -606,3 +606,28 @@ Release admission follows docs/releasing.md: official Verify HA service and clie
 Control20 final source composition: reviewed publisher workflow20f5004873edd05b4ffb0b38417ad84770046ff9cbc57ab4a41f788512a1fb5f, script ec55a1d44cd751f2493114a2c31a7447c5a625d16fb2411cc2849e40c5bc326c and test43fcd559c14991203742fa2079fa9ff0e108f181db4f942da12c4df269701977 are copied exactly after independent high-risk source GO from weather_backend_review. Redirect HOLD was corrected in the reviewed source: the authenticated GitHub API client refuses redirects; the retained ten focused publisher tests include actual inert stdlib redirect handling. The new publish-control job runs only on push/main after both mandatory same-SHA boundary and pinned-HA jobs succeed, with contents:write confined to that job. It publishes only a validated changed Control manifest version at github.sha, reuses an existing exact-commit release/tag, and fails closed on mismatch/ambiguous outcomes without retagging or overwriting. No GitHub API, publication or provider action was executed locally.
 
 The reviewed playlist service/test source, five real-HA inert cases plus final idempotency case and88 boundary checks are retained unchanged. Final composed Python formatter/lint, workflow/services YAML, shell syntax, manifest20, complete source inventory and exact tested-source pins pass; full mypy remains71 unchanged baseline errors rather than a full PASS. Speakers0.26.43 entire subtree32147754f43263b7ac9756fc0a390eaa9d30c65f, Native/C, scopes and HACS minimum are unchanged. Candidate is frozen only for exact-hash composition review and paired PV77 binding; official final CI, HACS Release/tag publication, sole-root Green installation/version/service readback, real account catalogue and visible UI acceptance remain pending. GitHub/HA/provider/installer actions remain with root under existing authorization.
+
+
+## Native START cancellation fixture follow-up — 24 October 2026
+
+Status: **ingen version aftalt**; source-only fixture successor on published main
+cc96fe33c2a94bccf1c5c7e5f8c7f7c868e0be04/tree aed22932e7d3ad93223211fa061a91e28694a479.
+Lead root; fixture owner native_idle_owner; independent reviewer weather_backend_review.
+
+Speakers0.26.44 ARM publication remains immutable and separately verified. The amd64
+publisher run40077936370/job120825256433 remains FAIL/partial publication: its
+protocol-only START fixture observed the original asynchronous C cancellation after
+C COMPLETE, while an old assertion expected only prepare/commit/barrier/open/complete.
+The fixture deliberately has no real writer, so Native correctly records
+writer_current/writer_missing/UNKNOWN and cancels C. Replay is already fenced.
+
+Only the existing room-start-diagnostics-native.patch test hunks and Native checksum
+entry change. The fixture joins the original cancel, requires exactly one cancel and
+the existing missing-writer diagnostic, then proves terminal commit/cancel replay
+adds no requests. No runtime guard, callback, timeout, provider behavior, version or
+publication changes. All13 subcases of the exact sequence test passed once in cached
+Linux arm64 Go1.25.11 with networking disabled; source review confirms fixture-only
+causal closure. Complete32-patch composition and byte comparison preserve every
+non-test source file. This is no claim that amd64 publication or a complete publisher
+has passed. No new release, merge, publication, HA, installation or physical action
+was performed by this follow-up. Root owns any later draft PR and delivery decision.
