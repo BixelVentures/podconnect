@@ -79,6 +79,8 @@ jobs:
           context: ./podconnect
           file: ./podconnect/Dockerfile
           platforms: ${{ matrix.platform }}
+          cache-from: type=gha,version=2,scope=podconnect-${{ matrix.arch }}
+          cache-to: type=gha,version=2,scope=podconnect-${{ matrix.arch }},mode=max,ignore-error=true
           push: true
           provenance: false
           sbom: false
