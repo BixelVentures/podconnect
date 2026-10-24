@@ -4,9 +4,12 @@ import ast
 import importlib.util
 import json
 import sys
+import time
 import types
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1] / "custom_components/podconnect"
 PKG = "inert_room_reason_contract"
@@ -50,19 +53,32 @@ class Rejected(Exception):
     pass
 
 
+ha_exceptions = types.ModuleType("homeassistant.exceptions")
+ha_exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+
+
 commands = types.ModuleType(PKG + ".commands")
 commands.CommandRejected = Rejected
 sys.modules[commands.__name__] = commands
 observation = types.ModuleType(PKG + ".observations")
-observation.current = lambda *args: None
+observation.current = lambda hass, entry, expected=None: expected
+observation.PLAYBACK_MAX_AGE_S = 15.0
+
+
+def unexpected_aggregate(value):
+    raise AssertionError("playback aggregate is outside this room-read fixture")
+
+
+observation._bounded = unexpected_aggregate
 sys.modules[observation.__name__] = observation
 if aiohttp is None:
     _missing = object()
     _original_aiohttp = sys.modules.get("aiohttp", _missing)
     sys.modules["aiohttp"] = aiohttp_stub
 try:
-    speakers = load("speakers")
-    room = load("room_transport")
+    with patch.dict(sys.modules, {"homeassistant.exceptions": ha_exceptions}):
+        speakers = load("speakers")
+        room = load("room_transport")
 finally:
     if aiohttp is None:
         if _original_aiohttp is _missing:
@@ -103,10 +119,27 @@ class ReadReasonContract(unittest.IsolatedAsyncioTestCase):
     async def invoke(self, body):
         client = Client(body)
         reader = speakers.SpeakersClient(client, "http://inert.invalid")
-        data = types.SimpleNamespace(speakers=reader)
+        source = {"ok": True, "owner_epoch": "epoch", "poll_sequence": 7}
+        data = types.SimpleNamespace(
+            speakers=reader,
+            observations=types.SimpleNamespace(playback=lambda entry: source),
+            coordinator=types.SimpleNamespace(
+                data={
+                    "playback_observed_at": datetime.now(UTC),
+                    "playback_observed_monotonic": time.monotonic(),
+                    "playback": {},
+                }
+            ),
+        )
+        hass = types.SimpleNamespace(
+            config_entries=types.SimpleNamespace(
+                async_get_entry=lambda entry: types.SimpleNamespace(unique_id="a")
+            )
+        )
         owner = types.SimpleNamespace(
             data=data,
             controls=lambda *args: {"owner_epoch": "epoch", "poll_sequence": 7},
+            _refresh_owner_current=lambda *args: True,
         )
         transport = room.RoomTransport(owner)
         transport.scope = lambda *args: {
@@ -125,7 +158,7 @@ class ReadReasonContract(unittest.IsolatedAsyncioTestCase):
         ns = {
             "__package__": PKG,
             "current": lambda *args: data,
-            "hass": None,
+            "hass": hass,
             "CommandRejected": Rejected,
         }
         exec(  # noqa: S102 - Execute only the parsed, checked-in service method.
