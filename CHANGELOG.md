@@ -1,3 +1,14 @@
+## Speakers 0.26.50
+
+- Add finite diagnostics to the existing final START custody verifier; preserve
+  UNKNOWN/refusal and every ownership guard. This does not claim an audio fix.
+- Correct the separately proven pre-START transient buffering-position timestamp.
+- Retain the actual Native+C paused/playing/EOF protocol reproducer in the existing
+  C CI fixture. C runtime, manager, Control21 and PodView remain unchanged.
+- Installed49 remains NOT accepted. Reviewed source is frozen for PR CI; merge waits
+  for rebuilt50 Native+C protocol proof and final packaging review. Station continuation
+  and physical acceptance remain open.
+
 ## Speakers 0.26.49
 
 - Correct only the Native bootstrap physical-predecessor request when no prior

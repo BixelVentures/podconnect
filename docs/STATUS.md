@@ -169,6 +169,51 @@ install/readback and bounded physical acceptance. Station continuation remains o
 no live audio, persisted field-journal recovery or general lifecycle success claimed.
 
 
+Lead continuation — final custody50, planned build, NOT accepted. Speakers49 is
+installed RUNNING, exact mergebd436182cf261e4bacbaef4b842b4e0a5c69165f /
+tree6edfb8425a03a74ab28f806966790a1c1da1f81c. The field flow reaches C complete then
+fails final custody with owner_changed; the result remains UNKNOWN. Private evidence:
+/private/tmp/pc49-first-transfer-live-log.txt and
+/private/tmp/pc49-after-transfer-state.txt. No additional Play, retry, reset or guard
+bypass is authorized; startup/RUNNING and C complete do not prove final ownership,
+audible playback or lifecycle acceptance.
+
+Affected chain: transfer -> prepared stream/current writer -> C complete -> existing
+Native final custody verification -> manager observation. A normal paused Native+C
+composite passes; the current playing fixture SIGSEGV is a fixture repair in progress,
+not product failure/success evidence. Normal actual-C playing proof and a frozen
+independently reviewed source packet are required before freeze. The authorized scope
+is finite diagnostics at existing final verification and a separately proven transient
+buffering-position timestamp correction. That separate timestamp bug is not an audio
+fix or explanation of field owner_changed. No ownership guard, timeout, C runtime,
+manager, Control or UI change; UNKNOWN must remain closed.
+
+PC13 source owner supplies causal finite-verifier/position regressions and actual-C
+playing proof; independent review covers changed bits and adjacent stale/current-owner
+boundaries. Integration owns this one existing STATUS continuation, version50 metadata
+and composition into the existing cumulative Native34 path after final GO. First33 and
+all unchanged runtime evidence are retained. No new application path, framework,
+publication or installation during prep. Root owns final official CI and delivery;
+physical acceptance remains open. Final source5-file patch2b4bd889 has independent
+SOURCE/PIN GO. The separate public-position regression retains RED10808489ms versus
+raw8487ms and GREEN8487ms with fresh timestamp; final verifier raw-position behavior
+is unchanged. Affected daemon race passes1.036s and three existing player verifier
+race cases pass1.052s. All five files pass formatting and exact49 patch checks.
+Normal actual49 Native+C paused/playing/EOF cases pass controlled protocol checks;
+the earlier playing SIGSEGV was corrected only in the existing fixture initialization.
+This does not explain the field UNKNOWN or prove audio. Existing C CI fixture retains
+that real protocol reproducer with no C runtime/workflow change.
+
+Integration folds the exact reviewed5-file Native delta into existing cumulative34;
+first33 and Docker/CI application path remain unchanged. Native and composed fixture
+clean replays/formatting pass. Candidate source is frozen for official PR CI; merge
+remains explicitly held until the rebuilt50 Native binary passes all three actual-C
+cases and independent final packaging review. Publication/install and physical
+acceptance remain pending. Root may separately require one kernel reboot through the
+existing prior-boot guard after idle checks; this is not DB reset or integration
+permission to perform it.
+
+
 ## Active lead decision — preserve paused Native ownership and reject unsafe release, 24 October 2026
 
 Lead: /root; implementation: weather_budget. Direct source evidence: releaseHomePod ignores empty-output PUT failure then writes released; idle and manual release report unconditional success. Field released=true with selected=true is not physical release proof. Earlier acknowledgement-only draft is withdrawn: even atomic current-owner/marker commit cannot stop an unbound output PUT deselecting a successor during the request.
