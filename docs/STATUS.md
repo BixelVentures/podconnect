@@ -91,6 +91,47 @@ no provider, C/AP2 output or acoustic success is claimed. All earlier candidate
 partial/pending notes are superseded by this source result, not by field acceptance.
 
 
+Lead continuation — exact-transfer47, planned build. Delivered46 is now the
+software baseline: merge261c31ddbf0f099b8f5b5e47eff8a996ba790b6c,
+source treec8c2a042f5265856036186bc9c8e539d612c9713. Official PR/main CI and
+publisher passed; ARM64 source identity and Green46 RUNNING were read back by root.
+Startup showed no generic writes and initial revision state. These results do not
+establish audible or full lifecycle acceptance.
+
+The first paused transfer selected a different output through root UI error; no Play
+was issued. The observed request was rejected before START by a later radio-page404.
+Two Spotify auto-requests followed one click; this does not prove two human actions or
+classify the C journal. Private field receipts remain root-owned. The remaining
+station/context eligibility and exact transfer identity are the next causal boundary.
+
+Affected chain: Spotify supplied current track/context -> Native transfer parse ->
+strict lazy context seek -> exact supplied-track eligibility -> existing prepared START
+and writer/current-owner fences -> manager receipt -> C route/output. Hypothesis:
+when upstream pagination is unavailable but the transfer already supplies a valid exact
+current-track identity, a narrowly eligible supplied-track fallback can preserve that
+identity without selecting an unrelated cached item. The source owner must define and
+prove eligibility; this planned hypothesis is not an implemented or field-proven fix.
+Failure must preserve prior state. No broad context fallback, automatic Play, manager/C/
+Control/PodView/UI changes, journal reset, permission widening or new engine.
+
+Native owner PC13 owns the bounded upstream source change and causal requested-track /
+lazy404 / malformed-or-ineligible / stale-owner regressions; independent74 review is
+required. Integration prepares Speakers47 metadata and one Native34 overlay after
+unchanged33 only once the immutable reviewed packet arrives. Reuse unchanged46 checks;
+run affected source/composition/static checks, then root owns one final official CI and
+publication/install flow. Rollback boundary is this isolated successor diff. Final source result: independent74 SOURCE/PIN/EVIDENCE GO covers Native34 patch
+142870ef and receiptc9deb128. Exact7 base/tip pins, clean delivered46 apply, actual
+seven-file delta, unchanged first33 checksums, all34 checksum values and changed Go
+formatting/whitespace pass. Source-owner tests cover actual paused and playing dealer
+transfer through existing prepared START/FIFO (9.081s), affected tracks race (1.020s),
+queue/shuffle (5.085s), with prior affected daemon17.536s retained. Upstream artifact
+and all seven evidence logs were independently verified. Supplied exact-track handling
+does not establish station continuation: later radio/context continuation remains
+incomplete and is not claimed fixed. Manager/C/Control/PV remain unchanged. Candidate
+is frozen source pending official CI/publication/installation and bounded physical
+acceptance; no provider/device actions by integration or audible success claimed.
+
+
 ## Active lead decision — preserve paused Native ownership and reject unsafe release, 24 October 2026
 
 Lead: /root; implementation: weather_budget. Direct source evidence: releaseHomePod ignores empty-output PUT failure then writes released; idle and manual release report unconditional success. Field released=true with selected=true is not physical release proof. Earlier acknowledgement-only draft is withdrawn: even atomic current-owner/marker commit cannot stop an unbound output PUT deselecting a successor during the request.
