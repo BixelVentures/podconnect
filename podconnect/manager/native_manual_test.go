@@ -411,3 +411,66 @@ func TestManualPendingRestoreRetainsLeaseAndOriginalCapState(t *testing.T) {
 		t.Fatal("unknown manual reply cleared restoration or became ACK")
 	}
 }
+
+// Suppression is a current source capability, never an authority fallback.
+func TestNativeBoundCapabilitySuppressesOnlyMatchingLegacyTransport(t *testing.T) {
+	for _, change := range []string{"current", "unsupported", "run", "phase", "alias-revision", "alias", "binding", "retired"} {
+		t.Run(change, func(t *testing.T) {
+			live := &glLive{}
+			source, stop := pc11Source(t, live)
+			defer close(stop)
+			status := glStatus{Active: true, Paused: true, SelAlias: 1, AliasBinding: &aliasBinding{Incarnation: "source", Registry: "registry", RoomID: "r0", Ready: true}}
+			if !live.acceptStatus(pc11Request(t, live, source), status) {
+				t.Fatal("initial status")
+			}
+			_, intent := live.transportSnapshot()
+			observed := &nativeManualObservation{Identity: nativeAttentionIdentity{testNativeProcess, "42", "1", "1", "1", "1", "1", "7", 35, 5, false}, Binding: *status.AliasBinding, Alias: 1, AliasRevision: intent.aliasRevision, Run: intent.run, Phase: intent.phase}
+			live.manualObservation = observed
+			switch change {
+			case "unsupported":
+				live.manualObservation = nil
+			case "run":
+				observed.Run++
+			case "phase":
+				observed.Phase++
+			case "alias-revision":
+				observed.AliasRevision++
+			case "alias":
+				observed.Alias++
+			case "binding":
+				observed.Binding.Incarnation = "foreign"
+			case "retired":
+				live.sourceRetired = true
+			}
+			supported := change == "current"
+			if live.nativeBoundTransportSupported(intent) != supported {
+				t.Fatal("foreign/stale capability suppresses ordinary transport")
+			}
+			before, next := transState{canon: -1, otTarget: -1}, transState{canon: 0, otTarget: 0}
+			accepted := live.admitTransport(intent, &before, next)
+			if accepted != (change != "current" && change != "retired") {
+				t.Fatalf("legacy admission=%v", accepted)
+			}
+			if !accepted && before.canon != -1 {
+				t.Fatal("suppressed capability changed canonical state")
+			}
+		})
+	}
+}
+
+func TestNativeBoundCapabilityArrivingAfterLegacyDecisionBlocksAdmission(t *testing.T) {
+	live := &glLive{}
+	source, stop := pc11Source(t, live)
+	defer close(stop)
+	status := glStatus{Active: true, Paused: true, SelAlias: 1, AliasBinding: &aliasBinding{Incarnation: "source", Registry: "registry", RoomID: "r0", Ready: true}}
+	live.acceptStatus(pc11Request(t, live, source), status)
+	_, intent := live.transportSnapshot()
+	if live.nativeBoundTransportSupported(intent) {
+		t.Fatal("invented capability")
+	}
+	live.manualObservation = &nativeManualObservation{Identity: nativeAttentionIdentity{testNativeProcess, "42", "1", "1", "1", "1", "1", "7", 35, 5, false}, Binding: *status.AliasBinding, Alias: 1, AliasRevision: intent.aliasRevision, Run: intent.run, Phase: intent.phase}
+	state := transState{canon: -1, otTarget: -1}
+	if live.admitTransport(intent, &state, transState{canon: 0, otTarget: 0}) {
+		t.Fatal("late capability allowed generic effect")
+	}
+}

@@ -1129,6 +1129,17 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					lastPlayVol = vc
 				}
 
+				// Native owns logical play/pause for the current bound contract;
+				// C PCM lifecycle cannot be fed back as a second transport command.
+				// Suppression grants no route or action authority. Admission repeats
+				// this check under the source mutex if capability arrives meanwhile.
+				if live.nativeBoundTransportSupported(intent) {
+					trans = transState{canon: -1, otTarget: -1}
+					transIntent = intent
+					prevActive = gl.Active
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
 				// Transport — both directions, OwnTone-startup-aware (no flicker, handles rapid taps).
 				nextTrans := trans
 				if transIntent.run != intent.run || transIntent.phase != intent.phase || transIntent.aliasRevision != intent.aliasRevision {
@@ -1143,15 +1154,21 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				// effect (or a no-command tick); no await precedes its HTTP.
 				transIntent = intent
 				if sg >= 0 {
+					action := "pause"
 					if sg == 1 {
-						librespotTransport(room.Librespot, "resume")
-					} else {
-						librespotTransport(room.Librespot, "pause")
+						action = "resume"
 					}
-					log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(sg))
+					if err := librespotTransport(room.Librespot, action); err != nil {
+						log.Printf("transport [%s]: Spotify %s not acknowledged: %v", room.Name, playWord(sg), err)
+					} else {
+						log.Printf("transport [%s]: -> Spotify %s", room.Name, playWord(sg))
+					}
 				} else if so >= 0 {
-					owntoneTransport(room.OwnTone, playWord(so))
-					log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(so))
+					if err := owntoneTransport(room.OwnTone, playWord(so)); err != nil {
+						log.Printf("transport [%s]: HomePod %s not acknowledged: %v", room.Name, playWord(so), err)
+					} else {
+						log.Printf("transport [%s]: -> HomePod %s", room.Name, playWord(so))
+					}
 				}
 			}
 			prevActive = gl.Active

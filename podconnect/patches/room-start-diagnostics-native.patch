@@ -178,10 +178,9 @@ index b985e92..eb86565 100644
  }
  func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index 8d0830b..c2fb4d9 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -3,6 +3,7 @@ package daemon
+@@ -3,6 +3,7 @@
  import (
  	"context"
  	"encoding/json"
@@ -189,7 +188,7 @@ index 8d0830b..c2fb4d9 100644
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/output"
  	"github.com/devgianlu/go-librespot/player"
-@@ -140,10 +141,26 @@ func TestStart35ActualConsumeFencesOwnerMutationAndOneUse(t *testing.T) {
+@@ -140,10 +141,26 @@
  		})
  	}
  }
@@ -217,10 +216,23 @@ index 8d0830b..c2fb4d9 100644
  			var priorMove *moveOperation
  			var priorStart *contentOperation
  			if strings.HasPrefix(mode, "move-") {
-@@ -164,6 +181,12 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -158,12 +175,25 @@
+ 			}
+ 			var cMu sync.Mutex
+ 			var calls []string
++			cancelObserved := make(chan struct{}, 1)
+ 			var nativeSteps []string
+ 			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 				endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
  				cMu.Lock()
  				calls = append(calls, endpoint)
  				cMu.Unlock()
++				if endpoint == "cancel" {
++					select {
++					case cancelObserved <- struct{}{}:
++					default:
++					}
++				}
 +				if endpoint == "open" && mode == "open-exchange-fails" {
 +					w.WriteHeader(http.StatusServiceUnavailable)
 +					_, _ = w.Write([]byte("private-diagnostic-sentinel"))
@@ -230,7 +242,7 @@ index 8d0830b..c2fb4d9 100644
  				var body map[string]json.RawMessage
  				_ = json.NewDecoder(r.Body).Decode(&body)
  				want := map[string]int{"prepare": 12, "commit": 9, "barrier": 6, "open": 4, "complete": 5, "cancel": 2}[endpoint]
-@@ -204,6 +227,10 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -204,6 +234,10 @@
  			go func() {
  				defer close(done)
  				for request := range server.requests {
@@ -241,7 +253,7 @@ index 8d0830b..c2fb4d9 100644
  					value, err := p.handleApiRequest(context.Background(), request)
  					request.Reply(value, err)
  				}
-@@ -251,6 +278,63 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -251,6 +285,63 @@
  			close(server.requests)
  			<-done
  			<-stopped
@@ -305,7 +317,32 @@ index 8d0830b..c2fb4d9 100644
  			completedC := mode == "complete" || mode == "move-complete" || mode == "start-complete"
  			// This protocol fixture deliberately has no actual player worker or
  			// FIFO descriptor. A C COMPLETE alone can no longer credit START.
-@@ -284,7 +368,7 @@ func TestStart35ConfiguredCSequenceOnlyCompletesAfterFinalPrivateResume(t *testi
+@@ -276,15 +367,31 @@
+ 				if strings.Join(nativeSteps, ",") != "quiesce,publish,resume" {
+ 					t.Fatal(nativeSteps)
+ 				}
++				// The absent real writer correctly makes this operation UNKNOWN and
++				// sends one asynchronous cancel. Join that original request before
++				// checking that terminal replay itself sends nothing further.
++				<-cancelObserved
++				cMu.Lock()
++				beforeReplay := strings.Join(calls, ",")
++				cMu.Unlock()
++				if beforeReplay != "prepare,commit,barrier,open,complete,cancel" {
++					t.Fatal("missing-writer cancellation changed", beforeReplay)
++				}
++				log.mu.Lock()
++				lines := append([]string(nil), log.lines...)
++				log.mu.Unlock()
++				if len(lines) != 1 || lines[0] != "content_start_failed stage=writer_current last_c_phase=completed error_class=writer_missing outcome=unknown" {
++					t.Fatal("missing-writer cause changed", lines)
++				}
+ 				op.commit(context.Background(), server)
+ 				op.cancelContent()
+ 				cMu.Lock()
+-				if strings.Join(calls, ",") != "prepare,commit,barrier,open,complete" {
++				if strings.Join(calls, ",") != beforeReplay {
+ 					t.Fatal("complete replay/cancel mutated", calls)
  				}
  				cMu.Unlock()
  			}

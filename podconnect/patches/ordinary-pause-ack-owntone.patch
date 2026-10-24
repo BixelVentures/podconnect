@@ -1,0 +1,130 @@
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -292,6 +292,8 @@
+ 
+ static bool start_route_owned(const struct output_native_owner *,const struct output_transport_identity *);
+ static bool start_route_clean_absent(void);
++static bool start_pause_move_owned(const struct output_native_owner *,const struct output_transport_identity *);
++static bool room_volume_pause_custody_current(const struct output_native_owner *,const struct output_transport_identity *,uint64_t);
+ #include "outputs_transport_custody.inc.c"
+ 
+ static struct transport_slot *
+@@ -379,8 +381,16 @@
+   if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+       || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry))) return -1;
+   if (request->bound) {
++    bool keep_pause=!strcmp(request->action,"resume")
++      && native_owner_equal(&request->native_owner,&transport_pause_owner)
++      && transport_identity_equal(&slot->result.identity,&transport_pause_identity)
++      && transport_pause_owned(request->device_id);
+     if (!transport_custody_admit(request->device_id,&request->native_owner,request->native_revision,
+           slot->admission_generation,&slot->result.identity)) return -1;
++    if (keep_pause) {
++      transport_pause_revision=request->native_revision;
++      transport_pause_retained=true; /* Actual PCM restart owns timer cancellation. */
++    }
+     if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+         || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
+         || !transport_custody_current(&request->native_owner,&identity,request->native_revision))) return -1;
+@@ -422,8 +432,13 @@
+       || slot->result.command.native_revision!=revision
+       || !transport_remaining(&slot->expiry)
+       || !transport_custody_current(&slot->result.command.native_owner,
+-          &slot->result.identity,revision)
+-      || !start_route_owned(&slot->result.command.native_owner,&slot->result.identity)) return -1;
++          &slot->result.identity,revision)) return -1;
++  /* The exact Native effect also exists on an ordinary proven route. Its ACK
++   * grants no START resource retention; normal FIFO suspend/resume still owns
++   * that output's lifecycle. Unknown START ownership must never pass here. */
++  if (!start_route_owned(&slot->result.command.native_owner,&slot->result.identity)
++      && !outputs_start_move_source_transition_current())
++    return start_route_clean_absent() ? 0 : -1;
+   transport_pause_owner=slot->result.command.native_owner;
+   transport_pause_identity=slot->result.identity;
+   transport_pause_revision=revision;
+diff --git a/src/outputs_transport_custody.inc.c b/src/outputs_transport_custody.inc.c
+--- a/src/outputs_transport_custody.inc.c
++++ b/src/outputs_transport_custody.inc.c
+@@ -139,7 +139,11 @@
+       || transport_pause_revision!=transport_custody_revision
+       || transport_identity_get(id,&actual)<0
+       || !transport_identity_equal(&actual,&transport_pause_identity)
+-      || !start_route_owned(&transport_pause_owner,&actual)) {
++      || (!start_route_owned(&transport_pause_owner,&actual)
++          && !(outputs_start_move_source_transition_current()
++              && outputs_start_bound_owner_current(&transport_pause_owner,&actual,false))
++          && !(room_volume_pause_custody_current(&transport_pause_owner,&actual,transport_pause_revision)
++              && start_pause_move_owned(&transport_pause_owner,&actual)))) {
+     transport_pause_retained=false;
+     return false;
+   }
+diff --git a/src/outputs_room_volume.inc.c b/src/outputs_room_volume.inc.c
+--- a/src/outputs_room_volume.inc.c
++++ b/src/outputs_room_volume.inc.c
+@@ -121,12 +121,29 @@
+     && room_volume_state_equal(&state,&slot->result.volume_state)
+     && room_volume_window_live(slot); /* Final clock after owner/proc probes: admission, fragments and ACK. */
+ }
++/* A volume result, even UNKNOWN, never changes the paused transport timeline.
++ * Join only its already-admitted current custody, never a prepared/old owner. */
++static bool room_volume_pause_custody_current(const struct output_native_owner *owner,
++    const struct output_transport_identity *identity,uint64_t revision)
++{
++  if (!revision || revision!=transport_custody_revision
++      || !native_owner_equal(owner,&transport_custody_owner)
++      || !transport_identity_equal(identity,&transport_custody_identity)) return false;
++  for (size_t i=0;i<ARRAY_SIZE(room_volume_slots);i++) {
++    const struct room_volume_slot *s=&room_volume_slots[i];
++    if (s->used && !s->result.contexts_drained && s->result.command.bound && s->result.command.native_revision==revision
++        && native_owner_equal(owner,&s->result.command.native_owner)
++        && transport_identity_equal(identity,&s->result.identity)) return true;
++  }
++  return false;
++}
+ int outputs_room_volume_commit(const struct output_room_volume_request *r,struct output_room_volume_result *out)
+ {
+   struct room_volume_slot *s;
+   struct output_transport_identity identity;
+   struct output_room_volume_state state;
+   struct output_device *d;
++  bool keep_pause;
+   int ret;
+   if (!r || !out || !(s=room_volume_find(r->token)) || s->used) return -1;
+   s->used=true; s->result.outcome=ROOM_VOLUME_REJECTED;
+@@ -147,9 +164,16 @@
+     if (!room_volume_window_live(s)) s->result.outcome=ROOM_VOLUME_EXPIRED;
+     room_volume_observe(s,out); return 0;
+   }
++  keep_pause=r->bound && native_owner_equal(&r->native_owner,&transport_pause_owner)
++    && transport_identity_equal(&s->result.identity,&transport_pause_identity)
++    && transport_pause_owned(r->device_id);
+   memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
+   if (r->bound && !transport_custody_admit(r->device_id,&r->native_owner,r->native_revision,s->admission_generation,&s->result.identity)) {
+     room_volume_observe(s,out); return 0;
++  }
++  if (keep_pause) {
++    transport_pause_revision=r->native_revision;
++    transport_pause_retained=true; /* Same exact paused owner, volume ordinal only. */
+   }
+   if (clock_gettime(CLOCK_MONOTONIC,&room_volume_pin_expiry)<0) { room_volume_observe(s,out); return 0; }
+   room_volume_pin_expiry.tv_sec+=10; room_volume_pin=s;
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -140,6 +140,15 @@
+     && transport_identity_equal(identity,&actual)
+     && start_move_reader_current(s,&actual,active_effect)
+     && start_completed_writer_current(s);
++}
++
++/* Passive Pause retention may coexist with its exact bound volume context.
++ * Mutation admission still uses the unchanged drained MOVE proof. */
++static bool start_pause_move_owned(const struct output_native_owner *owner,
++    const struct output_transport_identity *identity)
++{
++  return start_active && start_active->result.command.move_existing_session
++    && outputs_start_bound_owner_current(owner,identity,true);
+ }
+ 
+ static bool start_move_request_reader_current(const struct output_start_request *r,

@@ -19,7 +19,7 @@ import (
 func TestPC10BridgeRejectsStaleTransport(t *testing.T) {
 	mode := os.Getenv("PC10_BRIDGE_CHILD")
 	if mode == "" {
-		for _, mode := range []string{"playing", "paused", "event_aba", "poll_playing", "poll_aba", "alias_aba", "phase", "new_run", "admitted_completion"} {
+		for _, mode := range []string{"playing", "paused", "event_aba", "poll_playing", "poll_aba", "alias_aba", "phase", "new_run", "admitted_completion", "bound_native_pause"} {
 			t.Run(mode, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 				defer cancel()
@@ -40,8 +40,17 @@ func TestPC10BridgeRejectsStaleTransport(t *testing.T) {
 	defer func() { close(stop) }()
 	initial := glStatus{Active: true, Paused: mode != "paused" && mode != "admitted_completion", HasVol: true, VolPct: 35}
 	initial.SelAlias = 1
+	if mode == "bound_native_pause" {
+		store.setHomePodBinding("r0", "42", "Kitchen HomePod")
+		initial.AliasBinding = &aliasBinding{Incarnation: "bound-source", Registry: "registry", RoomID: "r0", Ready: true}
+	}
 	if !live.acceptStatus(pc11Request(t, live, source), initial) {
 		t.Fatal("initial source refused")
+	}
+	if mode == "bound_native_pause" {
+		live.mu.Lock()
+		live.manualObservation = &nativeManualObservation{Identity: nativeAttentionIdentity{testNativeProcess, "42", "1", "1", "1", "1", "1", "7", 35, 5, false}, Binding: *initial.AliasBinding, Alias: initial.SelAlias, AliasRevision: live.aliasRevision, Run: live.runEpoch, Phase: live.phaseEpoch}
+		live.mu.Unlock()
 	}
 	held, release := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
@@ -72,13 +81,17 @@ func TestPC10BridgeRejectsStaleTransport(t *testing.T) {
 				} else {
 					fmt.Fprint(w, `{"state":"pause"}`)
 				}
-			} else if mode == "paused" || mode == "event_aba" || mode == "poll_aba" || mode == "alias_aba" || mode == "admitted_completion" && playerReads.Load() > 1 {
+			} else if mode == "bound_native_pause" || mode == "paused" || mode == "event_aba" || mode == "poll_aba" || mode == "alias_aba" || mode == "admitted_completion" && playerReads.Load() > 1 {
 				fmt.Fprint(w, `{"state":"play"}`)
 			} else {
 				fmt.Fprint(w, `{"state":"pause"}`)
 			}
 		case "/api/player/pause", "/api/player/play":
 			commands <- "native:" + strings.TrimPrefix(r.URL.Path, "/api/player/")
+			if mode == "bound_native_pause" {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			if mode == "admitted_completion" && playerReads.Load() == 1 {
 				close(held)
 				select {
@@ -157,6 +170,17 @@ func TestPC10BridgeRejectsStaleTransport(t *testing.T) {
 		}
 	}
 	unblock()
+	if mode == "bound_native_pause" {
+		select {
+		case action := <-commands:
+			t.Fatalf("legacy PCM/timeline feedback effect after accepted Native pause: %s", action)
+		case <-time.After(650 * time.Millisecond):
+		}
+		if playerReads.Load() < 2 {
+			t.Fatal("actual loop did not cover repeated PCM play observations")
+		}
+		return
+	}
 	select {
 	case action := <-commands:
 		if action != want {
