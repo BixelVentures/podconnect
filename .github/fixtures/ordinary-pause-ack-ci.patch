@@ -1,8 +1,17 @@
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
-index 74f9635..e16752d 100644
+index 74f9635..803dda4 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
-@@ -595,6 +595,7 @@ struct recovery_wire_fixture {
+@@ -45,6 +45,8 @@ static int fixture_service_bind(struct net_socket *socket, unsigned short *port,
+ #include "../src/outputs/streaming.c"
+ #include "../src/player.c"
+ #undef db_speaker_save
++#include "../src/httpd_internal.h"
++extern struct httpd_module httpd_jsonapi;
+ 
+ /* The input command closes its real old reader before opening the successor.
+  * Schedule the pipe watcher's independent reset-close in that exact interval.
+@@ -595,6 +597,7 @@ struct recovery_wire_fixture {
  
  static struct recovery_wire_fixture *active_recovery_wire;
  static bool recovery_receiver_entropy, recovery_salt_red;
@@ -10,7 +19,7 @@ index 74f9635..e16752d 100644
  static int start_partial_writes,start_partial_bytes;
  int __real_evbuffer_write(struct evbuffer *,int);
  int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
-@@ -785,6 +786,13 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+@@ -785,6 +788,13 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
      if(f->mode==9 && f->volumes==2)code=503;
      if(f->mode==12)cseq++;
      if(f->mode==13)code=503;
@@ -24,9 +33,11 @@ index 74f9635..e16752d 100644
    } else if(!strncmp(header,"TEARDOWN ",9)) {
      enum output_attention_recovery_state state;struct output_attention_proof proof;
      f->teardowns++;
-@@ -1167,6 +1175,8 @@ int main(int argc, char **argv)
+@@ -1166,7 +1176,10 @@ int main(int argc, char **argv)
+   gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
    if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
      { recovery_salt_red = true; return recovery_wire_case(0); }
++  if (argc == 2 && !strcmp(argv[1], "--native-start-wire")) return start35_wire_case(29);
    if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
 +  if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
 +    { completed_move_real_resume=true; return start35_wire_case(24); }
@@ -34,7 +45,7 @@ index 74f9635..e16752d 100644
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index a5bc2e8..70552a5 100644
+index a5bc2e8..7504509 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
@@ -461,7 +472,121 @@ index a5bc2e8..70552a5 100644
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -384,7 +794,8 @@ static int start35_wire_case(int mode)
+@@ -312,6 +722,95 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
+   puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
+ }
+ 
++/* The existing real AP2/FIFO fixture also accepts the actual Native test
++ * process over loopback. Only the HTTP backend adapter is test code: the linked
++ * strict production handler and synchronous player owner execute every step. */
++struct native_start_wire {
++  struct recovery_wire_fixture *fixture;
++  struct event_base *http_base;
++  struct evhttp *http;
++  atomic_bool done,completed;
++};
++static void native_start_http(struct evhttp_request *request,void *arg)
++{
++  struct native_start_wire *wire=arg;
++  const char *uri=evhttp_request_get_uri(request);
++  struct evbuffer *response=evbuffer_new();
++  assert(response);
++  if(!strcmp(uri,"/fixture/done")){
++    evbuffer_add_printf(response,"{}");
++    evhttp_send_reply(request,200,"OK",response);
++    atomic_store(&wire->done,true);
++  }else{
++    char *path=strdup(uri),*rest=path,*part;
++    struct httpd_request actual={.in_body=evhttp_request_get_input_buffer(request),.out_body=response};
++    unsigned count=0;int status=404;
++    assert(path);
++    while((part=strsep(&rest,"/")) && count<ARRAY_SIZE(actual.path_parts)-1)
++      if(*part)actual.path_parts[count++]=part;
++    bool result=count==6 && !strcmp(actual.path_parts[4],"result");
++    if((count==5 || result) && !strcmp(actual.path_parts[0],"api")
++        && !strcmp(actual.path_parts[1],"outputs") && !strcmp(actual.path_parts[2],"1")
++        && !strcmp(actual.path_parts[3],"start")
++        && evhttp_request_get_command(request)==(result?EVHTTP_REQ_GET:EVHTTP_REQ_POST)){
++      for(struct httpd_uri_map *route=httpd_jsonapi.handlers;route->regexp;route++){
++        if(strstr(route->regexp,result?"/start/result/":"/start/(state|")){
++          status=route->handler(&actual);break;
++        }
++      }
++    }
++    if(status==200 && count==5 && !strcmp(actual.path_parts[4],"complete"))
++      atomic_store(&wire->completed,true);
++    fprintf(stderr,"ACTUAL Native→C %s status=%d body=%.*s\n",uri,status,
++      (int)evbuffer_get_length(response),(char *)evbuffer_pullup(response,-1));
++    evhttp_send_reply(request,status,status==200?"OK":"Rejected",response);
++    free(path);
++  }
++  evbuffer_free(response);
++}
++static void *native_start_http_thread(void *arg)
++{
++  struct native_start_wire *wire=arg;
++  event_base_dispatch(wire->http_base);
++  return NULL;
++}
++static void native_start_done_poll(int fd,short events,void *arg)
++{
++  struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
++  struct timeval soon={0,1000};(void)fd;(void)events;
++  if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
++  if(!atomic_load(&wire->completed) || !start_active
++      || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
++      || !f->device->session || f->device->volume!=35 || f->volumes!=1){
++    recovery_wire_fail(f,"actual Native did not finish after real C COMPLETED/route35");return;
++  }
++  fprintf(stderr,"PASS actual Native HTTP→C player owner→FIFO barrier→private AP2→FULL COMPLETED; Native final verdict asserted by driver\n");
++  event_base_loopbreak(f->base);
++}
++static void native_start_wire_run(struct recovery_wire_fixture *f,const char *fifo)
++{
++  struct native_start_wire wire={.fixture=f};struct sockaddr_in address={0};
++  struct timeval soon={0,1000},bound={25,0};socklen_t length=sizeof(address);pthread_t thread;
++  const char *ready_path=getenv("PC_NATIVE_START_READY_FILE");assert(ready_path);
++  wire.http_base=event_base_new();assert(wire.http_base);
++  wire.http=evhttp_new(wire.http_base);assert(wire.http);
++  evhttp_set_gencb(wire.http,native_start_http,&wire);
++  struct evhttp_bound_socket *socket=evhttp_bind_socket_with_handle(wire.http,"127.0.0.1",0);
++  assert(socket && !getsockname(evhttp_bound_socket_get_fd(socket),(struct sockaddr *)&address,&length));
++  cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
++  assert(!pthread_create(&thread,NULL,native_start_http_thread,&wire));
++  FILE *ready=fopen(ready_path,"w");assert(ready);
++  fprintf(ready,"{\"url\":\"http://127.0.0.1:%u\",\"pipe\":\"%s\",\"homepod_id\":\"1\"}\n",ntohs(address.sin_port),fifo);
++  assert(!fclose(ready));
++  f->poll=evtimer_new(f->base,native_start_done_poll,&wire);
++  f->deadline=evtimer_new(f->base,recovery_wire_deadline,f);
++  assert(f->poll && f->deadline && !evtimer_add(f->poll,&soon) && !evtimer_add(f->deadline,&bound));
++  event_base_dispatch(f->base);
++  event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
++  evhttp_free(wire.http);event_base_free(wire.http_base);
++  commands_base_free(cmdbase);cmdbase=NULL;
++}
++
+ static int start35_wire_case(int mode)
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+@@ -345,6 +844,17 @@ static int start35_wire_case(int mode)
+     char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
+     assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
+   }
++  if(mode==29){
++    keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++    airplay_control_svc.socket.fd4=f.udp_fd;
++    /* outputs_init normally allocates these; avoid its unrelated discovery. */
++    for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) { output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf); }
++    assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
++    player_tick_interval.tv_nsec=50000000;
++    pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++    pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++    native_start_wire_run(&f,fifo);goto cleanup;
++  }
+   if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
+     struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
+     struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
+@@ -384,7 +894,8 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -471,7 +596,7 @@ index a5bc2e8..70552a5 100644
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -431,7 +842,10 @@ static int start35_wire_case(int mode)
+@@ -431,7 +942,10 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -483,6 +608,19 @@ index a5bc2e8..70552a5 100644
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
+@@ -1043,7 +1557,11 @@ static int start35_wire_case(int mode)
+   }
+   if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
+  cleanup:
+-  if((mode==18 || mode==26 || mode==27 || mode==28) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
++  if(mode==29){
++    event_free(keep_alive_timer);keep_alive_timer=NULL;
++    for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++)evbuffer_free(output_buffer.data[i].evbuf);
++  }
++  if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if(input_ready)input_deinit();
+   if(worker_ready)worker_deinit();
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
 index 2ea29b0..29eac14 100644
 --- a/tests/start_gate_owner.inc.c

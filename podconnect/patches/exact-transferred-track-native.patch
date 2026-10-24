@@ -64,6 +64,22 @@ index 1e4dc10..7021759 100644
 +		})
 +	}
 +}
+diff --git a/daemon/controls.go b/daemon/controls.go
+index b998090..4d217d3 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -405,7 +405,10 @@ func (p *AppPlayer) loadCurrentTrackWithStart(ctx context.Context, paused, drop,
+ 	p.app.log.WithField("uri", spotId.Uri()).
+ 		Debugf("loading %s (paused: %t, position: %dms)", spotId.Type(), paused, trackPosition)
+ 
+-	p.state.updateTimestamp()
++	// Publish the already computed position at this buffering boundary. The
++	// previous timestamp may describe a paused source before a resume transfer.
++	p.state.player.PositionAsOfTimestamp = trackPosition
++	p.state.player.Timestamp = time.Now().UnixMilli()
+ 	p.state.player.IsPlaying = true
+ 	p.state.player.IsBuffering = true
+ 	p.state.player.IsPaused = paused
 diff --git a/daemon/player.go b/daemon/player.go
 index dd771d9..8d26b62 100644
 --- a/daemon/player.go
@@ -127,8 +143,58 @@ index cf02404..9f370d1 100644
  	target, err := capture.readCState(ctx)
  	if err != nil {
  		return nil, err
+diff --git a/daemon/room_content_execute.go b/daemon/room_content_execute.go
+index ce8c665..04b0494 100644
+--- a/daemon/room_content_execute.go
++++ b/daemon/room_content_execute.go
+@@ -2,8 +2,10 @@ package daemon
+ 
+ import (
+ 	"context"
++	"errors"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
+ 	"time"
+ )
+ 
+@@ -89,6 +91,8 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		reply := op.CReceipt
+ 		possible := op.Possible
+ 		cancelled := op.Cancelled || ctx.Err() != nil
++		requestedPaused := op.preparedPaused
++		positionInDuration := op.Prepared != nil && op.Stream != nil && op.Stream.Media != nil && op.Prepared.PositionAsOfTimestamp >= 0 && op.Prepared.PositionAsOfTimestamp <= int64(op.Stream.Media.Duration())
+ 		phase := "none"
+ 		if reply != nil {
+ 			phase = reply.Phase // Only cValid-accepted finite phases are retained.
+@@ -119,7 +123,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		// Native consume preserves its original cancel-first order and supplies
+ 		// the finite phase captured before that cancellation. Log outside op.mu.
+ 		if op.Owner != nil && op.Owner.app != nil && op.Owner.app.log != nil {
+-			op.Owner.app.log.Warnf("content_start_failed stage=%s last_c_phase=%s error_class=%s outcome=%s", stage, phase, errorClass, state)
++			if stage == "final_custody" {
++				op.Owner.app.log.Warnf("content_start_failed stage=%s last_c_phase=%s error_class=%s outcome=%s requested_paused=%t position_in_duration=%t", stage, phase, errorClass, state, requestedPaused, positionInDuration)
++			} else {
++				op.Owner.app.log.Warnf("content_start_failed stage=%s last_c_phase=%s error_class=%s outcome=%s", stage, phase, errorClass, state)
++			}
+ 		}
+ 	}
+ 	if ctx.Err() != nil {
+@@ -306,7 +314,11 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		return nil
+ 	})
+ 	if err != nil {
+-		failed("final_custody", "owner_changed", "")
++		class := player.Start35VerificationClass(err)
++		if errors.Is(err, ErrAliasConflict) {
++			class = "daemon_owner_changed"
++		}
++		failed("final_custody", class, "")
+ 	}
+ }
+ func outputPipe(identity *outputPipeIdentity) output.PipeIdentity {
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index 345ede4..709cace 100644
+index 345ede4..930f81b 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -14,6 +14,7 @@ import (
@@ -139,49 +205,314 @@ index 345ede4..709cace 100644
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -562,7 +563,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+@@ -30,12 +31,33 @@ import (
+ 	"unsafe"
+ )
+ 
+-type contentInertSource struct{ closes atomic.Int32 }
++type contentInertSource struct {
++	closes    atomic.Int32
++	finite    bool
++	remaining int
++	eofFile   string
++}
+ 
+-func (*contentInertSource) Read([]float32) (int, error) { return 0, nil }
+-func (*contentInertSource) PositionMs() int64           { return 0 }
+-func (*contentInertSource) SetPositionMs(int64) error   { return nil }
+-func (s *contentInertSource) Close() error              { s.closes.Add(1); return nil }
++func (s *contentInertSource) Read(p []float32) (int, error) {
++	if !s.finite {
++		return 0, nil
++	}
++	if s.remaining == 0 {
++		if s.eofFile != "" {
++			_ = os.WriteFile(s.eofFile, []byte("observed\n"), 0600)
++		}
++		return 0, io.EOF
++	}
++	n := min(len(p), s.remaining)
++	for i := 0; i < n; i++ {
++		p[i] = 0.01
++	}
++	s.remaining -= n
++	return n, nil
++}
++func (*contentInertSource) PositionMs() int64         { return 0 }
++func (*contentInertSource) SetPositionMs(int64) error { return nil }
++func (s *contentInertSource) Close() error            { s.closes.Add(1); return nil }
+ 
+ // Locally admitted/staged owner fixture only. Does not fake an authenticated
+ // provider session or exercise production account admission; actual player/FIFO
+@@ -562,21 +584,40 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
  // synthetic AP welcome seeds only the existing account getter; no provider
  // authentication, HomePod or physical audio is claimed by this regression.
  func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
 -	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
-+	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation"} {
++	modes := []string{"playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation"}
++	if mode := os.Getenv("PC_NATIVE_START_MODE"); mode != "" {
++		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" {
++			t.Fatal("invalid C compose mode")
++		}
++		modes = []string{mode}
++	}
++	for _, mode := range modes {
  		t.Run(mode, func(t *testing.T) {
  			p, _ := contentFixture(t)
- 			path := filepath.Join(t.TempDir(), "prepared.fifo")
-@@ -617,7 +618,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+-			path := filepath.Join(t.TempDir(), "prepared.fifo")
+-			if err := syscall.Mkfifo(path, 0600); err != nil {
+-				t.Fatal(err)
+-			}
+-			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+-			if err != nil {
+-				t.Fatal(err)
++			external := strings.HasPrefix(mode, "actual-c-")
++			path := os.Getenv("PC_NATIVE_START_PIPE")
++			var identity outputPipeIdentity
++			if !external {
++				path = filepath.Join(t.TempDir(), "prepared.fifo")
++				if err := syscall.Mkfifo(path, 0600); err != nil {
++					t.Fatal(err)
++				}
++				reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++				if err != nil {
++					t.Fatal(err)
++				}
++				defer reader.Close()
++				stat, _ := reader.Stat()
++				kernel := stat.Sys().(*syscall.Stat_t)
++				identity = outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
++			} else {
++				if path == "" || os.Getenv("PC_NATIVE_START_URL") == "" {
++					t.Fatal("missing actual C fixture endpoint")
++				}
++				p.app.cfg.DeviceAliasHomePodIDs[1] = "1"
++				p.aliasRegistry[1].HomePodID = "1"
+ 			}
+-			defer reader.Close()
+-			stat, _ := reader.Stat()
+-			kernel := stat.Sys().(*syscall.Stat_t)
+-			identity := outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
++
+ 			p.app.cfg.AudioOutputPipe = path
+ 			p.state.device.SelectedAliasId = 2
+ 			p.hasSpotConnId, p.hasInitialConnectState = true, true
+@@ -585,7 +626,8 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			p.roomContentReservation = nil
+ 			p.roomNativeIntent = 0
+ 			p.primaryLoadOrdinal = 1
+-			p.app.log = &librespot.NullLogger{}
++			log := &contentFailureLog{}
++			p.app.log = log
+ 			// The test seeds existing getter fields, never a production admission hook.
+ 			access := ap.NewAccesspoint(&librespot.NullLogger{}, nil, "fixture")
+ 			left, right := net.Pipe()
+@@ -601,9 +643,14 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			set("welcome", reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")}))
+ 			nextSessionField(p.sess, "ap", access)
+ 			var creates atomic.Int32
++			var actualOutput output.MovePipeOutput
+ 			worker, err := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
+ 				creates.Add(1)
+-				return p.app.withNewOutput(p, create)
++				out, e := p.app.withNewOutput(p, create)
++				if e == nil {
++					actualOutput, _ = out.(output.MovePipeOutput)
++				}
++				return out, e
+ 			}})
+ 			if err != nil {
+ 				t.Fatal(err)
+@@ -612,94 +659,148 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			p.player = worker
+ 			stream := &player.Stream{Source: &contentInertSource{}, PlaybackId: []byte{1, 2, 3}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Duration: proto.Int32(300000)})}
+ 			p.primaryStream = stream
++			if external {
++				source := stream.Source.(*contentInertSource)
++				source.finite = true
++				source.remaining = 30 * 44100 * 2
++				if mode == "actual-c-eof" {
++					source.remaining = 0
++					source.eofFile = os.Getenv("PC_NATIVE_START_EOF_FILE")
++				}
++			}
+ 			sessionID := p.state.player.SessionId
+ 			tracks := p.state.tracks
  			position := int64(8487)
  			p.state.player.PositionAsOfTimestamp = position
  			p.state.player.Timestamp = time.Now().UnixMilli()
 -			paused := mode == "paused" || mode == "dealer-paused"
-+			paused := mode == "paused" || mode == "dealer-paused" || mode == "dealer-lazy404-paused"
++			paused := mode == "actual-c-paused" || mode == "paused" || mode == "dealer-paused" || mode == "dealer-lazy404-paused"
  			p.state.setPaused(paused)
  			ctx, cancel := context.WithCancel(context.Background())
  			defer cancel()
-@@ -631,7 +632,20 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
- 				calls = append(calls, endpoint)
- 				var body map[string]json.RawMessage
- 				_ = json.NewDecoder(r.Body).Decode(&body)
-+				if endpoint == "state" || endpoint == "prepare" || endpoint == "commit" {
-+					if string(body["old_native_owner"]) != "null" {
-+						t.Error("fresh physical writer named a semantic predecessor")
-+						w.WriteHeader(http.StatusConflict)
-+						return
-+					}
-+				}
- 				if endpoint == "state" {
-+					if mode == "late-generation" {
-+						p.app.moveCustodyMu.Lock()
-+						p.app.openedWriterGeneration = 1
-+						p.app.openedWriterOwner = &AppPlayer{}
-+						p.app.moveCustodyMu.Unlock()
-+					}
- 					if creates.Load() != 0 {
- 						t.Error("writer opened before C state")
+ 			var calls []string
+ 			var receipt contentCReceipt
+ 			var mu sync.Mutex
+-			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-				endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
+-				mu.Lock()
+-				defer mu.Unlock()
+-				calls = append(calls, endpoint)
+-				var body map[string]json.RawMessage
+-				_ = json.NewDecoder(r.Body).Decode(&body)
+-				if endpoint == "state" {
+-					if creates.Load() != 0 {
+-						t.Error("writer opened before C state")
+-					}
+-					_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}})
+-					return
+-				}
+-				if endpoint == "prepare" {
+-					if creates.Load() != 0 {
+-						t.Error("writer opened before C prepare")
+-					}
+-					receipt = contentCReceipt{OK: true, Token: strings.Repeat("e", 32), Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}, InputEpoch: "0", WriterEpoch: "0", Expires: 8000, Drained: true, Phase: "prepared"}
+-					_ = json.Unmarshal(body["offer_id"], &receipt.OfferID)
+-					_ = json.Unmarshal(body["binding_id"], &receipt.BindingID)
+-					_ = json.Unmarshal(body["content_digest"], &receipt.ContentDigest)
+-					_ = json.Unmarshal(body["native_incarnation"], &receipt.Incarnation)
+-					_ = json.Unmarshal(body["native_revision"], &receipt.Revision)
+-					_ = json.Unmarshal(body["intended_native_owner"], &receipt.Intended)
+-					_ = json.Unmarshal(body["expected_input_path_digest"], &receipt.InputDigest)
+-					if receipt.Intended.SessionID != sessionID || receipt.Intended.AliasRevision != p.aliasRevision {
+-						t.Error("transfer semantic session/alias reset")
++			var owner *httptest.Server
++			if !external {
++				owner = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
++					mu.Lock()
++					defer mu.Unlock()
++					calls = append(calls, endpoint)
++					var body map[string]json.RawMessage
++					_ = json.NewDecoder(r.Body).Decode(&body)
++					if endpoint == "state" || endpoint == "prepare" || endpoint == "commit" {
++						if string(body["old_native_owner"]) != "null" {
++							t.Error("fresh physical writer named a semantic predecessor")
++							w.WriteHeader(http.StatusConflict)
++							return
++						}
  					}
-@@ -700,6 +714,33 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
- 			}))
- 			defer owner.Close()
- 			p.app.cfg.RoomTransportOwnToneURL = owner.URL
+-					if mode == "cancel" {
+-						cancel()
++					if endpoint == "state" {
++						if mode == "late-generation" {
++							p.app.moveCustodyMu.Lock()
++							p.app.openedWriterGeneration = 1
++							p.app.openedWriterOwner = &AppPlayer{}
++							p.app.moveCustodyMu.Unlock()
++						}
++						if creates.Load() != 0 {
++							t.Error("writer opened before C state")
++						}
++						_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}})
++						return
+ 					}
+-					if mode == "alias-aba" {
+-						p.aliasMu.Lock()
+-						p.aliasRevision += 2
+-						p.aliasMu.Unlock()
++					if endpoint == "prepare" {
++						if creates.Load() != 0 {
++							t.Error("writer opened before C prepare")
++						}
++						receipt = contentCReceipt{OK: true, Token: strings.Repeat("e", 32), Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}, InputEpoch: "0", WriterEpoch: "0", Expires: 8000, Drained: true, Phase: "prepared"}
++						_ = json.Unmarshal(body["offer_id"], &receipt.OfferID)
++						_ = json.Unmarshal(body["binding_id"], &receipt.BindingID)
++						_ = json.Unmarshal(body["content_digest"], &receipt.ContentDigest)
++						_ = json.Unmarshal(body["native_incarnation"], &receipt.Incarnation)
++						_ = json.Unmarshal(body["native_revision"], &receipt.Revision)
++						_ = json.Unmarshal(body["intended_native_owner"], &receipt.Intended)
++						_ = json.Unmarshal(body["expected_input_path_digest"], &receipt.InputDigest)
++						if receipt.Intended.SessionID != sessionID || receipt.Intended.AliasRevision != p.aliasRevision {
++							t.Error("transfer semantic session/alias reset")
++						}
++						if mode == "cancel" {
++							cancel()
++						}
++						if mode == "alias-aba" {
++							p.aliasMu.Lock()
++							p.aliasRevision += 2
++							p.aliasMu.Unlock()
++						}
++					} else {
++						_ = json.Unmarshal(body["native_reservation_id"], &receipt.ReservationID)
++						receipt.Possible, receipt.GateClosed, receipt.PinRemaining = true, true, 14000
++						receipt.Pipe = &identity
++						receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
++						if endpoint == "commit" && mode == "unknown" {
++							receipt.Phase = "unknown"
++						}
++						if endpoint == "commit" && mode == "foreign-pipe" {
++							wrong := identity
++							wrong.Inode = "1"
++							receipt.Pipe = &wrong
++						}
++						if endpoint == "barrier" || endpoint == "open" || endpoint == "complete" {
++							if creates.Load() != 1 {
++								t.Error("missing exact admitted FIFO writer")
++							}
++							_ = json.Unmarshal(body["writer_source_epoch"], &receipt.WriterEpoch)
++							receipt.InputEpoch = "1"
++							receipt.Route = &roomVolumeRoute{receipt.Target.Process, "202", "1", "1", "1", "1", "1", "0", receipt.InputDigest}
++						}
++						if endpoint == "open" || endpoint == "complete" {
++							receipt.GateClosed = false
++							receipt.Actual = &receipt.Intended
++						}
+ 					}
+-				} else {
+-					_ = json.Unmarshal(body["native_reservation_id"], &receipt.ReservationID)
+-					receipt.Possible, receipt.GateClosed, receipt.PinRemaining = true, true, 14000
+-					receipt.Pipe = &identity
+-					receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
+-					if endpoint == "commit" && mode == "unknown" {
++					if endpoint == "complete" && mode == "complete-fails" {
+ 						receipt.Phase = "unknown"
++						receipt.GateClosed = true
++						receipt.Actual = nil
+ 					}
+-					if endpoint == "commit" && mode == "foreign-pipe" {
+-						wrong := identity
+-						wrong.Inode = "1"
+-						receipt.Pipe = &wrong
+-					}
+-					if endpoint == "barrier" || endpoint == "open" || endpoint == "complete" {
+-						if creates.Load() != 1 {
+-							t.Error("missing exact admitted FIFO writer")
+-						}
+-						_ = json.Unmarshal(body["writer_source_epoch"], &receipt.WriterEpoch)
+-						receipt.InputEpoch = "1"
+-						receipt.Route = &roomVolumeRoute{receipt.Target.Process, "202", "1", "1", "1", "1", "1", "0", receipt.InputDigest}
+-					}
+-					if endpoint == "open" || endpoint == "complete" {
+-						receipt.GateClosed = false
+-						receipt.Actual = &receipt.Intended
++					if endpoint == "complete" && mode == "writer-lost" {
++						worker.Stop()
+ 					}
+-				}
+-				if endpoint == "complete" && mode == "complete-fails" {
+-					receipt.Phase = "unknown"
+-					receipt.GateClosed = true
+-					receipt.Actual = nil
+-				}
+-				if endpoint == "complete" && mode == "writer-lost" {
+-					worker.Stop()
+-				}
+-				receipt.Schema = "podconnect.output_start_" + endpoint + ".v1"
+-				_ = json.NewEncoder(w).Encode(receipt)
+-			}))
+-			defer owner.Close()
+-			p.app.cfg.RoomTransportOwnToneURL = owner.URL
++					receipt.Schema = "podconnect.output_start_" + endpoint + ".v1"
++					_ = json.NewEncoder(w).Encode(receipt)
++				}))
++				defer owner.Close()
++				p.app.cfg.RoomTransportOwnToneURL = owner.URL
++			} else {
++				p.app.cfg.RoomTransportOwnToneURL = os.Getenv("PC_NATIVE_START_URL")
++			}
 +			preexisting := false
 +			switch mode {
 +			case "prior-generation":
@@ -212,11 +543,12 @@ index 345ede4..709cace 100644
  			if mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
  				// Same shipped load caller must retire its own op.Prepared publication.
  				p.primaryStream = nil
-@@ -707,7 +748,15 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -707,7 +808,31 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  				p.primaryLoadOrdinal = 0
  				events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
  				nextSessionField(p.sess, "events", events)
 +				var lazyReads atomic.Int32
++				var bufferingPublished bool
  				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
 +					if r.Method == http.MethodGet {
 +						lazyReads.Add(1)
@@ -225,10 +557,25 @@ index 345ede4..709cace 100644
 +						}
 +						return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("missing")), Header: make(http.Header), Request: r}, nil
 +					}
++					if mode == "dealer-stale-paused-resume" && r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/connect-state/v1/devices/") {
++						raw, _ := io.ReadAll(r.Body)
++						var published connectpb.PutStateRequest
++						if e := proto.Unmarshal(raw, &published); e != nil {
++							t.Fatal(e)
++						}
++						state := published.GetDevice().GetPlayerState()
++						if state.GetIsBuffering() {
++							bufferingPublished = true
++							if state.PositionAsOfTimestamp != position || time.Since(time.UnixMilli(state.Timestamp)) > time.Second || state.PlaybackSpeed != 0 {
++								t.Error("preSTART buffering publication advanced old paused time", state.PositionAsOfTimestamp, state.PlaybackSpeed)
++							}
++						}
++						return &http.Response{StatusCode: 200, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++					}
  					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
  				}))
  				nextSessionField(p.sess, "sp", sp)
-@@ -729,11 +778,19 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -729,20 +854,47 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					transfer.Playback.IsPaused = paused
  					transfer.CurrentSession.OriginalSessionId = proto.String(sessionID)
  					transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
@@ -237,9 +584,17 @@ index 345ede4..709cace 100644
 +					}
  					req := pc13PlayRequest(t)
  					req.Command.Endpoint = "transfer"
++					if mode == "dealer-stale-paused-resume" {
++						transfer.Playback.IsPaused = true
++						transfer.Playback.Timestamp = time.Now().Add(-3 * time.Hour).UnixMilli()
++						req.Command.Options.RestorePaused = "resume"
++					}
  					req.TargetAliasId = proto.Uint32(2)
  					req.Command.Data, _ = proto.Marshal(transfer)
  					err = p.handleTransferCommand(ctx, req, transfer, sp)
++					if mode == "dealer-stale-paused-resume" && !bufferingPublished {
++						t.Fatal("no actual buffering state publication observed")
++					}
 +					if strings.HasPrefix(mode, "dealer-lazy404") && err == nil {
 +						if lazyReads.Load() != 1 || p.state.player.Track.Uri != transfer.Playback.CurrentTrack.Uri || p.state.player.ContextUri != transfer.CurrentSession.Context.Uri || p.state.player.Index.Page != 0 || p.state.player.Index.Track != 0 {
 +							t.Fatal("fallback lost exact requested track/context or retried unavailable page", lazyReads.Load())
@@ -248,21 +603,109 @@ index 345ede4..709cace 100644
  				} else {
  					err = p.loadCurrentTrackWithStart(ctx, false, true, false, true)
  				}
-@@ -776,6 +833,13 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
- 				if err == nil {
- 					t.Fatal("adverse START admitted", mode)
+ 			} else {
+ 				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
+ 			}
+-			good := mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
++			good := mode == "actual-c-paused" || mode == "actual-c-playing" || mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
+ 			if good {
+ 				if err != nil {
++					if external && actualOutput != nil {
++						op := p.app.startCustody
++						if op != nil {
++							selected, e := worker.Start35CurrentSource(ctx)
++							t.Logf("failed actual worker source_current=%t source_error=%v ordinal_valid=%t", selected == stream.Source, e, p.primaryLoadOrdinal > 0)
++							_ = actualOutput.WithStartLock(ctx, func(pipe output.PipeIdentity, _ func(bool)) error {
++								t.Logf("failed actual writer pipe_current=%t fd_current=%t paused=%t expected_paused=%t fenced=%t", pipe == op.Pipe, actualOutput.WriterFDUnderStartLock() == p.app.openedWriter.FD, actualOutput.PausedUnderStartLock(), paused, actualOutput.FencedUnderStartLock())
++								return nil
++							})
++						}
++					}
+ 					t.Fatal("prepared START failed", err, calls)
  				}
-+				if preexisting && (len(calls) != 0 || creates.Load() != 0) {
-+					t.Fatal("extant custody was bypassed before C request", mode, calls)
-+				}
-+				if mode == "late-generation" && (creates.Load() != 0 || p.app.openedWriterGeneration != 1 || p.app.openedWriterOwner == nil) {
-+					t.Fatal("late writer generation overwritten")
-+				}
+ 				if p.primaryStream != stream || (!strings.HasPrefix(mode, "dealer-") && p.state.tracks != tracks) || p.state.player.SessionId != sessionID || p.state.player.PositionAsOfTimestamp < position || p.state.player.PositionAsOfTimestamp > position+1000 || p.state.player.IsPaused != paused || creates.Load() != 1 || p.app.startCustody == nil || p.roomContentReservation != nil {
+@@ -760,10 +912,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				case <-time.After(time.Second):
+ 					t.Fatal("no real initial load observation")
+ 				}
+-				if strings.Join(calls, ",") != "state,prepare,commit,barrier,open,complete" {
++				if !external && strings.Join(calls, ",") != "state,prepare,commit,barrier,open,complete" {
+ 					t.Fatal("wrong protocol chain", calls)
+ 				}
+-				if paused {
++				if paused && !external {
+ 					if err := worker.Play(); err != nil {
+ 						t.Fatal("explicit later resume failed", err)
+ 					}
+@@ -773,23 +925,76 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					}
+ 				}
+ 			} else {
+-				if err == nil {
+-					t.Fatal("adverse START admitted", mode)
+-				}
+-				if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
+-					t.Fatal("unadmitted writer opened", mode, calls)
+-				}
+-				if mode == "complete-fails" || mode == "writer-lost" {
+-					if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 {
+-						t.Fatal("failed published START retained active actor")
++				if mode == "actual-c-eof" {
++					if err == nil {
++						t.Fatal("EOF unexpectedly final-credited")
++					}
++					op := p.app.startCustody
++					if op == nil || op.State != "unknown" || !p.roomContentQuarantined {
++						t.Fatal("EOF did not preserve quarantine")
++					}
++					log.mu.Lock()
++					lines := append([]string(nil), log.lines...)
++					log.mu.Unlock()
++					want := "content_start_failed stage=final_custody last_c_phase=completed error_class=pause_changed outcome=unknown requested_paused=false position_in_duration=true"
++					if len(lines) != 1 || lines[0] != want {
++						t.Fatalf("EOF lost finite content-free cause: %q", lines)
++					}
++					t.Log("actual C complete followed by Native finite EOF finalverify refusal with exact finite diagnostic")
++				} else {
++					if err == nil {
++						t.Fatal("adverse START admitted", mode)
++					}
++					if preexisting && (len(calls) != 0 || creates.Load() != 0) {
++						t.Fatal("extant custody was bypassed before C request", mode, calls)
++					}
++					if mode == "late-generation" && (creates.Load() != 0 || p.app.openedWriterGeneration != 1 || p.app.openedWriterOwner == nil) {
++						t.Fatal("late writer generation overwritten")
++					}
 +
- 				if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
- 					t.Fatal("unadmitted writer opened", mode, calls)
++					if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
++						t.Fatal("unadmitted writer opened", mode, calls)
+ 					}
+-					if p.app.startCustody == nil || p.app.startCustody.State == "complete" {
+-						t.Fatal("failed post-open result upgraded or lost custody")
++					if mode == "complete-fails" || mode == "writer-lost" {
++						if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 {
++							t.Fatal("failed published START retained active actor")
++						}
++						if p.app.startCustody == nil || p.app.startCustody.State == "complete" {
++							t.Fatal("failed post-open result upgraded or lost custody")
++						}
++					} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
++						t.Fatal("rejected attempt reset content")
+ 					}
+-				} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
+-					t.Fatal("rejected attempt reset content")
++				}
++			}
++			if external {
++				reply, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
++				if e != nil {
++					t.Fatal(e)
++				}
++				reply.Body.Close()
++				if reply.StatusCode != 200 {
++					t.Fatal("C fixture did not finish", reply.StatusCode)
  				}
-@@ -793,3 +857,21 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			}
  		})
  	}
  }
@@ -284,6 +727,119 @@ index 345ede4..709cace 100644
 +		t.Fatal("default selected-content START lost real predecessor transition")
 +	}
 +}
+diff --git a/player/start35.go b/player/start35.go
+index 09928bf..2d663c6 100644
+--- a/player/start35.go
++++ b/player/start35.go
+@@ -2,6 +2,7 @@ package player
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+@@ -10,6 +11,22 @@ import (
+ 	"time"
+ )
+ 
++type start35VerificationError string
++
++func (e start35VerificationError) Error() string { return string(e) }
++
++// Start35VerificationClass exposes only finite, content-free failure classes.
++func Start35VerificationClass(err error) string {
++	var failure start35VerificationError
++	if errors.As(err, &failure) {
++		switch failure {
++		case "source_changed", "pipe_changed", "writer_epoch_changed", "writer_fd_changed", "writer_fenced", "pause_changed", "initial_ordinal_invalid":
++			return string(failure)
++		}
++	}
++	return "worker_failed"
++}
++
+ type start35Command struct {
+ 	ctx                context.Context
+ 	phase              string
+@@ -66,7 +83,7 @@ func (p *Player) VerifyStart35(ctx context.Context, expected librespot.AudioSour
+ // exact requested pause state, source and writer survived C COMPLETE.
+ func (p *Player) VerifyStart35Prepared(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, paused bool, ordinal uint64, guard output.TransportGuard) error {
+ 	if ordinal == 0 || ordinal > 9007199254740991 {
+-		return fmt.Errorf("invalid initial load ordinal")
++		return start35VerificationError("initial_ordinal_invalid")
+ 	}
+ 	return p.verifyStart35(ctx, expected, pipe, epoch, writerFD, paused, ordinal, guard)
+ }
+@@ -141,11 +158,28 @@ func (p *Player) applyStart35(command *start35Command, out *output.Output, sourc
+ 				return e
+ 			}
+ 			defer lock.Unlock()
+-			if command.ctx.Err() != nil || source.source[source.which] != command.expected || identity != command.pipe ||
+-				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD ||
+-				writer.FencedUnderStartLock() || writer.PausedUnderStartLock() != command.paused {
+-				return fmt.Errorf("start writer/source changed")
++			if command.ctx.Err() != nil {
++				return command.ctx.Err()
++			}
++			if source.source[source.which] != command.expected {
++				return start35VerificationError("source_changed")
+ 			}
++			if identity != command.pipe {
++				return start35VerificationError("pipe_changed")
++			}
++			if command.epoch != strconv.FormatUint(p.startEpoch, 10) {
++				return start35VerificationError("writer_epoch_changed")
++			}
++			if writer.WriterFDUnderStartLock() != command.writerFD {
++				return start35VerificationError("writer_fd_changed")
++			}
++			if writer.FencedUnderStartLock() {
++				return start35VerificationError("writer_fenced")
++			}
++			if writer.PausedUnderStartLock() != command.paused {
++				return start35VerificationError("pause_changed")
++			}
++
+ 			return command.guard(func() {})
+ 		})
+ 		if err == nil && command.initialLoadOrdinal != 0 {
+diff --git a/player/start35_verify_test.go b/player/start35_verify_test.go
+index 2d1c78b..1b9e29e 100644
+--- a/player/start35_verify_test.go
++++ b/player/start35_verify_test.go
+@@ -106,14 +106,15 @@ func TestStart35HeldCCompleteCannotCreditClosedWriter(t *testing.T) {
+ 		pipe   output.PipeIdentity
+ 		epoch  string
+ 		fd     string
++		class  string
+ 	}{
+-		{old, pipe, epoch, writer.FD},
+-		{selected, output.PipeIdentity{Device: pipe.Device, Inode: "999", Type: "fifo"}, epoch, writer.FD},
+-		{selected, pipe, "999", writer.FD},
+-		{selected, pipe, epoch, "999"},
++		{old, pipe, epoch, writer.FD, "source_changed"},
++		{selected, output.PipeIdentity{Device: pipe.Device, Inode: "999", Type: "fifo"}, epoch, writer.FD, "pipe_changed"},
++		{selected, pipe, "999", writer.FD, "writer_epoch_changed"},
++		{selected, pipe, epoch, "999", "writer_fd_changed"},
+ 	} {
+ 		credited = false
+-		if err := p.VerifyStart35(context.Background(), mismatch.source, mismatch.pipe, mismatch.epoch, mismatch.fd, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
++		if err := p.VerifyStart35(context.Background(), mismatch.source, mismatch.pipe, mismatch.epoch, mismatch.fd, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited || Start35VerificationClass(err) != mismatch.class {
+ 			t.Fatal("stale source/FIFO/epoch/FD credited")
+ 		}
+ 	}
+@@ -240,8 +241,8 @@ func TestStart35HeldCCompleteCannotCreditNaturalEOFPause(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	credited := false
+-	if err := p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited {
+-		t.Fatal("C COMPLETE credited a naturally paused native writer")
++	if err := p.VerifyStart35(context.Background(), selected, pipe, epoch, writer.FD, func(mutate func()) error { mutate(); credited = true; return nil }); err == nil || credited || Start35VerificationClass(err) != "pause_changed" {
++		t.Fatal("C COMPLETE credited a naturally paused native writer or lost finite cause")
+ 	}
+ }
+ 
 diff --git a/spclient/context_resolver.go b/spclient/context_resolver.go
 index 368bb12..bda0825 100644
 --- a/spclient/context_resolver.go
