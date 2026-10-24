@@ -12,16 +12,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	stdlog "log"
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -893,10 +897,16 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					lastAlias = completed.alias
 					lastAliasBinding = copyAliasBinding(completed.binding)
 					aliasRoutePending = false
-					capped = false
+					capped = completed.startOwned
 					volCanon = -1
+					if completed.startOwned {
+						volCanon = startVolumePercent
+					}
 				}
 				prevActive = gl.Active
+				if completed != nil {
+					prevActive = true
+				}
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
@@ -912,7 +922,9 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Only the primary room runs in alias mode (single-engine), so this is the one router.
 			// Attempt on change; on failure retry on a 3s throttle (NOT every tick — that flooded the log
 			// + hammered OwnTone when the target HomePod was momentarily missing).
-			if room.Idx == 0 && gl.SelAlias > 0 {
+			// A bound Native alias is observation, never an ordinary route grant.
+			boundNativeRoute := room.Idx == 0 && gl.AliasBinding != nil && gl.AliasBinding.valid()
+			if room.Idx == 0 && gl.SelAlias > 0 && !boundNativeRoute {
 				if aliasRouteChanged(gl.SelAlias, lastAlias, gl.AliasBinding, lastAliasBinding) || (aliasRoutePending && time.Now().After(aliasRetryAt)) {
 					accepted, current := routeAliasOutputForAttentionIntent(room.OwnTone, gl.SelAlias, live, aliasRevision, att, true)
 					if !current {
@@ -986,7 +998,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// Pause/idle retains the Native writer and its context. The manager
 			// has no exact-owner release API and must never deselect outputs here.
 			if playing {
-				if released {
+				if released && !boundNativeRoute {
 					// Pre-prime the configured output while still released. Pipe
 					// autostart may run before the next bridge tick once it is selected.
 					preprimeID := room.HomepodID
@@ -1062,7 +1074,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// slider <-> HomePod hardware buttons, on one canonical value. Here we only handle the IDLE
 			// case: while no session is active, hold the output at/under the cap so the first audio of any
 			// new session can't blast (the active branch's one-shot never-loud cap takes over from there).
-			if !gl.Active && !released && time.Now().After(prearmNext) {
+			if !gl.Active && !released && !boundNativeRoute && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
 				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startVolumePercent) > volTol {
 					setOwntoneOutputVolume(room.OwnTone, id, startVolumePercent)
@@ -1074,7 +1086,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				// (actual loudness) must acknowledge that level before transport; the
 				// engine's quantized report may differ by the bridge tolerance. Once
 				// settled, the ordinary bidirectional reconcile returns volume to the user.
-				if !capped {
+				if !capped && !boundNativeRoute {
 					outputID := room.HomepodID
 					if gl.AliasBinding != nil {
 						selectedRoom := roomByID(gl.AliasBinding.RoomID)
@@ -1115,11 +1127,11 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				// held-window cap re-seeding volCanon every tick — NOT from this reconcile, which is stable.
 				vc, vGl, vOt := decideVolume(volCanon, gl.VolPct, gl.HasVol, otVol, otVolOk)
 				volCanon = vc
-				if vGl {
+				if vGl && !boundNativeRoute {
 					setLibrespotVolumePctOwned(room.Librespot, vc)
 					log.Printf("volume [%s]: -> Spotify %d%%", room.Name, vc)
 				}
-				if vOt && otID != "" && !live.nativeManualSupported() {
+				if vOt && otID != "" && !boundNativeRoute && !live.nativeManualSupported() {
 					setOwntoneOutputVolume(room.OwnTone, otID, vc)
 					log.Printf("volume [%s]: -> HomePod %d%%", room.Name, vc)
 				}
@@ -1133,7 +1145,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 				// C PCM lifecycle cannot be fed back as a second transport command.
 				// Suppression grants no route or action authority. Admission repeats
 				// this check under the source mutex if capability arrives meanwhile.
-				if live.nativeBoundTransportSupported(intent) {
+				if boundNativeRoute || live.nativeBoundTransportSupported(intent) {
 					trans = transState{canon: -1, otTarget: -1}
 					transIntent = intent
 					prevActive = gl.Active
@@ -1327,6 +1339,8 @@ func startRoomBridge(room *Room) {
 }
 
 func main() {
+	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	store = newRoomStore()
 	mgr = newRoomManager(store)
 
@@ -1564,7 +1578,21 @@ func main() {
 	})
 
 	log.Printf("podconnect-manager listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	server := &http.Server{Addr: ":" + port}
+	exited := make(chan error, 1)
+	go func() { exited <- server.ListenAndServe() }()
+	select {
+	case <-signals.Done():
+	case err := <-exited:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("manager HTTP stopped: %v", err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), roomShutdownTimeout)
+	defer cancel()
+	// Closing HTTP admission does not replace stopping the captured runtime.
+	_ = server.Close()
+	mgr.shutdownAll(ctx)
 }
 
 // attentionHandler serves /api/attention.
@@ -2461,8 +2489,11 @@ func speakerRescanHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
-	log.Printf("rescan: restarting OwnTone for room %s — fresh AirPlay/mDNS browse", pr.ID)
-	rt.restartOT()
+	log.Printf("rescan: retiring Native before replacing engines for room %s", pr.ID)
+	if !rt.restartOT() {
+		http.Error(w, "engine replacement incomplete or superseded; retirement unknown", http.StatusServiceUnavailable)
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 

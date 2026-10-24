@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,9 +47,12 @@ func releasedRoomRouteFixture(t *testing.T) (*releasedStartFixture, roomTranspor
 }
 
 func TestReleasedPlayingBridgeHoldsOwnedAndUnknownWithoutVolumeOrSelection(t *testing.T) {
-	for _, mode := range []string{"owned", "unknown", "busy", "foreign_owner", "stale_native", "stale_output", "changed_room", "paused", "idle", "clean_absent"} {
+	for _, mode := range []string{"owned", "unknown", "busy", "foreign_owner", "stale_native", "stale_output", "changed_room", "paused", "idle", "clean_absent", "unselected_clean_absent"} {
 		t.Run(mode, func(t *testing.T) {
 			f, scope, owner, route := releasedRoomRouteFixture(t)
+			if mode == "unselected_clean_absent" {
+				f.selected = false
+			}
 			oldRPC := roomTransportRPC
 			t.Cleanup(func() { roomTransportRPC = oldRPC })
 			var reads []string
@@ -79,7 +83,7 @@ func TestReleasedPlayingBridgeHoldsOwnedAndUnknownWithoutVolumeOrSelection(t *te
 					if json.Unmarshal(body, &supplied) != nil || supplied.Owner != *owner {
 						t.Fatal("C read was not bound to the receiver owner")
 					}
-					state := outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, mode == "owned", mode == "clean_absent"}
+					state := outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, mode == "owned", mode == "clean_absent" || mode == "unselected_clean_absent"}
 					if mode == "busy" {
 						state.Busy = true
 					}
@@ -206,21 +210,14 @@ func TestReleasedActualBridgeSkipsWritesUntilCleanAbsence(t *testing.T) {
 			t.Fatal("actual bridge did not reach joined C read")
 		}
 	}
-	deadline := time.Now().Add(1500 * time.Millisecond)
-	for mode == "clean_absent" && selections.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	// Clean absence is a fact, not a fresh Connect credit. Bound Native routes
+	// remain observation-only across subsequent bridge ticks in every mode.
+	time.Sleep(650 * time.Millisecond)
+	if writes.Load() != 0 || primes.Load() != 0 || selections.Load() != 0 {
+		t.Fatalf("no-credit bound bridge %s wrote: all=%d prime=%d select=%d", mode, writes.Load(), primes.Load(), selections.Load())
 	}
-	if mode != "clean_absent" {
-		time.Sleep(350 * time.Millisecond)
-	}
-	if got := writes.Load(); (mode == "clean_absent") != (got > 0) {
-		t.Fatalf("actual bridge %s issued %d writes", mode, got)
-	}
-	if mode == "clean_absent" && (primes.Load() == 0 || selections.Load() == 0) {
-		t.Fatalf("clean absence did not enter guarded prime+route recovery: prime=%d select=%d", primes.Load(), selections.Load())
-	}
-	if !fileExists(releasedPath(f.room)) && mode != "clean_absent" {
-		t.Fatal("held route lost persistent released marker")
+	if !fileExists(releasedPath(f.room)) {
+		t.Fatal("no-credit route consumed released marker")
 	}
 	os.Exit(0)
 }
@@ -466,6 +463,98 @@ func TestReleasedPausedTrackControlsKeepCurrentOwnerAndNoReplay(t *testing.T) {
 				}
 				if !f.rt.live.Get().Paused || len(f.effects) != 0 || !fileExists(releasedPath(f.room)) {
 					t.Fatal("manager resumed playback or reclaimed route")
+				}
+			})
+		}
+	}
+}
+
+func TestConnectCompletedStartObservationDoesNotRouteAgain(t *testing.T) {
+	for _, released := range []bool{true, false} {
+		for _, mode := range []string{"owned", "unknown", "foreign", "late", "successor", "marker_change", "unselected_owned"} {
+			t.Run(fmt.Sprintf("released=%v/%s", released, mode), func(t *testing.T) {
+				f, _, owner, route := releasedRoomRouteFixture(t)
+				if mode == "unselected_owned" {
+					f.selected = false
+				}
+				if !released {
+					if err := os.Remove(releasedPath(f.room)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				old := roomTransportRPC
+				t.Cleanup(func() { roomTransportRPC = old })
+				var protectedPrimes int
+				interceptRecoveryPrime(t, func(r *http.Request) *http.Response {
+					if r.URL.Query().Get("recovery") != "connect" {
+						t.Fatal("unprotected fallback")
+					}
+					protectedPrimes++
+					return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(""))}
+				})
+				reads := 0
+				roomTransportRPC = func(_ context.Context, _, method, path string, body []byte) ([]byte, error) {
+					reads++
+					switch {
+					case path == "/status":
+						return []byte(fmt.Sprintf(`{"username":"native-user","device_id":%q}`, f.id)), nil
+					case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
+						n := *owner
+						if mode == "foreign" {
+							n.Session = "foreign"
+							n.Account = "foreign"
+						}
+						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, n, []string{"pause"}, false})
+					case path == "/api/outputs/42/transport/bound-state":
+						var supplied struct {
+							Owner roomTransportIdentity `json:"native_owner"`
+						}
+						if json.Unmarshal(body, &supplied) != nil || supplied.Owner != *owner {
+							t.Fatal("unbound C read")
+						}
+						if mode == "late" {
+							f.rt.live.applyEvent("paused", nil)
+						}
+						if mode == "successor" {
+							announceConnect(t, f, 2)
+						}
+						if mode == "marker_change" {
+							if released {
+								_ = os.Remove(releasedPath(f.room))
+							} else {
+								_ = os.WriteFile(releasedPath(f.room), []byte("1"), 0600)
+							}
+						}
+						return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, mode != "unknown", false})
+					}
+					t.Fatalf("unexpected effect %s %s", method, path)
+					return nil, fmt.Errorf("effect")
+				}
+				live := &f.rt.live
+				announceConnect(t, f, 1)
+				handled, receipt := tryExplicitConnectRecoveryOutcome(f.room, live, &attention{})
+				if !handled || (receipt != nil) != (mode == "owned") {
+					t.Fatalf("handled=%v receipt=%v reads=%d", handled, receipt != nil, reads)
+				}
+				if mode == "owned" && protectedPrimes != 0 {
+					t.Fatal("owned START re-primed")
+				}
+				if protectedPrimes > 1 {
+					t.Fatal("fresh credit retried")
+				}
+				if receipt != nil && fileExists(releasedPath(f.room)) {
+					t.Fatal("completed route retained release marker")
+				}
+				if mode == "successor" {
+					return
+				}
+				before := reads
+				handled, receipt = tryExplicitConnectRecoveryOutcome(f.room, live, &attention{})
+				if mode != "successor" && (handled || receipt != nil || reads != before) {
+					t.Fatal("spent event replayed")
+				}
+				if mode != "owned" && !live.holdsConnectRecoveryFence() {
+					t.Fatal("unknown route lost fence")
 				}
 			})
 		}

@@ -481,3 +481,117 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -60,15 +60,35 @@
+   strcpy(r.expected_input_path,path);strcpy(r.policy_revision,OUTPUT_START_POLICY);
+   gcry_md_hash_buffer(GCRY_MD_SHA256,hash,path,strlen(path));for(i=0;i<32;i++)sprintf(r.expected_input_path_digest+2*i,"%02x",hash[i]);return r;
+ }
+-static void start_gate_process_successor(const struct output_native_process *process,bool expect_retired)
++static void start_gate_process_successor(const char *path,const struct output_native_process *process,
++    const struct output_native_process *fresh,bool expect_retired,bool replaced_namespace,bool different_boot)
+ {
+   struct output_start_request r={0};struct output_start_result out;struct output_device *d;
+   /* The child begins with the parent's pre-transaction globals, not the former
+    * owner's heap. Reopen actual persistent storage as a separate C process. */
+   sqlite3_close(hdl);assert(sqlite3_open(owner_database_path,&hdl)==SQLITE_OK);
++  struct db_start_guard saved={0},changed={0};
++  if(replaced_namespace){
++    /* Model the persisted certificate from the replaced container, with the
++     * SAME kernel boot and actual dead old PID. A PID absent here proves
++     * nothing about a different PID namespace. No kernel guard is stubbed. */
++    uint64_t device,inode;json_object *payload;
++    assert(start_pid_namespace(&device,&inode) && inode<UINT64_MAX);
++    assert(db_start_guard_load(&saved)==1);changed=saved;
++    payload=json_tokener_parse(saved.payload);assert(payload);
++    json_object_object_add(payload,"native_pid_namespace_inode",json_object_new_uint64(inode+1));
++    if(different_boot){
++      const char *prior="00000000-0000-0000-0000-000000000002";
++      assert(strcmp(prior,saved.boot_id));strcpy(changed.boot_id,prior);
++      json_object_object_add(payload,"native_boot_id",json_object_new_string(prior));
++    }
++    changed.payload=strdup(json_object_to_json_string_ext(payload,JSON_C_TO_STRING_PLAIN));json_object_put(payload);
++    assert(changed.payload && db_start_guard_save(&saved,&changed)==0);
++  }
+   outputs_attention_uuid(outputs_process);start_journal_startup();
++  assert(!start_journal_fault); /* Namespace mismatch is valid evidence, not corrupt storage. */
+   assert(start_startup_quarantine && outputs_start_gate_closed() && outputs_start_busy());
+-  assert(start_old_process_retired()==expect_retired);
++  assert(start_old_process_retired()==(expect_retired && (!replaced_namespace || different_boot)));
+   assert(start_process_current(process)==!expect_retired);
+   d=outputs_device_get(1);assert(d && !d->selected);
+   outputs_device_select(d,-1);assert(!d->selected);
+@@ -77,12 +97,39 @@
+   assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
+   struct output_transport_identity route;bool busy,start_owned,clean_absent;
+   assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
++  /* A fresh authenticated Native process does not inherit old RAM, token,
++   * owner or playback grant. Test the existing proper START admission only. */
++  r=start_gate_fixture_request(path,fresh);memset(r.offer_id,'e',32);
++  strcpy(r.intended_native_owner.session_id,"fresh-native-session");
++  struct output_start_state state;
++  bool admissible=expect_retired && (!replaced_namespace || different_boot);
++  assert(start_process_current(fresh));
++  assert(outputs_start_state_get(&r,&state)==0 && state.ready==admissible && state.busy==!admissible);
++  if(admissible){
++    assert(outputs_start_prepare(&r,&out)==0);r=out.command;
++    memset(r.native_reservation_id,'d',32);r.pending_native_mutators_drained=true;
++    assert(outputs_start_commit(&r,&out)==0 && out.phase==OUTPUT_START_GATE_DRAINING);
++    assert(!start_startup_quarantine && outputs_start_gate_closed() && start_active->writer_pending);
++    assert(!d->selected && !d->session); /* Admission is not AP2/audio success. */
++    if(different_boot){
++      /* Fixture restoration after successful conditional replacement only. */
++      struct db_start_guard current={0};assert(db_start_guard_load(&current)==1);
++      assert(db_start_guard_save(&current,&saved)==0);free(current.payload);
++    }
++  }else{
++    assert(outputs_start_prepare(&r,&out)<0 && !d->selected && !d->session);
++    if(replaced_namespace){
++      assert(db_start_guard_save(&changed,&saved)==0);
++      puts("PASS replaced PID namespace, same kernel boot, actual dead old PID: valid completed journal remains quarantined; generic and fresh START both deny");
++    }
++  }
++  free(changed.payload);free(saved.payload);
+   sqlite3_close(hdl);hdl=NULL;
+ }
+ static void exact_start_durable_gate(void)
+ {
+   char path[]="/tmp/start-owner-fifo-XXXXXX";int fd=mkstemp(path),status,pipes[2];pid_t native,owner,successor;
+-  struct output_native_process process={0};struct output_device *d;cfg_opt_t library[]={CFG_INT("pipe_sample_rate",44100,0),CFG_INT("pipe_bits_per_sample",16,0),CFG_END()};
++  struct output_native_process process={0},fresh={0};struct output_device *d;cfg_opt_t library[]={CFG_INT("pipe_sample_rate",44100,0),CFG_INT("pipe_bits_per_sample",16,0),CFG_END()};
+   cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
+   assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
+   assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
+@@ -92,6 +139,7 @@
+   assert(pipe(pipes)==0);native=fork();assert(native>=0);
+   if(!native){close(pipes[1]);char byte;(void)read(pipes[0],&byte,1);_exit(0);}
+   close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
++  fresh.pid=getpid();assert(start_boot_id(fresh.boot_id) && start_process_ticks(fresh.pid,&fresh.proc_start_ticks)==1);
+   struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
+   /* Both pre-open unknown and a post-open/completed record must keep a restarted
+    * C owner shut while the distinct, actually live native process remains. */
+@@ -114,11 +162,15 @@
+       sqlite3_close(hdl);_exit(0);
+     }
+     assert(waitpid(owner,&status,0)==owner && WIFEXITED(status) && WEXITSTATUS(status)==0);
+-    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(&process,false);_exit(0);}
++    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
+     assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   }
+   close(pipes[1]);assert(waitpid(native,&status,0)==native && WIFEXITED(status));
+-  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(&process,true);_exit(0);}
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,false);_exit(0);}
++  assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,true);_exit(0);}
++  assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,false,false);_exit(0);}
+   assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   /* Conditional journal replacement cannot steal a newer transaction. */
+   struct db_start_guard retained={0},wrong={0};assert(db_start_guard_load(&retained)==1);wrong=retained;memset(wrong.token,'f',32);
+@@ -127,5 +179,5 @@
+   assert(db_start_guard_save(&retained,&retained)<0);
+   assert(attention_sql(sqlite3_mprintf("PRAGMA synchronous=FULL"))==0);free(retained.payload);
+   clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);
+-  puts("PASS actual file-backed C owner successor processes: unknown/post-open/completed retain quarantine with live old native process; actual process retirement does not open gate; conditional/FULL journal failures reject");
++  puts("PASS file-backed C successors: live old Native rejects fresh START; actual old Native death with replaced saved PID namespace retains valid quarantine and denies fresh START; same namespace actual death or different saved kernel boot permits guarded START prepare/commit without generic selection; conditional/FULL journal failures reject");
+ }

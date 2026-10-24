@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"math"
 	"os"
 	"time"
@@ -11,6 +12,7 @@ import (
 const connectRecoveryWindow = 5 * time.Second
 
 type connectRecoveryIntent struct {
+	startOwned                  bool
 	loadOrdinal                 uint64
 	resumeOrdinal               uint64
 	awaitResume                 bool
@@ -157,14 +159,6 @@ func tryExplicitConnectRecoveryOutcome(room *Room, live *glLive, att *attention)
 	if room == nil || room.Idx != 0 {
 		return false, nil
 	}
-	if !fileExists(releasedPath(room)) {
-		// A recovery credit cannot survive another owner reclaiming the route.
-		live.mu.Lock()
-		live.connectRecovery = nil
-		live.connectRecoveryFence = nil
-		live.mu.Unlock()
-		return false, nil
-	}
 	credit, ok := live.consumeConnectRecovery()
 	if !ok {
 		return false, nil
@@ -184,8 +178,29 @@ func tryExplicitConnectRecoveryOutcome(room *Room, live *glLive, att *attention)
 	}
 	intent := credit.transport
 	guard := func() bool {
-		return time.Now().Before(credit.until) && live.startIntentCurrent(intent) && fileExists(releasedPath(room)) && !attentionBlocked()
+		return time.Now().Before(credit.until) && live.startIntentCurrent(intent) && !attentionBlocked()
 	}
+	status, capturedIntent := live.transportSnapshot()
+	if capturedIntent != intent || !guard() {
+		return true, nil
+	}
+	released := fileExists(releasedPath(room))
+	ctx, cancel := context.WithDeadline(context.Background(), credit.until)
+	state := bridgeStartRouteFact(ctx, room, status, intent, released)
+	cancel()
+	if !guard() || fileExists(releasedPath(room)) != released {
+		return true, nil
+	}
+	if state == startRouteOwned {
+		if !commitConnectRecoveryReceipt(room, live, att, credit, released) {
+			return true, nil
+		}
+		credit.startOwned = true
+		log.Printf("connect-recovery manager reason=completed_start_observed")
+		return true, credit
+	}
+	// This read proves only OWNED. Absence admission belongs exclusively to
+	// C's synchronous recovery=connect guard immediately before each effect.
 	primeOutcome := startPrimeRejected
 	accepted, current := routeAliasOutputWithGuardOutcome(room.OwnTone, credit.alias, live, credit.aliasRevision, nil, guard, &primeOutcome, true, true)
 	if primeOutcome == startPrimeTemporaryBusy && !accepted && current && guard() && live.retainConnectRecovery(credit) {
@@ -195,12 +210,7 @@ func tryExplicitConnectRecoveryOutcome(room *Room, live *glLive, att *attention)
 	if accepted && current && guard() && routeIntentCurrent(live, credit.alias, credit.aliasRevision) {
 		// Every C volume/selection command independently rejected busy/unknown START.
 		// A failure (including timeout) leaves release intact and cannot retry this credit.
-		if err := os.Remove(releasedPath(room)); err == nil {
-			live.mu.Lock()
-			if live.connectRecoveryFence == credit {
-				live.connectRecoveryFence = nil
-			}
-			live.mu.Unlock()
+		if commitConnectRecoveryReceipt(room, live, att, credit, released) {
 			log.Printf("connect-recovery manager reason=route_accepted")
 			log.Printf("connect-recovery manager reason=attempt_finished")
 			return true, credit
@@ -211,4 +221,28 @@ func tryExplicitConnectRecoveryOutcome(room *Room, live *glLive, att *attention)
 	}
 	log.Printf("connect-recovery manager reason=attempt_finished")
 	return true, nil
+}
+
+// Only the captured source/credit may commit bookkeeping after awaited route reads.
+// This point performs no network action and cannot consume a successor's marker.
+func commitConnectRecoveryReceipt(room *Room, live *glLive, att *attention, credit *connectRecoveryIntent, released bool) bool {
+	if att != nil {
+		att.mu.Lock()
+		defer att.mu.Unlock()
+		if att.active || att.nativeBusy || att.nativePending || att.pendingRelease || att.custodyBlockedLocked() || len(att.nativeGrants) > 0 {
+			return false
+		}
+	}
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	live.observeStopLocked()
+	current := glTransportIntent{live.runEpoch, live.phaseEpoch, live.aliasRevision, live.transportRevision, live.st.SelAlias}
+	if live.sourceRetired || live.connectRecoveryFence != credit || credit.transport != current || !time.Now().Before(credit.until) || !sameAliasBinding(credit.binding, live.st.AliasBinding) || !live.st.Active || live.st.Paused || live.st.Stopped || fileExists(releasedPath(room)) != released {
+		return false
+	}
+	if err := os.Remove(releasedPath(room)); err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	live.connectRecoveryFence = nil
+	return true
 }

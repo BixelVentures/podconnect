@@ -1,0 +1,1431 @@
+diff --git a/daemon/app.go b/daemon/app.go
+index 8934d62..a8428d6 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -53,7 +53,15 @@ type App struct {
+ 	queueWriterFences      map[*nativeTransportOffer]queueWriterFence
+ 	retirementPending      *retirementAttempt
+ 
+-	closed bool
++	ownerMu          sync.Mutex
++	currentPlayer    *AppPlayer
++	currentAPI       chan ApiRequest
++	currentDone      chan struct{}
++	playerTransition chan struct{}
++	runCancel        context.CancelFunc
++	closed           bool
++	closeOnce        sync.Once
++	closeErr         error
+ }
+ 
+ func parseDeviceType(val string) (devicespb.DeviceType, error) {
+@@ -143,6 +151,8 @@ func New(opts *Options) (*App, error) {
+ }
+ 
+ func (app *App) SetDeviceName(name string) {
++	app.ownerMu.Lock()
++	defer app.ownerMu.Unlock()
+ 	if app.cfg.DeviceName == name {
+ 		return
+ 	}
+@@ -158,6 +168,19 @@ func (app *App) SetDeviceName(name string) {
+ // error occurs. The credential type configured in cfg.Credentials.Type
+ // determines which login flow is used.
+ func (app *App) Run(ctx context.Context) error {
++	ctx, cancel := context.WithCancel(ctx)
++	app.ownerMu.Lock()
++	if app.closed {
++		app.ownerMu.Unlock()
++		cancel()
++		return fmt.Errorf("daemon is closed")
++	}
++	app.runCancel = cancel
++	app.ownerMu.Unlock()
++	defer func() {
++		cancel()
++		_ = app.Close()
++	}()
+ 	go func() {
+ 		select {
+ 		case <-ctx.Done():
+@@ -181,27 +204,133 @@ func (app *App) Run(ctx context.Context) error {
+ 
+ // Close releases resources held by the daemon. It is safe to call more than once.
+ func (app *App) Close() error {
+-	if app.closed {
+-		return nil
+-	}
+-	app.closed = true
++	// sync.Once joins concurrent callers; the owner lock only seals publication.
++	// Retirement and login completion are always awaited outside that mutex.
++	app.closeOnce.Do(func() {
++		app.ownerMu.Lock()
++		app.closed = true
++		if app.runCancel != nil {
++			app.runCancel()
++		}
++		current := app.detachCurrentPlayerLocked()
++		transition := app.playerTransition
++		app.ownerMu.Unlock()
++		if current != nil {
++			current.Close()
++		}
++		if transition != nil {
++			<-transition
++		}
+ 
+-	var errs []error
+-	if app.server != nil {
+-		if err := app.server.Close(); err != nil {
+-			errs = append(errs, err)
++		var errs []error
++		if app.server != nil {
++			if err := app.server.Close(); err != nil {
++				errs = append(errs, err)
++			}
+ 		}
+-	}
+-	if app.mpris != nil {
+-		if err := app.mpris.Close(); err != nil {
+-			errs = append(errs, err)
++		if app.mpris != nil {
++			if err := app.mpris.Close(); err != nil {
++				errs = append(errs, err)
++			}
+ 		}
++		if app.zeroconf != nil {
++			app.zeroconf.Close()
++		}
++		app.closeErr = errors.Join(errs...)
++	})
++	return app.closeErr
++}
++
++// detachCurrentPlayerLocked fences API forwarding before the exact owner retires.
++// The request channel stays open: a captured sender must never race channel close.
++func (app *App) detachCurrentPlayerLocked() *AppPlayer {
++	current := app.currentPlayer
++	if app.currentDone != nil {
++		close(app.currentDone)
+ 	}
+-	if app.zeroconf != nil {
+-		app.zeroconf.Close()
+-	}
++	app.currentPlayer, app.currentAPI, app.currentDone = nil, nil, nil
++	return current
++}
+ 
+-	return errors.Join(errs...)
++// replaceAppPlayer serializes existing login/logout replacement without holding a
++// mutex over authentication, writer join or C retirement. Close seals publication
++// and joins this same transition, including a prepared but unpublished player.
++func (app *App) replaceAppPlayer(ctx context.Context, expected *AppPlayer, create func(context.Context) (*AppPlayer, error)) (<-chan struct{}, error) {
++	for {
++		app.ownerMu.Lock()
++		if app.closed || ctx.Err() != nil {
++			app.ownerMu.Unlock()
++			return nil, fmt.Errorf("daemon is closing")
++		}
++		if pending := app.playerTransition; pending != nil {
++			app.ownerMu.Unlock()
++			select {
++			case <-pending:
++				continue
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			}
++		}
++		if expected != nil && app.currentPlayer != expected {
++			app.ownerMu.Unlock()
++			return nil, nil
++		}
++		done := make(chan struct{})
++		app.playerTransition = done
++		old := app.detachCurrentPlayerLocked()
++		if app.zeroconf != nil {
++			app.zeroconf.SetCurrentUser("")
++		}
++		app.ownerMu.Unlock()
++		defer func() {
++			app.ownerMu.Lock()
++			app.playerTransition = nil
++			close(done)
++			app.ownerMu.Unlock()
++		}()
++		if old != nil {
++			old.Close()
++		}
++		app.ownerMu.Lock()
++		closing := app.closed || ctx.Err() != nil
++		app.ownerMu.Unlock()
++		if closing {
++			return nil, fmt.Errorf("daemon is closing")
++		}
++		next, err := create(ctx)
++		app.ownerMu.Lock()
++		if app.closed || ctx.Err() != nil || err != nil {
++			app.ownerMu.Unlock()
++			if next != nil {
++				next.Close()
++			}
++			if err != nil {
++				return nil, err
++			}
++			return nil, fmt.Errorf("daemon is closing")
++		}
++		var runDone chan struct{}
++		if next != nil {
++			app.currentPlayer = next
++			app.currentAPI = make(chan ApiRequest)
++			app.currentDone = make(chan struct{})
++			apiCh := app.currentAPI
++			runDone = make(chan struct{})
++			go func() {
++				defer close(runDone)
++				next.Run(ctx, apiCh, app.mpris.Receive())
++			}()
++		}
++		if app.zeroconf != nil {
++			username := ""
++			if next != nil {
++				username = next.sess.Username()
++			}
++			app.zeroconf.SetCurrentUser(username)
++		}
++		app.ownerMu.Unlock()
++		return runDone, nil
++	}
+ }
+ 
+ func (app *App) persistState() error {
+@@ -223,6 +352,11 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err
+ 
+ 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)
+ 	appPlayer.prefetchTimer.Stop()
++	defer func() {
++		if err != nil {
++			appPlayer.Close()
++		}
++	}()
+ 
+ 	if appPlayer.sess, err = session.NewSessionFromOptions(ctx, &session.Options{
+ 		Log:         app.log,
+@@ -318,6 +452,7 @@ func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
+ 			app.state.Credentials.Data = appPlayer.sess.StoredCredentials()
+ 
+ 			if err = app.persistState(); err != nil {
++				appPlayer.Close()
+ 				return nil, err
+ 			}
+ 
+@@ -330,138 +465,106 @@ func (app *App) withCredentials(ctx context.Context, creds any) (err error) {
+ 
+ func (app *App) withAppPlayer(ctx context.Context, appPlayerFunc func(context.Context) (*AppPlayer, error)) (err error) {
+ 	if !app.cfg.ZeroconfEnabled {
+-		appPlayer, err := appPlayerFunc(ctx)
++		runDone, err := app.replaceAppPlayer(ctx, nil, appPlayerFunc)
+ 		if err != nil {
+ 			return err
+-		} else if appPlayer == nil {
++		}
++		if runDone == nil {
+ 			panic("zeroconf is disabled and no credentials are present")
+ 		}
+-
+-		appPlayer.Run(ctx, app.server.Receive(), app.mpris.Receive())
++		go app.forwardAPI(ctx)
++		select {
++		case <-runDone:
++		case <-ctx.Done():
++		}
+ 		return nil
+ 	}
+ 
+ 	if err := app.resolver.FetchAll(ctx); err != nil {
+ 		return fmt.Errorf("failed getting endpoints from resolver: %w", err)
+ 	}
+-
+-	app.zeroconf, err = zeroconf.NewZeroconf(app.log, app.cfg.ZeroconfPort, app.cfg.DeviceName, app.cfg.DeviceAliases, app.deviceId, app.deviceType, app.cfg.ZeroconfInterfacesToAdvertise, app.cfg.ZeroconfBackend == "avahi")
++	z, err := zeroconf.NewZeroconf(app.log, app.cfg.ZeroconfPort, app.cfg.DeviceName, app.cfg.DeviceAliases, app.deviceId, app.deviceType, app.cfg.ZeroconfInterfacesToAdvertise, app.cfg.ZeroconfBackend == "avahi")
+ 	if err != nil {
+ 		return fmt.Errorf("failed initializing zeroconf: %w", err)
+ 	}
+-
+-	var apiCh chan ApiRequest
+-
+-	currentPlayer, err := appPlayerFunc(ctx)
+-	if err != nil {
+-		return err
++	app.ownerMu.Lock()
++	if app.closed || ctx.Err() != nil {
++		app.ownerMu.Unlock()
++		z.Close()
++		return fmt.Errorf("daemon is closing")
+ 	}
++	app.zeroconf = z
++	app.ownerMu.Unlock()
+ 
+-	if currentPlayer != nil {
+-		app.log.WithField("username", librespot.ObfuscateUsername(currentPlayer.sess.Username())).
+-			Debugf("initializing zeroconf session")
+-
+-		apiCh = make(chan ApiRequest)
+-		go currentPlayer.Run(ctx, apiCh, app.mpris.Receive())
+-
+-		app.zeroconf.SetCurrentUser(currentPlayer.sess.Username())
++	if _, err := app.replaceAppPlayer(ctx, nil, appPlayerFunc); err != nil {
++		return err
+ 	}
+-
+-	go func() {
+-		for {
+-			select {
+-			case req := <-app.server.Receive():
+-				if currentPlayer == nil {
+-					if req.Type == ApiRequestTypeRoot {
+-						req.Reply(&ApiResponseRoot{}, nil)
+-					} else {
+-						req.Reply(nil, ErrNoSession)
+-					}
+-					break
+-				}
+-
+-				apiCh <- req
+-			}
+-		}
+-	}()
+-
++	go app.forwardAPI(ctx)
+ 	go func() {
+ 		for {
+ 			select {
+ 			case <-ctx.Done():
+-				if currentPlayer != nil {
+-					currentPlayer.Close()
+-					currentPlayer = nil
+-
+-					close(apiCh)
+-				}
+ 				return
+ 			case p := <-app.logoutCh:
+-				if p != currentPlayer {
+-					continue
+-				}
+-
+-				currentPlayer.Close()
+-				currentPlayer = nil
+-
+-				close(apiCh)
+-
+-				newAppPlayer, err := appPlayerFunc(ctx)
+-				if err != nil {
++				if _, err := app.replaceAppPlayer(ctx, p, appPlayerFunc); err != nil && ctx.Err() == nil {
+ 					app.log.WithError(err).Errorf("failed restoring session after logout")
+-
+-					app.zeroconf.SetCurrentUser("")
+-				} else if newAppPlayer == nil {
+-					app.zeroconf.SetCurrentUser("")
+-				} else {
+-					apiCh = make(chan ApiRequest)
+-					currentPlayer = newAppPlayer
+-
+-					go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+-
+-					app.zeroconf.SetCurrentUser(newAppPlayer.sess.Username())
+-
+-					app.log.WithField("username", librespot.ObfuscateUsername(currentPlayer.sess.Username())).
+-						Debugf("restored session after logout")
+ 				}
+ 			}
+ 		}
+ 	}()
+ 
+-	return app.zeroconf.Serve(func(req zeroconf.NewUserRequest) bool {
+-		if currentPlayer != nil {
+-			currentPlayer.Close()
+-			currentPlayer = nil
+-
+-			close(apiCh)
+-		}
+-
+-		newAppPlayer, err := app.newAppPlayer(ctx, session.BlobCredentials{
+-			Username: req.Username,
+-			Blob:     req.AuthBlob,
++	return z.Serve(func(req zeroconf.NewUserRequest) bool {
++		_, err := app.replaceAppPlayer(ctx, nil, func(ctx context.Context) (*AppPlayer, error) {
++			next, err := app.newAppPlayer(ctx, session.BlobCredentials{Username: req.Username, Blob: req.AuthBlob})
++			if err != nil {
++				return nil, err
++			}
++			if app.cfg.Credentials.Zeroconf.PersistCredentials {
++				app.state.Credentials.Username = next.sess.Username()
++				app.state.Credentials.Data = next.sess.StoredCredentials()
++				if err := app.persistState(); err != nil {
++					app.log.WithError(err).Errorf("failed persisting zeroconf credentials")
++				}
++			}
++			return next, nil
+ 		})
+ 		if err != nil {
+-			app.log.WithError(err).WithField("username", librespot.ObfuscateUsername(req.Username)).
+-				Errorf("failed creating new session from %s", req.DeviceName)
++			app.log.WithError(err).WithField("username", librespot.ObfuscateUsername(req.Username)).Errorf("failed creating new session from %s", req.DeviceName)
+ 			return false
+ 		}
++		return true
++	})
++}
+ 
+-		apiCh = make(chan ApiRequest)
+-		currentPlayer = newAppPlayer
+-
+-		if app.cfg.Credentials.Zeroconf.PersistCredentials {
+-			app.state.Credentials.Username = newAppPlayer.sess.Username()
+-			app.state.Credentials.Data = newAppPlayer.sess.StoredCredentials()
+-
+-			if err := app.persistState(); err != nil {
+-				app.log.WithError(err).Errorf("failed persisting zeroconf credentials")
++func (app *App) forwardAPI(ctx context.Context) {
++	requests := app.server.Receive()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case req, ok := <-requests:
++			if !ok {
++				return
++			}
++			app.ownerMu.Lock()
++			apiCh, done := app.currentAPI, app.currentDone
++			app.ownerMu.Unlock()
++			if apiCh == nil {
++				if req.Type == ApiRequestTypeRoot {
++					req.Reply(&ApiResponseRoot{}, nil)
++				} else {
++					req.Reply(nil, ErrNoSession)
++				}
++				continue
++			}
++			select {
++			case apiCh <- req:
++			case <-done:
++				req.Reply(nil, ErrNoSession)
++			case <-ctx.Done():
++				req.Reply(nil, ErrNoSession)
++				return
+ 			}
+-
+-			app.log.WithField("username", librespot.ObfuscateUsername(newAppPlayer.sess.Username())).
+-				Debugf("persisted zeroconf credentials")
+ 		}
+-
+-		go newAppPlayer.Run(ctx, apiCh, app.mpris.Receive())
+-		return true
+-	})
++	}
+ }
+diff --git a/daemon/context_commit_test.go b/daemon/context_commit_test.go
+index 2aef52c..1e4dc10 100644
+--- a/daemon/context_commit_test.go
++++ b/daemon/context_commit_test.go
+@@ -290,6 +290,13 @@ func TestDealerTransferAcceptsGidAndRetainsUriPrecedence(t *testing.T) {
+ 			req := pc13PlayRequest(t)
+ 			req.Command.Endpoint, req.Command.Data = "transfer", data
+ 			err = p.handlePlayerCommand(context.Background(), req)
++			if tc.name == "sixteen-byte GID" {
++				// Valid GID syntax never authorizes a different cached context track.
++				if err == nil || !strings.Contains(err.Error(), "failed seeking to track") || p.state.lastTransferTimestamp != 123 || p.state.player.SessionId != "previous-session" {
++					t.Fatalf("missing requested GID fell back to cached media: %v", err)
++				}
++				return
++			}
+ 			if err == nil || !strings.Contains(err.Error(), "failed parsing uri: invalid uri: invalid-pc13-post-commit") {
+ 				t.Fatalf("expected preparation accepted then deliberate media boundary: %v", err)
+ 			}
+@@ -363,7 +370,7 @@ func TestDealerTransferRetainsLazyEmptyPage(t *testing.T) {
+ 		shuffle                bool
+ 	}{
+ 		{"invalid page URL", "invalid-pc13-page-boundary", "invalid page url: invalid-pc13-page-boundary", 0, 0, false},
+-		{"page 404", "hm://pc10/lazy-page", "invalid status code from page", http.StatusNotFound, 2, false},
++		{"page 404", "hm://pc10/lazy-page", "invalid status code from page", http.StatusNotFound, 1, false},
+ 		{"resolved page", "hm://pc10/lazy-page", "", http.StatusOK, 1, false},
+ 		{"resolved shuffled page", "hm://pc10/lazy-page", "", http.StatusOK, 1, true},
+ 	} {
+@@ -720,3 +727,31 @@ func TestDealerOuter404ThenPreparedContextCommitsAliasAndNextCommand(t *testing.
+ 		}
+ 	}
+ }
++
++func TestDealerTransferLaterPage404CannotFallbackToCachedFirstTrack(t *testing.T) {
++	p := pc13ExistingPlayer(t, true)
++	p.primaryStream, p.secondaryStream = &player.Stream{}, &player.Stream{}
++	oldTracks, primary, secondary := p.state.tracks, p.primaryStream, p.secondaryStream
++	before := proto.Clone(p.state.player)
++	state := pc13TransferState()
++	state.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"}
++	state.Playback.PositionAsOfTimestamp = 8487
++	state.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}, NextPageUrl: "hm://fixture/later"}}
++	req := pc13PlayRequest(t)
++	req.Command.Endpoint = "transfer"
++	requests := 0
++	sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		requests++
++		if r.Method != http.MethodGet || r.URL.Path != "/fixture/later" {
++			return nil, fmt.Errorf("unexpected request: %s", r.URL)
++		}
++		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header), Request: r}, nil
++	}))
++	err := p.handleTransferCommand(context.Background(), req, state, sp)
++	if err == nil || !strings.Contains(err.Error(), "failed seeking to track") || !strings.Contains(err.Error(), "404") {
++		t.Fatalf("missing strict seek failure: %v", err)
++	}
++	if requests != 1 || !proto.Equal(before, p.state.player) || p.state.tracks != oldTracks || p.primaryStream != primary || p.secondaryStream != secondary || p.state.lastTransferTimestamp != 123 || p.state.device.SelectedAliasId != 2 || len(p.app.server.(*aliasTestServer).events) != 0 {
++		t.Fatal("lazy-page failure committed wrong cached content or changed owner")
++	}
++}
+diff --git a/daemon/controls.go b/daemon/controls.go
+index 10b1b43..b998090 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -345,6 +345,10 @@ func (p *AppPlayer) loadCurrentTrack(ctx context.Context, paused, drop bool) err
+ }
+ 
+ func (p *AppPlayer) loadCurrentTrackAttempt(ctx context.Context, paused, drop, allowUnplayableFallback bool) (loadErr error) {
++	return p.loadCurrentTrackWithStart(ctx, paused, drop, allowUnplayableFallback, false)
++}
++
++func (p *AppPlayer) loadCurrentTrackWithStart(ctx context.Context, paused, drop, allowUnplayableFallback, preparedDealer bool) (loadErr error) {
+ 	if p.primaryStream != nil {
+ 		p.sess.Events().OnPrimaryStreamUnload(p.primaryStream, p.player.PositionMs())
+ 
+@@ -365,11 +369,16 @@ func (p *AppPlayer) loadCurrentTrackAttempt(ctx context.Context, paused, drop, a
+ 	state, worker, session := p.state, p.player, p.sess
+ 	playerState := state.player
+ 	var prepared *player.Stream
++	var preparedStart *contentOperation
+ 	defer func() {
+ 		if allowUnplayableFallback && (errors.Is(loadErr, librespot.ErrMediaRestricted) || errors.Is(loadErr, librespot.ErrNoSupportedFormats)) {
+ 			return
+ 		}
+-		if loadErr == nil || p.state != state || p.state.player != playerState || p.player != worker || p.sess != session {
++		if p.state != state {
++			return
++		}
++		currentPlayerState := p.state.player == playerState || (preparedStart != nil && preparedStart.Published && p.state.player == preparedStart.Prepared && p.primaryStream == preparedStart.Stream)
++		if loadErr == nil || p.state != state || !currentPlayerState || p.player != worker || p.sess != session {
+ 			return
+ 		}
+ 		p.aliasMu.Lock()
+@@ -433,7 +442,13 @@ func (p *AppPlayer) loadCurrentTrackAttempt(ctx context.Context, paused, drop, a
+ 		return fmt.Errorf("initial load receipt exhausted")
+ 	}
+ 	p.primaryLoadOrdinal++
+-	if err := p.player.SetPrimaryStreamObserved(p.primaryStream.Source, paused, drop, p.primaryLoadOrdinal); err != nil {
++	if preparedDealer {
++		var err error
++		preparedStart, err = p.startPreparedDealerTransfer(ctx, paused, trackPosition)
++		if err != nil {
++			return fmt.Errorf("failed admitting transfer stream for %s: %w", spotId, err)
++		}
++	} else if err := p.player.SetPrimaryStreamObserved(p.primaryStream.Source, paused, drop, p.primaryLoadOrdinal); err != nil {
+ 		return fmt.Errorf("failed setting stream for %s: %w", spotId, err)
+ 	}
+ 
+diff --git a/daemon/player.go b/daemon/player.go
+index 5d64e7e..dd771d9 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -471,9 +471,12 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
+ 	// Lazy context preparation must succeed before changing the command or output owner.
+ 	contextSpotType := librespot.InferSpotifyIdTypeFromContextUri(transferState.CurrentSession.Context.Uri)
+ 	currentTrack := librespot.ContextTrackToProvidedTrack(contextSpotType, transferState.Playback.CurrentTrack)
+-	if err := ctxTracks.TrySeek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
++	if err := ctxTracks.Seek(ctx, tracks.ProvidedTrackComparator(contextSpotType, currentTrack)); err != nil {
+ 		return fmt.Errorf("failed seeking to track: %w", err)
+ 	}
++	if ctxTracks.CurrentTrack().Uri != currentTrack.Uri {
++		return fmt.Errorf("failed seeking to track: current media identity changed")
++	}
+ 
+ 	// shuffle the context if needed
+ 	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
+@@ -555,8 +558,13 @@ func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.Reques
+ 	p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
+ 	p.state.player.Index = ctxTracks.Index()
+ 
++	// The first process writer must be admitted by C before it is opened.
++	bootstrap, err := p.dealerTransferStartRequired(req)
++	if err != nil {
++		return err
++	}
+ 	// load current track into stream
+-	if err := p.loadCurrentTrack(ctx, pause, true); err != nil {
++	if err := p.loadCurrentTrackWithStart(ctx, pause, true, false, bootstrap); err != nil {
+ 		return fmt.Errorf("failed loading current track (transfer): %w", err)
+ 	}
+ 
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index 8062d30..cf02404 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -15,6 +15,7 @@ import (
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -104,6 +105,11 @@ type contentCapture struct {
+ 	OldOwner                                                                        *roomTransportIdentity
+ }
+ type contentOperation struct {
++	// Set only by the authenticated dealer actor for its already prepared stream.
++	preparedDealer     bool
++	preparedPaused     bool
++	initialLoadOrdinal uint64
++
+ 	CancelSent                                                                  bool
+ 	Actual                                                                      *roomTransportIdentity
+ 	mu                                                                          sync.Mutex
+@@ -455,3 +461,117 @@ func (op *contentOperation) stage() {
+ 		}
+ 	})
+ }
++
++// dealerTransferStartRequired is called only from the authenticated transfer
++// handler. Existing process writers retain their ordinary continuation path.
++func (p *AppPlayer) dealerTransferStartRequired(req dealer.RequestPayload) (bool, error) {
++	if p.app == nil || p.app.cfg == nil || p.app.cfg.AudioBackend != "pipe" || !p.app.cfg.ExternalVolume || p.app.cfg.RoomTransportOwnToneURL == "" {
++		return false, nil
++	}
++	p.app.moveCustodyMu.Lock()
++	fresh := p.app.openedWriterGeneration == 0
++	clean := p.app.openedWriterOwner == nil && p.app.startCustody == nil && p.app.moveCustody == nil && !p.app.moveCustodyUnknown && p.app.retirementPending == nil
++	p.app.moveCustodyMu.Unlock()
++	if !fresh {
++		return false, nil
++	}
++	alias := req.TargetAliasId
++	if alias == nil {
++		alias = req.Command.TargetAliasId
++	}
++	if !clean || req.Command.Endpoint != "transfer" || req.Command.Options.SystemInitiated || req.Command.PlayOptions.SystemInitiated || len(req.Command.Data) == 0 || req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 || alias == nil || *alias == 0 {
++		return false, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	binding := p.aliasBindingLocked()
++	if binding == nil || !binding.Ready || p.state.device.SelectedAliasId != *alias || binding.RoomID == "" {
++		return false, ErrAliasConflict
++	}
++	for _, requested := range []*uint32{req.TargetAliasId, req.Command.TargetAliasId} {
++		if requested != nil && *requested != 0 && *requested != *alias {
++			return false, ErrAliasConflict
++		}
++	}
++	return true, nil
++}
++
++// startPreparedDealerTransfer never resolves, seeks or reloads content. It
++// admits exactly the stream/context/session already prepared by the dealer
++// actor through the same C and native START steps as selected-content playback.
++func (p *AppPlayer) startPreparedDealerTransfer(ctx context.Context, paused bool, position int64) (*contentOperation, error) {
++	account, authenticated := p.sess.BoundUsername()
++	p.aliasMu.Lock()
++	binding := p.aliasBindingLocked()
++	homepod := ""
++	for _, alias := range p.aliasRegistry {
++		if alias.ID == p.state.device.SelectedAliasId {
++			homepod = alias.HomePodID
++			break
++		}
++	}
++	p.aliasMu.Unlock()
++	if !authenticated || binding == nil || !binding.Ready || p.primaryStream == nil || p.primaryStream.Source == nil || p.state.tracks == nil || p.primaryLoadOrdinal == 0 {
++		return nil, ErrAliasConflict
++	}
++	capture, err := p.captureContent(roomVolumeScope{account, p.app.deviceId, binding.RoomID, homepod})
++	if err != nil {
++		return nil, err
++	}
++	// A prepared decoder is not yet the worker's selected source or an output.
++	if capture.Source != nil || capture.Primary != p.primaryStream || capture.SessionID == "" || capture.TargetAlias != capture.SelectedAlias {
++		return nil, ErrAliasConflict
++	}
++	target, err := capture.readCState(ctx)
++	if err != nil {
++		return nil, err
++	}
++	value, err := p.offerContent(contentOfferActorRequest{capture, target.Target, ctx})
++	if err != nil {
++		return nil, err
++	}
++	op := value.(*contentOperation)
++	p.aliasMu.Lock()
++	if ctx.Err() != nil || !p.contentCurrentLocked(capture) || p.roomNativeIntent == ^uint64(0) {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	p.roomNativeIntent++
++	capture.Intent = p.roomNativeIntent
++	op.Revision = strconv.FormatUint(p.roomNativeIntent, 10)
++	op.Intended = roomTransportIdentity{account, p.app.deviceId, binding.RoomID, homepod, capture.Connection, capture.SessionID, capture.AliasIncarnation, capture.Registry, capture.AliasRevision}
++	if !nativeBoundOwnerValid(op.Intended) {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	op.preparedDealer, op.preparedPaused, op.initialLoadOrdinal = true, paused, p.primaryLoadOrdinal
++	op.Claimed, op.State = true, "staged"
++	op.StagedUntil = op.Expires
++	op.Stream, op.Tracks = p.primaryStream, p.state.tracks
++	op.Prepared = proto.Clone(p.state.player).(*connectpb.PlayerState)
++	op.Prepared.IsPlaying, op.Prepared.IsPaused, op.Prepared.IsBuffering = true, paused, false
++	op.Prepared.PositionAsOfTimestamp, op.Prepared.Timestamp = position, time.Now().UnixMilli()
++	op.Prepared.PlaybackId = hex.EncodeToString(op.Stream.PlaybackId)
++	op.Prepared.Duration = int64(op.Stream.Media.Duration())
++	op.ContentDigest = contentDigest(struct {
++		State   *connectpb.PlayerState
++		Binding string
++	}{op.Prepared, op.Offer.BindingID})
++	p.aliasMu.Unlock()
++	op.commit(ctx, nil)
++	op.mu.Lock()
++	complete := op.Terminal && op.State == "complete"
++	op.mu.Unlock()
++	p.aliasMu.Lock()
++	if p.roomContentReservation != nil && p.roomContentReservation.Operation == op {
++		p.roomContentReservation = nil
++	}
++	if !complete {
++		p.roomContentQuarantined = true
++	}
++	p.aliasMu.Unlock()
++	if !complete {
++		return op, ErrAliasConflict
++	}
++	return op, nil
++}
+diff --git a/daemon/room_content_actor.go b/daemon/room_content_actor.go
+index 0f48093..9c57abb 100644
+--- a/daemon/room_content_actor.go
++++ b/daemon/room_content_actor.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/hex"
+ 	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	"github.com/devgianlu/go-librespot/session"
+ 	"time"
+@@ -76,7 +77,13 @@ func (p *AppPlayer) applyContentStep(step contentStep) error {
+ 	}
+ 	ctx, cancel := context.WithDeadline(step.Context, op.Until)
+ 	defer cancel()
+-	actualPipe, actualEpoch, err := p.player.Start35(ctx, step.Phase, newSource, expected, pipe, epoch, func(mutate func()) error {
++	start := p.player.Start35
++	if op.preparedDealer {
++		start = func(ctx context.Context, phase string, source, expected librespot.AudioSource, pipe output.PipeIdentity, epoch string, guard output.TransportGuard) (output.PipeIdentity, string, error) {
++			return p.player.Start35Prepared(ctx, phase, source, expected, pipe, epoch, op.preparedPaused, guard)
++		}
++	}
++	actualPipe, actualEpoch, err := start(ctx, step.Phase, newSource, expected, pipe, epoch, func(mutate func()) error {
+ 		p.aliasMu.Lock()
+ 		defer p.aliasMu.Unlock()
+ 		op.mu.Lock()
+@@ -116,10 +123,12 @@ func (p *AppPlayer) applyContentStep(step contentStep) error {
+ 			op.Actual = &actual
+ 		}
+ 		if step.Phase == "resume" {
+-			p.state.setPaused(false)
++			p.state.setPaused(op.preparedDealer && op.preparedPaused)
+ 			p.state.player.IsBuffering = false
+ 			p.state.player.Timestamp = time.Now().UnixMilli()
+-			p.state.player.PositionAsOfTimestamp = 0
++			if !op.preparedDealer {
++				p.state.player.PositionAsOfTimestamp = 0
++			}
+ 			p.state.player.PlaybackId = hex.EncodeToString(op.Stream.PlaybackId)
+ 		}
+ 		return nil
+@@ -137,6 +146,10 @@ func (p *AppPlayer) applyContentStep(step contentStep) error {
+ 	return nil
+ }
+ func (op *contentOperation) actorStep(ctx context.Context, phase string) error {
++	if op.preparedDealer {
++		// Already running on this actor: dispatching back onto its channel deadlocks.
++		return op.Owner.applyContentStep(contentStep{Operation: op, Phase: phase, Context: ctx})
++	}
+ 	reply := make(chan error, 1)
+ 	step := contentStep{op, phase, ctx, reply}
+ 	select {
+diff --git a/daemon/room_content_execute.go b/daemon/room_content_execute.go
+index eb86565..ce8c665 100644
+--- a/daemon/room_content_execute.go
++++ b/daemon/room_content_execute.go
+@@ -131,7 +131,12 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		failed("c_prepare", cFailure(err), "")
+ 		return
+ 	}
+-	if _, err = server.roomTransportAsk(ctx, apiContentConsume, contentActorRequest{Operation: op, Context: ctx}); err != nil {
++	if op.preparedDealer {
++		_, err = op.Owner.consumeContent(contentActorRequest{Operation: op, Context: ctx})
++	} else {
++		_, err = server.roomTransportAsk(ctx, apiContentConsume, contentActorRequest{Operation: op, Context: ctx})
++	}
++	if err != nil {
+ 		op.mu.Lock()
+ 		errorClass := "native_actor_failed"
+ 		if ctx.Err() == context.DeadlineExceeded {
+@@ -275,7 +280,13 @@ func (op *contentOperation) commit(ctx context.Context, server *ConcreteApiServe
+ 		failed("writer_current", "writer_missing", "")
+ 		return
+ 	}
+-	err = op.Owner.player.VerifyStart35(ctx, selected, pipe, epoch, writerFD, func(mutate func()) error {
++	verify := op.Owner.player.VerifyStart35
++	if op.preparedDealer {
++		verify = func(ctx context.Context, source librespot.AudioSource, pipe output.PipeIdentity, epoch, fd string, guard output.TransportGuard) error {
++			return op.Owner.player.VerifyStart35Prepared(ctx, source, pipe, epoch, fd, op.preparedPaused, op.initialLoadOrdinal, guard)
++		}
++	}
++	err = verify(ctx, selected, pipe, epoch, writerFD, func(mutate func()) error {
+ 		op.Owner.aliasMu.Lock()
+ 		defer op.Owner.aliasMu.Unlock()
+ 		op.mu.Lock()
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 3815589..345ede4 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -5,20 +5,29 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/ap"
++	evtimpl "github.com/devgianlu/go-librespot/events/impl"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ 	"google.golang.org/protobuf/proto"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"path/filepath"
++	"reflect"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"testing"
+ 	"time"
++	"unsafe"
+ )
+ 
+ type contentInertSource struct{ closes atomic.Int32 }
+@@ -548,3 +557,239 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+ 		t.Fatal("actor retirement lost quarantine")
+ 	}
+ }
++
++// Reuses the admitted START fixture with the real worker and local FIFO. The
++// synthetic AP welcome seeds only the existing account getter; no provider
++// authentication, HomePod or physical audio is claimed by this regression.
++func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
++	for _, mode := range []string{"playing", "paused", "dealer-playing", "dealer-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost"} {
++		t.Run(mode, func(t *testing.T) {
++			p, _ := contentFixture(t)
++			path := filepath.Join(t.TempDir(), "prepared.fifo")
++			if err := syscall.Mkfifo(path, 0600); err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			stat, _ := reader.Stat()
++			kernel := stat.Sys().(*syscall.Stat_t)
++			identity := outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
++			p.app.cfg.AudioOutputPipe = path
++			p.state.device.SelectedAliasId = 2
++			p.hasSpotConnId, p.hasInitialConnectState = true, true
++			p.playbackReadyCh = make(chan struct{})
++			close(p.playbackReadyCh)
++			p.roomContentReservation = nil
++			p.roomNativeIntent = 0
++			p.primaryLoadOrdinal = 1
++			p.app.log = &librespot.NullLogger{}
++			// The test seeds existing getter fields, never a production admission hook.
++			access := ap.NewAccesspoint(&librespot.NullLogger{}, nil, "fixture")
++			left, right := net.Pipe()
++			defer left.Close()
++			defer right.Close()
++			fields := reflect.ValueOf(access).Elem()
++			set := func(name string, v reflect.Value) {
++				f := fields.FieldByName(name)
++				reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(v)
++			}
++			set("conn", reflect.ValueOf(left))
++			set("encConn", reflect.New(fields.FieldByName("encConn").Type().Elem()))
++			set("welcome", reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")}))
++			nextSessionField(p.sess, "ap", access)
++			var creates atomic.Int32
++			worker, err := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++				creates.Add(1)
++				return p.app.withNewOutput(p, create)
++			}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer worker.Close()
++			p.player = worker
++			stream := &player.Stream{Source: &contentInertSource{}, PlaybackId: []byte{1, 2, 3}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Duration: proto.Int32(300000)})}
++			p.primaryStream = stream
++			sessionID := p.state.player.SessionId
++			tracks := p.state.tracks
++			position := int64(8487)
++			p.state.player.PositionAsOfTimestamp = position
++			p.state.player.Timestamp = time.Now().UnixMilli()
++			paused := mode == "paused" || mode == "dealer-paused"
++			p.state.setPaused(paused)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			var calls []string
++			var receipt contentCReceipt
++			var mu sync.Mutex
++			owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
++				mu.Lock()
++				defer mu.Unlock()
++				calls = append(calls, endpoint)
++				var body map[string]json.RawMessage
++				_ = json.NewDecoder(r.Body).Decode(&body)
++				if endpoint == "state" {
++					if creates.Load() != 0 {
++						t.Error("writer opened before C state")
++					}
++					_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}})
++					return
++				}
++				if endpoint == "prepare" {
++					if creates.Load() != 0 {
++						t.Error("writer opened before C prepare")
++					}
++					receipt = contentCReceipt{OK: true, Token: strings.Repeat("e", 32), Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}, InputEpoch: "0", WriterEpoch: "0", Expires: 8000, Drained: true, Phase: "prepared"}
++					_ = json.Unmarshal(body["offer_id"], &receipt.OfferID)
++					_ = json.Unmarshal(body["binding_id"], &receipt.BindingID)
++					_ = json.Unmarshal(body["content_digest"], &receipt.ContentDigest)
++					_ = json.Unmarshal(body["native_incarnation"], &receipt.Incarnation)
++					_ = json.Unmarshal(body["native_revision"], &receipt.Revision)
++					_ = json.Unmarshal(body["intended_native_owner"], &receipt.Intended)
++					_ = json.Unmarshal(body["expected_input_path_digest"], &receipt.InputDigest)
++					if receipt.Intended.SessionID != sessionID || receipt.Intended.AliasRevision != p.aliasRevision {
++						t.Error("transfer semantic session/alias reset")
++					}
++					if mode == "cancel" {
++						cancel()
++					}
++					if mode == "alias-aba" {
++						p.aliasMu.Lock()
++						p.aliasRevision += 2
++						p.aliasMu.Unlock()
++					}
++				} else {
++					_ = json.Unmarshal(body["native_reservation_id"], &receipt.ReservationID)
++					receipt.Possible, receipt.GateClosed, receipt.PinRemaining = true, true, 14000
++					receipt.Pipe = &identity
++					receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
++					if endpoint == "commit" && mode == "unknown" {
++						receipt.Phase = "unknown"
++					}
++					if endpoint == "commit" && mode == "foreign-pipe" {
++						wrong := identity
++						wrong.Inode = "1"
++						receipt.Pipe = &wrong
++					}
++					if endpoint == "barrier" || endpoint == "open" || endpoint == "complete" {
++						if creates.Load() != 1 {
++							t.Error("missing exact admitted FIFO writer")
++						}
++						_ = json.Unmarshal(body["writer_source_epoch"], &receipt.WriterEpoch)
++						receipt.InputEpoch = "1"
++						receipt.Route = &roomVolumeRoute{receipt.Target.Process, "202", "1", "1", "1", "1", "1", "0", receipt.InputDigest}
++					}
++					if endpoint == "open" || endpoint == "complete" {
++						receipt.GateClosed = false
++						receipt.Actual = &receipt.Intended
++					}
++				}
++				if endpoint == "complete" && mode == "complete-fails" {
++					receipt.Phase = "unknown"
++					receipt.GateClosed = true
++					receipt.Actual = nil
++				}
++				if endpoint == "complete" && mode == "writer-lost" {
++					worker.Stop()
++				}
++				receipt.Schema = "podconnect.output_start_" + endpoint + ".v1"
++				_ = json.NewEncoder(w).Encode(receipt)
++			}))
++			defer owner.Close()
++			p.app.cfg.RoomTransportOwnToneURL = owner.URL
++			if mode == "complete-fails" || mode == "writer-lost" || strings.HasPrefix(mode, "dealer-") {
++				// Same shipped load caller must retire its own op.Prepared publication.
++				p.primaryStream = nil
++				p.secondaryStream = stream
++				p.primaryLoadOrdinal = 0
++				events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
++				nextSessionField(p.sess, "events", events)
++				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++				}))
++				nextSessionField(p.sess, "sp", sp)
++				p.app.cfg.ZeroconfEnabled = true
++				p.logout = make(chan *AppPlayer, 1)
++				p.prefetchTimer = time.NewTimer(time.Hour)
++				defer p.prefetchTimer.Stop()
++				p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++				p.state.player.Options = &connectpb.ContextPlayerOptions{}
++				p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++				id, _ := librespot.SpotifyIdFromUri(p.state.player.Track.Uri)
++				stream.Media = librespot.NewMediaFromTrack(&metadatapb.Track{Gid: id.Id(), Duration: proto.Int32(300000), Name: proto.String("fixture"), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture"), Date: &metadatapb.Date{}}})
++				if strings.HasPrefix(mode, "dealer-") {
++					p.prodInfo = &ProductInfo{}
++					transfer := pc13TransferState()
++					transfer.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: p.state.player.Track.Uri}
++					transfer.Playback.Timestamp = time.Now().UnixMilli()
++					transfer.Playback.PositionAsOfTimestamp = int32(position)
++					transfer.Playback.IsPaused = paused
++					transfer.CurrentSession.OriginalSessionId = proto.String(sessionID)
++					transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
++					req := pc13PlayRequest(t)
++					req.Command.Endpoint = "transfer"
++					req.TargetAliasId = proto.Uint32(2)
++					req.Command.Data, _ = proto.Marshal(transfer)
++					err = p.handleTransferCommand(ctx, req, transfer, sp)
++				} else {
++					err = p.loadCurrentTrackWithStart(ctx, false, true, false, true)
++				}
++			} else {
++				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
++			}
++			good := mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
++			if good {
++				if err != nil {
++					t.Fatal("prepared START failed", err, calls)
++				}
++				if p.primaryStream != stream || (!strings.HasPrefix(mode, "dealer-") && p.state.tracks != tracks) || p.state.player.SessionId != sessionID || p.state.player.PositionAsOfTimestamp < position || p.state.player.PositionAsOfTimestamp > position+1000 || p.state.player.IsPaused != paused || creates.Load() != 1 || p.app.startCustody == nil || p.roomContentReservation != nil {
++					t.Fatal("prepared transfer replaced/reset", calls)
++				}
++				selected, e := worker.Start35CurrentSource(context.Background())
++				if e != nil || selected != stream.Source {
++					t.Fatal("wrong actual selected decoder", e)
++				}
++				select {
++				case event := <-worker.Receive():
++					if event.InitialLoadOrdinal != 1 || (event.Type == player.EventTypePause) != paused {
++						t.Fatal("wrong initial worker receipt", event)
++					}
++				case <-time.After(time.Second):
++					t.Fatal("no real initial load observation")
++				}
++				if strings.Join(calls, ",") != "state,prepare,commit,barrier,open,complete" {
++					t.Fatal("wrong protocol chain", calls)
++				}
++				if paused {
++					if err := worker.Play(); err != nil {
++						t.Fatal("explicit later resume failed", err)
++					}
++					op := p.app.startCustody
++					if err := worker.VerifyStart35(context.Background(), stream.Source, op.Pipe, op.Epoch, p.app.openedWriter.FD, func(mutate func()) error { mutate(); return nil }); err != nil {
++						t.Fatal("initial Pause retained START fence", err)
++					}
++				}
++			} else {
++				if err == nil {
++					t.Fatal("adverse START admitted", mode)
++				}
++				if mode != "foreign-pipe" && mode != "complete-fails" && mode != "writer-lost" && creates.Load() != 0 {
++					t.Fatal("unadmitted writer opened", mode, calls)
++				}
++				if mode == "complete-fails" || mode == "writer-lost" {
++					if p.state.active || p.state.player.IsPlaying || p.primaryStream != nil || !p.aliasRetired || !p.roomVolumeClosing || len(p.logout) != 1 {
++						t.Fatal("failed published START retained active actor")
++					}
++					if p.app.startCustody == nil || p.app.startCustody.State == "complete" {
++						t.Fatal("failed post-open result upgraded or lost custody")
++					}
++				} else if p.state.player.SessionId != sessionID || p.primaryStream != stream || p.state.tracks != tracks {
++					t.Fatal("rejected attempt reset content")
++				}
++			}
++		})
++	}
++}
+diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+index 28e4f61..91ab7d8 100644
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -51,6 +51,7 @@ func (app *App) supersedeContentCustody(expectedMove *moveOperation, expectedSta
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+ 	if app.moveCustodyUnknown || app.retirementPending != nil || app.moveCustody != expectedMove || app.startCustody != expectedStart || successor == nil ||
++		(successor.preparedDealer && app.openedWriterGeneration != 0) ||
+ 		(expectedStart != nil && !completedStartCustody(expectedStart)) {
+ 		return ErrAliasConflict
+ 	}
+diff --git a/daemon/room_output_failure_test.go b/daemon/room_output_failure_test.go
+index 6e48327..54bb636 100644
+--- a/daemon/room_output_failure_test.go
++++ b/daemon/room_output_failure_test.go
+@@ -3,12 +3,15 @@ package daemon
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 	"syscall"
+ 	"testing"
+ 	"time"
+@@ -245,3 +248,208 @@ func TestNonZeroconfOutputFailureClosesItsOwnRunOwner(t *testing.T) {
+ 		t.Fatal("non-Zeroconf output failure did not join this owner and signal Run exit")
+ 	}
+ }
++
++// This is the existing retirement owner/real FIFO, held at both C acknowledgments.
++// App.Close and every Run exit must join it before closing process services.
++type shutdownObservedServer struct {
++	aliasTestServer
++	closes atomic.Int32
++	err    error
++}
++
++func (s *shutdownObservedServer) Close() error { s.closes.Add(1); return s.err }
++
++func TestAppShutdownJoinsCurrentPlayerAndConcurrentClose(t *testing.T) {
++	for _, runExit := range []bool{false, true} {
++		t.Run(fmt.Sprintf("run_exit_%v", runExit), func(t *testing.T) {
++			prepare, complete := make(chan struct{}), make(chan struct{})
++			releasePrepare, releaseComplete := make(chan struct{}), make(chan struct{})
++			var oncePrepare, onceComplete sync.Once
++			t.Cleanup(func() {
++				oncePrepare.Do(func() { close(releasePrepare) })
++				onceComplete.Do(func() { close(releaseComplete) })
++			})
++			var writer output.MovePipeIdentity
++			var owner *AppPlayer
++			var app *App
++			var prepares, completes atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if !app.ownerMu.TryLock() {
++					t.Error("application owner mutex held across C retirement I/O")
++				} else {
++					app.ownerMu.Unlock()
++				}
++				var body map[string]json.RawMessage
++				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++					t.Error(err)
++					return
++				}
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				phase := "prepare"
++				if strings.HasSuffix(r.URL.Path, "/prepare") {
++					prepares.Add(1)
++					close(prepare)
++					<-releasePrepare
++				} else {
++					phase = "complete"
++					completes.Add(1)
++					if !owner.player.Closed() {
++						t.Error("C complete preceded worker/writer join")
++					}
++					if fi, err := os.Stat("/proc/self/fd/" + writer.FD); err == nil {
++						if st, ok := fi.Sys().(*syscall.Stat_t); ok && fmt.Sprint(st.Dev) == writer.Device && fmt.Sprint(st.Ino) == writer.Inode {
++							t.Error("exact writer still open at complete")
++						}
++					}
++					close(complete)
++					<-releaseComplete
++				}
++				_ = json.NewEncoder(w).Encode(retirementReply("start", phase, reservation, writer))
++			}))
++			defer server.Close()
++			defer func() {
++				oncePrepare.Do(func() { close(releasePrepare) })
++				onceComplete.Do(func() { close(releaseComplete) })
++			}()
++			var old *AppPlayer
++			app, old, _ = retirementOwnerFixture(t, server.URL, "start")
++			owner, writer = old, app.openedWriter
++			services := &shutdownObservedServer{err: errors.New("service close receipt")}
++			app.server, app.cfg = services, &Config{}
++			app.currentPlayer, app.currentAPI, app.currentDone = owner, make(chan ApiRequest), make(chan struct{})
++			primary := make(chan error, 1)
++			go func() {
++				if runExit {
++					primary <- app.Run(context.Background())
++				} else {
++					primary <- app.Close()
++				}
++			}()
++			select {
++			case <-prepare:
++			case err := <-primary:
++				t.Fatalf("daemon escaped before current-player retirement: %v", err)
++			case <-time.After(time.Second):
++				t.Fatal("shutdown did not prepare retirement")
++			}
++			waiters := make(chan error, 2)
++			for i := 0; i < 2; i++ {
++				go func() { waiters <- app.Close() }()
++			}
++			select {
++			case err := <-waiters:
++				t.Fatalf("concurrent Close escaped prepare: %v", err)
++			case <-time.After(20 * time.Millisecond):
++			}
++			if services.closes.Load() != 0 || owner.player.Closed() {
++				t.Fatal("services or writer closed before C prepare ACK")
++			}
++			oncePrepare.Do(func() { close(releasePrepare) })
++			select {
++			case <-complete:
++			case <-time.After(time.Second):
++				t.Fatal("shutdown did not join writer then complete retirement")
++			}
++			select {
++			case err := <-primary:
++				t.Fatalf("Run/Close escaped terminal ACK: %v", err)
++			default:
++			}
++			if services.closes.Load() != 0 {
++				t.Fatal("services closed before terminal C receipt")
++			}
++			onceComplete.Do(func() { close(releaseComplete) })
++			select {
++			case err := <-primary:
++				if runExit {
++					if err == nil || !strings.Contains(err.Error(), "unknown credentials") {
++						t.Fatalf("Run lost original error: %v", err)
++					}
++				} else if !errors.Is(err, services.err) {
++					t.Fatalf("Close lost service error: %v", err)
++				}
++			case <-time.After(time.Second):
++				t.Fatal("daemon did not finish after actual terminal ACK")
++			}
++			for i := 0; i < 2; i++ {
++				select {
++				case err := <-waiters:
++					if !errors.Is(err, services.err) {
++						t.Fatalf("concurrent Close lost joined result: %v", err)
++					}
++				case <-time.After(time.Second):
++					t.Fatal("concurrent Close did not join")
++				}
++			}
++			if prepares.Load() != 1 || completes.Load() != 1 || services.closes.Load() != 1 || app.startCustody != nil || app.retirementPending != nil || app.moveCustodyUnknown {
++				t.Fatal("shutdown duplicated retirement or lost its exact terminal")
++			}
++		})
++	}
++}
++
++func TestAppShutdownJoinsUnpublishedPlayerAndSealsLateLogin(t *testing.T) {
++	app := &App{}
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: filepath.Join(t.TempDir(), "not-opened.fifo"), AudioOutputPipeFormat: "s16le"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	prepared := &AppPlayer{app: app, player: worker, stop: make(chan struct{}, 1)}
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce sync.Once
++	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); prepared.Close() })
++	login := make(chan error, 1)
++	go func() {
++		_, err := app.replaceAppPlayer(context.Background(), nil, func(context.Context) (*AppPlayer, error) { close(entered); <-release; return prepared, nil })
++		login <- err
++	}()
++	<-entered
++	closed := make(chan error, 1)
++	go func() { closed <- app.Close() }()
++	// Wait for the existing publication seal, not a guessed worker scheduling delay.
++	deadline := time.After(time.Second)
++	for {
++		app.ownerMu.Lock()
++		sealed := app.closed
++		app.ownerMu.Unlock()
++		if sealed {
++			break
++		}
++		select {
++		case <-deadline:
++			t.Fatal("shutdown did not seal pending login")
++		default:
++			time.Sleep(time.Millisecond)
++		}
++	}
++	select {
++	case err := <-closed:
++		t.Fatalf("Close escaped pending login: %v", err)
++	default:
++	}
++	releaseOnce.Do(func() { close(release) })
++	select {
++	case err := <-login:
++		if err == nil {
++			t.Fatal("late authenticated player published after Close")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("late login not joined")
++	}
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("Close did not join rejected player")
++	}
++	if !worker.Closed() || !prepared.aliasRetired || app.currentPlayer != nil || app.openedWriterOwner != nil {
++		t.Fatal("prepared no-writer player escaped shutdown")
++	}
++	called := false
++	if _, err := app.replaceAppPlayer(context.Background(), nil, func(context.Context) (*AppPlayer, error) { called = true; return nil, nil }); err == nil || called {
++		t.Fatal("closed daemon admitted another authentication attempt")
++	}
++}
+diff --git a/player/start35.go b/player/start35.go
+index 1759c15..09928bf 100644
+--- a/player/start35.go
++++ b/player/start35.go
+@@ -11,13 +11,15 @@ import (
+ )
+ 
+ type start35Command struct {
+-	ctx              context.Context
+-	phase            string
+-	source, expected librespot.AudioSource
+-	pipe             output.PipeIdentity
+-	epoch            string
+-	writerFD         string
+-	guard            output.TransportGuard
++	ctx                context.Context
++	phase              string
++	source, expected   librespot.AudioSource
++	pipe               output.PipeIdentity
++	epoch              string
++	writerFD           string
++	paused             bool
++	initialLoadOrdinal uint64
++	guard              output.TransportGuard
+ }
+ type start35Result struct {
+ 	Pipe   output.PipeIdentity
+@@ -27,9 +29,18 @@ type start35Result struct {
+ }
+ 
+ func (p *Player) Start35(ctx context.Context, phase string, source, expected librespot.AudioSource, pipe output.PipeIdentity, epoch string, guard output.TransportGuard) (output.PipeIdentity, string, error) {
++	return p.start35(ctx, phase, source, expected, pipe, epoch, false, guard)
++}
++
++// Start35Prepared preserves an authenticated transfer's requested pause state.
++func (p *Player) Start35Prepared(ctx context.Context, phase string, source, expected librespot.AudioSource, pipe output.PipeIdentity, epoch string, paused bool, guard output.TransportGuard) (output.PipeIdentity, string, error) {
++	return p.start35(ctx, phase, source, expected, pipe, epoch, paused, guard)
++}
++
++func (p *Player) start35(ctx context.Context, phase string, source, expected librespot.AudioSource, pipe output.PipeIdentity, epoch string, paused bool, guard output.TransportGuard) (output.PipeIdentity, string, error) {
+ 	reply := make(chan any, 1)
+ 	select {
+-	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: phase, source: source, expected: expected, pipe: pipe, epoch: epoch, guard: guard}, resp: reply}:
++	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: phase, source: source, expected: expected, pipe: pipe, epoch: epoch, paused: paused, guard: guard}, resp: reply}:
+ 	case <-p.closeDone:
+ 		return output.PipeIdentity{}, "", fmt.Errorf("player closed")
+ 	case <-ctx.Done():
+@@ -48,11 +59,24 @@ func (p *Player) Start35(ctx context.Context, phase string, source, expected lib
+ // VerifyStart35 joins the live output FD and selected source after a C COMPLETE
+ // await. The guard runs under both real locks and may only credit the owner.
+ func (p *Player) VerifyStart35(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, guard output.TransportGuard) error {
++	return p.verifyStart35(ctx, expected, pipe, epoch, writerFD, false, 0, guard)
++}
++
++// VerifyStart35Prepared publishes the initial-load observation only after the
++// exact requested pause state, source and writer survived C COMPLETE.
++func (p *Player) VerifyStart35Prepared(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, paused bool, ordinal uint64, guard output.TransportGuard) error {
++	if ordinal == 0 || ordinal > 9007199254740991 {
++		return fmt.Errorf("invalid initial load ordinal")
++	}
++	return p.verifyStart35(ctx, expected, pipe, epoch, writerFD, paused, ordinal, guard)
++}
++
++func (p *Player) verifyStart35(ctx context.Context, expected librespot.AudioSource, pipe output.PipeIdentity, epoch, writerFD string, paused bool, ordinal uint64, guard output.TransportGuard) error {
+ 	reply := make(chan any, 1)
+ 	select {
+ 	case <-p.closeDone:
+ 		return fmt.Errorf("start player closed")
+-	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: "verify", expected: expected, pipe: pipe, epoch: epoch, writerFD: writerFD, guard: guard}, resp: reply}:
++	case p.cmd <- playerCmd{start: &start35Command{ctx: ctx, phase: "verify", expected: expected, pipe: pipe, epoch: epoch, writerFD: writerFD, paused: paused, initialLoadOrdinal: ordinal, guard: guard}, resp: reply}:
+ 	case <-ctx.Done():
+ 		return ctx.Err()
+ 	}
+@@ -108,7 +132,7 @@ func (p *Player) applyStart35(command *start35Command, out *output.Output, sourc
+ 		if !ok {
+ 			return result, fmt.Errorf("no start writer FD owner")
+ 		}
+-		return result, writer.WithStartLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
++		err = writer.WithStartLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
+ 			lock, ok := source.cond.L.(*sync.Mutex)
+ 			if !ok {
+ 				return fmt.Errorf("no source lock")
+@@ -119,11 +143,24 @@ func (p *Player) applyStart35(command *start35Command, out *output.Output, sourc
+ 			defer lock.Unlock()
+ 			if command.ctx.Err() != nil || source.source[source.which] != command.expected || identity != command.pipe ||
+ 				command.epoch != strconv.FormatUint(p.startEpoch, 10) || writer.WriterFDUnderStartLock() != command.writerFD ||
+-				writer.FencedUnderStartLock() || writer.PausedUnderStartLock() {
++				writer.FencedUnderStartLock() || writer.PausedUnderStartLock() != command.paused {
+ 				return fmt.Errorf("start writer/source changed")
+ 			}
+ 			return command.guard(func() {})
+ 		})
++		if err == nil && command.initialLoadOrdinal != 0 {
++			typ := EventTypePlay
++			if command.paused {
++				typ = EventTypePause
++			}
++			p.ev <- Event{Type: typ, InitialLoadOrdinal: command.initialLoadOrdinal}
++		}
++		return result, err
++	}
++	if command.phase == "resume" && command.paused {
++		if _, ok := (*out).(output.MovePipeOutput); !ok {
++			return result, fmt.Errorf("no paused start owner")
++		}
+ 	}
+ 	if command.phase == "quiesce" {
+ 		pipe.FenceStart()
+@@ -178,7 +215,12 @@ func (p *Player) applyStart35(command *start35Command, out *output.Output, sourc
+ 				p.startedPlaying = time.Now()
+ 				setPaused(true)
+ 			case "resume":
+-				setPaused(false)
++				if command.paused {
++					// Release only the START fence, retaining semantic Pause.
++					(*out).(output.MovePipeOutput).SetMoveStateUnderStartLock(true, false)
++				} else {
++					setPaused(false)
++				}
+ 			}
+ 			result.Pipe = identity
+ 			result.Epoch = strconv.FormatUint(p.startEpoch, 10)

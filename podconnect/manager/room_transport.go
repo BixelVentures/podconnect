@@ -291,9 +291,14 @@ func currentNativeAccount(ctx context.Context, base, engineID string) string {
 // This result is intentionally not cached: a positive only suppresses this
 // tick's legacy route writes while the persistent released marker remains.
 func bridgeCurrentStartRoute(ctx context.Context, primary *Room, status glStatus, intent glTransportIntent) currentStartRoute {
+	return bridgeStartRouteFact(ctx, primary, status, intent, true)
+}
+
+// A fresh Connect credit may observe an already completed START, never mutate it.
+func bridgeStartRouteFact(ctx context.Context, primary *Room, status glStatus, intent glTransportIntent, released bool) currentStartRoute {
 	if primary == nil || primary.Idx != 0 || mgr == nil || status.AliasBinding == nil ||
 		!status.AliasBinding.valid() || !status.Active || status.Paused || status.Stopped ||
-		!fileExists(releasedPath(primary)) {
+		fileExists(releasedPath(primary)) != released {
 		return startRouteUnknown
 	}
 	rt := mgr.runtime(primary.ID)
@@ -312,12 +317,12 @@ func bridgeCurrentStartRoute(ctx context.Context, primary *Room, status glStatus
 	scope := roomTransportScope{target, selected.ID, selected.HomepodID, account}
 	claim, native, route, state, err := readRoomTransportState(ctx, scope)
 	latest := roomByID(selected.ID)
-	if err != nil || !claim.Released || claim.RT != rt || claim.Intent != intent ||
+	if err != nil || claim.Released != released || claim.RT != rt || claim.Intent != intent ||
 		claim.Proof.AliasBinding == nil || !sameAliasBinding(claim.Proof.AliasBinding, status.AliasBinding) ||
 		native.Identity.Account != account || route.Identity.Device != selected.HomepodID ||
 		latest == nil || latest.HomepodID != selected.HomepodID ||
 		!rt.live.startIntentCurrent(intent) ||
-		!fileExists(releasedPath(primary)) {
+		fileExists(releasedPath(primary)) != released {
 		return startRouteUnknown
 	}
 	return state
@@ -326,13 +331,16 @@ func bridgeCurrentStartRoute(ctx context.Context, primary *Room, status glStatus
 // A released, playing primary may enter ordinary recovery only after explicit
 // clean absence. Owned and unknown keep the marker and skip every legacy write.
 func holdReleasedBridgeRoute(primary *Room, status glStatus, intent glTransportIntent) bool {
-	if primary == nil || primary.Idx != 0 || !fileExists(releasedPath(primary)) {
+	if primary == nil || primary.Idx != 0 {
 		return false
 	}
 	if mgr != nil {
 		if rt := mgr.runtime(primary.ID); rt != nil && rt.live.holdsConnectRecoveryFence() {
 			return true
 		}
+	}
+	if !fileExists(releasedPath(primary)) {
+		return false
 	}
 	if !status.Active || status.Paused || status.Stopped {
 		return true

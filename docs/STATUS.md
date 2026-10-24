@@ -6,6 +6,91 @@ At11:05:47 the shipped log records bound-pause-confirm409, followed by repeated 
 
 Candidate is NOT ready for the remaining three-cycle acceptance. Hold switches, further audio tests, volume writes and restarts. Preserve current process evidence. Separate owners: native_idle_owner analyses pause/confirm/reconcile chain; weather_backend_review analyses exact-room volume availability; PodView owns display/timeline and must not substitute generic/cloud100 for unavailable exact volume. Root integrates only a demonstrated owner correction, causal regression and independent adversarial review. No timeout, retry, guard bypass, alternate engine or speculative volume restoration. Next: correlate first purpose-bound pause receipt and prove the failing ordinary Connect identity boundary before implementation. Existing installed artifact remains unchanged; rollback boundary will be the narrowly reviewed successor diff. All three full acceptance cycles remain incomplete.
 
+### Lead decision — combined46 restart and first-transfer candidate
+
+Lead root; integration weather_backend_integration. The current field evidence is
+installed45 FAIL, superseding the older44 attribution above without rewriting it.
+Actual45 boot shows rejected volume/output reconciliation before the sole explicit
+Spotify transfer. The requested track subsequently loads unpaused, then pipe autostart
+and output selection fail. Private evidence remains in
+/private/tmp/speakers45-green-boot-log.txt and
+/private/tmp/pc45-first-transfer-failure-live-log.txt. Passive observations disagree
+across the new C process and Native writer state; the target output has no selected
+current owner. These observations do not prove audible success. Root issued no
+additional Play, pause, volume write or restart after the sole Connect selection.
+
+Full chain under review: add-on/s6 stop -> manager SIGTERM -> Native App.Close and
+all original writer/decoder joins -> exact C termination -> supervisor restart ->
+fresh Native transfer credit -> prepared initial stream bootstrap -> current C FIFO
+reader -> bounded35% priming/current-room selection -> actual PCM/output observation.
+Pair replacement must stop the captured Native owner before its paired C process and
+must not let late old callbacks affect a replacement. Normal successful exit gains no
+added wait. The manager's existing bounded Native12s+12s+2s cleanup must fit a55s
+shutdown context, manager s6 timeout-kill60000ms and outer HA timeout70s. These stop
+budgets do not change speech, media waits, policy, retries or normal playback timing.
+
+Falsifiable hypothesis: source-owned first-transfer credit and initial prepared
+stream bootstrap, plus completed writer joins before paired C teardown, remove the
+proved pre-transfer reconcile writes and unsafe restart ordering. This is not proof
+that they explain the inaccessible old C journal: FileEditor cannot read its DB;
+the protected preupdate44 backup is metadata-only, so journal class stays UNKNOWN.
+Strict kernel/PID namespace mismatch DENY remains mandatory; a source/harness
+namespace finding must not be attributed to the field or used for admission bypass.
+No journal deletion, unbound release, auto Play, new engine, scope widening, timeout
+masking or new C runtime is authorized. Control0.10.21 and first32 stable Native
+patches remain unchanged; any C20 change is its namespace-boundary fixture only.
+
+Lead extends the same candidate dependency before the Native semantic identity edit:
+source TrySeek currently swallows a later-page404 and moveStart can succeed on the
+first cached entry, replacing the requested transferred track with an unrelated item.
+This is a proved source contract defect, not an attribution of the Green45 failure:
+inbound CurrentTrack identity was unavailable in that field trace. The assigned
+Native owner will make the transfer seek strict and prove exact requested identity
+before commit; a failed later-page fetch preserves the prior state. Existing cached
+first-page/later404 causal fixtures must prove no unrelated first-entry fallback,
+publication or old-owner teardown. No global fallback, refetch/reload or new endpoint
+is authorized; this is the same fresh-transfer path and rollback boundary.
+
+Source ownership: reviewed manager fresh-credit packet connect_recovery/room_transport;
+manager ordered SIGTERM/pair teardown main/supervisor/proc by native_idle_owner;
+Native prepared-stream bootstrap by C resume owner; Native App.Close JOIN by release75.
+Integration owns one cumulative unpublished Native overlay, exact checksums/Docker/CI
+composition only after final independent source GOs, plus this version/stop metadata.
+Regression plan uses existing manager focused tests, real Native harness shutdown and
+first-stream causal cases, strict namespace opposite cases and exact overlay replay/
+composition checks. Reuse unchanged passed source gates; broad official CI only on
+one frozen combined candidate. Rollback is this isolated successor diff, never DB or
+owner-marker reset. No46 version publication/installation or physical acceptance is
+claimed; root alone owns eventual combined install/readback and a bounded field test.
+
+
+Actual bounded integration result: reviewed manager shutdown packet37cc5949 is
+adopted with all three source hashes exact. The actual SIGTERM path closes admission
+and respawn, signals the captured Native process, joins its sole keepAliveWait while
+C stays alive, then signals/joins C; pair replacement uses the same ordering and
+barrier. The55s forced-exit boundary reports UNKNOWN; Pdeathsig and the C namespace
+fence remain unchanged. Baseline real-child SIGKILL causal RED is retained; final
+local race, actual Linux process cases, held-old-C respawn barrier, existing removeRoom,
+vet and formatting are reported GREEN by the source owner and independently reviewed.
+Final source composition: independently reviewed Native shutdown a0b80 and prepared
+START/strict-seek3772 are one Native33 overlay after the unchanged32. Clean replay
+matches all285 composed source files; all33 checksums and changed Go formatting pass.
+The manager now accepts only an exact current positive OWNED START fact and atomic
+receipt, seeds that already-primed bridge state without selection/recoveryprime, and
+suppresses six generic write groups while preserving observations/manual/attention.
+C absence is never inferred as positive ownership; fresh credit keeps its existing
+atomic C recovery path. Production source review is GO. Fourteen focused cases,
+seven actual bridge modes (final all-non-GET observer8.754s), and four existing
+no-credit modes pass; the strengthened observer includes Native pause/resume/volume.
+C20 production remains unchanged; only the existing CI fixture adds modeled prior-boot
+admission and same-boot changed-namespace denial. This is not actual reboot or current
+field-journal evidence. Control21 stays unchanged. Exact45 baseline, Native overlay,
+Docker/CI wiring and55/60/70s stop dependency were reviewed together. Official final
+CI/publication/installation and a bounded physical acceptance series remain pending;
+no provider, C/AP2 output or acoustic success is claimed. All earlier candidate
+partial/pending notes are superseded by this source result, not by field acceptance.
+
+
 ## Active lead decision — preserve paused Native ownership and reject unsafe release, 24 October 2026
 
 Lead: /root; implementation: weather_budget. Direct source evidence: releaseHomePod ignores empty-output PUT failure then writes released; idle and manual release report unconditional success. Field released=true with selected=true is not physical release proof. Earlier acknowledgement-only draft is withdrawn: even atomic current-owner/marker commit cannot stop an unbound output PUT deselecting a successor during the request.

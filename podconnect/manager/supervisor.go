@@ -15,19 +15,27 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/http"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // roomRuntime is the live process state for one room.
 type roomRuntime struct {
-	room *Room
-	stop chan struct{}
-	done chan struct{}
+	room        *Room
+	stop        chan struct{}
+	done        chan struct{}
+	stopOnce    sync.Once
+	lifecycleMu sync.Mutex
+	replacing   chan struct{}
+	stopContext context.Context
+	glDone      chan struct{}
+	otDone      chan struct{}
 
 	mu    sync.Mutex
 	glCmd *exec.Cmd
@@ -43,6 +51,7 @@ type roomManager struct {
 	mu       sync.Mutex
 	runtimes map[string]*roomRuntime
 	store    *roomStore
+	stopping bool
 }
 
 func newRoomManager(store *roomStore) *roomManager {
@@ -60,7 +69,7 @@ func (m *roomManager) runtime(id string) *roomRuntime {
 // not already running. Idempotent — calling it for an already-supervised room is a no-op.
 func (m *roomManager) ensureRunning(r *Room) {
 	m.mu.Lock()
-	if _, ok := m.runtimes[r.ID]; ok {
+	if _, ok := m.runtimes[r.ID]; ok || m.stopping {
 		m.mu.Unlock()
 		return
 	}
@@ -93,18 +102,19 @@ func (m *roomManager) removeRoom(id string) error {
 
 	m.mu.Lock()
 	rt := m.runtimes[id]
-	delete(m.runtimes, id)
 	m.mu.Unlock()
 
 	if rt != nil {
-		close(rt.stop)
-		select {
-		case <-rt.done:
-		case <-time.After(8 * time.Second):
-			log.Printf("rooms[%s]: teardown timed out, killing anyway", id)
-		}
-		rt.killAll()
+		ctx, cancel := context.WithTimeout(context.Background(), roomShutdownTimeout)
+		defer cancel()
+		rt.requestStop(ctx)
+		<-rt.done
 	}
+	m.mu.Lock()
+	if m.runtimes[id] == rt {
+		delete(m.runtimes, id)
+	}
+	m.mu.Unlock()
 	return nil
 }
 
@@ -164,30 +174,53 @@ func (rt *roomRuntime) supervise() {
 
 // keepAlive spawns a child via make(), waits for it, and respawns on exit until stop is closed. It
 // records the running *exec.Cmd in slot (under rt.mu) so restartGL/killAll can signal it.
-func (rt *roomRuntime) keepAlive(label string, slot **exec.Cmd, make func() *exec.Cmd) {
+func (rt *roomRuntime) keepAlive(label string, slot **exec.Cmd, build func() *exec.Cmd) {
 	for {
 		select {
 		case <-rt.stop:
 			return
 		default:
 		}
-		cmd := make()
+		cmd := build()
+		rt.mu.Lock()
+		select {
+		case <-rt.stop:
+			rt.mu.Unlock()
+			return
+		default:
+		}
+		if replacing := rt.replacing; replacing != nil {
+			rt.mu.Unlock()
+			select {
+			case <-rt.stop:
+				return
+			case <-replacing:
+			}
+			continue
+		}
 		setProcGroup(cmd) // own process group + die-with-parent (linux)
 		rt.pipeOutput(label, cmd)
 		if err := cmd.Start(); err != nil {
+			rt.mu.Unlock()
 			log.Printf("rooms[%s]: start %s: %v", rt.room.ID, label, err)
 			if rt.sleepOrStop(3 * time.Second) {
 				return
 			}
 			continue
 		}
-		rt.mu.Lock()
+		joined := make(chan struct{})
 		*slot = cmd
+		if slot == &rt.glCmd {
+			rt.glDone = joined
+		} else {
+			rt.otDone = joined
+		}
 		rt.mu.Unlock()
 		log.Printf("rooms[%s]: %s started (pid %d)", rt.room.ID, label, cmd.Process.Pid)
 		err := cmd.Wait()
 		rt.mu.Lock()
 		*slot = nil
+		close(joined)
 		rt.mu.Unlock()
 		select {
 		case <-rt.stop:
@@ -213,42 +246,120 @@ func (rt *roomRuntime) sleepOrStop(d time.Duration) bool {
 	}
 }
 
-// restartGL gracefully stops the running go-librespot child's group (SIGTERM, hard-kill fallback) so
-// it withdraws its zeroconf registration cleanly — no stale duplicate Connect entries; keepAlive
-// respawns it.
-func (rt *roomRuntime) restartGL() {
-	rt.mu.Lock()
-	cmd := rt.glCmd
-	rt.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		gracefulKillGroup(cmd)
+// roomShutdownTimeout covers the existing Native retirement prepare12s,
+// complete12s/result2s and local writer joins. The outer s6/HA caps are longer.
+const roomShutdownTimeout = 55 * time.Second
+
+func (rt *roomRuntime) requestStop(ctx context.Context) {
+	rt.stopOnce.Do(func() { rt.mu.Lock(); rt.stopContext = ctx; close(rt.stop); rt.mu.Unlock() })
+}
+
+// shutdownAll stops admission/respawn before taking any child snapshot. Each
+// runtime owns its existing cmd.Wait; shutdown only waits for that owner's join.
+func (m *roomManager) shutdownAll(ctx context.Context) {
+	m.mu.Lock()
+	m.stopping = true
+	runtimes := make([]*roomRuntime, 0, len(m.runtimes))
+	for _, rt := range m.runtimes {
+		rt.requestStop(ctx)
+		runtimes = append(runtimes, rt)
+	}
+	m.mu.Unlock()
+	for _, rt := range runtimes {
+		<-rt.done
 	}
 }
 
-// restartOT gracefully restarts the room's OwnTone child so it re-browses mDNS from scratch and
-// rediscovers AirPlay devices that appeared after it started (the panel "Rescan" action — for a device
-// that was powered on after OwnTone last browsed). SIGTERM-first so it withdraws its own
-// AirPlay/mDNS registrations cleanly; keepAlive respawns it. Briefly interrupts any audio OwnTone is
-// currently sending.
-func (rt *roomRuntime) restartOT() {
-	rt.mu.Lock()
-	cmd := rt.otCmd
-	rt.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		gracefulKillGroup(cmd)
+// stopChild never calls Wait itself: keepAlive remains its sole owner. A forced
+// exit is explicitly UNKNOWN; process join does not attest durable retirement.
+func (rt *roomRuntime) stopChild(ctx context.Context, cmd *exec.Cmd, joined <-chan struct{}, label string) bool {
+	if cmd == nil || cmd.Process == nil {
+		return true
 	}
-}
-
-// killAll kills both children's process groups (teardown).
-func (rt *roomRuntime) killAll() {
-	rt.mu.Lock()
-	cmds := []*exec.Cmd{rt.glCmd, rt.otCmd}
-	rt.mu.Unlock()
-	for _, c := range cmds {
-		if c != nil && c.Process != nil {
-			killGroup(c)
+	if joined == nil {
+		log.Printf("rooms[%s]: %s has no Wait owner; retirement UNKNOWN", rt.room.ID, label)
+		return false
+	}
+	select {
+	case <-joined:
+		return true
+	default:
+	}
+	// These two supervised daemons do not fork helpers. Use Go's captured
+	// process handle rather than resolving a numeric process group after reap.
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-joined:
+		return true
+	case <-ctx.Done():
+		select {
+		case <-joined:
+			return true
+		default:
 		}
+		log.Printf("rooms[%s]: %s shutdown deadline; forcing captured child, retirement UNKNOWN", rt.room.ID, label)
+		_ = cmd.Process.Kill()
+		<-joined
+		return false
 	}
+}
+
+// replaceChildren serializes current-child capture, retirement and replacement.
+// A rescan replaces the pair: killing C alone could strand a live Native journal.
+func (rt *roomRuntime) replaceChildren(pair bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), roomShutdownTimeout)
+	defer cancel()
+	rt.mu.Lock()
+	expectedNative, expectedRenderer := rt.glCmd, rt.otCmd
+	rt.mu.Unlock()
+	rt.lifecycleMu.Lock()
+	defer rt.lifecycleMu.Unlock()
+	rt.mu.Lock()
+	if rt.glCmd != expectedNative || (pair && rt.otCmd != expectedRenderer) {
+		rt.mu.Unlock()
+		return false
+	}
+	select {
+	case <-rt.stop:
+		rt.mu.Unlock()
+		return false
+	default:
+	}
+	barrier := make(chan struct{})
+	rt.replacing = barrier
+	native, nativeDone, renderer, rendererDone := rt.glCmd, rt.glDone, rt.otCmd, rt.otDone
+	rt.mu.Unlock()
+	defer func() { rt.mu.Lock(); rt.replacing = nil; close(barrier); rt.mu.Unlock() }()
+	joined := rt.stopChild(ctx, native, nativeDone, "Native")
+	if pair {
+		joined = rt.stopChild(ctx, renderer, rendererDone, "C") && joined
+	}
+	return joined
+}
+
+func (rt *roomRuntime) restartGL() {
+	if !rt.replaceChildren(false) {
+		log.Printf("rooms[%s]: Native replacement incomplete or superseded; retirement UNKNOWN", rt.room.ID)
+	}
+}
+func (rt *roomRuntime) restartOT() bool { return rt.replaceChildren(true) }
+
+// killAll is the ordered teardown used by the runtime stop owner. Keep C alive
+// through Native's actual process join so its completed writer can retire there.
+func (rt *roomRuntime) killAll() {
+	rt.lifecycleMu.Lock()
+	defer rt.lifecycleMu.Unlock()
+	rt.mu.Lock()
+	ctx := rt.stopContext
+	native, nativeDone, renderer, rendererDone := rt.glCmd, rt.glDone, rt.otCmd, rt.otDone
+	rt.mu.Unlock()
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), roomShutdownTimeout)
+		defer cancel()
+	}
+	rt.stopChild(ctx, native, nativeDone, "Native")
+	rt.stopChild(ctx, renderer, rendererDone, "C")
 }
 
 // pipeOutput routes a child's stdout/stderr to the manager log with a room/child prefix.
