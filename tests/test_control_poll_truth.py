@@ -1,14 +1,17 @@
 """Execute shipped coordination methods; unit boundaries, not a running HA instance."""
+
 import ast
-import time
 import asyncio
+import time
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock
-from test_control_errors import SpotifyApiError, HomeAssistantError
+
+from test_control_errors import HomeAssistantError, SpotifyApiError
 
 ROOT = Path(__file__).parents[1]
+
 
 class Base:
     def _handle_coordinator_update(self):
@@ -16,23 +19,46 @@ class Base:
 
 
 def entity():
-    tree = ast.parse((ROOT / 'custom_components/podconnect/media_player.py').read_text())
-    methods = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in ('_send', '_handle_coordinator_update')]
+    tree = ast.parse(
+        (ROOT / "custom_components/podconnect/media_player.py").read_text()
+    )
+    methods = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name in ("_send", "_handle_coordinator_update")
+    ]
     for method in methods:
         method.decorator_list = []
-    cls = ast.ClassDef(name='Entity', bases=[ast.Name(id='Base', ctx=ast.Load())], keywords=[], body=methods, decorator_list=[])
+    cls = ast.ClassDef(
+        name="Entity",
+        bases=[ast.Name(id="Base", ctx=ast.Load())],
+        keywords=[],
+        body=methods,
+        decorator_list=[],
+    )
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
-    ns = dict(asyncio=asyncio, Base=Base, SpotifyApiError=SpotifyApiError, HomeAssistantError=HomeAssistantError)
-    exec(compile(module, '<shipped control methods>', 'exec'), ns)
-    obj = ns['Entity']()
+    ns = dict(
+        asyncio=asyncio,
+        Base=Base,
+        SpotifyApiError=SpotifyApiError,
+        HomeAssistantError=HomeAssistantError,
+    )
+    exec(compile(module, "<shipped control methods>", "exec"), ns)
+    obj = ns["Entity"]()
     obj.writes = 0
     obj._command_generation = 0
     obj._optimistic_poll_floor = None
     obj._optimistic_playing = True
     obj._optimistic_shuffle = True
-    obj._optimistic_repeat = 'all'
+    obj._optimistic_repeat = "all"
     obj.async_write_ha_state = Mock()
-    obj.coordinator = SimpleNamespace(poll_sequence=4, last_update_success=True, data={'poll_sequence':4, 'playback':{'is_playing':False}}, async_request_refresh=AsyncMock())
+    obj.coordinator = SimpleNamespace(
+        poll_sequence=4,
+        last_update_success=True,
+        data={"poll_sequence": 4, "playback": {"is_playing": False}},
+        async_request_refresh=AsyncMock(),
+    )
     return obj
 
 
@@ -40,7 +66,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
     async def test_fresh_contradictory_poll_replaces_accepted_intent(self):
         obj = entity()
         await obj._send(AsyncMock()())
-        obj.coordinator.data['poll_sequence'] = 5
+        obj.coordinator.data["poll_sequence"] = 5
         obj._handle_coordinator_update()
         self.assertIsNone(obj._optimistic_playing)
         self.assertIsNone(obj._optimistic_shuffle)
@@ -56,7 +82,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_poll_is_not_confirmation(self):
         obj = entity()
         await obj._send(AsyncMock()())
-        obj.coordinator.data['poll_sequence'] = 5
+        obj.coordinator.data["poll_sequence"] = 5
         obj.coordinator.last_update_success = False
         obj._handle_coordinator_update()
         self.assertTrue(obj._optimistic_playing)
@@ -64,7 +90,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
     async def test_device_transfer_clears_old_intent(self):
         obj = entity()
         await obj._send(AsyncMock()())
-        obj.coordinator.data = {'poll_sequence':5, 'playback':None}
+        obj.coordinator.data = {"poll_sequence": 5, "playback": None}
         obj._handle_coordinator_update()
         self.assertIsNone(obj._optimistic_playing)
 
@@ -77,7 +103,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         first.set()
         await one
-        obj.coordinator.data['poll_sequence'] = 5
+        obj.coordinator.data["poll_sequence"] = 5
         obj._handle_coordinator_update()
         self.assertTrue(obj._optimistic_playing)
         self.assertIsNone(obj._optimistic_poll_floor)
@@ -89,26 +115,58 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
     async def test_network_failure_drops_unconfirmed_intent(self):
         obj = entity()
         with self.assertRaises(ConnectionError):
-            await obj._send(AsyncMock(side_effect=ConnectionError('offline'))())
+            await obj._send(AsyncMock(side_effect=ConnectionError("offline"))())
         self.assertIsNone(obj._optimistic_playing)
 
     async def test_coordinator_sequence_is_allocated_before_fetch(self):
-        tree = ast.parse((ROOT / 'custom_components/podconnect/coordinator.py').read_text())
-        method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == '_async_update_data')
-        ns = {'SpotifyApiError':SpotifyApiError, 'UpdateFailed':RuntimeError, 'Any':object, 'dt_util':SimpleNamespace(utcnow=lambda:0), 'time':time}
-        owner_check = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_check_command_owner')
-        exec(compile(ast.Module(body=[owner_check, method], type_ignores=[]), '<shipped coordinator>', 'exec'), ns)
+        tree = ast.parse(
+            (ROOT / "custom_components/podconnect/coordinator.py").read_text()
+        )
+        method = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_async_update_data"
+        )
+        ns = {
+            "asyncio": asyncio,
+            "SpotifyApiError": SpotifyApiError,
+            "UpdateFailed": RuntimeError,
+            "Any": object,
+            "dt_util": SimpleNamespace(utcnow=lambda: 0),
+            "time": time,
+        }
+        owner_check = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_check_command_owner"
+        )
+        exec(
+            compile(
+                ast.Module(body=[owner_check, method], type_ignores=[]),
+                "<shipped coordinator>",
+                "exec",
+            ),
+            ns,
+        )
         gate = asyncio.Event()
+
         async def playback():
             await gate.wait()
-            return {'is_playing':False}
-        obj = SimpleNamespace(poll_sequence=4, command_owner_guard=lambda: True, api=SimpleNamespace(playback_state=playback, devices=AsyncMock(return_value=[])))
-        obj._check_command_owner = lambda: ns['_check_command_owner'](obj)
-        task = asyncio.create_task(ns['_async_update_data'](obj))
+            return {"is_playing": False}
+
+        obj = SimpleNamespace(
+            poll_sequence=4,
+            command_owner_guard=lambda: True,
+            api=SimpleNamespace(
+                playback_state=playback, devices=AsyncMock(return_value=[])
+            ),
+        )
+        obj._check_command_owner = lambda: ns["_check_command_owner"](obj)
+        task = asyncio.create_task(ns["_async_update_data"](obj))
         await asyncio.sleep(0)
         self.assertEqual(obj.poll_sequence, 5)
         gate.set()
-        self.assertEqual((await task)['poll_sequence'], 5)
+        self.assertEqual((await task)["poll_sequence"], 5)
 
     async def test_cancelled_command_drops_unconfirmed_intent(self):
         obj = entity()

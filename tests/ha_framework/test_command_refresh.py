@@ -8,6 +8,10 @@ from test_room_volume import RoomVolumeFrameworkTests
 
 class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
     async def asyncSetUp(self):
+        self.refresh_playback_delay = 0.0
+        self.refresh_devices_delay = 0.0
+        self.refresh_provider_lag = False
+        self.refresh_native_paused = False
         self.refresh_hold = False
         self.refresh_entered = asyncio.Event()
         self.refresh_release = asyncio.Event()
@@ -22,11 +26,14 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.refresh_entered.clear()
 
     async def _backend(self, request):
+        if request.path == "/spotify/me/player/devices" and request.method == "GET":
+            await asyncio.sleep(self.refresh_devices_delay)
         if request.path == "/spotify/me/player" and request.method == "GET":
             self.playback_reads += 1
             self.active_reads += 1
             self.max_active_reads = max(self.max_active_reads, self.active_reads)
             try:
+                await asyncio.sleep(self.refresh_playback_delay)
                 response = await super()._backend(request)
                 self.refresh_entered.set()
                 if self.refresh_hold:
@@ -43,7 +50,9 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
                 if path.endswith("prepare")
             )
             if action in {"pause", "resume"}:
-                self.playing = action == "resume"
+                self.refresh_native_paused = action == "pause"
+                if not self.refresh_provider_lag:
+                    self.playing = action == "resume"
         return response
 
     async def demand_done(self):
@@ -217,6 +226,99 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(len(self.room_posts), 2)
         self.refresh_release.set()
         self.assertEqual(await self.room_invoke(request), result)
+
+    async def test_refresh_two_healthy_600ms_reads_publish_inside_existing_budget(self):
+        self.refresh_playback_delay = 0.6
+        self.refresh_devices_delay = 0.6
+        started = asyncio.get_running_loop().time()
+        pause = await self.room_invoke(self.room_request("pause"))
+        self.assertEqual(pause["outcome"], "accepted")
+        await self.demand_done()
+        coordinator = self.entries[0].runtime_data.coordinator
+        print(
+            "HEALTHY_600MS_READS",
+            {
+                "elapsed": asyncio.get_running_loop().time() - started,
+                "published_poll": coordinator.data["poll_sequence"],
+                "floor": pause["observe_after_poll_sequence"],
+                "last_update_success": coordinator.last_update_success,
+            },
+            flush=True,
+        )
+        self.assertGreater(
+            coordinator.data["poll_sequence"], pause["observe_after_poll_sequence"]
+        )
+        self.assertTrue(coordinator.last_update_success)
+        self.assertIn("resume", (await self.room_offer())["actions"])
+
+    async def test_refresh_exact_native_pause_overrides_provider_phase_lag_only(self):
+        self.refresh_provider_lag = True
+
+        def native_actions(value):
+            if self.refresh_native_paused:
+                value["actions"] = ["resume", "next", "previous"]
+
+        self.state_corrupt = native_actions
+        pause = await self.room_invoke(self.room_request("pause"))
+        self.assertEqual(pause["outcome"], "accepted")
+        await self.demand_done()
+        offered = await self.room_offer()
+        paused_before_resume = self.refresh_native_paused
+        self.assertTrue(paused_before_resume)
+        resume = await self.room_invoke(self.room_request("resume"))
+        print(
+            "EXACT_NATIVE_PROVIDER_PHASE_LAG",
+            {
+                "provider_playing": self.playing,
+                "native_paused_before_resume": paused_before_resume,
+                "actions": offered["actions"],
+                "resume_outcome": resume["outcome"],
+                "resume_error": resume.get("error_kind"),
+                "manager_posts": len(self.room_posts),
+            },
+            flush=True,
+        )
+        self.assertIn("resume", offered["actions"])
+        self.assertEqual(resume["outcome"], "accepted")
+
+    async def test_refresh_native_phase_keeps_provider_disallows_and_generic_phase(
+        self,
+    ):
+        self.state_corrupt = lambda value: value.update(actions=["resume"])
+        data = self.entries[0].runtime_data
+        generic = await self.invoke(self.request("resume"))
+        self.assertEqual(generic["error_kind"], "unsupported_action")
+        self.assertEqual(self.room_posts, [])
+        data.coordinator.data["playback"]["actions"]["disallows"]["resuming"] = True
+        self.assertNotIn("resume", (await self.room_offer())["actions"])
+        denied = await self.room_invoke(self.room_request("resume"))
+        self.assertEqual(denied["error_kind"], "unsupported_action")
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual(self._writes(), [])
+
+    async def test_refresh_native_phase_current_poll_still_required_before_commit(self):
+        self.state_corrupt = lambda value: value.update(actions=["resume"])
+        self.room_hold = True
+        task = self._task(self.room_invoke(self.room_request("resume")))
+        await asyncio.wait_for(self.room_entered.wait(), 2)
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        self.room_release.set()
+        result = await task
+        self.assertEqual(result["error_kind"], "stale_observation")
+        self.assertEqual(len(self.room_posts), 1)
+        self.assertEqual(self._writes(), [])
+
+    async def test_refresh_native_phase_foreign_current_room_never_commits(self):
+        self.state_corrupt = lambda value: value.update(actions=["resume"])
+        self.room_hold = True
+        task = self._task(self.room_invoke(self.room_request("resume")))
+        await asyncio.wait_for(self.room_entered.wait(), 2)
+        self.native_source_room = "room-beta"
+        self.room_release.set()
+        result = await task
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(len(self.room_posts), 1)
+        self.assertEqual(self._writes(), [])
 
 
 def load_tests(loader, tests, pattern):

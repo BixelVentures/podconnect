@@ -1,3 +1,96 @@
+## Active Speakers53 — original attention restoration after START session loss
+
+Lead /root; C owner native_idle_owner; Go owner weather_backend_integration. Private
+field diagnostics are retained locally and are not published as runtime logs or device
+identifiers. The observed boundary is rejected C attention admission followed by
+observation of a nonexistent request and blocked original restoration/rearm. One
+restart did not retire the pending durable custody; never clear it or pretend restore.
+
+The actual existing C START harness proves completed START plus actual AP2 session
+cleanup/loss → attention BEGIN desired_only → exact original RELEASE rejected while
+outputs_transport_busy remains true. Native expiry reproduces restoring state without
+admitted release. C owner may implement only a synchronous exact restoration
+constructor scope for validated original RELEASE or existing DB-origin PENDING RECOVER;
+full device/process/incarnation/session/lease/base/attention/route identity and current
+START slot/token/metadata epoch pinned, no nesting, cleared on every return before
+async work. Only that device with no session and unchanged owner may use the busy
+exception. Generic constructors/START guards/journals remain unchanged. Recovery is
+control-only/suspended: no PLAY/PCM/new route. Durable admission, receiver200/CSeq,
+real STOP/drain and terminal proof remain mandatory before custody retirement.
+
+Regressions cover real completed START/session loss/TTL, ordinary restore, stale full
+identity/replaced START/nesting, late callbacks, no audio/player-start and durable
+RECOVER. Independent adversarial review and final full patch-stack replay bind the
+source before freeze. No timeout increase, lease deletion, generic guard bypass or
+household action is approved. Rollback boundary is installed52; no deployed fix claim.
+
+### Additional proved durable-recovery rejection gap
+
+The existing custody harness reproduces explicit C HTTP400 followed by permanent
+observation of a request that was never admitted, despite a later valid fresh device
+read. Original C handler branch audit distinguishes this explicit pre-dispatch
+rejection from transport/timeout/malformed-success uncertainty; a400 may already
+advance in-memory identity before persistence fails, so never roll identity back or
+credit restoration. Go owner may retain a private durable rejected-attempt flag while
+preserving original origin/custody. A new request ID is permitted only after a fresh
+validated exact-device read, existing idle/lease0/not-restoring recovery preconditions,
+unchanged custody owner and full current CAS proof, on the existing bounded3s retry
+cadence. This is a new admission after proven rejection, never replay of unknown or
+old request IDs. Timeout/connection/malformed200/observation404 remain original-ID-only
+uncertain. Test restart persistence, blocked-before-next-read, changedowner/device,
+repeated rejection cadence, no duplicate write/credit and late unknown receipt.
+Implementation owner weather_backend_integration; native_idle_owner owns C patch.
+Separate existing native-grant400 classification must be reported explicitly; this
+custody-only repair does not automatically cover every active-lease rejection.
+
+### Additional proved released-playing cleanup starvation
+
+An existing real bridge fixture proves a released playing START-owned route repeatedly
+returns through its route-hold guard before original attention cleanup. Six owned
+route reads produce no original RELEASE. Move only the existing release-only original
+settlement ahead of that early route guard for a released primary, independent of
+playing/paused/stopped projection. The helper already validates inactive pending
+original owner/custody and cannot claim/select/prime/update another output. Keep the
+route hold and recovery fences intact. Go owner may make this bounded main.go guard
+change with the retained RED fixture; active attention, foreign owner and unrelated
+routing/effect negatives remain required. This source gap is separately proven and
+must not be presented as complete attribution of the private field failure.
+
+### Frozen53/22 software results — publication pending
+
+C source patch8fa28a41f1c1f065fc93d901b54f395129ef2212447267d0c1c789aba556d452
+has two independent adversarial SOURCE GO reviews. Existing24 production overlays
+replay to outputs.cdf992b19752e17540a26bd4248e73c8e72096221906222ce9f2f6029178528b8;
+only that file changes among209 production C/H files. The existing final CI fixture
+preserves its parents and runs the two restoration cases on the same bytes. Causal
+START/session-loss/TTL now yields exact200/CSeq, original restore, STOP/drain and
+terminal proof with no audio or new route; stale/nesting/late callbacks and seven
+retained recovery adversaries pass. Packaging review GO binds the five-file patch
+4e9e55ba3c3cdfffd3d7115b5e489d9a73b5572e13e6a514c94d4d41010af6bd.
+
+Manager patchd22b5eb1fb246c6a8fa2030e0d472dc72a9d0477c480f397e284efd2f6926ca6
+has independent SOURCE GO: definitive400 recovery, durable reload/cooldown, current
+owner/CAS, ambiguous observation-only, released-playing and retained race adversaries
+pass; formatting/vet pass. Historical unclassified attempts stay unknown. The ordinary
+active native-grant400 classification remains unchanged and must not be claimed fixed.
+
+Control22 production patch3d149defbbb1b72d1f92c2ecefea87d2f17a644d3a58e8c180fa38854c07ad8b
+has independent SOURCE GO and34 actual-HA framework/11 focused fixture passes, preserving
+all current-owner/disallow/phase/UNKNOWN/one-use boundaries. Changed metadata is only
+Speakers0.26.53 and Control0.10.22 plus grouped source release notes. Official CI,
+publication, activation and fresh software readback remain pending; physical sound,
+LED and daily-use acceptance are not implied by these source results.
+
+## Active Control22 — exact-room phase and bounded refresh, 25 October 2026
+
+Lead /root; implementation native_idle_owner. Exact public base609de80b1974d85c9124b40e9b58db23fe646976/tree4c5d922e7017f1cda8b2a2f595baba9719247d69. Control source0.10.21 is the baseline; source tests do not establish a private installation or physical outcome. This component is delivered together with the separately reviewed Speakers53 corrections above.
+
+Two actual HA-framework inert counterexamples are RED on published Control21 source: independent healthy playback/devices600ms reads sequentially exceed the existing1s postcommand refresh and leave the observation floor closed; a fresh provider-playing snapshot with exact Native/C paused exposes no Resume, and execute guard also rejects Resume by the stale provider phase. Chain: accepted command -> original postcommand floor -> bounded fresh aggregate -> exact room Native/C observation -> offered action -> current command guard -> exact one-use manager prepare/commit -> receipt.
+
+Decision: parallel independent playback/device reads inside the SAME lock and1s total budget, timestamp playback at its own return, cancel/join both on failure and publish aggregate only after both succeed. Preserve caller200ms, periodic10s interval, owner guard, floor and coalescing. Private exact-native-room context may skip ONLY Spotify playing/paused action filtering in BOTH read/latest and command guard; intersect verified Native/C actions, retain provider disallows, current account/target/poll, room/session/route proof, cancellation, duplicates/UNKNOWN and one-use effect checks. Generic Spotify controls remain unchanged. No budget/TTL extension, latest-owner adoption or always-enable behavior.
+
+Regression: both causal RED->GREEN plus provider disallow/generic-phase/changed poll-owner/foreign Native proof/no manager commit negatives; adapt only existing extracted asyncio namespace and mock kwargs callsites. Independent adversarial review before freeze. No real provider/household actions or release yet. Source-only component22 preparation is authorized; no Speakers engine or Native/C patch. Rollback is unchanged Control21 on this exact base. Root owns version/publication/Green activation and passive readback after the combined PodVoice/UI source is reviewed.
+
 ## Frozen candidate52 — metadata, first-PCM clocks and Native Pause, 25 October 2026
 
 Lead /root; composition /root/sol61_release75_review. Three failed physical music

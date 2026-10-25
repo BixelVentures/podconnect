@@ -293,9 +293,9 @@ class RoomTransport:
     async def read(self, hass, entry, target, room, homepod):
         from .commands import CommandRejected
 
-        before = self.commands.controls(entry, target)
+        before = self.commands.controls(entry, target, native_room_phase=True)
         state = await self.observe(hass, entry, target, room, homepod)
-        latest = self.commands.controls(entry, target)
+        latest = self.commands.controls(entry, target, native_room_phase=True)
         if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
             raise CommandRejected("stale_observation")
         if not state["actions"]:

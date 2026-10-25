@@ -882,7 +882,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// cannot strand an original voice duck's native cleanup custody.
 			// Only the attention owner may retire its already-admitted lease;
 			// this path never selects, primes, or reclaims the released output.
-			if room.Idx == 0 && fileExists(releasedPath(room)) && (!gl.Active || gl.Paused || gl.Stopped) {
+			if room.Idx == 0 && fileExists(releasedPath(room)) {
 				att.settleInactiveOriginal(room.OwnTone)
 			}
 			if room.Idx == 0 && gl.AliasBinding != nil && !gl.AliasBinding.valid() {
