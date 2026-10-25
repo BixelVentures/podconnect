@@ -12,7 +12,7 @@ index d48a854..a35a1d5 100644
  airplay_callback_owner_LDFLAGS = -Wl,--wrap=close -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
  EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
-index 74f9635..53112e6 100644
+index 74f9635..66bf530 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
 @@ -13,6 +13,7 @@
@@ -92,21 +92,68 @@ index 74f9635..53112e6 100644
  static int start_partial_writes,start_partial_bytes;
  int __real_evbuffer_write(struct evbuffer *,int);
  int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
-@@ -785,6 +841,13 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+@@ -677,6 +733,22 @@ static int recovery_wire_reply(struct recovery_wire_fixture *f,int code,int cseq
+   evbuffer_free(reply); return ret;
+ }
+ 
++struct held_start_reply {
++  struct recovery_wire_fixture *fixture;
++  struct event *timer;
++  uint8_t *body;
++  size_t length;
++  int code,cseq;
++};
++static void held_start_reply_send(evutil_socket_t fd,short what,void *arg)
++{
++  struct held_start_reply *held=arg;
++  (void)fd;(void)what;
++  if(recovery_wire_reply(held->fixture,held->code,held->cseq,held->body,held->length)<0)
++    recovery_wire_fail(held->fixture,"held START setup reply");
++  event_free(held->timer);free(held->body);free(held);
++}
++
+ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;
+@@ -785,15 +857,35 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
      if(f->mode==9 && f->volumes==2)code=503;
      if(f->mode==12)cseq++;
      if(f->mode==13)code=503;
 +  } else if(!strncmp(header,"FLUSH ",6)) {
-+    /* Only the mode17 adapter or explicit mode24 real-resume flag drives PCM.
-+     * Keep the encrypted matching-CSeq reply and reject an invented flush. */
-+    if((f->mode!=17 && !(f->mode==24 && completed_move_real_resume))
++    /* Preserve existing mode17/24 FLUSH; only the explicit mode29 Pause-loss
++     * discriminator joins it. Require the same session, body and RTP-Info. */
++    if((f->mode!=17 && !(f->mode==24 && completed_move_real_resume)
++        && !(f->mode==29 && getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")))
 +        || (f->mode==17 && f->phase!=4) || bytes || !f->device->session
 +        || !strstr(header,"\r\nRTP-Info: seq="))
 +      {recovery_wire_fail(f,"unexpected ordinary FLUSH");goto done;}
    } else if(!strncmp(header,"TEARDOWN ",9)) {
      enum output_attention_recovery_state state;struct output_attention_proof proof;
      f->teardowns++;
-@@ -1164,9 +1227,13 @@ int main(int argc, char **argv)
+-    if(f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
++    if(!(f->mode==29 && getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")) && f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
+       {recovery_wire_fail(f,"BASE receipt did not preserve exact control custody");goto done;}
+   } else if(strncmp(header,"RECORD ",7) && strncmp(header,"SETPEERS ",9) && strncmp(header,"POST /auth-setup ",17))
+     {recovery_wire_fail(f,"unexpected music/metadata/request");goto done;}
+   if(plist && wplist_to_bin(&response,&response_length,plist)<0){recovery_wire_fail(f,"real plist serialization");goto done;}
+-  if(recovery_wire_reply(f,code,cseq,response,response_length)<0){recovery_wire_fail(f,"owned wire reply");goto done;}
++  if(((f->mode==29 && getenv("PC_HOLD_START_SETUP"))
++      || (f->mode==16 && f->phase==2 && getenv("PC_HOLD_MOVE_SETUP")))
++      && !strncmp(header,"GET /info ",10)){
++    struct held_start_reply *held=calloc(1,sizeof(*held));struct timeval delay={3,0};
++    if(!held){recovery_wire_fail(f,"held START allocation");goto done;}
++    held->fixture=f;held->code=code;held->cseq=cseq;held->length=response_length;
++    held->body=malloc(response_length);held->timer=evtimer_new(f->base,held_start_reply_send,held);
++    if(!held->body || !held->timer || event_add(held->timer,&delay)<0){
++      if(held->timer)event_free(held->timer);free(held->body);free(held);
++      recovery_wire_fail(f,"held START schedule");goto done;
++    }
++    memcpy(held->body,response,response_length);
++  }else if(recovery_wire_reply(f,code,cseq,response,response_length)<0){recovery_wire_fail(f,"owned wire reply");goto done;}
+   if(activate_cipher) {
+     struct pair_result *result=NULL;
+     if(pair_setup_result(NULL,&result,f->pair)<0 || !result
+@@ -1164,9 +1256,13 @@ int main(int argc, char **argv)
    if (!gcry_check_version(GCRYPT_VERSION)) return 1;
    gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
    gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
@@ -121,7 +168,7 @@ index 74f9635..53112e6 100644
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index a5bc2e8..11774e7 100644
+index a5bc2e8..e40acec 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
@@ -540,7 +587,34 @@ index a5bc2e8..11774e7 100644
  /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
   * success. Admission alone cannot retain; only the exact post-effect receipt. */
  static void confirmed_pause_custody_case(struct output_device *device,
-@@ -252,6 +661,7 @@ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -214,12 +623,26 @@ static void confirmed_pause_custody_case(struct output_device *device,
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
+   assert(!transport_pause_retained); /* C commit precedes actual native effect. */
++  transport_custody_expiry.tv_sec+=5; /* Existing START custody outlives the next 10-second command. */
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
+   assert(!transport_pause_retained);
+   request.native_revision=52;request.native_prepare_id[0]='e';
+   assert(outputs_transport_prepare(&request,&prepared)==0);
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
++  assert(result.remaining_ms>0 && result.remaining_ms<=OUTPUT_TRANSPORT_TTL_MS
++    && transport_remaining(&transport_custody_expiry)>result.remaining_ms+4000);
++  {
++    struct output_transport_result queried;
++    struct transport_slot *slot=transport_find(request.token);
++    struct timespec original=slot->expiry;
++    assert(outputs_transport_result_get(request.token,&queried)==0
++      && queried.remaining_ms>0 && queried.remaining_ms<=OUTPUT_TRANSPORT_TTL_MS);
++    slot->expiry.tv_sec-=20;
++    assert(outputs_transport_result_get(request.token,&queried)==0 && !queried.remaining_ms);
++    slot->expiry=original;
++  }
++  puts("PASS bound transport ACK caps a longer shared custody to its 10-second slot; expired slot reports zero");
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)==0);
+   assert(transport_pause_owned(1));
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
+@@ -252,6 +675,7 @@ static void confirmed_pause_custody_case(struct output_device *device,
      assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
      assert(transport_pause_owned(1));
    }
@@ -548,7 +622,7 @@ index a5bc2e8..11774e7 100644
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -312,6 +722,115 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
+@@ -312,6 +736,218 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
    puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
  }
  
@@ -560,7 +634,67 @@ index a5bc2e8..11774e7 100644
 +  struct event_base *http_base;
 +  struct evhttp *http;
 +  atomic_bool done,completed,retired;
++  atomic_int audio_packets;
++  bool decoded_audio_packet, nonzero_pcm_input;
++  uint16_t last_audio_seq;
++  uint32_t last_audio_timestamp;
 +};
++/* AP2 leaves the 12-byte RTP header clear even though its audio payload is
++ * encrypted. Sync/control share this fixture's UDP port but use other types. */
++static bool native_start_audio_rtp(const unsigned char *packet,ssize_t length)
++{
++  return length>12 && (packet[0]>>6)==2 && (packet[1]&0x7f)==AIRPLAY_RTP_PAYLOADTYPE;
++}
++static void native_start_audio_poll(struct native_start_wire *wire)
++{
++  struct recovery_wire_fixture *f=wire->fixture;
++  unsigned char packet[4096];ssize_t length;
++  while((length=recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT))>0){
++    if(!native_start_audio_rtp(packet,length))continue;
++    if(!atomic_load(&wire->completed) || f->volumes<1 || outputs_start_gate_closed() || !start_active
++        || start_active->result.phase!=OUTPUT_START_COMPLETED){
++      recovery_wire_fail(f,"audio RTP crossed closed START gate");return;
++    }
++    struct airplay_session *session=f->device ? f->device->session : NULL;
++    struct airplay_master_session *master=session ? session->master_session : NULL;
++    uint16_t seq;uint32_t timestamp;size_t payload_len;
++    uint8_t nonce[12]={0},decoded[4096];gcry_cipher_hd_t cipher;
++    struct rtp_packet *source;
++    if(!session || !session->supports_encryption || !master || !master->rtp_session || length<36){
++      recovery_wire_fail(f,"audio RTP lacks negotiated encrypted session");return;
++    }
++    memcpy(&seq,packet+2,sizeof(seq));seq=ntohs(seq);
++    memcpy(&timestamp,packet+4,sizeof(timestamp));timestamp=ntohl(timestamp);
++    if(wire->decoded_audio_packet && (uint16_t)(seq-wire->last_audio_seq)!=1){
++      recovery_wire_fail(f,"audio RTP sequence did not advance by one");return;
++    }
++    if(wire->decoded_audio_packet && timestamp<=wire->last_audio_timestamp){
++      recovery_wire_fail(f,"audio RTP timestamp did not advance");return;
++    }
++    payload_len=(size_t)length-12-16-8;
++    source=rtp_packet_get(master->rtp_session,seq);
++    if(!source || source->payload_len!=payload_len || source->header[0]!=packet[0]
++        || (source->header[1]&0x7f)!=(packet[1]&0x7f) || memcmp(source->header+2,packet+2,10)){
++      recovery_wire_fail(f,"audio RTP has no matching encoded packet");return;
++    }
++    memcpy(nonce+4,packet+length-8,8);
++    cipher=chacha_open(session->shared_secret,AIRPLAY_AUDIO_KEY_LEN);
++    if(!cipher || gcry_cipher_setiv(cipher,nonce,sizeof(nonce))
++        || gcry_cipher_authenticate(cipher,packet+4,8)
++        || gcry_cipher_decrypt(cipher,decoded,payload_len,packet+12,payload_len)
++        || gcry_cipher_checktag(cipher,packet+length-8-16,16)
++        || memcmp(decoded,source->payload,payload_len)){
++      chacha_close(cipher);recovery_wire_fail(f,"audio RTP authentication/decode failed");return;
++    }
++    chacha_close(cipher);
++    for(size_t i=0;i<master->rawbuf_size;i++)
++      if(master->rawbuf[i]){wire->nonzero_pcm_input=true;break;}
++    wire->decoded_audio_packet=true;wire->last_audio_seq=seq;wire->last_audio_timestamp=timestamp;
++    atomic_fetch_add(&wire->audio_packets,1);
++  }
++  if(length<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)
++    recovery_wire_fail(f,"private RTP receive failed");
++}
 +static void native_start_http(struct evhttp_request *request,void *arg)
 +{
 +  struct native_start_wire *wire=arg;
@@ -573,7 +707,10 @@ index a5bc2e8..11774e7 100644
 +    evhttp_send_reply(request,409,"Fixture completed",response);
 +    evbuffer_free(response);return;
 +  }
-+  if(!strcmp(uri,"/fixture/done")){
++  if(!strcmp(uri,"/fixture/rtp") && wire->fixture->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
++    evbuffer_add_printf(response,"{\"audio_packets\":%d}",atomic_load(&wire->audio_packets));
++    evhttp_send_reply(request,200,"OK",response);
++  }else if(!strcmp(uri,"/fixture/done")){
 +    evbuffer_add_printf(response,"{}");
 +    evhttp_send_reply(request,200,"OK",response);
 +    atomic_store(&wire->done,true);
@@ -599,6 +736,17 @@ index a5bc2e8..11774e7 100644
 +        }
 +      }
 +    }
++    if(count==5 && !strcmp(actual.path_parts[0],"api") && !strcmp(actual.path_parts[1],"outputs")
++        && !strcmp(actual.path_parts[2],"1") && !strcmp(actual.path_parts[3],"transport")
++        && evhttp_request_get_command(request)==EVHTTP_REQ_POST){
++      const char *pattern=!strcmp(actual.path_parts[4],"bound-state") ? "/transport/bound-state$"
++        : !strcmp(actual.path_parts[4],"bound-pause-confirm") ? "/transport/bound-pause-confirm$"
++        : (!strcmp(actual.path_parts[4],"bound-prepare") || !strcmp(actual.path_parts[4],"bound-commit"))
++          ? "/transport/bound-(prepare|commit)$" : NULL;
++      for(struct httpd_uri_map *route=httpd_jsonapi.handlers;pattern && route->regexp;route++){
++        if(strstr(route->regexp,pattern)){status=route->handler(&actual);break;}
++      }
++    }
 +    if(status==200 && count==5 && !strcmp(actual.path_parts[4],"complete"))
 +      atomic_store(&wire->completed,true);
 +    if(status==200 && retirement && count==6 && !strcmp(actual.path_parts[5],"complete"))
@@ -620,7 +768,24 @@ index a5bc2e8..11774e7 100644
 +{
 +  struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
 +  struct timeval soon={0,1000};(void)fd;(void)events;
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
++    native_start_audio_poll(wire);
++    if(f->failed)return;
++  }
 +  if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
++  if(getenv("PC_NATIVE_START_EXPECT_PAUSE_RETAINED")){
++    struct airplay_session *session=f->device->session;
++    if(!atomic_load(&wire->completed) || !start_active || start_active->result.phase!=OUTPUT_START_COMPLETED
++        || !session || session!=start_active->session || session->state!=AIRPLAY_STATE_STREAMING
++        || f->teardowns || f->volumes!=1){recovery_wire_fail(f,"Native Pause/Resume did not preserve exact live streaming START route");return;}
++    fprintf(stderr,"PASS actual Native purpose-bound Pause -> real10sSTOP rearm -> explicit Native Resume -> same AP2session STREAMING and bound controls\n");
++    event_base_loopbreak(f->base);return;
++  }
++  if(getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")){
++    if(!atomic_load(&wire->completed) || !start_active || f->device->session || f->teardowns!=1){recovery_wire_fail(f,"Native Pause loss did not follow actual completed START and real STOP");return;}
++    fprintf(stderr,"CAUSAL RED actual Native Pause -> ordinary underrun -> real delayed STOP -> exact START AP2 session lost and bound-state409\n");
++    event_base_loopbreak(f->base);return;
++  }
 +  if(atomic_load(&wire->retired)){
 +    if(!atomic_load(&wire->completed) || start_active || outputs_start_source_owned()
 +        || start_journal_retirement_outcome!=OUTPUT_RETIRE_RETIRED_KNOWN
@@ -631,9 +796,21 @@ index a5bc2e8..11774e7 100644
 +    puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
 +  }else if(!atomic_load(&wire->completed) || !start_active
 +      || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
-+      || !f->device->session || f->device->volume!=35 || f->volumes!=1){
++      || !f->device->session || f->device->volume!=35 || f->volumes!=(getenv("PC_NATIVE_START_EXPECT_TWO")?2:1)){
 +    recovery_wire_fail(f,"actual Native did not finish after real C COMPLETED/route35");return;
 +  }
++  if(f->mode==29 && getenv("PC_EXPECT_PAUSED_CLOCK")
++      && (!pb_session.start_clock_pending || pb_session.start_ts.tv_sec || !outputs_start_source_owned()
++          || outputs_start_gate_closed() || atomic_load(&wire->audio_packets))){
++    recovery_wire_fail(f,"paused completed START consumed first-PCM clock");return;
++  }
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")
++      && (atomic_load(&wire->audio_packets)<1 || !wire->decoded_audio_packet || !wire->nonzero_pcm_input)){
++    recovery_wire_fail(f,"no authenticated RTP from nonzero PCM reached private peer");return;
++  }
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))
++    fprintf(stderr,"PASS private AP2 authenticated ALAC RTP packets=%d from nonzero PCM after completed/volume/open gate\n",
++      atomic_load(&wire->audio_packets));
 +  fprintf(stderr,"PASS actual Native HTTP→C player owner→FIFO barrier→private AP2→FULL COMPLETED; Native final verdict asserted by driver\n");
 +  event_base_loopbreak(f->base);
 +}
@@ -664,7 +841,15 @@ index a5bc2e8..11774e7 100644
  static int start35_wire_case(int mode)
  {
    struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-@@ -345,6 +864,18 @@ static int start35_wire_case(int mode)
+@@ -335,6 +971,7 @@ static int start35_wire_case(int mode)
+   f.device=calloc(1,sizeof(*f.device));extra=calloc(1,sizeof(*extra));assert(f.device && extra);
+   f.device->id=1;f.device->name=strdup("private-start35-native");f.device->type=OUTPUT_TYPE_AIRPLAY;f.device->type_name="AirPlay";f.device->advertised=true;
+   f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);f.device->extra_device_info=extra;extra->mdns_name=strdup(f.device->name);
++  if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
+   f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
+   /* Seed the real library database without invoking an unrelated scanner command consumer. */
+   sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
+@@ -345,6 +982,18 @@ static int start35_wire_case(int mode)
      char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
      assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
    }
@@ -683,7 +868,34 @@ index a5bc2e8..11774e7 100644
    if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
      struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
      struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
-@@ -384,7 +915,8 @@ static int start35_wire_case(int mode)
+@@ -365,7 +1014,26 @@ static int start35_wire_case(int mode)
+     assert(input_start_fifo_exact(item,fifo,&read_deadline)>=0);
+     assert(input_fifo_owner_get(item,fifo,false,0,0,&read_deadline,&fd)==0);
+     outputs_transport_input_changed(item,fifo,true);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct db_queue_item *playing=db_queue_fetch_byitemid(item);assert(playing);
++      session_start(source_create(playing,0));free_queue_item(playing,0);
++      session_update_read_start(0);
++      struct media_quality *quality=malloc(sizeof(*quality));*quality=(struct media_quality){44100,16,2};
++      player_tick_interval.tv_nsec=50000000;session_update_read_quality(quality);
++      session_update_read(2205);player_state=PLAY_PLAYING;
++      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++      keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++      airplay_control_svc.socket.fd4=f.udp_fd;
++      for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++){output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);}
++      assert(pb_timer_start()==0);
++      if(getenv("PC_MOVE_CLOCK_PAUSED")){assert(pb_timer_stop()==0);player_state=PLAY_PAUSED;}
++    }
+     *r=(struct output_start_request){.device_id=2,.native_revision=1,.move_existing_session=true};
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      r->source_pointer=pb_session.playing_now;r->source_item_id=pb_session.playing_now->item_id;
++      r->source_paused=player_state==PLAY_PAUSED;
++    }
+     r->old_native_owner=recovery_burst_owner();
+     if(mode==24 || mode==25){memset(r->old_native_owner.alias_incarnation,'a',32);r->old_native_owner.alias_incarnation[32]=0;memset(r->old_native_owner.alias_registry,'b',64);r->old_native_owner.alias_registry[64]=0;}
+     r->old_owner_present=true;r->intended_native_owner=r->old_native_owner;
+@@ -384,7 +1052,8 @@ static int start35_wire_case(int mode)
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -693,7 +905,83 @@ index a5bc2e8..11774e7 100644
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -431,7 +963,10 @@ static int start35_wire_case(int mode)
+@@ -395,8 +1064,14 @@ static int start35_wire_case(int mode)
+     assert(outputs_start_commit(r,&f.start_result)<0); /* One-use rejected token cannot revive. */
+     memset(r->offer_id,'d',32);assert(outputs_start_prepare(r,&f.start_result)==0);
+     *r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
+-    assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
+-    assert(outputs_start_reader_ready(r->token,fd.device,fd.inode)==0);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct player_start_command move={.action=2,.request=r,.result=&f.start_result};int result=-1;
++      assert(start_command(&move,&result)==COMMAND_END && result==0);
++      assert(f.start_result.phase==OUTPUT_START_READER_READY && outputs_start_gate_closed());
++    }else{
++      assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
++      assert(outputs_start_reader_ready(r->token,fd.device,fd.inode)==0);
++    }
+     r->writer_source_epoch=1;r->pipe_device=fd.device;r->pipe_inode=fd.inode;r->writer_quiescent=true;
+     assert(outputs_start_barrier_begin(r,&f.start_result)==0);
+     assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&read_deadline,&fd)==0 && fd.epoch);
+@@ -411,7 +1086,29 @@ static int start35_wire_case(int mode)
+     assert(f.start_result.gate_closed && f.start_result.contexts_drained && target->session && target->volume==27
+       && f.start_result.session_volume_percent==27);
+     r->committed_native_owner=r->intended_native_owner;
+-    assert(outputs_start_open(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct timespec before=pb_session.pts;uint32_t position=pb_session.pos;
++      struct output_start_request bad=*r;struct output_start_result rejected;
++      struct player_start_command invalid={.action=4,.request=&bad,.result=&rejected};int result=0;
++      assert(!pb_session.start_clock_pending);
++      bad.token[0]=bad.token[0]=='a'?'b':'a';
++      assert(start_command(&invalid,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++      bad=*r;strcpy(bad.committed_native_owner.session_id,"foreign-clock-owner");result=0;
++      assert(start_command(&invalid,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++      assert(pb_session.pos==position && !memcmp(&pb_session.pts,&before,sizeof(before)));
++      struct player_start_command move={.action=4,.request=r,.result=&f.start_result};result=-1;
++      assert(start_command(&move,&result)==COMMAND_END && result==0);
++      assert(f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
++      assert(pb_session.pos==position && !memcmp(&pb_session.pts,&before,sizeof(before)));
++      if(getenv("PC_MOVE_CLOCK_PAUSED")){
++        assert(!pb_session.start_clock_pending && player_state==PLAY_PAUSED
++          && !event_pending(pb_timer_ev,EV_READ|EV_TIMEOUT,NULL));
++        result=0;assert(start_command(&move,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++        puts("PASS paused MOVE OPEN never resumes or arms clock; stale/foreign/duplicate OPEN inert");
++        goto cleanup;
++      }
++      assert(pb_session.start_clock_pending);
++    }else assert(outputs_start_open(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
+     r->native_mutators_drained=true;
+     if(mode==19)fixture_post_full_writer=&writer;
+     if(mode==20){fixture_post_full_item=item;fixture_post_full_path=fifo;}
+@@ -427,11 +1124,38 @@ static int start35_wire_case(int mode)
+     }
+     assert(outputs_start_complete(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_COMPLETED
+       && transport_input_item==(uint64_t)item && !strcmp(transport_input_path_digest,r->expected_input_path_digest));
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      char pcm[8820];memset(pcm,1,sizeof(pcm));assert(write(writer,pcm,sizeof(pcm))>0);
++      int bytes=0,samples=0;uint32_t position=pb_session.pos;
++      struct player_source *source=pb_session.playing_now;uint64_t input_epoch=f.start_result.input_epoch;
++      uint16_t sequence=((struct airplay_session *)target->session)->master_session->rtp_session->seqnum;
++      for(int attempt=0;attempt<200 && samples==0;attempt++){
++        assert(source_read(&bytes,&samples,pb_session.buffer,pb_session.bufsize)>=0);
++        if(samples==0)usleep(1000);
++      }
++      assert(bytes>0 && samples>0 && !pb_session.start_clock_pending && pb_session.pos==position+(uint32_t)samples
++        && pb_session.playing_now==source && f.start_result.input_epoch==input_epoch
++        && ((struct airplay_session *)target->session)->master_session->rtp_session->seqnum==sequence);
++      struct timespec anchored=pb_session.pts;struct output_start_result duplicate;
++      struct player_start_command repeat={.action=4,.request=r,.result=&duplicate};int repeat_result=0;
++      assert(start_command(&repeat,&repeat_result)==COMMAND_END && repeat_result<0
++        && !pb_session.start_clock_pending && !memcmp(&pb_session.pts,&anchored,sizeof(anchored)));
++      struct timespec wall;clock_gettime(CLOCK_MONOTONIC,&wall);
++      double age=(wall.tv_sec-pb_session.pts.tv_sec)+(wall.tv_nsec-pb_session.pts.tv_nsec)/1e9;
++      fprintf(stderr,"MOVE_CLOCK_PROBE first-positive age=%.6f samples=%d pending=%d pos=%u\n",age,samples,pb_session.start_clock_pending,pb_session.pos);
++      outputs_write(pb_session.buffer,bytes,samples,&pb_session.quality,&pb_session.pts);
++      pb_timer_stop();
++      if(age>0.5)recovery_wire_fail(&f,"MOVE first positive PCM inherited stale presentation clock");
++      goto cleanup;
++    }
+     if(mode==24){
        struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -705,9 +993,12 @@ index a5bc2e8..11774e7 100644
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
-@@ -1043,7 +1578,11 @@ static int start35_wire_case(int mode)
+@@ -1041,9 +1765,13 @@ static int start35_wire_case(int mode)
+     fifo_live_reader_handoff_case(item,r->expected_input_path);
+     puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
-   if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
+-  if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
++  if(!f.failed && !(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
   cleanup:
 -  if((mode==18 || mode==26 || mode==27 || mode==28) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
 +  if(mode==29){
@@ -718,7 +1009,7 @@ index a5bc2e8..11774e7 100644
    while(airplay_sessions)session_cleanup(airplay_sessions);
    if(input_ready)input_deinit();
    if(worker_ready)worker_deinit();
-@@ -1055,6 +1594,8 @@ static int start35_wire_case(int mode)
+@@ -1055,6 +1783,8 @@ static int start35_wire_case(int mode)
    pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
    if(outputs_deferredev)event_free(outputs_deferredev);
    if(database_ready)db_perthread_deinit();

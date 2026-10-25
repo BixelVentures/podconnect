@@ -32,3 +32,4 @@ fa07060f5896fdef44473ee078ed79e186b9947ef95be688790f2c9c27258f54  /patches/pipe-
 7c7c71fab01890deabc4b6c9f4f20652b1a36c73a6e7ac3a21f6636bb8c669f8  /patches/connect-explicit-resume-native.patch
 19ec12e72e7c84a503fd3620c4360d87d8180d503fb817ab0d21640efeaaba81  /patches/connect-prepared-start-shutdown-native.patch
 c72790365d270fc32bdbc174f53d2e2d611360305f005c5ccb30ddb2a3b06fba  /patches/exact-transferred-track-native.patch
+8bee7953014503df46e0ab95801b997e6b663226bc482fa9e8499677447d9202  /patches/direct-native-pause-native.patch

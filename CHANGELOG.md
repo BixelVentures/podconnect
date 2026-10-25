@@ -1,15 +1,17 @@
 ## Speakers 0.26.52
 
-- Keep FIFO metadata creation, reads and retirement on the existing input thread,
-  bound to its exact source/setup generation. A delayed stop for a reused DB id/path
-  must not retire the successor metadata watch.
-- Retain the causal metadata-FIFO owner regression in the existing official C gate.
-  Native production, manager and Control source0.10.21 are unchanged. No retry, timeout,
-  route-authority or volume-policy change is added.
-- Reviewed offline ARM source and protocol evidence does not establish HomePod
-  audibility or attribute every failed field attempt. RTP output evidence remains
-  external; its large fixture is excluded from this release. Official CI,
-  publication, installation and physical acceptance remain pending.
+- Bind FIFO metadata watches to their input-thread source/setup generation so a
+  delayed old stop cannot retire the successor watch.
+- Anchor fresh selected START and playing MOVE timestamps at their first admitted
+  PCM, fixing reproduced stale first-sync timestamps after held handshakes.
+- Cap bound transport ACK time to the existing command slot and shared custody;
+  preserve all lease durations, UNKNOWN refusals and ownership guards.
+- Keep direct Native Pause/Resume on the exact purpose-bound completed START route,
+  preserving its session, writer and controls through the real delayed STOP.
+- Retain causal regressions in the existing Native/C gates and reuse their binaries
+  for the composed CI cases. Manager and Control source0.10.21 are unchanged.
+  Reviewed software/protocol evidence does not establish HomePod audibility;
+  final official CI, publication, installation and physical acceptance are pending.
 
 ## Speakers 0.26.51
 
