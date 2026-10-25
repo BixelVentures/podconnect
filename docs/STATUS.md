@@ -1,3 +1,52 @@
+## Control23 source result — reviewed, not yet installed
+
+Root implemented paired wall/monotonic clock capture before queue metadata work.
+The source absolute expiry is preserved in the public DTO and stored command offer.
+Two processing-delay regressions failed against the original code, then passed;
+all72 existing RoomQueueFrameworkTests passed in the cached official HA container
+(7.719s), with formatter/lint/diff checks. Independent reviewer verified exact patch
+5e25cac5f3f156378eee815fb50f5a1cb03cca40a5278d9a1a9d9340f916d274 and gave SOURCE GO.
+Only room_queue.py and its existing test change behavior; manifest/changelog select
+Control0.10.23. Native Speakers0.26.53 remains byte-identical. Publication, activation
+on Green and actual queue projection remain separate next steps; no physical audio
+or effect acceptance claimed.
+
+## Active Control successor — preserve original queue observation deadline
+
+Lead /root; implementation owner weather_backend_integration. Base is published
+main44e14d95564abd81ca104bc0b3dbf0377d69b6ff/tree7d7162381b5d9d129582039cc8b07ac5fba52bb0,
+Speakers0.26.53/Control0.10.22. This isolated successor leaves installed bits and
+Speakers production context unchanged. Private receiver data is retained locally,
+not published in this source decision.
+
+Observed exact response contains20 native queue rows, but valid_until exceeds its
+original source observed_at+max_age_ms deadline by a fraction of a millisecond.
+Actual consumer replay rejects it; lowering only the copied deadline to the original
+source bound permits all20 rows. The normal playback sample separately passes at
+its real integer-age quantization range; it is not evidence for a playback defect.
+
+Cause hypothesis: RoomQueue.read computes remaining lifetime at t1, builds metadata,
+then returns time.time(t2)+remaining, inadvertently extending the original absolute
+source lifetime. Chain: actual Spotify/native queue observation -> Control metadata
+projection -> original expiry -> PV strict queue projection -> UI read/fresh opaque
+option -> current one-use command. Preserve source/purpose/epoch/poll/route/native
+and monotonic expiry, one-use sequence/receipt and UNKNOWN behavior on both sides.
+
+Minimum fix: capture wallnow once for remaining computation and retain one immutable
+valid_until bounded by the original source deadline, rather than add remaining to
+a later clock reading. Review adjacent monotonic stored deadlines for the same
+processing-time extension without relaxing any consumer TTL or adding tolerance.
+No UI, provider, Native/C/PCM, playback command, grant policy or timeout tuning.
+
+Planned causal RED->GREEN uses existing room-queue HA fixture with delayed metadata
+projection/time advancement and the retained actual-response boundary replay. Verify
+all20 rows accepted at capture, deadline never exceeds source expiry, expired and
+foreign observations still rejected, and unchanged prepare/commit owner/one-use
+semantics. Focused formatter/lint/type checks and independent review before combined
+publication/install with PodVoice88; no live effect or audibility claim.
+Rollback restores the narrow Control change, never resets custody or relaxes expiry.
+Status implementation authorized; no source result, publication or installation yet.
+
 ## Active Speakers53 — original attention restoration after START session loss
 
 Lead /root; C owner native_idle_owner; Go owner weather_backend_integration. Private

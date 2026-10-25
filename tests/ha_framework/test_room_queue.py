@@ -4,6 +4,9 @@ import asyncio
 import copy
 import time
 import unittest
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import voluptuous as vol
 from aiohttp import web
@@ -159,6 +162,66 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         body = self.queue_request()
         prepared = await self.queue_call("prepare_room_queue", body)
         return body, prepared
+
+    async def _queue_with_processing_delay(self):
+        from custom_components.podconnect import room_queue
+
+        owner = self.entries[0].runtime_data.commands
+        observed = owner.controls("account-alpha", "spotify-one")["observation"]
+        source_until = (
+            datetime.fromisoformat(observed["observed_at"]).timestamp()
+            + observed["max_age_ms"] / 1000
+        )
+        clock = {"wall": source_until - 2, "mono": 1000.0}
+        queue = self.queue()
+        queue["items"] = [
+            {**queue["items"][0], "id": f"{index:024x}", "position": index}
+            for index in range(20)
+        ]
+        real_copy = copy.deepcopy
+        real_artwork = room_queue.validate_spotify_artwork
+
+        def delayed_copy(value):
+            if (
+                isinstance(value, dict)
+                and value.get("schema") == "podconnect.room_queue_state.v1"
+            ):
+                clock["wall"] += 0.25
+                clock["mono"] += 0.25
+            return real_copy(value)
+
+        def delayed_artwork(value):
+            clock["wall"] += 0.025
+            clock["mono"] += 0.025
+            return real_artwork(value)
+
+        with (
+            patch.object(self, "queue", return_value=queue),
+            patch.object(
+                room_queue,
+                "time",
+                SimpleNamespace(
+                    time=lambda: clock["wall"], monotonic=lambda: clock["mono"]
+                ),
+            ),
+            patch.object(room_queue, "copy", SimpleNamespace(deepcopy=delayed_copy)),
+            patch.object(room_queue, "validate_spotify_artwork", delayed_artwork),
+        ):
+            result = await self.queue_read()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["items"]), 20)
+        self.assertEqual(self.queue_posts, [])
+        self.assertEqual(self._writes(), [])
+        saved = owner.room_queue.observations["c" * 32]
+        return result, saved, source_until
+
+    async def test_queue_metadata_processing_never_extends_source_deadline(self):
+        result, _, source_until = await self._queue_with_processing_delay()
+        self.assertLessEqual(result["valid_until"], source_until)
+
+    async def test_queue_copy_processing_never_extends_native_deadline(self):
+        _, saved, _ = await self._queue_with_processing_delay()
+        self.assertLessEqual(saved["deadline"], 1002.0)
 
     async def test_queue_distinct_prepare_no_effect_no_sequence_then_commit_once(self):
         data = self.entries[0].runtime_data
