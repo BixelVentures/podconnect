@@ -1,8 +1,6 @@
-diff --git a/src/outputs.c b/src/outputs.c
-index 1f995c3..4c23e81 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
-@@ -394,7 +394,7 @@ outputs_transport_commit(const struct output_transport_request *request, struct
+@@ -394,7 +394,7 @@
      if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
          || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
          || !transport_custody_current(&request->native_owner,&identity,request->native_revision))) return -1;
@@ -11,7 +9,7 @@ index 1f995c3..4c23e81 100644
      *result=slot->result; return 0;
    }
    if (clock_gettime(CLOCK_MONOTONIC,&transport_pin_expiry)<0) return -1;
-@@ -411,7 +411,8 @@ outputs_transport_result_get(const char *token, struct output_transport_result *
+@@ -411,7 +411,8 @@
    struct transport_slot *slot=transport_find(token);
    if (!slot || !slot->used || !result) return -1;
    *result=slot->result;
@@ -21,3 +19,106 @@ index 1f995c3..4c23e81 100644
      outputs_transport_busy() && transport_pin==slot ? transport_remaining(&transport_pin_expiry) : 0;
    return 0;
  }
+@@ -782,6 +783,77 @@
+   outputs_attention_complete(operation,OUTPUT_ATTENTION_UNKNOWN,0,0);
+ }
+ 
++/* Only the synchronous original attention recovery constructor may attach a
++ * control-only session through unrelated START custody. Never an audio grant. */
++struct attention_restore_constructor {
++  struct output_device *device;
++  struct output_attention_state expected;
++  struct start_slot *start;
++  char start_token[33];
++  enum output_start_phase start_phase;
++  uint64_t metadata_epoch;
++  bool source_owned, gate_closed;
++};
++static __thread const struct attention_restore_constructor *attention_restore_scope;
++
++static bool
++attention_restore_constructor_current(uint64_t device_id)
++{
++  const struct attention_restore_constructor *scope = attention_restore_scope;
++  struct output_attention_state state;
++  struct output_device *device = outputs_device_get(device_id);
++  return scope && device && device == scope->device && !device->session
++    && outputs_attention_state_get(device_id, &state) == 0
++    && attention_identity_equal(&state, &scope->expected)
++    && start_active == scope->start
++    && (!start_active || (!strcmp(start_active->result.command.token, scope->start_token)
++        && start_active->result.phase == scope->start_phase))
++    && outputs_start_metadata_generation() == scope->metadata_epoch
++    && outputs_start_source_owned() == scope->source_owned
++    && outputs_start_gate_closed() == scope->gate_closed;
++}
++
++static int
++attention_recovery_prepare_exact(struct output_device *device,
++    const struct output_attention_request *request, enum output_attention_recovery_state recovery_state)
++{
++  struct attention_restore_constructor scope = { .device = device, .expected = request->expected };
++  struct output_attention_proof proof;
++  enum output_attention_recovery_state original_state;
++  bool original;
++  int ret;
++
++  if (attention_restore_scope) return -1; /* No nested constructor authority. */
++  if (device->session) return outputs[device->type]->device_attention_recovery_prepare(device);
++  original = request->action == OUTPUT_ATTENTION_RECOVER
++    ? recovery_state == OUTPUT_RECOVERY_PENDING
++    : request->action == OUTPUT_ATTENTION_RELEASE && request->expected.lease
++      && db_attention_origin_get(device->id, &device->attention_origin, &original_state, &proof) == 0
++      && original_state == OUTPUT_RECOVERY_PENDING;
++  if (!original) return outputs[device->type]->device_attention_recovery_prepare(device);
++  scope.start = start_active;
++  if (start_active) {
++    memcpy(scope.start_token, start_active->result.command.token, sizeof(scope.start_token));
++    scope.start_phase = start_active->result.phase;
++  }
++  scope.metadata_epoch = outputs_start_metadata_generation();
++  scope.source_owned = outputs_start_source_owned();
++  scope.gate_closed = outputs_start_gate_closed();
++  attention_restore_scope = &scope;
++  if (!attention_restore_constructor_current(device->id))
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Attention restore constructor denied: stale_scope\n");
++      ret = -1;
++    }
++  else
++    {
++      ret = outputs[device->type]->device_attention_recovery_prepare(device);
++      if (ret < 0) DPRINTF(E_LOG, L_PLAYER, "Attention restore constructor denied: backend_prepare\n");
++    }
++  attention_restore_scope = NULL; /* Before durable admission, I/O, or callbacks. */
++  return ret;
++}
++
+ int
+ outputs_attention_admit(const struct output_attention_request *request, struct output_attention_result *result)
+ {
+@@ -870,12 +942,12 @@
+           || (admitted.recovery_state == OUTPUT_RECOVERY_NEVER_ADMITTED && !strcmp(request->origin.process,outputs_process)))
+         return -1; // A still-current process could receive that BEGIN later.
+       if (admitted.recovery_state == OUTPUT_RECOVERY_PENDING
+-          && outputs[device->type]->device_attention_recovery_prepare(device) < 0)
++          && attention_recovery_prepare_exact(device, request, admitted.recovery_state) < 0)
+         return -1;
+     }
+   if (request->action == OUTPUT_ATTENTION_RELEASE && !device->session
+       && outputs[device->type]->device_attention_recovery_prepare
+-      && outputs[device->type]->device_attention_recovery_prepare(device) < 0) return -1;
++      && attention_recovery_prepare_exact(device, request, OUTPUT_RECOVERY_NONE) < 0) return -1;
+   if (request->action == OUTPUT_ATTENTION_BEGIN)
+     {
+       struct output_attention_origin origin = {0};
+@@ -1632,7 +1704,8 @@
+   if (!device)
+     return -1;
+ 
+-  if (outputs_transport_busy() && !outputs_start_transition_current(device_id,1)) return -1; /* Only the exact START constructor may transition. */
++  if (outputs_transport_busy() && !outputs_start_transition_current(device_id,1)
++      && !attention_restore_constructor_current(device_id)) return -1; /* Exact audio or restoration constructor only. */
+   if (device->session_epoch >= UINT64_MAX - 1)
+     return -1;
+   device->session_epoch++;

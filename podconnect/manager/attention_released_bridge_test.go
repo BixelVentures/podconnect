@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -246,6 +248,107 @@ func TestReleasedRoomRetiresOriginalAttentionLease(t *testing.T) {
 		select {
 		case <-deadline:
 			t.Fatalf("original lease still %s after bridge ticks; native release writes=%d other writes=%d", strings.ToLower(att.snapshot(time.Now()).Outcome), releaseWrites.Load(), otherWrites.Load())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+func TestReleasedPlayingSTARTStillRetiresOriginalAttention(t *testing.T) {
+	if os.Getenv("PC87_PLAYING_RELEASE_CHILD") == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestReleasedPlayingSTARTStillRetiresOriginalAttention$", "-test.timeout=4s")
+		cmd.Env = append(os.Environ(), "PC87_PLAYING_RELEASE_CHILD=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("actual bridge: %v\n%s", err, out)
+		}
+		return
+	}
+	f, _, owner, route := releasedRoomRouteFixture(t)
+	var reads, releases, effects atomic.Int32
+	parked := make(chan struct{})
+	oldRPC := roomTransportRPC
+	defer func() { roomTransportRPC = oldRPC }()
+	roomTransportRPC = func(_ context.Context, _, method, path string, body []byte) ([]byte, error) {
+		switch {
+		case path == "/status":
+			return []byte(fmt.Sprintf(`{"username":"native-user","device_id":%q}`, f.id)), nil
+		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
+		case path == "/api/outputs/42/transport/bound-state":
+			var supplied struct {
+				Owner roomTransportIdentity `json:"native_owner"`
+			}
+			if json.Unmarshal(body, &supplied) != nil || supplied.Owner != *owner {
+				t.Fatal("C state not bound to exact Native owner")
+			}
+			reads.Add(1)
+			if releases.Load() > 0 {
+				// The real bridge has no stop seam. Park this child at its next
+				// inert route read before fixture cleanup restores package globals.
+				close(parked)
+				<-make(chan struct{})
+			}
+			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, []string{"pause"}, false, true, false})
+		}
+		return nil, fmt.Errorf("unexpected route read %s %s", method, path)
+	}
+	original := nativeAttentionIdentity{testNativeProcess, "42", "1", "4", "3", "310", "3", "179", 35, 5, false}
+	previous := http.DefaultTransport
+	http.DefaultTransport = startTransport(func(r *http.Request) (*http.Response, error) {
+		var value any
+		if r.URL.Path == "/api/outputs/42/attention" && r.Method == http.MethodGet {
+			value = nativeAttentionObservation{nativeAttentionIdentity: original, LastRelease: "0"}
+		} else if r.URL.Path == "/api/outputs/42/attention" && r.Method == http.MethodPut {
+			var c nativeAttentionCommand
+			if json.NewDecoder(r.Body).Decode(&c) != nil || c.Action != "release" || c.Expected != original || c.Cap != 0 || c.TTL != 0 {
+				effects.Add(1)
+				return nil, fmt.Errorf("not exact original release")
+			}
+			releases.Add(1)
+			value = nativeAttentionResult{Identity: original, RequestID: c.RequestID, Operation: "311", Action: "release", Outcome: "protocol_accepted", ResponseCode: 200, CSeq: 311, Current: true}
+		} else {
+			if r.Method != http.MethodGet {
+				effects.Add(1)
+			}
+			return previous.RoundTrip(r)
+		}
+		raw, err := json.Marshal(value)
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(raw))}, err
+	})
+	att := &f.rt.att
+	if !att.engageOwned(testConversationA, att.challenge(), true, 5, "voice", defaultAttentionTTL, time.Now()) {
+		t.Fatal("attention admission")
+	}
+	update := nativeAttentionResult{Identity: original, RequestID: testConversationB, Operation: "310", Action: "update", Outcome: "desired_only", Current: true}
+	g := &nativeAttentionGrant{Origin: nativeAttentionOrigin{testNativeProcess, testConversationA}, Identity: original, Command: nativeAttentionCommand{Expected: original, RequestID: testConversationB, Action: "update", Cap: 5, TTL: 2000}, Result: update, Submitted: true, Revision: att.nativeRevision}
+	att.nativeGrants = map[string]*nativeAttentionGrant{"42": g}
+	att.nativeResults = map[string]nativeAttentionResult{"42": update}
+	att.nativePending = true
+	att.custody = &attentionCustody{Version: 1, Room: "r0", path: filepath.Join(t.TempDir(), "custody"), Sessions: []*custodySession{{Process: attentionManagerProcess(), Revision: fmt.Sprint(att.admissionRevision), Nonce: testConversationA, Outputs: map[string]*custodyOutput{testConversationA: {Base: f.room.OwnTone, DeviceID: "42", Origin: g.Origin, Original: original}}}}}
+	if err := att.custody.save(); err != nil {
+		t.Fatal(err)
+	}
+	if !att.releaseOwned(testConversationA, att.challenge()) {
+		t.Fatal("release admission")
+	}
+	go roomBridge(f.room, &boolFlag{}, &f.rt.live, att)
+	deadline := time.After(1200 * time.Millisecond)
+	for {
+		if att.snapshot(time.Now()).Outcome == "released" {
+			select {
+			case <-parked:
+			case <-deadline:
+				t.Fatal("bridge did not reach cleanup barrier")
+			}
+			if releases.Load() != 1 || effects.Load() != 0 || !fileExists(releasedPath(f.room)) {
+				t.Fatalf("release=%d unrelated=%d marker=%v", releases.Load(), effects.Load(), fileExists(releasedPath(f.room)))
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("original lease remains pending: START-owned reads=%d release writes=%d unrelated writes=%d", reads.Load(), releases.Load(), effects.Load())
 		case <-time.After(25 * time.Millisecond):
 		}
 	}

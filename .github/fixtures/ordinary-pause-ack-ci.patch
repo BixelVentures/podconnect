@@ -1,18 +1,3 @@
-diff --git a/src/Makefile.am b/src/Makefile.am
-index d48a854..a35a1d5 100644
---- a/src/Makefile.am
-+++ b/src/Makefile.am
-@@ -241,7 +241,7 @@ airplay_callback_owner_SOURCES = ../tests/airplay_callback_owner.c \
- 	$(GPERF_SRC) \
- 	$(LEXER_SRC) $(PARSER_SRC)
- airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
--	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
-+	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\" -DPIPE_METADATA_OWNER_TEST
- airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
- airplay_callback_owner_LDFLAGS = -Wl,--wrap=close -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
- EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
-diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
-index 74f9635..66bf530 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
 @@ -13,6 +13,7 @@
@@ -23,7 +8,7 @@ index 74f9635..66bf530 100644
  #include "../src/pair_ap/pair-tlv.h"
  
  /* Inert speaker persistence only. Every state, request, crypto/codec constructor,
-@@ -45,6 +46,60 @@ static int fixture_service_bind(struct net_socket *socket, unsigned short *port,
+@@ -45,6 +46,60 @@
  #include "../src/outputs/streaming.c"
  #include "../src/player.c"
  #undef db_speaker_save
@@ -84,7 +69,7 @@ index 74f9635..66bf530 100644
  
  /* The input command closes its real old reader before opening the successor.
   * Schedule the pipe watcher's independent reset-close in that exact interval.
-@@ -595,6 +650,7 @@ struct recovery_wire_fixture {
+@@ -595,6 +650,7 @@
  
  static struct recovery_wire_fixture *active_recovery_wire;
  static bool recovery_receiver_entropy, recovery_salt_red;
@@ -92,10 +77,12 @@ index 74f9635..66bf530 100644
  static int start_partial_writes,start_partial_bytes;
  int __real_evbuffer_write(struct evbuffer *,int);
  int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
-@@ -677,6 +733,22 @@ static int recovery_wire_reply(struct recovery_wire_fixture *f,int code,int cseq
+@@ -675,6 +731,22 @@
+     ret=bufferevent_write(f->peer,encrypted,encrypted_length); free(encrypted);
+   } else ret=bufferevent_write_buffer(f->peer,reply);
    evbuffer_free(reply); return ret;
- }
- 
++}
++
 +struct held_start_reply {
 +  struct recovery_wire_fixture *fixture;
 +  struct event *timer;
@@ -110,12 +97,10 @@ index 74f9635..66bf530 100644
 +  if(recovery_wire_reply(held->fixture,held->code,held->cseq,held->body,held->length)<0)
 +    recovery_wire_fail(held->fixture,"held START setup reply");
 +  event_free(held->timer);free(held->body);free(held);
-+}
-+
+ }
+ 
  static void recovery_wire_read(struct bufferevent *peer,void *arg)
- {
-   struct recovery_wire_fixture *f=arg;
-@@ -785,15 +857,35 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+@@ -785,15 +857,35 @@
      if(f->mode==9 && f->volumes==2)code=503;
      if(f->mode==12)cseq++;
      if(f->mode==13)code=503;
@@ -153,11 +138,38 @@ index 74f9635..66bf530 100644
    if(activate_cipher) {
      struct pair_result *result=NULL;
      if(pair_setup_result(NULL,&result,f->pair)<0 || !result
-@@ -1164,9 +1256,13 @@ int main(int argc, char **argv)
+@@ -1107,7 +1199,11 @@
+       if (outputs_device_start(f.device, recovery_wire_retired_start, false) != 1)
+         { recovery_wire_fail(&f, "actual old START was not queued"); goto cleanup; }
+     }
+-  else if(outputs_attention_admit(&f.command,&f.result)<0 || f.result.outcome!=OUTPUT_ATTENTION_PENDING){recovery_wire_fail(&f,"public fresh RECOVER not pending");goto cleanup;}
++  else {
++    if(mode==0 && getenv("PC_ATTENTION_RECOVER_BUSY")) atomic_store(&start_owned_latch,true);
++    if(outputs_attention_admit(&f.command,&f.result)<0 || f.result.outcome!=OUTPUT_ATTENTION_PENDING)
++      {recovery_wire_fail(&f,"public fresh RECOVER not pending");goto cleanup;}
++  }
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+   if(!f.poll || !f.deadline || evtimer_add(f.deadline,&bound) || evtimer_add(f.poll,&soon)){f.failed=1;goto cleanup;}
+   event_base_dispatch(f.base);
+@@ -1124,6 +1220,11 @@
+  volume_case_complete:
+   if(!f.failed) {char byte; if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"unexpected recovery audio/data packet");}
+  cleanup:
++  if(mode==0 && getenv("PC_ATTENTION_RECOVER_BUSY")) {
++    assert(outputs_start_source_owned() && !attention_restore_scope);
++    puts("PASS persisted original DB-origin RECOVER control-only constructor under retained busy latch; no unrelated START authority");
++    atomic_store(&start_owned_latch,false); /* Fixture process cleanup only. */
++  }
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if (mode>=7 && room_volume_pin) room_volume_pin_expiry.tv_sec-=11;
+   (void)room_volume_pin_busy();
+@@ -1164,9 +1265,15 @@
    if (!gcry_check_version(GCRYPT_VERSION)) return 1;
    gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
    gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
 +  if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
++  if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
++    { for(int mode=0;mode<7;mode++) if(recovery_wire_case(mode))return 1; return 0; }
    if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
      { recovery_salt_red = true; return recovery_wire_case(0); }
 +  if (argc == 2 && !strcmp(argv[1], "--native-start-wire")) return start35_wire_case(29);
@@ -167,11 +179,74 @@ index 74f9635..66bf530 100644
    if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
    if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
    if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
-diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index a5bc2e8..e40acec 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
-@@ -195,6 +195,415 @@ static void queue_actual_same_reader(struct output_device *target,const struct o
+@@ -10,6 +10,64 @@
+ /* The writer remains live but paused, as at the observed second START.
+  * Cross the real deficit boundary on one real timer/FIFO read while the actual
+  * AP constructor is waiting for its private receiver response. */
++static void attention_restore_scope_negative_cases(struct output_device *device)
++{
++  struct attention_restore_constructor scope={.device=device,.start=start_active,
++    .start_phase=start_active->result.phase,.metadata_epoch=outputs_start_metadata_generation(),
++    .source_owned=outputs_start_source_owned(),.gate_closed=outputs_start_gate_closed()};
++  struct output_attention_request nested={.action=OUTPUT_ATTENTION_RELEASE};
++  assert(outputs_attention_state_get(device->id,&scope.expected)==0);
++  memcpy(scope.start_token,start_active->result.command.token,33);
++  attention_restore_scope=&scope;
++  assert(attention_restore_constructor_current(device->id));
++  uint64_t old=device->incarnation;
++  device->incarnation++;assert(!attention_restore_constructor_current(device->id));device->incarnation=old;
++  old=device->route_revision;
++  device->route_revision++;assert(!attention_restore_constructor_current(device->id));device->route_revision=old;
++  old=device->attention_revision;
++  device->attention_revision++;assert(!attention_restore_constructor_current(device->id));device->attention_revision=old;
++  old=device->session_epoch;
++  device->session_epoch++;assert(!attention_restore_constructor_current(device->id));device->session_epoch=old;
++  scope.expected.process[0]=scope.expected.process[0]=='0'?'1':'0';
++  assert(!attention_restore_constructor_current(device->id));
++  memcpy(scope.expected.process,outputs_process,37);
++  scope.start_token[0]=scope.start_token[0]=='0'?'1':'0';
++  assert(!attention_restore_constructor_current(device->id));
++  memcpy(scope.start_token,start_active->result.command.token,33);
++  scope.metadata_epoch++;assert(!attention_restore_constructor_current(device->id));scope.metadata_epoch--;
++  struct start_slot *saved=start_active;
++  start_active=NULL;assert(!attention_restore_constructor_current(device->id));start_active=saved;
++  nested.expected=scope.expected;
++  assert(attention_recovery_prepare_exact(device,&nested,OUTPUT_RECOVERY_NONE)<0 && !device->session);
++  attention_restore_scope=NULL;
++  assert(!attention_restore_constructor_current(device->id));
++  puts("PASS restoration scope rejects stale process/incarnation/session/route/revision/START token/epoch/replacement and nested constructor");
++}
++
++static void attention_start_restore_poll(int fd, short what, void *arg)
++{
++  struct recovery_wire_fixture *f=arg;
++  struct output_attention_state state;
++  struct output_attention_result result;
++  struct timeval soon={0,1000};
++  assert(outputs_attention_state_get(1,&state)==0);
++  assert(outputs_attention_result_get(state.process,state.last_release_operation,&result)==0);
++  if(result.outcome==OUTPUT_ATTENTION_PENDING){evtimer_add(f->poll,&soon);return;}
++  fprintf(stderr,"RESTORE_TERMINAL outcome=%d current=%d code=%d cseq=%d lease=%llu restoring=%d idle=%d session=%p sessions=%p masters=%p volumes=%d stops=%d pair=%d owned=%d gate=%d\n",result.outcome,result.current,result.response_code,result.request_cseq,(unsigned long long)state.lease,state.restoring,state.recovery_idle,f->device->session,airplay_sessions,airplay_master_sessions,f->volumes,f->teardowns,f->pair_messages,outputs_start_source_owned(),outputs_start_gate_closed());
++  assert(result.outcome==OUTPUT_ATTENTION_PROTOCOL_ACCEPTED && result.current
++    && result.response_code==200 && result.request_cseq>0
++    && !state.lease && !state.restoring && state.recovery_idle
++    && !f->device->session && !airplay_sessions && !airplay_master_sessions
++    && f->volumes==1 && f->teardowns==1 && f->pair_messages==2
++    && outputs_start_source_owned() && !outputs_start_gate_closed()
++    && start_active && start_active->result.phase==OUTPUT_START_COMPLETED
++    && !strcmp(start_active->result.command.token,f->start_command.token));
++  char byte;
++  assert(recv(f->udp_fd,&byte,1,MSG_DONTWAIT)<0);
++  puts("PASS exact original attention restoration through real completed-START session loss and TTL: control-only AP2/CSeq35/STOP drained, no audio or START custody clear");
++  event_base_loopbreak(f->base);
++}
++
+ static void start_route_starvation_tick(struct recovery_wire_fixture *f,bool gated)
+ {
+   struct airplay_session *session=f->device->session;
+@@ -195,6 +253,415 @@
        assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
        puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
  }
@@ -587,7 +662,7 @@ index a5bc2e8..e40acec 100644
  /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
   * success. Admission alone cannot retain; only the exact post-effect receipt. */
  static void confirmed_pause_custody_case(struct output_device *device,
-@@ -214,12 +623,26 @@ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -214,12 +681,26 @@
    strcpy(request.token,prepared.command.token);
    assert(outputs_transport_commit(&request,&result)==0);
    assert(!transport_pause_retained); /* C commit precedes actual native effect. */
@@ -614,7 +689,7 @@ index a5bc2e8..e40acec 100644
    assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)==0);
    assert(transport_pause_owned(1));
    assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
-@@ -252,6 +675,7 @@ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -252,6 +733,7 @@
      assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
      assert(transport_pause_owned(1));
    }
@@ -622,7 +697,7 @@ index a5bc2e8..e40acec 100644
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -312,6 +736,218 @@ static void fifo_live_reader_handoff_case(uint32_t item,const char *path)
+@@ -312,6 +794,218 @@
    puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
  }
  
@@ -841,7 +916,7 @@ index a5bc2e8..e40acec 100644
  static int start35_wire_case(int mode)
  {
    struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-@@ -335,6 +971,7 @@ static int start35_wire_case(int mode)
+@@ -335,6 +1029,7 @@
    f.device=calloc(1,sizeof(*f.device));extra=calloc(1,sizeof(*extra));assert(f.device && extra);
    f.device->id=1;f.device->name=strdup("private-start35-native");f.device->type=OUTPUT_TYPE_AIRPLAY;f.device->type_name="AirPlay";f.device->advertised=true;
    f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);f.device->extra_device_info=extra;extra->mdns_name=strdup(f.device->name);
@@ -849,10 +924,11 @@ index a5bc2e8..e40acec 100644
    f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
    /* Seed the real library database without invoking an unrelated scanner command consumer. */
    sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
-@@ -345,6 +982,18 @@ static int start35_wire_case(int mode)
+@@ -344,6 +1039,18 @@
+     sqlite3 *shift=NULL;assert(sqlite3_open(database,&shift)==SQLITE_OK);
      char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
      assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
-   }
++  }
 +  if(mode==29){
 +    if(getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);assert(mkfifo(metadata,0600)==0);}
 +    keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
@@ -864,11 +940,10 @@ index a5bc2e8..e40acec 100644
 +    pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
 +    pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
 +    native_start_wire_run(&f,fifo);goto cleanup;
-+  }
+   }
    if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
      struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
-     struct output_start_request *r=&f.start_command;struct output_start_state state;struct timespec read_deadline;
-@@ -365,7 +1014,26 @@ static int start35_wire_case(int mode)
+@@ -365,7 +1072,26 @@
      assert(input_start_fifo_exact(item,fifo,&read_deadline)>=0);
      assert(input_fifo_owner_get(item,fifo,false,0,0,&read_deadline,&fd)==0);
      outputs_transport_input_changed(item,fifo,true);
@@ -895,7 +970,7 @@ index a5bc2e8..e40acec 100644
      r->old_native_owner=recovery_burst_owner();
      if(mode==24 || mode==25){memset(r->old_native_owner.alias_incarnation,'a',32);r->old_native_owner.alias_incarnation[32]=0;memset(r->old_native_owner.alias_registry,'b',64);r->old_native_owner.alias_registry[64]=0;}
      r->old_owner_present=true;r->intended_native_owner=r->old_native_owner;
-@@ -384,7 +1052,8 @@ static int start35_wire_case(int mode)
+@@ -384,7 +1110,8 @@
        struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
          .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
        proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
@@ -905,7 +980,7 @@ index a5bc2e8..e40acec 100644
      }
      assert(!start_journal.token[0]);
      assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
-@@ -395,8 +1064,14 @@ static int start35_wire_case(int mode)
+@@ -395,8 +1122,14 @@
      assert(outputs_start_commit(r,&f.start_result)<0); /* One-use rejected token cannot revive. */
      memset(r->offer_id,'d',32);assert(outputs_start_prepare(r,&f.start_result)==0);
      *r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
@@ -922,7 +997,7 @@ index a5bc2e8..e40acec 100644
      r->writer_source_epoch=1;r->pipe_device=fd.device;r->pipe_inode=fd.inode;r->writer_quiescent=true;
      assert(outputs_start_barrier_begin(r,&f.start_result)==0);
      assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&read_deadline,&fd)==0 && fd.epoch);
-@@ -411,7 +1086,29 @@ static int start35_wire_case(int mode)
+@@ -411,7 +1144,29 @@
      assert(f.start_result.gate_closed && f.start_result.contexts_drained && target->session && target->volume==27
        && f.start_result.session_volume_percent==27);
      r->committed_native_owner=r->intended_native_owner;
@@ -953,7 +1028,7 @@ index a5bc2e8..e40acec 100644
      r->native_mutators_drained=true;
      if(mode==19)fixture_post_full_writer=&writer;
      if(mode==20){fixture_post_full_item=item;fixture_post_full_path=fifo;}
-@@ -427,11 +1124,38 @@ static int start35_wire_case(int mode)
+@@ -427,11 +1182,38 @@
      }
      assert(outputs_start_complete(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_COMPLETED
        && transport_input_item==(uint64_t)item && !strcmp(transport_input_path_digest,r->expected_input_path_digest));
@@ -993,7 +1068,64 @@ index a5bc2e8..e40acec 100644
      }
      struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
      struct output_transport_result stale_audio_result;
-@@ -1041,9 +1765,13 @@ static int start35_wire_case(int mode)
+@@ -738,6 +1520,56 @@
+   if(mode==21)fixture_post_full_writer=&writer;
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+   assert(f.poll && f.deadline && !evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++  if(!f.failed && getenv("PC_ATTENTION_RESTORE_CASE")){
++    assert(f.start_result.phase==OUTPUT_START_COMPLETED && f.device->session);
++    session_cleanup(f.device->session); /* Actual loss/drain; no synthetic session-ready flag. */
++    assert(!f.device->session && outputs_transport_busy());
++    struct output_attention_request duck={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5,.ttl_ms=4000};
++    struct output_attention_result duck_result,restore_result;
++    outputs_attention_uuid(duck.request_id);
++    assert(outputs_attention_state_get(1,&duck.expected)==0);
++    assert(outputs_attention_admit(&duck,&duck_result)==0
++      && duck_result.outcome==OUTPUT_ATTENTION_DESIRED_ONLY);
++    attention_restore_scope_negative_cases(f.device);
++    f.command.origin=f.device->attention_origin;
++    /* The actual old connection is closed by session_cleanup above. Retire its
++     * sequential private receiver before accepting the separate control peer. */
++    if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}
++    pair_cipher_free(f.cipher);f.cipher=NULL;pair_setup_free(f.pair);f.pair=NULL;
++    evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++    f.pair_messages=0;f.volumes=0;f.teardowns=0;
++    f.device->attention_deadline.tv_sec-=5;
++    attention_timer_cb(-1,EV_TIMEOUT,f.device); /* Existing one-shot expiry owner. */
++    struct output_attention_state after;
++    assert(outputs_attention_state_get(1,&after)==0);
++    int accepted=outputs_attention_result_get(after.process,after.last_release_operation,&restore_result);
++    fprintf(stderr,"ACTUAL_START_ATTENTION_RESTORE accepted=%d busy=%d lease=%llu restoring=%d recovery_idle=%d last_release=%llu\n",
++      accepted,outputs_transport_busy(),(unsigned long long)after.lease,after.restoring,after.recovery_idle,
++      (unsigned long long)after.last_release_operation);
++    assert(accepted==0 && restore_result.outcome==OUTPUT_ATTENTION_PENDING);
++    assert(f.device->session && ((struct airplay_session *)f.device->session)->recovery_only
++      && !attention_restore_scope && !attention_emission_current(f.device->session,NULL));
++    int unrelated;
++    assert(outputs_device_session_add(1,&unrelated)<0);
++    event_free(f.poll);f.poll=evtimer_new(f.base,attention_start_restore_poll,&f);
++    event_del(f.deadline);
++    assert(f.poll && !evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));
++    event_base_dispatch(f.base);
++    assert(!f.failed);
++    struct output_attention_request successor={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5,.ttl_ms=4000};
++    struct output_attention_result next,old_release;
++    assert(outputs_attention_state_get(1,&successor.expected)==0);
++    assert(outputs_attention_result_get(successor.expected.process,successor.expected.last_release_operation,&old_release)==0);
++    outputs_attention_uuid(successor.request_id);
++    assert(outputs_attention_admit(&successor,&next)==0 && next.identity.lease!=old_release.identity.lease);
++    uint64_t next_lease=next.identity.lease;
++    outputs_attention_complete(&old_release,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,old_release.request_cseq);
++    outputs_attention_complete(&duck_result,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,old_release.request_cseq);
++    assert(f.device->attention_lease==next_lease && !f.device->attention_restoring
++      && !f.device->session && outputs_start_source_owned());
++    puts("PASS late original release/duck callbacks cannot clear successor lease or authorize an audio session");
++    goto cleanup;
++  }
+   if(!f.failed && (mode==26 || mode==27 || mode==28)){
+     struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
+       .native_process=r->native_process,.writer_source_epoch=f.start_result.writer_source_epoch,
+@@ -1041,9 +1873,13 @@
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -1009,7 +1141,7 @@ index a5bc2e8..e40acec 100644
    while(airplay_sessions)session_cleanup(airplay_sessions);
    if(input_ready)input_deinit();
    if(worker_ready)worker_deinit();
-@@ -1055,6 +1783,8 @@ static int start35_wire_case(int mode)
+@@ -1055,6 +1891,8 @@
    pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
    if(outputs_deferredev)event_free(outputs_deferredev);
    if(database_ready)db_perthread_deinit();
@@ -1019,11 +1151,9 @@ index a5bc2e8..e40acec 100644
 +  unlink(fifo);
    return f.failed;
  }
-diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 2ea29b0..29eac14 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -35,9 +35,50 @@ static void start_gate_strict_http(const struct output_start_request *r)
+@@ -35,9 +35,50 @@
    const char *cases[][2]={{"\"boot_id\":","\"unknown\":0,\"boot_id\":"},{"\"pid\":","\"pid\":\"1\",\"pid\":"},{"\"homepod_id\":","\"homepod_id\":\"1\",\"homepod_id\":"},{"\"room_id\":","\"unknown\":0,\"room_id\":"},{"\"native_revision\":\"100\"","\"native_revision\":true"},{"\"start_volume_percent\":35","\"start_volume_percent\":\"35\""}};
    for(size_t i=0;i<ARRAY_SIZE(cases);i++){changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);}
    changed=malloc(strlen(raw)+4);sprintf(changed,"%s {}",raw);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);
@@ -1074,7 +1204,7 @@ index 2ea29b0..29eac14 100644
    puts("PASS actual START HTTP state5/8 prepare12/common27; nested process/owner duplicate and unknown keys, wrong types/trailing JSON reject before admission");
  }
  static int start_gate_unused_volume(struct output_device *d,const struct output_room_volume_result *r)
-@@ -60,15 +101,35 @@ static struct output_start_request start_gate_fixture_request(const char *path,c
+@@ -60,15 +101,35 @@
    strcpy(r.expected_input_path,path);strcpy(r.policy_revision,OUTPUT_START_POLICY);
    gcry_md_hash_buffer(GCRY_MD_SHA256,hash,path,strlen(path));for(i=0;i<32;i++)sprintf(r.expected_input_path_digest+2*i,"%02x",hash[i]);return r;
  }
@@ -1112,7 +1242,7 @@ index 2ea29b0..29eac14 100644
    assert(start_process_current(process)==!expect_retired);
    d=outputs_device_get(1);assert(d && !d->selected);
    outputs_device_select(d,-1);assert(!d->selected);
-@@ -77,12 +138,39 @@ static void start_gate_process_successor(const struct output_native_process *pro
+@@ -77,12 +138,39 @@
    assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
    struct output_transport_identity route;bool busy,start_owned,clean_absent;
    assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
@@ -1153,7 +1283,7 @@ index 2ea29b0..29eac14 100644
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -92,6 +180,7 @@ static void exact_start_durable_gate(void)
+@@ -92,6 +180,7 @@
    assert(pipe(pipes)==0);native=fork();assert(native>=0);
    if(!native){close(pipes[1]);char byte;(void)read(pipes[0],&byte,1);_exit(0);}
    close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
@@ -1161,7 +1291,7 @@ index 2ea29b0..29eac14 100644
    struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
    /* Both pre-open unknown and a post-open/completed record must keep a restarted
     * C owner shut while the distinct, actually live native process remains. */
-@@ -114,11 +203,15 @@ static void exact_start_durable_gate(void)
+@@ -114,11 +203,15 @@
        sqlite3_close(hdl);_exit(0);
      }
      assert(waitpid(owner,&status,0)==owner && WIFEXITED(status) && WEXITSTATUS(status)==0);
@@ -1179,10 +1309,22 @@ index 2ea29b0..29eac14 100644
    assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    /* Conditional journal replacement cannot steal a newer transaction. */
    struct db_start_guard retained={0},wrong={0};assert(db_start_guard_load(&retained)==1);wrong=retained;memset(wrong.token,'f',32);
-@@ -127,5 +220,5 @@ static void exact_start_durable_gate(void)
+@@ -127,5 +220,5 @@
    assert(db_start_guard_save(&retained,&retained)<0);
    assert(attention_sql(sqlite3_mprintf("PRAGMA synchronous=FULL"))==0);free(retained.payload);
    clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);
 -  puts("PASS actual file-backed C owner successor processes: unknown/post-open/completed retain quarantine with live old native process; actual process retirement does not open gate; conditional/FULL journal failures reject");
+-}
 +  puts("PASS file-backed C successors: live old Native rejects fresh START; actual old Native death with replaced saved PID namespace retains valid quarantine and denies fresh START; same namespace actual death or different saved kernel boot permits guarded START prepare/commit without generic selection; conditional/FULL journal failures reject");
- }
++}
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -241,7 +241,7 @@
+ 	$(GPERF_SRC) \
+ 	$(LEXER_SRC) $(PARSER_SRC)
+ airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
+-	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
++	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\" -DPIPE_METADATA_OWNER_TEST
+ airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
+ airplay_callback_owner_LDFLAGS = -Wl,--wrap=close -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
+ EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c

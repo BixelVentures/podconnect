@@ -1,3 +1,18 @@
+## Speakers 0.26.53 / Control 0.10.22
+
+- Restore the exact original attention lease after a completed START loses its
+  AP2 session, using the existing control-only recovery constructor with unchanged
+  ownership, receiver acknowledgement, drain and no-audio guards.
+- Preserve original cleanup on released playing routes before ordinary route holds.
+- Distinguish confirmed pre-admission recovery rejection from uncertain results;
+  retain durable custody and require fresh exact-owner/CAS admission for a new attempt.
+- Refresh playback and devices concurrently inside the original one-second command
+  observation budget; retain independent observation timestamps and cancel/join.
+- Use actual Native phase for exact-room transport offers while preserving generic
+  Spotify disallows, freshness, owner and one-use command guards.
+- Source and protocol regression evidence is separate from official CI, publication,
+  installation, actual audible playback and visible Voice PE acceptance.
+
 ## Speakers 0.26.52
 
 - Bind FIFO metadata watches to their input-thread source/setup generation so a

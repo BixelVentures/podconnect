@@ -170,7 +170,9 @@ class PlaybackCommands:
             and not data.api._web.closed
         )
 
-    def controls(self, entry_id, target_id, *, for_command=False):
+    def controls(
+        self, entry_id, target_id, *, for_command=False, native_room_phase=False
+    ):
         data = self.data
         binding = (
             data.api,
@@ -224,16 +226,17 @@ class PlaybackCommands:
             for action, key in _DISALLOWED.items()
             if not disallows.get(key, False)
         ]
-        actions = [
-            action
-            for action in actions
-            if not (
-                action == "pause"
-                and playback["state"] != "playing"
-                or action == "resume"
-                and playback["state"] != "paused"
-            )
-        ]
+        if not native_room_phase:
+            actions = [
+                action
+                for action in actions
+                if not (
+                    action == "pause"
+                    and playback["state"] != "playing"
+                    or action == "resume"
+                    and playback["state"] != "paused"
+                )
+            ]
         volume = device.get("volume_percent")
         volume = volume if type(volume) is int and 0 <= volume <= 100 else None
         if device.get("supports_volume") is True and volume is not None:
@@ -488,7 +491,12 @@ class PlaybackCommands:
                 observed = (
                     self.track_controls(entry_id, target_id, for_command=True)
                     if action in {"play_track", "play_context"}
-                    else self.controls(entry_id, target_id, for_command=True)
+                    else self.controls(
+                        entry_id,
+                        target_id,
+                        for_command=True,
+                        native_room_phase=room_transport is not None,
+                    )
                 )
                 if (
                     observed["owner_epoch"] != epoch

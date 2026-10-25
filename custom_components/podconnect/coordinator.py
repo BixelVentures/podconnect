@@ -70,15 +70,30 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._check_command_owner()
         self.poll_sequence += 1
         poll_sequence = self.poll_sequence
-        try:
+
+        async def read_playback():
             playback = await self.api.playback_state()
             self._check_command_owner()
-            playback_observed_at = dt_util.utcnow()
-            playback_observed_monotonic = time.monotonic()
-            devices = await self.api.devices()
+            return playback, dt_util.utcnow(), time.monotonic()
+
+        reads = (
+            asyncio.create_task(read_playback()),
+            asyncio.create_task(self.api.devices()),
+        )
+        try:
+            playback_result, devices = await asyncio.gather(*reads)
             self._check_command_owner()
+            playback, playback_observed_at, playback_observed_monotonic = (
+                playback_result
+            )
         except SpotifyApiError as err:
             raise UpdateFailed(str(err)) from err
+        finally:
+            for read in reads:
+                if not read.done():
+                    read.cancel()
+            await asyncio.gather(*reads, return_exceptions=True)
+        self._check_command_owner()
         return {
             "poll_sequence": poll_sequence,
             "playback": playback,

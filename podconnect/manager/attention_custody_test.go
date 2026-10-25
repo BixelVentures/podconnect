@@ -1088,3 +1088,197 @@ func TestAttentionUpdateFailedRetirementSaveNeverClaimsRetired(t *testing.T) {
 		t.Fatal("failed retirement save was credited")
 	}
 }
+
+// A definitive admission rejection is not a lost possible-effect receipt.
+// Recheck the exact current device before a new original-origin recovery attempt.
+func TestCustodyPreAdmission400CanRecoverAfterFreshDeviceRead(t *testing.T) {
+	a := &attention{}
+	path := filepath.Join(t.TempDir(), "custody")
+	original := nativeAttentionIdentity{testNativeProcess, "1", "1", "0", "1", "1", "1", "7", 65, 5, false}
+	origin := nativeAttentionOrigin{testNativeProcess, testConversationA}
+	state := nativeAttentionIdentity{testConversationB, "1", "1", "0", "1", "0", "1", "0", 65, 65, false}
+	puts, queries, reads := 0, 0, 0
+	var firstRequest string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.URL.Query().Get("request_id") != "" {
+				queries++
+				http.Error(w, "request was rejected before dispatch", 404)
+				return
+			}
+			reads++
+			json.NewEncoder(w).Encode(nativeRecoveryObservation{nativeAttentionObservation: nativeAttentionObservation{state, "0"}, Idle: custodyIdle(true)})
+			return
+		}
+		var command nativeRecoveryCommand
+		if json.NewDecoder(r.Body).Decode(&command) != nil || command.Action != "recover" || command.Origin != origin || command.Expected != state || command.Cap != 0 || command.TTL != 0 {
+			t.Error("foreign or unvalidated recovery")
+			http.Error(w, "action", 400)
+			return
+		}
+		puts++
+		if puts == 1 {
+			firstRequest = command.RequestID
+			http.Error(w, "known admission rejection", 400)
+			return
+		}
+		if command.RequestID == firstRequest || reads < 2 {
+			t.Error("resent original request without new device read")
+		}
+		terminal := nativeRecoveryTerminal{Identity: state, RequestID: command.RequestID, Operation: "2", Action: "recover", ResponseCode: 200, CSeq: 7}
+		json.NewEncoder(w).Encode(nativeRecoveryResult{nativeAttentionResult: nativeAttentionResult{Identity: state, RequestID: command.RequestID, Operation: "2", Action: "recover", Outcome: "protocol_accepted", ResponseCode: 200, CSeq: 7, Current: true}, Origin: origin, State: "restored", Proof: &nativeRecoveryProof{Database: testNativeProcess, LedgerComplete: true, Terminal: &terminal}})
+	}))
+	defer srv.Close()
+	a.custody = &attentionCustody{Version: 1, Room: "r0", path: path, imported: true, Sessions: []*custodySession{{Process: attentionManagerProcess(), Revision: "1", Nonce: testConversationA, Outputs: map[string]*custodyOutput{testConversationA: {Base: srv.URL, DeviceID: "1", Origin: origin, Original: original}}}}}
+	if err := a.custody.save(); err != nil {
+		t.Fatal(err)
+	}
+	if a.reconcileCustody() {
+		t.Fatal("400 credited original retirement")
+	}
+	if puts != 1 || firstRequest == "" || !a.custodyBlocked() {
+		t.Fatal("first admission was not retained")
+	}
+	// Known rejection persists, including across manager restart, but cooldown
+	// cannot issue a PUT and does not pretend the original custody was retired.
+	output := a.custody.Sessions[0].Outputs[testConversationA]
+	if !output.RecoveryRejected || a.reconcileCustody() || puts != 1 || queries != 0 {
+		t.Fatal("confirmed rejection did not retain bounded cooldown")
+	}
+	reloaded := &attention{}
+	reloaded.loadCustody(path, "r0")
+	a = reloaded
+	output = a.custody.Sessions[0].Outputs[testConversationA]
+	if a.custody.fault != nil || !output.RecoveryRejected || a.reconcileCustody() || puts != 1 {
+		t.Fatal("restart lost rejected-attempt custody/cooldown")
+	}
+	output.recoveryRetryAt = time.Now().Add(-time.Second)
+	// Reconciliation reads current exact device afresh; a confirmed400 must not
+	// become endless query404 against a request the backend did not dispatch.
+	if !a.reconcileCustody() {
+		t.Fatalf("pre-admission rejection remained locked: puts=%d fresh_reads=%d request_queries=%d", puts, reads, queries)
+	}
+	if puts != 2 || queries != 0 || !a.custody.Sessions[0].Retired || !a.custody.Sessions[0].Outputs[testConversationA].Retired {
+		t.Fatal("missing exact new recovery proof")
+	}
+}
+
+func TestCustodyAmbiguousRecoveryNeverReadmits(t *testing.T) {
+	for _, mode := range []string{"http500", "malformed200", "connection_lost", "query404", "late_unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			a := &attention{}
+			original := nativeAttentionIdentity{testNativeProcess, "1", "1", "0", "1", "1", "1", "7", 65, 5, false}
+			origin := nativeAttentionOrigin{testNativeProcess, testConversationA}
+			state := nativeAttentionIdentity{testConversationB, "1", "1", "0", "1", "0", "1", "0", 65, 65, false}
+			puts, queries := 0, 0
+			var sent nativeRecoveryCommand
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					if r.URL.Query().Get("request_id") != "" {
+						queries++
+						if r.URL.Query().Get("request_id") != sent.RequestID {
+							t.Error("adopted a different request")
+						}
+						if mode == "late_unknown" {
+							json.NewEncoder(w).Encode(nativeRecoveryResult{nativeAttentionResult: nativeAttentionResult{Identity: state, RequestID: sent.RequestID, Operation: "2", Action: "recover", Outcome: "unknown", Current: true}, Origin: origin, State: "unknown"})
+							return
+						}
+						http.Error(w, "unresolved original", 404)
+						return
+					}
+					json.NewEncoder(w).Encode(nativeRecoveryObservation{nativeAttentionObservation: nativeAttentionObservation{state, "0"}, Idle: custodyIdle(true)})
+					return
+				}
+				puts++
+				if json.NewDecoder(r.Body).Decode(&sent) != nil {
+					t.Error("invalid recovery")
+				}
+				switch mode {
+				case "http500":
+					http.Error(w, "not explicit admission rejection", 500)
+				case "malformed200":
+					fmt.Fprint(w, `{"not":"receipt"}`)
+				case "connection_lost", "query404", "late_unknown":
+					connection, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					connection.Close()
+				}
+			}))
+			defer srv.Close()
+			output := &custodyOutput{Base: srv.URL, DeviceID: "1", Origin: origin, Original: original}
+			a.custody = &attentionCustody{Version: 1, Room: "r0", path: filepath.Join(t.TempDir(), "custody"), imported: true, Sessions: []*custodySession{{Process: attentionManagerProcess(), Revision: "1", Nonce: testConversationA, Outputs: map[string]*custodyOutput{testConversationA: output}}}}
+			if err := a.custody.save(); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 3; i++ {
+				if a.reconcileCustody() {
+					t.Fatal("unknown credited as restoration")
+				}
+			}
+			if puts != 1 || queries < 1 || output.RecoveryRejected || output.Retired {
+				t.Fatalf("ambiguous request resent: puts=%d queries=%d rejected=%v", puts, queries, output.RecoveryRejected)
+			}
+		})
+	}
+}
+
+func TestCustodyRejectedFreshReadCannotChangeOwnerOrDevice(t *testing.T) {
+	for _, mode := range []string{"device", "custody_owner", "session_owner", "request_owner", "origin", "live_lease", "restoring", "not_idle"} {
+		t.Run(mode, func(t *testing.T) {
+			a := &attention{}
+			original := nativeAttentionIdentity{testNativeProcess, "1", "1", "0", "1", "1", "1", "7", 65, 5, false}
+			origin := nativeAttentionOrigin{testNativeProcess, testConversationA}
+			state := nativeAttentionIdentity{testConversationB, "1", "1", "0", "1", "0", "1", "0", 65, 65, false}
+			output := &custodyOutput{DeviceID: "1", Origin: origin, Original: original, RecoveryRejected: true, Recovery: &nativeRecoveryCommand{nativeAttentionCommand{state, testConversationB, "recover", 0, 0}, origin}}
+			puts := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					puts++
+					http.Error(w, "unexpected effect", 400)
+					return
+				}
+				observed, idle := state, true
+				switch mode {
+				case "device":
+					observed.DeviceID = "2"
+				case "custody_owner":
+					a.mu.Lock()
+					a.custody = &attentionCustody{}
+					a.mu.Unlock()
+				case "session_owner":
+					a.mu.Lock()
+					a.custody.Sessions[0].Nonce = testConversationB
+					a.mu.Unlock()
+				case "request_owner":
+					a.mu.Lock()
+					replacement := *output.Recovery
+					output.Recovery = &replacement
+					a.mu.Unlock()
+				case "origin":
+					a.mu.Lock()
+					output.Origin.RequestID = testConversationB
+					a.mu.Unlock()
+				case "live_lease":
+					observed.Lease = "9"
+				case "restoring":
+					observed.Restoring = true
+				case "not_idle":
+					idle = false
+				}
+				json.NewEncoder(w).Encode(nativeRecoveryObservation{nativeAttentionObservation: nativeAttentionObservation{observed, "0"}, Idle: custodyIdle(idle)})
+			}))
+			defer srv.Close()
+			output.Base = srv.URL
+			a.custody = &attentionCustody{Version: 1, Room: "r0", path: filepath.Join(t.TempDir(), "custody"), imported: true, Sessions: []*custodySession{{Process: attentionManagerProcess(), Revision: "1", Nonce: testConversationA, Outputs: map[string]*custodyOutput{testConversationA: output}}}}
+			if err := a.custody.save(); err != nil {
+				t.Fatal(err)
+			}
+			if a.reconcileCustody() || puts != 0 || output.Retired {
+				t.Fatal("fresh read crossed original custody/device authority")
+			}
+		})
+	}
+}

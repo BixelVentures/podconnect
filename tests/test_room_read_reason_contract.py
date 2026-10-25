@@ -142,7 +142,10 @@ class ReadReasonContract(unittest.IsolatedAsyncioTestCase):
         )
         owner = types.SimpleNamespace(
             data=data,
-            controls=lambda *args: {"owner_epoch": "epoch", "poll_sequence": 7},
+            controls=lambda *args, **kwargs: {
+                "owner_epoch": "epoch",
+                "poll_sequence": 7,
+            },
             _refresh_owner_current=lambda *args: True,
         )
         transport = room.RoomTransport(owner)

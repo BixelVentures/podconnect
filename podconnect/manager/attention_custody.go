@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Custody is retirement authority, never authority to replay a BEGIN or adopt a
@@ -47,16 +48,18 @@ type nativeRecoveryResult struct {
 	Proof  *nativeRecoveryProof  `json:"recovery_proof,omitempty"`
 }
 type custodyOutput struct {
-	ConsumedDrains map[string]bool         `json:"consumed_drains,omitempty"`
-	NoSubmission   bool                    `json:"no_submission,omitempty"`
-	Release        *nativeAttentionResult  `json:"release,omitempty"`
-	Original       nativeAttentionIdentity `json:"original"`
-	Base           string                  `json:"endpoint"`
-	DeviceID       string                  `json:"device_id"`
-	Origin         nativeAttentionOrigin   `json:"origin"`
-	Retired        bool                    `json:"retired"`
-	Recovery       *nativeRecoveryCommand  `json:"recovery,omitempty"`
-	Result         *nativeRecoveryResult   `json:"result,omitempty"`
+	RecoveryRejected bool                    `json:"recovery_rejected,omitempty"`
+	recoveryRetryAt  time.Time               // Existing three-second recovery retry cadence; not authority.
+	ConsumedDrains   map[string]bool         `json:"consumed_drains,omitempty"`
+	NoSubmission     bool                    `json:"no_submission,omitempty"`
+	Release          *nativeAttentionResult  `json:"release,omitempty"`
+	Original         nativeAttentionIdentity `json:"original"`
+	Base             string                  `json:"endpoint"`
+	DeviceID         string                  `json:"device_id"`
+	Origin           nativeAttentionOrigin   `json:"origin"`
+	Retired          bool                    `json:"retired"`
+	Recovery         *nativeRecoveryCommand  `json:"recovery,omitempty"`
+	Result           *nativeRecoveryResult   `json:"result,omitempty"`
 }
 type custodySession struct {
 	Process  string                    `json:"process"`
@@ -196,6 +199,13 @@ func (a *attention) loadCustody(path, room string) {
 			if o == nil || key != o.Origin.RequestID || !validAttentionNonce(key) || !validAttentionNonce(o.Origin.Process) || !nativeCurrency(o.DeviceID) || !o.Original.valid() || o.Original.DeviceID != o.DeviceID || o.Original.Process != o.Origin.Process || o.Base == "" || s.Retired && !o.Retired {
 				c.fault = errors.New("invalid custody output")
 				return
+			}
+			if o.RecoveryRejected {
+				if o.Recovery == nil || o.Result != nil || o.Retired {
+					c.fault = errors.New("invalid rejected recovery attempt")
+					return
+				}
+				o.recoveryRetryAt = time.Now().Add(3 * time.Second)
 			}
 			if o.Retired && !o.NoSubmission && !validCustodyRelease(o) && (o.Recovery == nil || o.Result == nil || !recoveryReceipt(*o.Recovery, o.Original, o.DeviceID, *o.Result)) {
 				c.fault = errors.New("custody retirement lacks exact proof")
@@ -422,13 +432,35 @@ func (a *attention) reconcileCustody() bool {
 			if o.Retired {
 				continue
 			}
+			origin, original, endpoint, device := o.Origin, o.Original, o.Base, o.DeviceID
+			parentProcess, parentRevision, parentNonce := s.Process, s.Revision, s.Nonce
+			attempt := o.Recovery
+			outputCurrentLocked := func() bool {
+				present := false
+				for _, parent := range c.Sessions {
+					present = present || parent == s
+				}
+				return a.custody == c && c.fault == nil && present &&
+					s.Process == parentProcess && s.Revision == parentRevision && s.Nonce == parentNonce &&
+					!s.Retired && !o.Retired &&
+					s.Outputs[origin.RequestID] == o && o.Origin == origin && o.Original == original &&
+					o.Base == endpoint && o.DeviceID == device
+			}
 			var state nativeRecoveryObservation
 			if nativeAttentionHTTP(o.Base, o.DeviceID, "", http.MethodGet, nil, &state) != nil || !state.valid() || state.DeviceID != o.DeviceID {
 				return false
 			}
+			a.mu.Lock()
+			retained := outputCurrentLocked() && o.Recovery == attempt
+			rejected := o.RecoveryRejected
+			cooling := rejected && time.Now().Before(o.recoveryRetryAt)
+			a.mu.Unlock()
+			if !retained || cooling {
+				return false
+			}
 			// Native process replacement invalidates the fresh attempt, not the durable
 			// original obligation. Only recover can act; old BEGIN/UPDATE are never sent.
-			fresh := o.Recovery == nil || o.Recovery.Expected.Process != state.Process
+			fresh := rejected || o.Recovery == nil || o.Recovery.Expected.Process != state.Process
 			drainKey := state.Process + ":" + state.DrainedOperation + ":" + state.DrainedRequestID
 			ownedDrain := false
 			if o.Recovery != nil && o.Result != nil && (o.Result.Outcome == "failed" || o.Result.Outcome == "unknown") && validRecoveryObservation(*o.Recovery, o.DeviceID, *o.Result) {
@@ -445,6 +477,11 @@ func (a *attention) reconcileCustody() bool {
 				}
 				command := nativeRecoveryCommand{nativeAttentionCommand{state.nativeAttentionIdentity, requestID, "recover", 0, 0}, o.Origin}
 				a.mu.Lock()
+				if !outputCurrentLocked() || o.Recovery != attempt {
+					a.mu.Unlock()
+					return false
+				}
+				o.RecoveryRejected = false
 				o.Recovery = &command
 				o.Result = nil
 				if ownedDrain {
@@ -459,13 +496,28 @@ func (a *attention) reconcileCustody() bool {
 					return false
 				}
 				var result nativeRecoveryResult
-				if nativeAttentionHTTP(o.Base, o.DeviceID, "", http.MethodPut, &command, &result) != nil {
+				if err := nativeAttentionHTTP(o.Base, o.DeviceID, "", http.MethodPut, &command, &result); err != nil {
+					// This C endpoint's 400 paths precede backend dispatch. Retain
+					// original custody, but do not poll a nonexistent command forever.
+					if err == nativeAttentionHTTPStatus(http.StatusBadRequest) {
+						a.mu.Lock()
+						if outputCurrentLocked() && o.Recovery == &command && o.Result == nil {
+							o.RecoveryRejected = true
+							o.recoveryRetryAt = time.Now().Add(3 * time.Second)
+							_ = c.save() // A failed durable save sets the existing custody fault.
+						}
+						a.mu.Unlock()
+					}
 					return false
 				}
-				if !validRecoveryObservation(*o.Recovery, o.DeviceID, result) {
+				if !validRecoveryObservation(command, device, result) {
 					return false
 				}
 				a.mu.Lock()
+				if !outputCurrentLocked() || o.Recovery != &command {
+					a.mu.Unlock()
+					return false
+				}
 				o.Result = &result
 				err = c.save()
 				a.mu.Unlock()
