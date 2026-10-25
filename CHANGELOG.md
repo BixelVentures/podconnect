@@ -1,3 +1,16 @@
+## Speakers 0.26.52
+
+- Keep FIFO metadata creation, reads and retirement on the existing input thread,
+  bound to its exact source/setup generation. A delayed stop for a reused DB id/path
+  must not retire the successor metadata watch.
+- Retain the causal metadata-FIFO owner regression in the existing official C gate.
+  Native production, manager and Control source0.10.21 are unchanged. No retry, timeout,
+  route-authority or volume-policy change is added.
+- Reviewed offline ARM source and protocol evidence does not establish HomePod
+  audibility or attribute every failed field attempt. RTP output evidence remains
+  external; its large fixture is excluded from this release. Official CI,
+  publication, installation and physical acceptance remain pending.
+
 ## Speakers 0.26.51
 
 - Apply the retirement-only correction for an exact failed, C-completed START

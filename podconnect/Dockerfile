@@ -144,6 +144,8 @@ COPY patches/connect-retired-owner-detach-owntone.patch /patches/connect-retired
 COPY patches/connect-retired-owner-detach-owntone.sha256 /patches/connect-retired-owner-detach-owntone.sha256
 COPY patches/ordinary-pause-ack-owntone.patch /patches/ordinary-pause-ack-owntone.patch
 COPY patches/ordinary-pause-ack-owntone.sha256 /patches/ordinary-pause-ack-owntone.sha256
+COPY patches/pipe-metadata-owner-owntone.patch /patches/pipe-metadata-owner-owntone.patch
+COPY patches/pipe-metadata-owner-owntone.sha256 /patches/pipe-metadata-owner-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
@@ -205,6 +207,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/ordinary-pause-ack-owntone.sha256 \
   && git apply --check /patches/ordinary-pause-ack-owntone.patch \
   && git apply /patches/ordinary-pause-ack-owntone.patch \
+  && sha256sum -c /patches/pipe-metadata-owner-owntone.sha256 \
+  && git apply --check /patches/pipe-metadata-owner-owntone.patch \
+  && git apply /patches/pipe-metadata-owner-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

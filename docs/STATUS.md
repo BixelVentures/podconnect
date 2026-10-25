@@ -1,3 +1,40 @@
+## Active candidate52 — FIFO metadata ownership, 25 October 2026
+
+Lead /root; mechanical composition /root/sol61_release75_review. The lead reports
+three failed physical music attempts; admitted Native playback, FIFO/metadata
+ownership and actual speaker audio remain separate claims. Baseline is published
+Speakers0.26.51 / Control source0.10.21, commit4b9740bb1fcb8272ab00cc9415c0fead61b84591,
+tree80a4e4e0c64c0d1cb292146a0405c1c5a62033ad. No successful sound acceptance is inferred.
+
+Reviewed correction: metadata watches are created/read/retired on the existing pipe
+input thread and bound to the exact setup generation and source identity; a late
+stop for a reused DB id/path cannot retire its successor. Speakers0.26.52 adds one
+reviewed C overlay after unchanged C20. Native159 production files, manager,
+Control source0.10.21, authority, retries, timeouts, volume and route policy are unchanged.
+
+Independent review74 source/composition GO covers the seven-path source preparation
+receipt ea8d115c7054f2b7c2fcf0ade9c15cbfef33cdc371236fe7fd1c6c818b5fd7cd.
+Its portability-only fixture adaptations preserve both existing Gcrypt initialization
+calls and omit generated Makefile.in; existing autoreconf regenerates that file from
+the reviewed Makefile.am flag. C21 production patch e42518bb and composed pipe.c
+7d4ea19f match the source owner. The cumulative existing CI-only overlay is f6ae54ae;
+Docker and official CI apply production C21 in the same position. Official CI invokes
+--metadata-pipe-owner exactly once. Clean21-source/5-fixture replay, YAML and whitespace
+checks pass. Existing ARM OwnTone/harness and actual metadata-FIFO successor results
+are retained; no broad local gate was repeated.
+
+The stale-retirement counterfactual is causal source evidence, not reproduction of
+the field evbuffer crash or proof of HomePod sound. The separately reviewed private
+Native→FIFO→C→AP2 RTP evidence is retained externally: packet emission at a private
+peer, not decrypted PCM content, sub-poll device timing, provider behavior or physical
+HomePod audibility. The large RTP Native fixture and its C observer are deliberately
+excluded from52; no new Native fixture or production artifact is adopted.
+
+This is the frozen local52 candidate for root-owned official CI. Publication,
+installation and physical acceptance are pending. Root alone owns remote mutation
+and delivery; no network/device action occurred during composition. Rollback removes
+C21 and its metadata build/fixture wiring. All incumbent gates remain in force.
+
 ## Active field incident — ordinary Connect pause and volume observation, 24 October 2026
 
 Lead: /root. Installed Speakers0.26.44, Control0.10.21 and PodVoice2.0.80. First ordinary Spotify Connect transfer at11:01:53 reached route_accepted at11:01:56, primed35%. Same-process passive C snapshots show selected Kitchen, session1/route1, base/effective35; no physical sound acceptance is recorded. User reports volume control disabling/re-enabling and displaying100%, plus a non-live timeline. A displayed100% is not evidence of physical100%.

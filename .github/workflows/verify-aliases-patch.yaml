@@ -124,6 +124,9 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/ordinary-pause-ack-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/ordinary-pause-ack-owntone.patch"
           git apply "$patch_dir/ordinary-pause-ack-owntone.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/pipe-metadata-owner-owntone.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/pipe-metadata-owner-owntone.patch"
+          git apply "$patch_dir/pipe-metadata-owner-owntone.patch"
           # Fixture-only macro scope; no production OwnTone source or Docker image change.
           fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
           sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
@@ -166,6 +169,7 @@ jobs:
           sudo -n make check
           sudo -n src/outputs_attention_owner --deployed-uid-proc
           sudo -n src/airplay_callback_owner --queue-wire
+          sudo -n src/airplay_callback_owner --metadata-pipe-owner
           sudo -n timeout 25 src/airplay_callback_owner --move-pause-resume-wire
           sudo -n src/airplay_callback_owner --queue-connect-wire
           sudo -n src/airplay_callback_owner --move-retire-wire

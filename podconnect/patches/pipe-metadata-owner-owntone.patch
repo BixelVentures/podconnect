@@ -1,0 +1,343 @@
+--- a/src/inputs/pipe.c
++++ b/src/inputs/pipe.c
+@@ -45,6 +45,9 @@
+ #include <errno.h>
+ #include <limits.h>
+ #include <pthread.h>
++#ifdef PIPE_METADATA_OWNER_TEST
++#include <assert.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/ioctl.h>
+@@ -99,6 +102,7 @@
+   enum pipetype type;   // PCM (audio) or metadata
+   event_callback_fn cb; // Callback when there is data to read
+   struct event *ev;     // Event for the callback
++  uint64_t metadata_generation; // Input setup identity, distinct from reused DB id
+ 
+   struct pipe *next;
+ };
+@@ -122,6 +126,8 @@
+ {
+   // Pipe that we start watching for metadata after playback starts
+   struct pipe *pipe;
++  uint32_t source_id;
++  uint64_t generation;
+   // We read metadata into this evbuffer
+   struct evbuffer *evbuf;
+   // Storage of current metadata
+@@ -154,6 +160,11 @@
+ 
+ // Pipe + extra fields that we start watching for metadata after playback starts
+ static struct pipe_metadata pipe_metadata;
++/* Assigned only by the input thread; zero is never a live metadata watch. */
++static uint64_t pipe_metadata_next_generation;
++#ifdef PIPE_METADATA_OWNER_TEST
++static uint64_t pipe_metadata_test_reads;
++#endif
+ 
+ /* -------------------------------- HELPERS --------------------------------- */
+ 
+@@ -826,21 +837,47 @@
+ 
+ 
+ /* --------------------------- METADATA PIPE HANDLING ----------------------- */
+-/*                                Thread: worker                              */
++/*                                Thread: pipe                                */
+ 
+ static void
+ pipe_metadata_watch_del(void *arg)
+ {
++#ifdef PIPE_METADATA_OWNER_TEST
++  assert(pthread_equal(pthread_self(), tid_pipe));
++#endif
+   if (!pipe_metadata.pipe)
+     return;
+ 
+-  evbuffer_free(pipe_metadata.evbuf);
++  /* The read event and FIFO belong to this event loop. Retire them before
++   * releasing the buffer that an active callback may still reference. */
+   watch_del(pipe_metadata.pipe);
+   pipe_free(pipe_metadata.pipe);
+   pipe_metadata.pipe = NULL;
++  pipe_metadata.source_id = 0;
++  pipe_metadata.generation = 0;
++  evbuffer_free(pipe_metadata.evbuf);
++  pipe_metadata.evbuf = NULL;
+ 
+   pict_tmpfile_close(pipe_metadata.prepared.pict_tmpfile_fd, pipe_metadata.prepared.pict_tmpfile_path);
+   pipe_metadata.prepared.pict_tmpfile_fd = -1;
++}
++
++struct pipe_metadata_command
++{
++  uint32_t source_id;
++  uint64_t generation;
++  char path[];
++};
++
++static enum command_state
++pipe_metadata_watch_del_command(void *arg, int *retval)
++{
++  struct pipe_metadata_command *command = arg;
++  if (!command || (pipe_metadata.source_id == command->source_id
++      && pipe_metadata.generation == command->generation))
++    pipe_metadata_watch_del(NULL);
++  *retval = 0;
++  return COMMAND_END;
+ }
+ 
+ // Some metadata arrived on a pipe we watch
+@@ -850,6 +887,11 @@
+   enum pipe_metadata_msg message;
+   size_t len;
+   int ret;
++
++#ifdef PIPE_METADATA_OWNER_TEST
++  assert(pthread_equal(pthread_self(), tid_pipe));
++  pipe_metadata_test_reads++;
++#endif
+ 
+   ret = evbuffer_read(pipe_metadata.evbuf, pipe_metadata.pipe->fd, PIPE_READ_MAX);
+   if (ret < 0)
+@@ -900,21 +942,34 @@
+     event_add(pipe_metadata.pipe->ev, NULL);
+ }
+ 
+-static void
+-pipe_metadata_watch_add(void *arg)
+-{
+-  char *base_path = arg;
++static enum command_state
++pipe_metadata_watch_add(void *arg, int *retval)
++{
++#ifdef PIPE_METADATA_OWNER_TEST
++  assert(pthread_equal(pthread_self(), tid_pipe));
++#endif
++  struct pipe_metadata_command *command = arg;
+   char path[PATH_MAX];
+   int ret;
+ 
+-  ret = snprintf(path, sizeof(path), "%s.metadata", base_path);
+-  if ((ret < 0) || (ret > sizeof(path)))
+-    return;
++  ret = snprintf(path, sizeof(path), "%s.metadata", command->path);
++  if ((ret < 0) || ((size_t)ret >= sizeof(path)))
++    return COMMAND_END;
+ 
+   pipe_metadata_watch_del(NULL); // Just in case we somehow already have a metadata pipe open
+ 
+   pipe_metadata.pipe = pipe_create(path, 0, PIPE_METADATA, pipe_metadata_read_cb);
+   pipe_metadata.evbuf = evbuffer_new();
++  if (!pipe_metadata.pipe || !pipe_metadata.evbuf)
++    {
++      if (pipe_metadata.pipe)
++	pipe_free(pipe_metadata.pipe);
++      if (pipe_metadata.evbuf)
++	evbuffer_free(pipe_metadata.evbuf);
++      pipe_metadata.pipe = NULL;
++      pipe_metadata.evbuf = NULL;
++      return COMMAND_END;
++    }
+ 
+   ret = watch_add(pipe_metadata.pipe);
+   if (ret < 0)
+@@ -922,9 +977,47 @@
+       evbuffer_free(pipe_metadata.evbuf);
+       pipe_free(pipe_metadata.pipe);
+       pipe_metadata.pipe = NULL;
+-      return;
+-    }
+-}
++      pipe_metadata.evbuf = NULL;
++      return COMMAND_END;
++    }
++  pipe_metadata.source_id = command->source_id;
++  pipe_metadata.generation = command->generation;
++  *retval = 0;
++  return COMMAND_END;
++}
++
++#ifdef PIPE_METADATA_OWNER_TEST
++struct pipe_metadata_test_state
++{
++  uint64_t generation;
++  uint64_t reads;
++  uint32_t source_id;
++  bool watching;
++};
++static enum command_state
++pipe_metadata_test_observe(void *arg, int *retval)
++{
++  struct pipe_metadata_test_state *state = arg;
++  state->generation = pipe_metadata.generation;
++  state->reads = pipe_metadata_test_reads;
++  state->source_id = pipe_metadata.source_id;
++  state->watching = pipe_metadata.pipe && pipe_metadata.evbuf && pipe_metadata.pipe->ev;
++  *retval = 0;
++  return COMMAND_END;
++}
++int
++pipe_metadata_test_snapshot(uint64_t *generation, uint32_t *source_id, bool *watching, uint64_t *reads)
++{
++  struct pipe_metadata_test_state state = {0};
++  if (!cmdbase || commands_exec_sync(cmdbase, pipe_metadata_test_observe, NULL, &state) < 0)
++    return -1;
++  *generation = state.generation;
++  *source_id = state.source_id;
++  *watching = state.watching;
++  *reads = state.reads;
++  return 0;
++}
++#endif
+ 
+ 
+ /* ----------------------- PIPE WATCH THREAD START/STOP --------------------- */
+@@ -946,6 +1039,7 @@
+   if (!tid_pipe)
+     return;
+ 
++  commands_exec_sync(cmdbase, pipe_metadata_watch_del_command, NULL, NULL);
+   commands_exec_sync(cmdbase, pipe_watch_update, NULL, NULL);
+   commands_base_destroy(cmdbase);
+ 
+@@ -995,9 +1089,8 @@
+   return head;
+ }
+ 
+-// Queries the db to see if any pipes are present in the library. If so, starts
+-// the pipe thread to watch the pipes. If no pipes in library, it will shut down
+-// the pipe thread.
++// Update library watches on the pipe event loop. Metadata uses the same loop,
++// which remains alive even when the library has no watched PCM pipes.
+ static void
+ pipe_listener_cb(short event_mask, void *ctx)
+ {
+@@ -1008,16 +1101,6 @@
+     return;
+ 
+   cmdarg->pipelist = pipelist_create();
+-  if (!cmdarg->pipelist)
+-    {
+-      pipe_thread_stop();
+-      free(cmdarg);
+-      return;
+-    }
+-
+-  if (!tid_pipe)
+-    pipe_thread_start();
+-
+   commands_exec_async(cmdbase, pipe_watch_update, cmdarg);
+ }
+ 
+@@ -1029,6 +1112,7 @@
+ setup(struct input_source *source)
+ {
+   struct pipe *pipe;
++  struct pipe_metadata_command *metadata_command;
+   int fd;
+ 
+   fd = pipe_open(source->path, 0);
+@@ -1041,8 +1125,18 @@
+ 
+   pipe->fd = fd;
+   pipe->is_autostarted = (source->id == pipe_autostart_id);
+-
+-  worker_execute(pipe_metadata_watch_add, source->path, strlen(source->path) + 1, 0);
++  if (pipe_metadata_next_generation != UINT64_MAX)
++    pipe->metadata_generation = ++pipe_metadata_next_generation;
++
++  metadata_command = malloc(sizeof(*metadata_command) + strlen(source->path) + 1);
++  if (metadata_command)
++    {
++      metadata_command->source_id = source->id;
++      metadata_command->generation = pipe->metadata_generation;
++      strcpy(metadata_command->path, source->path);
++      if (!metadata_command->generation || commands_exec_async(cmdbase, pipe_metadata_watch_add, metadata_command) < 0)
++	free(metadata_command);
++    }
+ 
+   source->input_ctx = pipe;
+ 
+@@ -1057,6 +1151,7 @@
+ stop(struct input_source *source)
+ {
+   struct pipe *pipe = source->input_ctx;
++  struct pipe_metadata_command *metadata_command;
+   union pipe_arg *cmdarg;
+ 
+   DPRINTF(E_DBG, L_PLAYER, "Stopping pipe\n");
+@@ -1074,8 +1169,16 @@
+       commands_exec_async(cmdbase, pipe_watch_reset, cmdarg);
+     }
+ 
+-  if (pipe_metadata.pipe)
+-    worker_execute(pipe_metadata_watch_del, NULL, 0, 0);
++  /* The add may still be queued; always queue the matching retirement after
++   * it. An old stop cannot destroy a successor's metadata watch. */
++  metadata_command = malloc(sizeof(*metadata_command));
++  if (metadata_command)
++    {
++      metadata_command->source_id = source->id;
++      metadata_command->generation = pipe->metadata_generation;
++      if (commands_exec_async(cmdbase, pipe_metadata_watch_del_command, metadata_command) < 0)
++	free(metadata_command);
++    }
+ 
+   pipe_free(pipe);
+ 
+@@ -1144,26 +1247,27 @@
+   pipe_metadata.prepared.pict_tmpfile_fd = -1;
+ 
+   pipe_autostart = cfg_getbool(cfg_getsec(cfg, "library"), "pipe_autostart");
++  pipe_sample_rate = cfg_getint(cfg_getsec(cfg, "library"), "pipe_sample_rate");
++  if (pipe_sample_rate != 44100 && pipe_sample_rate != 48000 && pipe_sample_rate != 88200 && pipe_sample_rate != 96000)
++    {
++      DPRINTF(E_FATAL, L_PLAYER, "The configuration of pipe_sample_rate is invalid: %d\n", pipe_sample_rate);
++      return -1;
++    }
++
++  pipe_bits_per_sample = cfg_getint(cfg_getsec(cfg, "library"), "pipe_bits_per_sample");
++  if (pipe_bits_per_sample != 16 && pipe_bits_per_sample != 32)
++    {
++      DPRINTF(E_FATAL, L_PLAYER, "The configuration of pipe_bits_per_sample is invalid: %d\n", pipe_bits_per_sample);
++      return -1;
++    }
++
++  pipe_thread_start();
+   if (pipe_autostart)
+     {
+       pipe_listener_cb(0, NULL);
+       CHECK_ERR(L_PLAYER, listener_add(pipe_listener_cb, LISTENER_DATABASE, NULL));
+     }
+ 
+-  pipe_sample_rate = cfg_getint(cfg_getsec(cfg, "library"), "pipe_sample_rate");
+-  if (pipe_sample_rate != 44100 && pipe_sample_rate != 48000 && pipe_sample_rate != 88200 && pipe_sample_rate != 96000)
+-    {
+-      DPRINTF(E_FATAL, L_PLAYER, "The configuration of pipe_sample_rate is invalid: %d\n", pipe_sample_rate);
+-      return -1;
+-    }
+-
+-  pipe_bits_per_sample = cfg_getint(cfg_getsec(cfg, "library"), "pipe_bits_per_sample");
+-  if (pipe_bits_per_sample != 16 && pipe_bits_per_sample != 32)
+-    {
+-      DPRINTF(E_FATAL, L_PLAYER, "The configuration of pipe_bits_per_sample is invalid: %d\n", pipe_bits_per_sample);
+-      return -1;
+-    }
+-
+   return 0;
+ }
+ 
+@@ -1173,8 +1277,9 @@
+   if (pipe_autostart)
+     {
+       listener_remove(pipe_listener_cb);
+-      pipe_thread_stop();
+-    }
++    }
++
++  pipe_thread_stop();
+ 
+   CHECK_ERR(L_PLAYER, pthread_mutex_destroy(&pipe_metadata.prepared.lock));
+ }
