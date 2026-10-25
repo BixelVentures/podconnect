@@ -357,7 +357,10 @@ class PlaybackCommands:
         if old is None:
             return result  # Eviction is not evidence of rejection or completion.
         receipt = old[1]
-        if receipt.get("schema") == "podconnect.content_reservation.v1":
+        record = None
+        if receipt.get("schema") == "podconnect.content_reservation.v1" or receipt.get(
+            "action"
+        ) in (*self.room_content.actions, *self.room_move.actions):
             records = (self.room_content.records, self.room_move.records)
             record = next(
                 (
@@ -368,7 +371,10 @@ class PlaybackCommands:
                 ),
                 None,
             )
-            if record is None:
+            if record is None or (
+                receipt.get("schema") != "podconnect.content_reservation.v1"
+                and record["terminal"] is not receipt
+            ):
                 return result
         elif (
             receipt.get("request_id") != request_id
@@ -382,6 +388,116 @@ class PlaybackCommands:
             result["status"] = "pending"
         elif receipt.get("outcome") == "rejected":
             result["status"] = "rejected"
+        elif receipt.get("outcome") == "accepted" and record is not None:
+            output = projection.get("output")
+            binding = output.get("binding") if isinstance(output, dict) else None
+            request = record["request"]
+            offer_key = (
+                "start_offer"
+                if record is self.room_content.records.get(sequence)
+                else "move_offer"
+            )
+            offer = request[offer_key]
+            if (
+                isinstance(binding, dict)
+                and binding.get("target_id") == request["target_id"]
+                and binding.get("native_room_id") == request["room_id"]
+                and binding.get("homepod_id") == request["homepod_id"]
+                and receipt.get("target", {}).get("target_id") == request["target_id"]
+                and receipt.get("owner_epoch") == self.owner_epoch
+                and receipt.get("config_entry_id") == entry_id
+                and receipt.get(
+                    "start_operation_id"
+                    if offer_key == "start_offer"
+                    else "move_operation_id"
+                )
+                == offer["offer_id"]
+            ):
+                try:
+                    reader = (
+                        self.data.speakers.room_content_current
+                        if offer_key == "start_offer"
+                        else self.data.speakers.room_move_current
+                    )
+                    async with asyncio.timeout(4):
+                        witness = await reader(offer["offer_id"], offer["binding_id"])
+                    async with asyncio.timeout(2):
+                        state = await self.room_transport.observe(
+                            hass,
+                            entry_id,
+                            binding["target_id"],
+                            binding["native_room_id"],
+                            binding["homepod_id"],
+                        )
+                    identity = [
+                        entry_id,
+                        self.owner_epoch,
+                        state["native"],
+                        state["route"],
+                    ]
+                    binding_id = hashlib.sha256(
+                        json.dumps(
+                            identity,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    ).hexdigest()
+                    route = state["route"]
+                    c_route = witness["route"]
+                    target = witness["target"]
+                    if (
+                        isinstance(witness, dict)
+                        and set(witness)
+                        == {
+                            "schema",
+                            "offer_id",
+                            "binding_id",
+                            "operation_id",
+                            "native",
+                            "route",
+                            "target",
+                            "physical_result_verified",
+                        }
+                        and witness["schema"]
+                        == "podconnect.native_completed_current.v1"
+                        and witness["offer_id"] == offer["offer_id"]
+                        and witness["binding_id"] == offer["binding_id"]
+                        and witness["operation_id"] == offer["offer_id"]
+                        and witness["physical_result_verified"] is False
+                        and witness["native"] == state["native"]
+                        and isinstance(c_route, dict)
+                        and c_route == route
+                        and isinstance(target, dict)
+                        and set(target)
+                        == {"process", "device_id", "device_incarnation"}
+                        and target["process"] == route["process"]
+                        and target["device_id"] == route["device_id"]
+                        and target["device_incarnation"] == route["device_incarnation"]
+                        and int(route["route_revision"]) > 0
+                        and binding_id == binding["binding_id"]
+                        and sequence == self.command_sequence
+                        and not self.busy
+                        and self.receipts.get(sequence) is old
+                        and record["terminal"] is receipt
+                        and self._refresh_owner_current(hass, entry_id)
+                    ):
+                        result["status"] = "confirmed"
+                        result["observation"] = {
+                            "source": "native_bound_state",
+                            "effect_revision": route["route_revision"],
+                            "prepare_id": offer["offer_id"],
+                        }
+                except (
+                    CommandRejected,
+                    HomeAssistantError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    SpeakersError,
+                    TimeoutError,
+                ):
+                    pass
         elif receipt.get("outcome") == "accepted" and len(old) == 3 and old[2]:
             output = projection.get("output")
             binding = output.get("binding") if isinstance(output, dict) else None

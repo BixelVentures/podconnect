@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_room_content as fixtures
+import test_room_move as move_fixtures
 from aiohttp import web
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry
@@ -42,6 +43,19 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             "play_episode",
             "play_tracks",
         ]
+        self.source_selection_fixture = False
+        self.source_move_posts = []
+        self.source_release_status = 200
+        self.source_has_release = True
+        self.source_idle_probe_status = 200
+        self.source_idle_reads = 0
+        self.source_idle_echo = True
+        self.source_alias_names = ("Alpha", "Beta")
+        self.source_external_name = "External"
+        self.source_release_corrupt = None
+        self.source_effects = []
+        self.source_external_restricted = False
+        self.source_current_target = None
         self.alias_reads = 0
         self.alias_hold_at = None
         self.alias_entered = asyncio.Event()
@@ -58,6 +72,7 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
                 self.library_release,
             )
         )
+        self.alias_reads = 0
         self.data = self.entries[0].runtime_data
         registry = entity_registry.async_get(self.hass)
         self.entity_id = registry.async_get_entity_id(
@@ -79,6 +94,165 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         return value
 
     async def _backend(self, request):
+        if self.source_selection_fixture:
+            if (
+                request.path == "/api/rooms"
+                and request.query.get("include_release") == "1"
+            ):
+                return web.json_response(
+                    {
+                        "rooms": [
+                            {
+                                "id": "room-alpha",
+                                "homepod_id": "123",
+                                "release": {"owner_binding_id": "d" * 64}
+                                if self.source_has_release
+                                else None,
+                            },
+                            {"id": "room-beta", "homepod_id": "456"},
+                        ]
+                    }
+                )
+            if request.path == "/api/release":
+                body = await request.json()
+                self.source_effects.append((request.path, body))
+                if self.source_release_status != 200:
+                    return web.Response(status=self.source_release_status)
+                result = {
+                    "schema": "podconnect.release_result.v1",
+                    "ok": True,
+                    "prepare_id": "a" * 32,
+                    "outcome": "retired",
+                    "terminal": True,
+                    "contexts_drained": True,
+                    "retry_allowed": False,
+                    "physical_result_verified": False,
+                }
+                if self.source_release_corrupt:
+                    self.source_release_corrupt(result)
+                return web.json_response(result)
+            if request.path == "/api/room-switch" and request.method == "POST":
+                body = await request.json()
+                self.source_effects.append((request.path, body))
+                native = self.native()
+                return web.json_response(
+                    {
+                        "accepted_local": True,
+                        "binding": {
+                            "ready": True,
+                            "incarnation": native["alias_incarnation"],
+                            "registry": native["alias_registry"],
+                            "room_id": body["room_id"],
+                        },
+                        **(
+                            {"idle_only": True} if body.get("idle_only") is True else {}
+                        ),
+                    }
+                )
+            if request.path == "/spotify/me/player" and request.method == "PUT":
+                body = await request.json()
+                self.source_effects.append((request.path, body))
+                self.calls.append((request.method, request.path, b"", True))
+                return web.Response(status=204)
+            if request.path == "/api/room-switch" and request.method == "GET":
+                if request.query.get("idle_only") == "1":
+                    self.source_idle_reads += 1
+                    if self.source_idle_probe_status != 200:
+                        return web.Response(status=self.source_idle_probe_status)
+                self.alias_reads += 1
+                self.alias_entered.set()
+                if self.alias_reads == self.alias_hold_at:
+                    await self.alias_release.wait()
+                native = self.native()
+                return web.json_response(
+                    {
+                        "binding": {
+                            "ready": True,
+                            "incarnation": native["alias_incarnation"],
+                            "registry": native["alias_registry"],
+                            "room_id": native["room_id"],
+                        },
+                        **(
+                            {"idle_only": True}
+                            if request.query.get("idle_only") == "1"
+                            and self.source_idle_echo
+                            else {}
+                        ),
+                        "aliases": [
+                            {
+                                "id": 1,
+                                "room_id": "room-alpha",
+                                "name": self.source_alias_names[0],
+                            },
+                            {
+                                "id": 2,
+                                "room_id": "room-beta",
+                                "name": self.source_alias_names[1],
+                            },
+                        ],
+                    }
+                )
+            if request.path == "/spotify/me/player/devices":
+                return web.json_response(
+                    {
+                        "devices": [
+                            {
+                                "id": self.native_id,
+                                "name": "Alpha",
+                                "is_restricted": False,
+                                "is_active": True,
+                                "volume_percent": 30,
+                                "supports_volume": True,
+                            },
+                            {
+                                "id": self.external_id,
+                                "name": self.source_external_name,
+                                "is_restricted": self.source_external_restricted,
+                                "is_active": False,
+                                "volume_percent": 30,
+                                "supports_volume": True,
+                            },
+                        ]
+                    }
+                )
+            if request.path == "/api/room-move/state":
+                self.move_offer_id = "a" * 32
+                self.assertEqual(request.query["target_id"], self.native_id)
+                return web.json_response(
+                    {
+                        "schema": "podconnect.room_move_state.v1",
+                        "ok": True,
+                        "move_offer": move_fixtures.RoomMoveFrameworkTests.move_offer_value(
+                            self
+                        ),
+                        "actions": ["move_existing_session"],
+                        "physical_result_verified": False,
+                    }
+                )
+            if request.path.startswith("/api/room-move/"):
+                body = await request.json()
+                self.source_move_posts.append((request.path, body))
+                if request.path.endswith("prepare"):
+                    self.content_entered.set()
+                    if self.content_hold:
+                        await self.content_release.wait()
+                    return web.json_response(
+                        move_fixtures.RoomMoveFrameworkTests.move_result(
+                            self, "prepare", "staged"
+                        )
+                    )
+                if request.path.endswith("cancel"):
+                    return web.json_response(
+                        move_fixtures.RoomMoveFrameworkTests.move_result(
+                            self, "cancel", "cancelled"
+                        )
+                    )
+                self.assertEqual(request.path, "/api/room-move/commit")
+                return web.json_response(
+                    move_fixtures.RoomMoveFrameworkTests.move_result(
+                        self, "commit", "complete"
+                    )
+                )
         if (
             request.path
             in {
@@ -154,7 +328,7 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
                 {
                     "is_playing": self.playing,
                     "device": {
-                        "id": self.native_id,
+                        "id": self.source_current_target or self.native_id,
                         "name": "SAME NAME",
                         "is_restricted": False,
                         "volume_percent": 30,
@@ -562,6 +736,315 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         )
         self.assertEqual(len(self._writes()), 1)
         self.assertEqual((self.prepares(), self.content_commits()), ([], []))
+
+    async def test_media_select_configured_alias_uses_room_move_preserving_pause(self):
+        self.source_selection_fixture = True
+        self.beta_output = "456"
+        for playing in (True, False):
+            self.playing = playing
+            await self.data.coordinator.async_refresh()
+            await self.native_call("select_source", source="Beta")
+            prepare = self.source_move_posts[-2][1]
+            self.assertEqual(prepare["action"], "move_existing_session")
+            self.assertEqual(prepare["args"], {})
+            self.assertEqual(prepare["scope"]["room_id"], "room-beta")
+            self.assertEqual(prepare["scope"]["homepod_id"], "456")
+            self.assertEqual(self.playing, playing)
+        self.assertEqual(
+            [path for path, _ in self.source_move_posts],
+            ["/api/room-move/prepare", "/api/room-move/commit"] * 2,
+        )
+        self.assertEqual(self.data.commands.command_sequence, 2)
+        self.assertEqual(self._writes(), [])
+
+    async def test_media_select_source_list_reads_only_cached_aliases(self):
+        from custom_components.podconnect.targets import configured_alias_targets
+
+        self.source_selection_fixture = True
+        await configured_alias_targets(self.data.speakers)
+        reads = self.alias_reads
+        for _ in range(3):
+            self.assertIn("Beta", self.entity.source_list)
+            self.assertIn("Alpha", self.entity.source_list)
+        self.assertEqual(self.alias_reads, reads)
+        self.assertEqual(
+            (self.source_effects, self.source_move_posts, self._writes()), ([], [], [])
+        )
+
+    async def test_media_select_native_to_external_releases_once_before_transfer(self):
+        self.source_selection_fixture = True
+        self.playing = False
+        await self.native_call("select_source", source="External")
+        self.assertEqual(
+            [path for path, _ in self.source_effects],
+            ["/api/release", "/spotify/me/player"],
+        )
+        release = self.source_effects[0][1]
+        self.assertEqual(set(release), {"room_id", "expected_binding_id", "request_id"})
+        self.assertEqual(release["room_id"], "room-alpha")
+        self.assertEqual(release["expected_binding_id"], "d" * 64)
+        self.assertRegex(release["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            self.source_effects[1][1], {"device_ids": [self.external_id], "play": False}
+        )
+        self.assertEqual(self.source_move_posts, [])
+
+    async def test_media_select_native_unknown_release_cannot_transfer(self):
+        self.source_selection_fixture = True
+        self.source_release_corrupt = lambda value: value.update(contexts_drained=False)
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.assertEqual([path for path, _ in self.source_effects], ["/api/release"])
+        self.assertEqual(self._writes(), [])
+
+    async def test_media_select_external_source_uses_existing_adapter_without_release(
+        self,
+    ):
+        self.source_selection_fixture = True
+        self.source_has_release = False
+        self.source_current_target = self.external_id
+        self.playing = True
+        await self.native_call("select_source", source="External")
+        self.assertEqual(
+            self.source_effects,
+            [("/spotify/me/player", {"device_ids": [self.external_id], "play": True})],
+        )
+        self.assertEqual(self.source_move_posts, [])
+
+    async def test_media_select_idle_native_uses_explicit_idle_guard(self):
+        self.source_selection_fixture = True
+        self.source_current_target = self.external_id
+        await self.native_call("select_source", source="Beta")
+        self.assertEqual(
+            self.source_effects,
+            [
+                (
+                    "/api/room-switch",
+                    {
+                        "room_id": "room-beta",
+                        "expected_incarnation": "incarnation-a",
+                        "expected_registry": "registry-a",
+                        "idle_only": True,
+                    },
+                )
+            ],
+        )
+        self.assertEqual((self.source_move_posts, self._writes()), ([], []))
+
+    async def test_media_select_unknown_identity_and_owner_change_have_no_effect(self):
+        self.source_selection_fixture = True
+        self.identity_status = 503
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.identity_status = 200
+        self.identity_hold = True
+        self.identity_entered.clear()
+        task = self._task(self.native_call("select_source", source="Beta"))
+        await asyncio.wait_for(self.identity_entered.wait(), 2)
+        await self.data.coordinator.async_refresh()
+        self.identity_release.set()
+        with self.assertRaises(HomeAssistantError):
+            await task
+        self.assertEqual(
+            (self.source_effects, self.source_move_posts, self._writes()), ([], [], [])
+        )
+
+    async def test_media_select_typed_services_share_same_move_and_release_owners(self):
+        self.source_selection_fixture = True
+        self.beta_output = "456"
+        alias = await self.hass.services.async_call(
+            "podconnect",
+            "move_playback",
+            {
+                "config_entry_id": self.entries[0].entry_id,
+                "kind": "configured_alias",
+                "target_id": "room-beta",
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(alias["outcome"], "accepted")
+        self.assertTrue(alias["accepted_room_move"])
+        await self.data.coordinator.async_refresh()
+        external = await self.hass.services.async_call(
+            "podconnect",
+            "move_playback",
+            {
+                "config_entry_id": self.entries[0].entry_id,
+                "kind": "spotify_device",
+                "target_id": self.external_id,
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertTrue(external["provider_request_accepted"])
+        self.assertEqual(
+            [path for path, _ in self.source_effects],
+            ["/api/release", "/spotify/me/player"],
+        )
+        self.assertEqual(len(self.source_move_posts), 2)
+        self.assertEqual(self.data.commands.command_sequence, 1)
+
+    async def test_media_select_release_then_restricted_target_never_transfers(self):
+        self.source_selection_fixture = True
+        self.source_release_corrupt = lambda value: setattr(
+            self, "source_external_restricted", True
+        )
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.assertEqual([path for path, _ in self.source_effects], ["/api/release"])
+        self.assertEqual(self._writes(), [])
+
+    async def test_media_select_release_does_not_require_retired_native_alias(self):
+        self.source_selection_fixture = True
+        self.source_release_corrupt = lambda value: setattr(
+            self, "identity_status", 503
+        )
+        await self.native_call("select_source", source="External")
+        self.assertEqual(
+            [path for path, _ in self.source_effects],
+            ["/api/release", "/spotify/me/player"],
+        )
+
+    async def test_media_select_provider_external_retained_writer_is_released(self):
+        self.source_selection_fixture = True
+        self.source_current_target = self.external_id
+        await self.native_call("select_source", source="External")
+        self.assertEqual(
+            [path for path, _ in self.source_effects],
+            ["/api/release", "/spotify/me/player"],
+        )
+        self.assertEqual(self.source_idle_reads, 1)
+
+    async def test_media_select_null_release_unknown_custody_cannot_transfer(self):
+        self.source_selection_fixture = True
+        self.source_current_target = self.external_id
+        self.source_has_release = False
+        self.source_idle_probe_status = 409
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.assertEqual(self.source_idle_reads, 1)
+        self.assertEqual((self.source_effects, self._writes()), ([], []))
+
+    async def test_media_select_foreign_retained_writer_cannot_release_or_transfer(
+        self,
+    ):
+        self.source_selection_fixture = True
+        self.source_current_target = self.external_id
+        self.state_corrupt = lambda state: state["native"].update(
+            account_user_id="foreign-account"
+        )
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.assertEqual((self.source_effects, self._writes()), ([], []))
+
+    async def test_media_select_alias_name_collisions_have_no_effects(self):
+        self.source_selection_fixture = True
+        self.source_external_name = "Beta"
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="Beta")
+        self.source_external_name = "External"
+        self.source_alias_names = ("Beta", "Beta")
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="Beta")
+        self.assertEqual(
+            (self.source_effects, self.source_move_posts, self._writes()), ([], [], [])
+        )
+
+    async def test_media_select_old_manager_without_idle_echo_cannot_transfer(self):
+        self.source_selection_fixture = True
+        self.source_has_release = False
+        self.source_idle_echo = False
+        self.source_current_target = self.external_id
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="External")
+        self.assertEqual((self.source_effects, self._writes()), ([], []))
+
+    async def test_media_select_changed_destination_after_staging_cancels_move(self):
+        self.source_selection_fixture = True
+        self.beta_output = "456"
+        self.content_hold = True
+        task = self._task(self.native_call("select_source", source="Beta"))
+        await asyncio.wait_for(self.content_entered.wait(), 2)
+        self.beta_output = "789"
+        self.content_release.set()
+        with self.assertRaises(HomeAssistantError):
+            await task
+        cleanup = list(self.data.commands.room_move.cleanups)
+        if cleanup:
+            await asyncio.wait_for(asyncio.gather(*cleanup), 2)
+        self.assertEqual(
+            [path for path, _ in self.source_move_posts],
+            ["/api/room-move/prepare", "/api/room-move/cancel"],
+        )
+        self.assertEqual((self.source_effects, self._writes()), ([], []))
+
+    async def test_media_select_new_native_during_transfer_oauth_stops_external_send(
+        self,
+    ):
+        self.source_selection_fixture = True
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.holds.append(release)
+        original = self.data.session.async_ensure_token_valid
+        calls = 0
+
+        async def held():
+            nonlocal calls
+            calls += 1
+            await original()
+            # Initial device/playback reads precede the transfer's own OAuth fence.
+            if calls == 3:
+                entered.set()
+                await release.wait()
+
+        with patch.object(self.data.session, "async_ensure_token_valid", held):
+            task = self._task(self.native_call("select_source", source="External"))
+            await asyncio.wait_for(entered.wait(), 2)
+            self.assertEqual(
+                [path for path, _ in self.source_effects], ["/api/release"]
+            )
+            # A new Native owner is active while OAuth is suspended. Its strict
+            # idle read rejects; this operation must not release that newer owner.
+            self.source_idle_probe_status = 409
+            release.set()
+            with self.assertRaises(HomeAssistantError):
+                await task
+        self.assertEqual([path for path, _ in self.source_effects], ["/api/release"])
+        self.assertEqual(self.source_idle_reads, 1)
+        self.assertEqual(self._writes(), [])
+
+    async def test_media_select_current_alias_requires_observed_route_without_mutation(
+        self,
+    ):
+        self.source_selection_fixture = True
+        result = await self.hass.services.async_call(
+            "podconnect",
+            "move_playback",
+            {
+                "config_entry_id": self.entries[0].entry_id,
+                "kind": "configured_alias",
+                "target_id": "room-alpha",
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(
+            result,
+            {
+                "kind": "configured_alias",
+                "target_id": "room-alpha",
+                "observed_current": True,
+                "physical_result_verified": False,
+            },
+        )
+        self.assertNotIn("accepted_room_move", result)
+        self.state_corrupt = lambda state: state["route"].update(device_id="999")
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("select_source", source="Alpha")
+        self.assertEqual(
+            (self.source_effects, self.source_move_posts, self._writes()), ([], [], [])
+        )
+        self.assertEqual(self.data.commands.command_sequence, 0)
 
     async def test_media_native_options_use_one_typed_owner_without_optimism(self):
         for service, arguments, action, field, expected in (

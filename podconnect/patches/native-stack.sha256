@@ -37,5 +37,5 @@ aa47ea940c0109d0b8efe765a04e7a924c24bddc604e00fda0a50d8e60385e48  /patches/room-
 69d47e430a2da5aa10f68e2f45ed8201ad1f218a67f560180fdd45981435dbc4  /patches/room-release-native-tests.patch
 35ca22c8d97810fd430865f063d73506e10ba962cf593d54d3a0fd34a2b0e1a5  /patches/move-quiesce-native.patch
 541fabcc4da592178a7485ceabf2b3c65ff4854d4785d19565187bf0d9b7bd40  /patches/move-quiesce-native-tests.patch
-6d2c2d4c11c55fee4aac0ee8effe3ac25f9b0236653a562d8a4c60543c20f3b4  /patches/room-owner-parity-native.patch
-0e3f86624296f1d9e7e6157faad67a8bbc5c1e3f389c91b1243c6e837d9949d4  /patches/room-owner-parity-native-tests.patch
+7bb386d9eb8375f90fb403d0111286733a8fdae07cd1739df5edc1e77cc4345e  /patches/room-owner-parity-native.patch
+1053455d067349aab332e1b5317bb58b5a00b18b682cc31652e0046eb37a5c4d  /patches/room-owner-parity-native-tests.patch

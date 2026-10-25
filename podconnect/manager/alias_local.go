@@ -130,6 +130,7 @@ type aliasSelectionRequest struct {
 	RoomID              string `json:"room_id"`
 	ExpectedIncarnation string `json:"expected_incarnation"`
 	ExpectedRegistry    string `json:"expected_registry"`
+	IdleOnly            bool   `json:"idle_only,omitempty"`
 }
 
 // This is a relay to the existing engine, never a second output selector.
@@ -147,17 +148,21 @@ func roomSwitchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func roomSwitchAt(w http.ResponseWriter, r *http.Request, base string) {
+	idleRead := false
+	if r.URL.RawQuery != "" {
+		values := r.URL.Query()["idle_only"]
+		if r.Method != http.MethodGet || len(r.URL.Query()) != 1 || len(values) != 1 || values[0] != "1" {
+			w.WriteHeader(400)
+			return
+		}
+		idleRead = true
+	}
 	var body aliasSelectionRequest
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&body) != nil || body.RoomID == "" || body.ExpectedIncarnation == "" || body.ExpectedRegistry == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		var trailing any
-		if decoder.Decode(&trailing) != io.EOF {
+		raw, err := io.ReadAll(r.Body)
+		var fields map[string]json.RawMessage
+		if err != nil || queueClosedJSON(raw, &body) != nil || queueClosedJSON(raw, &fields) != nil || fields["idle_only"] != nil && string(fields["idle_only"]) != "true" || body.RoomID == "" || body.ExpectedIncarnation == "" || body.ExpectedRegistry == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -183,7 +188,11 @@ func roomSwitchAt(w http.ResponseWriter, r *http.Request, base string) {
 		}
 	}
 	encoded, _ := json.Marshal(body)
-	request, err := http.NewRequestWithContext(r.Context(), r.Method, base+"/player/aliases", bytes.NewReader(encoded))
+	endpoint := base + "/player/aliases"
+	if idleRead {
+		endpoint += "?idle_only=1"
+	}
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, endpoint, bytes.NewReader(encoded))
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		return
@@ -205,6 +214,7 @@ func roomSwitchAt(w http.ResponseWriter, r *http.Request, base string) {
 		// Refuse misleading success from an old engine/default root route.
 		var reply struct {
 			AcceptedLocal bool          `json:"accepted_local"`
+			IdleOnly      bool          `json:"idle_only,omitempty"`
 			Binding       *aliasBinding `json:"binding"`
 			Aliases       []aliasEntry  `json:"aliases"`
 		}
@@ -212,11 +222,11 @@ func roomSwitchAt(w http.ResponseWriter, r *http.Request, base string) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		if r.Method == http.MethodPost && (!reply.AcceptedLocal || reply.Binding.RoomID != body.RoomID || reply.Binding.Registry != body.ExpectedRegistry || reply.Binding.Incarnation != body.ExpectedIncarnation) {
+		if r.Method == http.MethodPost && (!reply.AcceptedLocal || body.IdleOnly && !reply.IdleOnly || reply.Binding.RoomID != body.RoomID || reply.Binding.Registry != body.ExpectedRegistry || reply.Binding.Incarnation != body.ExpectedIncarnation) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		if r.Method == http.MethodGet && (len(reply.Aliases) == 0 || aliasRegistryHash(reply.Aliases) != reply.Binding.Registry) {
+		if r.Method == http.MethodGet && (idleRead && !reply.IdleOnly || len(reply.Aliases) == 0 || aliasRegistryHash(reply.Aliases) != reply.Binding.Registry) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}

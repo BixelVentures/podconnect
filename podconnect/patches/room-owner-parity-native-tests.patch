@@ -1,7 +1,606 @@
+diff --git a/daemon/device_alias_test.go b/daemon/device_alias_test.go
+index 45478da..396408d 100644
+--- a/daemon/device_alias_test.go
++++ b/daemon/device_alias_test.go
+@@ -1,6 +1,29 @@
+ package daemon
+ 
+-import "testing"
++import (
++	"context"
++	"encoding/json"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++	"unsafe"
++
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
++	"google.golang.org/protobuf/proto"
++)
+ 
+ func TestResolveDeviceAlias(t *testing.T) {
+ 	cases := []struct {
+@@ -26,3 +49,516 @@ func TestResolveDeviceAlias(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// Extends the admitted content fixture with the real empty source worker. The AP
++// welcome only seeds the established account getter; it is not authentication.
++func idleAliasFixture(t *testing.T) (*AppPlayer, *aliasTestServer, *atomic.Int32) {
++	t.Helper()
++	p, _ := contentFixture(t)
++	p.state.active = false
++	p.state.player.IsPlaying = false
++	p.state.player.SessionId = ""
++	p.primaryStream = nil
++	p.roomTransportOffer = nil
++	p.hasSpotConnId, p.hasInitialConnectState = true, true
++	p.playbackReadyCh = make(chan struct{})
++	close(p.playbackReadyCh)
++	path := filepath.Join(t.TempDir(), "idle.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { reader.Close() })
++	p.app.cfg.AudioOutputPipe = path
++	creates := &atomic.Int32{}
++	worker, err := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) { creates.Add(1); return create() }})
++	if err != nil {
++		t.Fatal(err)
++	}
++	p.player = worker
++	t.Cleanup(worker.Close)
++	access := ap.NewAccesspoint(p.app.log, nil, "fixture")
++	left, right := net.Pipe()
++	t.Cleanup(func() { left.Close(); right.Close() })
++	fields := reflect.ValueOf(access).Elem()
++	for name, value := range map[string]reflect.Value{"conn": reflect.ValueOf(left), "encConn": reflect.New(fields.FieldByName("encConn").Type().Elem()), "welcome": reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")})} {
++		f := fields.FieldByName(name)
++		reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(value)
++	}
++	nextSessionField(p.sess, "ap", access)
++	server := p.app.server.(*aliasTestServer)
++	return p, server, creates
++}
++
++func idleAliasRequest(p *AppPlayer) ApiRequestDataSelectAlias {
++	var request ApiRequestDataSelectAlias
++	raw, _ := json.Marshal(map[string]any{"room_id": "r1", "expected_incarnation": p.aliasIncarnation, "expected_registry": p.aliasFingerprint, "idle_only": true})
++	_ = json.Unmarshal(raw, &request)
++	return request
++}
++
++func idleAliasCReply() idleAliasCState {
++	return idleAliasCState{CleanAbsent: true, Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"00000000-0000-0000-0000-000000000001", "202", "1"}}
++}
++
++func TestIdleAliasActualHandlerOnlySelectsLocalWithoutCRead(t *testing.T) {
++	p, events, creates := idleAliasFixture(t)
++	p.roomContentIncarnation, p.roomContentSteps = "", nil
++	var reads atomic.Int32
++	output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		reads.Add(1)
++		if r.Method != http.MethodPost || r.URL.Path != "/api/outputs/202/start/state" {
++			t.Error("idle selection mutated C", r.Method, r.URL.Path)
++		}
++		var body map[string]json.RawMessage
++		if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 6 || string(body["old_native_owner"]) != "null" || string(body["require_clean_absent"]) != "true" {
++			t.Error("idle state read invented prior owner", body)
++		}
++		var process contentProcess
++		_ = json.Unmarshal(body["native_process"], &process)
++		actual, ok := nativeContentProcess()
++		if !ok || process != actual {
++			t.Error("state read lost actual process")
++		}
++		var path, digest string
++		_ = json.Unmarshal(body["expected_input_path"], &path)
++		_ = json.Unmarshal(body["expected_input_path_digest"], &digest)
++		if path != p.app.cfg.AudioOutputPipe || digest != contentDigestBytes(path) {
++			t.Error("state read lost pipe binding")
++		}
++		_ = json.NewEncoder(w).Encode(idleAliasCReply())
++	}))
++	defer output.Close()
++	p.app.cfg.RoomTransportOwnToneURL = output.URL
++	before := proto.Clone(p.state.player)
++	state, owner, tracks, queue := p.state, p.player, p.state.tracks, p.state.queueID
++	request := idleAliasRequest(p)
++	result, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeSelectAlias, Data: request})
++	if err != nil {
++		t.Fatal("fresh idle selection failed", err)
++	}
++	reply := result.(*ApiResponseSelectAlias)
++	if !reply.AcceptedLocal || !reply.IdleOnly || reply.ID != 2 || reply.Binding.RoomID != "r1" || reads.Load() != 0 || creates.Load() != 0 || len(events.events) != 1 || events.events[0].Type != "selected_alias" {
++		t.Fatal("idle selection not local-only", reply, reads.Load(), creates.Load(), len(events.events))
++	}
++	if !proto.Equal(before, p.state.player) || p.state != state || p.player != owner || p.state.tracks != tracks || p.state.queueID != queue || p.primaryStream != nil || p.app.openedWriterOwner != nil || p.roomContentIncarnation != "" || p.roomContentSteps != nil {
++		t.Fatal("idle alias selection changed retained playback")
++	}
++	source, err := p.player.Start35CurrentSource(context.Background())
++	if err != nil || source != nil {
++		t.Fatal("local selection created source", err)
++	}
++	raw, _ := json.Marshal(reply)
++	var wire map[string]any
++	_ = json.Unmarshal(raw, &wire)
++	if len(wire) != 4 || wire["accepted_local"] != true || wire["idle_only"] != true {
++		t.Fatal("local selection claimed native or physical acceptance", string(raw))
++	}
++}
++
++func TestIdleAliasActualHandlerRejectsNonIdleCustodyAndCancellation(t *testing.T) {
++	for _, mode := range []string{"active", "playing", "session", "primary", "source", "writer-owner", "writer-fd", "start-custody", "move-custody", "unknown", "retirement", "permit", "quarantine", "cancel", "registry", "incarnation", "read-source", "read-start-custody"} {
++		t.Run(mode, func(t *testing.T) {
++			p, events, creates := idleAliasFixture(t)
++			var reads atomic.Int32
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				reads.Add(1)
++				_ = json.NewEncoder(w).Encode(idleAliasCReply())
++			}))
++			defer output.Close()
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			request := idleAliasRequest(p)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			switch strings.TrimPrefix(mode, "read-") {
++			case "active":
++				p.state.active = true
++			case "playing":
++				p.state.player.IsPlaying = true
++			case "session":
++				p.state.player.SessionId = "retained-session"
++			case "primary":
++				p.primaryStream = &player.Stream{Source: &contentInertSource{}}
++			case "source":
++				if err := p.player.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++					t.Fatal(err)
++				}
++			case "writer-owner":
++				p.app.openedWriterOwner = p
++			case "writer-fd":
++				p.app.openedWriter.FD = "7"
++			case "start-custody":
++				p.app.startCustody = &contentOperation{}
++			case "move-custody":
++				p.app.moveCustody = &moveOperation{}
++			case "unknown":
++				p.app.moveCustodyUnknown = true
++			case "retirement":
++				p.app.retirementPending = &retirementAttempt{}
++			case "permit":
++				p.app.startOutputPermit = &contentOperation{}
++			case "quarantine":
++				p.roomContentQuarantined = true
++			case "cancel":
++				cancel()
++			case "registry":
++				request.ExpectedRegistry = "stale"
++			case "incarnation":
++				request.ExpectedIncarnation = "stale"
++			}
++			beforeCreates := creates.Load()
++			var err error
++			var hasValue bool
++			if strings.HasPrefix(mode, "read-") {
++				value, callErr := p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypeAliases, Data: true})
++				reply, _ := value.(*ApiResponseAliases)
++				err, hasValue = callErr, reply != nil
++			} else {
++				value, callErr := p.selectLocalAlias(request, ctx)
++				err, hasValue = callErr, value != nil
++			}
++			if err == nil || hasValue || p.state.device.SelectedAliasId != 1 || len(events.events) != 0 || reads.Load() != 0 || creates.Load() != beforeCreates {
++				t.Fatal("nonidle owner selected locally or performed new effects", err, reads.Load(), creates.Load())
++			}
++		})
++	}
++}
++
++func TestIdleAliasHeldCReadRejectsSuccessorAndCancelledCapture(t *testing.T) {
++	for _, mode := range []string{"source", "session", "connection", "generation", "intent", "retirement", "writer-owner", "alias-aba", "registry", "cancel", "read-source", "read-session", "read-alias-aba", "read-intent", "read-cancel"} {
++		t.Run(mode, func(t *testing.T) {
++			p, events, creates := idleAliasFixture(t)
++			entered, release := make(chan struct{}), make(chan struct{})
++			var once sync.Once
++			t.Cleanup(func() { once.Do(func() { close(release) }) })
++			var reads atomic.Int32
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				reads.Add(1)
++				close(entered)
++				<-release
++				state := idleAliasCReply()
++				state.Target.DeviceID = "101"
++				if r.URL.Path != "/api/outputs/101/start/state" {
++					t.Error("idle read used another alias", r.URL.Path)
++				}
++				_ = json.NewEncoder(w).Encode(state)
++			}))
++			defer output.Close()
++			defer once.Do(func() { close(release) })
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			done := make(chan error, 1)
++			go func() {
++				var err error
++				var hasValue bool
++				// Only the physical-absence GET still awaits C. Its shared
++				// final Native/worker fences remain covered by every late event.
++				value, callErr := p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypeAliases, Data: true})
++				err, hasValue = callErr, value != nil
++				if hasValue && err == nil {
++					done <- nil
++				} else {
++					done <- err
++				}
++			}()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				t.Fatal("fresh C read not reached")
++			}
++			switch strings.TrimPrefix(mode, "read-") {
++			case "source":
++				if err := p.player.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++					t.Fatal(err)
++				}
++			case "session":
++				p.state.player.SessionId = "successor"
++			case "connection":
++				p.spotConnId = "successor"
++			case "generation":
++				p.invalidateRoomTransportGeneration()
++			case "intent":
++				p.roomNativeIntent++
++			case "retirement":
++				p.app.retirementPending = &retirementAttempt{}
++			case "writer-owner":
++				p.app.openedWriterOwner = p
++			case "alias-aba":
++				for _, room := range []string{"r1", "r0"} {
++					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{RoomID: room, ExpectedIncarnation: p.aliasIncarnation, ExpectedRegistry: p.aliasFingerprint}); err != nil {
++						t.Fatal(err)
++					}
++				}
++			case "registry":
++				p.initAliasRegistry()
++			case "cancel":
++				cancel()
++			}
++			beforeCreates, beforeEvents := creates.Load(), len(events.events)
++			once.Do(func() { close(release) })
++			select {
++			case err := <-done:
++				if err == nil {
++					t.Fatal("stale idle capture accepted")
++				}
++			case <-time.After(2 * time.Second):
++				t.Fatal("held idle selection not joined")
++			}
++			if p.state.device.SelectedAliasId != 1 || len(events.events) != beforeEvents || reads.Load() != 1 || creates.Load() != beforeCreates {
++				t.Fatal("stale capture selected alias, retried or mutated output", reads.Load(), creates.Load())
++			}
++		})
++	}
++}
++
++func TestIdleAliasHTTPMalformedFlagCannotDowngradeToLegacySelection(t *testing.T) {
++	for _, field := range []string{`,"idle_only":null`, `,"idle_only":false`, `,"idle_only":1`, `,"idle_only":"true"`, `,"idle_only":true,"idle_only":true`, `,"idle_only":true,"extra":true`} {
++		t.Run(field, func(t *testing.T) {
++			body := `{"room_id":"r1","expected_incarnation":"current","expected_registry":"current"` + field + `}`
++			response := httptest.NewRecorder()
++			(&ConcreteApiServer{}).handleAliases(response, httptest.NewRequest(http.MethodPost, "/player/aliases", strings.NewReader(body)))
++			if response.Code != http.StatusBadRequest {
++				t.Fatal("malformed strict-idle flag reached legacy selection", response.Code)
++			}
++		})
++	}
++}
++
++func TestIdleAliasReadActualHandlerPreservesAliasesAndDefaultShape(t *testing.T) {
++	p, events, creates := idleAliasFixture(t)
++	p.roomContentIncarnation, p.roomContentSteps = "", nil
++	before, err := p.localAliases()
++	if err != nil {
++		t.Fatal(err)
++	}
++	revision := p.aliasRevision
++	playerState := proto.Clone(p.state.player)
++	state, worker, primary, tracks, queue := p.state, p.player, p.primaryStream, p.state.tracks, p.state.queueID
++	var reads atomic.Int32
++	output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		reads.Add(1)
++		if r.Method != http.MethodPost || r.URL.Path != "/api/outputs/101/start/state" {
++			t.Error("idle GET performed C mutation or changed target", r.Method, r.URL.Path)
++		}
++		var body map[string]json.RawMessage
++		if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 6 || string(body["old_native_owner"]) != "null" || string(body["require_clean_absent"]) != "true" {
++			t.Error("idle GET invented old owner", body)
++		}
++		state := idleAliasCReply()
++		state.Target.DeviceID = "101"
++		_ = json.NewEncoder(w).Encode(state)
++	}))
++	defer output.Close()
++	p.app.cfg.RoomTransportOwnToneURL = output.URL
++	value, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeAliases, Data: true})
++	if err != nil {
++		t.Fatal("readonly idle proof failed", err)
++	}
++	result := value.(*ApiResponseAliases)
++	if !result.IdleOnly || !reflect.DeepEqual(result.Binding, before.Binding) || !reflect.DeepEqual(result.Aliases, before.Aliases) || reads.Load() != 1 {
++		t.Fatal("idle GET omitted proof or changed existing aliases", result, reads.Load())
++	}
++	if p.aliasRevision != revision || len(events.events) != 0 || creates.Load() != 0 || p.state != state || p.player != worker || p.primaryStream != primary || p.state.tracks != tracks || p.state.queueID != queue || !proto.Equal(p.state.player, playerState) || p.app.openedWriterOwner != nil || p.roomContentIncarnation != "" || p.roomContentSteps != nil {
++		t.Fatal("readonly idle proof mutated alias/player/output")
++	}
++	source, err := p.player.Start35CurrentSource(context.Background())
++	if err != nil || source != nil {
++		t.Fatal("idle GET created source", err)
++	}
++	raw, _ := json.Marshal(result)
++	var wire map[string]any
++	_ = json.Unmarshal(raw, &wire)
++	if len(wire) != 3 || wire["idle_only"] != true {
++		t.Fatal("idle GET proof shape changed", string(raw))
++	}
++	legacy, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeAliases})
++	if err != nil {
++		t.Fatal(err)
++	}
++	raw, _ = json.Marshal(legacy)
++	var legacyWire map[string]any
++	_ = json.Unmarshal(raw, &legacyWire)
++	if len(legacyWire) != 2 || legacyWire["idle_only"] != nil || reads.Load() != 1 || p.aliasRevision != revision || len(events.events) != 0 {
++		t.Fatal("default GET acquired idle field or effects", string(raw))
++	}
++}
++
++func TestIdleAliasReadHTTPRejectsMalformedQuery(t *testing.T) {
++	for _, query := range []string{"?idle_only", "?idle_only=", "?idle_only=0", "?idle_only=true", "?idle_only=1&idle_only=1", "?idle_only=1&extra=1", "?extra=1"} {
++		t.Run(query, func(t *testing.T) {
++			response := httptest.NewRecorder()
++			(&ConcreteApiServer{}).handleAliases(response, httptest.NewRequest(http.MethodGet, "/player/aliases"+query, nil))
++			if response.Code != http.StatusBadRequest {
++				t.Fatal("malformed idle GET reached actor", response.Code)
++			}
++		})
++	}
++}
++
++func TestIdleAliasStrictReadRejectsOrdinaryReadyOrFalseAbsence(t *testing.T) {
++	for _, mode := range []string{"missing-clean-absence", "false-clean-absence"} {
++		t.Run(mode, func(t *testing.T) {
++			p, events, creates := idleAliasFixture(t)
++			beforeRevision := p.aliasRevision
++			beforeState := proto.Clone(p.state.player)
++			var reads atomic.Int32
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				reads.Add(1)
++				if r.Method != http.MethodPost || r.URL.Path != "/api/outputs/101/start/state" {
++					t.Error("idle rejection performed C mutation", r.Method, r.URL.Path)
++				}
++				var request map[string]json.RawMessage
++				if json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 6 || string(request["old_native_owner"]) != "null" || string(request["require_clean_absent"]) != "true" {
++					t.Error("idle request omitted required absence predicate", request)
++				}
++				state := idleAliasCReply()
++				state.Target.DeviceID = "101"
++				if mode == "missing-clean-absence" {
++					// The ordinary 8-field START-ready packet is valid for START admission,
++					// but grants no strict idle evidence.
++					_ = json.NewEncoder(w).Encode(contentCState{Schema: state.Schema, OK: state.OK, Ready: state.Ready, Busy: state.Busy, Policy: state.Policy, Percent: state.Percent, Target: state.Target, Physical: state.Physical})
++				} else {
++					state.CleanAbsent = false
++					_ = json.NewEncoder(w).Encode(state)
++				}
++			}))
++			defer output.Close()
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			value, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeAliases, Data: true})
++			reply, _ := value.(*ApiResponseAliases)
++			if err == nil || reply != nil || p.state.device.SelectedAliasId != 1 || p.aliasRevision != beforeRevision || len(events.events) != 0 || creates.Load() != 0 || reads.Load() != 1 || !proto.Equal(p.state.player, beforeState) {
++				t.Fatal("ordinary readiness or false absence granted local idle selection", err, reads.Load())
++			}
++		})
++	}
++}
++
++func TestIdleAliasHTTPCancellationReachesActualActorBeforeLocalAcceptance(t *testing.T) {
++	for _, method := range []string{http.MethodPost, http.MethodGet} {
++		t.Run(method, func(t *testing.T) {
++			p, events, creates := idleAliasFixture(t)
++			beforeRevision := p.aliasRevision
++			beforeState := proto.Clone(p.state.player)
++			entered, release := make(chan struct{}), make(chan struct{})
++			var once sync.Once
++			t.Cleanup(func() { once.Do(func() { close(release) }) })
++			var reads atomic.Int32
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				reads.Add(1)
++				state := idleAliasCReply()
++				if method == http.MethodGet {
++					state.Target.DeviceID = "101"
++				}
++				if r.Method != http.MethodPost || r.URL.Path != "/api/outputs/"+state.Target.DeviceID+"/start/state" {
++					t.Error("HTTP cancellation fixture performed C mutation", r.Method, r.URL.Path)
++				}
++				if method == http.MethodGet {
++					close(entered)
++					<-release
++				}
++				_ = json.NewEncoder(w).Encode(state)
++			}))
++			defer output.Close()
++			defer once.Do(func() { close(release) })
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			server := &ConcreteApiServer{log: p.app.log, requests: make(chan ApiRequest)}
++			actorDone := make(chan struct{})
++			actorStop, stopActor := context.WithCancel(context.Background())
++			t.Cleanup(func() {
++				stopActor()
++				select {
++				case <-actorDone:
++				case <-time.After(time.Second):
++					t.Error("cancelled HTTP actor did not join")
++				}
++			})
++			go func() {
++				defer close(actorDone)
++				select {
++				case call := <-server.Receive():
++					if method == http.MethodPost {
++						raw, _ := json.Marshal(call.Data)
++						var fields map[string]json.RawMessage
++						_ = json.Unmarshal(raw, &fields)
++						if len(fields) != 4 || fields["Context"] != nil || fields["context"] != nil {
++							t.Error("request context leaked into strict POST wire", string(raw))
++						}
++					}
++					if method == http.MethodPost {
++						// No C await belongs to a local preference. Cancel the
++						// real queued request before its actual actor dispatch.
++						close(entered)
++						<-release
++					}
++					// Shutdown remains live. Only the originating HTTP request is
++					// cancelled; the real data/actor adapter must propagate it.
++					value, err := p.handleApiRequest(context.Background(), call)
++					call.Reply(value, err)
++				case <-actorStop.Done():
++				}
++			}()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			url, body := "/player/aliases?idle_only=1", ""
++			if method == http.MethodPost {
++				url = "/player/aliases"
++				raw, _ := json.Marshal(idleAliasRequest(p))
++				body = string(raw)
++			}
++			request := httptest.NewRequest(method, url, strings.NewReader(body)).WithContext(ctx)
++			response := httptest.NewRecorder()
++			httpDone := make(chan struct{})
++			go func() { defer close(httpDone); server.handleAliases(response, request) }()
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				t.Fatal("actual HTTP/actor C-state await not reached")
++			}
++			cancel()
++			once.Do(func() { close(release) })
++			select {
++			case <-httpDone:
++			case <-time.After(2 * time.Second):
++				t.Fatal("HTTP cancellation did not join")
++			}
++			select {
++			case <-actorDone:
++			case <-time.After(time.Second):
++				t.Fatal("cancelled actor did not finish")
++			}
++			wantReads := int32(0)
++			if method == http.MethodGet {
++				wantReads = 1
++			}
++			if response.Code == http.StatusOK || p.state.device.SelectedAliasId != 1 || p.aliasRevision != beforeRevision || len(events.events) != 0 || reads.Load() != wantReads || creates.Load() != 0 || !proto.Equal(p.state.player, beforeState) {
++				t.Fatal("cancelled HTTP request reached local acceptance or changed playback", response.Code, p.state.device.SelectedAliasId, len(events.events))
++			}
++		})
++	}
++}
++
++func TestIdleAliasPreferenceDoesNotRequirePhysicalCAbsence(t *testing.T) {
++	for _, code := range []int{http.StatusConflict, http.StatusServiceUnavailable} {
++		t.Run(strconv.Itoa(code), func(t *testing.T) {
++			p, events, creates := idleAliasFixture(t)
++			var reads atomic.Int32
++			output := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reads.Add(1); w.WriteHeader(code) }))
++			defer output.Close()
++			p.app.cfg.RoomTransportOwnToneURL = output.URL
++			before := proto.Clone(p.state.player)
++			reply, err := p.selectLocalAlias(idleAliasRequest(p), context.Background())
++			if err != nil || reply == nil || !reply.AcceptedLocal || !reply.IdleOnly || reply.ID != 2 || reads.Load() != 0 || creates.Load() != 0 || len(events.events) != 1 || !proto.Equal(before, p.state.player) || p.primaryStream != nil || p.app.openedWriterOwner != nil {
++				t.Fatal("local preference depended on C availability or claimed physical effects", err, reply, reads.Load(), creates.Load())
++			}
++			revision := p.aliasRevision
++			value, err := p.idleLocalAliases(context.Background())
++			if err == nil || value != nil || reads.Load() != 1 || p.aliasRevision != revision || len(events.events) != 1 || creates.Load() != 0 {
++				t.Fatal("strict absence GET accepted cold/unknown C or changed local preference", err, reads.Load())
++			}
++		})
++	}
++}
+diff --git a/daemon/room_completed_writer_test.go b/daemon/room_completed_writer_test.go
+index 2ba6c02..f65f929 100644
+--- a/daemon/room_completed_writer_test.go
++++ b/daemon/room_completed_writer_test.go
+@@ -74,7 +74,9 @@ func TestCompletedWriterFreshPhoneSessionAndNextTrackReproof(t *testing.T) {
+ 	p.state.device.SelectedAliasId = 2
+ 	op.Actual = &owned
+ 	op.CReceipt = &contentCReceipt{Phase: "completed", Actual: &owned, WriterEpoch: epoch,
+-		Pipe: &outputPipeIdentity{Device: pipe.Device, Inode: pipe.Inode, Type: pipe.Type}}
++		Pipe:   &outputPipeIdentity{Device: pipe.Device, Inode: pipe.Inode, Type: pipe.Type},
++		Route:  &roomVolumeRoute{Process: "11111111-1111-1111-1111-111111111111", DeviceID: owned.HomePodID, DeviceIncarnation: "1", SessionEpoch: "1", RouteRevision: "1", SelectionRevision: "1", InputGeneration: "1", InputItemID: "1", InputPathDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
++		Target: contentTarget{Process: "11111111-1111-1111-1111-111111111111", DeviceID: owned.HomePodID, Incarnation: "1"}}
+ 	op.Terminal, op.State = true, "complete"
+ 	p.app.startCustody = op
+ 	actualFD := p.app.openedWriter.FD
+@@ -82,6 +84,30 @@ func TestCompletedWriterFreshPhoneSessionAndNextTrackReproof(t *testing.T) {
+ 	p.hasInitialConnectState = true
+ 	identity := owned
+ 	identity.ConnectionID, identity.SessionID = p.spotConnId, p.state.player.SessionId
++	op.Actual, op.CReceipt.Actual = &identity, &identity
++	if value, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err != nil || value.(completedCurrentWitness).Operation != op.Offer.OfferID {
++		t.Fatal("current completed START did not prove its exact writer", err)
++	}
++	p.app.startCustody = nil
++	if _, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err == nil {
++		t.Fatal("retired START still proved current after custody moved")
++	}
++	// Model a later completed MOVE custody on the same actual FIFO. Its own
++	// operation can be read, while the old START receipt loses authority.
++	move := &moveOperation{Owner: p, Capture: &moveCapture{contentCapture: op.Capture},
++		Offer:  moveOffer{OfferID: "ffffffffffffffffffffffffffffffff", BindingID: op.Offer.BindingID},
++		Actual: &identity, CReceipt: &moveCReceipt{Phase: "completed", Actual: &identity,
++			WriterEpoch: epoch, Pipe: op.CReceipt.Pipe, Route: op.CReceipt.Route, Target: op.CReceipt.Target},
++		Pipe: p.app.openedWriter, Epoch: epoch, Terminal: true, State: "complete"}
++	p.app.moveCustody = move
++	if value, err := p.completedCurrent(completedCurrentRequest{move: move, ctx: context.Background()}); err != nil || value.(completedCurrentWitness).Operation != move.Offer.OfferID {
++		t.Fatal("new MOVE did not prove same current writer", err)
++	}
++	if _, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err == nil {
++		t.Fatal("old START proved current after newer MOVE took custody")
++	}
++	p.app.moveCustody = nil
++	p.app.startCustody = op
+ 	if _, err := p.verifyCompletedWriter(context.Background(), identity); err != nil {
+ 		t.Fatal("same App/new accepted phone owner lost exact writer", err)
+ 	}
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 18620f5..89ca50f 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ import (
  	"crypto/cipher"
  	"crypto/sha256"
  	_ "embed"
@@ -9,7 +608,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	"encoding/hex"
  	"encoding/json"
  	"fmt"
-@@ -26,9 +27,12 @@
+@@ -26,9 +27,12 @@ import (
  	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
  	streamingpb "github.com/devgianlu/go-librespot/proto/spotify/streaming"
  	"github.com/devgianlu/go-librespot/tracks"
@@ -22,7 +621,25 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -598,9 +602,9 @@
+@@ -485,7 +489,7 @@ func TestStart35UnknownParkAndCloseNeverUseTimeoutAsDrainProof(t *testing.T) {
+ 	if !quarantine {
+ 		t.Fatal("unprovenwriter adopted aftertimer")
+ 	}
+-	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint}); err == nil {
++	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint, false, nil}); err == nil {
+ 		t.Fatal("alias bypassedfailedstartquarantine")
+ 	}
+ 	if !p.roomVolumeBusy() {
+@@ -585,7 +589,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+ 	if !p.roomVolumeBusy() {
+ 		t.Fatal("elapsed timer admitted foreign legacy owner before quarantine")
+ 	}
+-	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint}); err == nil {
++	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint, false, nil}); err == nil {
+ 		t.Fatal("expired reservation admitted alias before park retirement")
+ 	}
+ 	p.waitContentReservation(context.Background())
+@@ -598,9 +602,9 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
  // synthetic AP welcome seeds only the existing account getter; no provider
  // authentication, HomePod or physical audio is claimed by this regression.
  func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
@@ -34,7 +651,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			t.Fatal("invalid C compose mode")
  		}
  		modes = []string{mode}
-@@ -611,6 +615,7 @@
+@@ -611,6 +615,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			external := strings.HasPrefix(mode, "actual-c-")
  			path := os.Getenv("PC_NATIVE_START_PIPE")
  			var identity outputPipeIdentity
@@ -42,7 +659,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			if !external {
  				path = filepath.Join(t.TempDir(), "prepared.fifo")
  				if err := syscall.Mkfifo(path, 0600); err != nil {
-@@ -621,6 +626,7 @@
+@@ -621,6 +626,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					t.Fatal(err)
  				}
  				defer reader.Close()
@@ -50,7 +667,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  				stat, _ := reader.Stat()
  				kernel := stat.Sys().(*syscall.Stat_t)
  				identity = outputPipeIdentity{strconv.FormatUint(uint64(kernel.Dev), 10), strconv.FormatUint(uint64(kernel.Ino), 10), "fifo"}
-@@ -630,7 +636,7 @@
+@@ -630,7 +636,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  				}
  				p.app.cfg.DeviceAliasHomePodIDs[1] = "1"
  				p.aliasRegistry[1].HomePodID = "1"
@@ -59,7 +676,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  					p.app.cfg.DeviceAliasHomePodIDs[0] = "2"
  					p.initAliasRegistry()
  				}
-@@ -670,8 +676,12 @@
+@@ -670,8 +676,12 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  				}
  				return out, e
  			}}
@@ -74,7 +691,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			}
  			worker, err := player.NewPlayer(options)
  			if err != nil {
-@@ -762,7 +772,7 @@
+@@ -762,7 +772,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  						_ = json.Unmarshal(body["native_revision"], &receipt.Revision)
  						_ = json.Unmarshal(body["intended_native_owner"], &receipt.Intended)
  						_ = json.Unmarshal(body["expected_input_path_digest"], &receipt.InputDigest)
@@ -83,7 +700,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  							t.Error("transfer semantic session/alias reset")
  						}
  						if mode == "cancel" {
-@@ -815,6 +825,35 @@
+@@ -815,6 +825,35 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			} else {
  				p.app.cfg.RoomTransportOwnToneURL = os.Getenv("PC_NATIVE_START_URL")
  			}
@@ -119,7 +736,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			if strings.HasPrefix(mode, "actual-c-selected") || mode == "actual-c-native-pause" {
  				testSelectedContentCommitActualC(t, p, worker, stream, mode)
  				return
-@@ -1002,13 +1041,37 @@
+@@ -1002,7 +1041,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					}
  					return
  				}
@@ -131,10 +748,10 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  					if err := worker.Play(); err != nil {
  						t.Fatal("explicit later resume failed", err)
  					}
- 					op := p.app.startCustody
+@@ -1010,6 +1052,27 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					if err := worker.VerifyStart35(context.Background(), stream.Source, op.Pipe, op.Epoch, p.app.openedWriter.FD, func(mutate func()) error { mutate(); return nil }); err != nil {
  						t.Fatal("initial Pause retained START fence", err)
-+					}
+ 					}
 +					if external {
 +						until := time.Now().Add(5 * time.Second)
 +						for {
@@ -155,10 +772,11 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
 +							}
 +							time.Sleep(10 * time.Millisecond)
 +						}
- 					}
++					}
  				}
  			} else {
-@@ -1126,6 +1189,9 @@
+ 				if mode == "actual-c-eof" {
+@@ -1126,6 +1189,9 @@ func testSelectedContentCommitActualC(t *testing.T, p *AppPlayer, worker *player
  func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker *player.Player, stream *player.Stream, mode string, supplied *ConcreteApiServer) {
  	ctx, cancel := context.WithCancel(context.Background())
  	defer cancel()
@@ -168,7 +786,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	if os.Getenv("PC70_RELEASE_COMPOSE") == "ordinary" || os.Getenv("PC70_RELEASE_COMPOSE") == "move" {
  		p.roomMoveSteps = make(chan moveStep) // Same actor-step channel as the incumbent MOVE owner fixture.
  		nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
-@@ -1218,7 +1284,11 @@
+@@ -1218,7 +1284,11 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  		}()
  		defer func() { close(server.requests); <-actorDone }()
  	}
@@ -181,7 +799,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	if err != nil {
  		t.Fatal("capture", err)
  	}
-@@ -1235,6 +1305,10 @@
+@@ -1235,6 +1305,10 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  		t.Fatal("store")
  	}
  	request := contentPrepareRequest{capture.Scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
@@ -192,7 +810,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  	if mode == "actual-c-selected" {
  		_, err = server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
  		if err != nil {
-@@ -1290,12 +1364,91 @@
+@@ -1290,12 +1364,91 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
  		t.Fatal("selected state not observed", err)
  	}
@@ -285,7 +903,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  		if e != nil {
  			t.Fatal(e)
  		}
-@@ -1304,7 +1457,7 @@
+@@ -1304,7 +1457,7 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			body, _ := json.Marshal(struct {
  				Owner roomTransportIdentity `json:"native_owner"`
  			}{owner})
@@ -294,7 +912,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			if e != nil {
  				t.Fatal(e)
  			}
-@@ -1330,6 +1483,52 @@
+@@ -1330,6 +1483,52 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			t.Fatal("actual REST actor pause", pause.Code, p.state.player.IsPaused)
  		}
  		t.Log("actual REST /player/pause -> same actor -> real player.Pause, no C command from fixture")
@@ -347,7 +965,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  		// The production timer is used unchanged. Observe only its existing bound
  		// read; never manufacture a Pause confirmation or adopt a lost session.
  		until := time.Now().Add(15 * time.Second)
-@@ -1361,6 +1560,10 @@
+@@ -1361,6 +1560,10 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			if readBound() != 200 || actual.Identity != originalRoute {
  				t.Fatal("Resume changed exact C route")
  			}
@@ -358,7 +976,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			t.Log("PASS actual Native Pause retained same writer/source/C route beyond real10sSTOP; explicit Native Resume keeps same owner and controls")
  		}
  	}
-@@ -1385,47 +1588,132 @@
+@@ -1385,48 +1588,133 @@ func (selectedStageKey) GetVersion() int32                          { return 1 }
  func (selectedStageKey) GetToken() []byte                           { return nil }
  func (selectedStageKey) Deobfuscate([]byte, []byte) ([]byte, error) { return make([]byte, 16), nil }
  
@@ -479,7 +1097,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  			var first, last int
  			if _, e := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &first, &last); e != nil {
  				return nil, e
-+			}
+ 			}
 +			if proof := selectedPCMProof; proof != nil {
 +				if first%(512*1024) != 0 || last != min(first+512*1024-1, len(encrypted)-1) {
 +					return nil, fmt.Errorf("noncanonical requested chunk %d-%d", first, last)
@@ -494,10 +1112,11 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
 +				proof.mu.Lock()
 +				proof.ranges[first]++
 +				proof.mu.Unlock()
- 			}
++			}
  			last = min(last, len(encrypted)-1)
  			if first < 0 || first > last {
-@@ -1450,6 +1738,138 @@
+ 				return nil, fmt.Errorf("invalid synthetic range")
+@@ -1450,6 +1738,138 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options)
  	nextSessionField(p.sess, "events", events)
  	p.app.client = &http.Client{Transport: transport}
  	options.Spclient, options.Events, options.FlacEnabled = sp, events, true
@@ -636,7 +1255,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
  }
  
  // These local receipt adversaries supplement the actual-C delayed-STOP case.
-@@ -1520,3 +1940,411 @@
+@@ -1520,3 +1940,411 @@ func replyDirectPauseFixture(t *testing.T, p *AppPlayer, mode string, w http.Res
  		t.Fatal("unexpected direct Pause request", action)
  	}
  }
@@ -1049,6 +1668,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
 +	}
 +}
 diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
+index b805ef5..0931dd3 100644
 --- a/daemon/room_move_custody_test.go
 +++ b/daemon/room_move_custody_test.go
 @@ -1,6 +1,7 @@
@@ -1059,7 +1679,7 @@ diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
  	"encoding/json"
  	"errors"
  	"net/http"
-@@ -18,9 +19,120 @@
+@@ -18,11 +19,122 @@ import (
  	"github.com/devgianlu/go-librespot/player"
  )
  
@@ -1170,20 +1790,143 @@ diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
  func attemptCustodyOutput(app *App, owner *AppPlayer) error {
  	_, err := app.withNewOutput(owner, func() (output.Output, error) { return nil, nil })
  	return err
-+}
-+
+ }
+ 
 +// Incumbent retirement tests seed custody only; this is not runtime admission.
 +func (app *App) installCompletedMoveCustody(op *moveOperation) {
 +	app.moveCustodyMu.Lock()
 +	defer app.moveCustodyMu.Unlock()
 +	app.moveCustody = op
++}
++
+ func TestFreshPlayerWriterReportsExactCustodyRefusalWithoutOpeningFIFO(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name    string
+diff --git a/daemon/room_release_test.go b/daemon/room_release_test.go
+index 00b3f79..c8649c4 100644
+--- a/daemon/room_release_test.go
++++ b/daemon/room_release_test.go
+@@ -672,7 +672,7 @@ func testManualReleaseComposed(t *testing.T, p *AppPlayer, server *ConcreteApiSe
+ 	if calls != 1 {
+ 		t.Fatal("actual terminal retained fresh-writer fence")
+ 	}
+-	if os.Getenv("PC70_RELEASE_NEXT_START") == "1" {
++	if os.Getenv("PC70_RELEASE_NEXT_START") == "1" || os.Getenv("PC70_RELEASE_IDLE_PROBE") == "1" {
+ 		testManualReleaseManagedNextSTART(t, p)
+ 		return
+ 	}
+@@ -732,6 +732,16 @@ func testManualReleaseManagedNextSTART(t *testing.T, old *AppPlayer) {
+ 		fresh.app = app
+ 		fresh.initAliasRegistry()
+ 		fresh.state.device.SelectedAliasId = 2
++		if os.Getenv("PC70_RELEASE_IDLE_PROBE") == "1" {
++			fresh.state.active = false
++			fresh.state.player.IsPlaying, fresh.state.player.IsPaused = false, false
++			fresh.state.player.SessionId = ""
++			fresh.primaryStream = nil
++			fresh.roomContentIncarnation = ""
++			fresh.roomContentSteps = nil
++			fresh.roomTransportOffer, fresh.roomTransportPending = nil, nil
++			fresh.roomNativeIntent = 0
++		}
+ 		fresh.logout = app.logoutCh
+ 		fresh.stop = make(chan struct{}, 1)
+ 		fresh.volumeUpdate = make(chan float32, 1)
+@@ -781,6 +791,10 @@ func testManualReleaseManagedNextSTART(t *testing.T, old *AppPlayer) {
+ 	if app.manualRelease != nil || app.startCustody != nil || app.moveCustody != nil || fresh.roomManualRelease != nil {
+ 		t.Fatal("replacement inherited released custody")
+ 	}
++	if os.Getenv("PC70_RELEASE_IDLE_PROBE") == "1" {
++		testManualReleaseManagedIdlePreference(t, fresh, api)
++		return
++	}
+ 	previous := os.Getenv("PC70_RELEASE_COMPOSE")
+ 	os.Setenv("PC70_RELEASE_COMPOSE", "")
+ 	defer os.Setenv("PC70_RELEASE_COMPOSE", previous)
+@@ -965,3 +979,78 @@ func (*releasePauseEvents) OnPlayerPause(*player.Stream, string, bool, *connectp
  }
  
- func TestFreshPlayerWriterReportsExactCustodyRefusalWithoutOpeningFIFO(t *testing.T) {
+ func (*releasePauseEvents) OnPlayerEnd(*player.Stream, int64) {}
++
++// One opt-in continuation of the incumbent actual-C PC70 case: no new START,
++// decoder, source or output after release. The C done verdict retains its
++// existing known-terminal/closed-gate/no-selected-session assertions.
++func testManualReleaseManagedIdlePreference(t *testing.T, fresh *AppPlayer, api *ConcreteApiServer) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	original := fresh.aliasBinding()
++	if original == nil || !original.Ready {
++		t.Fatal("fresh idle alias binding")
++	}
++	var current, target ApiAlias
++	for _, alias := range fresh.aliasRegistry {
++		if alias.RoomID == original.RoomID {
++			current = alias
++		} else {
++			target = alias
++		}
++	}
++	if current.ID == 0 || target.ID == 0 {
++		t.Fatal("two configured idle destinations required")
++	}
++	process, valid := nativeContentProcess()
++	if !valid {
++		t.Fatal("actual Native process certificate")
++	}
++	body := struct {
++		Process     contentProcess         `json:"native_process"`
++		Incarnation string                 `json:"native_incarnation"`
++		Old         *roomTransportIdentity `json:"old_native_owner"`
++		Path        string                 `json:"expected_input_path"`
++		Digest      string                 `json:"expected_input_path_digest"`
++		Require     bool                   `json:"require_clean_absent"`
++	}{process, original.Incarnation, nil, fresh.app.cfg.AudioOutputPipe, contentDigestBytes(fresh.app.cfg.AudioOutputPipe), true}
++	var state idleAliasCState
++	endpoint := fresh.app.cfg.RoomTransportOwnToneURL + "/api/outputs/" + current.HomePodID + "/start/state"
++	if err := contentHTTP(ctx, http.MethodPost, endpoint, body, &state); err != nil || !state.CleanAbsent || !state.Ready || state.Busy || !state.OK || state.Physical {
++		t.Fatal("actual C strict absence after completed PC70", err, state)
++	}
++	beforeRevision := fresh.aliasRevision
++	read := httptest.NewRecorder()
++	api.handleAliases(read, httptest.NewRequest(http.MethodGet, "/player/aliases?idle_only=1", nil).WithContext(ctx))
++	var aliases ApiResponseAliases
++	var fields map[string]json.RawMessage
++	if read.Code != 200 || json.Unmarshal(read.Body.Bytes(), &aliases) != nil || json.Unmarshal(read.Body.Bytes(), &fields) != nil || len(fields) != 3 || !aliases.IdleOnly || aliases.Binding == nil || *aliases.Binding != *original || fresh.aliasRevision != beforeRevision {
++		t.Fatal("actual C strict9 -> public Native idle GET", read.Code, read.Body.String())
++	}
++	request := ApiRequestDataSelectAlias{RoomID: target.RoomID, ExpectedIncarnation: original.Incarnation, ExpectedRegistry: original.Registry, IdleOnly: true}
++	raw, _ := json.Marshal(request)
++	selected := httptest.NewRecorder()
++	api.handleAliases(selected, httptest.NewRequest(http.MethodPost, "/player/aliases", strings.NewReader(string(raw))).WithContext(ctx))
++	var receipt ApiResponseSelectAlias
++	if selected.Code != 200 || json.Unmarshal(selected.Body.Bytes(), &receipt) != nil || !receipt.AcceptedLocal || !receipt.IdleOnly || receipt.ID != target.ID || receipt.Binding == nil || receipt.Binding.RoomID != target.RoomID || fresh.aliasRevision != beforeRevision+1 {
++		t.Fatal("actual C strict9 -> local idle destination preference", selected.Code, selected.Body.String())
++	}
++	reread := httptest.NewRecorder()
++	api.handleAliases(reread, httptest.NewRequest(http.MethodGet, "/player/aliases?idle_only=1", nil).WithContext(ctx))
++	if reread.Code != 200 {
++		t.Fatal("idle preference preserved strict C absence", reread.Code, reread.Body.String())
++	}
++	source, err := fresh.player.Start35CurrentSource(ctx)
++	if err != nil || source != nil || fresh.primaryStream != nil || fresh.state.active || fresh.state.player.IsPlaying || fresh.state.player.SessionId != "" || fresh.app.openedWriterOwner != nil || fresh.app.openedWriter.FD != "" || fresh.app.startCustody != nil || fresh.app.moveCustody != nil || fresh.roomContentSteps != nil || fresh.roomContentIncarnation != "" {
++		t.Fatal("idle preference created source/writer/custody/offer", err)
++	}
++	done, err := http.Post(fresh.app.cfg.RoomTransportOwnToneURL+"/fixture/done", "application/json", strings.NewReader("{}"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	done.Body.Close()
++	if done.StatusCode != 200 {
++		t.Fatal("C post-release closed-gate verdict", done.StatusCode)
++	}
++	t.Log("PASS actual PC70 terminal release -> managed fresh actor -> actual C exact9 clean_absent -> public idle GET/local destination preference; no new source/PCM/output/custody/grant; C closed-gate terminal verdict retained")
++}
 diff --git a/daemon/room_transport_test.go b/daemon/room_transport_test.go
+index fc417f4..a2e242c 100644
 --- a/daemon/room_transport_test.go
 +++ b/daemon/room_transport_test.go
-@@ -2,16 +2,29 @@
+@@ -2,16 +2,29 @@ package daemon
  
  import (
  	"context"
@@ -1213,7 +1956,7 @@ diff --git a/daemon/room_transport_test.go b/daemon/room_transport_test.go
  )
  
  // This fixture seeds an admitted local actor only. It is not a real authenticated
-@@ -35,6 +48,35 @@
+@@ -35,6 +48,35 @@ func roomTransportAdmittedFixture(t *testing.T) (*AppPlayer, *nativeTransportOff
  	p.roomTransportOffer = offer
  	return p, offer
  }
@@ -1249,24 +1992,34 @@ diff --git a/daemon/room_transport_test.go b/daemon/room_transport_test.go
  func TestRoomTransportActualActorConsumptionRejectsABAAndRetirement(t *testing.T) {
  	for _, mutation := range []string{"alias-aba", "retire", "session", "connection", "actor", "mapping", "pipe", "expiry", "cancel"} {
  		t.Run(mutation, func(t *testing.T) {
-@@ -151,8 +193,15 @@
+@@ -44,7 +86,7 @@ func TestRoomTransportActualActorConsumptionRejectsABAAndRetirement(t *testing.T
+ 			switch mutation {
+ 			case "alias-aba":
+ 				for _, room := range []string{"r1", "r0"} {
+-					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint}); err != nil {
++					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint, false, nil}); err != nil {
+ 						t.Fatal(err)
+ 					}
+ 				}
+@@ -151,9 +193,16 @@ func TestRoomTransportMappingDigestLegacyAndUnsupportedPolicy(t *testing.T) {
  			t.Fatal("unsupported physical action advertised", action)
  		}
  	}
 -	if !reflect.DeepEqual(roomTransportActions, []string{"pause", "resume", "next", "previous"}) {
 +	if !reflect.DeepEqual(roomTransportActionsFor(false), []string{"pause", "resume", "next", "previous"}) {
  		t.Fatal("unsupported action included")
-+	}
+ 	}
 +	if !reflect.DeepEqual(roomTransportActionsFor(true), []string{"pause", "resume", "next", "previous", "seek"}) {
 +		t.Fatal("typed bound seek capability missing")
 +	}
 +	zero := int64(0)
 +	if _, err := p.prepareRoomTransport(context.Background(), roomTransportPrepareRequest{Action: "seek", PositionMS: &zero}); err != ErrBadRequest {
 +		t.Fatal("legacy unbound route admitted typed seek")
- 	}
++	}
  }
  func TestRoomTransportHTTPRejectsOpenProtocolAndCancelledActor(t *testing.T) {
-@@ -331,3 +380,541 @@
+ 	server := &ConcreteApiServer{requests: make(chan ApiRequest, 1)}
+@@ -331,3 +380,541 @@ func TestRoomTransportDirectPauseWriterGenerationFinalGuard(t *testing.T) {
  		t.Fatal("final worker mutation guard accepted a successor writer generation")
  	}
  }
@@ -1809,9 +2562,10 @@ diff --git a/daemon/room_transport_test.go b/daemon/room_transport_test.go
 +	}
 +}
 diff --git a/daemon/room_volume_test.go b/daemon/room_volume_test.go
+index af69c84..9fde218 100644
 --- a/daemon/room_volume_test.go
 +++ b/daemon/room_volume_test.go
-@@ -11,7 +11,18 @@
+@@ -11,8 +11,19 @@ import (
  	"sync/atomic"
  	"testing"
  	"time"
@@ -1822,19 +2576,19 @@ diff --git a/daemon/room_volume_test.go b/daemon/room_volume_test.go
 +	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
 +	"google.golang.org/protobuf/proto"
  )
-+
+ 
 +type effectStateStore struct{}
 +
 +func (effectStateStore) Load() (*librespot.AppState, error) { return &librespot.AppState{}, nil }
 +func (effectStateStore) Save(*librespot.AppState) error     { return nil }
- 
++
  // As in audio4: seed a locally admitted actor only; do not impersonate an actual
  // authenticated Spotify session or claim that fixture authority is provider proof.
-@@ -26,6 +37,101 @@
- 	actor.Snapshot.VolumePercent = 45
+ func roomVolumeFixture(t *testing.T) (*AppPlayer, *roomVolumeOperation) {
+@@ -27,6 +38,101 @@ func roomVolumeFixture(t *testing.T) (*AppPlayer, *roomVolumeOperation) {
  	op := &roomVolumeOperation{Owner: p, Actor: actor, Binding: binding, ID: actor.Snapshot.PrepareID, ArgsDigest: strings.Repeat("b", 64), OwnToneURL: actor.OwnToneURL, InputDigest: input, Expires: actor.Expires, RetainUntil: time.Now().Add(time.Minute), Latest: roomVolumeReceipt{NativePrepareID: actor.Snapshot.PrepareID, State: "prepared"}}
  	return p, op
-+}
+ }
 +func TestRoomVolumeEffectRequiresTerminalOwnerAcceptanceAndCurrentIntent(t *testing.T) {
 +	p, op := roomVolumeFixture(t)
 +	op.Bound = true
@@ -1929,9 +2683,28 @@ diff --git a/daemon/room_volume_test.go b/daemon/room_volume_test.go
 +	if _, err := p.recordVolumeEffect(context.Background(), roomVolumeActorRequest{op, context.Background()}); err == nil {
 +		t.Fatal("exhausted action ordinal cannot certify another effect")
 +	}
- }
++}
  func volumeTestActor(t *testing.T, p *AppPlayer, server *ConcreteApiServer) func() {
  	t.Helper()
+ 	done := make(chan struct{})
+@@ -156,7 +262,7 @@ func TestRoomVolumePendingClaimAliasABACancelAndMalformedOwnerDenyCommit(t *test
+ 			<-entered
+ 			if mode == "alias-aba" {
+ 				for _, room := range []string{"r1", "r0"} {
+-					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint}); err != nil {
++					if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{room, p.aliasIncarnation, p.aliasFingerprint, false, nil}); err != nil {
+ 						t.Fatal(err)
+ 					}
+ 				}
+@@ -208,7 +314,7 @@ func TestRoomVolumeReservationRejectsDirectLegacyAliasAndCloseWaits(t *testing.T
+ 	deadline := time.Now().Add(80 * time.Millisecond)
+ 	p.roomVolumeReservation = &nativeRoomVolumeReservation{op, deadline}
+ 	op.ReservationUntil = deadline
+-	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint}); err == nil {
++	if _, err := p.selectLocalAlias(ApiRequestDataSelectAlias{"r1", p.aliasIncarnation, p.aliasFingerprint, false, nil}); err == nil {
+ 		t.Fatal("direct alias mutator bypassed reservation")
+ 	}
+ 	if _, err := p.handleApiRequest(context.Background(), ApiRequest{Type: ApiRequestTypeResume}); err == nil {
 diff --git a/daemon/testdata/selected-sustained.flac b/daemon/testdata/selected-sustained.flac
 new file mode 100644
 index 0000000000000000000000000000000000000000..9278df920c77eb63a35fdca055b7129466759e38
@@ -25740,9 +26513,10 @@ literal 0
 HcmV?d00001
 
 diff --git a/output/room_transport_test.go b/output/room_transport_test.go
+index e2abb67..a163ead 100644
 --- a/output/room_transport_test.go
 +++ b/output/room_transport_test.go
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,7 @@ package output
  
  import (
  	"context"
@@ -25750,7 +26524,7 @@ diff --git a/output/room_transport_test.go b/output/room_transport_test.go
  	"sync"
  	"testing"
  	"time"
-@@ -76,3 +77,26 @@
+@@ -76,3 +77,26 @@ func TestRoomTransportPipeHeldLockReturnsOnCancellation(t *testing.T) {
  	}
  	out.lock.Unlock()
  }
@@ -25778,9 +26552,10 @@ diff --git a/output/room_transport_test.go b/output/room_transport_test.go
 +	}
 +}
 diff --git a/player/room_transport_test.go b/player/room_transport_test.go
+index d246bf6..6805f6d 100644
 --- a/player/room_transport_test.go
 +++ b/player/room_transport_test.go
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,7 @@ import (
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/output"
  	"sync"
@@ -25788,7 +26563,7 @@ diff --git a/player/room_transport_test.go b/player/room_transport_test.go
  	"testing"
  	"time"
  )
-@@ -190,3 +191,160 @@
+@@ -190,3 +191,160 @@ func TestRoomTransportPublicationDisposesDisplacedSourcesOnly(t *testing.T) {
  		t.Fatal("player teardown did not close adopted raw/decoder owner")
  	}
  }
@@ -25950,9 +26725,10 @@ diff --git a/player/room_transport_test.go b/player/room_transport_test.go
 +	}
 +}
 diff --git a/tracks/room_transport_test.go b/tracks/room_transport_test.go
+index 39550b6..12e3130 100644
 --- a/tracks/room_transport_test.go
 +++ b/tracks/room_transport_test.go
-@@ -270,3 +270,61 @@
+@@ -270,3 +270,61 @@ func TestTransferredTrackRefusesOtherFailuresCancelAndForeignQueue(t *testing.T)
  		})
  	}
  }

@@ -1,85 +1,23 @@
---- a/tests/outputs_attention_owner.c
-+++ b/tests/outputs_attention_owner.c
-@@ -1373,7 +1373,12 @@
-   assert(outputs_transport_busy() && outputs_transport_current(&first));
-   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0
-     && !busy && !start_owned && clean_absent);
--  r=burst_audio(&owner,2,"resume"); assert(outputs_transport_commit(&r,&last)==0);
-+  /* Bound-only Seek uses the existing exact digest and admission owner. */
-+  r=transport_fixture_request("seek"); assert(!transport_command_valid(&r));
-+  r.bound=true;r.native_owner=owner;r.native_revision=2;assert(transport_command_valid(&r));
-+  r=burst_audio(&owner,2,"seek");assert(outputs_transport_commit(&r,&last)==0);
-+  assert(outputs_transport_pause_confirm(1,r.token,r.native_prepare_id,2)==0 && !transport_pause_retained);
-+  r=burst_audio(&owner,3,"resume"); assert(outputs_transport_commit(&r,&last)==0);
-   assert(!outputs_transport_current(&first) && outputs_transport_current(&last) && a->volume==base);
-   /* The same App's new Spotify session may read current state; every other
-    * owner field remains exact and stale offers keep their captured identity. */
-@@ -1386,25 +1391,25 @@
-   changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
-   changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)<0);
-   outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
--  early=burst_audio(&owner,3,"pause"); newer=burst_audio(&owner,4,"resume");
-+  early=burst_audio(&owner,4,"pause"); newer=burst_audio(&owner,5,"resume");
-   assert(outputs_transport_commit(&newer,&last)==0); assert(outputs_transport_commit(&early,&first)<0);
-   assert(outputs_transport_commit(&early,&first)<0); /* Stale consumed token cannot retry. */
--  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,5,"next");
-+  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,6,"next");
-   assert(outputs_transport_commit(&r,&last)==0 && last.remaining_ms>9900); expiry=transport_custody_expiry;
-   assert(outputs_transport_result_get(r.token,&first)==0);
-   assert(expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec==transport_custody_expiry.tv_nsec);
--  early=burst_audio(&owner,6,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
--  r=burst_audio(&owner,7,"pause"); assert(outputs_transport_commit(&r,&last)==0);
-+  early=burst_audio(&owner,7,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
-+  r=burst_audio(&owner,8,"pause"); assert(outputs_transport_commit(&r,&last)==0);
-   assert(outputs_transport_commit(&early,&first)<0); /* Expire/fresh same-route custody ABA. */
--  v=burst_volume(&owner,8,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
-+  v=burst_volume(&owner,9,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
-   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
-   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
-   assert(outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED && volume.contexts_drained);
-   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && !busy && outputs_transport_busy());
--  v=burst_volume(&owner,9,45); assert(outputs_room_volume_commit(&v,&volume)==0);
-+  v=burst_volume(&owner,10,45); assert(outputs_room_volume_commit(&v,&volume)==0);
-   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
-   assert(a->volume==45 && outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED);
--  v=burst_volume(&owner,10,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
-+  v=burst_volume(&owner,11,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
-   assert(outputs_room_volume_cancel(v.token,v.native_reservation_id,&volume)==0 && volume.outcome==ROOM_VOLUME_UNKNOWN);
-   room_volume_find(v.token)->deadline.tv_sec-=2; transport_custody_expiry.tv_sec-=11;
-   assert(outputs_transport_busy()); /* Undrained context still quarantines even beyond custody expiry. */
-@@ -1414,7 +1419,7 @@
-   r=transport_fixture_request("pause"); r.bound=true; r.native_owner=owner; r.native_revision=UINT64_MAX;
-   assert(outputs_transport_prepare(&r,&last)<0);
-   generation=transport_admission_generation; transport_admission_generation=UINT64_MAX;
--  r.native_revision=11; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
-+  r.native_revision=12; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
-   transport_admission_generation=generation;
-   outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
-   puts("PASS compatible exactnative9 audio order/stalegeneration/expiryABA/maxdeadline/nonrenewingread; sequential terminaldrained volume before10s; undrainedunknown quarantine; overflowfailclosed");
-@@ -1470,6 +1475,8 @@
-     && !json_object_get_boolean(field));
-   assert(json_object_object_get_ex(reply,"clean_absent",&field) && json_object_is_type(field,json_type_boolean)
-     && json_object_get_boolean(field));
-+  assert(json_object_object_get_ex(reply,"actions",&field) && json_object_array_length(field)==5
-+    && !strcmp(json_object_get_string(json_object_array_get_idx(field,4)),"seek"));
-   jparse_free(reply);
-   json_object_object_add(body,"native_prepare_id",json_object_new_string("dddddddddddddddddddddddddddddddd"));
-   json_object_object_add(body,"native_revision",json_object_new_string("20"));
-@@ -1484,6 +1491,14 @@
-     assert(count==tokens);
-   }
-   changed=malloc(strlen(raw)+4); sprintf(changed,"%s {}",raw);
-+  assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
-+  free(raw);json_object_object_add(body,"action",json_object_new_string("seek"));
-+  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
-+  for(i=0;i<ARRAY_SIZE(cases);i++) {
-+    changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);
-+    assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
-+  }
-+  changed=room_volume_json_replace(raw,"\"action\":\"seek\"","\"action\":\"seek\",\"position_ms\":0");
-   assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
-   assert(transport_http(&hreq,"bound-prepare",raw)==HTTP_OK);free(raw);
-   reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==7);
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -938,13 +938,13 @@
+ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
+-  if (f->peer && f->mode == 29 && getenv("PC70_RELEASE_COMPOSE") && f->pc70_peer_sessions == 1)
++  if (f->peer && f->mode == 29 && (getenv("PC70_RELEASE_COMPOSE") || getenv("PC55_SEEK_MOVE")) && f->pc70_peer_sessions == 1)
+     {
+       bool next = getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && start_active
+                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE
+                   && strcmp(start_active->result.command.token, release_operation.predecessor.completed_token);
+       struct output_device *old = outputs_device_get(1);
+-      bool move = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && start_active
++      bool move = (getenv("PC55_SEEK_MOVE") || (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))) && start_active
+                   && start_active->result.command.move_existing_session && start_active->result.command.device_id == 2
+                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE && old && !old->session
+                   && !old->selected;
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -583,6 +583,75 @@
@@ -396,21 +334,183 @@
        {
  	struct output_device *target = calloc(1, sizeof(*target));
  	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
---- a/tests/airplay_callback_owner.c
-+++ b/tests/airplay_callback_owner.c
-@@ -938,13 +938,13 @@
- static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
- {
-   struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
--  if (f->peer && f->mode == 29 && getenv("PC70_RELEASE_COMPOSE") && f->pc70_peer_sessions == 1)
-+  if (f->peer && f->mode == 29 && (getenv("PC70_RELEASE_COMPOSE") || getenv("PC55_SEEK_MOVE")) && f->pc70_peer_sessions == 1)
-     {
-       bool next = getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && start_active
-                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE
-                   && strcmp(start_active->result.command.token, release_operation.predecessor.completed_token);
-       struct output_device *old = outputs_device_get(1);
--      bool move = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && start_active
-+      bool move = (getenv("PC55_SEEK_MOVE") || (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))) && start_active
-                   && start_active->result.command.move_existing_session && start_active->result.command.device_id == 2
-                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE && old && !old->session
-                   && !old->selected;
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -27,6 +27,93 @@
+   json_object_object_add(process,"boot_id",json_object_new_string(r->native_process.boot_id));attention_json_u64(process,"pid",r->native_process.pid);attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks);
+   json_object_object_add(body,"native_process",process);raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
+   assert(start_gate_http(&h,"state",raw)==HTTP_OK);free(raw);reply=jparse_obj_from_evbuffer(h.out_body);assert(reply && json_object_object_length(reply)==8);json_object_put(reply);
++  /* Read-only strict absence is stronger than ordinary START admission. */
++  json_object_object_add(body, "require_clean_absent", json_object_new_boolean(true));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_OK);
++  free(raw);
++  reply = jparse_obj_from_evbuffer(h.out_body);
++  json_object *clean, *ready, *busy;
++  assert(reply && json_object_object_length(reply) == 9 && json_object_object_get_ex(reply, "clean_absent", &clean)
++         && json_object_is_type(clean, json_type_boolean) && json_object_get_boolean(clean)
++         && json_object_object_get_ex(reply, "ready", &ready) && json_object_get_boolean(ready)
++         && json_object_object_get_ex(reply, "busy", &busy) && !json_object_get_boolean(busy));
++  json_object_put(reply);
++  struct output_device *device = outputs_device_get(1);
++  struct output_start_state strict_available;
++  uint64_t base = device->base_revision, route = device->route_revision, metadata = outputs_start_metadata_generation();
++  int volume = device->volume;
++  struct start_slot pending = { 0 };
++#define STRICT_DENIED()                                                                                                \
++  do                                                                                                                   \
++    {                                                                                                                  \
++      raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));     \
++      assert(start_gate_http(&h, "state", raw) == 409);                                                                \
++      free(raw);                                                                                                       \
++      assert(!evbuffer_get_length(h.out_body));                                                                        \
++    }                                                                                                                  \
++  while (0)
++  device->session = device;
++  assert(outputs_start_state_get(r, &strict_available) == 0 && strict_available.ready);
++  STRICT_DENIED();
++  device->session = NULL;
++  device->selected = true;
++  STRICT_DENIED();
++  device->selected = false;
++  device->busy = true;
++  STRICT_DENIED();
++  device->busy = false;
++  device->attention_restart_pending = true;
++  STRICT_DENIED();
++  device->attention_restart_pending = false;
++  start_active = &pending;
++  pending.writer_pending = true;
++  STRICT_DENIED();
++  start_active = NULL;
++  atomic_store(&start_gate, true);
++  STRICT_DENIED();
++  assert(outputs_start_gate_closed());
++  atomic_store(&start_gate, false);
++  start_scope = &pending;
++  STRICT_DENIED();
++  start_scope = NULL;
++  start_journal_fault = true;
++  STRICT_DENIED();
++  start_journal_fault = false;
++  /* A real writable descriptor of the exact registered FIFO also denies.
++   * The baseline request's distinct child owns no writer; use this process. */
++  json_object *own_process = json_object_new_object();
++  struct output_native_process own = { .pid = getpid() };
++  assert(start_boot_id(own.boot_id) && start_process_ticks(own.pid, &own.proc_start_ticks) == 1);
++  json_object_object_add(own_process, "boot_id", json_object_new_string(own.boot_id));
++  attention_json_u64(own_process, "pid", own.pid);
++  attention_json_u64(own_process, "proc_start_ticks", own.proc_start_ticks);
++  json_object_get(process);
++  json_object_object_add(body, "native_process", own_process);
++  int writer = open(r->expected_input_path, O_RDWR | O_NONBLOCK);
++  assert(writer >= 0);
++  STRICT_DENIED();
++  close(writer);
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_OK);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", json_object_new_boolean(false));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", NULL);
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", json_object_new_string("true"));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_del(body, "require_clean_absent");
++  json_object_object_add(body, "native_process", process);
++  assert(device->base_revision == base && device->route_revision == route && device->volume == volume
++         && outputs_start_metadata_generation() == metadata && !start_active && !start_journal.token[0]);
++#undef STRICT_DENIED
+   json_object_object_add(body,"offer_id",json_object_new_string("ffffffffffffffffffffffffffffffff"));json_object_object_add(body,"binding_id",json_object_new_string(r->binding_id));
+   json_object_object_add(body,"content_digest",json_object_new_string(r->content_digest));attention_json_u64(body,"native_revision",r->native_revision);
+   json_object_object_add(body,"intended_native_owner",start_journal_owner(&r->intended_native_owner));
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -1373,7 +1373,12 @@
+   assert(outputs_transport_busy() && outputs_transport_current(&first));
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0
+     && !busy && !start_owned && clean_absent);
+-  r=burst_audio(&owner,2,"resume"); assert(outputs_transport_commit(&r,&last)==0);
++  /* Bound-only Seek uses the existing exact digest and admission owner. */
++  r=transport_fixture_request("seek"); assert(!transport_command_valid(&r));
++  r.bound=true;r.native_owner=owner;r.native_revision=2;assert(transport_command_valid(&r));
++  r=burst_audio(&owner,2,"seek");assert(outputs_transport_commit(&r,&last)==0);
++  assert(outputs_transport_pause_confirm(1,r.token,r.native_prepare_id,2)==0 && !transport_pause_retained);
++  r=burst_audio(&owner,3,"resume"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(!outputs_transport_current(&first) && outputs_transport_current(&last) && a->volume==base);
+   /* The same App's new Spotify session may read current state; every other
+    * owner field remains exact and stale offers keep their captured identity. */
+@@ -1386,25 +1391,25 @@
+   changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)<0);
+   outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
+-  early=burst_audio(&owner,3,"pause"); newer=burst_audio(&owner,4,"resume");
++  early=burst_audio(&owner,4,"pause"); newer=burst_audio(&owner,5,"resume");
+   assert(outputs_transport_commit(&newer,&last)==0); assert(outputs_transport_commit(&early,&first)<0);
+   assert(outputs_transport_commit(&early,&first)<0); /* Stale consumed token cannot retry. */
+-  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,5,"next");
++  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,6,"next");
+   assert(outputs_transport_commit(&r,&last)==0 && last.remaining_ms>9900); expiry=transport_custody_expiry;
+   assert(outputs_transport_result_get(r.token,&first)==0);
+   assert(expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec==transport_custody_expiry.tv_nsec);
+-  early=burst_audio(&owner,6,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
+-  r=burst_audio(&owner,7,"pause"); assert(outputs_transport_commit(&r,&last)==0);
++  early=burst_audio(&owner,7,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
++  r=burst_audio(&owner,8,"pause"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(outputs_transport_commit(&early,&first)<0); /* Expire/fresh same-route custody ABA. */
+-  v=burst_volume(&owner,8,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
++  v=burst_volume(&owner,9,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED && volume.contexts_drained);
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && !busy && outputs_transport_busy());
+-  v=burst_volume(&owner,9,45); assert(outputs_room_volume_commit(&v,&volume)==0);
++  v=burst_volume(&owner,10,45); assert(outputs_room_volume_commit(&v,&volume)==0);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(a->volume==45 && outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED);
+-  v=burst_volume(&owner,10,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
++  v=burst_volume(&owner,11,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
+   assert(outputs_room_volume_cancel(v.token,v.native_reservation_id,&volume)==0 && volume.outcome==ROOM_VOLUME_UNKNOWN);
+   room_volume_find(v.token)->deadline.tv_sec-=2; transport_custody_expiry.tv_sec-=11;
+   assert(outputs_transport_busy()); /* Undrained context still quarantines even beyond custody expiry. */
+@@ -1414,7 +1419,7 @@
+   r=transport_fixture_request("pause"); r.bound=true; r.native_owner=owner; r.native_revision=UINT64_MAX;
+   assert(outputs_transport_prepare(&r,&last)<0);
+   generation=transport_admission_generation; transport_admission_generation=UINT64_MAX;
+-  r.native_revision=11; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
++  r.native_revision=12; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
+   transport_admission_generation=generation;
+   outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
+   puts("PASS compatible exactnative9 audio order/stalegeneration/expiryABA/maxdeadline/nonrenewingread; sequential terminaldrained volume before10s; undrainedunknown quarantine; overflowfailclosed");
+@@ -1470,6 +1475,8 @@
+     && !json_object_get_boolean(field));
+   assert(json_object_object_get_ex(reply,"clean_absent",&field) && json_object_is_type(field,json_type_boolean)
+     && json_object_get_boolean(field));
++  assert(json_object_object_get_ex(reply,"actions",&field) && json_object_array_length(field)==5
++    && !strcmp(json_object_get_string(json_object_array_get_idx(field,4)),"seek"));
+   jparse_free(reply);
+   json_object_object_add(body,"native_prepare_id",json_object_new_string("dddddddddddddddddddddddddddddddd"));
+   json_object_object_add(body,"native_revision",json_object_new_string("20"));
+@@ -1484,6 +1491,14 @@
+     assert(count==tokens);
+   }
+   changed=malloc(strlen(raw)+4); sprintf(changed,"%s {}",raw);
++  assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
++  free(raw);json_object_object_add(body,"action",json_object_new_string("seek"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  for(i=0;i<ARRAY_SIZE(cases);i++) {
++    changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);
++    assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
++  }
++  changed=room_volume_json_replace(raw,"\"action\":\"seek\"","\"action\":\"seek\",\"position_ms\":0");
+   assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
+   assert(transport_http(&hreq,"bound-prepare",raw)==HTTP_OK);free(raw);
+   reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==7);

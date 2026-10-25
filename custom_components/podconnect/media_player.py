@@ -33,7 +33,7 @@ from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
 from .native_start import start_guards
-from .targets import spotify_transfer_target
+from .targets import configured_alias_targets, select_playback_source
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
 # integration still loads on older cores (it just won't advertise search there).
@@ -103,6 +103,15 @@ async def async_setup_entry(
 ) -> None:
     """Create a media_player for each Connect device, adding new ones as they appear."""
     coordinator = entry.runtime_data.coordinator
+    speakers = entry.runtime_data.speakers
+    if speakers is not None:
+        from .speakers import SpeakersError
+
+        try:
+            async with asyncio.timeout(5):
+                await configured_alias_targets(speakers)
+        except (SpeakersError, ClientError, TimeoutError):
+            pass  # An unavailable catalogue cannot grant a selection.
     known: set[str] = set()
 
     # Taste/history "play something I like" tool for an AI assist (and the UI): play the user's
@@ -281,12 +290,17 @@ class PodConnectMediaPlayer(
 
     @property
     def source_list(self) -> list[str]:
-        """All available Connect devices — selecting one moves the session there."""
-        return [
+        """Display the last read alias catalogue; admission always reads it again."""
+        data = getattr(self.coordinator.config_entry, "runtime_data", None)
+        speakers = getattr(data, "speakers", None)
+        aliases = getattr(speakers, "_configured_alias_targets", ())
+        names = [row["name"] for row in aliases]
+        names.extend(
             dev["name"]
             for dev in (self.coordinator.data or {}).get("devices", [])
             if dev.get("name")
-        ]
+        )
+        return list(dict.fromkeys(names))
 
     @property
     def shuffle(self) -> bool | None:
@@ -921,49 +935,25 @@ class PodConnectMediaPlayer(
         return None
 
     async def async_select_source(self, source: str) -> None:
-        """ "Connect to a device": transfer the session to `source`, keeping play/pause state."""
-        entry = self.coordinator.config_entry
-        data = getattr(entry, "runtime_data", None)
-        if (
-            data is None
-            or not data.active
-            or data.coordinator is not self.coordinator
-            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id)
-            is not entry
-        ):
-            raise HomeAssistantError("PodConnect account entry unavailable")
-        try:
-            device_id, is_playing = await spotify_transfer_target(
-                self.coordinator.api, name=source
-            )
-        except (SpotifyApiError, ClientError, TimeoutError) as err:
-            raise HomeAssistantError("Spotify target lookup failed") from err
-        if (
-            getattr(entry, "runtime_data", None) is not data
-            or not data.active
-            or data.coordinator is not self.coordinator
-            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id)
-            is not entry
-        ):
-            raise HomeAssistantError("PodConnect account entry unavailable")
-        if is_playing:
-            guard, native_ready = start_guards(
-                self.coordinator.hass,
-                self._entry_id,
-                data,
-                device_id,
-                expected_api=self.coordinator.api,
-            )
-            await self._send(
-                self.coordinator.api.transfer(
-                    device_id,
-                    play=True,
-                    execution_guard=guard,
-                    async_execution_guard=native_ready,
-                )
-            )
-        else:
-            await self._send(self.coordinator.api.transfer(device_id, play=False))
+        """The entity and typed target service share the same Native admission."""
+        coordinator, target = self.coordinator, self._device_id
+
+        def entity_guard():
+            if self.coordinator is not coordinator or self._device_id != target:
+                raise HomeAssistantError("PodConnect selection entity changed")
+
+        result = await select_playback_source(
+            self.coordinator.hass,
+            self._entry_id,
+            name=source,
+            entity_guard=entity_guard,
+            send=self._send,
+        )
+        if result["kind"] == "configured_alias":
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
+            self._optimistic_repeat = None
+            self._optimistic_poll_floor = None
 
     async def _browse_category(self, category: str) -> list[BrowseMedia]:
         """Fetch one profile category as playable leaves."""

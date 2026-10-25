@@ -39,6 +39,100 @@ type roomContentResult struct {
 	Physical  bool    `json:"physical_result_verified"`
 }
 
+type roomCurrentTarget struct {
+	Process     string `json:"process"`
+	Device      string `json:"device_id"`
+	Incarnation string `json:"device_incarnation"`
+}
+type roomCurrentWitness struct {
+	Schema    string                  `json:"schema"`
+	Offer     string                  `json:"offer_id"`
+	Binding   string                  `json:"binding_id"`
+	Operation string                  `json:"operation_id"`
+	Native    roomTransportIdentity   `json:"native"`
+	Route     outputTransportIdentity `json:"route"`
+	Target    roomCurrentTarget       `json:"target"`
+	Physical  bool                    `json:"physical_result_verified"`
+}
+
+func decodeRoomCurrent(raw []byte, offer, binding string, scope roomTransportScope) (roomCurrentWitness, error) {
+	var witness roomCurrentWitness
+	_, err := contentFields(raw, "schema", "offer_id", "binding_id", "operation_id", "native", "route", "target", "physical_result_verified")
+	if err != nil || decodeQueueManagerJSON(raw, &witness) != nil || witness.Schema != "podconnect.native_completed_current.v1" || witness.Offer != offer || witness.Binding != binding || witness.Operation != offer || witness.Physical || !validTransportIdentity(witness.Native, scope) || !validOutputTransportIdentity(witness.Route, scope.Homepod) || witness.Target.Process != witness.Route.Process || witness.Target.Device != scope.Homepod || witness.Target.Incarnation != witness.Route.Incarnation {
+		return witness, fmt.Errorf("invalid current owner witness")
+	}
+	return witness, nil
+}
+
+func roomCurrentResult(w http.ResponseWriter, r *http.Request, kind, offer, binding string) {
+	var nativeURL string
+	var scope roomTransportScope
+	var originalContent *roomContentRecord
+	var originalMove *roomMoveRecord
+	if kind == "content" {
+		roomContentStore.Lock()
+		record := roomContentStore.Records[offer]
+		valid := record != nil && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && roomContentBindingCurrent(record.Binding)
+		if valid {
+			nativeURL, scope = record.Binding.NativeURL, record.Request.Scope
+			originalContent = record
+		}
+		roomContentStore.Unlock()
+		if !valid {
+			http.Error(w, "not current", http.StatusConflict)
+			return
+		}
+	} else {
+		roomMoveStore.Lock()
+		record := roomMoveStore.Records[offer]
+		valid := record != nil && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && roomContentBindingCurrent(record.Binding)
+		if valid {
+			nativeURL, scope = record.Binding.NativeURL, record.Request.Scope
+			originalMove = record
+		}
+		roomMoveStore.Unlock()
+		if !valid {
+			http.Error(w, "not current", http.StatusConflict)
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	path := "/player/room_" + kind + "/result?" + url.Values{"offer_id": {offer}, "binding_id": {binding}, "include_current": {"1"}}.Encode()
+	rpc := roomContentRPC
+	if kind == "move" {
+		rpc = roomMoveRPC
+	}
+	raw, err := rpc(ctx, nativeURL, http.MethodGet, path, nil)
+	witness, parseErr := decodeRoomCurrent(raw, offer, binding, scope)
+	if err != nil || parseErr != nil || ctx.Err() != nil {
+		http.Error(w, "current owner unavailable", http.StatusConflict)
+		return
+	}
+	if kind == "content" {
+		roomContentStore.Lock()
+		record := roomContentStore.Records[offer]
+		valid := record != nil && record == originalContent && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && record.Binding.NativeURL == nativeURL && roomContentBindingCurrent(record.Binding)
+		roomContentStore.Unlock()
+		if !valid {
+			http.Error(w, "owner replaced", http.StatusConflict)
+			return
+		}
+	} else {
+		roomMoveStore.Lock()
+		record := roomMoveStore.Records[offer]
+		valid := record != nil && record == originalMove && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && record.Binding.NativeURL == nativeURL && roomContentBindingCurrent(record.Binding)
+		roomMoveStore.Unlock()
+		if !valid {
+			http.Error(w, "owner replaced", http.StatusConflict)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(witness)
+}
+
 type roomContentRecord struct {
 	Binding    roomContentBinding
 	Request    roomContentRequest
@@ -249,8 +343,13 @@ func roomContentPrepareHandler(w http.ResponseWriter, r *http.Request) {
 func roomContentResultHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	offer, binding := q.Get("offer_id"), q.Get("binding_id")
-	if r.Method != http.MethodGet || len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
+	current := len(q) == 3 && len(q["include_current"]) == 1 && q.Get("include_current") == "1"
+	if r.Method != http.MethodGet || (!current && len(q) != 2) || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
 		http.Error(w, "arguments", 400)
+		return
+	}
+	if current {
+		roomCurrentResult(w, r, "content", offer, binding)
 		return
 	}
 	roomContentOperation(w, r, "result", offer, binding)

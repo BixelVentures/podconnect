@@ -606,3 +606,86 @@ func TestLocalAliasRetiredDuringNativeObservationCannotDuck(t *testing.T) {
 		}
 	}
 }
+
+func TestRoomSwitchIdlePreferenceStrictRelay(t *testing.T) {
+	_, binding := setupLocalAliasRooms(t)
+	calls := 0
+	idleEcho := true
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != "POST" || r.URL.Path != "/player/aliases" {
+			t.Error("preference escaped alias owner")
+		}
+		var body aliasSelectionRequest
+		if json.NewDecoder(r.Body).Decode(&body) != nil || !body.IdleOnly || body.RoomID != binding.RoomID {
+			t.Error("lost idle-only admission")
+		}
+		json.NewEncoder(w).Encode(map[string]any{"accepted_local": true, "id": 2, "binding": binding, "idle_only": idleEcho})
+	}))
+	defer engine.Close()
+	request := aliasSelectionRequest{RoomID: binding.RoomID, ExpectedIncarnation: binding.Incarnation, ExpectedRegistry: binding.Registry, IdleOnly: true}
+	raw, _ := json.Marshal(request)
+	out := httptest.NewRecorder()
+	roomSwitchAt(out, httptest.NewRequest("POST", "/api/room-switch", bytes.NewReader(raw)), engine.URL)
+	if out.Code != 200 || calls != 1 || strings.Contains(out.Body.String(), "accepted_room_move") || strings.Contains(out.Body.String(), "physical_result_verified") {
+		t.Fatalf("not local-only acceptance: %d %s", out.Code, out.Body.String())
+	}
+	idleEcho = false
+	out = httptest.NewRecorder()
+	roomSwitchAt(out, httptest.NewRequest("POST", "/api/room-switch", bytes.NewReader(raw)), engine.URL)
+	if out.Code != 502 || calls != 2 {
+		t.Fatal("old engine ignored strict idle guard")
+	}
+	for _, invalid := range []string{"null", "false", "1", "\"true\""} {
+		bad := strings.Replace(string(raw), `"idle_only":true`, `"idle_only":`+invalid, 1)
+		out = httptest.NewRecorder()
+		roomSwitchAt(out, httptest.NewRequest("POST", "/api/room-switch", strings.NewReader(bad)), engine.URL)
+		if out.Code != 400 || calls != 2 {
+			t.Fatalf("bad idle mode reached owner: %s %d", invalid, out.Code)
+		}
+	}
+}
+
+func TestRoomSwitchIdleReadIsOptInAndRejectsOldEngine(t *testing.T) {
+	rooms, binding := setupLocalAliasRooms(t)
+	entries, _ := aliasEntriesForRooms(rooms, []string{"A", "B"})
+	echo := true
+	calls := 0
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != "GET" || r.URL.Path != "/player/aliases" {
+			t.Error("idle read mutated endpoint")
+		}
+		response := map[string]any{"binding": binding, "aliases": entries}
+		if r.URL.RawQuery != "" {
+			if r.URL.RawQuery != "idle_only=1" {
+				t.Error("lost closed opt-in")
+			}
+			if echo {
+				response["idle_only"] = true
+			}
+		}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer engine.Close()
+	for _, query := range []string{"", "?idle_only=1"} {
+		out := httptest.NewRecorder()
+		roomSwitchAt(out, httptest.NewRequest("GET", "/api/room-switch"+query, nil), engine.URL)
+		if out.Code != 200 || strings.Contains(out.Body.String(), `"idle_only"`) != (query != "") {
+			t.Fatalf("read shape changed: %d %s", out.Code, out.Body.String())
+		}
+	}
+	echo = false
+	out := httptest.NewRecorder()
+	roomSwitchAt(out, httptest.NewRequest("GET", "/api/room-switch?idle_only=1", nil), engine.URL)
+	if out.Code != 502 || calls != 3 {
+		t.Fatal("old GET masqueraded as idle proof")
+	}
+	for _, query := range []string{"?idle_only=0", "?idle_only=true", "?idle_only=1&idle_only=1", "?idle_only=1&room=r0"} {
+		out = httptest.NewRecorder()
+		roomSwitchAt(out, httptest.NewRequest("GET", "/api/room-switch"+query, nil), engine.URL)
+		if out.Code != 400 || calls != 3 {
+			t.Fatal("malformed idle read reached owner")
+		}
+	}
+}

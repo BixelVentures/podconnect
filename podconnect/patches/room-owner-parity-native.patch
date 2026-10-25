@@ -1,7 +1,80 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index 9ec0afd..152ffad 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -314,18 +314,22 @@ type ApiAliasBinding struct {
+ }
+ 
+ type ApiResponseAliases struct {
+-	Binding *ApiAliasBinding `json:"binding"`
+-	Aliases []ApiAlias       `json:"aliases"`
++	Binding  *ApiAliasBinding `json:"binding"`
++	Aliases  []ApiAlias       `json:"aliases"`
++	IdleOnly bool             `json:"idle_only,omitempty"`
+ }
+ 
+ type ApiRequestDataSelectAlias struct {
+-	RoomID              string `json:"room_id"`
+-	ExpectedIncarnation string `json:"expected_incarnation"`
+-	ExpectedRegistry    string `json:"expected_registry"`
++	RoomID              string          `json:"room_id"`
++	ExpectedIncarnation string          `json:"expected_incarnation"`
++	ExpectedRegistry    string          `json:"expected_registry"`
++	IdleOnly            bool            `json:"idle_only,omitempty"`
++	Context             context.Context `json:"-"`
+ }
+ 
+ type ApiResponseSelectAlias struct {
+ 	AcceptedLocal bool             `json:"accepted_local"`
++	IdleOnly      bool             `json:"idle_only,omitempty"`
+ 	Binding       *ApiAliasBinding `json:"binding"`
+ 	ID            uint32           `json:"id"`
+ }
+@@ -499,7 +503,20 @@ func jsonDecode(r *http.Request, v any) error {
+ 
+ func (s *ConcreteApiServer) handleAliases(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method == http.MethodGet {
+-		s.handleRequest(ApiRequest{Type: ApiRequestTypeAliases}, w)
++		idle := false
++		if r.URL.RawQuery != "" {
++			values := r.URL.Query()["idle_only"]
++			if len(r.URL.Query()) != 1 || len(values) != 1 || values[0] != "1" {
++				w.WriteHeader(400)
++				return
++			}
++			idle = true
++		}
++		if idle {
++			s.handleRequest(ApiRequest{Type: ApiRequestTypeAliases, Data: idleAliasReadRequest{r.Context()}}, w)
++		} else {
++			s.handleRequest(ApiRequest{Type: ApiRequestTypeAliases}, w)
++		}
+ 		return
+ 	}
+ 	if r.Method != http.MethodPost {
+@@ -508,10 +525,16 @@ func (s *ConcreteApiServer) handleAliases(w http.ResponseWriter, r *http.Request
+ 	}
+ 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+ 	var data ApiRequestDataSelectAlias
+-	if err := jsonDecode(r, &data); err != nil || data.RoomID == "" || data.ExpectedRegistry == "" || data.ExpectedIncarnation == "" {
++	raw, err := io.ReadAll(r.Body)
++	_ = r.Body.Close()
++	var fields map[string]json.RawMessage
++	if err != nil || strictVolumeJSON(raw, &data) != nil || strictVolumeJSON(raw, &fields) != nil || fields["idle_only"] != nil && string(fields["idle_only"]) != "true" || data.RoomID == "" || data.ExpectedRegistry == "" || data.ExpectedIncarnation == "" {
+ 		w.WriteHeader(http.StatusBadRequest)
+ 		return
+ 	}
++	if data.IdleOnly {
++		data.Context = r.Context()
++	}
+ 	s.handleRequest(ApiRequest{Type: ApiRequestTypeSelectAlias, Data: data}, w)
+ }
+ 
 diff --git a/daemon/controls.go b/daemon/controls.go
+index 7e9d576..44aa4d7 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -485,59 +485,45 @@
+@@ -485,59 +485,45 @@ func (p *AppPlayer) loadCurrentTrackWithStart(ctx context.Context, paused, drop,
  	return nil
  }
  
@@ -18,7 +91,10 @@ diff --git a/daemon/controls.go b/daemon/controls.go
 -		})
 -
 -		requiresUpdate = true
--	}
++func (p *AppPlayer) setOptions(ctx context.Context, repeatingContext *bool, repeatingTrack *bool, shufflingContext *bool) error {
++	if p.state == nil || p.state.player == nil || p.state.player.Options == nil {
++		return ErrAliasConflict
+ 	}
 -
 -	if repeatingTrack != nil && *repeatingTrack != p.state.player.Options.RepeatingTrack {
 -		p.state.player.Options.RepeatingTrack = *repeatingTrack
@@ -31,42 +107,16 @@ diff --git a/daemon/controls.go b/daemon/controls.go
 -		})
 -
 -		requiresUpdate = true
--	}
++	before := proto.Clone(p.state.player.Options).(*connectpb.ContextPlayerOptions)
++	after := proto.Clone(before).(*connectpb.ContextPlayerOptions)
++	if repeatingContext != nil {
++		after.RepeatingContext = *repeatingContext
+ 	}
 -
 -	if p.state.tracks != nil && shufflingContext != nil && *shufflingContext != p.state.player.Options.ShufflingContext {
 -		if err := p.state.tracks.ToggleShuffle(ctx, *shufflingContext); err != nil {
 -			p.app.log.WithError(err).Errorf("failed toggling shuffle context (value: %t)", *shufflingContext)
 -			return
--		}
--
--		p.state.player.Options.ShufflingContext = *shufflingContext
--		p.state.player.Track = p.state.tracks.CurrentTrack()
--		p.state.player.PrevTracks = p.state.tracks.PrevTracks()
--		p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
--		p.state.player.Index = p.state.tracks.Index()
--
--		p.app.server.Emit(&ApiEvent{
--			Type: ApiEventTypeShuffleContext,
--			Data: ApiEventDataShuffleContext{
--				Value: *shufflingContext,
--			},
--		})
--
--		requiresUpdate = true
--	}
--
--	if requiresUpdate {
--		p.updateState(ctx)
--	}
-+func (p *AppPlayer) setOptions(ctx context.Context, repeatingContext *bool, repeatingTrack *bool, shufflingContext *bool) error {
-+	if p.state == nil || p.state.player == nil || p.state.player.Options == nil {
-+		return ErrAliasConflict
-+	}
-+	before := proto.Clone(p.state.player.Options).(*connectpb.ContextPlayerOptions)
-+	after := proto.Clone(before).(*connectpb.ContextPlayerOptions)
-+	if repeatingContext != nil {
-+		after.RepeatingContext = *repeatingContext
-+	}
 +	if repeatingTrack != nil {
 +		after.RepeatingTrack = *repeatingTrack
 +	}
@@ -82,8 +132,26 @@ diff --git a/daemon/controls.go b/daemon/controls.go
 +		staged, err = staged.PrepareShuffle(ctx, after.ShufflingContext)
 +		if err != nil {
 +			return err
-+		}
-+	}
+ 		}
+-
+-		p.state.player.Options.ShufflingContext = *shufflingContext
+-		p.state.player.Track = p.state.tracks.CurrentTrack()
+-		p.state.player.PrevTracks = p.state.tracks.PrevTracks()
+-		p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
+-		p.state.player.Index = p.state.tracks.Index()
+-
+-		p.app.server.Emit(&ApiEvent{
+-			Type: ApiEventTypeShuffleContext,
+-			Data: ApiEventDataShuffleContext{
+-				Value: *shufflingContext,
+-			},
+-		})
+-
+-		requiresUpdate = true
+ 	}
+-
+-	if requiresUpdate {
+-		p.updateState(ctx)
 +	if ctx.Err() != nil {
 +		return ctx.Err()
 +	}
@@ -93,14 +161,14 @@ diff --git a/daemon/controls.go b/daemon/controls.go
 +		p.state.player.PrevTracks = staged.PrevTracks()
 +		p.state.player.NextTracks = staged.NextTracks(ctx, nil)
 +		p.state.player.Index = staged.Index()
-+	}
+ 	}
 +	p.state.player.Options = after
 +	p.publishOptions(ctx, before, after)
 +	return nil
  }
  
  func (p *AppPlayer) addToQueue(ctx context.Context, track *connectpb.ContextTrack) {
-@@ -629,6 +615,9 @@
+@@ -629,6 +615,9 @@ func (p *AppPlayer) pause(ctx context.Context) error {
  }
  
  func (p *AppPlayer) seek(ctx context.Context, position int64) error {
@@ -110,7 +178,7 @@ diff --git a/daemon/controls.go b/daemon/controls.go
  	if p.primaryStream == nil {
  		return fmt.Errorf("no primary stream")
  	}
-@@ -643,6 +632,12 @@
+@@ -643,6 +632,12 @@ func (p *AppPlayer) seek(ctx context.Context, position int64) error {
  
  	p.state.player.Timestamp = time.Now().UnixMilli()
  	p.state.player.PositionAsOfTimestamp = position
@@ -123,7 +191,7 @@ diff --git a/daemon/controls.go b/daemon/controls.go
  	p.updateState(ctx)
  	p.schedulePrefetchNext()
  
-@@ -665,7 +660,6 @@
+@@ -665,7 +660,6 @@ func (p *AppPlayer) seek(ctx context.Context, position int64) error {
  		},
  	})
  
@@ -131,10 +199,172 @@ diff --git a/daemon/controls.go b/daemon/controls.go
  }
  
  func (p *AppPlayer) skipPrev(ctx context.Context, allowSeeking bool) error {
+diff --git a/daemon/device_alias.go b/daemon/device_alias.go
+index b678598..3640faf 100644
+--- a/daemon/device_alias.go
++++ b/daemon/device_alias.go
+@@ -1,6 +1,7 @@
+ package daemon
+ 
+ import (
++	"context"
+ 	"crypto/rand"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+@@ -103,7 +104,14 @@ func (p *AppPlayer) emitSelectedAlias(id uint32, binding *ApiAliasBinding) {
+ 	p.app.server.Emit(&ApiEvent{Type: "selected_alias", Data: data})
+ }
+ 
+-func (p *AppPlayer) selectLocalAlias(data ApiRequestDataSelectAlias) (*ApiResponseSelectAlias, error) {
++func (p *AppPlayer) selectLocalAlias(data ApiRequestDataSelectAlias, contexts ...context.Context) (*ApiResponseSelectAlias, error) {
++	if data.IdleOnly {
++		ctx := context.Background()
++		if len(contexts) != 0 {
++			ctx = contexts[0]
++		}
++		return p.selectIdleLocalAlias(ctx, data)
++	}
+ 	// Close and local commit share only this short admission boundary.
+ 	p.aliasMu.Lock()
+ 	if p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.contentBusyLocked() || p.aliasFingerprint == "" || data.ExpectedRegistry != p.aliasFingerprint || data.ExpectedIncarnation != p.aliasIncarnation {
+@@ -131,3 +139,132 @@ func (p *AppPlayer) selectLocalAlias(data ApiRequestDataSelectAlias) (*ApiRespon
+ }
+ 
+ func (p *AppPlayer) retireAliases() { p.retireRoomVolumeOwner() }
++
++// A preference for the next explicit START is not a retained-session MOVE.
++// Local preference needs only the exact idle Native actor. The opt-in read
++// additionally proves C absence without selecting an output or granting a route.
++func (p *AppPlayer) selectIdleLocalAlias(parent context.Context, data ApiRequestDataSelectAlias, readonly ...bool) (*ApiResponseSelectAlias, error) {
++	owned, stop := queueOperationContext(parent, data.Context)
++	defer stop()
++	ctx, cancel := context.WithTimeout(owned, roomTransportLifetime)
++	defer cancel()
++	if p.app == nil || p.sess == nil || p.state == nil || p.state.player == nil || p.state.device == nil || p.player == nil {
++		return nil, ErrAliasConflict
++	}
++	account, authenticated := p.sess.BoundUsername()
++	if !authenticated {
++		return nil, ErrAliasConflict
++	}
++	var scope roomVolumeScope
++	p.aliasMu.Lock()
++	for _, alias := range p.aliasRegistry {
++		if alias.RoomID == data.RoomID {
++			scope = roomVolumeScope{account, p.app.deviceId, alias.RoomID, alias.HomePodID}
++		}
++	}
++	valid := data.ExpectedRegistry == p.aliasFingerprint && data.ExpectedIncarnation == p.aliasIncarnation && p.idleAliasCurrentLocked()
++	p.aliasMu.Unlock()
++	if !valid || scope.HomePodID == "" {
++		return nil, ErrAliasConflict
++	}
++	capture, err := p.captureContent(scope, true)
++	if err != nil || capture.OldOwner != nil || capture.Source != nil {
++		return nil, ErrAliasConflict
++	}
++	if len(readonly) != 0 && readonly[0] {
++		if err = readIdleAliasCState(ctx, capture); err != nil {
++			return nil, err
++		}
++	}
++	actualSource, err := p.player.Start35CurrentSource(ctx)
++	if err != nil || actualSource != nil {
++		return nil, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	if ctx.Err() != nil || parent.Err() != nil || !p.contentCurrentLocked(capture) || !p.idleAliasCurrentLocked() {
++		p.aliasMu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	if len(readonly) != 0 && readonly[0] {
++		binding := p.aliasBindingLocked()
++		id := p.state.device.SelectedAliasId
++		p.aliasMu.Unlock()
++		return &ApiResponseSelectAlias{Binding: binding, ID: id, IdleOnly: true}, nil
++	}
++	p.advanceAliasRevisionLocked()
++	p.state.device.SelectedAliasId = capture.TargetAlias
++	binding := p.aliasBindingLocked()
++	p.aliasMu.Unlock()
++	// This event is a bound alias observation, never a C route grant.
++	p.emitSelectedAlias(capture.TargetAlias, binding)
++	return &ApiResponseSelectAlias{AcceptedLocal: true, Binding: binding, ID: capture.TargetAlias, IdleOnly: true}, nil
++}
++
++// Called with aliasMu held; no lock is retained across C or worker reads.
++func (p *AppPlayer) idleAliasCurrentLocked() bool {
++	if p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.contentBusyLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.state.active || p.state.player.IsPlaying || p.state.player.SessionId != "" || p.primaryStream != nil || !p.transportMappingCurrentLocked() {
++		return false
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	return !p.app.moveCustodyUnknown && p.app.retirementPending == nil && p.app.startCustody == nil && p.app.moveCustody == nil && p.app.startOutputPermit == nil && p.app.manualRelease == nil && p.app.openedWriterOwner == nil && p.app.openedWriter.FD == ""
++}
++
++// The opt-in read proves the same idle boundary without changing the alias,
++// its revision, the player, C selection, or any command authority.
++type idleAliasReadRequest struct{ Context context.Context }
++
++func (p *AppPlayer) idleLocalAliases(ctx context.Context, requests ...context.Context) (*ApiResponseAliases, error) {
++	aliases, err := p.localAliases()
++	if err != nil {
++		return nil, err
++	}
++	request := ApiRequestDataSelectAlias{RoomID: aliases.Binding.RoomID, ExpectedIncarnation: aliases.Binding.Incarnation, ExpectedRegistry: aliases.Binding.Registry, IdleOnly: true}
++	if len(requests) != 0 {
++		request.Context = requests[0]
++	}
++	proof, err := p.selectIdleLocalAlias(ctx, request, true)
++	if err != nil {
++		return nil, err
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	current := p.aliasBindingLocked()
++	if current == nil || *current != *proof.Binding || !p.idleAliasCurrentLocked() {
++		return nil, ErrAliasConflict
++	}
++	return &ApiResponseAliases{Binding: current, Aliases: append([]ApiAlias(nil), p.aliasRegistry...), IdleOnly: true}, nil
++}
++
++// An ordinary START-ready reply may still contain retire-capable sessions.
++// Only C's opt-in absence predicate is evidence for this read-only preference.
++type idleAliasCState struct {
++	Schema      string        `json:"schema"`
++	OK          bool          `json:"ok"`
++	Ready       bool          `json:"ready"`
++	Busy        bool          `json:"busy"`
++	Policy      string        `json:"policy_revision"`
++	Percent     int           `json:"start_volume_percent"`
++	Target      contentTarget `json:"target_identity"`
++	Physical    bool          `json:"physical_result_verified"`
++	CleanAbsent bool          `json:"clean_absent"`
++}
++
++func readIdleAliasCState(ctx context.Context, capture *contentCapture) error {
++	request := struct {
++		Process            contentProcess         `json:"native_process"`
++		Incarnation        string                 `json:"native_incarnation"`
++		OldOwner           *roomTransportIdentity `json:"old_native_owner"`
++		Path               string                 `json:"expected_input_path"`
++		Digest             string                 `json:"expected_input_path_digest"`
++		RequireCleanAbsent bool                   `json:"require_clean_absent"`
++	}{capture.Process, capture.AliasIncarnation, nil, capture.Pipe, capture.PipeDigest, true}
++	var state idleAliasCState
++	if err := contentHTTP(ctx, "POST", capture.endpoint("state"), request, &state); err != nil {
++		return err
++	}
++	if state.Schema != "podconnect.output_start_state.v1" || !state.OK || !state.Ready || state.Busy || !state.CleanAbsent || state.Policy != start35Policy || state.Percent != 35 || state.Target.DeviceID != capture.Scope.HomePodID || !volumeUUID.MatchString(state.Target.Process) || !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0" || state.Physical {
++		return ErrAliasConflict
++	}
++	return nil
++}
 diff --git a/daemon/player.go b/daemon/player.go
+index 5f73c3d..07548d7 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -50,6 +50,8 @@
+@@ -50,6 +50,8 @@ type AppPlayer struct {
  	roomReleaseWait                  chan struct{}
  	roomTransportOffer               *nativeTransportOffer
  	roomTransportPending             *nativeTransportOffer
@@ -143,7 +373,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	aliasRevision                    uint64
  	aliasRevisionExhausted           bool
  	roomTransportGeneration          uint64
-@@ -196,6 +198,9 @@
+@@ -196,6 +198,9 @@ func (p *AppPlayer) handleDealerMessage(ctx context.Context, msg dealer.Message)
  			return fmt.Errorf("failed unmarshalling SetVolumeCommand: %w", err)
  		}
  
@@ -153,7 +383,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  		p.updateVolume(uint32(setVolCmd.Volume))
  		p.emitVolumeAction(uint32(setVolCmd.Volume), "spotify_connect", "", "")
  	} else if strings.HasPrefix(msg.Uri, "hm://connect-state/v1/connect/logout") {
-@@ -359,19 +364,15 @@
+@@ -359,19 +364,15 @@ func (p *AppPlayer) handlePlayerCommandWithSpclient(ctx context.Context, req dea
  		return nil
  	case "set_repeating_context":
  		val := req.Command.Value.(bool)
@@ -177,7 +407,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case "set_queue":
  		p.setQueue(ctx, req.Command.PrevTracks, req.Command.NextTracks)
  		return nil
-@@ -649,7 +650,7 @@
+@@ -649,7 +650,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  
  	if p.roomVolumeBusy() {
  		switch req.Type {
@@ -186,7 +416,16 @@ diff --git a/daemon/player.go b/daemon/player.go
  		default:
  			return nil, ErrAliasConflict
  		}
-@@ -693,13 +694,21 @@
+@@ -672,6 +673,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		return p.claimMove(req.Data.(moveActorRequest))
+ 	case apiMoveConsume:
+ 		return p.consumeMove(req.Data.(moveActorRequest))
++	case apiCompletedCurrent:
++		return p.completedCurrent(req.Data.(completedCurrentRequest))
+ 	case apiContentObserve:
+ 		return p.captureContent(req.Data.(roomVolumeScope))
+ 	case apiContentOffer:
+@@ -693,13 +696,21 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		if p.roomVolumeBusy() {
  			actions = []string{}
  		}
@@ -209,7 +448,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case apiRoomVolumeBoundPrepare:
  		return p.prepareRoomVolumeVersion(ctx, req.Data.(roomVolumePrepareActorRequest), true)
  	case apiRoomVolumePrepare:
-@@ -708,6 +717,8 @@
+@@ -708,6 +719,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		return p.claimRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
  	case apiRoomVolumeConsume:
  		return p.consumeRoomVolume(ctx, req.Data.(roomVolumeActorRequest))
@@ -218,7 +457,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case apiRoomBoundState:
  		return p.roomTransportStateVersion(ctx, req.Data.(roomTransportStateRequest), true)
  	case apiRoomBoundPrepare:
-@@ -726,6 +737,8 @@
+@@ -726,6 +739,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		return p.fenceRoomRelease(ctx, req.Data.(*nativeTransportOffer))
  	case apiRoomReleaseClose:
  		return p.admitRoomReleaseClose(ctx, req.Data.(*nativeTransportOffer))
@@ -227,7 +466,28 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case apiRoomTransportEffect:
  		return p.effectRoomTransport(ctx, req.Data.(roomTransportEffectRequest))
  	case apiRoomTransportAbort:
-@@ -834,11 +847,9 @@
+@@ -736,13 +751,19 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 	case ApiRequestTypeQueueOccurrence:
+ 		return p.commitQueueOccurrence(ctx, req.Data.(queueJumpRequest))
+ 	case ApiRequestTypeAliases:
++		if request, ok := req.Data.(idleAliasReadRequest); ok {
++			return p.idleLocalAliases(ctx, request.Context)
++		}
++		if idle, _ := req.Data.(bool); idle {
++			return p.idleLocalAliases(ctx)
++		}
+ 		return p.localAliases()
+ 	case ApiRequestTypeSelectAlias:
+ 		data, ok := req.Data.(ApiRequestDataSelectAlias)
+ 		if !ok {
+ 			return nil, ErrBadRequest
+ 		}
+-		return p.selectLocalAlias(data)
++		return p.selectLocalAlias(data, ctx)
+ 	case ApiRequestTypeRoot:
+ 		return &ApiResponseRoot{PlaybackReady: p.playbackReady()}, nil
+ 	case ApiRequestTypeWebApi:
+@@ -834,11 +855,9 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  			position = data.Position
  		}
  
@@ -241,7 +501,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case ApiRequestTypeNext:
  		data := req.Data.(ApiRequestDataNext)
  		if data.Uri != nil {
-@@ -912,16 +923,13 @@
+@@ -912,16 +931,13 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		return nil, nil
  	case ApiRequestTypeSetRepeatingContext:
  		val := req.Data.(bool)
@@ -261,7 +521,7 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case ApiRequestTypeAddToQueue:
  		p.addToQueue(ctx, &connectpb.ContextTrack{Uri: req.Data.(string)})
  		return nil, nil
-@@ -983,19 +991,18 @@
+@@ -983,19 +999,18 @@ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2
  		dt := req.Argument
  		switch dt {
  		case mpris.None:
@@ -285,10 +545,100 @@ diff --git a/daemon/player.go b/daemon/player.go
  	case mpris.MediaPlayer2PlayerCommandVolumeChanged:
  		volRelative := req.Argument.(float64)
  		volAbs := uint32(player.MaxStateVolume * volRelative)
+diff --git a/daemon/room_completed_writer.go b/daemon/room_completed_writer.go
+index 7995213..398a79c 100644
+--- a/daemon/room_completed_writer.go
++++ b/daemon/room_completed_writer.go
+@@ -6,6 +6,84 @@ import (
+ 	"github.com/devgianlu/go-librespot/output"
+ )
+ 
++// completedCurrentRequest is a read-only query for one retained operation.
++// It runs on the AppPlayer actor; the HTTP handler never reads live player
++// fields or decides that a cached completion is current.
++type completedCurrentRequest struct {
++	content *contentOperation
++	move    *moveOperation
++	ctx     context.Context
++}
++
++const apiCompletedCurrent ApiRequestType = "completed_current"
++
++type completedCurrentWitness struct {
++	Schema    string                `json:"schema"`
++	Offer     string                `json:"offer_id"`
++	Binding   string                `json:"binding_id"`
++	Operation string                `json:"operation_id"`
++	Native    roomTransportIdentity `json:"native"`
++	Route     roomVolumeRoute       `json:"route"`
++	Target    contentTarget         `json:"target"`
++	Physical  bool                  `json:"physical_result_verified"`
++}
++
++func (p *AppPlayer) completedCurrent(request completedCurrentRequest) (any, error) {
++	if request.ctx == nil || request.ctx.Err() != nil || (request.content == nil) == (request.move == nil) {
++		return nil, ErrAliasConflict
++	}
++	var owner roomTransportIdentity
++	var route roomVolumeRoute
++	var target contentTarget
++	var offer, binding string
++	if op := request.content; op != nil {
++		op.mu.Lock()
++		valid := op.Owner == p && op.Terminal && op.State == "complete" && op.Actual != nil && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Route != nil
++		if valid {
++			owner, route, target = *op.Actual, *op.CReceipt.Route, op.CReceipt.Target
++			offer, binding = op.Offer.OfferID, op.Offer.BindingID
++		}
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	} else {
++		op := request.move
++		op.mu.Lock()
++		valid := op.Owner == p && op.Terminal && op.State == "complete" && op.Actual != nil && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Route != nil
++		if valid {
++			owner, route, target = *op.Actual, *op.CReceipt.Route, op.CReceipt.Target
++			offer, binding = op.Offer.OfferID, op.Offer.BindingID
++		}
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	}
++	current, err := p.verifyCompletedWriter(request.ctx, owner)
++	if err != nil || current == nil || current.start != request.content || current.move != request.move || request.ctx.Err() != nil {
++		return nil, ErrAliasConflict
++	}
++	// A completed operation can be retired while the worker verifies the FIFO.
++	if op := request.content; op != nil {
++		op.mu.Lock()
++		valid := op.Owner == p && op.Terminal && op.State == "complete" && op.Actual != nil && *op.Actual == owner && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Route != nil && *op.CReceipt.Route == route
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	} else {
++		op := request.move
++		op.mu.Lock()
++		valid := op.Owner == p && op.Terminal && op.State == "complete" && op.Actual != nil && *op.Actual == owner && op.CReceipt != nil && op.CReceipt.Phase == "completed" && op.CReceipt.Route != nil && *op.CReceipt.Route == route
++		op.mu.Unlock()
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	}
++	return completedCurrentWitness{"podconnect.native_completed_current.v1", offer, binding, offer, owner, route, target, false}, nil
++}
++
+ // A completed C source may continue with a new phone connection or playback
+ // session only on this same App, Player and live FIFO writer. The two changing
+ // owner fields are intentionally excluded only at this completed-source gate.
 diff --git a/daemon/room_content.go b/daemon/room_content.go
+index 9d6977d..4e08a2f 100644
 --- a/daemon/room_content.go
 +++ b/daemon/room_content.go
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,7 @@ import (
  	"encoding/json"
  	"fmt"
  	"io"
@@ -296,7 +646,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	"path/filepath"
  	"regexp"
  	"strconv"
-@@ -33,6 +34,7 @@
+@@ -33,6 +34,7 @@ const (
  )
  
  var contentTrackURI = regexp.MustCompile(`^spotify:track:[a-zA-Z0-9]{22}$`)
@@ -304,7 +654,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  var contentContextURI = regexp.MustCompile(`^spotify:(album|playlist|artist|show):[a-zA-Z0-9]{22}$`)
  
  type contentOffer struct {
-@@ -45,9 +47,13 @@
+@@ -45,9 +47,13 @@ type contentOffer struct {
  	ExpiresAfterMS     int    `json:"expires_after_ms"`
  }
  type contentArgs struct {
@@ -321,7 +671,30 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  }
  type contentPrepareRequest struct {
  	Scope  roomVolumeScope `json:"scope"`
-@@ -312,8 +318,53 @@
+@@ -237,7 +243,7 @@ func (p *AppPlayer) contentBusyLocked() bool {
+ 	// An elapsed deadline alone cannot open a scheduling gap for another owner.
+ 	return p.roomContentQuarantined || p.roomContentReservation != nil || p.moveBusyLocked()
+ }
+-func (p *AppPlayer) captureContent(scope roomVolumeScope) (*contentCapture, error) {
++func (p *AppPlayer) captureContent(scope roomVolumeScope, readonly ...bool) (*contentCapture, error) {
+ 	actualAccount, authenticated := p.sess.BoundUsername()
+ 	actualProcess, processOK := nativeContentProcess()
+ 	if !processOK || !authenticated || p.app == nil || p.app.cfg == nil || p.sess == nil || p.player == nil || p.state == nil || p.state.player == nil || p.state.device == nil || !p.playbackReady() || actualAccount != scope.AccountUserID || scope.AccountUserID == "" || p.app.deviceId != scope.TargetID || p.spotConnId == "" || p.app.cfg.AudioBackend != "pipe" || p.app.cfg.AudioOutputPipeFormat != "s16le" || !p.app.cfg.ExternalVolume || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) {
+@@ -264,10 +270,11 @@ func (p *AppPlayer) captureContent(scope roomVolumeScope) (*contentCapture, erro
+ 	if target.ID == 0 || !volumeCounter(scope.HomePodID) || scope.HomePodID == "0" {
+ 		return nil, ErrAliasConflict
+ 	}
+-	if p.roomContentSteps == nil {
++	readOnly := len(readonly) != 0 && readonly[0]
++	if p.roomContentSteps == nil && !readOnly {
+ 		p.roomContentSteps = make(chan contentStep)
+ 	}
+-	if p.roomContentIncarnation == "" {
++	if p.roomContentIncarnation == "" && !readOnly {
+ 		id, err := randomQueueID(16)
+ 		if err != nil {
+ 			return nil, err
+@@ -312,8 +319,53 @@ func (p *AppPlayer) offerContent(request contentOfferActorRequest) (any, error)
  	op := &contentOperation{Owner: p, Capture: c, Offer: contentOffer{"podconnect.room_content_offer.v1", id, binding, c.Incarnation, start35Policy, 35, 5000}, Target: request.Target, Expires: time.Now().Add(5 * time.Second), RetainUntil: time.Now().Add(45 * time.Second), State: "staging", TerminalSignal: make(chan struct{})}
  	return op, nil
  }
@@ -376,7 +749,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  }
  func (p *AppPlayer) claimContent(request contentActorRequest) (any, error) {
  	op := request.Operation
-@@ -344,9 +395,16 @@
+@@ -344,9 +396,16 @@ func (p *AppPlayer) claimContent(request contentActorRequest) (any, error) {
  	op.Claimed = true
  	op.Action = request.Request.Action
  	op.Args = request.Request.Args
@@ -393,7 +766,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	}
  	c := op.Capture
  	op.Intended = roomTransportIdentity{c.Scope.AccountUserID, c.Scope.TargetID, c.Scope.RoomID, c.Scope.HomePodID, c.Connection, futureSession, p.aliasIncarnation, c.Registry, c.AliasRevision + 1}
-@@ -383,7 +441,13 @@
+@@ -383,7 +442,13 @@ func (op *contentOperation) stage() {
  			op.finish(terminalState)
  		}
  	}()
@@ -408,11 +781,10 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	if err != nil {
  		terminalState = "rejected"
  		return
-@@ -392,6 +456,15 @@
- 	if err != nil {
+@@ -393,6 +458,15 @@ func (op *contentOperation) stage() {
  		terminalState = "rejected"
  		return
-+	}
+ 	}
 +	// The new list has no selected current occurrence yet. Shuffle here so
 +	// every occurrence is eligible to start, while retaining the list's normal
 +	// shuffle seed/state for a later explicit unshuffle.
@@ -421,10 +793,11 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
 +			terminalState = "rejected"
 +			return
 +		}
- 	}
++	}
  	if err = list.TrySeek(ctx, func(*connectpb.ContextTrack) bool { return true }); err != nil {
  		terminalState = "rejected"
-@@ -405,6 +478,9 @@
+ 		return
+@@ -405,6 +479,9 @@ func (op *contentOperation) stage() {
  	state.Restrictions = spotCtx.Restrictions
  	state.ContextRestrictions = spotCtx.Restrictions
  	state.Options = &connectpb.ContextPlayerOptions{}
@@ -434,7 +807,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	state.Suppressions = &connectpb.Suppressions{}
  	state.PlayOrigin = &connectpb.PlayOrigin{FeatureIdentifier: "go-librespot", FeatureVersion: librespot.VersionNumberString()}
  	state.Track = list.CurrentTrack()
-@@ -416,6 +492,12 @@
+@@ -416,6 +493,12 @@ func (op *contentOperation) stage() {
  	state.IsBuffering = false
  	state.PositionAsOfTimestamp = 0
  	state.Timestamp = time.Now().UnixMilli()
@@ -447,7 +820,7 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	id, err := librespot.SpotifyIdFromUri(state.Track.Uri)
  	if err != nil {
  		terminalState = "rejected"
-@@ -428,6 +510,13 @@
+@@ -428,6 +511,13 @@ func (op *contentOperation) stage() {
  	}
  	op.mu.Lock()
  	op.Stream = stream
@@ -462,13 +835,13 @@ diff --git a/daemon/room_content.go b/daemon/room_content.go
  	cancelled = op.Cancelled || ctx.Err() != nil
  	if !cancelled {
 diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
+index 7c7b3a8..67c13e0 100644
 --- a/daemon/room_content_http.go
 +++ b/daemon/room_content_http.go
-@@ -22,6 +22,34 @@
- 	if err != nil || len(raw) > 16384 || strictContentJSON(raw, out) != nil {
+@@ -23,6 +23,34 @@ func contentBody(w http.ResponseWriter, r *http.Request, out any) bool {
  		w.WriteHeader(400)
  		return false
-+	}
+ 	}
 +	if request, ok := out.(*contentPrepareRequest); ok {
 +		// Exact list arguments reject even empty foreign track/context fields.
 +		var fields map[string]json.RawMessage
@@ -496,10 +869,11 @@ diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
 +				}
 +			}
 +		}
- 	}
++	}
  	return true
  }
-@@ -84,7 +112,7 @@
+ func contentWrite(w http.ResponseWriter, value any) {
+@@ -84,7 +112,7 @@ func (s *ConcreteApiServer) handleContentControls(w http.ResponseWriter, r *http
  		Registry string          `json:"alias_registry"`
  		Digest   string          `json:"input_path_digest"`
  		OwnTone  string          `json:"own_tone_url"`
@@ -508,10 +882,34 @@ diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
  }
  func (s *ConcreteApiServer) handleContentPrepare(w http.ResponseWriter, r *http.Request) {
  	var request contentPrepareRequest
+@@ -154,7 +182,8 @@ func (s *ConcreteApiServer) handleContentResult(w http.ResponseWriter, r *http.R
+ 		return
+ 	}
+ 	q := r.URL.Query()
+-	if len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !volumeHex32.MatchString(q.Get("offer_id")) || !volumeHex64.MatchString(q.Get("binding_id")) {
++	current := len(q) == 3 && len(q["include_current"]) == 1 && q.Get("include_current") == "1"
++	if (!current && len(q) != 2) || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !volumeHex32.MatchString(q.Get("offer_id")) || !volumeHex64.MatchString(q.Get("binding_id")) {
+ 		w.WriteHeader(400)
+ 		return
+ 	}
+@@ -163,5 +192,12 @@ func (s *ConcreteApiServer) handleContentResult(w http.ResponseWriter, r *http.R
+ 		w.WriteHeader(409)
+ 		return
+ 	}
++	if current {
++		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
++		defer cancel()
++		value, err := s.roomTransportAsk(ctx, apiCompletedCurrent, completedCurrentRequest{content: op, ctx: ctx})
++		roomTransportResponse(w, value, err)
++		return
++	}
+ 	contentWrite(w, op.receipt("result"))
+ }
 diff --git a/daemon/room_move.go b/daemon/room_move.go
+index 2ab7d78..856b6ce 100644
 --- a/daemon/room_move.go
 +++ b/daemon/room_move.go
-@@ -54,13 +54,16 @@
+@@ -54,13 +54,16 @@ type moveReceipt struct {
  }
  type moveCapture struct {
  	*contentCapture
@@ -535,7 +933,7 @@ diff --git a/daemon/room_move.go b/daemon/room_move.go
  }
  type moveOperation struct {
  	mu                                                                                                   sync.Mutex
-@@ -184,10 +187,29 @@
+@@ -184,10 +187,29 @@ func (p *AppPlayer) captureMove(scope roomVolumeScope) (*moveCapture, error) {
  	if c.OldOwner == nil || c.OldOwner.HomePodID == scope.HomePodID || c.OldOwner.RoomID == scope.RoomID || c.Primary == nil || c.Source == nil || c.Primary.Source != c.Source || !c.State.active || !c.PlayerState.IsPlaying || c.SessionID == "" || c.State.tracks == nil || p.moveBusyLocked() {
  		return nil, ErrAliasConflict
  	}
@@ -568,9 +966,10 @@ diff --git a/daemon/room_move.go b/daemon/room_move.go
  func (p *AppPlayer) offerMove(request moveOfferActorRequest) (any, error) {
  	p.aliasMu.Lock()
 diff --git a/daemon/room_move_actor.go b/daemon/room_move_actor.go
+index 5218478..6e2f713 100644
 --- a/daemon/room_move_actor.go
 +++ b/daemon/room_move_actor.go
-@@ -6,7 +6,7 @@
+@@ -6,7 +6,7 @@ import (
  )
  
  func (p *AppPlayer) moveEffectCurrentLocked(op *moveOperation, ctx context.Context) bool {
@@ -580,18 +979,17 @@ diff --git a/daemon/room_move_actor.go b/daemon/room_move_actor.go
  	}
  	if !op.Switched {
 diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+index c9b048a..679b65f 100644
 --- a/daemon/room_move_custody.go
 +++ b/daemon/room_move_custody.go
-@@ -10,10 +10,37 @@
+@@ -10,10 +10,37 @@ import (
  // The App outlives individual authenticated AppPlayers. A completed MOVE's C
  // token belongs to the process-wide FIFO writer, so the next AppPlayer must
  // retire it before opening a replacement descriptor.
 -func (app *App) installCompletedMoveCustody(op *moveOperation) {
--	app.moveCustodyMu.Lock()
--	defer app.moveCustodyMu.Unlock()
 +func (app *App) moveCustodyCurrent(owner *AppPlayer, capture *moveCapture) bool {
-+	app.moveCustodyMu.Lock()
-+	defer app.moveCustodyMu.Unlock()
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
 +	return app.moveCustodyCurrentLocked(owner, capture)
 +}
 +
@@ -624,9 +1022,10 @@ diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
  
  func (app *App) contentCustodySnapshot() (*moveOperation, *contentOperation, error) {
 diff --git a/daemon/room_move_execute.go b/daemon/room_move_execute.go
+index 43ddfe4..e1fa3d2 100644
 --- a/daemon/room_move_execute.go
 +++ b/daemon/room_move_execute.go
-@@ -242,8 +242,10 @@
+@@ -242,8 +242,10 @@ func (op *moveOperation) commit(parent context.Context, server *ConcreteApiServe
  		if op.Owner.app == nil {
  			return ErrAliasConflict
  		}
@@ -638,8 +1037,36 @@ diff --git a/daemon/room_move_execute.go b/daemon/room_move_execute.go
  		op.State = "complete"
  		op.Terminal = true
  		op.RetainUntil = time.Now().Add(time.Minute)
+diff --git a/daemon/room_move_http.go b/daemon/room_move_http.go
+index 877e21c..f50b525 100644
+--- a/daemon/room_move_http.go
++++ b/daemon/room_move_http.go
+@@ -183,7 +183,8 @@ func (s *ConcreteApiServer) handleMoveResult(w http.ResponseWriter, r *http.Requ
+ 		return
+ 	}
+ 	q := r.URL.Query()
+-	if len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !volumeHex32.MatchString(q.Get("offer_id")) || !volumeHex64.MatchString(q.Get("binding_id")) {
++	current := len(q) == 3 && len(q["include_current"]) == 1 && q.Get("include_current") == "1"
++	if (!current && len(q) != 2) || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !volumeHex32.MatchString(q.Get("offer_id")) || !volumeHex64.MatchString(q.Get("binding_id")) {
+ 		w.WriteHeader(http.StatusBadRequest)
+ 		return
+ 	}
+@@ -192,5 +193,12 @@ func (s *ConcreteApiServer) handleMoveResult(w http.ResponseWriter, r *http.Requ
+ 		w.WriteHeader(http.StatusConflict)
+ 		return
+ 	}
++	if current {
++		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
++		defer cancel()
++		value, err := s.roomTransportAsk(ctx, apiCompletedCurrent, completedCurrentRequest{move: op, ctx: ctx})
++		roomTransportResponse(w, value, err)
++		return
++	}
+ 	moveWrite(w, op.receipt("result"))
+ }
 diff --git a/daemon/room_options.go b/daemon/room_options.go
 new file mode 100644
+index 0000000..f73c3ae
 --- /dev/null
 +++ b/daemon/room_options.go
 @@ -0,0 +1,169 @@
@@ -813,9 +1240,10 @@ new file mode 100644
 +	return true, nil
 +}
 diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+index 335fc68..ea305d5 100644
 --- a/daemon/room_transport.go
 +++ b/daemon/room_transport.go
-@@ -31,7 +31,16 @@
+@@ -31,7 +31,16 @@ const (
  	roomTransportLifetime                  = 5 * time.Second
  )
  
@@ -833,7 +1261,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  var homePodIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
  
  type roomTransportIdentity struct {
-@@ -45,6 +54,53 @@
+@@ -45,6 +54,53 @@ type roomTransportIdentity struct {
  	AliasRegistry    string `json:"alias_registry"`
  	AliasRevision    uint64 `json:"alias_revision"`
  }
@@ -887,7 +1315,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  type roomTransportStateRequest struct {
  	AccountUserID  string          `json:"account_user_id"`
  	TargetID       string          `json:"target_id"`
-@@ -54,22 +110,29 @@
+@@ -54,22 +110,29 @@ type roomTransportStateRequest struct {
  	IncludeRelease bool            `json:"-"`
  }
  type roomTransportPrepareRequest struct {
@@ -917,7 +1345,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	ArgsDigest     string           `json:"args_digest"`
  	ExpiresAfterMS int              `json:"expires_after_ms"`
  	NativeRevision string           `json:"native_revision,omitempty"`
-@@ -77,6 +140,13 @@
+@@ -77,6 +140,13 @@ type roomTransportSnapshot struct {
  	WriterProof    *queueWriterWire `json:"writer_proof,omitempty"`
  }
  type nativeTransportOffer struct {
@@ -931,7 +1359,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	Bound               bool
  	NativeRevision      string
  	Published           bool
-@@ -242,6 +312,13 @@
+@@ -242,6 +312,13 @@ func (p *AppPlayer) roomTransportStateVersion(parent context.Context, request ro
  		return nil, ErrAliasConflict
  	}
  	var release *releaseOwnerDescriptor
@@ -945,7 +1373,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	if request.IncludeRelease {
  		if !p.managedReleaseAvailable() {
  			return nil, ErrAliasConflict
-@@ -257,17 +334,24 @@
+@@ -257,17 +334,24 @@ func (p *AppPlayer) roomTransportStateVersion(parent context.Context, request ro
  	}
  	return struct {
  		Release  *releaseOwnerDescriptor `json:"release,omitempty"`
@@ -971,7 +1399,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	if request.Action == "release" {
  		return p.prepareRoomRelease(parent, request, bound)
  	}
-@@ -295,11 +379,19 @@
+@@ -295,11 +379,19 @@ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request
  	if bound && !nativeBoundOwnerValid(identity) {
  		return nil, ErrAliasConflict
  	}
@@ -991,7 +1419,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	offer.Bound = bound
  	offer.NativeRevision = revision
  	stagedOwned := true
-@@ -309,8 +401,19 @@
+@@ -309,9 +401,20 @@ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request
  		}
  	}()
  	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: boundSchema("podconnect.native_room_transport.v1", bound), Action: request.Action, VolumePercent: 0, ExpiresAfterMS: 5000}
@@ -1001,17 +1429,18 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
 +	}
  	if bound {
  		offer.Snapshot.NativeRevision = revision
-+	}
+ 	}
 +	if optionAction(request.Action) {
 +		offer.Snapshot.ShuffleEnabled = request.ShuffleEnabled
 +		offer.Snapshot.RepeatMode = request.RepeatMode
 +		if err := p.prepareRoomOptions(ctx, offer, &request); err != nil {
 +			return nil, err
 +		}
- 	}
++	}
  	if request.Action == "next" || request.Action == "previous" {
  		staged, state, err := p.prepareRoomTransportTrack(ctx, request.Action == "previous", p.sess.Spclient())
-@@ -355,11 +458,15 @@
+ 		if err != nil {
+@@ -355,11 +458,15 @@ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request
  	offer.Snapshot.PrepareID = id
  	// Full immutable native identity/action/args, encoded by this owner.
  	raw, err := json.Marshal(struct {
@@ -1032,7 +1461,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	if err != nil {
  		return nil, err
  	}
-@@ -378,6 +485,12 @@
+@@ -378,6 +485,12 @@ func (p *AppPlayer) transportOfferCurrentAtLocked(offer *nativeTransportOffer, p
  	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || (admissionDeadline && !time.Now().Before(offer.Expires)) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
  		return false
  	}
@@ -1045,7 +1474,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	if offer.WriterGeneration != 0 {
  		p.app.moveCustodyMu.Lock()
  		current := p.app.openedWriterOwner == p && p.app.openedWriterGeneration == offer.WriterGeneration
-@@ -440,6 +553,10 @@
+@@ -440,6 +553,10 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  		return nil, ErrAliasConflict
  	}
  	p.roomTransportPending = nil // private in-process capability, never an HTTP field
@@ -1056,7 +1485,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	defer offer.discardPrepared()
  	if parent.Err() != nil || (request.Context != nil && request.Context.Err() != nil) || !time.Now().Before(offer.Expires) {
  		return nil, ErrAliasConflict
-@@ -449,6 +566,9 @@
+@@ -449,6 +566,9 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  		stream = offer.PreparedStream.Source
  	}
  	paused := offer.Snapshot.Action == "pause"
@@ -1066,18 +1495,18 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  	if offer.PreparedStream != nil {
  		paused = offer.PreparedState.IsPaused
  	}
-@@ -465,6 +585,10 @@
- 		defer p.aliasMu.Unlock()
+@@ -466,6 +586,10 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  		if !p.transportOfferCurrentLocked(offer, parent, request.Context) {
  			return ErrAliasConflict
-+		}
+ 		}
 +		// A nil callback is a read-only pre-effect check.
 +		if mutate == nil {
 +			return nil
- 		}
++		}
  		// No I/O or deferred operation in this callback.
  		mutate()
-@@ -477,6 +601,8 @@
+ 		offer.Published = true
+@@ -477,6 +601,8 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  			p.state.player.PlaybackId = hex.EncodeToString(offer.PreparedStream.PlaybackId)
  			p.state.player.Duration = int64(offer.PreparedStream.Media.Duration())
  			p.state.player.PositionAsOfTimestamp = 0
@@ -1086,7 +1515,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  		} else {
  			p.state.player.PositionAsOfTimestamp = p.state.trackPosition()
  		}
-@@ -485,8 +611,18 @@
+@@ -485,8 +611,18 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  		p.state.player.IsBuffering = false
  		return nil
  	}
@@ -1106,7 +1535,7 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  		offer.Queue.EffectEnqueued = true
  		writer := output.MovePipeIdentity{PipeIdentity: offer.Writer.Wire.Pipe, FD: offer.Writer.Wire.FD}
  		err = p.player.GuardedQueueTransport(effectContext, stream, offer.Primary.Source, writer, offer.Writer.Wire.Epoch, guard)
-@@ -501,16 +637,21 @@
+@@ -501,16 +637,21 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
  	if offer.PreparedStream != nil {
  		p.sess.Events().PostPrimaryStreamLoad(p.primaryStream, paused)
  	}
@@ -1115,8 +1544,6 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
 -		event = player.EventTypePause
 -	} else if offer.PreparedStream != nil {
 -		event = player.EventTypePlay
--	}
--	p.handlePlayerEvent(parent, &player.Event{Type: event})
 +	if offer.Snapshot.Action == "seek" {
 +		p.publishSeek(parent, oldPosition, *offer.Snapshot.PositionMS)
 +	} else {
@@ -1127,7 +1554,8 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
 +			event = player.EventTypePlay
 +		}
 +		p.handlePlayerEvent(parent, &player.Event{Type: event})
-+	}
+ 	}
+-	p.handlePlayerEvent(parent, &player.Event{Type: event})
  	if offer.Queue != nil {
  		return queueAccepted(offer), nil
  	}
@@ -1136,9 +1564,10 @@ diff --git a/daemon/room_transport.go b/daemon/room_transport.go
  		Schema         string `json:"schema"`
  		AcceptedNative bool   `json:"accepted_native"`
 diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+index b34a34f..b36fa1c 100644
 --- a/daemon/room_transport_http.go
 +++ b/daemon/room_transport_http.go
-@@ -160,6 +160,26 @@
+@@ -160,6 +160,26 @@ func roomTransportBody(w http.ResponseWriter, r *http.Request, out any) bool {
  		w.WriteHeader(400)
  		return false
  	}
@@ -1165,7 +1594,7 @@ diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
  	if len(raw) > 2048 {
  		request, ok := out.(*roomTransportPrepareRequest)
  		if !ok || (request.Action != "queue" && request.Action != "release") {
-@@ -200,7 +220,7 @@
+@@ -200,7 +220,7 @@ func (s *ConcreteApiServer) handleRoomTransportPrepare(w http.ResponseWriter, r
  	if !roomTransportBody(w, r, &request) {
  		return
  	}
@@ -1174,7 +1603,7 @@ diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
  		w.WriteHeader(400)
  		return
  	}
-@@ -219,7 +239,7 @@
+@@ -219,7 +239,7 @@ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *
  	if !roomTransportBody(w, r, &request) {
  		return
  	}
@@ -1183,7 +1612,7 @@ diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
  		w.WriteHeader(400)
  		return
  	}
-@@ -251,6 +271,25 @@
+@@ -251,6 +271,25 @@ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *
  		defer cancelCleanup()
  		_, _ = s.roomTransportAsk(cleanup, apiRoomTransportAbort, offer)
  	}()
@@ -1209,7 +1638,7 @@ diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
  	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("transport redirect denied") }}
  	if err = commitRoomTransportOwner(ctx, client, offer, request.OwnToneToken); err != nil {
  		roomTransportResponse(w, nil, err)
-@@ -258,7 +297,7 @@
+@@ -258,7 +297,7 @@ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *
  	}
  	// No public endpoint accepts this pointer. A real C ACK is required to enqueue.
  	data, err := s.roomTransportAsk(ctx, apiRoomTransportEffect, roomTransportEffectRequest{offer, ctx})
@@ -1219,9 +1648,10 @@ diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
  			(offer.Snapshot.Action == "next" || offer.Snapshot.Action == "previous"))) {
  		// Only the private actor can report this actual guarded effect. COMMIT's
 diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
+index d0b3639..82ca79e 100644
 --- a/daemon/room_transport_pause.go
 +++ b/daemon/room_transport_pause.go
-@@ -32,6 +32,14 @@
+@@ -32,6 +32,14 @@ type directPauseOutputPrepare struct {
  // prepare/consume/effect methods directly avoids enqueueing onto that same actor.
  // A configured bound route never falls back to an uncorrelated local Pause.
  func (p *AppPlayer) pauseBoundRoom(ctx context.Context) (bool, error) {
@@ -1236,7 +1666,7 @@ diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
  	if p.app == nil || p.app.cfg == nil || p.app.cfg.AudioBackend != "pipe" || !p.app.cfg.ExternalVolume || p.app.cfg.RoomTransportOwnToneURL == "" {
  		return false, nil
  	}
-@@ -58,7 +66,7 @@
+@@ -58,7 +66,7 @@ func (p *AppPlayer) pauseBoundRoom(ctx context.Context) (bool, error) {
  	if scope.RoomID == "" || scope.HomePodID == "" {
  		return true, ErrAliasConflict
  	}
@@ -1245,7 +1675,7 @@ diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
  	if err != nil {
  		return true, err
  	}
-@@ -106,14 +114,14 @@
+@@ -106,14 +114,14 @@ func (p *AppPlayer) pauseBoundRoom(ctx context.Context) (bool, error) {
  		}
  		seen[action] = true
  	}
@@ -1262,7 +1692,7 @@ diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
  	var prepared directPauseOutputPrepare
  	if err = roomBoundHTTP(ctx, http.MethodPost, endpoint+"bound-prepare", boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision), &prepared, offer.Snapshot.roomTransportIdentity, offer.NativeRevision); err != nil {
  		return true, err
-@@ -137,14 +145,18 @@
+@@ -137,14 +145,18 @@ func (p *AppPlayer) pauseBoundRoom(ctx context.Context) (bool, error) {
  	// effectRoomTransport synchronously publishes exactly its own Pause event,
  	// which advances the existing transport generation once. A separate event
  	// or successor must not be adopted by sampling the latest generation.
@@ -1287,9 +1717,10 @@ diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
  	if !current() {
  		return true, ErrAliasConflict
 diff --git a/daemon/room_volume.go b/daemon/room_volume.go
+index 53cffc8..e60895d 100644
 --- a/daemon/room_volume.go
 +++ b/daemon/room_volume.go
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,7 @@ const (
  	apiRoomVolumePrepare          ApiRequestType = "room_volume_prepare"
  	apiRoomVolumeClaim            ApiRequestType = "room_volume_claim"
  	apiRoomVolumeConsume          ApiRequestType = "room_volume_consume"
@@ -1297,7 +1728,7 @@ diff --git a/daemon/room_volume.go b/daemon/room_volume.go
  	roomVolumeReservationLifetime                = 3 * time.Second
  	roomVolumeOfferLifetime                      = 5 * time.Second
  	roomVolumeStoreLimit                         = 128
-@@ -117,31 +118,32 @@
+@@ -117,31 +118,32 @@ type roomVolumeOwnerReceipt struct {
  	PinRemainingMS      int             `json:"pin_remaining_ms"`
  }
  type roomVolumeOperation struct {
@@ -1355,7 +1786,7 @@ diff --git a/daemon/room_volume.go b/daemon/room_volume.go
  }
  type nativeRoomVolumeReservation struct {
  	Operation *roomVolumeOperation
-@@ -331,7 +333,7 @@
+@@ -331,7 +333,7 @@ func (p *AppPlayer) prepareRoomVolumeVersion(parent context.Context, request roo
  	actor.Bound = bound
  	actor.CompletedWriter = completed
  	actor.NativeRevision = revision
@@ -1364,7 +1795,7 @@ diff --git a/daemon/room_volume.go b/daemon/room_volume.go
  	return op, nil
  }
  func (p *AppPlayer) claimRoomVolume(parent context.Context, request roomVolumeActorRequest) (any, error) {
-@@ -376,6 +378,44 @@
+@@ -376,6 +378,44 @@ func (p *AppPlayer) consumeRoomVolume(parent context.Context, request roomVolume
  	p.roomVolumeReservation = &nativeRoomVolumeReservation{op, deadline}
  	return op, nil
  }
@@ -1410,9 +1841,10 @@ diff --git a/daemon/room_volume.go b/daemon/room_volume.go
  	p.aliasMu.Lock()
  	reservation := p.roomVolumeReservation
 diff --git a/daemon/room_volume_http.go b/daemon/room_volume_http.go
+index 84acfbc..f45bdd8 100644
 --- a/daemon/room_volume_http.go
 +++ b/daemon/room_volume_http.go
-@@ -367,6 +367,10 @@
+@@ -367,6 +367,10 @@ func (s *ConcreteApiServer) handleRoomVolumeCommit(w http.ResponseWriter, r *htt
  		return
  	}
  	receipt := op.commitOwner(ctx)
@@ -1424,9 +1856,10 @@ diff --git a/daemon/room_volume_http.go b/daemon/room_volume_http.go
  }
  func (s *ConcreteApiServer) handleRoomVolumeCancel(w http.ResponseWriter, r *http.Request) {
 diff --git a/output/driver-pipe.go b/output/driver-pipe.go
+index 2446af6..3528c58 100644
 --- a/output/driver-pipe.go
 +++ b/output/driver-pipe.go
-@@ -306,3 +306,55 @@
+@@ -306,3 +306,55 @@ func (out *pipeOutput) WithTransportLock(ctx context.Context, apply func(func(bo
  	}
  	return apply(func(paused bool) { out.paused = paused; out.cond.Signal() })
  }
@@ -1483,9 +1916,10 @@ diff --git a/output/driver-pipe.go b/output/driver-pipe.go
 +	return apply(actual, out.paused, func() { out.pendingPCM = nil; out.pendingErr = nil })
 +}
 diff --git a/player/room_transport.go b/player/room_transport.go
+index d9f5e6a..e73b8a3 100644
 --- a/player/room_transport.go
 +++ b/player/room_transport.go
-@@ -16,6 +16,7 @@
+@@ -16,6 +16,7 @@ type guardedTransportCommand struct {
  	guard          output.TransportGuard
  	writer         *output.MovePipeIdentity
  	epoch          string
@@ -1493,19 +1927,19 @@ diff --git a/player/room_transport.go b/player/room_transport.go
  }
  
  // GuardedTransport is additive; legacy player operations keep their behavior.
-@@ -29,6 +30,11 @@
- // actual writer fstat/epoch check for the distinct queue-purpose admission.
- func (p *Player) GuardedQueueTransport(ctx context.Context, source, expectedSource librespot.AudioSource, writer output.MovePipeIdentity, epoch string, guard output.TransportGuard) error {
+@@ -31,6 +32,11 @@ func (p *Player) GuardedQueueTransport(ctx context.Context, source, expectedSour
  	return p.guardedTransport(&guardedTransportCommand{context: ctx, source: source, expectedSource: expectedSource, writer: &writer, epoch: epoch, guard: guard})
-+}
-+
+ }
+ 
 +// GuardedSeek joins the same worker and captured pipe/source, preserving Pause.
 +func (p *Player) GuardedSeek(ctx context.Context, position int64, paused bool, expected librespot.AudioSource, writer *output.MovePipeIdentity, guard output.TransportGuard) error {
 +	return p.guardedTransport(&guardedTransportCommand{context: ctx, positionMS: &position, paused: paused, expectedSource: expected, writer: writer, guard: guard})
- }
- 
++}
++
  func (p *Player) guardedTransport(command *guardedTransportCommand) error {
-@@ -57,6 +63,48 @@
+ 	reply := make(chan any, 1)
+ 	select {
+@@ -57,6 +63,48 @@ func (p *Player) applyGuardedTransport(command *guardedTransportCommand, out *ou
  		return fmt.Errorf("no existing pipe output")
  	}
  
@@ -1555,9 +1989,10 @@ diff --git a/player/room_transport.go b/player/room_transport.go
  	if !ok {
  		return fmt.Errorf("guarded pipe output unavailable")
 diff --git a/tracks/room_transport.go b/tracks/room_transport.go
+index 43b300f..d4a6f69 100644
 --- a/tracks/room_transport.go
 +++ b/tracks/room_transport.go
-@@ -144,3 +144,18 @@
+@@ -144,3 +144,18 @@ func (tl *List) PrepareQueueOccurrence(ctx context.Context, revision uint64, pos
  	}
  	return clone, nil
  }
@@ -1577,9 +2012,10 @@ diff --git a/tracks/room_transport.go b/tracks/room_transport.go
 +	return clone, nil
 +}
 diff --git a/tracks/tracks.go b/tracks/tracks.go
+index 3325363..e24dab4 100644
 --- a/tracks/tracks.go
 +++ b/tracks/tracks.go
-@@ -381,7 +381,7 @@
+@@ -381,7 +381,7 @@ func (tl *List) ToggleShuffle(ctx context.Context, shuffle bool) error {
  			// TODO: check that we do not seek forever
  		}
  		if err := iter.error(); err != nil {

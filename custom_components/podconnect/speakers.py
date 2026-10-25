@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientTimeout
@@ -124,8 +125,16 @@ class SpeakersClient:
             # No response body, URL, or credential material enters the public error.
             raise SpeakersError("Speakers request failed; outcome unknown") from err
 
-    async def aliases(self) -> dict:
-        data = await self._request("GET", "/api/room-switch")
+    async def aliases(self, *, idle_only: bool = False) -> dict:
+        data = await self._request(
+            "GET", "/api/room-switch" + ("?idle_only=1" if idle_only else "")
+        )
+        if idle_only and (
+            not isinstance(data, dict)
+            or set(data) != {"binding", "aliases", "idle_only"}
+            or data["idle_only"] is not True
+        ):
+            raise SpeakersError("Native idle owner unavailable")
         if not isinstance(data, dict):
             raise SpeakersError("Invalid alias catalog")
         binding = data.get("binding")
@@ -163,7 +172,14 @@ class SpeakersClient:
             "aliases": [{k: r[k] for k in ("id", "room_id", "name")} for r in rows],
         }
 
-    async def move(self, target: str, catalog: dict) -> dict:
+    async def move(
+        self,
+        target: str,
+        catalog: dict,
+        *,
+        idle_only: bool = False,
+        execution_guard=None,
+    ) -> dict:
         matches = [row for row in catalog["aliases"] if row["room_id"] == target]
         if len(matches) != 1:
             raise SpeakersError("Configured alias is unavailable")
@@ -173,14 +189,99 @@ class SpeakersClient:
             "expected_incarnation": binding["incarnation"],
             "expected_registry": binding["registry"],
         }
+        if idle_only:
+            body["idle_only"] = True
+        if execution_guard is not None:
+            execution_guard()
         reply = await self._request("POST", "/api/room-switch", body)
+        if execution_guard is not None:
+            execution_guard()
         if (
             not isinstance(reply, dict)
             or reply.get("accepted_local") is not True
+            or idle_only
+            and reply.get("idle_only") is not True
             or reply.get("binding") != {**binding, "room_id": target}
         ):
             raise SpeakersError("Local selection outcome unknown")
         return {"accepted_local": True, "binding": reply["binding"]}
+
+    async def ensure_no_owned_session(
+        self, room_id: str, request_id: str, *, execution_guard=None, owner_guard=None
+    ) -> dict:
+        """Release exactly the observed Native writer before an external transfer."""
+        if (
+            not _text(room_id)
+            or not isinstance(request_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", request_id)
+        ):
+            raise SpeakersError("Invalid release request")
+        data = await self._request("GET", "/api/rooms?include_release=1")
+        rows = (
+            data.get("rooms")
+            if isinstance(data, dict) and set(data) == {"rooms"}
+            else None
+        )
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise SpeakersError("Release owner unavailable")
+        matches = [row for row in rows if row.get("id") == room_id]
+        release = matches[0].get("release") if len(matches) == 1 else None
+        if release is None:
+            catalog = await self.aliases(idle_only=True)
+            if execution_guard is not None:
+                execution_guard()
+            if catalog["binding"]["room_id"] != room_id:
+                raise SpeakersError("Native idle owner changed")
+            return {"idle_only": True}
+        if owner_guard is None:
+            raise SpeakersError("Release account owner unavailable")
+        await owner_guard()
+        if (
+            not isinstance(release, dict)
+            or set(release) != {"owner_binding_id"}
+            or not isinstance(release["owner_binding_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", release["owner_binding_id"])
+        ):
+            raise SpeakersError("Release owner unavailable")
+        if execution_guard is not None:
+            execution_guard()
+        result = await self._request(
+            "POST",
+            "/api/release",
+            {
+                "room_id": room_id,
+                "expected_binding_id": release["owner_binding_id"],
+                "request_id": request_id,
+            },
+            budget=17,
+        )
+        if execution_guard is not None:
+            execution_guard()
+        if (
+            not isinstance(result, dict)
+            or set(result)
+            != {
+                "schema",
+                "ok",
+                "prepare_id",
+                "outcome",
+                "terminal",
+                "contexts_drained",
+                "retry_allowed",
+                "physical_result_verified",
+            }
+            or result["schema"] != "podconnect.release_result.v1"
+            or result["ok"] is not True
+            or result["outcome"] != "retired"
+            or result["terminal"] is not True
+            or result["contexts_drained"] is not True
+            or result["retry_allowed"] is not False
+            or result["physical_result_verified"] is not False
+            or not isinstance(result["prepare_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", result["prepare_id"])
+        ):
+            raise SpeakersError("Release rejected or outcome unknown")
+        return result
 
     async def rooms(self) -> list:
         data = await self._request("GET", "/api/rooms")
@@ -346,6 +447,16 @@ class SpeakersClient:
             budget=17,
         )
 
+    async def room_content_current(self, offer_id, binding_id):
+        return await self._request(
+            "GET",
+            "/api/room-content/result?"
+            + urlencode(
+                {"offer_id": offer_id, "binding_id": binding_id, "include_current": "1"}
+            ),
+            budget=4,
+        )
+
     async def commit_room_content(self, offer_id, binding_id):
         return await self._request(
             "POST",
@@ -387,6 +498,16 @@ class SpeakersClient:
             "/api/room-move/result?"
             + urlencode({"offer_id": offer_id, "binding_id": binding_id}),
             budget=17,
+        )
+
+    async def room_move_current(self, offer_id, binding_id):
+        return await self._request(
+            "GET",
+            "/api/room-move/result?"
+            + urlencode(
+                {"offer_id": offer_id, "binding_id": binding_id, "include_current": "1"}
+            ),
+            budget=4,
         )
 
     async def commit_room_move(self, offer_id, binding_id):
