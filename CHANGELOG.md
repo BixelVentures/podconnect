@@ -1,3 +1,8 @@
+## Control 0.10.23 — preserve native queue freshness
+
+- Keep the original native queue expiry while preparing track metadata, so processing time cannot invalidate an otherwise fresh queue in PodVoice. Preserve both wall-clock and monotonic source deadlines; command authorization and one-use execution are unchanged.
+- Speakers 0.26.53 is unchanged.
+
 ## Speakers 0.26.53 / Control 0.10.22
 
 - Restore the exact original attention lease after a completed START loses its

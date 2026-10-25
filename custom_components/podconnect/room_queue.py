@@ -279,9 +279,10 @@ class RoomQueue:
 
         stamp = datetime.fromisoformat(latest["observation"]["observed_at"]).timestamp()
         observation = latest["observation"]
+        wall_now, monotonic_now = time.time(), time.monotonic()
         remaining = min(
-            queue["expires_after_ms"] / 1000 - (time.monotonic() - started),
-            stamp + observation["max_age_ms"] / 1000 - time.time(),
+            queue["expires_after_ms"] / 1000 - (monotonic_now - started),
+            stamp + observation["max_age_ms"] / 1000 - wall_now,
             (observation["max_age_ms"] - observation["age_ms"]) / 1000,
         )
         if remaining <= 0:
@@ -292,7 +293,7 @@ class RoomQueue:
             "entry": entry,
             "epoch": latest["owner_epoch"],
             "poll": latest["poll_sequence"],
-            "deadline": time.monotonic() + remaining,
+            "deadline": monotonic_now + remaining,
         }
         metadata = {}
         cache = getattr(self.commands.data.observations, "_queue_cache", None)
@@ -361,7 +362,7 @@ class RoomQueue:
             "returned_count": len(queue["items"]),
             "truncated": queue["truncated"],
             "actions": value["actions"] if latest["status"] == "ready" else [],
-            "valid_until": time.time() + remaining,
+            "valid_until": wall_now + remaining,
             "physical_result_verified": False,
         }
 
