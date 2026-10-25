@@ -15,6 +15,47 @@ from custom_components.podconnect.room_content import (
 
 
 class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
+    async def test_content_library_closed_arguments_and_full_list_replay(self):
+        args = {
+            "track_uris": ["spotify:track:0" + ch * 21 for ch in "ABA"],
+            "shuffle": False,
+            "library_source": "liked",
+            "max_volume": 35,
+        }
+        self.assertTrue(valid_selected_arguments("play_tracks", args))
+        for mutation in (
+            {"track_uris": []},
+            {"track_uris": args["track_uris"] * 17},
+            {"track_uris": ["spotify:track:" + "Z" * 22]},
+            {"shuffle": 0},
+            {"shuffle": None},
+            {"library_source": "playlist"},
+            {"context_uri": ""},
+            {"track_uri": args["track_uris"][0]},
+        ):
+            self.assertFalse(
+                valid_selected_arguments("play_tracks", {**args, **mutation})
+            )
+        boundary = {**args, "track_uris": [args["track_uris"][0]] * 50}
+        self.assertTrue(valid_selected_arguments("play_tracks", boundary))
+        request = self.content_request(action="play_tracks", args=args)
+        original = copy.deepcopy(request)
+        result = await self.content_invoke("prepare_room_selected_content", request)
+        self.assertEqual(result["state"], "staged")
+        request["args"]["track_uris"][0:2] = reversed(
+            request["args"]["track_uris"][0:2]
+        )
+        result = await self.content_invoke("prepare_room_selected_content", request)
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(len(self.prepares()), 1)
+        self.assertEqual(self.prepares()[0]["args"], original["args"])
+        result = await self.content_invoke("start_room_selected_content", original)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "play_tracks")
+        result = await self.content_invoke("start_room_selected_content", original)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.content_commits()), 1)
+
     def test_exact_context_kind_arguments_match_native_owner(self):
         for kind in ("playlist", "album", "artist", "show"):
             with self.subTest(kind=kind):
@@ -92,7 +133,9 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
                     "schema": "podconnect.room_content_state.v1",
                     "ok": True,
                     "start_offer": self.content_offer_value(),
-                    "actions": ["play_track", "play_context"],
+                    "actions": getattr(
+                        self, "content_actions", ["play_track", "play_context"]
+                    ),
                     "physical_result_verified": False,
                 }
             )
@@ -574,6 +617,93 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
                 "error_kind"
             ],
             "stale_command",
+        )
+        self.assertEqual(self.content_commits(), [])
+        await self.content_cleanup()
+
+    async def test_content_episode_public_selected_service_preserves_exact_admitted_uri(
+        self,
+    ):
+        self.content_actions = ["play_track", "play_context", "play_episode"]
+        request = self.content_request(
+            action="play_episode",
+            args={"episode_uri": "spotify:episode:" + "0" * 21 + "4", "max_volume": 35},
+        )
+        staged = await self.content_invoke("prepare_room_selected_content", request)
+        self.assertEqual(staged["state"], "staged")
+        receipt = await self.content_invoke("start_room_selected_content", request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.assertEqual(receipt["action"], "play_episode")
+        self.assertEqual((len(self.prepares()), len(self.content_commits())), (1, 1))
+        self.assertEqual(self.prepares()[0]["args"], request["args"])
+        duplicate = await self.content_invoke("start_room_selected_content", request)
+        self.assertEqual(duplicate, receipt)
+        self.assertEqual(len(self.content_commits()), 1)
+
+    def test_content_episode_closed_arguments_preserve_kind_and_ceiling(self):
+        good = {"episode_uri": "spotify:episode:" + "0" * 21 + "4", "max_volume": 35}
+        self.assertTrue(valid_selected_arguments("play_episode", good))
+        for value in (
+            {**good, "max_volume": 34},
+            {**good, "max_volume": True},
+            {**good, "track_uri": "spotify:track:" + "F" * 22},
+            {**good, "episode_uri": "spotify:track:" + "F" * 22},
+            {**good, "episode_uri": "spotify:audiobook:" + "F" * 22},
+        ):
+            self.assertFalse(valid_selected_arguments("play_episode", value))
+        self.assertFalse(
+            valid_selected_arguments(
+                "play_context", {"context_uri": good["episode_uri"], "max_volume": 35}
+            )
+        )
+
+    async def test_content_episode_replaced_owner_cannot_start(self):
+        self.content_actions = ["play_track", "play_context", "play_episode"]
+        request = self.content_request(
+            action="play_episode",
+            args={"episode_uri": "spotify:episode:" + "0" * 21 + "4", "max_volume": 35},
+        )
+        self.content_hold = True
+        task = self._task(self.content_invoke("prepare_room_selected_content", request))
+        await asyncio.wait_for(self.content_entered.wait(), 2)
+        self.entries[0].runtime_data.coordinator.owner_epoch = "replacement"
+        self.content_release.set()
+        self.assertFalse((await task)["ok"])
+        self.assertEqual(
+            (await self.content_invoke("start_room_selected_content", request))[
+                "outcome"
+            ],
+            "rejected",
+        )
+        self.assertEqual(self.content_commits(), [])
+        await self.content_cleanup()
+
+    async def test_content_episode_cancel_and_low_ceiling_never_start(self):
+        self.content_actions = ["play_track", "play_context", "play_episode"]
+        request = self.content_request(
+            action="play_episode",
+            args={"episode_uri": "spotify:episode:" + "0" * 21 + "4", "max_volume": 35},
+        )
+        bad = {**request, "args": {**request["args"], "max_volume": 34}}
+        self.assertFalse(
+            (await self.content_invoke("prepare_room_selected_content", bad))["ok"]
+        )
+        self.assertEqual(self.prepares(), [])
+        self.assertTrue(
+            (await self.content_invoke("prepare_room_selected_content", request))["ok"]
+        )
+        self.assertTrue(
+            (
+                await self.content_invoke(
+                    "cancel_room_content_preparation", self.cancel_args(request)
+                )
+            )["ok"]
+        )
+        self.assertEqual(
+            (await self.content_invoke("start_room_selected_content", request))[
+                "outcome"
+            ],
+            "rejected",
         )
         self.assertEqual(self.content_commits(), [])
         await self.content_cleanup()

@@ -25,6 +25,7 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
         self.volume_prepare_corrupt = None
         self.volume_state_corrupt = None
         self.volume_state_reads = []
+        self.volume_effect = None
         self.volume_state_hold = False
         self.volume_state_entered = asyncio.Event()
         self.volume_state_release = asyncio.Event()
@@ -78,6 +79,7 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                 "route": self.route(),
                 "volume_state": self.volume_snapshot(),
                 "actions": ["volume"],
+                "effect": self.volume_effect,
                 "physical_result_verified": False,
             }
             if self.volume_state_corrupt:
@@ -163,6 +165,42 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
             blocking=True,
             return_response=True,
         )
+
+    async def test_volume_effect_requires_matching_native_operation(self):
+        request = self.volume_request()
+        receipt = await self.volume_invoke(request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.output_observation = True
+        self.volume_effect = {
+            "prepare_id": "c" * 32,
+            "action": "volume",
+            "effect_revision": "1",
+            "native_revision": "1",
+            "native_owner": self.native(),
+        }
+
+        async def snapshot():
+            return await self.hass.services.async_call(
+                "podconnect",
+                "get_playback_snapshot",
+                {
+                    "config_entry_id": "account-alpha",
+                    "include_output": True,
+                    "include_controls": True,
+                    "request_id": request["request_id"],
+                    "command_sequence": request["command_sequence"],
+                },
+                blocking=True,
+                return_response=True,
+            )
+
+        confirmed = await snapshot()
+        self.assertEqual(confirmed["settlement"]["status"], "confirmed")
+        self.volume_effect["prepare_id"] = "d" * 32
+        self.assertNotEqual((await snapshot())["settlement"]["status"], "confirmed")
+        self.volume_effect["prepare_id"] = "c" * 32
+        self.volume_effect["native_owner"] = {**self.native(), "session_id": "foreign"}
+        self.assertNotEqual((await snapshot())["settlement"]["status"], "confirmed")
 
     async def cleanup_finished(self):
         tasks = list(self.volume_commands.room_volume.cleanups)

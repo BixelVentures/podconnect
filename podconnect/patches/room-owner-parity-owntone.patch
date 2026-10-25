@@ -1,0 +1,62 @@
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -246,7 +246,8 @@
+     && r->writer.writer_fd<=INT_MAX && r->writer.pipe_device && r->writer.pipe_inode;
+   if (!strcmp(r->action,"volume")) return r->percent >= 0 && r->percent <= 100;
+   return r->percent == -1 && (!strcmp(r->action,"pause") || !strcmp(r->action,"resume")
+-      || !strcmp(r->action,"next") || !strcmp(r->action,"previous"));
++      || !strcmp(r->action,"next") || !strcmp(r->action,"previous")
++      || (r->bound && !strcmp(r->action,"seek")));
+ }
+ 
+ static int
+@@ -391,7 +392,7 @@
+   if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+       || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry))) return -1;
+   if (request->bound) {
+-    bool keep_pause=!strcmp(request->action,"resume")
++    bool keep_pause=(!strcmp(request->action,"resume") || !strcmp(request->action,"seek"))
+       && native_owner_equal(&request->native_owner,&transport_pause_owner)
+       && transport_identity_equal(&slot->result.identity,&transport_pause_identity)
+       && transport_pause_owned(request->device_id);
+@@ -399,7 +400,7 @@
+           slot->admission_generation,&slot->result.identity)) return -1;
+     if (keep_pause) {
+       transport_pause_revision=request->native_revision;
+-      transport_pause_retained=true; /* Actual PCM restart owns timer cancellation. */
++      transport_pause_retained=true; /* Actual PCM restart owns timer cancellation, also across a paused seek. */
+     }
+     if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+         || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
+@@ -439,14 +440,18 @@
+   if (!slot->used || !slot->result.command.bound || slot->result.outcome!=0
+       || (strcmp(slot->result.command.action,"pause")
+           && strcmp(slot->result.command.action,"next")
+-          && strcmp(slot->result.command.action,"previous"))
++          && strcmp(slot->result.command.action,"previous")
++          && strcmp(slot->result.command.action,"seek"))
+       || slot->result.command.device_id!=id
+       || strcmp(slot->result.command.native_prepare_id,prepare)
+       || slot->result.command.native_revision!=revision
+       || !transport_remaining(&slot->expiry)
+       || !transport_custody_current(&slot->result.command.native_owner,
+           &slot->result.identity,revision)) return -1;
+-  /* The exact Native effect also exists on an ordinary proven route. Its ACK
++  /* Native calls this private completion only after the actual worker remains
++   * paused. Seek uses that same effect boundary, including a fresh paused START
++   * with no earlier Pause command; C commit alone never creates retention.
++   * The exact Native effect also exists on an ordinary proven route. Its ACK
+    * grants no START resource retention; normal FIFO suspend/resume still owns
+    * that output's lifecycle. Unknown START ownership must never pass here. */
+   if (!start_route_owned(&slot->result.command.native_owner,&slot->result.identity)
+--- a/src/httpd_jsonapi_transport_bound.inc.c
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -52,7 +52,7 @@
+   uint64_t id; bool busy,start_owned=false,clean_absent=false,queue=false; size_t i;
+   struct output_queue_writer writer={0};
+   json_object *body=transport_parse_body_limit(hreq->in_body,8192),*reply,*actions;
+-  const char *names[]={"pause","resume","next","previous"}; int ret=HTTP_BADREQUEST;
++  const char *names[]={"pause","resume","next","previous","seek"}; int ret=HTTP_BADREQUEST;
+   if(body && json_object_object_length(body)==2)queue=true;
+   if (!body || json_object_object_length(body)!=(queue?2:1) || (queue && queue_writer_parse(body,&writer)<0) || transport_native_parse(body,&owner,NULL)<0
+       || safe_atou64(hreq->path_parts[2],&id)<0) goto out;

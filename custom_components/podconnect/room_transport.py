@@ -15,7 +15,8 @@ from homeassistant.exceptions import HomeAssistantError
 from .observations import PLAYBACK_MAX_AGE_S, _bounded, current
 from .speakers import ROOM_READ_REASONS, SpeakersError
 
-ACTIONS = ("pause", "resume", "next", "previous")
+_OBSERVED_ACTIONS = ("pause", "resume", "next", "previous")
+ACTIONS = (*_OBSERVED_ACTIONS, "seek", "shuffle", "repeat")
 _NATIVE = {
     "account_user_id",
     "target_id",
@@ -99,6 +100,30 @@ def _snapshot(value, schema, extra, scope):
     )
 
 
+def valid_effect(value, native):
+    return value is None or (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "prepare_id",
+            "action",
+            "effect_revision",
+            "native_revision",
+            "native_owner",
+        }
+        and isinstance(value["prepare_id"], str)
+        and _TOKEN.fullmatch(value["prepare_id"]) is not None
+        and value["action"] in (*ACTIONS, "volume")
+        and all(
+            isinstance(value[key], str)
+            and _DECIMAL.fullmatch(value[key]) is not None
+            and 0 < int(value[key]) < 2**64
+            for key in ("effect_revision", "native_revision")
+        )
+        and value["native_owner"] == native
+    )
+
+
 class RoomTransport:
     """No replay cache, sequence, routing mutation, or generic provider fallback."""
 
@@ -161,8 +186,12 @@ class RoomTransport:
             raise CommandRejected("stale_observation")
         if (
             not _snapshot(
-                state, "podconnect.room_transport_state.v1", {"actions"}, scope
+                state,
+                "podconnect.room_transport_state.v1",
+                {"actions", "effect"},
+                scope,
             )
+            or not valid_effect(state["effect"], state["native"])
             or not isinstance(state["actions"], list)
             or any(
                 not isinstance(action, str) or action not in ACTIONS
@@ -278,7 +307,7 @@ class RoomTransport:
                     )
                     actions = [
                         action
-                        for action in ACTIONS
+                        for action in _OBSERVED_ACTIONS
                         if action in state["actions"] and action in allowed["actions"]
                     ]
                     volume, reason = None, None
@@ -386,11 +415,19 @@ class RoomTransport:
             "physical_result_verified": False,
         }
 
-    async def commit(self, hass, entry, target, context, action, guard, sending):
+    async def commit(
+        self, hass, entry, target, context, action, guard, sending, *, args=None
+    ):
         from .commands import CommandRejected
 
         if action not in ACTIONS or not valid_context(context):
             raise CommandRejected("invalid_arguments")
+        args = {} if args is None else args
+        if not isinstance(args, dict):
+            raise CommandRejected("invalid_arguments")
+        from .commands import _arguments
+
+        _arguments(action, args)
         scope = self.scope(
             hass, entry, target, context["room_id"], context["homepod_id"]
         )
@@ -399,8 +436,17 @@ class RoomTransport:
         guard()
         started = time.monotonic()
         try:
+            arguments = (
+                {"position_ms": args["position_ms"]}
+                if action == "seek"
+                else {"shuffle_enabled": args["enabled"]}
+                if action == "shuffle"
+                else {"repeat_mode": args["mode"]}
+                if action == "repeat"
+                else {}
+            )
             prepared = await self.commands.data.speakers.prepare_room_transport(
-                scope, context["native"], context["route"], action
+                scope, context["native"], context["route"], action, **arguments
             )
         except SpeakersError as exc:
             raise CommandRejected("room_transport_unavailable") from exc
@@ -408,7 +454,8 @@ class RoomTransport:
             not _snapshot(
                 prepared,
                 "podconnect.room_transport_prepare.v1",
-                {"prepare_id", "expires_after_ms", "action", "volume_percent"},
+                {"prepare_id", "expires_after_ms", "action", "volume_percent"}
+                | set(arguments),
                 scope,
             )
             or prepared["native"] != context["native"]
@@ -416,6 +463,10 @@ class RoomTransport:
             or prepared["action"] != action
             or type(prepared["volume_percent"]) is not int
             or prepared["volume_percent"] != 0
+            or any(
+                type(prepared.get(key)) is not type(value) or prepared[key] != value
+                for key, value in arguments.items()
+            )
             or not isinstance(prepared["prepare_id"], str)
             or _TOKEN.fullmatch(prepared["prepare_id"]) is None
             or type(prepared["expires_after_ms"]) is not int
@@ -432,7 +483,7 @@ class RoomTransport:
             raise CommandRejected("native_account_unproven")
         if time.monotonic() - started >= prepared["expires_after_ms"] / 1000:
             raise CommandRejected("room_transport_expired")
-        sending()
+        sending(prepared["prepare_id"])
         ack = await self.commands.data.speakers.commit_room_transport(
             prepared["prepare_id"]
         )

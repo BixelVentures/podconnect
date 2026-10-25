@@ -50,7 +50,7 @@ func TestRoomBoundSequencePauseResumeVolumeUsesFreshPrivateAuthority(t *testing.
 				t.Fatal("preparation reused")
 			}
 			ids[id] = true
-			return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", id, f.Native, request.Action, 0, strings.Repeat("b", 64), 5000, fmt.Sprint(revision)})
+			return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", id, f.Native, request.Action, 0, strings.Repeat("b", 64), 5000, fmt.Sprint(revision), nil, nil, ""})
 		case "/api/outputs/42/transport/bound-prepare":
 			var request struct {
 				ID       string                `json:"native_prepare_id"`
@@ -103,13 +103,13 @@ func TestRoomBoundSequencePauseResumeVolumeUsesFreshPrivateAuthority(t *testing.
 			return json.Marshal(nativeRoomVolumeResult{Schema: "podconnect.native_room_volume_commit.v2", ID: request.ID, OK: true, State: "protocol_accepted", Reserved: true, Protocol: true, Possible: true, Terminal: true, Drained: true})
 		}
 		if strings.HasPrefix(path, "/player/room_volume/bound-state?") {
-			return json.Marshal(receiverTransportState{"podconnect.native_room_volume_state.v2", true, f.Native, []string{"volume"}, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_volume_state.v2", true, f.Native, []string{"volume"}, nil, false})
 		}
 		return original(ctx, base, method, path, body)
 	}
 	started := time.Now()
 	for i, action := range []string{"pause", "resume"} {
-		body, _ := json.Marshal(roomTransportRequest{f.Scope, f.Native, f.Route, action, 0})
+		body, _ := json.Marshal(roomTransportRequest{f.Scope, f.Native, f.Route, action, 0, nil, nil, ""})
 		w := httptest.NewRecorder()
 		transportPrepareHandler(w, httptest.NewRequest("POST", "/api/room-transport/prepare", bytes.NewReader(body)))
 		if w.Code != 200 {

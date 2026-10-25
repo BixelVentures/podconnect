@@ -451,17 +451,34 @@ class SpeakersClient:
             room_read_reason=True,
         )
 
-    async def prepare_room_transport(self, scope, native, route, action):
+    async def prepare_room_transport(
+        self,
+        scope,
+        native,
+        route,
+        action,
+        *,
+        position_ms=None,
+        shuffle_enabled=None,
+        repeat_mode=None,
+    ):
+        body = {
+            "scope": scope,
+            "native": native,
+            "route": route,
+            "action": action,
+            "volume_percent": 0,
+        }
+        if action == "seek":
+            body["position_ms"] = position_ms
+        elif action == "shuffle":
+            body["shuffle_enabled"] = shuffle_enabled
+        elif action == "repeat":
+            body["repeat_mode"] = repeat_mode
         return await self._request(
             "POST",
             "/api/room-transport/prepare",
-            {
-                "scope": scope,
-                "native": native,
-                "route": route,
-                "action": action,
-                "volume_percent": 0,
-            },
+            body,
             budget=10,
         )
 

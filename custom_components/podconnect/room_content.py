@@ -50,6 +50,7 @@ _IDENTITY_KEYS = {
 _HEX32 = re.compile(r"[a-f0-9]{32}")
 _HEX64 = re.compile(r"[a-f0-9]{64}")
 _TRACK = re.compile(r"spotify:track:[A-Za-z0-9]{22}")
+_EPISODE = re.compile(r"spotify:episode:[A-Za-z0-9]{22}")
 _CONTEXT = re.compile(r"spotify:(?:playlist|album|artist|show):[A-Za-z0-9]{22}")
 
 
@@ -75,11 +76,45 @@ def valid_start_offer(value):
     )
 
 
+def canonical_list_track(uri):
+    if not isinstance(uri, str) or _TRACK.fullmatch(uri) is None:
+        return False
+    number = 0
+    for character in uri.rsplit(":", 1)[1]:
+        number = (
+            number * 62
+            + "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".index(
+                character
+            )
+        )
+    return number.bit_length() <= 128
+
+
 def valid_selected_arguments(action, value):
-    if not isinstance(action, str) or action not in {"play_track", "play_context"}:
+    if action == "play_tracks":
+        return (
+            isinstance(value, dict)
+            and set(value) == {"track_uris", "shuffle", "library_source", "max_volume"}
+            and isinstance(value["track_uris"], list)
+            and 1 <= len(value["track_uris"]) <= 50
+            and all(canonical_list_track(uri) for uri in value["track_uris"])
+            and type(value["shuffle"]) is bool
+            and value["library_source"] in ("liked", "top_tracks", "recent")
+            and type(value["max_volume"]) is int
+            and 35 <= value["max_volume"] <= 100
+        )
+    if not isinstance(action, str) or action not in {
+        "play_track",
+        "play_context",
+        "play_episode",
+    }:
         return False
     key, pattern = (
-        ("track_uri", _TRACK) if action == "play_track" else ("context_uri", _CONTEXT)
+        ("track_uri", _TRACK)
+        if action == "play_track"
+        else ("episode_uri", _EPISODE)
+        if action == "play_episode"
+        else ("context_uri", _CONTEXT)
     )
     return (
         isinstance(value, dict)
@@ -98,7 +133,7 @@ def valid_selected_receipt(
     accepted_key="accepted_selected_content",
     operation_key="start_operation_id",
     volume_key="start_volume_percent",
-    actions=("play_track", "play_context"),
+    actions=("play_track", "play_context", "play_episode", "play_tracks"),
     volume_valid=None,
 ):
     if volume_valid is None:
@@ -233,7 +268,7 @@ class RoomContent:
     accepted_key = "accepted_selected_content"
     operation_key = "start_operation_id"
     volume_key = "start_volume_percent"
-    actions = ("play_track", "play_context")
+    actions = ("play_track", "play_context", "play_episode", "play_tracks")
     staging_timeout = STAGING_TIMEOUT_S
     valid_offer = staticmethod(valid_start_offer)
     valid_arguments = staticmethod(valid_selected_arguments)

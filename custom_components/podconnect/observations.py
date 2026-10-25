@@ -274,16 +274,17 @@ def _limit(value):
 
 def register_observation_services(hass):
     async def playback(call):
+        from .commands import CommandRejected
+
         entry_id = call.data["config_entry_id"]
         data = current(hass, entry_id)
+        commands = data.commands
         result = data.observations.playback(entry_id)
         if not call.data.get("include_output", False) or not result.get("ok"):
             return result
         if not call.data.get("include_controls", False):
-            return await data.commands.room_transport.playback_output(
-                hass, entry_id, result
-            )
-        result = await data.commands.room_transport.playback_output(
+            return await commands.room_transport.playback_output(hass, entry_id, result)
+        result = await commands.room_transport.playback_output(
             hass,
             entry_id,
             result,
@@ -294,12 +295,27 @@ def register_observation_services(hass):
         except HomeAssistantError:
             return _error("unavailable")
         if result.get("ok") and "request_id" in call.data:
-            result["settlement"] = data.commands.settlement(
+            try:
+                source = commands.room_transport.observation_source(hass, entry_id)
+            except (HomeAssistantError, CommandRejected):
+                return _error("unavailable")
+            result["settlement"] = await commands.settlement(
                 hass,
                 entry_id,
                 call.data["request_id"],
                 call.data["command_sequence"],
+                result,
             )
+            try:
+                current(hass, entry_id, data)
+                if (
+                    not commands._refresh_owner_current(hass, entry_id)
+                    or commands.room_transport.observation_source(hass, entry_id)
+                    != source
+                ):
+                    return _error("unavailable")
+            except (HomeAssistantError, CommandRejected):
+                return _error("unavailable")
         try:
             return _bounded(result)
         except (ValueError, TypeError):

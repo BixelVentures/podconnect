@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -54,6 +56,7 @@ var roomContentStore = struct {
 }{Records: make(map[string]*roomContentRecord)}
 
 var contentTrackURI = regexp.MustCompile(`^spotify:track:[A-Za-z0-9]{22}$`)
+var contentEpisodeURI = regexp.MustCompile(`^spotify:episode:[A-Za-z0-9]{22}$`)
 var contentContextURI = regexp.MustCompile(`^spotify:(playlist|album|artist|show):[A-Za-z0-9]{22}$`)
 var roomContentRPC = doRoomContentRPC
 
@@ -100,9 +103,29 @@ func decodeRoomContentRequest(raw []byte) (roomContentRequest, error) {
 	if err != nil || decodeQueueManagerJSON(fields["scope"], &request.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &request.Offer) != nil || json.Unmarshal(fields["action"], &request.Action) != nil || !validTransportScope(request.Scope) || !validRoomContentOffer(request.Offer) {
 		return request, fmt.Errorf("invalid content request")
 	}
+	if request.Action == "play_tracks" {
+		args, err := contentFields(fields["args"], "track_uris", "shuffle", "library_source", "max_volume")
+		var uris []string
+		var shuffle *bool
+		var source string
+		var ceiling int
+		if err != nil || json.Unmarshal(args["track_uris"], &uris) != nil || len(uris) < 1 || len(uris) > 50 || json.Unmarshal(args["shuffle"], &shuffle) != nil || shuffle == nil || json.Unmarshal(args["library_source"], &source) != nil || !slices.Contains([]string{"liked", "top_tracks", "recent"}, source) || json.Unmarshal(args["max_volume"], &ceiling) != nil || ceiling < 35 || ceiling > 100 {
+			return request, fmt.Errorf("invalid content arguments")
+		}
+		for _, uri := range uris {
+			id, valid := new(big.Int).SetString(strings.TrimPrefix(uri, "spotify:track:"), 62)
+			if !contentTrackURI.MatchString(uri) || !valid || id.BitLen() > 128 {
+				return request, fmt.Errorf("invalid content track")
+			}
+		}
+		request.Args = map[string]any{"track_uris": uris, "shuffle": *shuffle, "library_source": source, "max_volume": ceiling}
+		return request, nil
+	}
 	key, uriPattern := "track_uri", contentTrackURI
 	if request.Action == "play_context" {
 		key, uriPattern = "context_uri", contentContextURI
+	} else if request.Action == "play_episode" {
+		key, uriPattern = "episode_uri", contentEpisodeURI
 	} else if request.Action != "play_track" {
 		return request, fmt.Errorf("invalid action")
 	}

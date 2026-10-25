@@ -45,7 +45,7 @@ func managerVolumeFixture(t *testing.T) *volumeFixture {
 		f.Mu.Unlock()
 		switch {
 		case strings.HasPrefix(path, "/player/room_volume/bound-state?"):
-			return json.Marshal(receiverTransportState{"podconnect.native_room_volume_state.v2", true, f.Native, []string{"volume"}, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_volume_state.v2", true, f.Native, []string{"volume"}, nil, false})
 		case path == "/api/outputs/42/volume/bound-state":
 			var request struct {
 				Owner roomTransportIdentity `json:"native_owner"`
@@ -87,6 +87,31 @@ func (f *volumeFixture) prepare(t *testing.T, percent int) *httptest.ResponseRec
 	w := httptest.NewRecorder()
 	roomVolumePrepareHandler(w, httptest.NewRequest("POST", "/api/room-volume/prepare", bytes.NewReader(raw)))
 	return w
+}
+
+func TestRoomVolumeEffectRequiresExactAcceptedOperationAndFreshCRevision(t *testing.T) {
+	f := managerVolumeFixture(t)
+	id := strings.Repeat("a", 32)
+	request := roomVolumeRequest{f.Scope, f.Native, f.Route, f.Volume, "volume", 36}
+	roomVolumeStore.Lock()
+	roomVolumeStore.Records[id] = &roomVolumeRecord{Request: request, Claim: f.Claim, Dispatched: true, Result: &nativeRoomVolumeResult{ID: id, OK: true, State: "protocol_accepted", Reserved: true, Protocol: true, Possible: true, Terminal: true, Drained: true}}
+	roomVolumeStore.Unlock()
+	effect := &receiverRoomEffect{id, "volume", "1", "2", f.Native}
+	after := roomVolumeState{"8", "8", 36, 36}
+	if currentRoomVolumeEffect(effect, f.Scope, f.Claim, f.Native, f.Route, after) == nil {
+		t.Fatal("exact accepted operation and C revision must remain attributable")
+	}
+	for _, changed := range []roomVolumeState{{"9", "8", 36, 36}, {"8", "9", 36, 36}, {"8", "8", 35, 35}} {
+		if currentRoomVolumeEffect(effect, f.Scope, f.Claim, f.Native, f.Route, changed) != nil {
+			t.Fatal("foreign or later C mutation cannot confirm old volume effect")
+		}
+	}
+	roomVolumeStore.Lock()
+	roomVolumeStore.Records[id].Result.Protocol = false
+	roomVolumeStore.Unlock()
+	if currentRoomVolumeEffect(effect, f.Scope, f.Claim, f.Native, f.Route, after) != nil {
+		t.Fatal("unknown or rejected receipt cannot confirm volume")
+	}
 }
 func volumePost(kind string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()

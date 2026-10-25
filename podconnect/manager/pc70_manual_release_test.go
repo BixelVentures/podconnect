@@ -49,7 +49,7 @@ func manualReleaseFixture(t *testing.T) (*transportFixture, nativeReleaseOwner, 
 		case path == "/api/outputs/42/transport/bound-state":
 			return json.Marshal(outputTransportState{Schema: "podconnect.output_transport_state.v2", OK: true, Identity: f.Route, Actions: []string{"pause", "resume"}, CleanAbsent: true})
 		case path == "/player/room_transport/bound-prepare":
-			return json.Marshal(nativeReleasePrepare{receiverTransportPrepare{"podconnect.native_room_transport.v2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", f.Native, "release", 0, strings.Repeat("c", 64), 5000, "1"}, roomReleasePurpose, owner.Writer})
+			return json.Marshal(nativeReleasePrepare{receiverTransportPrepare{"podconnect.native_room_transport.v2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", f.Native, "release", 0, strings.Repeat("c", 64), 5000, "1", nil, nil, ""}, roomReleasePurpose, owner.Writer})
 		case path == "/api/outputs/42/transport/bound-prepare":
 			return json.Marshal(outputTransportPrepare{"podconnect.output_transport_prepare.v2", true, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", f.Route, f.Native, "1", 10000})
 		case path == "/player/room_transport/bound-commit":

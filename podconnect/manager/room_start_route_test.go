@@ -75,7 +75,7 @@ func TestReleasedPlayingBridgeHoldsOwnedAndUnknownWithoutVolumeOrSelection(t *te
 					if mode == "foreign_owner" {
 						actual.Account = "foreign"
 					}
-					return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, actual, []string{"pause"}, false})
+					return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, actual, []string{"pause"}, nil, false})
 				case path == "/api/outputs/42/transport/bound-state":
 					var supplied struct {
 						Owner roomTransportIdentity `json:"native_owner"`
@@ -191,7 +191,7 @@ func TestReleasedActualBridgeSkipsWritesUntilCleanAbsence(t *testing.T) {
 		case path == "/status":
 			return []byte(fmt.Sprintf(`{"username":"native-user","device_id":%q}`, f.id)), nil
 		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, nil, false})
 		case path == "/api/outputs/42/transport/bound-state":
 			select {
 			case reads <- struct{}{}:
@@ -237,7 +237,7 @@ func TestReleasedRoomTransportRejoinsExactRouteAfterEachAwait(t *testing.T) {
 			roomTransportRPC = func(_ context.Context, _, _, path string, body []byte) ([]byte, error) {
 				switch {
 				case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-					return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
+					return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, nil, false})
 				case path == "/api/outputs/42/transport/bound-state":
 					var request struct {
 						Owner roomTransportIdentity `json:"native_owner"`
@@ -250,7 +250,7 @@ func TestReleasedRoomTransportRejoinsExactRouteAfterEachAwait(t *testing.T) {
 					if phase == "after_native_prepare" {
 						current.Route = "9"
 					}
-					return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, "pause", 0, strings.Repeat("b", 64), 5000, "1"})
+					return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, "pause", 0, strings.Repeat("b", 64), 5000, "1", nil, nil, ""})
 				case path == "/api/outputs/42/transport/bound-prepare":
 					outputPrepares++
 					if phase == "after_output_prepare" {
@@ -264,7 +264,7 @@ func TestReleasedRoomTransportRejoinsExactRouteAfterEachAwait(t *testing.T) {
 					return nil, fmt.Errorf("unexpected endpoint %s", path)
 				}
 			}
-			request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, "pause", 0})
+			request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, "pause", 0, nil, nil, ""})
 			prepared := httptest.NewRecorder()
 			transportPrepareHandler(prepared, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
 			if phase == "before_commit" {
@@ -331,7 +331,7 @@ func TestReleasedPausedRoomTransportNeedsFreshJoinedStartOwner(t *testing.T) {
 	roomTransportRPC = func(_ context.Context, _, _, path string, _ []byte) ([]byte, error) {
 		switch {
 		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, nil, false})
 		case path == "/api/outputs/42/transport/bound-state":
 			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, transportActions, false, owned, false})
 		case path == "/player/room_transport/bound-prepare":
@@ -340,7 +340,7 @@ func TestReleasedPausedRoomTransportNeedsFreshJoinedStartOwner(t *testing.T) {
 				current.Paused = false
 				f.rt.live.set(current)
 			}
-			return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, "resume", 0, strings.Repeat("b", 64), 5000, "1"})
+			return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, "resume", 0, strings.Repeat("b", 64), 5000, "1", nil, nil, ""})
 		case path == "/api/outputs/42/transport/bound-prepare":
 			outputPrepares++
 			if flipAtNativePrepare {
@@ -360,18 +360,18 @@ func TestReleasedPausedRoomTransportNeedsFreshJoinedStartOwner(t *testing.T) {
 	stateRead := httptest.NewRecorder()
 	transportStateHandler(stateRead, httptest.NewRequest(http.MethodGet,
 		fmt.Sprintf("/api/room-transport/state?target_id=%s&room_id=r0&homepod_id=42&account_user_id=native-user", f.id), nil))
-	if stateRead.Code != http.StatusOK || !strings.Contains(stateRead.Body.String(), `"actions":["resume","next","previous"]`) {
+	if stateRead.Code != http.StatusOK || !strings.Contains(stateRead.Body.String(), `"actions":["resume","next","previous","seek","shuffle","repeat"]`) {
 		t.Fatalf("released paused route lost supported track actions: %d %s", stateRead.Code, stateRead.Body.String())
 	}
 	for _, action := range []string{"pause"} {
-		request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0})
+		request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0, nil, nil, ""})
 		result := httptest.NewRecorder()
 		transportPrepareHandler(result, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
 		if result.Code != http.StatusConflict {
 			t.Fatalf("released paused %s action admitted: %d", action, result.Code)
 		}
 	}
-	request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, "resume", 0})
+	request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, "resume", 0, nil, nil, ""})
 	result := httptest.NewRecorder()
 	transportPrepareHandler(result, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
 	if result.Code != http.StatusConflict || outputPrepares != 0 {
@@ -419,7 +419,7 @@ func TestReleasedPausedTrackControlsKeepCurrentOwnerAndNoReplay(t *testing.T) {
 				roomTransportRPC = func(_ context.Context, _, _, path string, body []byte) ([]byte, error) {
 					switch {
 					case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, false})
+						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, nil, false})
 					case path == "/api/outputs/42/transport/bound-state":
 						return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, transportActions, false, true, false})
 					case path == "/player/room_transport/bound-prepare":
@@ -431,7 +431,7 @@ func TestReleasedPausedTrackControlsKeepCurrentOwnerAndNoReplay(t *testing.T) {
 						if json.Unmarshal(body, &request) != nil || request.Action != action || request.Percent != 0 {
 							t.Fatal("wrong paused-track preparation", string(body))
 						}
-						return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, action, 0, strings.Repeat("b", 64), 5000, "1"})
+						return json.Marshal(receiverTransportPrepare{"podconnect.native_room_transport.v2", strings.Repeat("a", 32), *owner, action, 0, strings.Repeat("b", 64), 5000, "1", nil, nil, ""})
 					case path == "/api/outputs/42/transport/bound-prepare":
 						return json.Marshal(outputTransportPrepare{"podconnect.output_transport_prepare.v2", true, strings.Repeat("c", 32), *route, *owner, "1", 10000})
 					case path == "/player/room_transport/bound-commit":
@@ -444,7 +444,7 @@ func TestReleasedPausedTrackControlsKeepCurrentOwnerAndNoReplay(t *testing.T) {
 						return nil, fmt.Errorf("unexpected paused track endpoint %s", path)
 					}
 				}
-				request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0})
+				request, _ := json.Marshal(roomTransportRequest{scope, *owner, *route, action, 0, nil, nil, ""})
 				prepared := httptest.NewRecorder()
 				transportPrepareHandler(prepared, httptest.NewRequest(http.MethodPost, "/api/room-transport/prepare", bytes.NewReader(request)))
 				if prepared.Code != http.StatusOK {
@@ -504,7 +504,7 @@ func TestConnectCompletedStartObservationDoesNotRouteAgain(t *testing.T) {
 							n.Session = "foreign"
 							n.Account = "foreign"
 						}
-						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, n, []string{"pause"}, false})
+						return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, n, []string{"pause"}, nil, false})
 					case path == "/api/outputs/42/transport/bound-state":
 						var supplied struct {
 							Owner roomTransportIdentity `json:"native_owner"`

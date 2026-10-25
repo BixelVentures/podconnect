@@ -7,18 +7,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
 type contentOperationFixture struct {
-	Request    roomContentRequest
-	Prepared   int
-	Commits    int
-	Cancels    int
-	Stage      string
-	FailCommit bool
+	Request       roomContentRequest
+	Prepared      int
+	Commits       int
+	Cancels       int
+	Stage         string
+	FailCommit    bool
+	NativeRequest roomContentRequest
 }
 
 func contentOperationSetup(t *testing.T) *contentOperationFixture {
@@ -52,6 +54,7 @@ func contentOperationSetup(t *testing.T) *contentOperationFixture {
 			if err != nil || parsed.Scope != f.Request.Scope || parsed.Offer != f.Request.Offer {
 				t.Fatal("unbound native preparation", string(body), err)
 			}
+			f.NativeRequest = parsed
 		case strings.HasPrefix(path, "/player/room_content/result?"):
 			endpoint = "result"
 		case path == "/player/room_content/commit":
@@ -79,6 +82,92 @@ func contentOperationSetup(t *testing.T) *contentOperationFixture {
 		return json.Marshal(result)
 	}
 	return f
+}
+
+func TestContentLibraryExactListAndReplayFence(t *testing.T) {
+	for _, count := range []int{1, 50} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			f := contentOperationSetup(t)
+			uris := make([]string, count)
+			for i := range uris {
+				uris[i] = fmt.Sprintf("spotify:track:%022d", i%3)
+			}
+			f.Request.Action = "play_tracks"
+			f.Request.Args = map[string]any{"track_uris": uris, "shuffle": true, "library_source": "liked", "max_volume": 35}
+			f.Stage = "staged"
+			if w := f.prepare(t); w.Code != 200 || !reflect.DeepEqual(f.NativeRequest.Args, f.Request.Args) {
+				t.Fatal("list changed", w.Code, f.NativeRequest.Args)
+			}
+			f.Request.Args["library_source"] = "recent"
+			if w := f.prepare(t); w.Code != 409 || f.Prepared != 1 {
+				t.Fatal("source not bound", w.Code, f.Prepared)
+			}
+			f.Request.Args["library_source"] = "liked"
+			f.Request.Args["shuffle"] = false
+			if w := f.prepare(t); w.Code != 409 || f.Prepared != 1 {
+				t.Fatal("shuffle not bound", w.Code, f.Prepared)
+			}
+			f.Request.Args["shuffle"] = true
+			if count > 1 {
+				uris[0], uris[1] = uris[1], uris[0]
+				if w := f.prepare(t); w.Code != 409 || f.Prepared != 1 {
+					t.Fatal("order not bound", w.Code, f.Prepared)
+				}
+				uris[0], uris[1] = uris[1], uris[0]
+			}
+			if w := f.operation(t, "commit"); w.Code != 200 || f.Commits != 1 {
+				t.Fatal(w.Code, w.Body.String())
+			}
+			f.operation(t, "commit")
+			f.prepare(t)
+			if f.Commits != 1 || f.Prepared != 1 {
+				t.Fatal("replayed list", f.Commits, f.Prepared)
+			}
+		})
+	}
+}
+
+func TestContentLibraryClosedArguments(t *testing.T) {
+	for _, change := range []func(map[string]any){
+		func(a map[string]any) { a["track_uris"] = []string{} },
+		func(a map[string]any) { a["track_uris"] = make([]string, 51) },
+		func(a map[string]any) { a["track_uris"] = []string{"spotify:track:" + strings.Repeat("Z", 22)} },
+		func(a map[string]any) { a["track_uris"] = []string{"spotify:episode:" + strings.Repeat("0", 22)} },
+		func(a map[string]any) { a["shuffle"] = nil },
+		func(a map[string]any) { a["shuffle"] = 0 },
+		func(a map[string]any) { delete(a, "shuffle") },
+		func(a map[string]any) { a["library_source"] = "playlist" },
+		func(a map[string]any) { a["context_uri"] = "" },
+	} {
+		f := contentOperationSetup(t)
+		f.Request.Action = "play_tracks"
+		f.Request.Args = map[string]any{"track_uris": []string{"spotify:track:" + strings.Repeat("0", 22)}, "shuffle": false, "library_source": "top_tracks", "max_volume": 35}
+		change(f.Request.Args)
+		if w := f.prepare(t); w.Code != 400 || f.Prepared != 0 || f.Commits != 0 {
+			t.Fatal("malformed list admitted", w.Code, f.Prepared, f.Commits)
+		}
+	}
+	if !validRoomContentActions([]string{"play_track", "play_context", "play_episode", "play_tracks"}) {
+		t.Fatal("list capability rejected")
+	}
+}
+
+func TestContentLibraryUnknownCommitDoesNotReplay(t *testing.T) {
+	f := contentOperationSetup(t)
+	f.Request.Action = "play_tracks"
+	f.Request.Args = map[string]any{"track_uris": []string{"spotify:track:" + strings.Repeat("0", 22)}, "shuffle": false, "library_source": "recent", "max_volume": 35}
+	f.Stage = "staged"
+	f.FailCommit = true
+	if w := f.prepare(t); w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	if w := f.operation(t, "commit"); w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"unknown"`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	f.operation(t, "commit")
+	if f.Commits != 1 {
+		t.Fatal("unknown list replay", f.Commits)
+	}
 }
 
 func (f *contentOperationFixture) prepare(t *testing.T) *httptest.ResponseRecorder {
@@ -272,4 +361,32 @@ func TestContentCannotCreditPhysicalCompletionFromStageOrUndispatchedStatus(t *t
 			t.Fatal("read credited undispatched physical effect", w.Code, w.Body.String(), f.Commits)
 		}
 	})
+}
+
+func TestContentEpisodeUsesExclusiveURIAndSameNativeOwner(t *testing.T) {
+	f := contentOperationSetup(t)
+	f.Request.Action = "play_episode"
+	f.Request.Args = map[string]any{"episode_uri": "spotify:episode:0000000000000000000004", "max_volume": 35}
+	f.Stage = "staged"
+	if !validRoomContentActions([]string{"play_track", "play_context", "play_episode"}) {
+		t.Fatal("episode capability rejected")
+	}
+	if w := f.prepare(t); w.Code != 200 || f.Prepared != 1 || f.Commits != 0 {
+		t.Fatal("episode did not stage", w.Code, f.Prepared, f.Commits)
+	}
+	if w := f.operation(t, "commit"); w.Code != 200 || f.Commits != 1 {
+		t.Fatal("episode did not commit once", w.Code, f.Commits)
+	}
+	for _, args := range []map[string]any{
+		{"episode_uri": "spotify:track:1234567890123456789012", "max_volume": 35},
+		{"episode_uri": "spotify:audiobook:1234567890123456789012", "max_volume": 35},
+		{"episode_uri": "spotify:episode:0000000000000000000004", "max_volume": 34},
+		{"episode_uri": "spotify:episode:0000000000000000000004", "track_uri": "spotify:track:1234567890123456789012", "max_volume": 35},
+	} {
+		f.Request.Args = args
+		raw, _ := json.Marshal(f.Request)
+		if _, err := decodeRoomContentRequest(raw); err == nil {
+			t.Fatal("nonclosed episode accepted", args)
+		}
+	}
 }

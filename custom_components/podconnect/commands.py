@@ -20,7 +20,15 @@ from .targets import spotify_devices
 COMMAND_TIMEOUT_S = 6
 MAX_RECEIPTS = 128
 _ACTIONS = ("pause", "resume", "next", "previous", "volume")
-_COMMAND_ACTIONS = (*_ACTIONS, "play_track", "play_context", "play_queue_occurrence")
+_COMMAND_ACTIONS = (
+    *_ACTIONS,
+    "seek",
+    "shuffle",
+    "repeat",
+    "play_track",
+    "play_context",
+    "play_queue_occurrence",
+)
 _TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
@@ -47,6 +55,32 @@ def _sequence(value):
 
 
 def _arguments(action, args):
+    if action == "shuffle":
+        if (
+            not isinstance(args, dict)
+            or set(args) != {"enabled"}
+            or type(args["enabled"]) is not bool
+        ):
+            raise CommandRejected("invalid_arguments")
+        return
+    if action == "repeat":
+        if (
+            not isinstance(args, dict)
+            or set(args) != {"mode"}
+            or not isinstance(args["mode"], str)
+            or args["mode"] not in {"off", "context", "track"}
+        ):
+            raise CommandRejected("invalid_arguments")
+        return
+    if action == "seek":
+        if (
+            not isinstance(args, dict)
+            or set(args) != {"position_ms"}
+            or type(args["position_ms"]) is not int
+            or not 0 <= args["position_ms"] < 2**53
+        ):
+            raise CommandRejected("invalid_arguments")
+        return
     if action == "play_queue_occurrence":
         from .queue_controls import valid_arguments
 
@@ -100,6 +134,28 @@ def _arguments(action, args):
             or len(args["start_policy_revision"]) != 64
         ):
             raise CommandRejected("invalid_arguments")
+
+
+def _option_allowed(action, args, provider):
+    """Apply provider restrictions to changed option bits, retaining idempotence."""
+    disallows = provider["actions"]["disallows"]
+    if action == "shuffle":
+        actual = provider.get("shuffle_state")
+        return type(actual) is bool and (
+            actual == args["enabled"] or not disallows.get("toggling_shuffle", False)
+        )
+    modes = {"off": (False, False), "context": (True, False), "track": (True, True)}
+    actual = provider.get("repeat_state")
+    if not isinstance(actual, str) or actual not in modes:
+        return False
+    return all(
+        before == after or not disallows.get(restriction, False)
+        for before, after, restriction in zip(
+            modes[actual],
+            modes[args["mode"]],
+            ("toggling_repeat_context", "toggling_repeat_track"),
+        )
+    )
 
 
 class PlaybackCommands:
@@ -232,6 +288,15 @@ class PlaybackCommands:
             for action, key in _DISALLOWED.items()
             if not disallows.get(key, False)
         ]
+        if native_room_phase and not disallows.get("seeking", False):
+            actions.append("seek")
+        if native_room_phase:
+            if type(provider.get("shuffle_state")) is bool:
+                actions.append("shuffle")
+            if isinstance(provider.get("repeat_state"), str) and provider[
+                "repeat_state"
+            ] in {"off", "context", "track"}:
+                actions.append("repeat")
         if not native_room_phase:
             actions = [
                 action
@@ -273,13 +338,8 @@ class PlaybackCommands:
             "physical_result_verified": False,
         }
 
-    def settlement(self, hass, entry_id, request_id, sequence):
-        """Read the existing receipt, without upgrading acceptance to effect proof.
-
-        Current Native state does not echo the consumed transport/volume operation.
-        A matching Spotify clock, item or volume therefore cannot confirm it. The
-        read also cannot retry a request or extend its original authority.
-        """
+    async def settlement(self, hass, entry_id, request_id, sequence, projection):
+        """Join a retained accepted operation to a fresh, exact native witness."""
         current(hass, entry_id, self.data)
         if not self._refresh_owner_current(hass, entry_id):
             raise CommandRejected("owner_replaced")
@@ -322,6 +382,67 @@ class PlaybackCommands:
             result["status"] = "pending"
         elif receipt.get("outcome") == "rejected":
             result["status"] = "rejected"
+        elif receipt.get("outcome") == "accepted" and len(old) == 3 and old[2]:
+            output = projection.get("output")
+            binding = output.get("binding") if isinstance(output, dict) else None
+            if isinstance(binding, dict) and binding.get("target_id") == receipt.get(
+                "target", {}
+            ).get("target_id"):
+                try:
+                    reader = (
+                        self.room_volume.observe
+                        if receipt["action"] == "volume"
+                        else self.room_transport.observe
+                    )
+                    async with asyncio.timeout(2):
+                        state = await reader(
+                            hass,
+                            entry_id,
+                            binding["target_id"],
+                            binding["native_room_id"],
+                            binding["homepod_id"],
+                        )
+                    identity = [
+                        entry_id,
+                        self.owner_epoch,
+                        state["native"],
+                        state["route"],
+                    ]
+                    binding_id = hashlib.sha256(
+                        json.dumps(
+                            identity,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    ).hexdigest()
+                    effect = state["effect"]
+                    if (
+                        sequence == self.command_sequence
+                        and not self.busy
+                        and self.receipts.get(sequence) is old
+                        and self._refresh_owner_current(hass, entry_id)
+                        and binding_id == binding["binding_id"]
+                        and effect is not None
+                        and effect["prepare_id"] == old[2]
+                        and effect["action"] == receipt["action"]
+                    ):
+                        result["status"] = "confirmed"
+                        result["observation"] = {
+                            "source": "native_bound_state",
+                            "effect_revision": effect["effect_revision"],
+                            "prepare_id": old[2],
+                        }
+                except (
+                    CommandRejected,
+                    HomeAssistantError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    SpeakersError,
+                    TimeoutError,
+                ):
+                    pass  # A failed or changed read is not proof of an effect.
         return result
 
     def track_controls(self, entry_id, target_id, *, for_command=False):
@@ -467,6 +588,8 @@ class PlaybackCommands:
         def rejected(kind):
             return {**receipt, "error_kind": kind}
 
+        if action in {"seek", "shuffle", "repeat"} and room_transport is None:
+            return rejected("native_room_required")
         if epoch != self.owner_epoch:
             return rejected("stale_owner")
         if request_id != f"{epoch}:{command_sequence}":
@@ -577,6 +700,10 @@ class PlaybackCommands:
                     not in observed["actions"]
                 ):
                     raise CommandRejected("unsupported_action")
+                if action in {"shuffle", "repeat"} and not _option_allowed(
+                    action, request["args"], self.data.coordinator.data["playback"]
+                ):
+                    raise CommandRejected("unsupported_action")
                 if (
                     action in {"play_track", "play_context"}
                     and observed["volume_percent"] > request["args"]["max_volume"]
@@ -588,9 +715,12 @@ class PlaybackCommands:
 
         possible_send = False
 
-        def sending():
-            nonlocal possible_send
+        operation_id = None
+
+        def sending(exact_operation_id=None):
+            nonlocal possible_send, operation_id
             possible_send = True
+            operation_id = exact_operation_id
             if room_volume is not None:
                 receipt["possible_effect"] = True
 
@@ -634,7 +764,15 @@ class PlaybackCommands:
                 if not ack["protocol_accepted"]:
                     receipt["error_kind"] = "outcome_unknown"
             elif room_transport is not None:
-                if action not in ("pause", "resume", "next", "previous"):
+                if action not in (
+                    "pause",
+                    "resume",
+                    "next",
+                    "previous",
+                    "seek",
+                    "shuffle",
+                    "repeat",
+                ):
                     raise CommandRejected("unsupported_action")
                 async with asyncio.timeout(18):
                     await self.room_transport.commit(
@@ -645,6 +783,7 @@ class PlaybackCommands:
                         action,
                         guard,
                         sending,
+                        args=request["args"],
                     )
                 receipt = {
                     **receipt,
@@ -789,7 +928,7 @@ class PlaybackCommands:
                     self.poll_floor, self.data.coordinator.poll_sequence
                 )
             receipt["observe_after_poll_sequence"] = self.poll_floor
-            self.receipts[command_sequence] = (fingerprint, receipt)
+            self.receipts[command_sequence] = (fingerprint, receipt, operation_id)
             self.busy = False
             if possible_send and self._refresh_owner_current(hass, entry_id):
                 await self.binding[1].async_refresh_after_command()
@@ -1016,7 +1155,9 @@ def register_command_services(hass):
     room_command_schema = {
         **command_schema,
         **room_identity,
-        vol.Required("action"): vol.In(("pause", "resume", "next", "previous")),
+        vol.Required("action"): vol.In(
+            ("pause", "resume", "next", "previous", "shuffle", "repeat")
+        ),
         vol.Required("native"): dict,
         vol.Required("route"): dict,
     }
@@ -1039,7 +1180,9 @@ def register_command_services(hass):
     content_command_schema = {
         **command_schema,
         **room_identity,
-        vol.Required("action"): vol.In(("play_track", "play_context")),
+        vol.Required("action"): vol.In(
+            ("play_track", "play_context", "play_episode", "play_tracks")
+        ),
         vol.Required("start_offer"): dict,
     }
     content_cancel_schema = {

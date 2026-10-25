@@ -101,7 +101,7 @@ func readRoomVolume(ctx context.Context, s roomTransportScope) (startClaim, rece
 	}
 	q := url.Values{"account_user_id": {s.Account}, "target_id": {s.Target}, "room_id": {s.Room}, "homepod_id": {s.Homepod}}
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_volume/bound-state?"+q.Encode(), nil)
-	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_volume_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validRoomVolumeActions(n.Actions) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
+	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_volume_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validReceiverRoomEffect(n.Effect, n.Identity) || n.Effect != nil && n.Effect.Action != "volume" || !validRoomVolumeActions(n.Actions) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
 		return claim, n, o, fmt.Errorf("native volume unavailable")
 	}
 	boundState, _ := json.Marshal(map[string]any{"native_owner": n.Identity})
@@ -110,6 +110,34 @@ func readRoomVolume(ctx context.Context, s roomTransportScope) (startClaim, rece
 		return claim, n, o, fmt.Errorf("output volume unavailable")
 	}
 	return claim, n, o, nil
+}
+
+// A Native stamp alone cannot certify volume: join the same retained operation
+// to the fresh C revision/value read and the terminal owner receipt.
+func currentRoomVolumeEffect(effect *receiverRoomEffect, s roomTransportScope, claim startClaim, native roomTransportIdentity, route outputTransportIdentity, volume roomVolumeState) *receiverRoomEffect {
+	if effect == nil || effect.Action != "volume" || effect.Owner != native || !transportClaimCurrent(claim, s) {
+		return nil
+	}
+	roomVolumeStore.Lock()
+	record := roomVolumeStore.Records[effect.PrepareID]
+	if record == nil || record.Result == nil || !record.Dispatched || record.Cancelled || !record.Result.OK || record.Result.State != "protocol_accepted" || !record.Result.Terminal || !record.Result.Drained || !record.Result.Protocol || !record.Result.Possible || !record.Result.Reserved || record.Request.Scope != s || record.Request.Native != native || record.Request.Route != route || record.Request.Volume.BaseRevision == "" {
+		roomVolumeStore.Unlock()
+		return nil
+	}
+	request := record.Request
+	roomVolumeStore.Unlock()
+	before, err := strconv.ParseUint(request.Volume.BaseRevision, 10, 64)
+	if err != nil || before == ^uint64(0) || !transportClaimCurrent(record.Claim, s) || volume.BaseRevision != strconv.FormatUint(before+1, 10) || volume.AttentionRevision != request.Volume.AttentionRevision || volume.BasePercent != request.Percent {
+		return nil
+	}
+	if request.Volume.EffectivePercent < request.Volume.BasePercent {
+		if volume.EffectivePercent != min(request.Percent, request.Volume.EffectivePercent) {
+			return nil
+		}
+	} else if volume.EffectivePercent < min(request.Percent, request.Volume.BasePercent) || volume.EffectivePercent > request.Percent {
+		return nil
+	}
+	return effect
 }
 func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -130,7 +158,7 @@ func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	_, n, o, err := readRoomVolume(ctx, s)
+	claim, n, o, err := readRoomVolume(ctx, s)
 	if err != nil {
 		http.Error(w, "volume unavailable", 409)
 		return
@@ -139,7 +167,7 @@ func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 	if !o.Busy && len(n.Actions) == 1 && len(o.Actions) == 1 {
 		actions = []string{"volume"}
 	}
-	writeJSON(w, map[string]any{"schema": "podconnect.room_volume_state.v1", "ok": true, "native": n.Identity, "route": o.Identity, "volume_state": o.Volume, "actions": actions, "physical_result_verified": false})
+	writeJSON(w, map[string]any{"schema": "podconnect.room_volume_state.v1", "ok": true, "native": n.Identity, "route": o.Identity, "volume_state": o.Volume, "actions": actions, "effect": currentRoomVolumeEffect(n.Effect, s, claim, n.Identity, o.Identity, o.Volume), "physical_result_verified": false})
 }
 func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

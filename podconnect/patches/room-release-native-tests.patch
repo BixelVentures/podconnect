@@ -108,17 +108,17 @@
  	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r1", "1"})
  	if err != nil {
  		t.Fatal("capture", err)
-@@ -1296,6 +1350,10 @@
- 			}
- 			time.Sleep(10 * time.Millisecond)
- 		}
-+	}
+@@ -1237,6 +1291,10 @@
+ 	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
+ 		t.Fatal("selected state not observed", err)
+ 	}
 +	if os.Getenv("PC70_RELEASE_COMPOSE") == "start" {
 +		testManualReleaseComposed(t, p, server)
 +		return
- 	}
++	}
  	if mode == "actual-c-native-pause" {
  		owner, e := p.roomTransportIdentity("account", "engine", "r1", "1")
+ 		if e != nil {
 --- a/daemon/room_queue_test.go
 +++ b/daemon/room_queue_test.go
 @@ -5,6 +5,9 @@

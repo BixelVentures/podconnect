@@ -7,7 +7,7 @@ import copy
 import re
 import time
 
-from .room_transport import valid_identity
+from .room_transport import valid_effect, valid_identity
 from .speakers import SpeakersError
 
 _TOKEN = re.compile(r"[a-f0-9]{32}")
@@ -122,6 +122,47 @@ class RoomVolume:
             hass, entry, target, context["room_id"], context["homepod_id"]
         )
 
+    async def observe(self, hass, entry, target, room, homepod):
+        """Read an exact Native/C witness without offering volume authority."""
+        from .commands import CommandRejected
+
+        context = {"room_id": room, "homepod_id": homepod}
+        scope = self._scope(hass, entry, target, context)
+        before = self.commands.room_transport.observation_source(hass, entry)
+        try:
+            state = await self.commands.data.speakers.room_volume_state(scope)
+        except SpeakersError as exc:
+            raise CommandRejected("room_volume_unavailable") from exc
+        if self._scope(hass, entry, target, context) != scope or (
+            self.commands.room_transport.observation_source(hass, entry) != before
+        ):
+            raise CommandRejected("stale_observation")
+        if (
+            not isinstance(state, dict)
+            or set(state)
+            != {
+                "schema",
+                "ok",
+                "native",
+                "route",
+                "volume_state",
+                "actions",
+                "effect",
+                "physical_result_verified",
+            }
+            or state["schema"] != "podconnect.room_volume_state.v1"
+            or state["ok"] is not True
+            or state["physical_result_verified"] is not False
+            or state["actions"] not in ([], ["volume"])
+            or not valid_identity(state["native"], state["route"], scope)
+            or not valid_volume_state(state["volume_state"])
+            or not valid_effect(state["effect"], state["native"])
+            or state["effect"] is not None
+            and state["effect"]["action"] != "volume"
+        ):
+            raise CommandRejected("room_volume_unavailable")
+        return state
+
     async def read(self, hass, entry, target, room, homepod, *, passive=False):
         from .commands import CommandRejected
 
@@ -147,6 +188,7 @@ class RoomVolume:
                 "route",
                 "volume_state",
                 "actions",
+                "effect",
                 "physical_result_verified",
             }
             or state["schema"] != "podconnect.room_volume_state.v1"
@@ -155,6 +197,9 @@ class RoomVolume:
             or state["actions"] not in (["volume"], [])
             or not valid_identity(state["native"], state["route"], scope)
             or not valid_volume_state(state["volume_state"])
+            or not valid_effect(state["effect"], state["native"])
+            or state["effect"] is not None
+            and state["effect"]["action"] != "volume"
         ):
             raise CommandRejected("room_volume_unavailable")
         return {
@@ -248,7 +293,7 @@ class RoomVolume:
                 raise CommandRejected("native_account_unproven")
             if time.monotonic() - started >= prepared["expires_after_ms"] / 1000:
                 raise CommandRejected("room_volume_expired")
-            sending()
+            sending(prepare_id)
             ack = await client.commit_room_volume(prepare_id)
             if not valid_result(ack, prepare_id):
                 raise SpeakersError("Room volume outcome unknown")

@@ -274,7 +274,7 @@ func TestReleasedPlayingSTARTStillRetiresOriginalAttention(t *testing.T) {
 		case path == "/status":
 			return []byte(fmt.Sprintf(`{"username":"native-user","device_id":%q}`, f.id)), nil
 		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, []string{"pause"}, nil, false})
 		case path == "/api/outputs/42/transport/bound-state":
 			var supplied struct {
 				Owner roomTransportIdentity `json:"native_owner"`

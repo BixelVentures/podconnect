@@ -41,12 +41,12 @@ func validRoomContentOffer(offer roomContentOffer) bool {
 }
 
 func validRoomContentActions(actions []string) bool {
-	if actions == nil || len(actions) > 2 {
+	if actions == nil || len(actions) > 4 {
 		return false
 	}
 	seen := map[string]bool{}
 	for _, action := range actions {
-		if !slices.Contains([]string{"play_track", "play_context"}, action) || seen[action] {
+		if !slices.Contains([]string{"play_track", "play_context", "play_episode", "play_tracks"}, action) || seen[action] {
 			return false
 		}
 		seen[action] = true
