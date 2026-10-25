@@ -1,0 +1,23 @@
+diff --git a/src/outputs.c b/src/outputs.c
+index 1f995c3..4c23e81 100644
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -394,7 +394,7 @@ outputs_transport_commit(const struct output_transport_request *request, struct
+     if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+         || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
+         || !transport_custody_current(&request->native_owner,&identity,request->native_revision))) return -1;
+-    slot->result.remaining_ms=transport_remaining(&transport_custody_expiry); slot->result.outcome=0;
++    slot->result.remaining_ms=MIN(transport_remaining(&slot->expiry),transport_remaining(&transport_custody_expiry)); slot->result.outcome=0;
+     *result=slot->result; return 0;
+   }
+   if (clock_gettime(CLOCK_MONOTONIC,&transport_pin_expiry)<0) return -1;
+@@ -411,7 +411,8 @@ outputs_transport_result_get(const char *token, struct output_transport_result *
+   struct transport_slot *slot=transport_find(token);
+   if (!slot || !slot->used || !result) return -1;
+   *result=slot->result;
+-  result->remaining_ms=slot->result.command.bound ? transport_custody_remaining(&slot->result.command.native_owner,&slot->result.identity) :
++  result->remaining_ms=slot->result.command.bound ? MIN(transport_remaining(&slot->expiry),
++      transport_custody_remaining(&slot->result.command.native_owner,&slot->result.identity)) :
+     outputs_transport_busy() && transport_pin==slot ? transport_remaining(&transport_pin_expiry) : 0;
+   return 0;
+ }

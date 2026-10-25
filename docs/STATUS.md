@@ -1,3 +1,144 @@
+## Frozen candidate52 — metadata, first-PCM clocks and Native Pause, 25 October 2026
+
+Lead /root; composition /root/sol61_release75_review. Three failed physical music
+attempts remain failed. Native admission, FIFO/metadata ownership, protocol output
+and actual HomePod sound are separate claims. Source baseline is published51,
+commit4b9740bb1fcb8272ab00cc9415c0fead61b84591/tree80a4e4e0c64c0d1cb292146a0405c1c5a62033ad.
+The same unreleased52/PR80 continues from metadata-only headcc527c26f921c45409db192916d12efb1adafaf9,
+treea101af964a55d1eb976767f023849cb6237f3bc2. Control source0.10.21 and manager bytes
+remain unchanged; this source label is not a refreshed installed-Control readback.
+
+One combined52 candidate contains these independently reviewed corrections:
+- C21 metadata owner e42518bb: create/read/retire each watch on the input thread,
+  bound to exact source/setup generation; late old stop cannot retire a successor.
+- C22 fresh selected START clock7338d2ef and C24 playing MOVE clockadc32a24: anchor
+  the existing presentation clock at the first positive current-owner PCM after
+  successful admission, preserving paused/stale/foreign/duplicate behavior.
+- C23 bound transport ACK e29c31b9: report the minimum of the existing purpose-bound
+  slot and shared custody remaining. No lease, timeout or admission duration changes.
+- Native35 full8bee7953 contains only reviewed c59fba4e's five production files and
+  its causal tests/small asset. Direct Native Pause uses the same exact purpose-bound
+  owner transaction and confirmation; UNKNOWN is never replayed or adopted.
+
+C21→24 apply in identical Docker/official-CI order after unchanged first20 overlays.
+First34 Native patch artifacts are unchanged. Full Native35 runs its relevant tests
+in the existing Docker path. The CI-only clock delta2dff8b35 merges Pause3106 and
+clock6a592 parents into room_content_test5fff9386 without losing either case/assertion
+set. Existing C fixture3e30805c preserves Gcrypt initialization, generated-Makefile
+handling, strict mode17/24 FLUSH, and adds only mode29's typed bound-HTTP/Pause path.
+Independent review74 approves the merged fixtures and workflow5de87d15/driver3201dc59.
+The driver differs from its reviewed parent only by two path environment options.
+
+Verified software evidence: owner offline ARM metadata-FIFO/source-retirement
+regressions pass. Held fresh START was RED at about3.1s stale first sync and GREEN
+near0.1ms; held playing MOVE was RED3.232s and GREEN about0.19ms, with paused/stale/
+foreign/duplicate neighbors retained. Bound ACK over10s was causal RED; capped ACK,
+query and expired-slot-zero cases pass. Actual Native/C Pause→real10sSTOP rearm→
+explicit Resume retains the same writer/C route/AP2 session and controls200 in15.88s.
+Merged Native compile plus eight direct-Pause race cases pass5.194s. Fresh Native35
+plus CI replay and final C24 plus five CI fixtures match the composed bytes. YAML,
+formatting, checksums and whitespace checks pass; no broad local suite was repeated.
+
+Official CI retains parallel Native/C builds, uploads those existing binaries and
+SQLite extension, then one dependent job runs held fresh START, late paused Resume
+and Native Pause with the existing driver. The private authenticated-RTP/nonzero-PCM
+fixture is included because the reproduced clock defect requires a permanent
+regression. These protocol results do not prove provider behavior, sub-poll device
+timing, field evbuffer-crash attribution or HomePod audibility. The new official
+artifact-join job has not yet executed; earlier owner results remain separate.
+
+All source/port reviews are GO; root alone owns final PR update, official CI, merge,
+publication, installation and physical acceptance. Those delivery/physical stages
+are pending. No home/provider/device action occurred during composition. Rollback
+is this52 successor's four C overlays, Native35 and associated fixture/build wiring;
+all incumbent ownership, UNKNOWN, one-use and teardown guards remain in force.
+
+### Lead continuation — direct Native Pause retention, 25 October 2026
+
+Blocking causal software regression, lead-approved before runtime edit: installed51
+source is reproduced offline through public selected prepare/stage/commit, the real
+Native actor/decoder/FIFO and linked actual C/AP2. REST Pause pauses that same worker,
+then C underruns, sends FLUSH, and the unchanged ten-second STOP sends TEARDOWN;
+the exact bound-state changes from200 to409. Native correctly remains paused but
+controls lose their actual route. Private-peer FLUSH initialization failures are
+retained separately and do not count as product evidence. No field Pause origin or
+HomePod audibility is inferred from this trace.
+
+Decision: reuse the existing exact purpose-bound pause protocol from the direct
+Native actor, with current authenticated alias/writer/source/generation/intent and
+C route/token/revision joins: prepare, exact C prepare/commit ACK, actual guarded
+worker effect, then one-use pause confirmation. Direct actor calls must never
+self-enqueue. Recheck every await, retain no locks across C I/O, reject foreign,
+stale or unknown outcomes without generic Pause fallback/replay, and surface REST
+errors. Direct Pause alone captures the existing nonzero registered writer generation
+on its consumed offer and rechecks it inside the existing final guarded worker
+effect; legacy HTTP offers remain unchanged. Post-effect verification expects only
+the one generation advance from that effect's own synchronous Pause event, not an
+arbitrary latest actor. Ordinary clean-absent retains its existing ACK-only semantics. C guard,
+playback timeout and physical-claim rules remain unchanged.
+
+Gate: same real flow must retain its exact AP2 route and controls beyond the real
+STOP boundary, then explicit Resume must use the same worker/source/route. Existing
+late/foreign/generation/unknown negatives and bound HTTP parity are required;
+independent reviewer weather_backend_review owns adversarial closure.
+
+Implemented Native production-only patchc59fba4e4ea6f71bd8524b709fc5f5f13ee3bcfb24ea34738820cc47b6d1f2a0
+in five files. The real exchange also exposed C ACK reporting the retained START
+resource's15s budget instead of the exact10s transport slot. Independent C owner
+supplies the three-line MIN(slot,custody) ACK correction; custody/token/admission
+and Native's strict10000ms guard stay unchanged. Final combined candidate actual
+Native/C proof passes Native0/C0 in15.88s: purpose-bound Pause ACK, real ten-second
+STOP retained without TEARDOWN, then explicit same-worker/source/writer Native
+Resume with the same AP2 session/route STREAMING and bound controls200. Eight
+focused race adversaries, exact final writer-generation/FD-reuse guard, unchanged
+HTTP actor/receipt parity, formatting and vet pass. This is synthetic offline
+protocol/software evidence, not field attribution or HomePod audibility. Fixture
+FLUSH/terminal-observation and syntheticPUT204 failures remain separately retained;
+no product timeout was changed. Independent Native source/evidence closure remains
+pending; no official CI/release/install/physical acceptance is credited here.
+Root owns the combined candidate and delivery; no home/provider/device effects.
+
+
+### Lead continuation — playing MOVE first-PCM clock, 25 October 2026
+
+Lead /root approved this bounded correction after the existing mode16 owner probe
+reproduced a 3.232-second stale first-target sync clock. The isolated probe uses the
+actual MOVE player commit (timer quiescence), a three-second asynchronous target
+negotiation, actual OPEN (timer restart), a real FIFO positive read and the actual
+AirPlay sync sender. Its predecessor clock was seeded at the real player owner
+function, not a preceding physical playback. All229 C/H matched the reviewed fresh
+START clock candidate; no HomePod or first field no-audio attribution is inferred.
+
+Decision before runtime edit: reuse the fresh-START session-local pending clock
+anchor only after an exact successful playing MOVE OPEN and timer restart. The
+existing source-owned latch includes journaled MOVE. First positive gate-open PCM
+anchors before event/metadata processing; source position, media generation, Native
+writer, RTP sequence/audio epoch, metadata and deficits stay unchanged. Failed,
+duplicate or stale OPEN must not arm; requested-paused MOVE must not resume or arm.
+Session teardown clears pending state before a successor. No timer tuning, fallback,
+new command authority, reset of the journal or automatic playback is authorized.
+
+Gate: the same mode16 RED must become GREEN with current first-sync timing; bounded
+failed/duplicate/stale and paused-OPEN negatives must remain unchanged. Admission34
+owns independent review. Fresh-START patch7338d2ef remains the base. Rollback is this
+MOVE-only caller-local delta. Root owns the combined candidate and release.
+
+Result: isolated production patch adc32a2440d92f9cd6c3289d229ed1049651a8e685dff580fdbd2a02111a29e5
+changes only the existing successful-playing-MOVE OPEN caller. Same causal fixture
+RED first-sync age3.231680 seconds becomes GREEN0.189 milliseconds. The final
+expanded playing cohort passes with0.170 milliseconds, preserving media position,
+source pointer, input epoch and pre-emission RTP sequence; stale token/foreign owner
+and duplicate OPEN are inert. Requested-paused MOVE remains paused with no timer or
+pending clock armed. Existing first-positive anchoring precedes metadata processing.
+Admission34 independently reviewed the exact runtime delta SOURCE GO. Production
+and fixture apply-checks and whitespace checks pass; no broad suite repeated.
+Receipt MOVE-FIRST-PCM-CLOCK-RECEIPT.json SHA3e0d7879e74450d5df6d8a0d23cb6794069e7454042252d62f39908948960eea
+is retained in /private/tmp/pc54-move-clock-review-20261025. The original fixture-only
+pre-reader phase mismatch is retained separately; it was not product evidence.
+This proves private sender timing, not field attribution or physical speaker sound.
+Official CI, integration, publication, installation and physical acceptance remain
+pending; fresh-START and metadata reviews remain separate retained results.
+
 ## Active field incident — ordinary Connect pause and volume observation, 24 October 2026
 
 Lead: /root. Installed Speakers0.26.44, Control0.10.21 and PodVoice2.0.80. First ordinary Spotify Connect transfer at11:01:53 reached route_accepted at11:01:56, primed35%. Same-process passive C snapshots show selected Kitchen, session1/route1, base/effective35; no physical sound acceptance is recorded. User reports volume control disabling/re-enabling and displaying100%, plus a non-live timeline. A displayed100% is not evidence of physical100%.

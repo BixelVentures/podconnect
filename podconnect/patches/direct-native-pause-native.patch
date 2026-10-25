@@ -1,0 +1,1070 @@
+diff --git a/daemon/controls.go b/daemon/controls.go
+index 4d217d3..70baeb5 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -598,6 +598,9 @@ func (p *AppPlayer) playObserved(ctx context.Context, ordinal uint64) error {
+ }
+ 
+ func (p *AppPlayer) pause(ctx context.Context) error {
++	if handled, err := p.pauseBoundRoom(ctx); handled {
++		return err
++	}
+ 	if p.primaryStream == nil {
+ 		return fmt.Errorf("no primary stream")
+ 	}
+diff --git a/daemon/player.go b/daemon/player.go
+index 8d26b62..7fc9c92 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -802,8 +802,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		_ = p.play(ctx)
+ 		return nil, nil
+ 	case ApiRequestTypePause:
+-		_ = p.pause(ctx)
+-		return nil, nil
++		return nil, p.pause(ctx)
+ 	case ApiRequestTypeStop:
+ 		_ = p.stopPlayback(ctx)
+ 		return nil, nil
+@@ -811,7 +810,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		if p.state.player.IsPaused {
+ 			_ = p.play(ctx)
+ 		} else {
+-			_ = p.pause(ctx)
++			return nil, p.pause(ctx)
+ 		}
+ 		return nil, nil
+ 	case ApiRequestTypeSeek:
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 2dc76c3..6521e80 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -1,20 +1,33 @@
+ package daemon
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/sha256"
++	_ "embed"
++	"encoding/hex"
+ 	"encoding/json"
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/ap"
+ 	"github.com/devgianlu/go-librespot/dealer"
+ 	evtimpl "github.com/devgianlu/go-librespot/events/impl"
++	"github.com/devgianlu/go-librespot/mpris"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
++	"github.com/devgianlu/go-librespot/playplay"
+ 	pb "github.com/devgianlu/go-librespot/proto/spotify"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	storagepb "github.com/devgianlu/go-librespot/proto/spotify/download"
++	extpb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	filespb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata/audiofiles"
+ 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	streamingpb "github.com/devgianlu/go-librespot/proto/spotify/streaming"
+ 	"github.com/devgianlu/go-librespot/tracks"
+ 	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
+ 	"io"
+ 	"net"
+ 	"net/http"
+@@ -585,9 +598,9 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+ // synthetic AP welcome seeds only the existing account getter; no provider
+ // authentication, HomePod or physical audio is claimed by this regression.
+ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+-	modes := []string{"playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation"}
++	modes := []string{"playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation", "direct-pause-current", "direct-pause-unknown-state", "direct-pause-route", "direct-pause-foreign-prepare", "direct-pause-late-generation", "direct-pause-late-intent", "direct-pause-unknown-commit", "direct-pause-unknown-confirm"}
+ 	if mode := os.Getenv("PC_NATIVE_START_MODE"); mode != "" {
+-		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" {
++		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" && mode != "actual-c-selected" && mode != "actual-c-selected-stage" && mode != "actual-c-selected-successor" && mode != "actual-c-native-pause" {
+ 			t.Fatal("invalid C compose mode")
+ 		}
+ 		modes = []string{mode}
+@@ -645,14 +658,18 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			nextSessionField(p.sess, "ap", access)
+ 			var creates atomic.Int32
+ 			var actualOutput output.MovePipeOutput
+-			worker, err := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			options := &player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
+ 				creates.Add(1)
+ 				out, e := p.app.withNewOutput(p, create)
+ 				if e == nil {
+ 					actualOutput, _ = out.(output.MovePipeOutput)
+ 				}
+ 				return out, e
+-			}})
++			}}
++			if strings.HasPrefix(mode, "actual-c-selected-") || mode == "actual-c-native-pause" {
++				configureSelectedStage(t, p, options)
++			}
++			worker, err := player.NewPlayer(options)
+ 			if err != nil {
+ 				t.Fatal(err)
+ 			}
+@@ -669,6 +686,20 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					source.eofFile = os.Getenv("PC_NATIVE_START_EOF_FILE")
+ 				}
+ 			}
++			if strings.HasPrefix(mode, "direct-pause-") {
++				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++				}))
++				current := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000003"}
++				list, e := tracks.NewTrackListFromContext(context.Background(), p.app.log, sp, &connectpb.Context{Uri: current.Uri, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{current}}}})
++				if e != nil {
++					t.Fatal(e)
++				}
++				if e = list.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); e != nil {
++					t.Fatal(e)
++				}
++				p.state.tracks = list
++			}
+ 			sessionID := p.state.player.SessionId
+ 			tracks := p.state.tracks
+ 			position := int64(8487)
+@@ -687,6 +718,11 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
+ 					mu.Lock()
+ 					defer mu.Unlock()
++					if strings.HasPrefix(mode, "direct-pause-") && strings.Contains(r.URL.Path, "/transport/") {
++						calls = append(calls, strings.TrimPrefix(r.URL.Path, "/api/outputs/202/transport/"))
++						replyDirectPauseFixture(t, p, mode, w, r)
++						return
++					}
+ 					calls = append(calls, endpoint)
+ 					var body map[string]json.RawMessage
+ 					_ = json.NewDecoder(r.Body).Decode(&body)
+@@ -775,6 +811,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			} else {
+ 				p.app.cfg.RoomTransportOwnToneURL = os.Getenv("PC_NATIVE_START_URL")
+ 			}
++			if strings.HasPrefix(mode, "actual-c-selected") || mode == "actual-c-native-pause" {
++				testSelectedContentCommitActualC(t, p, worker, stream, mode)
++				return
++			}
+ 			preexisting := false
+ 			switch mode {
+ 			case "prior-generation":
+@@ -885,7 +925,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			} else {
+ 				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
+ 			}
+-			good := mode == "actual-c-paused" || mode == "actual-c-playing" || mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
++			good := strings.HasPrefix(mode, "direct-pause-") || mode == "actual-c-paused" || mode == "actual-c-playing" || mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
+ 			if good {
+ 				if err != nil {
+ 					if external && actualOutput != nil {
+@@ -919,6 +959,45 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				if !external && strings.Join(calls, ",") != "state,prepare,commit,barrier,open,complete" {
+ 					t.Fatal("wrong protocol chain", calls)
+ 				}
++				if strings.HasPrefix(mode, "direct-pause-") {
++					// The real START worker/source/writer remains the observed target.
++					p.app.mpris = mpris.DummyServer{}
++					p.state.player.Options = &connectpb.ContextPlayerOptions{}
++					p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++					p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++					events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
++					nextSessionField(p.sess, "events", events)
++					nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++						return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++					})))
++					p.prefetchTimer = time.NewTimer(time.Hour)
++					defer p.prefetchTimer.Stop()
++					_, e := p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypePause})
++					good := mode == "direct-pause-current"
++					if (e == nil) != good {
++						t.Fatal("REST Pause reported wrong owner outcome", mode, e)
++					}
++					wantPaused := good || mode == "direct-pause-unknown-confirm"
++					if p.state.player.IsPaused != wantPaused {
++						t.Fatal("invalid owner/unknown mutated actual Pause", mode, p.state.player.IsPaused)
++					}
++					mu.Lock()
++					actual := strings.Join(calls[6:], ",")
++					mu.Unlock()
++					want := "bound-state"
++					if mode == "direct-pause-current" || mode == "direct-pause-unknown-confirm" {
++						want += ",bound-prepare,bound-commit,bound-pause-confirm"
++					} else if mode != "direct-pause-unknown-state" && mode != "direct-pause-route" {
++						want += ",bound-prepare"
++						if mode == "direct-pause-unknown-commit" {
++							want += ",bound-commit"
++						}
++					}
++					if actual != want || p.roomTransportOffer != nil || p.roomTransportPending != nil {
++						t.Fatal("stale/unknown repeated or leaked capability", actual, want)
++					}
++					return
++				}
+ 				if paused && !external {
+ 					if err := worker.Play(); err != nil {
+ 						t.Fatal("explicit later resume failed", err)
+@@ -1034,3 +1113,352 @@ func TestPreparedDealerKeepsDefaultSTARTPredecessorBody(t *testing.T) {
+ 		t.Fatal("default selected-content START lost real predecessor transition")
+ 	}
+ }
++
++// Keeps real public commit dispatch/actor park/worker and actual C. Provider
++// decoding is deliberately seeded here so this case isolates the next boundary.
++func testSelectedContentCommitActualC(t *testing.T, p *AppPlayer, worker *player.Player, stream *player.Stream, mode string) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	p.primaryStream = nil
++	p.app.mpris = mpris.DummyServer{}
++	p.app.server = &StubApiServer{log: p.app.log}
++	if mode == "actual-c-selected-successor" {
++		p.primaryStream = stream
++		if _, e := p.startPreparedDealerTransfer(ctx, false, 0); e != nil {
++			t.Fatal("initial authenticated prepared current writer", e)
++		}
++		t.Log("initial real prepared current writer completed before selected replacement")
++	} else {
++		p.state.player.SessionId = ""
++	}
++
++	p.state.player.Options = &connectpb.ContextPlayerOptions{}
++	p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++	p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++	if mode == "actual-c-selected" {
++		events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
++		nextSessionField(p.sess, "events", events)
++		sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++			return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++		}))
++		nextSessionField(p.sess, "sp", sp)
++		list, e := tracks.NewTrackListFromContext(ctx, p.app.log, sp, &connectpb.Context{Uri: "spotify:track:0000000000000000000003", Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: "spotify:track:0000000000000000000003"}}}}})
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = list.TrySeek(ctx, func(*connectpb.ContextTrack) bool { return true }); e != nil {
++			t.Fatal(e)
++		}
++		p.state.tracks = list
++	}
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	actorDone := make(chan struct{})
++	go func() {
++		defer close(actorDone)
++		for req := range server.requests {
++			if !p.dispatchAPIAndPark(ctx, req) {
++				return
++			}
++		}
++	}()
++	defer func() { close(server.requests); <-actorDone }()
++	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r1", "1"})
++	if err != nil {
++		t.Fatal("capture", err)
++	}
++	state, err := capture.readCState(ctx)
++	if err != nil {
++		t.Fatal("actual C state", err)
++	}
++	offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++	if err != nil {
++		t.Fatal("offer", err)
++	}
++	op := offered.(*contentOperation)
++	if !server.roomContents.put(op) {
++		t.Fatal("store")
++	}
++	request := contentPrepareRequest{capture.Scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
++	if mode == "actual-c-selected" {
++		_, err = server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
++		if err != nil {
++			t.Fatal("claim", err)
++		}
++		op.mu.Lock()
++		op.Stream, op.Tracks = stream, p.state.tracks
++		op.Prepared.SessionId = op.Intended.SessionID
++		op.Prepared.IsPlaying, op.Prepared.IsPaused = true, true
++		op.ContentDigest = strings.Repeat("d", 64)
++		op.State = "staged"
++		op.StagedUntil = time.Now().Add(5 * time.Second)
++		op.mu.Unlock()
++	} else {
++		raw, _ := json.Marshal(request)
++		rec := httptest.NewRecorder()
++		server.handleContentPrepare(rec, httptest.NewRequest("POST", "/player/room_content/prepare", bytes.NewReader(raw)))
++		if rec.Code != 200 {
++			t.Fatal("public prepare", rec.Code, rec.Body.String())
++		}
++		until := time.Now().Add(3 * time.Second)
++		for {
++			op.mu.Lock()
++			phase := op.State
++			op.mu.Unlock()
++			if phase == "staged" {
++				break
++			}
++			if phase != "staging" || time.Now().After(until) {
++				t.Fatal("actual stage did not produce stream", phase)
++			}
++			time.Sleep(time.Millisecond)
++		}
++		stream = op.Stream
++		t.Log("public prepare -> actual ContextResolve/metadata/key/storage/AES/FLAC/NewStream staged")
++	}
++	body, _ := json.Marshal(contentIDRequest{op.Offer.OfferID, op.Offer.BindingID})
++	rec := httptest.NewRecorder()
++	server.handleContentCommit(rec, httptest.NewRequest("POST", "/player/room_content/commit", strings.NewReader(string(body))))
++	var receipt contentReceipt
++	if err = json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
++		t.Fatal(err, rec.Code, rec.Body.String())
++	}
++	if !receipt.Accepted {
++		t.Fatal("selected-content actual commit rejected", rec.Code, receipt)
++	}
++	// Join the existing actor's terminal publication before observing state.
++	_, err = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
++	if err == nil {
++		t.Fatal("expected unsupported noop")
++	}
++	selected, err := worker.Start35CurrentSource(ctx)
++	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
++		t.Fatal("selected state not observed", err)
++	}
++	if mode == "actual-c-native-pause" {
++		owner, e := p.roomTransportIdentity("account", "engine", "r1", "1")
++		if e != nil {
++			t.Fatal(e)
++		}
++		var actual directPauseOutputState
++		readBound := func() int {
++			body, _ := json.Marshal(struct {
++				Owner roomTransportIdentity `json:"native_owner"`
++			}{owner})
++			response, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/api/outputs/1/transport/bound-state", "application/json", bytes.NewReader(body))
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer response.Body.Close()
++			raw, _ := io.ReadAll(response.Body)
++			if response.StatusCode == 200 && json.Unmarshal(raw, &actual) != nil {
++				t.Fatal("invalid actual bound state")
++			}
++			t.Logf("actual C paused owner read status=%d", response.StatusCode)
++			return response.StatusCode
++		}
++		if status := readBound(); status != 200 {
++			t.Fatal("before pause bound state", status)
++		}
++		originalRoute := actual.Identity
++		originalWriter, e := p.app.completedWriterCurrent(p, owner)
++		if e != nil || originalWriter == nil {
++			t.Fatal("current writer", e)
++		}
++		pause := httptest.NewRecorder()
++		server.handleRequest(ApiRequest{Type: ApiRequestTypePause}, pause)
++		if pause.Code != 200 || !p.state.player.IsPaused {
++			t.Fatal("actual REST actor pause", pause.Code, p.state.player.IsPaused)
++		}
++		t.Log("actual REST /player/pause -> same actor -> real player.Pause, no C command from fixture")
++		// The production timer is used unchanged. Observe only its existing bound
++		// read; never manufacture a Pause confirmation or adopt a lost session.
++		until := time.Now().Add(15 * time.Second)
++		status := 200
++		for status == 200 && time.Now().Before(until) {
++			time.Sleep(500 * time.Millisecond)
++			status = readBound()
++		}
++		if status != 200 {
++			t.Errorf("product regression: actual Native Pause must retain exact C session/controls, got HTTP%d", status)
++		}
++		if status == 200 {
++			if actual.Identity != originalRoute || !p.state.player.IsPaused {
++				t.Fatal("pause changed actual route or semantic state")
++			}
++			resume := httptest.NewRecorder()
++			server.handleRequest(ApiRequest{Type: ApiRequestTypeResume}, resume)
++			if resume.Code != 200 || p.state.player.IsPaused {
++				t.Fatal("actual explicit Resume", resume.Code)
++			}
++			// Join real worker processing and allow its same FIFO bytes to reach
++			// the independent C player; C's terminal observer requires STREAMING.
++			selected, e := worker.Start35CurrentSource(ctx)
++			latestWriter, werr := p.app.completedWriterCurrent(p, owner)
++			if e != nil || werr != nil || selected != stream.Source || latestWriter == nil || *latestWriter != *originalWriter {
++				t.Fatal("Resume replaced current worker/source/writer", e, werr)
++			}
++			time.Sleep(250 * time.Millisecond)
++			if readBound() != 200 || actual.Identity != originalRoute {
++				t.Fatal("Resume changed exact C route")
++			}
++			t.Log("PASS actual Native Pause retained same writer/source/C route beyond real10sSTOP; explicit Native Resume keeps same owner and controls")
++		}
++	}
++	reply, err := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	reply.Body.Close()
++	if reply.StatusCode != 200 {
++		t.Fatal("C done", reply.StatusCode)
++	}
++	t.Log("actual selected public commit -> real actor park -> real FIFO/C completed -> observed playing")
++}
++
++//go:embed testdata/selected-start.flac
++var selectedStageFLAC []byte
++
++type selectedStageKey struct{}
++
++func (selectedStageKey) IsSupported() bool                          { return true }
++func (selectedStageKey) GetVersion() int32                          { return 1 }
++func (selectedStageKey) GetToken() []byte                           { return nil }
++func (selectedStageKey) Deobfuscate([]byte, []byte) ([]byte, error) { return make([]byte, 16), nil }
++
++func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options) {
++	old := playplay.Plugin
++	playplay.Plugin = selectedStageKey{}
++	t.Cleanup(func() { playplay.Plugin = old })
++	block, _ := aes.NewCipher(make([]byte, 16))
++	encrypted := make([]byte, len(selectedStageFLAC))
++	cipher.NewCTR(block, []byte{0x72, 0xe0, 0x67, 0xfb, 0xdd, 0xcb, 0xcf, 0x77, 0xeb, 0xe8, 0xbc, 0x64, 0x3f, 0x63, 0x0d, 0x93}).XORKeyStream(encrypted, selectedStageFLAC)
++	id, _ := librespot.SpotifyIdFromUri("spotify:track:0000000000000000000004")
++	transport := pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		var data []byte
++		status := 200
++		header := make(http.Header)
++		switch {
++		case strings.HasPrefix(r.URL.Path, "/context-resolve/v1/"):
++			data, _ = json.Marshal(&connectpb.Context{Uri: id.Uri(), Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: id.Uri()}}}}})
++		case r.URL.Path == "/extended-metadata/v0/extended-metadata":
++			raw, _ := io.ReadAll(r.Body)
++			var req extpb.BatchedEntityRequest
++			if e := proto.Unmarshal(raw, &req); e != nil {
++				return nil, e
++			}
++			kind := req.EntityRequest[0].Query[0].ExtensionKind
++			var message proto.Message
++			switch kind {
++			case extpb.ExtensionKind_TRACK_V4:
++				message = &metadatapb.Track{Gid: id.Id(), Duration: proto.Int32(30000), Name: proto.String("synthetic"), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("synthetic"), Date: &metadatapb.Date{}}}
++			case extpb.ExtensionKind_AUDIO_FILES:
++				message = &filespb.AudioFilesExtensionResponse{Files: []*filespb.ExtendedAudioFile{{File: &metadatapb.AudioFile{FileId: bytes.Repeat([]byte{1}, 20), Format: metadatapb.AudioFile_FLAC_FLAC.Enum()}}}}
++			default:
++				return nil, fmt.Errorf("unexpected metadata %s", kind)
++			}
++			any, _ := anypb.New(message)
++			data, _ = proto.Marshal(&extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{{ExtensionKind: kind, ExtensionData: []*extpb.EntityExtensionData{{EntityUri: id.Uri(), Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: any}}}}})
++		case strings.HasPrefix(r.URL.Path, "/playplay/v1/key/"):
++			data, _ = proto.Marshal(&streamingpb.PlayPlayLicenseResponse{})
++		case strings.HasPrefix(r.URL.Path, "/storage-resolve/v2/"):
++			data, _ = proto.Marshal(&storagepb.StorageResolveResponse{Result: storagepb.StorageResolveResponse_CDN, Cdnurl: []string{"https://synthetic.invalid/fixture/selected.flac"}})
++		case r.URL.Path == "/fixture/selected.flac":
++			var first, last int
++			if _, e := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &first, &last); e != nil {
++				return nil, e
++			}
++			last = min(last, len(encrypted)-1)
++			if first < 0 || first > last {
++				return nil, fmt.Errorf("invalid synthetic range")
++			}
++			status = 206
++			data = encrypted[first : last+1]
++			header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, len(encrypted)))
++		case r.Method == "PUT":
++			// PutConnectState accepts200; only the inactive endpoint uses204.
++			if strings.HasSuffix(r.URL.Path, "/inactive") {
++				status = 204
++			}
++		default:
++			return nil, fmt.Errorf("unexpected local provider request %s %s", r.Method, r.URL.Path)
++		}
++		return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(data)), ContentLength: int64(len(data)), Header: header, Request: r}, nil
++	})
++	sp := pc13Spclient(t, transport)
++	nextSessionField(p.sess, "sp", sp)
++	events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
++	nextSessionField(p.sess, "events", events)
++	p.app.client = &http.Client{Transport: transport}
++	options.Spclient, options.Events, options.FlacEnabled = sp, events, true
++}
++
++// These local receipt adversaries supplement the actual-C delayed-STOP case.
++// Each starts with the same real worker/FIFO and a completed START fixture.
++func replyDirectPauseFixture(t *testing.T, p *AppPlayer, mode string, w http.ResponseWriter, r *http.Request) {
++	t.Helper()
++	offer := p.roomTransportOffer
++	if offer == nil {
++		offer = p.roomTransportPending
++	}
++	// effectRoomTransport consumes the pointer before its one-use confirmation.
++	var body map[string]json.RawMessage
++	if json.NewDecoder(r.Body).Decode(&body) != nil {
++		t.Fatal("fixture body")
++	}
++	action := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/transport/")
++	if action == "bound-pause-confirm" {
++		if mode == "direct-pause-unknown-confirm" {
++			w.WriteHeader(500)
++			return
++		}
++		var token, prepare, revision string
++		_ = json.Unmarshal(body["token"], &token)
++		_ = json.Unmarshal(body["native_prepare_id"], &prepare)
++		_ = json.Unmarshal(body["native_revision"], &revision)
++		_ = json.NewEncoder(w).Encode(map[string]any{"schema": "podconnect.output_transport_pause_confirmation.v1", "ok": true, "token": token, "native_prepare_id": prepare, "native_revision": revision, "physical_result_verified": false})
++		return
++	}
++	if offer == nil {
++		t.Fatal("no exact in-flight Native offer")
++	}
++	digest := sha256.Sum256([]byte(offer.InputPath))
++	route := roomVolumeRoute{"00000000-0000-0000-0000-000000000001", "202", "1", "1", "1", "1", "1", "1", hex.EncodeToString(digest[:])}
++	token := strings.Repeat("f", 32)
++	switch action {
++	case "bound-state":
++		if mode == "direct-pause-unknown-state" {
++			w.WriteHeader(409)
++			return
++		}
++		if mode == "direct-pause-route" {
++			route.InputPathDigest = strings.Repeat("a", 64)
++		}
++		_ = json.NewEncoder(w).Encode(directPauseOutputState{"podconnect.output_transport_state.v2", true, route, false, true, false, roomTransportActions, false})
++	case "bound-prepare":
++		owner := offer.Snapshot.roomTransportIdentity
++		if mode == "direct-pause-foreign-prepare" {
++			owner.SessionID = "foreign"
++		}
++		if mode == "direct-pause-late-generation" {
++			p.app.moveCustodyMu.Lock()
++			p.app.openedWriterGeneration++
++			p.app.moveCustodyMu.Unlock()
++		}
++		if mode == "direct-pause-late-intent" {
++			p.aliasMu.Lock()
++			p.roomNativeIntent++
++			p.aliasMu.Unlock()
++		}
++		_ = json.NewEncoder(w).Encode(boundOwnerPayload(directPauseOutputPrepare{"podconnect.output_transport_prepare.v2", true, token, route, 10000}, owner, offer.NativeRevision))
++	case "bound-commit":
++		if mode == "direct-pause-unknown-commit" {
++			w.WriteHeader(500)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(boundOwnerPayload(roomTransportOutputACK{"podconnect.output_transport_commit.v2", true, token, offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, 10000, "accepted", false}, offer.Snapshot.roomTransportIdentity, offer.NativeRevision))
++	default:
++		t.Fatal("unexpected direct Pause request", action)
++	}
++}
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+index 259580d..a6f11ef 100644
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -78,6 +78,7 @@ type nativeTransportOffer struct {
+ 	Published           bool
+ 	Disposed            bool
+ 	Generation          uint64
++	WriterGeneration    uint64 // Optional exact writer snapshot for direct actor Pause.
+ 	OriginalPlayerState *connectpb.PlayerState
+ 	QueueRevision       uint64
+ 	Snapshot            roomTransportSnapshot
+@@ -337,6 +338,14 @@ func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, par
+ 	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
+ 		return false
+ 	}
++	if offer.WriterGeneration != 0 {
++		p.app.moveCustodyMu.Lock()
++		current := p.app.openedWriterOwner == p && p.app.openedWriterGeneration == offer.WriterGeneration
++		p.app.moveCustodyMu.Unlock()
++		if !current {
++			return false
++		}
++	}
+ 	if offer.Bound && offer.CompletedWriter != nil {
+ 		current, err := p.app.completedWriterCurrent(p, offer.Snapshot.roomTransportIdentity)
+ 		if err != nil || current == nil || *current != *offer.CompletedWriter {
+diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+index d6a06f2..7709f43 100644
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -65,6 +65,58 @@ func confirmBoundPause(ctx context.Context, client *http.Client, offer *nativeTr
+ 	return nil
+ }
+ 
++func commitRoomTransportOwner(ctx context.Context, client *http.Client, offer *nativeTransportOffer, token string) error {
++	inputDigest := sha256.Sum256([]byte(offer.InputPath))
++	payload := struct {
++		Token                   string `json:"token"`
++		NativePrepareID         string `json:"native_prepare_id"`
++		Action                  string `json:"action"`
++		ArgsDigest              string `json:"args_digest"`
++		ExpectedInputPathDigest string `json:"expected_input_path_digest"`
++	}{token, offer.Snapshot.PrepareID, offer.Snapshot.Action, offer.Snapshot.ArgsDigest, hex.EncodeToString(inputDigest[:])}
++	var envelope any = payload
++	if offer.Bound {
++		envelope = boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
++	}
++	if offer.Queue != nil {
++		envelope = queueCommitPayload(offer, token)
++	}
++	body, _ := json.Marshal(envelope)
++	suffix := "commit"
++	if offer.Bound {
++		suffix = "bound-commit"
++	}
++	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/" + suffix
++	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return err
++	}
++	call.Header.Set("Content-Type", "application/json")
++	response, err := client.Do(call)
++	if err != nil {
++		return err
++	}
++	limit := int64(2048)
++	if offer.Bound {
++		limit = 8192
++	}
++	raw, readErr := io.ReadAll(io.LimitReader(response.Body, limit+1))
++	_ = response.Body.Close()
++	var ack roomTransportOutputACK
++	decodeErr := decodeQueueJSON(raw, &ack)
++	if offer.Bound {
++		decodeErr = decodeBoundOwner(raw, &ack, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
++	}
++	valid := decodeErr == nil && ack.Schema == boundSchema("podconnect.output_transport_commit.v1", offer.Bound) && ack.OK && ack.Token == token && ack.NativePrepareID == offer.Snapshot.PrepareID && ack.ArgsDigest == offer.Snapshot.ArgsDigest && ack.PinRemainingMS >= 1 && ack.PinRemainingMS <= 10000 && ack.Outcome == "accepted" && !ack.Physical
++	if offer.Queue != nil {
++		valid = validQueueACK(raw, offer, token)
++	}
++	if response.StatusCode != 200 || readErr != nil || int64(len(raw)) > limit || !valid {
++		return ErrAliasConflict
++	}
++	return nil
++}
++
+ func (s *ConcreteApiServer) roomTransportAsk(ctx context.Context, typ ApiRequestType, data any) (any, error) {
+ 	req, wait := NewApiRequest(typ, data)
+ 	select {
+@@ -193,58 +245,11 @@ func (s *ConcreteApiServer) handleRoomTransportCommit(w http.ResponseWriter, r *
+ 		defer cancelCleanup()
+ 		_, _ = s.roomTransportAsk(cleanup, apiRoomTransportAbort, offer)
+ 	}()
+-	inputDigest := sha256.Sum256([]byte(offer.InputPath))
+-	payload := struct {
+-		Token                   string `json:"token"`
+-		NativePrepareID         string `json:"native_prepare_id"`
+-		Action                  string `json:"action"`
+-		ArgsDigest              string `json:"args_digest"`
+-		ExpectedInputPathDigest string `json:"expected_input_path_digest"`
+-	}{request.OwnToneToken, offer.Snapshot.PrepareID, offer.Snapshot.Action, offer.Snapshot.ArgsDigest, hex.EncodeToString(inputDigest[:])}
+-	var envelope any = payload
+-	if offer.Bound {
+-		envelope = boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
+-	}
+-	if offer.Queue != nil {
+-		envelope = queueCommitPayload(offer, request.OwnToneToken)
+-	}
+-	body, _ := json.Marshal(envelope)
+-	suffix := "commit"
+-	if offer.Bound {
+-		suffix = "bound-commit"
+-	}
+-	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/" + suffix
+-	call, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+-	if err != nil {
+-		roomTransportResponse(w, nil, err)
+-		return
+-	}
+-	call.Header.Set("Content-Type", "application/json")
+ 	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("transport redirect denied") }}
+-	response, err := client.Do(call)
+-	if err != nil {
++	if err = commitRoomTransportOwner(ctx, client, offer, request.OwnToneToken); err != nil {
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+-	limit := int64(2048)
+-	if offer.Bound {
+-		limit = 8192
+-	}
+-	raw, readErr := io.ReadAll(io.LimitReader(response.Body, limit+1))
+-	_ = response.Body.Close()
+-	var ack roomTransportOutputACK
+-	decodeErr := decodeQueueJSON(raw, &ack)
+-	if offer.Bound {
+-		decodeErr = decodeBoundOwner(raw, &ack, offer.Snapshot.roomTransportIdentity, offer.NativeRevision)
+-	}
+-	valid := decodeErr == nil && ack.Schema == boundSchema("podconnect.output_transport_commit.v1", offer.Bound) && ack.OK && ack.Token == request.OwnToneToken && ack.NativePrepareID == offer.Snapshot.PrepareID && ack.ArgsDigest == offer.Snapshot.ArgsDigest && ack.PinRemainingMS >= 1 && ack.PinRemainingMS <= 10000 && ack.Outcome == "accepted" && !ack.Physical
+-	if offer.Queue != nil {
+-		valid = validQueueACK(raw, offer, request.OwnToneToken)
+-	}
+-	if response.StatusCode != 200 || readErr != nil || int64(len(raw)) > limit || !valid {
+-		roomTransportResponse(w, nil, ErrAliasConflict)
+-		return
+-	}
+ 	// No public endpoint accepts this pointer. A real C ACK is required to enqueue.
+ 	data, err := s.roomTransportAsk(ctx, apiRoomTransportEffect, roomTransportEffectRequest{offer, ctx})
+ 	if offer.Bound && err == nil && (offer.Snapshot.Action == "pause" ||
+diff --git a/daemon/room_transport_pause.go b/daemon/room_transport_pause.go
+new file mode 100644
+index 0000000..d0b3639
+--- /dev/null
++++ b/daemon/room_transport_pause.go
+@@ -0,0 +1,153 @@
++package daemon
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"net/http"
++	"slices"
++	"strings"
++	"time"
++)
++
++type directPauseOutputState struct {
++	Schema      string          `json:"schema"`
++	OK          bool            `json:"ok"`
++	Identity    roomVolumeRoute `json:"identity"`
++	Busy        bool            `json:"busy"`
++	StartOwned  bool            `json:"start_owned"`
++	CleanAbsent bool            `json:"clean_absent"`
++	Actions     []string        `json:"actions"`
++	Physical    bool            `json:"physical_result_verified"`
++}
++type directPauseOutputPrepare struct {
++	Schema   string          `json:"schema"`
++	OK       bool            `json:"ok"`
++	Token    string          `json:"token"`
++	Identity roomVolumeRoute `json:"identity"`
++	Expires  int             `json:"expires_after_ms"`
++}
++
++// pauseBoundRoom runs on the current AppPlayer actor. Reusing the existing
++// prepare/consume/effect methods directly avoids enqueueing onto that same actor.
++// A configured bound route never falls back to an uncorrelated local Pause.
++func (p *AppPlayer) pauseBoundRoom(ctx context.Context) (bool, error) {
++	if p.app == nil || p.app.cfg == nil || p.app.cfg.AudioBackend != "pipe" || !p.app.cfg.ExternalVolume || p.app.cfg.RoomTransportOwnToneURL == "" {
++		return false, nil
++	}
++	ctx, cancel := context.WithTimeout(ctx, roomTransportLifetime)
++	defer cancel()
++	if p.sess == nil || p.state == nil || p.state.device == nil {
++		return true, ErrAliasConflict
++	}
++	account, authenticated := p.sess.BoundUsername()
++	if !authenticated {
++		return true, ErrAliasConflict
++	}
++	scope := roomVolumeScope{AccountUserID: account, TargetID: p.app.deviceId}
++	p.aliasMu.Lock()
++	binding := p.aliasBindingLocked()
++	if binding != nil && binding.Ready {
++		for _, alias := range p.aliasRegistry {
++			if alias.ID == p.state.device.SelectedAliasId && alias.RoomID == binding.RoomID {
++				scope.RoomID, scope.HomePodID = alias.RoomID, alias.HomePodID
++			}
++		}
++	}
++	p.aliasMu.Unlock()
++	if scope.RoomID == "" || scope.HomePodID == "" {
++		return true, ErrAliasConflict
++	}
++	_, err := p.prepareRoomTransportVersion(ctx, roomTransportPrepareRequest{AccountUserID: scope.AccountUserID, TargetID: scope.TargetID, RoomID: scope.RoomID, HomePodID: scope.HomePodID, Action: "pause", Context: ctx}, true)
++	if err != nil {
++		return true, err
++	}
++	offer := p.roomTransportOffer
++	if offer == nil {
++		return true, ErrAliasConflict
++	}
++	p.app.moveCustodyMu.Lock()
++	if p.app.openedWriterOwner == p && p.app.openedWriterGeneration != 0 && p.app.openedWriter.Type == "fifo" {
++		offer.WriterGeneration = p.app.openedWriterGeneration
++	}
++	p.app.moveCustodyMu.Unlock()
++	if offer.WriterGeneration == 0 {
++		p.roomTransportOffer = nil
++		offer.discardPrepared()
++		return true, ErrAliasConflict
++	}
++	defer func() {
++		if p.roomTransportOffer == offer {
++			p.roomTransportOffer = nil
++		}
++		p.abortRoomTransport(offer)
++		offer.discardPrepared()
++	}()
++	expectedGeneration := offer.Generation
++	current := func() bool {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		expected := *offer
++		expected.Generation = expectedGeneration
++		return p.transportOfferCurrentLocked(&expected, ctx, ctx)
++	}
++	endpoint := strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + scope.HomePodID + "/transport/"
++	var state directPauseOutputState
++	if err = roomVolumeHTTP(ctx, http.MethodPost, endpoint+"bound-state", struct {
++		Owner roomTransportIdentity `json:"native_owner"`
++	}{offer.Snapshot.roomTransportIdentity}, &state); err != nil {
++		return true, err
++	}
++	digest := sha256.Sum256([]byte(offer.InputPath))
++	seen := map[string]bool{}
++	for _, action := range state.Actions {
++		if seen[action] || !slices.Contains(roomTransportActions, action) {
++			return true, ErrAliasConflict
++		}
++		seen[action] = true
++	}
++	if !current() || state.Schema != "podconnect.output_transport_state.v2" || !state.OK || state.Physical || state.Busy || state.StartOwned && state.CleanAbsent || !state.Identity.valid() || state.Identity.DeviceID != scope.HomePodID || state.Identity.InputPathDigest != hex.EncodeToString(digest[:]) || !slices.Contains(state.Actions, "pause") {
++		return true, ErrAliasConflict
++	}
++	payload := struct {
++		Prepare string `json:"native_prepare_id"`
++		Action  string `json:"action"`
++		Digest  string `json:"args_digest"`
++	}{offer.Snapshot.PrepareID, "pause", offer.Snapshot.ArgsDigest}
++	var prepared directPauseOutputPrepare
++	if err = roomBoundHTTP(ctx, http.MethodPost, endpoint+"bound-prepare", boundOwnerPayload(payload, offer.Snapshot.roomTransportIdentity, offer.NativeRevision), &prepared, offer.Snapshot.roomTransportIdentity, offer.NativeRevision); err != nil {
++		return true, err
++	}
++	if !current() || prepared.Schema != "podconnect.output_transport_prepare.v2" || !prepared.OK || !volumeHex32.MatchString(prepared.Token) || prepared.Identity != state.Identity || prepared.Expires != 10000 {
++		return true, ErrAliasConflict
++	}
++	if _, err = p.consumeRoomTransportVersion(ctx, roomTransportConsumeRequest{offer.Snapshot.PrepareID, ctx}, true); err != nil {
++		return true, err
++	}
++	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAliasConflict }}
++	if err = commitRoomTransportOwner(ctx, client, offer, prepared.Token); err != nil {
++		return true, err
++	}
++	if !current() {
++		return true, ErrAliasConflict
++	}
++	if _, err = p.effectRoomTransport(ctx, roomTransportEffectRequest{offer, ctx}); err != nil {
++		return true, err
++	}
++	// effectRoomTransport synchronously publishes exactly its own Pause event,
++	// which advances the existing transport generation once. A separate event
++	// or successor must not be adopted by sampling the latest generation.
++	expectedGeneration++
++	if !current() {
++		return true, ErrAliasConflict
++	}
++	if err = confirmBoundPause(ctx, client, offer, prepared.Token); err != nil {
++		// The actual Pause may already have happened. Never retry this token or
++		// replace an unknown confirmation with an unbound success response.
++		return true, err
++	}
++	if !current() {
++		return true, ErrAliasConflict
++	}
++	return true, nil
++}
+diff --git a/daemon/room_transport_test.go b/daemon/room_transport_test.go
+index b138aac..fc417f4 100644
+--- a/daemon/room_transport_test.go
++++ b/daemon/room_transport_test.go
+@@ -310,3 +310,24 @@ func TestRoomTransportPreparedSourceDiscardOwnership(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRoomTransportDirectPauseWriterGenerationFinalGuard(t *testing.T) {
++	p, offer := roomTransportAdmittedFixture(t)
++	p.app.openedWriterOwner = p
++	p.app.openedWriterGeneration = 7
++	offer.WriterGeneration = 7
++	ctx := context.Background()
++	if got, err := p.consumeRoomTransport(ctx, roomTransportConsumeRequest{offer.Snapshot.PrepareID, ctx}); err != nil || got != offer {
++		t.Fatal("current exact writer offer not consumed", err)
++	}
++	// Same actor and identical saved FIFO/FD values cannot hide replacement.
++	p.app.moveCustodyMu.Lock()
++	p.app.openedWriterGeneration++
++	p.app.moveCustodyMu.Unlock()
++	p.aliasMu.Lock()
++	current := p.transportOfferCurrentLocked(offer, ctx, ctx)
++	p.aliasMu.Unlock()
++	if current {
++		t.Fatal("final worker mutation guard accepted a successor writer generation")
++	}
++}
+diff --git a/daemon/testdata/selected-start.flac b/daemon/testdata/selected-start.flac
+new file mode 100644
+index 0000000000000000000000000000000000000000..591967747c3f1517daa31f8598fb2dc7517a9f59
+GIT binary patch
+literal 27540
+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
+F^FLWz)V=@!
+
+literal 0
+HcmV?d00001
+

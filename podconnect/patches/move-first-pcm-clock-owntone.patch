@@ -1,0 +1,22 @@
+--- a/src/player_start.inc.c
++++ b/src/player_start.inc.c
+@@ -101,12 +101,13 @@
+     if(c->request->move_existing_session && (outputs_start_result_get(c->request->device_id,c->request->token,&observed)<0
+         || !move_source_current(&observed.command,false))){*retval=-1;return COMMAND_END;}
+     *retval=outputs_start_open(c->request,c->result);
+-    if(!*retval && c->request->move_existing_session && !observed.command.source_paused
+-        && pb_timer_start()<0){
+-      /* OPEN already changed the guarded route. A failed retained timer must
+-       * synchronously close the gate and retire the target session. */
+-      outputs_start_cancel(c->request->token,c->request->native_reservation_id,&observed);
+-      *retval=-1;
++    if(!*retval && c->request->move_existing_session && !observed.command.source_paused){
++      if(pb_timer_start()<0){
++        /* OPEN already changed the guarded route. A failed retained timer must
++         * synchronously close the gate and retire the target session. */
++        outputs_start_cancel(c->request->token,c->request->native_reservation_id,&observed);
++        *retval=-1;
++      }else pb_session.start_clock_pending=true;
+     }
+   }
+   else if(c->action==7){
