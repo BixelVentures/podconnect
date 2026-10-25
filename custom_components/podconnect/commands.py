@@ -78,7 +78,7 @@ def _arguments(action, args):
             args.get("context_uri" if action == "play_context" else "track_uri"), str
         )
         or re.fullmatch(
-            r"spotify:playlist:[A-Za-z0-9]{22}"
+            r"spotify:(?:playlist|album|artist|show):[A-Za-z0-9]{22}"
             if action == "play_context"
             else r"spotify:track:[A-Za-z0-9]{22}",
             args["context_uri" if action == "play_context" else "track_uri"],
@@ -171,7 +171,13 @@ class PlaybackCommands:
         )
 
     def controls(
-        self, entry_id, target_id, *, for_command=False, native_room_phase=False
+        self,
+        entry_id,
+        target_id,
+        *,
+        for_command=False,
+        native_room_phase=False,
+        for_observation=False,
     ):
         data = self.data
         binding = (
@@ -256,7 +262,7 @@ class PlaybackCommands:
             "next_command_sequence": self.command_sequence + 1 if capacity else None,
             "observation": observed["observation"],
             "target": playback["target"],
-            "actions": actions if ready else [],
+            "actions": actions if ready or for_observation else [],
             "volume_percent": volume,
             "track_play_supported": True,
             "status": "ready"
@@ -266,6 +272,57 @@ class PlaybackCommands:
             else "sequence_exhausted",
             "physical_result_verified": False,
         }
+
+    def settlement(self, hass, entry_id, request_id, sequence):
+        """Read the existing receipt, without upgrading acceptance to effect proof.
+
+        Current Native state does not echo the consumed transport/volume operation.
+        A matching Spotify clock, item or volume therefore cannot confirm it. The
+        read also cannot retry a request or extend its original authority.
+        """
+        current(hass, entry_id, self.data)
+        if not self._refresh_owner_current(hass, entry_id):
+            raise CommandRejected("owner_replaced")
+        result = {
+            "schema": "podconnect.command_settlement.v1",
+            "status": "unknown",
+            "request_id": request_id,
+            "command_sequence": sequence,
+            "owner_epoch": self.owner_epoch,
+            "observation": None,
+        }
+        if request_id != f"{self.owner_epoch}:{sequence}":
+            return result
+        old = self.receipts.get(sequence)
+        if old is None:
+            return result  # Eviction is not evidence of rejection or completion.
+        receipt = old[1]
+        if receipt.get("schema") == "podconnect.content_reservation.v1":
+            records = (self.room_content.records, self.room_move.records)
+            record = next(
+                (
+                    item
+                    for items in records
+                    if (item := items.get(sequence)) is not None
+                    and item["request"]["request_id"] == request_id
+                ),
+                None,
+            )
+            if record is None:
+                return result
+        elif (
+            receipt.get("request_id") != request_id
+            or receipt.get("owner_epoch") != self.owner_epoch
+            or receipt.get("config_entry_id") != entry_id
+        ):
+            return result
+        if sequence < self.command_sequence:
+            result["status"] = "superseded"
+        elif self.busy or receipt.get("schema") == "podconnect.content_reservation.v1":
+            result["status"] = "pending"
+        elif receipt.get("outcome") == "rejected":
+            result["status"] = "rejected"
+        return result
 
     def track_controls(self, entry_id, target_id, *, for_command=False):
         """Offer one exact fresh device, including an inactive selected output."""

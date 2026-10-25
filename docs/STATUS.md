@@ -1,3 +1,121 @@
+## Active54/Control24 — D2 single-owner implementation
+
+## Integrated PC70 source checkpoint — no release
+
+Root packaged independently reviewed Native aa47 + MOVE35ca and C24808 into the existing Docker stack, including the causal test increments. Actual isolated MOVE->durable release->real Close/join->independent C terminal/drain succeeds Native0/C0 with physical_result_verified:false; receipt /private/tmp/pc70-manual-release-20261025/C-MOVE-COMPOSE-a6bb-GREEN.json. Clean packaged replay matches all163Native production files/5changedtests and scoped C pins; final target2 fixture matches ed5d95cc. Current Dockerfile2f95056c includes all8hash-pinned patches. No officialCI/release/Greeninstall in this source phase. HA seek/shuffle/repeat and correlated settlement, PC13 gate0 and full compatible acceptance remain open. Seek work is isolated and excluded from this checkpoint.
+
+Lead/releaseowner /root; actualbase917b2e092c0ebe40c1fa987bc781188dc9b34692,
+treeb51c6fdb075c17df7717a113a8a2b46a5c24e372, restoredexact5publishedControl23blobs
+on53base and verifiedfulltree; exactpublichead/mergecommit hashes imported through
+GitHubplugin. Candidate /private/tmp/pc54-control24-single-owner-20261025,
+branchcodex/pc54-control24-single-owner. LastverifiedGreen53/23; no install/effect now.
+CanonicalapprovedD2plan is docs/LEAD-PLAN.md in PodVoice91candidate; plan97/98/97
+doesnotconstitute SOURCE or physicalGO. Rootowns integration and sharedSTATUS.
+
+Observed: media_player genericNative-targetplayback/volume bypasses boundCommands
+and usesSpotifyAPI, unlike touch/currentselectedvoice. Playback.v2 has no actual
+volume/read-onlyaffordances or request-correlatedsettlement; UI compensates with
+passiveexecutableoffers and actionmatchers. Hypothesis: routeverifiedNativeHAcallers
+throughsameexistingCommands/content/transport/volume owners and projecttheiractual
+read-onlystatus and settlement toremoveclientcompensation aftercomposedproof.
+KeepHAactor/PVpermissions distinct; unknownNativeclassificationneverWebAPIfallback.
+
+Chain: HA/MCP/touchintent -> exactactualaccount/Nativeidentity/currentroomroute ->
+sameCommandsadmission/sequence -> Native/C -> request-correlatedreceipt/current
+observation -> surface; nativevoiceplayback/duckrestore/close/rearmstayownedbyPV.
+Invariants: oneeffectowner; freshauthority/owner/route; truthfulsourceclock/volume;
+atmostonce/UNKNOWNnoreplay; source/readknowledge notanexecutiongrant; privatepayload
+notlogged/published. No newbroker/globalstore, audio/VAD tuning or effect tests.
+
+PC70observedmanualreleaseunsupported. Approvedproposal extendsEXISTINGboundtransport
+andCretirementjournal withclosedmanual_release_v1/transport_releasepurpose forordinary
+routesaswellasSTART/MOVE. Exactserverreadbinding -> durableCprepare/gateclosed ACK
+BEFOREcapturedNativeClose/joinoutsideactor -> independentCclosedwriter/drain/exactold
+selectionproof -> terminalreceipt. No fakeSTARTtoken, generic404success ornewowner
+effects. Cowner/journalfeasibility+upgrade/reboot/downgrade gate precedesadoption.
+PC13actualsuccessfulstationcontinuationprotocol is Gate0; no guessedautoplayrenewal.
+
+PC70 causal update before implementation: START/MOVE manual-release must retain
+its genuine predecessor plus a closed typed nested manual_release in the SAME
+existing retirement journal, so the manual token/arguments/owner/writer and terminal
+proof survive a C crash. Old53 rejects typed variants; forward-only recovery remains
+mandatory after such a write. Fresh process drain/proof cannot reuse old monotonic
+input epochs/deadlines as authority. The exact consumed manual-operation pointer
+owns failure retirement; OutputFailed must not enter competing automatic retirement
+or synchronous actor Close. Only the captured worker's Close after actual durable
+C-prepare ACK may run outside actor/locks; a specifically proven same-failure alias
+retirement can be distinguished from foreign source/session/generation changes.
+Unknown provenance remains UNKNOWN with no Close or rollback shortcut. Existing
+managed Zeroconf logout/replacement is reused only after exact C terminal and old
+custody clear, then next real START must pass; unsupported non-Zeroconf rejects before
+prepare. These are draft fixes for discovered crash/deadlock/reconnect races, not GO.
+
+Plannedregressions: actualHA/MCP/entity andtouchsharedowner/concurrency/currentness;
+v1/v2unchanged+v3closedDTOactualvolume/nooffers; commandssettlementforeignepoch,
+sourcechanges/timeout/UNKNOWN; Native/C releaseSTART/MOVE/ordinary pausedplaying,
+lostACK/cancel/stale/crash/recovery; readonlyprotocolartifacts forstationthen2page
+continuation/EOF/Next/prefetch. Reuseunchangedchecks; highriskindependentreviewbefore
+onefinalofficialCI perrepo andonecompatiblecombinedGreenwindow. Noresultsclaimed.
+
+Rollbackkeeps53/23compatibleimages/component/options/policy/data. Newpurposewrites
+forbidone-sidedoldC/Native downgrade orjournalsletning; onlycurrentnewpairterminalized
+andlegacy-readabletransactionstate permitsoldpairrestore, otherwiseforwardrecovery.
+Source/lifecycle/APIownerproofandcausaltests mustpassbeforefreeze. ActualHomePod
+sound, LED/timer/Stop andphysicalacceptance remainseparatelaterhumanseries.
+
+### HA track/playlist selected-content — independent SOURCE GO
+
+Incrementc2523b848cd31638e0583bfb85c255091a49b8c1efcef91173936de384d389e6
+is independently reviewed GO with final runtimebd03f97b29e0eb857b5006bcf95cc5dcebe546dc451e755e18a26839f0619a4b.
+Actual registered HA exact Native track/playlist uses RoomContent read/prepare/start,
+Native fixed startup35 unchanged under HA actor max100 ceiling. Exact alias catalog,
+account/API/session/poll/source and final same-room checks are retained. Cancellation
+uses existing owner cleanup; UNKNOWN never falls back/replays. Pre-reservation poll
+checks stay strict; post-reservation routine poll advances defer to canonical owner's
+fresh floor/sequence/identity admission. The review finding below is resolved by a
+held-staging monotonic-poll regression.22 actual HA cases plus invalidated old method
+and optimistic-field assertion pass; formatter/lint pass. Other Native URI kinds,
+library, seek/shuffle/repeat and source selection remain explicit parity work.
+
+### HA selected-content increment — review finding before freeze
+
+Actual HA track/playlist caller now stages through existing RoomContent, but lead
+review found its post-prepare caller guard still required the pre-staging poll number.
+RoomContent intentionally permits newer monotonic observations after reservation;
+metadata staging may take32s while ordinary HA polling advances. Hypothesis: exact
+owner/alias/API/session guards after reservation must defer poll-floor/current sequence
+admission to RoomContent.start instead of cancelling valid work on routine refresh.
+Add held-prepare -> same-owner poll advance -> staged exact START regression; older
+poll/owner/alias replacement, cancellation and UNKNOWN still reject/no fallback.
+This increment is not SOURCE GO until the finding is fixed and final pins reviewed.
+
+### HA entity shared-owner transport — independent SOURCE GO
+
+Formatted packet4763e3a18149c23032f373712ec397d787a943d16a7f21de6a9256b35795de1e,
+media_player SHAbe780ca22836fc93dd7a8af8b23f250b1fc60911ef99858ae389b67a26977691,
+and focused HA fixture385401b07e232dc5a29c5cbf6dba968f323d492f916668b3955d74e1a4eb859c
+have independent SOURCE GO. Actual HA pause bypass RED -> GREEN and11 actual HA
+cases cover all5operations, shared busy, stale poll/route/expiry, sequence, UNKNOWN
+and classification failures. Formatter AST identity retains tested behavior.
+Configured Native Play/resume/Pause/Next/Previous/Volume now use bound Commands;
+there is no Spotify fallback after Native failure and no optimistic accepted truth.
+Proven non-Native and no-config legacy behavior remain distinct. Seek/shuffle/repeat,
+selected content/library and source selection remain open; selected track/playlist
+caller reuse is the next separate increment. No new public release or Green effects.
+
+### Control24 read-only v3 — independent SOURCE GO
+
+Exact frozen six-file patch44fce2add49f0051a6c2c4a0cb5c36b6eea2542a33c1af9aa943cfa88da81be4
+and SOURCE-PINS19494285aa14b8e93ebe23d1c2289f9bda9a6c1bdf498608943f5ebd1769340a
+received independent adversarial SOURCE GO;29 affected actual HA cases pass.
+Both v3 opt-ins are required, v1/v2 unchanged; reads create no offers/sequences or
+effects, retain original source/5s freshness and recheck owner after Native/C waits.
+Actual action intersection and base/effective volume are observation, not authority.
+Settlement reads existing receipts only; no correlated Native effect echo exists,
+so accepted/current-looking playback cannot become confirmed. Pending/rejected/
+superseded/unknown are honest intermediate outcomes. PV adapter, HA ingress, Native
+settlement, queue occurrence, PC70/PC13, integration/release/Green remain open.
+
 ## Control23 source result — reviewed, not yet installed
 
 Root implemented paired wall/monotonic clock capture before queue metadata work.

@@ -173,20 +173,31 @@ class RoomTransport:
             raise CommandRejected("room_transport_unavailable")
         return state
 
-    async def playback_output(self, hass, entry, observed):
+    async def playback_output(self, hass, entry, observed, *, include_controls=False):
         """One read-only resolver; the deadline is an observation, never a lease."""
         from .commands import CommandRejected
 
-        def aggregate(reason, binding=None):
+        def aggregate(reason, binding=None, controls=None):
             value = {
                 **observed,
-                "schema": "podconnect.playback.v2",
+                "schema": "podconnect.playback.v3"
+                if include_controls
+                else "podconnect.playback.v2",
                 "output": {
                     "status": "observed" if binding is not None else "unavailable",
                     "reason": reason,
                     "binding": binding,
                 },
             }
+            if include_controls:
+                value["controls"] = controls or {
+                    "status": "unavailable",
+                    "reason": reason or "route_unavailable",
+                    "binding_id": None,
+                    "valid_until": None,
+                    "supported_actions": [],
+                    "volume": None,
+                }
             try:
                 return _bounded(value)
             except (ValueError, TypeError):
@@ -257,6 +268,59 @@ class RoomTransport:
                     or native["alias_registry"] != catalog["binding"]["registry"]
                 ):
                     return aggregate("owner_changed")
+                controls = None
+                if include_controls:
+                    allowed = self.commands.controls(
+                        entry,
+                        target["target_id"],
+                        native_room_phase=True,
+                        for_observation=True,
+                    )
+                    actions = [
+                        action
+                        for action in ACTIONS
+                        if action in state["actions"] and action in allowed["actions"]
+                    ]
+                    volume, reason = None, None
+                    try:
+                        volume_read = await self.commands.room_volume.read(
+                            hass,
+                            entry,
+                            target["target_id"],
+                            room,
+                            homepod,
+                            passive=True,
+                        )
+                    except CommandRejected as exc:
+                        guard()
+                        if str(exc) != "room_volume_unavailable":
+                            raise
+                        reason = "volume_unavailable"
+                    else:
+                        guard()
+                        if (
+                            volume_read["native"] != native
+                            or volume_read["route"] != state["route"]
+                        ):
+                            return aggregate("owner_changed")
+                        actual = volume_read["volume_state"]
+                        volume = {
+                            "base_percent": actual["base_percent"],
+                            "effective_percent": actual["effective_percent"],
+                        }
+                        if (
+                            "volume" in volume_read["actions"]
+                            and "volume" in allowed["actions"]
+                        ):
+                            actions.append("volume")
+                    controls = {
+                        "status": "observed",
+                        "reason": reason,
+                        "binding_id": None,  # Filled only from the joined route below.
+                        "valid_until": valid_until,
+                        "supported_actions": actions,
+                        "volume": volume,
+                    }
                 # Poll sequence/progress fence this publication above, but do not
                 # turn the same physical route into a new identity each poll.
                 identity = [entry, source[1], native, state["route"]]
@@ -269,6 +333,8 @@ class RoomTransport:
                     ).encode()
                 ).hexdigest()
                 guard()
+                if controls is not None:
+                    controls["binding_id"] = binding_id
                 return aggregate(
                     None,
                     {
@@ -278,6 +344,7 @@ class RoomTransport:
                         "binding_id": binding_id,
                         "valid_until": valid_until,
                     },
+                    controls,
                 )
         except CommandRejected as exc:
             if str(exc) in {
@@ -287,6 +354,10 @@ class RoomTransport:
             }:
                 return {"ok": False, "error_kind": "unavailable"}
             return unavailable()
+        except HomeAssistantError:
+            if not include_controls:
+                raise
+            return {"ok": False, "error_kind": "unavailable"}
         except (SpeakersError, TimeoutError, ValueError, TypeError, KeyError):
             return unavailable()
 

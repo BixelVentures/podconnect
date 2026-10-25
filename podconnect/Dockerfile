@@ -93,6 +93,14 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply "/patches/exact-transferred-track-native.patch" \
   && git apply --check "/patches/direct-native-pause-native.patch" \
   && git apply "/patches/direct-native-pause-native.patch" \
+  && git apply --check /patches/room-release-native.patch \
+  && git apply /patches/room-release-native.patch \
+  && git apply --check /patches/room-release-native-tests.patch \
+  && git apply /patches/room-release-native-tests.patch \
+  && git apply --check /patches/move-quiesce-native.patch \
+  && git apply /patches/move-quiesce-native.patch \
+  && git apply --check /patches/move-quiesce-native-tests.patch \
+  && git apply /patches/move-quiesce-native-tests.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -155,6 +163,11 @@ COPY patches/purpose-bound-transport-ack-owntone.sha256 /patches/purpose-bound-t
 COPY patches/move-first-pcm-clock-owntone.patch /patches/move-first-pcm-clock-owntone.patch
 COPY patches/move-first-pcm-clock-owntone.sha256 /patches/move-first-pcm-clock-owntone.sha256
 COPY patches/owntone-start-proof.sha256 /patches/owntone-start-proof.sha256
+COPY patches/room-release-owntone.patch /patches/room-release-owntone.patch
+COPY patches/room-release-owntone-tests.patch /patches/room-release-owntone-tests.patch
+COPY patches/room-release-owntone-timer-tests.patch /patches/room-release-owntone-timer-tests.patch
+COPY patches/room-release-owntone-target2-tests.patch /patches/room-release-owntone-target2-tests.patch
+COPY patches/room-release-owntone.sha256 /patches/room-release-owntone.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
@@ -227,6 +240,15 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/move-first-pcm-clock-owntone.sha256 \
   && git apply --check /patches/move-first-pcm-clock-owntone.patch \
   && git apply /patches/move-first-pcm-clock-owntone.patch \
+  && sha256sum -c /patches/room-release-owntone.sha256 \
+  && git apply --check /patches/room-release-owntone.patch \
+  && git apply /patches/room-release-owntone.patch \
+  && git apply --check /patches/room-release-owntone-tests.patch \
+  && git apply /patches/room-release-owntone-tests.patch \
+  && git apply --check /patches/room-release-owntone-timer-tests.patch \
+  && git apply /patches/room-release-owntone-timer-tests.patch \
+  && git apply --check /patches/room-release-owntone-target2-tests.patch \
+  && git apply /patches/room-release-owntone-target2-tests.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

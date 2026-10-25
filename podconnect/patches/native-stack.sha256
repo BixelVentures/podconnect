@@ -33,3 +33,7 @@ fa07060f5896fdef44473ee078ed79e186b9947ef95be688790f2c9c27258f54  /patches/pipe-
 19ec12e72e7c84a503fd3620c4360d87d8180d503fb817ab0d21640efeaaba81  /patches/connect-prepared-start-shutdown-native.patch
 c72790365d270fc32bdbc174f53d2e2d611360305f005c5ccb30ddb2a3b06fba  /patches/exact-transferred-track-native.patch
 8bee7953014503df46e0ab95801b997e6b663226bc482fa9e8499677447d9202  /patches/direct-native-pause-native.patch
+aa47ea940c0109d0b8efe765a04e7a924c24bddc604e00fda0a50d8e60385e48  /patches/room-release-native.patch
+fe558cf4f7531bb0207c33c7c97932a5ebfcbe8785b80cf48c0870ecd7a7e4b3  /patches/room-release-native-tests.patch
+35ca22c8d97810fd430865f063d73506e10ba962cf593d54d3a0fd34a2b0e1a5  /patches/move-quiesce-native.patch
+541fabcc4da592178a7485ceabf2b3c65ff4854d4785d19565187bf0d9b7bd40  /patches/move-quiesce-native-tests.patch

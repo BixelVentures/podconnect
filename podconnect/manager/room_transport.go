@@ -120,6 +120,11 @@ var roomTransportStore struct {
 	sync.Mutex
 	Busy  bool
 	Offer *roomTransportOffer
+	// Last manual disconnect receipt shares this owner's admission/replay lock.
+	ReleaseRequest    roomReleaseRequest
+	ReleaseResult     roomReleaseResult
+	ReleasePresent    bool
+	ReleaseNativeBase string
 }
 var errTransportClaim = errors.New("room transport unavailable")
 var errTransportReceiver = errors.New("native room transport unavailable")

@@ -1,0 +1,1082 @@
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -759,6 +759,7 @@
+ 	m.HandleFunc("/player/room_transport/bound-queue", s.handleRoomQueue)
+ 	m.HandleFunc("/player/room_transport/bound-prepare", s.handleRoomTransportPrepare)
+ 	m.HandleFunc("/player/room_transport/bound-commit", s.handleRoomTransportCommit)
++	m.HandleFunc("/player/room_transport/bound-result", s.handleRoomReleaseResult)
+ 	m.HandleFunc("/player/room_content/controls", s.handleContentControls)
+ 	m.HandleFunc("/player/room_content/prepare", s.handleContentPrepare)
+ 	m.HandleFunc("/player/room_content/commit", s.handleContentCommit)
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -52,6 +52,8 @@
+ 	openedWriterGeneration uint64
+ 	queueWriterFences      map[*nativeTransportOffer]queueWriterFence
+ 	retirementPending      *retirementAttempt
++	manualRelease          *nativeTransportOffer
++	manualReleaseReceipt   *nativeTransportOffer
+ 
+ 	ownerMu          sync.Mutex
+ 	currentPlayer    *AppPlayer
+@@ -546,6 +548,11 @@
+ 			if !ok {
+ 				return
+ 			}
++			if req.Type == apiRoomReleaseLookup {
++				value, err := app.roomReleaseLookup(req.Data.(string))
++				req.Reply(value, err)
++				continue
++			}
+ 			app.ownerMu.Lock()
+ 			apiCh, done := app.currentAPI, app.currentDone
+ 			app.ownerMu.Unlock()
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -23,7 +23,7 @@
+ )
+ 
+ func (p *AppPlayer) prefetchNext(ctx context.Context) {
+-	if p.roomVolumeBusy() {
++	if p.pendingManualRelease() != nil || p.roomVolumeBusy() {
+ 		return
+ 	}
+ 	// Limit ourselves to 30 seconds for prefetching
+@@ -115,6 +115,7 @@
+ 		// failure from an older output cannot retire a newer stream or alias.
+ 		if p.player == nil || !p.player.ClaimOutputFailure(ev.OutputEpoch, func() {
+ 			p.aliasMu.Lock()
++			p.markManualReleaseFailureLocked(ev.OutputEpoch)
+ 			p.roomVolumeClosing = true
+ 			p.aliasRetired = true
+ 			p.aliasMu.Unlock()
+@@ -122,6 +123,12 @@
+ 			return
+ 		}
+ 		p.invalidateRoomTransportGeneration()
++		if p.pendingManualRelease() != nil {
++			// The consumed release is the sole retirement owner. Keep failure truth,
++			// avoid a competing legacy prepare, and never wait for C inside the actor.
++			go p.Close()
++			return
++		}
+ 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 		defer cancel()
+ 		if err := p.stopPlayback(ctx); err != nil {
+@@ -731,6 +738,9 @@
+ }
+ 
+ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool, error) {
++	if p.pendingManualRelease() != nil {
++		return false, ErrAliasConflict
++	}
+ 	var uri string
+ 	var hasNextTrack bool
+ 	// GoStart below rewinds an exhausted context. Retain the track that actually
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -46,6 +46,8 @@
+ 	roomCloseMu                      sync.Mutex
+ 	roomCloseDone                    chan struct{}
+ 	roomRetirement                   *retirementAttempt
++	roomManualRelease                *nativeTransportOffer
++	roomReleaseWait                  chan struct{}
+ 	roomTransportOffer               *nativeTransportOffer
+ 	roomTransportPending             *nativeTransportOffer
+ 	aliasRevision                    uint64
+@@ -238,7 +240,7 @@
+ 	if req.Command.Endpoint == "transfer" {
+ 		p.app.log.Infof("connect-recovery native reason=transfer_received")
+ 	}
+-	if p.roomVolumeBusy() {
++	if p.roomVolumeBusy() || p.app.manualReleasePending() {
+ 		if req.Command.Endpoint == "transfer" {
+ 			p.app.log.Infof("connect-recovery native reason=room_volume_busy")
+ 		}
+@@ -647,13 +649,16 @@
+ 
+ 	if p.roomVolumeBusy() {
+ 		switch req.Type {
+-		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort, apiMoveConsume:
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomReleaseLookup, apiRoomReleaseClose, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort, apiMoveConsume:
+ 		default:
+ 			return nil, ErrAliasConflict
+ 		}
+ 	}
+ 	switch req.Type {
+ 	case ApiRequestTypeResume, ApiRequestTypePause, ApiRequestTypeStop, ApiRequestTypePlayPause, ApiRequestTypeSeek, ApiRequestTypePrev, ApiRequestTypeNext, ApiRequestTypePlay, ApiRequestTypeSetVolume, ApiRequestTypeSetRepeatingContext, ApiRequestTypeSetRepeatingTrack, ApiRequestTypeSetShufflingContext, ApiRequestTypeAddToQueue, ApiRequestTypeQueueOccurrence:
++		if p.app.manualReleasePending() {
++			return nil, ErrAliasConflict
++		}
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
+@@ -715,6 +720,12 @@
+ 		return p.prepareRoomTransport(ctx, req.Data.(roomTransportPrepareRequest))
+ 	case apiRoomTransportConsume:
+ 		return p.consumeRoomTransport(ctx, req.Data.(roomTransportConsumeRequest))
++	case apiRoomReleaseLookup:
++		return p.app.roomReleaseLookup(req.Data.(string))
++	case apiRoomReleaseFence:
++		return p.fenceRoomRelease(ctx, req.Data.(*nativeTransportOffer))
++	case apiRoomReleaseClose:
++		return p.admitRoomReleaseClose(ctx, req.Data.(*nativeTransportOffer))
+ 	case apiRoomTransportEffect:
+ 		return p.effectRoomTransport(ctx, req.Data.(roomTransportEffectRequest))
+ 	case apiRoomTransportAbort:
+@@ -942,7 +953,7 @@
+ }
+ 
+ func (p *AppPlayer) handleMprisEvent(ctx context.Context, req mpris.MediaPlayer2PlayerCommand) error {
+-	if p.roomVolumeBusy() {
++	if p.roomVolumeBusy() || p.app.manualReleasePending() {
+ 		return ErrAliasConflict
+ 	}
+ 	p.invalidateRoomTransportGeneration()
+@@ -1019,6 +1030,12 @@
+ 	// Concurrent replacement paths must all wait for the same completed close.
+ 	// The short mutex is released before reservation wait, cancellation or I/O.
+ 	p.roomCloseMu.Lock()
++	if wait := p.roomReleaseWait; wait != nil && p.roomManualRelease == nil {
++		p.roomCloseMu.Unlock()
++		<-wait // C result rendezvous, outside the actor and all owner locks.
++		p.Close()
++		return
++	}
+ 	if done := p.roomCloseDone; done != nil {
+ 		p.roomCloseMu.Unlock()
+ 		<-done
+@@ -1035,9 +1052,10 @@
+ 	var retirement *retirementAttempt
+ 	p.roomCloseMu.Lock()
+ 	retirement = p.roomRetirement
++	manualRelease := p.roomManualRelease != nil
+ 	p.roomRetirement = nil
+ 	p.roomCloseMu.Unlock()
+-	if p.app != nil && retirement == nil {
++	if p.app != nil && retirement == nil && !manualRelease {
+ 		retirement = p.app.prepareCompletedRetirementFor(p)
+ 	}
+ 	if p.player != nil {
+@@ -1177,6 +1195,18 @@
+ 				apiRecv = nil
+ 				continue
+ 			}
++			// Failed ordinary playback authority stays closed. Only the already
++			// consumed, exact captured release may finish its server-owned teardown.
++			if req.Type == apiRoomReleaseClose {
++				value, err := p.admitRoomReleaseClose(context.Background(), req.Data.(*nativeTransportOffer))
++				req.Reply(value, err)
++				continue
++			}
++			if req.Type == apiRoomReleaseLookup {
++				value, err := p.app.roomReleaseLookup(req.Data.(string))
++				req.Reply(value, err)
++				continue
++			}
+ 			req.Reply(nil, fmt.Errorf("Spotify transport exhausted; session recovery required"))
+ 		case req, ok := <-mprisRecv:
+ 			if !ok {
+--- a/daemon/queue_occurrence.go
++++ b/daemon/queue_occurrence.go
+@@ -72,6 +72,49 @@
+ 	Primary     *player.Stream
+ 	Generation  uint64
+ 	Writer      *queueWriterProof
++}
++
++// retainQueuePresentation is called only after a fresh bound observation has
++// captured its writer and passed current owner checks. It never grants authority.
++func retainQueuePresentation(previous, fresh *nativeQueueOffer) {
++	if previous == nil || fresh == nil || previous == fresh ||
++		previous.BoundOwner == nil || fresh.BoundOwner == nil ||
++		*previous.BoundOwner != *fresh.BoundOwner ||
++		previous.State == nil || previous.State != fresh.State ||
++		previous.Tracks == nil || previous.Tracks != fresh.Tracks ||
++		previous.PlayerState == nil || previous.PlayerState != fresh.PlayerState ||
++		previous.Session == nil || previous.Session != fresh.Session ||
++		previous.Player == nil || previous.Player != fresh.Player ||
++		previous.Primary == nil || previous.Primary != fresh.Primary ||
++		previous.Generation != fresh.Generation || previous.Alias != fresh.Alias ||
++		previous.Writer == nil || fresh.Writer == nil || previous.Writer.Wire != fresh.Writer.Wire ||
++		(previous.Writer.Completed == nil) != (fresh.Writer.Completed == nil) ||
++		(previous.Writer.Completed != nil && *previous.Writer.Completed != *fresh.Writer.Completed) {
++		return
++	}
++	old, next := previous.Snapshot, fresh.Snapshot
++	if old.Schema != "podconnect.native_queue.v1" || old.Schema != next.Schema ||
++		old.TargetID != next.TargetID || old.RoomID != next.RoomID || old.AccountUserID != next.AccountUserID ||
++		old.ConnectionID != next.ConnectionID || old.SessionID != next.SessionID ||
++		old.AliasIncarnation != next.AliasIncarnation || old.QueueRevision != next.QueueRevision ||
++		old.Truncated != next.Truncated || len(old.Items) != len(next.Items) ||
++		!queueIDPattern.MatchString(next.ObservationID) || old.ObservationID == next.ObservationID {
++		return
++	}
++	seen := make(map[string]bool, len(old.Items))
++	for index, row := range old.Items {
++		current := next.Items[index]
++		if !queueOccurrenceIDPattern.MatchString(row.ID) || seen[row.ID] ||
++			row.Position != index || current.Position != index || row.URI != current.URI || row.Queued != current.Queued {
++			return
++		}
++		seen[row.ID] = true
++	}
++	// Only presentation IDs survive. The fresh observation, deadline and private
++	// admission proof stay detached; neither an old lease nor a consumed offer returns.
++	for index := range fresh.Snapshot.Items {
++		fresh.Snapshot.Items[index].ID = old.Items[index].ID
++	}
+ }
+ 
+ func randomQueueID(bytes int) (string, error) {
+--- a/daemon/room_burst.go
++++ b/daemon/room_burst.go
+@@ -49,6 +49,9 @@
+ func (p *AppPlayer) nextNativeIntent() (string, error) {
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
++	if p.app.manualReleasePending() {
++		return "", ErrAliasConflict
++	}
+ 	if p.roomNativeIntent == ^uint64(0) {
+ 		return "", ErrAliasConflict
+ 	}
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -322,6 +322,9 @@
+ 	}
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
++	if p.app.manualReleasePending() {
++		return nil, ErrAliasConflict
++	}
+ 	op.mu.Lock()
+ 	defer op.mu.Unlock()
+ 	echo, original := request.Request.Offer, op.Offer
+--- a/daemon/room_move.go
++++ b/daemon/room_move.go
+@@ -166,6 +166,9 @@
+ 	return p.roomMoveQuarantined || p.roomMoveReservation != nil
+ }
+ func (p *AppPlayer) captureMove(scope roomVolumeScope) (*moveCapture, error) {
++	if p.app.manualReleasePending() {
++		return nil, ErrAliasConflict
++	}
+ 	c, err := p.captureContent(scope)
+ 	if err != nil {
+ 		return nil, err
+@@ -222,6 +225,9 @@
+ 	}
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
++	if p.app.manualReleasePending() {
++		return nil, ErrAliasConflict
++	}
+ 	op.mu.Lock()
+ 	defer op.mu.Unlock()
+ 	echo, original := request.Request.Offer, op.Offer
+--- a/daemon/room_queue.go
++++ b/daemon/room_queue.go
+@@ -123,16 +123,18 @@
+ func (app *App) queueWriterBusyLocked() bool {
+ 	now := time.Now()
+ 	for op, fence := range app.queueWriterFences {
+-		if !now.Before(fence.Until) {
++		if !now.Before(fence.Until) && app.manualRelease != op {
+ 			delete(app.queueWriterFences, op)
+ 		}
+ 	}
+-	return len(app.queueWriterFences) > 0
++	return app.manualRelease != nil || len(app.queueWriterFences) > 0
+ }
+ func (app *App) releaseQueueWriter(op *nativeTransportOffer) {
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+-	delete(app.queueWriterFences, op)
++	if app.manualRelease != op {
++		delete(app.queueWriterFences, op)
++	}
+ }
+ func (p *AppPlayer) queueWriterCurrentLocked(proof *queueWriterProof, offer *nativeTransportOffer) bool {
+ 	if proof == nil || p.app == nil {
+@@ -158,7 +160,7 @@
+ 		return false
+ 	}
+ 	fence, ok := app.queueWriterFences[offer]
+-	return ok && fence.Owner == p && fence.Writer == writer && fence.Generation == generation && time.Now().Before(fence.Until)
++	return ok && fence.Owner == p && fence.Writer == writer && fence.Generation == generation && (time.Now().Before(fence.Until) || app.manualRelease == offer)
+ }
+ func (p *AppPlayer) captureQueueWriter(ctx context.Context, identity roomTransportIdentity, reserve *nativeTransportOffer) (*queueWriterProof, error) {
+ 	if p.primaryStream == nil || p.primaryStream.Source == nil || p.player == nil || p.state == nil || p.state.player == nil || p.app == nil || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) {
+@@ -236,6 +238,7 @@
+ 	if err != nil || !nativeBoundOwnerValid(identity) {
+ 		return nil, ErrAliasConflict
+ 	}
++	previous := p.queueOccurrenceOffer
+ 	offer, err := p.newQueueObservation(parent, queueReadRequest{request.AccountUserID, request.RoomID, ctx})
+ 	if err != nil {
+ 		return nil, err
+@@ -258,6 +261,7 @@
+ 	if remaining < 1 {
+ 		return nil, ErrAliasConflict
+ 	}
++	retainQueuePresentation(previous, offer)
+ 	p.queueOccurrenceOffer = offer
+ 	return queueStateResponse{"podconnect.native_room_queue_state.v1", true, queuePurpose, identity, offer.Snapshot.ObservationID, offer.Snapshot.QueueRevision, min(remaining, 10000), offer.Snapshot.Items, offer.Snapshot.Truncated, writer.Wire, false}, nil
+ }
+@@ -428,6 +432,6 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+ 	defer cancel()
+-	data, err := s.roomTransportAsk(ctx, apiRoomBoundQueue, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	data, err := s.roomTransportAsk(ctx, apiRoomBoundQueue, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, false})
+ 	roomTransportResponse(w, data, err)
+ }
+--- /dev/null
++++ b/daemon/room_release.go
+@@ -0,0 +1,530 @@
++package daemon
++
++// Manual release is an existing bound transport purpose. Its immutable writer
++// proof is observed without authority; C's durable commit, not an HTTP timeout,
++// authorizes closing that captured AppPlayer.
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/devgianlu/go-librespot/output"
++)
++
++const releaseOwnerSchema = "podconnect.native_release_owner.v1"
++const manualReleasePurpose = "manual_release_v1"
++const apiRoomReleaseFence ApiRequestType = "room_release_fence"
++const apiRoomReleaseLookup ApiRequestType = "room_release_lookup"
++const apiRoomReleaseClose ApiRequestType = "room_release_close"
++
++type manualReleaseFailure struct {
++	OutputEpoch uint64
++	Generation  uint64
++}
++type releaseOperation struct {
++	Mu              sync.Mutex
++	Token           string
++	ACK             *releasePrepareACK
++	Receipt         *releaseResult
++	TerminalC       *releaseResult
++	HandoffPending  bool
++	CommitAttempted bool
++	Logout          chan *AppPlayer
++}
++type releaseOwnerDescriptor struct {
++	Schema string                `json:"schema"`
++	Owner  roomTransportIdentity `json:"native_owner"`
++	Writer queueWriterWire       `json:"writer_proof"`
++}
++type releaseResult struct {
++	Schema    string `json:"schema"`
++	OK        bool   `json:"ok"`
++	PrepareID string `json:"prepare_id"`
++	Outcome   string `json:"outcome"`
++	Terminal  bool   `json:"terminal"`
++	Drained   bool   `json:"contexts_drained"`
++	Retry     bool   `json:"retry_allowed"`
++	Physical  bool   `json:"physical_result_verified"`
++}
++
++func releaseOutcome(offer *nativeTransportOffer, outcome string) releaseResult {
++	retired := outcome == "retired"
++	return releaseResult{"podconnect.release_result.v1", retired, offer.Snapshot.PrepareID, outcome, retired || outcome == "rejected", retired, false, false}
++}
++func (p *AppPlayer) prepareRoomRelease(parent context.Context, request roomTransportPrepareRequest, bound bool) (any, error) {
++	if !p.managedReleaseAvailable() {
++		return nil, ErrAliasConflict
++	}
++	if !bound || request.ExpectedReleaseOwner == nil || request.ExpectedReleaseOwner.Schema != releaseOwnerSchema || request.Queue != nil || request.VolumePercent != 0 {
++		return nil, ErrBadRequest
++	}
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil || !nativeBoundOwnerValid(identity) || request.ExpectedReleaseOwner.Owner != identity || ctx.Err() != nil {
++		return nil, ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return nil, err
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return nil, err
++	}
++	offer := &nativeTransportOffer{Bound: true, NativeRevision: revision, Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: p.state.tracks.TransportRevision(), State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, ReleaseOwner: p, ReleaseOperation: &releaseOperation{Logout: p.logout}, Expires: time.Now().Add(roomTransportLifetime)}
++	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: "podconnect.native_room_transport.v2", PrepareID: id, Action: "release", NativeRevision: revision, ExpiresAfterMS: 5000, Purpose: manualReleasePurpose}
++	writer, err := p.captureQueueWriter(ctx, identity, offer)
++	if err != nil {
++		return nil, err
++	}
++	offer.Writer = writer
++	if writer.Wire != request.ExpectedReleaseOwner.Writer {
++		offer.discardPrepared()
++		return nil, ErrAliasConflict
++	}
++	offer.WriterGeneration, _ = strconv.ParseUint(writer.Wire.Generation, 10, 64)
++	offer.Snapshot.WriterProof = &writer.Wire
++	raw, _ := json.Marshal(struct {
++		Owner    roomTransportIdentity `json:"native_owner"`
++		Writer   queueWriterWire       `json:"writer_proof"`
++		Action   string                `json:"action"`
++		Purpose  string                `json:"purpose"`
++		Revision string                `json:"native_revision"`
++	}{identity, writer.Wire, "release", manualReleasePurpose, revision})
++	digest := sha256.Sum256(raw)
++	offer.Snapshot.ArgsDigest = hex.EncodeToString(digest[:])
++	p.aliasMu.Lock()
++	current := p.transportOfferCurrentLocked(offer, parent, request.Context) && p.queueWriterCurrentLocked(writer, offer)
++	p.aliasMu.Unlock()
++	if !current {
++		offer.discardPrepared()
++		return nil, ErrAliasConflict
++	}
++	p.storeRoomTransportOffer(offer)
++	return offer.Snapshot, nil
++}
++
++// Called by the private actor before C's commit await. This existing admission
++// fence has no expiry: an ambiguous C outcome cannot reopen a successor writer.
++func (p *AppPlayer) fenceRoomRelease(ctx context.Context, offer *nativeTransportOffer) (any, error) {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if offer == nil || offer.ReleaseOwner != p || p.roomTransportPending != offer || !p.transportOfferCurrentLocked(offer, ctx, nil) || !p.queueWriterCurrentLocked(offer.Writer, offer) {
++		return nil, ErrAliasConflict
++	}
++	p.roomCloseMu.Lock()
++	defer p.roomCloseMu.Unlock()
++	if p.roomCloseDone != nil || p.roomReleaseWait != nil {
++		return nil, ErrAliasConflict
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	if p.app.manualRelease != nil || p.app.moveCustodyUnknown || p.app.retirementPending != nil {
++		return nil, ErrAliasConflict
++	}
++	offer.ReleaseStart = p.app.startCustody
++	offer.ReleaseMove = p.app.moveCustody
++	p.app.manualRelease = offer
++	p.app.manualReleaseReceipt = offer
++	p.roomReleaseWait = make(chan struct{})
++	return true, nil
++}
++func (p *AppPlayer) admitRoomReleaseClose(ctx context.Context, offer *nativeTransportOffer) (any, error) {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if offer == nil || p.roomTransportPending != offer || !p.releaseCleanupCurrentLocked(ctx, offer) {
++		return nil, ErrAliasConflict
++	}
++	p.roomCloseMu.Lock()
++	defer p.roomCloseMu.Unlock()
++	if p.roomCloseDone != nil || p.roomRetirement != nil {
++		return nil, ErrAliasConflict
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	if p.app.manualRelease != offer || p.app.startCustody != offer.ReleaseStart || p.app.moveCustody != offer.ReleaseMove {
++		return nil, ErrAliasConflict
++	}
++	// Set only after the exact durable C ACK. Close still owns cancellation/join;
++	// only its redundant START/MOVE prepare is suppressed for this operation.
++	p.roomManualRelease = offer
++	if wait := p.roomReleaseWait; wait != nil {
++		p.roomReleaseWait = nil
++		close(wait)
++	}
++	p.roomTransportPending = nil
++	offer.Published = true
++	return p, nil
++}
++func releaseEndpoint(offer *nativeTransportOffer, suffix string) string {
++	return strings.TrimSuffix(offer.OwnToneURL, "/") + "/api/outputs/" + offer.Snapshot.HomePodID + "/transport/" + suffix
++}
++
++type releasePrepareACK struct {
++	Schema         string                `json:"schema"`
++	OK             bool                  `json:"ok"`
++	Phase          string                `json:"phase"`
++	Token          string                `json:"token"`
++	PrepareID      string                `json:"native_prepare_id"`
++	Digest         string                `json:"args_digest"`
++	Owner          roomTransportIdentity `json:"native_owner"`
++	Revision       string                `json:"native_revision"`
++	Identity       roomVolumeRoute       `json:"identity"`
++	Writer         queueWriterWire       `json:"writer_proof"`
++	Purpose        string                `json:"purpose"`
++	Outcome        string                `json:"outcome"`
++	GateClosed     bool                  `json:"gate_closed"`
++	DurablePending bool                  `json:"durable_pending"`
++	Remaining      int                   `json:"remaining_ms"`
++	Physical       *bool                 `json:"physical_result_verified"`
++}
++type releaseCResult struct {
++	Schema    string                `json:"schema"`
++	OK        bool                  `json:"ok"`
++	Token     string                `json:"token"`
++	PrepareID string                `json:"native_prepare_id"`
++	Digest    string                `json:"args_digest"`
++	Owner     roomTransportIdentity `json:"native_owner"`
++	Revision  string                `json:"native_revision"`
++	Identity  roomVolumeRoute       `json:"identity"`
++	Writer    queueWriterWire       `json:"writer_proof"`
++	Purpose   string                `json:"purpose"`
++	Outcome   string                `json:"outcome"`
++	Terminal  bool                  `json:"terminal"`
++	Drained   bool                  `json:"contexts_drained"`
++	Retry     bool                  `json:"retry_allowed"`
++	Physical  *bool                 `json:"physical_result_verified"`
++}
++
++func releaseHTTP(ctx context.Context, client *http.Client, method, url string, payload any, out any) (int, error) {
++	var body io.Reader
++	if payload != nil {
++		raw, err := json.Marshal(payload)
++		if err != nil {
++			return 0, err
++		}
++		body = bytes.NewReader(raw)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, url, body)
++	if err != nil {
++		return 0, err
++	}
++	if payload != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	response, err := client.Do(req)
++	if err != nil {
++		return 0, err
++	}
++	defer response.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(response.Body, 8193))
++	if err != nil || len(raw) > 8192 {
++		return response.StatusCode, ErrAliasConflict
++	}
++	if response.StatusCode != 200 {
++		return response.StatusCode, ErrAliasConflict
++	}
++	return response.StatusCode, strictContentJSON(raw, out)
++}
++func (ack releasePrepareACK) matches(offer *nativeTransportOffer, token string) bool {
++	return ack.Schema == "podconnect.output_transport_release_prepare.v1" && ack.OK && ack.Phase == "committed" && ack.Token == token && ack.PrepareID == offer.Snapshot.PrepareID && ack.Digest == offer.Snapshot.ArgsDigest && ack.Owner == offer.Snapshot.roomTransportIdentity && ack.Revision == offer.NativeRevision && ack.Writer == offer.Writer.Wire && ack.Purpose == manualReleasePurpose && ack.Outcome == "pending" && ack.GateClosed && ack.DurablePending && ack.Remaining >= 0 && ack.Remaining <= 10000 && ack.Physical != nil && !*ack.Physical && validReleaseIdentity(ack.Identity, offer)
++}
++func (ack releaseCResult) retired(offer *nativeTransportOffer, token string) bool {
++	return ack.Schema == "podconnect.output_transport_release_result.v1" && ack.OK && ack.Token == token && ack.PrepareID == offer.Snapshot.PrepareID && ack.Digest == offer.Snapshot.ArgsDigest && ack.Owner == offer.Snapshot.roomTransportIdentity && ack.Revision == offer.NativeRevision && ack.Writer == offer.Writer.Wire && ack.Purpose == manualReleasePurpose && ack.Outcome == "retired" && ack.Terminal && ack.Drained && !ack.Retry && ack.Physical != nil && !*ack.Physical && validReleaseIdentity(ack.Identity, offer)
++}
++
++// Identity is the existing C route descriptor, validated by manager before C
++// prepare. Native additionally pins its returned bytes across commit/result.
++func validReleaseIdentity(identity roomVolumeRoute, offer *nativeTransportOffer) bool {
++	return identity.valid() && identity.DeviceID == offer.Snapshot.HomePodID && identity.InputPathDigest == offer.Writer.Wire.InputDigest
++}
++func (s *ConcreteApiServer) commitRoomRelease(offer *nativeTransportOffer, token string) (any, error) {
++	return s.runRoomRelease(offer, token, true)
++}
++func (s *ConcreteApiServer) runRoomRelease(offer *nativeTransportOffer, token string, commit bool) (any, error) {
++	op := offer.ReleaseOperation
++	if !commit {
++		if !op.Mu.TryLock() {
++			return releaseOutcome(offer, "unknown"), nil
++		}
++	} else {
++		op.Mu.Lock()
++	}
++	defer op.Mu.Unlock()
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++	if op.Receipt != nil {
++		return *op.Receipt, nil
++	}
++	if !commit {
++		if !op.CommitAttempted || (token != "" && token != op.Token) {
++			return releaseOutcome(offer, "unknown"), nil
++		}
++		token = op.Token
++	}
++	if op.TerminalC != nil {
++		return s.finishReleaseHandoff(ctx, offer), nil
++	}
++
++	if commit {
++		if offer.ReleaseOperation.CommitAttempted {
++			return releaseOutcome(offer, "unknown"), nil
++		}
++		if _, err := s.roomTransportAsk(ctx, apiRoomReleaseFence, offer); err != nil {
++			return releaseOutcome(offer, "rejected"), nil
++		}
++		offer.ReleaseOperation.Token = token
++		offer.ReleaseOperation.CommitAttempted = true
++	}
++	client := &http.Client{Timeout: 12 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAliasConflict }}
++	payload := struct {
++		Token       string                `json:"token"`
++		PrepareID   string                `json:"native_prepare_id"`
++		Action      string                `json:"action"`
++		Digest      string                `json:"args_digest"`
++		Owner       roomTransportIdentity `json:"native_owner"`
++		Revision    string                `json:"native_revision"`
++		Purpose     string                `json:"purpose"`
++		Writer      queueWriterWire       `json:"writer_proof"`
++		InputDigest string                `json:"expected_input_path_digest"`
++	}{token, offer.Snapshot.PrepareID, "release", offer.Snapshot.ArgsDigest, offer.Snapshot.roomTransportIdentity, offer.NativeRevision, manualReleasePurpose, offer.Writer.Wire, offer.Writer.Wire.InputDigest}
++
++	var ack releasePrepareACK
++	if offer.ReleaseOperation.ACK != nil {
++		ack = *offer.ReleaseOperation.ACK
++	} else {
++		var err error
++		var status int
++		if commit {
++			status, err = releaseHTTP(ctx, client, http.MethodPost, releaseEndpoint(offer, "bound-commit"), payload, &ack)
++		} else {
++			err = ErrAliasConflict
++		}
++		if status == http.StatusConflict {
++			offer.ReleaseOwner.rejectRoomRelease(offer)
++			result := releaseOutcome(offer, "rejected")
++			offer.ReleaseOperation.Receipt = &result
++			return result, nil
++		}
++		if err != nil || !ack.matches(offer, token) {
++			var recovered releasePrepareACK
++			_, readErr := releaseHTTP(ctx, client, http.MethodGet, releaseEndpoint(offer, "bound-result/"+token), nil, &recovered)
++			if readErr != nil || !recovered.matches(offer, token) {
++				return releaseOutcome(offer, "unknown"), nil
++			}
++			ack = recovered
++		}
++		offer.ReleaseOperation.ACK = &ack
++	}
++	if !offer.ReleaseOwner.player.Closed() {
++		value, err := s.roomTransportAsk(ctx, apiRoomReleaseClose, offer)
++		if err != nil || value != offer.ReleaseOwner {
++			return releaseOutcome(offer, "unknown"), nil
++		}
++	}
++	offer.ReleaseOwner.player.InterruptRetiringRead() // existing post-durable retirement interruption, outside actor/locks
++	offer.ReleaseOwner.Close()                        // outside the actor, joins the real worker and session
++	confirmation := struct {
++		Token     string `json:"token"`
++		PrepareID string `json:"native_prepare_id"`
++		Revision  string `json:"native_revision"`
++		Closed    bool   `json:"native_close_done"`
++	}{token, offer.Snapshot.PrepareID, offer.NativeRevision, true}
++	var result releaseCResult
++	_, err := releaseHTTP(ctx, client, http.MethodPost, releaseEndpoint(offer, "bound-release-confirm"), confirmation, &result)
++	if err != nil || !result.retired(offer, token) || !sameReleaseIdentity(ack.Identity, result.Identity) {
++		_, err = releaseHTTP(ctx, client, http.MethodGet, releaseEndpoint(offer, "bound-result/"+token), nil, &result)
++	}
++	if err != nil || !result.retired(offer, token) || !sameReleaseIdentity(ack.Identity, result.Identity) {
++		return releaseOutcome(offer, "unknown"), nil
++	}
++	app := offer.ReleaseOwner.app
++	app.moveCustodyMu.Lock()
++	if app.manualRelease != offer || app.openedWriterOwner != offer.ReleaseOwner || app.openedWriterGeneration != offer.WriterGeneration || app.startCustody != offer.ReleaseStart || app.moveCustody != offer.ReleaseMove {
++		app.moveCustodyMu.Unlock()
++		return releaseOutcome(offer, "unknown"), nil
++	}
++	app.startCustody = nil
++	app.moveCustody = nil
++	app.openedWriter = output.MovePipeIdentity{}
++	app.openedWriterOwner = nil
++	app.manualRelease = nil
++	delete(app.queueWriterFences, offer)
++
++	retired := releaseOutcome(offer, "retired")
++	offer.ReleaseOperation.TerminalC = &retired
++	offer.ReleaseOperation.HandoffPending = true
++	app.moveCustodyMu.Unlock()
++	return s.finishReleaseHandoff(ctx, offer), nil
++
++}
++func sameReleaseIdentity(a, b roomVolumeRoute) bool { return a == b }
++
++func (p *AppPlayer) releaseCleanupPending(offer *nativeTransportOffer) bool {
++	if offer == nil || offer.Snapshot.Action != "release" {
++		return false
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	return p.app.manualRelease == offer
++}
++func (p *AppPlayer) releaseCleanupCurrentLocked(ctx context.Context, offer *nativeTransportOffer) bool {
++	// A consumed release retires the captured connection/writer, not a song.
++	// Playback observations and same-writer track progress are not new authority.
++	if offer == nil || offer.ReleaseOwner != p || p.roomTransportPending != offer || ctx.Err() != nil || !p.boundIntentCurrentLocked(offer) || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomVolumeReservedLocked() || p.state == nil || p.state.player == nil || p.sess != offer.Session || p.player != offer.Player || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.aliasIncarnation != offer.Snapshot.AliasIncarnation || p.aliasFingerprint != offer.Snapshot.AliasRegistry || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath || !p.transportMappingCurrentLocked() {
++		return false
++	}
++	if (p.aliasRetired || p.roomVolumeClosing) && !p.manualReleaseFailureCurrentLocked(ctx, offer) {
++		return false
++	}
++	selected := false
++	for _, alias := range p.aliasRegistry {
++		if alias.ID == p.state.device.SelectedAliasId && alias.RoomID == offer.Snapshot.RoomID && alias.HomePodID == offer.Snapshot.HomePodID {
++			selected = true
++			break
++		}
++	}
++	if !selected || !p.queueWriterCurrentLocked(offer.Writer, offer) {
++		return false
++	}
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	return p.app.manualRelease == offer && p.app.startCustody == offer.ReleaseStart && p.app.moveCustody == offer.ReleaseMove
++}
++
++func (p *AppPlayer) rejectRoomRelease(offer *nativeTransportOffer) {
++	p.roomCloseMu.Lock()
++	defer p.roomCloseMu.Unlock()
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	if p.app.manualRelease != offer {
++		return
++	}
++	p.app.manualRelease = nil
++	if wait := p.roomReleaseWait; wait != nil {
++		p.roomReleaseWait = nil
++		close(wait)
++	}
++	delete(p.app.queueWriterFences, offer)
++}
++
++func (s *ConcreteApiServer) handleRoomReleaseResult(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	q := r.URL.Query()
++	if len(q) != 1 || len(q["prepare_id"]) != 1 || !volumeHex32.MatchString(q.Get("prepare_id")) {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
++	defer cancel()
++	value, err := s.roomTransportAsk(ctx, apiRoomReleaseLookup, q.Get("prepare_id"))
++	if err != nil {
++		roomTransportResponse(w, nil, err)
++		return
++	}
++	offer, ok := value.(*nativeTransportOffer)
++	if !ok || offer == nil {
++		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	// This read joins only the already consumed cleanup. No new COMMIT, prepare,
++	// intent, token or writer authority can be created by result observation.
++	result, err := s.runRoomRelease(offer, "", false)
++	roomTransportResponse(w, result, err)
++}
++
++// The existing App API forwarder serves this read even after the captured
++// actor has closed. A retained receipt never grants a new operation authority.
++func (app *App) roomReleaseLookup(id string) (any, error) {
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	offer := app.manualReleaseReceipt
++	if offer == nil || offer.Snapshot.PrepareID != id {
++		return nil, ErrAliasConflict
++	}
++	return offer, nil
++}
++
++func (app *App) manualReleasePending() bool {
++	if app == nil {
++		return false
++	}
++	app.moveCustodyMu.Lock()
++	defer app.moveCustodyMu.Unlock()
++	return app.manualRelease != nil
++}
++
++func (p *AppPlayer) pendingManualRelease() *nativeTransportOffer {
++	p.app.moveCustodyMu.Lock()
++	defer p.app.moveCustodyMu.Unlock()
++	offer := p.app.manualRelease
++	if offer != nil && offer.ReleaseOwner == p {
++		return offer
++	}
++	return nil
++}
++
++// Called only in the worker's accepted ClaimOutputFailure callback, before that
++// exact failure retires the alias. The failure owns the single generation step;
++// an independent writer/session/intent/alias change can never use this witness.
++func (p *AppPlayer) markManualReleaseFailureLocked(epoch uint64) {
++	offer := p.pendingManualRelease()
++	if offer == nil || epoch == 0 || p.aliasRetired || p.roomVolumeClosing || p.roomTransportGenerationExhausted || p.roomTransportGeneration >= 1<<53-1 || !p.releaseCleanupCurrentLocked(context.Background(), offer) {
++		return
++	}
++	offer.ReleaseFailure = &manualReleaseFailure{epoch, p.roomTransportGeneration + 1}
++}
++func (p *AppPlayer) manualReleaseFailureCurrentLocked(ctx context.Context, offer *nativeTransportOffer) bool {
++	failure := offer.ReleaseFailure
++	return failure != nil && failure.OutputEpoch != 0 && ctx.Err() == nil && p.aliasRetired && p.roomVolumeClosing && p.roomTransportGeneration == failure.Generation
++}
++
++func (p *AppPlayer) managedReleaseAvailable() bool {
++	return p.app != nil && p.app.cfg != nil && p.app.cfg.ZeroconfEnabled && p.logout != nil && p.logout == p.app.logoutCh
++}
++
++// C retirement and authenticated-session readiness are separate. This is only
++// delivery of the already consumed operation's incumbent logout packet; reads
++// cannot repeat C COMMIT, Close, or create a replacement authority.
++func (s *ConcreteApiServer) finishReleaseHandoff(ctx context.Context, offer *nativeTransportOffer) releaseResult {
++	op := offer.ReleaseOperation
++	unknown := releaseOutcome(offer, "unknown")
++	unknown.Drained = true
++	if op.TerminalC == nil {
++		return unknown
++	}
++	app := offer.ReleaseOwner.app
++	app.ownerMu.Lock()
++	current := app.currentPlayer
++	replaced := !app.closed && current != nil && current != offer.ReleaseOwner && current.sess != nil && current.sess != offer.Session && current.player != nil && current.player != offer.Player && !current.player.Closed() && current.playbackReady() && app.currentAPI != nil && app.currentDone != nil
++	same := !app.closed && current == offer.ReleaseOwner
++	app.ownerMu.Unlock()
++	if replaced {
++		op.HandoffPending = false
++		op.Receipt = op.TerminalC
++		return *op.Receipt
++	}
++	if !same || !app.cfg.ZeroconfEnabled || op.Logout == nil || offer.ReleaseOwner.logout != op.Logout || app.logoutCh != op.Logout {
++		return unknown
++	}
++	select {
++	case op.Logout <- offer.ReleaseOwner:
++		op.HandoffPending = false
++		op.Receipt = op.TerminalC
++		return *op.Receipt
++	case <-ctx.Done():
++		return unknown
++	}
++}
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -46,31 +46,35 @@
+ 	AliasRevision    uint64 `json:"alias_revision"`
+ }
+ type roomTransportStateRequest struct {
+-	AccountUserID string          `json:"account_user_id"`
+-	TargetID      string          `json:"target_id"`
+-	RoomID        string          `json:"room_id"`
+-	HomePodID     string          `json:"homepod_id"`
+-	Context       context.Context `json:"-"`
++	AccountUserID  string          `json:"account_user_id"`
++	TargetID       string          `json:"target_id"`
++	RoomID         string          `json:"room_id"`
++	HomePodID      string          `json:"homepod_id"`
++	Context        context.Context `json:"-"`
++	IncludeRelease bool            `json:"-"`
+ }
+ type roomTransportPrepareRequest struct {
+-	AccountUserID string          `json:"account_user_id"`
+-	TargetID      string          `json:"target_id"`
+-	RoomID        string          `json:"room_id"`
+-	HomePodID     string          `json:"homepod_id"`
+-	Action        string          `json:"action"`
+-	VolumePercent int             `json:"volume_percent"`
+-	Queue         *queueSelection `json:"queue,omitempty"`
+-	Context       context.Context `json:"-"`
++	AccountUserID        string                  `json:"account_user_id"`
++	TargetID             string                  `json:"target_id"`
++	RoomID               string                  `json:"room_id"`
++	HomePodID            string                  `json:"homepod_id"`
++	Action               string                  `json:"action"`
++	VolumePercent        int                     `json:"volume_percent"`
++	Queue                *queueSelection         `json:"queue,omitempty"`
++	ExpectedReleaseOwner *releaseOwnerDescriptor `json:"expected_release_owner,omitempty"`
++	Context              context.Context         `json:"-"`
+ }
+ type roomTransportSnapshot struct {
+ 	roomTransportIdentity
+-	Schema         string `json:"schema"`
+-	PrepareID      string `json:"prepare_id"`
+-	Action         string `json:"action"`
+-	VolumePercent  int    `json:"volume_percent"`
+-	ArgsDigest     string `json:"args_digest"`
+-	ExpiresAfterMS int    `json:"expires_after_ms"`
+-	NativeRevision string `json:"native_revision,omitempty"`
++	Schema         string           `json:"schema"`
++	PrepareID      string           `json:"prepare_id"`
++	Action         string           `json:"action"`
++	VolumePercent  int              `json:"volume_percent"`
++	ArgsDigest     string           `json:"args_digest"`
++	ExpiresAfterMS int              `json:"expires_after_ms"`
++	NativeRevision string           `json:"native_revision,omitempty"`
++	Purpose        string           `json:"purpose,omitempty"`
++	WriterProof    *queueWriterWire `json:"writer_proof,omitempty"`
+ }
+ type nativeTransportOffer struct {
+ 	Bound               bool
+@@ -96,6 +100,11 @@
+ 	CompletedWriter     *completedWriter
+ 	Queue               *queueTransportProof
+ 	Writer              *queueWriterProof
++	ReleaseOwner        *AppPlayer
++	ReleaseStart        *contentOperation
++	ReleaseMove         *moveOperation
++	ReleaseOperation    *releaseOperation
++	ReleaseFailure      *manualReleaseFailure
+ }
+ type roomTransportConsumeRequest struct {
+ 	PrepareID string
+@@ -107,6 +116,9 @@
+ }
+ 
+ func (offer *nativeTransportOffer) discardPrepared() {
++	if offer != nil && offer.Snapshot.Action == "release" && offer.ReleaseOwner != nil {
++		offer.ReleaseOwner.app.releaseQueueWriter(offer)
++	}
+ 	if offer != nil && offer.Queue != nil && offer.Queue.Owner != nil && (!offer.Queue.EffectEnqueued || offer.Queue.EffectJoined) {
+ 		offer.Queue.Owner.app.releaseQueueWriter(offer)
+ 	}
+@@ -131,16 +143,20 @@
+ 		p.roomTransportOffer = nil
+ 		offer.discardPrepared()
+ 	}
+-	if offer := p.roomTransportPending; offer != nil && !time.Now().Before(offer.Expires) {
++	if offer := p.roomTransportPending; offer != nil && !time.Now().Before(offer.Expires) && !p.releaseCleanupPending(offer) {
+ 		p.roomTransportPending = nil
+ 		offer.discardPrepared()
+ 	}
+ }
+ func (p *AppPlayer) clearRoomTransport() {
+ 	p.roomTransportOffer.discardPrepared()
+-	p.roomTransportPending.discardPrepared()
+ 	p.roomTransportOffer = nil
+-	p.roomTransportPending = nil
++	// A failed provider/actor does not erase the already consumed release's
++	// captured cleanup exclusion or turn it into another transport grant.
++	if !p.releaseCleanupPending(p.roomTransportPending) {
++		p.roomTransportPending.discardPrepared()
++		p.roomTransportPending = nil
++	}
+ }
+ func (p *AppPlayer) abortRoomTransport(offer *nativeTransportOffer) {
+ 	if offer != nil && p.roomTransportPending == offer {
+@@ -225,18 +241,39 @@
+ 	if err != nil || (bound && !nativeBoundOwnerValid(identity)) {
+ 		return nil, ErrAliasConflict
+ 	}
++	var release *releaseOwnerDescriptor
++	if request.IncludeRelease {
++		if !p.managedReleaseAvailable() {
++			return nil, ErrAliasConflict
++		}
++		if !bound {
++			return nil, ErrBadRequest
++		}
++		writer, err := p.captureQueueWriter(ctx, identity, nil)
++		if err != nil {
++			return nil, err
++		}
++		release = &releaseOwnerDescriptor{releaseOwnerSchema, identity, writer.Wire}
++	}
+ 	return struct {
+-		Schema   string                `json:"schema"`
+-		Ready    bool                  `json:"ready"`
+-		Identity roomTransportIdentity `json:"identity"`
+-		Actions  []string              `json:"actions"`
+-		Physical bool                  `json:"physical_result_verified"`
+-	}{boundSchema("podconnect.native_room_transport_state.v1", bound), true, identity, slices.Clone(roomTransportActions), false}, nil
++		Release  *releaseOwnerDescriptor `json:"release,omitempty"`
++		Schema   string                  `json:"schema"`
++		Ready    bool                    `json:"ready"`
++		Identity roomTransportIdentity   `json:"identity"`
++		Actions  []string                `json:"actions"`
++		Physical bool                    `json:"physical_result_verified"`
++	}{release, boundSchema("podconnect.native_room_transport_state.v1", bound), true, identity, slices.Clone(roomTransportActions), false}, nil
+ }
+ func (p *AppPlayer) prepareRoomTransport(parent context.Context, request roomTransportPrepareRequest) (any, error) {
+ 	return p.prepareRoomTransportVersion(parent, request, false)
+ }
+ func (p *AppPlayer) prepareRoomTransportVersion(parent context.Context, request roomTransportPrepareRequest, bound bool) (any, error) {
++	if request.Action == "release" {
++		return p.prepareRoomRelease(parent, request, bound)
++	}
++	if request.ExpectedReleaseOwner != nil {
++		return nil, ErrBadRequest
++	}
+ 	if request.Action == "queue" {
+ 		if !bound {
+ 			return nil, ErrBadRequest
+@@ -335,7 +372,10 @@
+ 	return offer.Snapshot, nil
+ }
+ func (p *AppPlayer) transportOfferCurrentLocked(offer *nativeTransportOffer, parent, request context.Context) bool {
+-	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || !time.Now().Before(offer.Expires) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
++	return p.transportOfferCurrentAtLocked(offer, parent, request, true)
++}
++func (p *AppPlayer) transportOfferCurrentAtLocked(offer *nativeTransportOffer, parent, request context.Context, admissionDeadline bool) bool {
++	if offer == nil || !p.boundIntentCurrentLocked(offer) || parent.Err() != nil || (request != nil && request.Err() != nil) || (admissionDeadline && !time.Now().Before(offer.Expires)) || p.aliasRetired || p.roomVolumeClosing || p.roomVolumeReservedLocked() || p.aliasRevisionExhausted || p.roomTransportGenerationExhausted || p.roomTransportGeneration != offer.Generation || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player || p.primaryStream != offer.Primary || p.state == nil || p.state.player == nil || p.state.player != offer.OriginalPlayerState || !p.state.active || !p.state.player.IsPlaying || p.state.tracks != offer.Tracks || p.state.tracks.TransportRevision() != offer.QueueRevision || p.spotConnId != offer.Snapshot.ConnectionID || p.state.player.SessionId != offer.Snapshot.SessionID || p.aliasRevision != offer.Snapshot.AliasRevision || p.app.deviceId != offer.Snapshot.TargetID || p.app.cfg.RoomTransportOwnToneURL != offer.OwnToneURL || p.app.cfg.AudioOutputPipe != offer.InputPath {
+ 		return false
+ 	}
+ 	if offer.WriterGeneration != 0 {
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -162,7 +162,7 @@
+ 	}
+ 	if len(raw) > 2048 {
+ 		request, ok := out.(*roomTransportPrepareRequest)
+-		if !ok || request.Action != "queue" {
++		if !ok || (request.Action != "queue" && request.Action != "release") {
+ 			w.WriteHeader(400)
+ 			return false
+ 		}
+@@ -175,7 +175,8 @@
+ 		return
+ 	}
+ 	q := r.URL.Query()
+-	if len(q) != 4 {
++	includeRelease := q.Get("include_release") == "true" && roomBoundRequest(r)
++	if len(q) != 4 && !(len(q) == 5 && includeRelease && len(q["include_release"]) == 1) {
+ 		w.WriteHeader(400)
+ 		return
+ 	}
+@@ -191,7 +192,7 @@
+ 	if roomBoundRequest(r) {
+ 		typ = apiRoomBoundState
+ 	}
+-	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, includeRelease})
+ 	roomTransportResponse(w, data, err)
+ }
+ func (s *ConcreteApiServer) handleRoomTransportPrepare(w http.ResponseWriter, r *http.Request) {
+@@ -238,6 +239,11 @@
+ 	offer, ok := value.(*nativeTransportOffer)
+ 	if !ok || offer == nil || ctx.Err() != nil || !time.Now().Before(offer.Expires) {
+ 		roomTransportResponse(w, nil, ErrAliasConflict)
++		return
++	}
++	if offer.Snapshot.Action == "release" {
++		data, err := s.commitRoomRelease(offer, request.OwnToneToken)
++		roomTransportResponse(w, data, err)
+ 		return
+ 	}
+ 	defer func() {
+--- a/daemon/room_volume_http.go
++++ b/daemon/room_volume_http.go
+@@ -272,7 +272,7 @@
+ 	if roomBoundRequest(r) {
+ 		typ = apiRoomVolumeBoundState
+ 	}
+-	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx})
++	data, err := s.roomTransportAsk(ctx, typ, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, false})
+ 	roomTransportResponse(w, data, err)
+ }
+ func (s *ConcreteApiServer) handleRoomVolumePrepare(w http.ResponseWriter, r *http.Request) {

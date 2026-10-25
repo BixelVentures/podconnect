@@ -1,0 +1,237 @@
+--- a/output/pipe_liveness_test.go
++++ b/output/pipe_liveness_test.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os"
+@@ -15,7 +16,7 @@
+ // Extends the existing actual startPipeFixture/full-FIFO setup with the missing
+ // no-consumer liveness case using the actual output worker and kernel FIFO.
+ func TestPC58KeeperReaderAllowsBoundedCommandLiveness(t *testing.T) {
+-	for _, command := range []string{"Pause", "Close"} {
++	for _, command := range []string{"Pause", "Close", "MoveQuiesce"} {
+ 		t.Run(command, func(t *testing.T) {
+ 			reader := &startRead{entered: make(chan struct{})}
+ 			out, read, path := startPipeFixture(t, reader)
+@@ -56,7 +57,13 @@
+ 			}
+ 			done := make(chan error, 1)
+ 			go func() {
+-				if command == "Pause" {
++				if command == "MoveQuiesce" {
++					done <- out.WithMoveControlLock(context.Background(), func(_ PipeIdentity, _ func(bool)) error {
++						out.FenceStart()
++						out.SetMoveStateUnderStartLock(true, true)
++						return nil
++					})
++				} else if command == "Pause" {
+ 					done <- out.Pause()
+ 				} else {
+ 					done <- out.Close()
+@@ -131,7 +138,7 @@
+ 	t.Fatal("actual FIFO write did not wait")
+ }
+ func TestPC58PauseRetainsOnlyUnwrittenSuffixAndFenceDiscardsIt(t *testing.T) {
+-	for _, boundary := range []string{"resume", "drop", "start"} {
++	for _, boundary := range []string{"resume", "drop", "start", "move", "move-abort"} {
+ 		t.Run(boundary, func(t *testing.T) {
+ 			source := &pc58SingleChunk{}
+ 			out, read, path := startPipeFixture(t, source)
+@@ -161,7 +168,16 @@
+ 				t.Fatal(err)
+ 			}
+ 			pc58WaitWrite(t)
+-			if err = out.Pause(); err != nil {
++			if boundary == "move" || boundary == "move-abort" {
++				err = out.WithMoveControlLock(context.Background(), func(_ PipeIdentity, _ func(bool)) error {
++					out.FenceStart()
++					out.SetMoveStateUnderStartLock(true, true)
++					return nil
++				})
++			} else {
++				err = out.Pause()
++			}
++			if err != nil {
+ 				t.Fatal(err)
+ 			}
+ 			remaining := len(out.pendingPCM)
+@@ -202,7 +218,26 @@
+ 					t.Fatal(err)
+ 				}
+ 			}
+-			if boundary == "start" {
++			if boundary == "move" || boundary == "move-abort" {
++				if boundary == "move" {
++					err = out.WithMoveLock(context.Background(), func(identity PipeIdentity, _ func(bool)) error {
++						if identity != before.PipeIdentity || len(out.pendingPCM) != remaining {
++							t.Error("MOVE switch lost writer or suffix")
++						}
++						return nil
++					})
++					if err != nil {
++						t.Fatal(err)
++					}
++				}
++				err = out.WithMoveLock(context.Background(), func(identity PipeIdentity, _ func(bool)) error {
++					if identity != before.PipeIdentity || len(out.pendingPCM) != remaining {
++						t.Error("MOVE resume/abort lost writer or suffix")
++					}
++					out.SetMoveStateUnderStartLock(false, false)
++					return nil
++				})
++			} else if boundary == "start" {
+ 				err = out.WithStartLock(context.Background(), func(_ PipeIdentity, pause func(bool)) error { pause(false); return nil })
+ 			} else {
+ 				err = out.Resume()
+@@ -242,7 +277,7 @@
+ 				time.Sleep(time.Millisecond)
+ 			}
+ 			expected := written
+-			if boundary == "resume" {
++			if boundary == "resume" || boundary == "move" || boundary == "move-abort" {
+ 				expected = total
+ 			}
+ 			if len(got) != expected {
+@@ -300,3 +335,71 @@
+ 		t.Fatal(err)
+ 	}
+ }
++
++func TestMoveControlCancellationReturnsBeforeOwnedWaiterRestoresUnderLock(t *testing.T) {
++	out, _, _ := startPipeFixture(t, &startRead{entered: make(chan struct{})})
++	expired, cancel := context.WithCancel(context.Background())
++	cancel()
++	calls := 0
++	if err := out.WithMoveControlLock(expired, func(PipeIdentity, func(bool)) error { calls++; return nil }); err != context.Canceled || calls != 0 || out.controlPending.Load() {
++		t.Fatal("expired command announced control", err, calls)
++	}
++	out.lock.Lock()
++	ctx, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
++	defer stop()
++	done := make(chan error, 1)
++	go func() {
++		done <- out.WithMoveControlLock(ctx, func(PipeIdentity, func(bool)) error { calls++; return nil })
++	}()
++	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
++		out.lock.Unlock()
++		t.Fatal(err)
++	}
++	if !out.controlPending.Load() {
++		out.lock.Unlock()
++		t.Fatal("cancellation cleared pending before owned lock join")
++	}
++	out.lock.Unlock()
++	until := time.Now().Add(time.Second)
++	joined := false
++	for time.Now().Before(until) {
++		if out.control.TryLock() {
++			joined = true
++			out.control.Unlock()
++			break
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if !joined || out.controlPending.Load() || calls != 0 {
++		t.Fatal("owned waiter failed to restore control after join", joined, calls)
++	}
++	if err := out.Pause(); err != nil {
++		t.Fatal("later normal control blocked", err)
++	}
++}
++
++func TestMoveControlDeadlineSetterErrorJoinsBeforePendingClear(t *testing.T) {
++	out, _, _ := startPipeFixture(t, &startRead{entered: make(chan struct{})})
++	file, err := os.CreateTemp(t.TempDir(), "unsupported-deadline")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer file.Close()
++	out.lock.Lock()
++	original := out.file
++	out.file = file
++	out.lock.Unlock()
++	calls := 0
++	err = out.WithMoveControlLock(context.Background(), func(PipeIdentity, func(bool)) error { calls++; return nil })
++	out.lock.Lock()
++	out.file = original
++	pending := out.controlPending.Load()
++	out.lock.Unlock()
++	if err == nil || calls != 0 || pending {
++		t.Fatal("setter error did not restore under owned lock", err, calls, pending)
++	}
++	if !out.control.TryLock() {
++		t.Fatal("setter error retained control")
++	}
++	out.control.Unlock()
++}
+--- a/player/room_move_test.go
++++ b/player/room_move_test.go
+@@ -16,6 +16,7 @@
+ 	lock     sync.Mutex
+ 	identity output.PipeIdentity
+ 	fd       string
++	controls int
+ 	fenced   bool
+ }
+ 
+@@ -32,6 +33,17 @@
+ 	}
+ 	defer backend.lock.Unlock()
+ 	return apply(backend.identity, func(paused bool) { backend.paused, backend.fenced = paused, paused })
++}
++
++func (backend *moveBackend) OpenedWriterIdentity() output.MovePipeIdentity {
++	return output.MovePipeIdentity{PipeIdentity: backend.identity, FD: backend.fd}
++}
++func (backend *moveBackend) WithMoveLock(ctx context.Context, apply func(output.PipeIdentity, func(bool)) error) error {
++	return backend.WithStartLock(ctx, apply)
++}
++func (backend *moveBackend) WithMoveControlLock(ctx context.Context, apply func(output.PipeIdentity, func(bool)) error) error {
++	backend.controls++
++	return backend.WithStartLock(ctx, apply)
+ }
+ 
+ func TestRoomMoveSameSourceAndPausedPreservation(t *testing.T) {
+@@ -207,3 +219,38 @@
+ 		t.Fatalf("unknown post-open source did not fence same actual writer: %v", err)
+ 	}
+ }
++
++func TestRoomMoveQuiesceRejectsExpiredOrForeignOutputBeforeControlSetter(t *testing.T) {
++	backend := &moveBackend{identity: output.PipeIdentity{Device: "1", Inode: "2", Type: "fifo"}, fd: "42"}
++	var out output.Output = backend
++	source := NewSwitchingAudioSource()
++	primary := &transportSource{id: 1}
++	source.SetPrimary(primary)
++	p := &Player{}
++	guard := func(mutate func()) error { mutate(); return nil }
++	snapshot, err := p.applyRoomMove(&roomMoveCommand{ctx: context.Background(), phase: "snapshot", expectedSource: primary, wasPlaying: true}, &out, source)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, mode := range []string{"fd", "epoch", "expired"} {
++		ctx := context.Background()
++		epoch := snapshot.Epoch
++		if mode == "fd" {
++			backend.fd = "43"
++		} else {
++			backend.fd = "42"
++		}
++		if mode == "epoch" {
++			epoch = "1"
++		}
++		if mode == "expired" {
++			var cancel context.CancelFunc
++			ctx, cancel = context.WithCancel(ctx)
++			cancel()
++		}
++		_, err = p.applyRoomMove(&roomMoveCommand{ctx: ctx, phase: "quiesce", expectedSource: primary, pipe: snapshot.Pipe, epoch: epoch, wasPlaying: true, guard: guard}, &out, source)
++		if err == nil || backend.controls != 0 || backend.fenced || backend.paused || p.startEpoch != 0 {
++			t.Fatal("foreign/expired command reached control setter", mode, err, backend.controls)
++		}
++	}
++}

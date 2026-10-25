@@ -53,7 +53,8 @@ var roomContentStore = struct {
 	Records map[string]*roomContentRecord
 }{Records: make(map[string]*roomContentRecord)}
 
-var contentURI = regexp.MustCompile(`^spotify:(track|playlist):[A-Za-z0-9]{22}$`)
+var contentTrackURI = regexp.MustCompile(`^spotify:track:[A-Za-z0-9]{22}$`)
+var contentContextURI = regexp.MustCompile(`^spotify:(playlist|album|artist|show):[A-Za-z0-9]{22}$`)
 var roomContentRPC = doRoomContentRPC
 
 // The native critical section has its own immutable twelve-second cutoff.
@@ -99,16 +100,16 @@ func decodeRoomContentRequest(raw []byte) (roomContentRequest, error) {
 	if err != nil || decodeQueueManagerJSON(fields["scope"], &request.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &request.Offer) != nil || json.Unmarshal(fields["action"], &request.Action) != nil || !validTransportScope(request.Scope) || !validRoomContentOffer(request.Offer) {
 		return request, fmt.Errorf("invalid content request")
 	}
-	key, prefix := "track_uri", "spotify:track:"
+	key, uriPattern := "track_uri", contentTrackURI
 	if request.Action == "play_context" {
-		key, prefix = "context_uri", "spotify:playlist:"
+		key, uriPattern = "context_uri", contentContextURI
 	} else if request.Action != "play_track" {
 		return request, fmt.Errorf("invalid action")
 	}
 	args, err := contentFields(fields["args"], key, "max_volume")
 	var uri string
 	var ceiling int
-	if err != nil || json.Unmarshal(args[key], &uri) != nil || json.Unmarshal(args["max_volume"], &ceiling) != nil || !contentURI.MatchString(uri) || len(uri) != len(prefix)+22 || uri[:len(prefix)] != prefix || ceiling < 35 || ceiling > 100 {
+	if err != nil || json.Unmarshal(args[key], &uri) != nil || json.Unmarshal(args["max_volume"], &ceiling) != nil || !uriPattern.MatchString(uri) || ceiling < 35 || ceiling > 100 {
 		return request, fmt.Errorf("invalid content arguments")
 	}
 	request.Args = map[string]any{key: uri, "max_volume": ceiling}

@@ -1,0 +1,11 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1483,6 +1483,8 @@
+ 	target->v4_port = ntohs(address.sin_port);
+ 	target->extra_device_info = target_extra;
+ 	target_extra->mdns_name = strdup(target->name);
++	if (getenv("PC_REQUIRE_RTP_AUDIO"))
++	  target_extra->supports_encryption = 1;
+ 	assert(outputs_device_add(target, false) == target && outputs_device_volume_register(target, 65, -1) == 0);
+       }
+     native_start_wire_run(&f,fifo);goto cleanup;

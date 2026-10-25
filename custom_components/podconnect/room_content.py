@@ -50,7 +50,7 @@ _IDENTITY_KEYS = {
 _HEX32 = re.compile(r"[a-f0-9]{32}")
 _HEX64 = re.compile(r"[a-f0-9]{64}")
 _TRACK = re.compile(r"spotify:track:[A-Za-z0-9]{22}")
-_PLAYLIST = re.compile(r"spotify:playlist:[A-Za-z0-9]{22}")
+_CONTEXT = re.compile(r"spotify:(?:playlist|album|artist|show):[A-Za-z0-9]{22}")
 
 
 def _text(value, limit=1024):
@@ -79,7 +79,7 @@ def valid_selected_arguments(action, value):
     if not isinstance(action, str) or action not in {"play_track", "play_context"}:
         return False
     key, pattern = (
-        ("track_uri", _TRACK) if action == "play_track" else ("context_uri", _PLAYLIST)
+        ("track_uri", _TRACK) if action == "play_track" else ("context_uri", _CONTEXT)
     )
     return (
         isinstance(value, dict)

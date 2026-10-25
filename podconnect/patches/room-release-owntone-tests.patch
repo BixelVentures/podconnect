@@ -1,0 +1,1025 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -131,6 +131,7 @@
+ static uint32_t fixture_post_full_item;
+ static const char *fixture_post_full_path;
+ static bool fixture_expire_retirement_reader;
++static bool fixture_expire_manual_post_full;
+ int __real_input_fifo_owner_get(uint32_t,const char *,bool,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ int __wrap_input_fifo_owner_get(uint32_t item,const char *path,bool drain,uint64_t device,uint64_t inode,
+     const struct timespec *deadline,struct input_fifo_identity *reader)
+@@ -148,6 +149,14 @@
+ int __wrap_db_start_guard_save(const struct db_start_guard *expected,const struct db_start_guard *record)
+ {
+   int result=__real_db_start_guard_save(expected,record);
++  if (result == 0 && fixture_expire_manual_post_full && release_operation.prepared && release_operation.used)
++    {
++      release_operation.expiry.tv_sec -= 20;
++      if (start_active && release_operation.predecessor.completed_token[0]
++          && !strcmp(start_active->result.command.token, release_operation.predecessor.completed_token))
++	start_active->retirement.deadline.tv_sec -= 20;
++      fixture_expire_manual_post_full = false;
++    }
+   if(result==0 && (fixture_post_full_writer || fixture_post_full_item)){
+     json_object *payload=json_tokener_parse(record->payload),*phase;
+     bool completed=payload && json_object_object_get_ex(payload,"phase",&phase)
+@@ -187,8 +196,20 @@
+     if (p && contexts[i] == p) { contexts[i] = NULL; context_frees++; break; }
+   free(p);
+ }
++static bool pc70_real_speaker_persistence;
++int
++db_speaker_get(struct output_device *, uint64_t);
++int
++db_speaker_save(struct output_device *);
+ int fixture_speaker_get(struct output_device *device, uint64_t id)
+-{ (void)id; device->volume = 30; device->selected = false; return 0; }
++{
++  if (pc70_real_speaker_persistence)
++    return db_speaker_get(device, id);
++  (void)id;
++  device->volume = 30;
++  device->selected = false;
++  return 0;
++}
+ int fixture_speaker_save(struct output_device *device)
+ { (void)device; return 0; }
+ 
+@@ -640,7 +661,7 @@
+   struct output_attention_result result;
+   unsigned short udp_port;
+   int udp_fd,mode,phase,failed,wire,volumes,teardowns,pair_messages,start_callbacks,stop_callbacks;
+-  int short_salts,padded_salts;
++  int short_salts, padded_salts, pc70_peer_sessions;
+   struct output_attention_result handoff;
+   struct output_room_volume_request volume_command;
+   struct output_room_volume_result volume_result;
+@@ -841,11 +862,25 @@
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct((f->mode==16 || (f->mode==17 && f->phase!=4) || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23 || f->mode==24 || f->mode==25) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
+-    char expected[64];
+-    snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+-    if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+-      {recovery_wire_fail(f,"fresh BASE payload differs from durable manual60");goto done;}
++      float mapped = airplay_volume_from_pct(
++          ((f->mode == 29 && getenv("PC70_RELEASE_COMPOSE")
++               && ((!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") && f->volumes == 0)
++                   || (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && f->volumes < 2)))
++              || f->mode == 16 || (f->mode == 17 && f->phase != 4) || f->mode == 19 || f->mode == 20 || f->mode == 22
++              || f->mode == 23 || f->mode == 24 || f->mode == 25)
++              ? 27
++          : f->mode >= 11 ? 35
++          : f->mode >= 7  ? (f->volumes ? (f->mode == 10 && f->volumes >= 2 ? 45 : 44) : 27)
++                          : 60,
++          f->device->name);
++      char expected[64];
++      snprintf(
++          expected, sizeof(expected), "volume: -%d.%06d\r\n", -(int)mapped, -(int)(1000000.0 * (mapped - (int)mapped)));
++      if (!body || (size_t)bytes != strlen(expected) || memcmp(body, expected, bytes))
++	{
++	  recovery_wire_fail(f, "fresh BASE payload differs from durable manual60");
++	  goto done;
++	}
+     f->volumes++;
+     if (!f->device->session || ((f->mode < 4 || f->mode == 6) && (f->volumes != 1 || !((struct airplay_session *)f->device->session)->recovery_only)))
+       {recovery_wire_fail(f,"duplicate lax write or missing real recovery owner");goto done;}
+@@ -860,10 +895,9 @@
+   } else if(!strncmp(header,"FLUSH ",6)) {
+     /* Preserve existing mode17/24 FLUSH; only the explicit mode29 Pause-loss
+      * discriminator joins it. Require the same session, body and RTP-Info. */
+-    if((f->mode!=17 && !(f->mode==24 && completed_move_real_resume)
+-        && !(f->mode==29 && getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")))
+-        || (f->mode==17 && f->phase!=4) || bytes || !f->device->session
+-        || !strstr(header,"\r\nRTP-Info: seq="))
++    if ((f->mode != 17 && !(f->mode == 24 && completed_move_real_resume)
++            && !(f->mode == 29 && (getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS") || getenv("PC70_RELEASE_COMPOSE"))))
++        || (f->mode == 17 && f->phase != 4) || bytes || !f->device->session || !strstr(header, "\r\nRTP-Info: seq="))
+       {recovery_wire_fail(f,"unexpected ordinary FLUSH");goto done;}
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+@@ -904,10 +938,32 @@
+ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
++  if (f->peer && f->mode == 29 && getenv("PC70_RELEASE_COMPOSE") && f->pc70_peer_sessions == 1)
++    {
++      bool next = getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && start_active
++                  && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE
++                  && strcmp(start_active->result.command.token, release_operation.predecessor.completed_token);
++      struct output_device *old = outputs_device_get(1);
++      bool move = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && start_active
++                  && start_active->result.command.move_existing_session && start_active->result.command.device_id == 2
++                  && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE && old && !old->session
++                  && !old->selected;
++      if (next || move)
++	{
++	  bufferevent_free(f->peer);
++	  f->peer = NULL;
++	  pair_cipher_free(f->cipher);
++	  f->cipher = NULL;
++	  pair_setup_free(f->pair);
++	  f->pair = NULL;
++	  evbuffer_drain(f->plain, evbuffer_get_length(f->plain));
++	}
++    }
+   if(f->peer || length<(int)sizeof(*address) || address->sin_family!=AF_INET || ntohl(address->sin_addr.s_addr)!=INADDR_LOOPBACK)
+     {evutil_closesocket(fd);recovery_wire_fail(f,"unexpected/duplicate receiver connection");return;}
+   f->peer=bufferevent_socket_new(f->base,fd,BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
+   if(!f->peer){evutil_closesocket(fd);recovery_wire_fail(f,"peer owner allocation");return;}
++  f->pc70_peer_sessions++;
+   bufferevent_setcb(f->peer,recovery_wire_read,NULL,recovery_wire_event,f);bufferevent_enable(f->peer,EV_READ|EV_WRITE);
+ }
+ 
+@@ -1265,6 +1321,8 @@
+   if (!gcry_check_version(GCRYPT_VERSION)) return 1;
+   gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
+   gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
++  if (argc == 3 && (!strcmp(argv[1], "--pc70-recover-fenced") || !strcmp(argv[1], "--pc70-recover-terminal")))
++    return manual_release_recover_process_case(argv[2], !strcmp(argv[1], "--pc70-recover-fenced"));
+   if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
+     { for(int mode=0;mode<7;mode++) if(recovery_wire_case(mode))return 1; return 0; }
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -28,6 +28,64 @@
+ int input_fifo_owner_get(uint32_t item,const char *path,bool drain,uint64_t device,uint64_t inode,
+     const struct timespec *deadline,struct input_fifo_identity *out)
+ { (void)item;(void)path;(void)drain;(void)device;(void)inode;(void)deadline;(void)out;return -1; }
++
++/* No input backend in this ledger fixture: typed release effect paths deny. */
++int
++input_fifo_retire(uint32_t item, const char *path, uint64_t dev, uint64_t ino, uint64_t epoch,
++    const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  (void)item;
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)epoch;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_retire_transport(uint32_t item, const char *path, uint64_t dev, uint64_t ino, uint64_t epoch,
++    const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  return input_fifo_retire(item, path, dev, ino, epoch, deadline, out);
++}
++int
++input_fifo_retire_empty(const char *path, uint64_t dev, uint64_t ino, uint64_t epoch, const struct timespec *deadline,
++    struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)epoch;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_retire_recovered(
++    const char *path, uint64_t dev, uint64_t ino, const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_stage_reader(const char *path, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_stage_release(const char *path, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)out;
++  return -1;
++}
+ 
+ /* PC12 exercises the complete existing JSON API TU. Only the synchronous
+  * player command return is controlled here; parsing and ownership stay real.
+@@ -1026,6 +1084,12 @@
+ { return outputs_transport_state_get(id,out,busy); }
+ int player_transport_result_get(const char *token, struct output_transport_result *out)
+ { return outputs_transport_result_get(token,out); }
++int
++player_transport_release_confirm(uint64_t id, const char *token, const char *prepare, uint64_t revision, bool closed,
++    struct output_transport_result *out)
++{
++  return outputs_transport_release_confirm(id, token, prepare, revision, closed, out);
++}
+ int player_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
+ { return outputs_transport_pause_confirm(id,token,prepare,revision); }
+ 
+@@ -1687,11 +1751,15 @@
+   uint64_t unique=UINT64_MAX;
+   assert(start_unique_writer_fd(&r.native_process,fifo.st_dev,fifo.st_ino,&unique) && unique==(uint64_t)writer);
+   assert(start_all_writers_closed(&r.native_process,fifo.st_dev,fifo.st_ino)==0);
++  assert(!release_fifo_has_no_writers(fifo.st_dev, fifo.st_ino) && geteuid() == 999 && getegid() == 999);
+   assert(seteuid(0)==0 && setegid(0)==0 && geteuid()==0 && getegid()==0);
+   assert(write(release[1],"x",1)==1);
+   char closed;
+   assert(read(ready[0],&closed,1)==1 && closed=='c');
+   assert(start_all_writers_closed(&r.native_process,fifo.st_dev,fifo.st_ino)==1);
++  assert(setegid(999) == 0 && seteuid(999) == 0);
++  assert(release_fifo_has_no_writers(fifo.st_dev, fifo.st_ino) && geteuid() == 999 && getegid() == 999);
++  assert(seteuid(0) == 0 && setegid(0) == 0);
+   assert(write(release[1],"x",1)==1);close(release[1]);close(ready[0]);
+   assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   assert(unlink(path)==0);
+@@ -1773,6 +1841,8 @@
+   queue_strict_wire();
+   move_actual_writer_fd_proof();
+   exact_start_durable_gate();
++  manual_release_journal_upgrade_gate();
++  manual_release_strict_wire();
+   event_free(outputs_deferredev);
+   event_base_free(evbase_player);
+   sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -4,6 +4,264 @@
+ #include <signal.h>
+ #include <poll.h>
+ #include "../src/input.h"
++static int
++manual_release_recover_process_case(const char *database, bool fenced)
++{
++  assert(evthread_use_pthreads() == 0);
++  evbase_player = event_base_new();
++  assert(evbase_player);
++  cfg = cfg_init(toplvl_cfg, 0);
++  assert(cfg);
++  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", database);
++  cfg_setbool(cfg_getsec(cfg, "library"), "pipe_autostart", false);
++  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup() == 0);
++  start_journal_startup();
++  assert(!start_journal_fault && start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING);
++  pc70_real_speaker_persistence = true;
++  struct output_device saved = { .id = 1, .selected = true, .volume = 27, .name = "persisted-old-route" };
++  assert(db_speaker_save(&saved) == 0);
++  struct output_device *restored = calloc(1, sizeof(*restored));
++  assert(restored);
++  restored->id = 1;
++  restored->name = strdup("private-restored-output");
++  restored->type = OUTPUT_TYPE_AIRPLAY;
++  restored->type_name = "AirPlay";
++  restored->advertised = true;
++  assert(outputs_device_add(restored, false) == restored && !restored->selected && !restored->session);
++  puts("PASS actual SQLite selected1→outputs_device_add under startup journal gate→selected0/no session; no old route "
++       "authority restored");
++  assert(worker_init() == 0 && input_init() == 0);
++  struct output_transport_result receipt;
++  struct output_queue_writer proof = release_record.result.command.writer;
++  char token[33];
++  strcpy(token, release_record.result.command.token);
++  assert(outputs_transport_result_get(token, &receipt) == 0 && !receipt.release_terminal);
++  bool old_writer = start_proven_writer_fd(&proof.native_process, proof.writer_fd, proof.pipe_device, proof.pipe_inode);
++  assert(receipt.release_durable_pending == old_writer && receipt.release_gate_closed);
++  assert(!start_journal_payload_legacy_valid());
++  {
++    json_object *copy = json_tokener_parse(start_journal.payload), *manual, *writer;
++    char *saved = start_journal.payload;
++    if (json_object_object_get_ex(copy, "manual_release", &manual))
++      {
++	assert(json_object_object_get_ex(manual, "writer_proof", &writer));
++	json_object_object_add(writer, "source_epoch", json_object_new_uint64(proof.source_epoch + 1));
++	start_journal.payload = strdup(json_object_to_json_string_ext(copy, JSON_C_TO_STRING_PLAIN));
++	assert(start_journal.payload && !start_journal_payload_valid());
++	free(start_journal.payload);
++	start_journal.payload = saved;
++	assert(start_journal_payload_valid());
++      }
++    json_object_put(copy);
++  }
++  outputs_transport_release_recover_pending();
++  if (fenced)
++    assert(start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING
++           && outputs_start_gate_closed());
++  else
++    {
++      assert(!start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN
++             && start_retired_reopen_pending && outputs_start_gate_closed());
++      assert(strcmp(release_record.retired_c_process, release_record.result.identity.process));
++      assert(release_record.retired_epoch == 1); /* Fresh process, never imported old epoch. */
++      assert(outputs_start_retired_stage_reader() && start_retired_stage_ready);
++    }
++  input_deinit();
++  worker_deinit();
++  db_perthread_deinit();
++  db_deinit();
++  cfg_free(cfg);
++  cfg = NULL;
++  puts(fenced ? "PASS fresh C process pending release remains fenced by actual old/foreign writer"
++              : "PASS fresh C process retires pending journal using exact closed writers and fresh empty input epoch; "
++                "terminal stages reader, no old grant");
++  return 0;
++}
++static void
++manual_release_exec_recovery(const char *database, bool fenced)
++{
++  int status;
++  pid_t child = fork();
++  assert(child >= 0);
++  if (!child)
++    {
++      execl("/work/src/airplay_callback_owner", "airplay_callback_owner",
++          fenced ? "--pc70-recover-fenced" : "--pc70-recover-terminal", database, (char *)NULL);
++      _exit(127);
++    }
++  assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++}
++
++/* Actual FIFO/AP2 release path, including a read of the consumed pending
++ * operation after lost-ACK scheduling, all-FD refusal and late confirmation. */
++static void
++manual_release_actual_case(struct output_device *d, const struct output_native_owner *owner, int *writer)
++{
++  struct output_transport_request r = { .device_id = d->id, .bound = true, .native_revision = 900, .percent = -1 };
++  struct output_transport_result prepared, committed, result;
++  struct stat fifo;
++  r.native_owner = *owner;
++  strcpy(r.action, "release");
++  memset(r.native_prepare_id, '7', 32);
++  memset(r.args_digest, '8', 64);
++  assert(fstat(*writer, &fifo) == 0);
++  r.writer.writer_fd = *writer;
++  r.writer.pipe_device = fifo.st_dev;
++  r.writer.pipe_inode = fifo.st_ino;
++  r.writer.native_process.pid = getpid();
++  assert(start_boot_id(r.writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &r.writer.native_process.proc_start_ticks) == 1);
++  r.writer.source_epoch = start_active ? start_active->result.writer_source_epoch : 0;
++  r.writer.open_generation = 1;
++  strcpy(r.writer.input_path_digest, transport_input_path_digest);
++  {
++    struct output_transport_identity diagnostic;
++    uint64_t epoch = 0;
++    int identity = transport_identity_get(d->id, &diagnostic);
++    fprintf(stderr,
++        "RELEASE_DIAGNOSTIC valid=%d available=%d identity=%d writer=%d owned=%d absent=%d contexts=%d epoch=%" PRIu64
++        " source=%" PRIu64 " active=%" PRIu64 "\n",
++        native_owner_valid(owner, d->id), transport_bound_available(d->id, owner, r.native_revision), identity,
++        identity == 0 && queue_writer_current(&r.writer, &diagnostic, &epoch),
++        identity == 0 && start_route_owned(owner, &diagnostic), start_route_clean_absent(), start_contexts_drained(),
++        epoch, r.writer.source_epoch, start_active ? start_active->result.writer_source_epoch : 0);
++  }
++  {
++    struct input_fifo_identity owned = { 0 }, unchanged = { 0 };
++    struct timespec limit;
++    clock_gettime(CLOCK_MONOTONIC, &limit);
++    limit.tv_sec++;
++    struct db_queue_item *item = db_queue_fetch_byitemid(transport_input_item);
++    assert(item && item->path);
++    assert(input_fifo_owner_get(item->id, item->path, false, 0, 0, &limit, &owned) == 0);
++    assert(input_fifo_retire(item->id, item->path, owned.device, owned.inode, 0, &limit, &unchanged) < 0);
++    assert(input_fifo_retire_transport(
++               item->id, item->path, owned.device, owned.inode + 1, owned.epoch, &limit, &unchanged)
++           < 0);
++    assert(input_fifo_retire_transport(
++               item->id + 1, item->path, owned.device, owned.inode, owned.epoch, &limit, &unchanged)
++           < 0);
++    if (owned.epoch)
++      assert(input_fifo_retire_transport(item->id, item->path, owned.device, owned.inode, 0, &limit, &unchanged) < 0);
++    assert(input_fifo_owner_get(item->id, item->path, false, 0, 0, &limit, &unchanged) == 0
++           && unchanged.epoch == owned.epoch);
++    free_queue_item(item, 0);
++  }
++  struct output_device foreign = { 0 };
++  struct output_device *prior_list = outputs_device_list;
++  foreign.next = prior_list;
++  foreign.id = 999;
++  foreign.attention_restart_pending = true;
++  outputs_device_list = &foreign;
++  assert(outputs_transport_prepare(&r, &prepared) < 0 && !outputs_start_gate_closed());
++  foreign.attention_restart_pending = false;
++  foreign.attention_restoring = true;
++  assert(outputs_transport_prepare(&r, &prepared) < 0 && !outputs_start_gate_closed());
++  outputs_device_list = prior_list;
++  assert(outputs_transport_prepare(&r, &prepared) == 0 && !prepared.release_gate_closed
++         && !prepared.release_durable_pending);
++  {
++    struct output_transport_request held = prepared.command;
++    struct output_transport_result refused;
++    char journal[33];
++    strcpy(journal, start_journal.token);
++    strcpy(held.expected_input_path_digest, prepared.identity.input_path_digest);
++    transport_selection_revision++;
++    assert(outputs_transport_commit(&held, &refused) < 0 && !outputs_start_gate_closed()
++           && !strcmp(journal, start_journal.token));
++    transport_selection_revision--;
++    memset(r.native_prepare_id, '6', 32);
++    assert(outputs_transport_prepare(&r, &prepared) == 0 && !prepared.release_gate_closed);
++  }
++  r = prepared.command;
++  strcpy(r.expected_input_path_digest, prepared.identity.input_path_digest);
++  if (getenv("PC70_EXPIRE_AFTER_FULL"))
++    fixture_expire_manual_post_full = true;
++  assert(outputs_transport_commit(&r, &committed) == 0 && committed.release_gate_closed
++         && committed.release_durable_pending);
++  if (getenv("PC70_EXPIRE_AFTER_FULL"))
++    assert(!fixture_expire_manual_post_full && !committed.remaining_ms);
++  assert(outputs_transport_commit(&r, &result) < 0); /* Never retry consumed admission. */
++  assert(outputs_transport_result_get(r.token, &result) == 0 && result.release_durable_pending
++         && result.release_gate_closed && transport_identity_equal(&result.identity, &prepared.identity));
++  if (getenv("PC70_RELEASE_CRASH"))
++    {
++      const char *database = cfg_getstr(cfg_getsec(cfg, "general"), "db_path");
++      manual_release_exec_recovery(database, true); /* Exact old writer still open. */
++      close(*writer);
++      *writer = -1;
++      start_retire_sessions();
++      outputs_device_deselect(d);
++      input_deinit();
++      int signal[2], ready[2];
++      assert(pipe(signal) == 0 && pipe(ready) == 0);
++      pid_t foreign = fork();
++      assert(foreign >= 0);
++      if (!foreign)
++	{
++	  close(signal[1]);
++	  close(ready[0]);
++	  int fd = open(release_operation.record.input_path, O_RDWR | O_NONBLOCK);
++	  assert(fd >= 0);
++	  assert(write(ready[1], "r", 1) == 1);
++	  char b;
++	  assert(read(signal[0], &b, 1) == 1);
++	  close(fd);
++	  _exit(0);
++	}
++      close(signal[0]);
++      close(ready[1]);
++      char byte;
++      assert(read(ready[0], &byte, 1) == 1);
++      close(ready[0]);
++      manual_release_exec_recovery(database, true); /* Old process closed, foreign new writer remains. */
++      assert(write(signal[1], "c", 1) == 1);
++      close(signal[1]);
++      int status;
++      assert(waitpid(foreign, &status, 0) == foreign && WIFEXITED(status));
++      manual_release_exec_recovery(database, false); /* Actual exec: fresh C input epoch starts at zero. */
++      /* This parent modeled the crashed C owner and already joined its input.
++       * The successful exec child owns cold-start recovery; do not rebuild and
++       * tear down a second input owner under the old stopped fixture cmdbase. */
++      puts("PASS actual exec pending-release recovery series complete");
++      fflush(NULL);
++      exit(0);
++    }
++  assert(outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result) == 0
++         && !result.release_terminal);
++  assert(outputs_start_gate_closed() && d->selected); /* An open FD cannot be lied away by CloseDone. */
++  close(*writer);
++  *writer = -1;
++  release_operation.expiry.tv_sec -= 20;
++  int confirm
++      = outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result);
++  fprintf(stderr,
++      "RELEASE_CONFIRM rc=%d terminal=%d state=%d fault=%d route=%d writers=%d selected=%d session=%p epoch=%" PRIu64
++      " oldepoch=%" PRIu64 " staged=%d input=%" PRIu64 " oldinput=%" PRIu64 "\n",
++      confirm, result.release_terminal, release_operation.record.retirement, start_journal_fault,
++      release_route_retirable(&release_operation),
++      start_all_writers_closed(&r.writer.native_process, r.writer.pipe_device, r.writer.pipe_inode), d->selected,
++      d->session, d->session_epoch, prepared.identity.session_epoch, start_retired_stage_ready,
++      release_operation.record.retired_epoch, release_operation.record.admitted_epoch);
++  fprintf(stderr,
++      "RELEASE_ROUTE current=%" PRIu64 "/%" PRIu64 " old=%" PRIu64 "/%" PRIu64 " incarnation=%" PRIu64 "/%" PRIu64
++      " busy=%d lease=%" PRIu64 " retiring=%d restart=%d restoring=%d pin=%p volume=%d undrained=%d contexts=%d\n",
++      d->route_revision, transport_selection_revision, prepared.identity.route_revision,
++      prepared.identity.selection_revision, d->incarnation, prepared.identity.device_incarnation, d->busy,
++      d->attention_lease, d->attention_retiring_session, d->attention_restart_pending, d->attention_restoring,
++      (void *)transport_pin, room_volume_pin_busy(), room_volume_undrained(), start_contexts_drained());
++  assert(confirm == 0 && result.release_terminal);
++  assert(result.release_contexts_drained && outputs_start_gate_closed() && !d->session && !d->selected && !start_active
++         && !transport_custody_busy() && start_retired_stage_ready);
++  uint64_t selection = transport_selection_revision;
++  assert(outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result) == 0
++         && result.release_terminal && selection == transport_selection_revision);
++  puts("PASS manual release actual FIFO/AP2 prepare→durable closed gate→lostACK readonly→openFD denial→late "
++       "exactClose/drain/terminal/detach; duplicate confirm no effect");
++}
++
+ struct start_fifo_writer {int fd;ssize_t written;};
+ static void *start_fifo_finish(void *arg)
+ {struct start_fifo_writer *w=arg;char bytes[4096]={0};w->written=write(w->fd,bytes,sizeof(bytes));return NULL;}
+@@ -205,7 +463,10 @@
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+ {
+   struct recovery_wire_fixture *f=active_recovery_wire;
+-  if(!f || (f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25) || device!=f->device || state!=OUTPUT_STATE_CONNECTED || !device->session)
++  if (!f
++      || (f->mode != 16 && f->mode != 17 && f->mode != 19 && f->mode != 20 && f->mode != 22 && f->mode != 23
++          && f->mode != 24 && f->mode != 25 && !(f->mode == 29 && getenv("PC70_RELEASE_COMPOSE")))
++      || device != f->device || state != OUTPUT_STATE_CONNECTED || !device->session)
+     {if(f)recovery_wire_fail(f,"MOVE old actual AP2 route did not connect");return;}
+   f->phase=1;event_base_loopbreak(f->base);
+ }
+@@ -797,11 +1058,13 @@
+ /* The existing real AP2/FIFO fixture also accepts the actual Native test
+  * process over loopback. Only the HTTP backend adapter is test code: the linked
+  * strict production handler and synchronous player owner execute every step. */
++static int pc70_ordinary_keeper = -1;
+ struct native_start_wire {
+   struct recovery_wire_fixture *fixture;
+   struct event_base *http_base;
+   struct evhttp *http;
+   atomic_bool done,completed,retired;
++  atomic_bool reset_audio;
+   atomic_int audio_packets;
+   bool decoded_audio_packet, nonzero_pcm_input;
+   uint16_t last_audio_seq;
+@@ -878,52 +1141,105 @@
+   if(!strcmp(uri,"/fixture/rtp") && wire->fixture->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
+     evbuffer_add_printf(response,"{\"audio_packets\":%d}",atomic_load(&wire->audio_packets));
+     evhttp_send_reply(request,200,"OK",response);
+-  }else if(!strcmp(uri,"/fixture/done")){
+-    evbuffer_add_printf(response,"{}");
+-    evhttp_send_reply(request,200,"OK",response);
+-    atomic_store(&wire->done,true);
+-  }else{
+-    char *path=strdup(uri),*rest=path,*part;
+-    struct httpd_request actual={.in_body=evhttp_request_get_input_buffer(request),.out_body=response};
+-    unsigned count=0;int status=404;
+-    assert(path);
+-    while((part=strsep(&rest,"/")) && count<ARRAY_SIZE(actual.path_parts)-1)
+-      if(*part)actual.path_parts[count++]=part;
+-    bool retirement=count>=6 && !strcmp(actual.path_parts[4],"retire");
+-    bool result=retirement ? count==7 && !strcmp(actual.path_parts[5],"result")
+-      : count==6 && !strcmp(actual.path_parts[4],"result");
+-    if((count==5 || result || (retirement && count==6)) && !strcmp(actual.path_parts[0],"api")
+-        && !strcmp(actual.path_parts[1],"outputs") && !strcmp(actual.path_parts[2],"1")
+-        && !strcmp(actual.path_parts[3],"start")
+-        && evhttp_request_get_command(request)==(result?EVHTTP_REQ_GET:EVHTTP_REQ_POST)){
+-      const char *pattern=retirement ? (result?"/retire/result/":"/retire/(prepare|")
+-        : (result?"/start/result/":"/start/(state|");
+-      for(struct httpd_uri_map *route=httpd_jsonapi.handlers;route->regexp;route++){
+-        if(strstr(route->regexp,pattern)){
+-          status=route->handler(&actual);break;
+-        }
+-      }
+-    }
+-    if(count==5 && !strcmp(actual.path_parts[0],"api") && !strcmp(actual.path_parts[1],"outputs")
+-        && !strcmp(actual.path_parts[2],"1") && !strcmp(actual.path_parts[3],"transport")
+-        && evhttp_request_get_command(request)==EVHTTP_REQ_POST){
+-      const char *pattern=!strcmp(actual.path_parts[4],"bound-state") ? "/transport/bound-state$"
+-        : !strcmp(actual.path_parts[4],"bound-pause-confirm") ? "/transport/bound-pause-confirm$"
+-        : (!strcmp(actual.path_parts[4],"bound-prepare") || !strcmp(actual.path_parts[4],"bound-commit"))
+-          ? "/transport/bound-(prepare|commit)$" : NULL;
+-      for(struct httpd_uri_map *route=httpd_jsonapi.handlers;pattern && route->regexp;route++){
+-        if(strstr(route->regexp,pattern)){status=route->handler(&actual);break;}
+-      }
+-    }
+-    if(status==200 && count==5 && !strcmp(actual.path_parts[4],"complete"))
+-      atomic_store(&wire->completed,true);
+-    if(status==200 && retirement && count==6 && !strcmp(actual.path_parts[5],"complete"))
+-      atomic_store(&wire->retired,true);
+-    fprintf(stderr,"ACTUAL Native→C %s status=%d body=%.*s\n",uri,status,
+-      (int)evbuffer_get_length(response),(char *)evbuffer_pullup(response,-1));
+-    evhttp_send_reply(request,status,status==200?"OK":"Rejected",response);
+-    free(path);
+-  }
++    }
++  else if (!strcmp(uri, "/fixture/ordinary-writer-ready") && getenv("PC70_RELEASE_COMPOSE")
++           && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++           && pc70_ordinary_keeper >= 0)
++    {
++      close(pc70_ordinary_keeper);
++      pc70_ordinary_keeper = -1;
++      evbuffer_add_printf(response, "{}");
++      evhttp_send_reply(request, 200, "OK", response);
++    }
++  else if (!strcmp(uri, "/fixture/done"))
++    {
++      evbuffer_add_printf(response, "{}");
++      evhttp_send_reply(request, 200, "OK", response);
++      atomic_store(&wire->done, true);
++    }
++  else
++    {
++      char *path = strdup(uri), *rest = path, *part;
++      struct httpd_request actual = { .in_body = evhttp_request_get_input_buffer(request), .out_body = response };
++      unsigned count = 0;
++      int status = 404;
++      assert(path);
++      while ((part = strsep(&rest, "/")) && count < ARRAY_SIZE(actual.path_parts) - 1)
++	if (*part)
++	  actual.path_parts[count++] = part;
++      if (getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && count == 5
++          && !strcmp(actual.path_parts[3], "start") && !strcmp(actual.path_parts[4], "commit"))
++	{
++	  atomic_store(&wire->completed, false);
++	  atomic_store(&wire->reset_audio, true);
++	}
++      bool move_fixture = getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move");
++      bool output_id
++          = count > 2 && (!strcmp(actual.path_parts[2], "1") || (move_fixture && !strcmp(actual.path_parts[2], "2")));
++      bool move_request = count > 3 && move_fixture && !strcmp(actual.path_parts[3], "move");
++      if (move_request && count == 5 && !strcmp(actual.path_parts[4], "commit"))
++	{
++	  wire->fixture->device = outputs_device_get(2);
++	  assert(wire->fixture->device);
++	  wire->fixture->phase = 2;
++	}
++      bool retirement = count >= 6 && !strcmp(actual.path_parts[4], "retire");
++      bool result = retirement ? count == 7 && !strcmp(actual.path_parts[5], "result")
++                               : count == 6 && !strcmp(actual.path_parts[4], "result");
++      if ((count == 5 || result || (retirement && count == 6)) && !strcmp(actual.path_parts[0], "api")
++          && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && (!strcmp(actual.path_parts[3], "start") || move_request)
++          && evhttp_request_get_command(request) == (result ? EVHTTP_REQ_GET : EVHTTP_REQ_POST))
++	{
++	  const char *pattern = retirement ? (result ? "/retire/result/" : "/retire/(prepare|")
++	                                   : (move_request ? (result ? "/move/result/" : "/move/(state|")
++	                                                   : (result ? "/start/result/" : "/start/(state|"));
++	  for (struct httpd_uri_map *route = httpd_jsonapi.handlers; route->regexp; route++)
++	    {
++	      if (strstr(route->regexp, pattern))
++		{
++		  status = route->handler(&actual);
++		  break;
++		}
++	    }
++	}
++      if (count == 5 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && !strcmp(actual.path_parts[3], "transport") && evhttp_request_get_command(request) == EVHTTP_REQ_POST)
++	{
++	  const char *pattern
++	      = !strcmp(actual.path_parts[4], "bound-state")             ? "/transport/bound-state$"
++	        : !strcmp(actual.path_parts[4], "bound-pause-confirm")   ? "/transport/bound-pause-confirm$"
++	        : !strcmp(actual.path_parts[4], "bound-release-confirm") ? "/transport/bound-release-confirm$"
++	        : (!strcmp(actual.path_parts[4], "bound-prepare") || !strcmp(actual.path_parts[4], "bound-commit"))
++	            ? "/transport/bound-(prepare|commit)$"
++	            : NULL;
++	  for (struct httpd_uri_map *route = httpd_jsonapi.handlers; pattern && route->regexp; route++)
++	    {
++	      if (strstr(route->regexp, pattern))
++		{
++		  status = route->handler(&actual);
++		  break;
++		}
++	    }
++	}
++      if (count == 6 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && !strcmp(actual.path_parts[3], "transport") && !strcmp(actual.path_parts[4], "bound-result")
++          && evhttp_request_get_command(request) == EVHTTP_REQ_GET)
++	for (struct httpd_uri_map *route = httpd_jsonapi.handlers; route->regexp; route++)
++	  if (strstr(route->regexp, "/transport/bound-result/"))
++	    {
++	      status = route->handler(&actual);
++	      break;
++	    }
++      if (status == 200 && count == 5 && !strcmp(actual.path_parts[4], "complete"))
++	atomic_store(&wire->completed, true);
++      if (status == 200 && retirement && count == 6 && !strcmp(actual.path_parts[5], "complete"))
++	atomic_store(&wire->retired, true);
++      fprintf(stderr, "ACTUAL Native→C %s status=%d body=%.*s\n", uri, status, (int)evbuffer_get_length(response),
++          (char *)evbuffer_pullup(response, -1));
++      evhttp_send_reply(request, status, status == 200 ? "OK" : "Rejected", response);
++      free(path);
++    }
+   evbuffer_free(response);
+ }
+ static void *native_start_http_thread(void *arg)
+@@ -936,11 +1252,60 @@
+ {
+   struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
+   struct timeval soon={0,1000};(void)fd;(void)events;
++  if (atomic_exchange(&wire->reset_audio, false))
++    {
++      unsigned char old[4096];
++      while (recv(f->udp_fd, old, sizeof(old), MSG_DONTWAIT) > 0)
++	{
++	}
++      wire->decoded_audio_packet = false;
++      wire->nonzero_pcm_input = false;
++      wire->last_audio_seq = 0;
++      wire->last_audio_timestamp = 0;
++      atomic_store(&wire->audio_packets, 0);
++    }
+   if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
+     native_start_audio_poll(wire);
+     if(f->failed)return;
+   }
+   if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
++  if (getenv("PC70_RELEASE_COMPOSE"))
++    {
++      bool ordinary = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary");
++      if (getenv("PC70_RELEASE_NEXT_START"))
++	{
++	  if (!release_operation.terminal || !start_active || start_active->result.phase != OUTPUT_START_COMPLETED
++	      || !f->device->selected || !f->device->session || outputs_start_gate_closed()
++	      || start_journal_retirement_outcome != OUTPUT_RETIRE_NONE
++	      || strcmp(start_journal.token, start_active->result.command.token)
++	      || !strcmp(start_journal.token, release_operation.predecessor.completed_token)
++	      || !strcmp(start_journal.token, release_operation.record.result.command.token))
++	    {
++	      recovery_wire_fail(f, "manual release did not admit a genuine managed next START");
++	      return;
++	    }
++	  fprintf(stderr,
++	      "PASS actual Native+C manual release class=%s then managed fresh authenticated player/new writer genuine "
++	      "public START; old manual token not adopted\n",
++	      getenv("PC70_RELEASE_COMPOSE"));
++	  event_base_loopbreak(f->base);
++	  return;
++	}
++      if ((ordinary ? atomic_load(&wire->completed) : !atomic_load(&wire->completed)) || !release_operation.terminal
++          || start_active || outputs_start_source_owned()
++          || start_journal_retirement_outcome != OUTPUT_RETIRE_RETIRED_KNOWN || !outputs_start_gate_closed()
++          || !start_retired_stage_ready || f->device->selected || f->device->session || pc70_ordinary_keeper >= 0)
++	{
++	  recovery_wire_fail(f, "actual Native manual release did not durably retire exact C owner");
++	  return;
++	}
++      fprintf(stderr,
++          "PASS actual Native+C manual release class=%s durable closed gate→real worker Close→exact FIFO/AP2 "
++          "drain→terminal/reopen staging; no physical audio claim\n",
++          getenv("PC70_RELEASE_COMPOSE"));
++      event_base_loopbreak(f->base);
++      return;
++    }
+   if(getenv("PC_NATIVE_START_EXPECT_PAUSE_RETAINED")){
+     struct airplay_session *session=f->device->session;
+     if(!atomic_load(&wire->completed) || !start_active || start_active->result.phase!=OUTPUT_START_COMPLETED
+@@ -1050,6 +1415,52 @@
+     player_tick_interval.tv_nsec=50000000;
+     pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
+     pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++    if (getenv("PC70_RELEASE_COMPOSE")
++        && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move")))
++      {
++	outputs_device_select(f.device, -1);
++	f.deadline = evtimer_new(f.base, recovery_wire_deadline, &f);
++	assert(f.deadline && !evtimer_add(f.deadline, &bound));
++	assert(outputs_device_start(f.device, move_wire_old_connected, false) == 1);
++	event_base_dispatch(f.base);
++	assert(!f.failed && f.phase == 1 && f.device->session && f.device->selected);
++	event_free(f.deadline);
++	f.deadline = NULL;
++	pc70_ordinary_keeper = open(fifo, O_RDWR | O_NONBLOCK);
++	assert(pc70_ordinary_keeper >= 0);
++	clock_gettime(CLOCK_MONOTONIC, &deadline);
++	deadline.tv_sec += 4;
++	assert(input_start_fifo_exact(item, fifo, &deadline) >= 0);
++	outputs_transport_input_changed(item, fifo, true);
++	struct db_queue_item *playing = db_queue_fetch_byitemid(item);
++	assert(playing);
++	session_start(source_create(playing, 0));
++	free_queue_item(playing, 0);
++	session_update_read_start(0);
++	struct media_quality *quality = malloc(sizeof(*quality));
++	*quality = (struct media_quality){ 44100, 16, 2 };
++	session_update_read_quality(quality);
++	session_update_read(2205);
++	player_state = PLAY_PLAYING;
++	assert(!start_active && !start_journal.token[0] && start_route_clean_absent());
++      }
++    if (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++      {
++	struct output_device *target = calloc(1, sizeof(*target));
++	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
++	assert(target && target_extra);
++	target->id = 2;
++	target->name = strdup("private-move-target");
++	target->type = OUTPUT_TYPE_AIRPLAY;
++	target->type_name = "AirPlay";
++	target->advertised = true;
++	target->quality = (struct media_quality){ 44100, 16, 2 };
++	target->v4_address = strdup("127.0.0.1");
++	target->v4_port = ntohs(address.sin_port);
++	target->extra_device_info = target_extra;
++	target_extra->mdns_name = strdup(target->name);
++	assert(outputs_device_add(target, false) == target && outputs_device_volume_register(target, 65, -1) == 0);
++      }
+     native_start_wire_run(&f,fifo);goto cleanup;
+   }
+   if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
+@@ -1310,6 +1721,11 @@
+     assert(outputs_start_commit(r,&observed)==0 && observed.phase==OUTPUT_START_REJECTED
+       && !observed.possible_effect && !outputs_start_gate_closed());
+     assert(!strcmp(start_journal.token,completed.token));
++    if (mode == 17 && getenv("PC70_RELEASE"))
++      {
++	manual_release_actual_case(target, &fresh_owner, &writer);
++	goto cleanup;
++      }
+     if(mode==17 || mode==22 || mode==23){
+       struct output_retirement_request retire={.device_id=2,.move_existing_session=true,
+         .native_process=completed.native_process,.writer_source_epoch=completed.writer_source_epoch,
+@@ -1468,6 +1884,11 @@
+       puts("PASS delayed retired MOVE cancel cannot close gate or retire/change fresh normal AP2 route");
+       event_del(f.deadline);commands_base_free(cmdbase);cmdbase=NULL;
+       event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);
++      if (getenv("PC70_RELEASE_ORDINARY"))
++	{
++	  manual_release_actual_case(target, &fresh_owner, &replacement);
++	  goto cleanup;
++	}
+       close(replacement);
+       puts("PASS actual MOVE FULL retirement → exact normal autostart public command → Connect prime35 → one real selected AP2 route; missing input/unrelated custody denied; terminal journal retained, no START ownership credit");
+       goto cleanup;
+@@ -1709,6 +2130,11 @@
+           && !busy && owned && !absent);
+       }
+     }
++    if (getenv("PC70_RELEASE"))
++      {
++	manual_release_actual_case(f.device, &same_app, &writer);
++	goto cleanup;
++      }
+     same_app.alias_revision++;
+     assert(!outputs_start_bound_owner_current(&same_app,&same_route,false));
+     struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -222,3 +222,179 @@
+   clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);
+   puts("PASS file-backed C successors: live old Native rejects fresh START; actual old Native death with replaced saved PID namespace retains valid quarantine and denies fresh START; same namespace actual death or different saved kernel boot permits guarded START prepare/commit without generic selection; conditional/FULL journal failures reject");
+ }
++
++/* New-purpose upgrade gate: the old parser must quarantine this record, while
++ * the new parser retains pending across owner replacement without grants. */
++static void
++manual_release_journal_upgrade_gate(void)
++{
++  struct transport_release_record r = { 0 };
++  struct output_transport_request *c = &r.result.command;
++  struct db_start_guard saved = { 0 }, next = { 0 };
++  json_object *o, *v;
++  const char *serialized;
++  char *old_payload;
++  bool old_fault = start_journal_fault;
++  assert(db_start_guard_load(&saved) == 1);
++  strcpy(c->token, "11111111111111111111111111111111");
++  strcpy(c->native_prepare_id, "22222222222222222222222222222222");
++  memset(c->args_digest, 'a', 64);
++  c->args_digest[64] = 0;
++  c->native_revision = 1;
++  c->native_owner = burst_owner();
++  c->writer.native_process.pid = getpid();
++  assert(start_boot_id(c->writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &c->writer.native_process.proc_start_ticks) == 1);
++  c->writer.writer_fd = 3;
++  c->writer.source_epoch = 1;
++  c->writer.open_generation = 1;
++  memset(c->writer.input_path_digest, 'b', 64);
++  c->writer.input_path_digest[64] = 0;
++  c->writer.pipe_device = 1;
++  c->writer.pipe_inode = 2;
++  strcpy(r.result.identity.process, outputs_process);
++  strcpy(r.result.identity.input_path_digest, c->writer.input_path_digest);
++  r.result.identity.device_id = 1;
++  r.result.identity.device_incarnation = 1;
++  r.result.identity.session_epoch = 1;
++  r.result.identity.route_revision = 1;
++  r.result.identity.selection_revision = 1;
++  r.result.identity.input_generation = 1;
++  r.result.identity.input_item_id = 1;
++  strcpy(r.input_path, "/tmp/ordinary-native-fifo");
++  r.admitted_epoch = 9;
++  r.retirement = OUTPUT_RETIRE_PENDING;
++  assert(start_pid_namespace(&r.pidns_device, &r.pidns_inode));
++  o = release_journal_json(&r);
++  serialized = json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN);
++  strcpy(next.token, c->token);
++  strcpy(next.c_process, outputs_process);
++  strcpy(next.boot_id, c->writer.native_process.boot_id);
++  next.pid = getpid();
++  next.proc_start_ticks = c->writer.native_process.proc_start_ticks;
++  next.payload = (char *)serialized;
++  assert(db_start_guard_save(&saved, &next) == 0);
++  start_journal_startup();
++  assert(!start_journal_fault && start_startup_quarantine && outputs_start_gate_closed());
++  assert(start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING && !start_route_clean_absent());
++  assert(!start_journal_payload_legacy_valid()); /* Actual prior parser body, no compatibility fiction. */
++  {
++    char *saved = start_journal.payload;
++    json_object *missing = json_tokener_parse(saved);
++    json_object_object_del(missing, "admitted_input_epoch");
++    start_journal.payload = strdup(json_object_to_json_string_ext(missing, JSON_C_TO_STRING_PLAIN));
++    assert(start_journal.payload && !start_journal_payload_valid());
++    free(start_journal.payload);
++    json_object_put(missing);
++    start_journal.payload = saved;
++    assert(start_journal_payload_valid());
++    struct transport_release_record zero = r;
++    zero.admitted_epoch = 0;
++    json_object *present = release_journal_json(&zero);
++    start_journal.payload = strdup(json_object_to_json_string_ext(present, JSON_C_TO_STRING_PLAIN));
++    assert(start_journal.payload && start_journal_payload_valid() && release_record.admitted_epoch == 0);
++    free(start_journal.payload);
++    json_object_put(present);
++    start_journal.payload = saved;
++    assert(start_journal_payload_valid());
++  }
++  json_object_object_add(o, "retirement_outcome", json_object_new_string("retired_known"));
++  json_object_object_add(o, "retired_input_epoch", json_object_new_uint64(10));
++  json_object_object_add(o, "retired_c_process", json_object_new_string(outputs_process));
++  serialized = json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN);
++  next.payload = (char *)serialized;
++  assert(db_start_guard_save(&start_journal, &next) == 0);
++  start_journal_startup();
++  assert(
++      !start_journal_fault && !start_startup_quarantine && start_retired_reopen_pending && outputs_start_gate_closed());
++  assert(!start_journal_payload_legacy_valid()); /* Terminal still requires forward recovery. */
++  old_payload = start_journal.payload;
++  start_journal.payload = strdup(old_payload);
++  assert(start_journal.payload);
++  v = json_object_new_int(1);
++  json_object_object_add(o, "unrecognized", v);
++  free(start_journal.payload);
++  start_journal.payload = strdup(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
++  assert(!start_journal_payload_valid());
++  free(start_journal.payload);
++  start_journal.payload = old_payload;
++  assert(db_start_guard_save(&start_journal, &saved) == 0);
++  start_journal_startup();
++  start_journal_fault = old_fault;
++  free(saved.payload);
++  json_object_put(o);
++  puts("PASS manual release typed journal pending/terminal survive startup; actual legacy parser rejects both; unknown "
++       "fields reject; no START token fabricated");
++}
++
++static void
++manual_release_strict_wire(void)
++{
++  struct output_transport_result r = { 0 };
++  struct output_transport_request *c = &r.command;
++  struct httpd_request h = { 0 };
++  json_object *body = json_object_new_object(), *reply;
++  char *raw;
++  h.in_body = evbuffer_new();
++  h.out_body = evbuffer_new();
++  h.path_parts[2] = "1";
++  h.path_parts[4] = "bound-prepare";
++  c->native_owner = burst_owner();
++  c->native_revision = 1;
++  memset(c->native_prepare_id, 'a', 32);
++  memset(c->args_digest, 'b', 64);
++  c->writer.native_process.pid = getpid();
++  assert(start_boot_id(c->writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &c->writer.native_process.proc_start_ticks) == 1);
++  c->writer.open_generation = 1;
++  memset(c->writer.input_path_digest, 'c', 64);
++  c->writer.pipe_device = 1;
++  c->writer.pipe_inode = 2;
++  json_object_object_add(body, "native_prepare_id", json_object_new_string(c->native_prepare_id));
++  json_object_object_add(body, "args_digest", json_object_new_string(c->args_digest));
++  json_object_object_add(body, "action", json_object_new_string("release"));
++  transport_native_binding_json(body, &c->native_owner, c->native_revision);
++  json_object_object_add(body, "purpose", json_object_new_string("manual_release_v1"));
++  json_object_object_add(body, "writer_proof", queue_writer_json(&c->writer));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(raw);
++  evbuffer_add(h.in_body, raw, strlen(raw));
++  assert(jsonapi_reply_transport_write(&h)
++         == 409); /* Valid ordinary source_epoch0/fd0 reaches owner, inert input denies. */
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s{}", raw);
++  assert(jsonapi_reply_transport_write(&h) == HTTP_BADREQUEST);
++  json_object_object_add(body, "purpose", json_object_new_string("queue_occurrence_v1"));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_write(&h) == HTTP_BADREQUEST);
++  json_object_put(body);
++  free(raw);
++  body = json_object_new_object();
++  json_object_object_add(body, "token", json_object_new_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
++  json_object_object_add(body, "native_prepare_id", json_object_new_string(c->native_prepare_id));
++  attention_json_u64(body, "native_revision", 1);
++  json_object_object_add(body, "native_close_done", json_object_new_boolean(false));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == HTTP_BADREQUEST);
++  json_object_object_add(body, "native_close_done", json_object_new_boolean(true));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == 409);
++  json_object_object_add(body, "writer_proof", queue_writer_json(&c->writer));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == HTTP_BADREQUEST);
++  json_object_put(body);
++  reply = transport_release_json(&r, false, true);
++  assert(json_object_object_length(reply) == 16);
++  json_object_put(reply);
++  reply = transport_release_json(&r, true, true);
++  assert(json_object_object_length(reply) == 15);
++  json_object_put(reply);
++  evbuffer_free(h.in_body);
++  evbuffer_free(h.out_body);
++  puts("PASS manual release strict prepare7/commit9 and confirm4; source_epoch0/fd0 valid, "
++       "wrongpurpose/trailing/CloseDonefalse/proofreplay denied; typedACK16/result15");
++}

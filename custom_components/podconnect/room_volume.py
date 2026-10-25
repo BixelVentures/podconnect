@@ -122,7 +122,7 @@ class RoomVolume:
             hass, entry, target, context["room_id"], context["homepod_id"]
         )
 
-    async def read(self, hass, entry, target, room, homepod):
+    async def read(self, hass, entry, target, room, homepod, *, passive=False):
         from .commands import CommandRejected
 
         context = {"room_id": room, "homepod_id": homepod}
@@ -165,7 +165,9 @@ class RoomVolume:
             "native": copy.deepcopy(state["native"]),
             "route": copy.deepcopy(state["route"]),
             "volume_state": copy.deepcopy(state["volume_state"]),
-            "actions": state["actions"] if latest["status"] == "ready" else [],
+            "actions": state["actions"]
+            if passive or latest["status"] == "ready"
+            else [],
             "volume_percent": None,
             "track_play_supported": False,
             "physical_result_verified": False,

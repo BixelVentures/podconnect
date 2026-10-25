@@ -1,0 +1,73 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1082,10 +1082,19 @@
+   unsigned char packet[4096];ssize_t length;
+   while((length=recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT))>0){
+     if(!native_start_audio_rtp(packet,length))continue;
+-    if(!atomic_load(&wire->completed) || f->volumes<1 || outputs_start_gate_closed() || !start_active
+-        || start_active->result.phase!=OUTPUT_START_COMPLETED){
+-      recovery_wire_fail(f,"audio RTP crossed closed START gate");return;
+-    }
++    bool ordinary
++        = getenv("PC70_RELEASE_COMPOSE")
++          && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++          && !start_active && start_route_clean_absent() && player_state == PLAY_PLAYING && f->device
++          && f->device->selected && f->device->session;
++    if (f->volumes < 1 || outputs_start_gate_closed()
++        || (!ordinary
++            && (!atomic_load(&wire->completed) || !start_active
++                || start_active->result.phase != OUTPUT_START_COMPLETED)))
++      {
++	recovery_wire_fail(f, "audio RTP crossed closed START gate");
++	return;
++      }
+     struct airplay_session *session=f->device ? f->device->session : NULL;
+     struct airplay_master_session *master=session ? session->master_session : NULL;
+     uint16_t seq;uint32_t timestamp;size_t payload_len;
+@@ -1148,6 +1157,7 @@
+     {
+       close(pc70_ordinary_keeper);
+       pc70_ordinary_keeper = -1;
++      assert(commands_exec_sync(cmdbase, playback_start_bh, NULL, NULL) == 0);
+       evbuffer_add_printf(response, "{}");
+       evhttp_send_reply(request, 200, "OK", response);
+     }
+@@ -1182,6 +1192,7 @@
+ 	  wire->fixture->device = outputs_device_get(2);
+ 	  assert(wire->fixture->device);
+ 	  wire->fixture->phase = 2;
++	  atomic_store(&wire->reset_audio, true);
+ 	}
+       bool retirement = count >= 6 && !strcmp(actual.path_parts[4], "retire");
+       bool result = retirement ? count == 7 && !strcmp(actual.path_parts[5], "result")
+@@ -1265,8 +1276,20 @@
+       atomic_store(&wire->audio_packets, 0);
+     }
+   if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
+-    native_start_audio_poll(wire);
+-    if(f->failed)return;
++      bool move_transition = getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move")
++                             && start_active && start_active->result.phase != OUTPUT_START_COMPLETED;
++      if (move_transition)
++	{
++	  /* Old route packets in flight are not evidence for the new MOVE route. */
++	  unsigned char old[4096];
++	  while (recv(f->udp_fd, old, sizeof(old), MSG_DONTWAIT) > 0)
++	    {
++	    }
++	}
++      else
++	native_start_audio_poll(wire);
++      if (f->failed)
++	return;
+   }
+   if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
+   if (getenv("PC70_RELEASE_COMPOSE"))
+@@ -1413,6 +1436,7 @@
+     for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) { output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf); }
+     assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
+     player_tick_interval.tv_nsec=50000000;
++    pb_write_deficit_max = PLAYER_WRITE_BEHIND_MAX * 1000000 / player_tick_interval.tv_nsec;
+     pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
+     pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
+     if (getenv("PC70_RELEASE_COMPOSE")

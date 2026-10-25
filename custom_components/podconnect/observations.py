@@ -279,9 +279,31 @@ def register_observation_services(hass):
         result = data.observations.playback(entry_id)
         if not call.data.get("include_output", False) or not result.get("ok"):
             return result
-        return await data.commands.room_transport.playback_output(
-            hass, entry_id, result
+        if not call.data.get("include_controls", False):
+            return await data.commands.room_transport.playback_output(
+                hass, entry_id, result
+            )
+        result = await data.commands.room_transport.playback_output(
+            hass,
+            entry_id,
+            result,
+            include_controls=True,
         )
+        try:
+            current(hass, entry_id, data)
+        except HomeAssistantError:
+            return _error("unavailable")
+        if result.get("ok") and "request_id" in call.data:
+            result["settlement"] = data.commands.settlement(
+                hass,
+                entry_id,
+                call.data["request_id"],
+                call.data["command_sequence"],
+            )
+        try:
+            return _bounded(result)
+        except (ValueError, TypeError):
+            return _error("malformed_response")
 
     async def queue(call):
         entry_id = call.data["config_entry_id"]
@@ -293,7 +315,28 @@ def register_observation_services(hass):
     account = {
         vol.Required("config_entry_id"): vol.All(str, vol.Length(min=1, max=1024))
     }
-    playback_schema = {**account, vol.Optional("include_output", default=False): bool}
+
+    def playback_options(value):
+        if value["include_controls"] and not value["include_output"]:
+            raise vol.Invalid("include_controls requires include_output")
+        if ("request_id" in value) != ("command_sequence" in value):
+            raise vol.Invalid("request_id and command_sequence must be paired")
+        if "request_id" in value and not value["include_controls"]:
+            raise vol.Invalid("settlement requires include_controls")
+        return value
+
+    playback_schema = vol.All(
+        {
+            **account,
+            vol.Optional("include_output", default=False): bool,
+            vol.Optional("include_controls", default=False): bool,
+            vol.Optional("request_id"): vol.All(str, vol.Length(min=1, max=145)),
+            vol.Optional("command_sequence"): vol.All(
+                _limit, vol.Range(min=1, max=2**53 - 1)
+            ),
+        },
+        playback_options,
+    )
     for name, handler, schema in (
         ("get_playback_snapshot", playback, playback_schema),
         (

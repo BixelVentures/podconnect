@@ -208,6 +208,33 @@ func TestContentClosedRequestsRejectDuplicateNestedURIAndInvalidCeilings(t *test
 	}
 }
 
+func TestContentContextKindsUseOnePreparedNativeOwner(t *testing.T) {
+	for _, kind := range []string{"playlist", "album", "artist", "show"} {
+		t.Run(kind, func(t *testing.T) {
+			f := contentOperationSetup(t)
+			f.Request.Action = "play_context"
+			f.Request.Args = map[string]any{"context_uri": "spotify:" + kind + ":1234567890123456789012", "max_volume": 35}
+			f.Stage = "staged"
+			if w := f.prepare(t); w.Code != 200 || f.Prepared != 1 || f.Commits != 0 {
+				t.Fatal("context did not stage with one native owner", w.Code, f.Prepared, f.Commits)
+			}
+			if w := f.operation(t, "commit"); w.Code != 200 || f.Commits != 1 {
+				t.Fatal("context did not commit once", w.Code, f.Commits)
+			}
+		})
+	}
+	for _, kind := range []string{"episode", "audiobook", "station", "local"} {
+		t.Run("reject_"+kind, func(t *testing.T) {
+			f := contentOperationSetup(t)
+			f.Request.Action = "play_context"
+			f.Request.Args = map[string]any{"context_uri": "spotify:" + kind + ":1234567890123456789012", "max_volume": 35}
+			if w := f.prepare(t); w.Code != 400 || f.Prepared != 0 || f.Commits != 0 {
+				t.Fatal("unsupported context crossed manager owner", w.Code, f.Prepared, f.Commits)
+			}
+		})
+	}
+}
+
 func TestContentCapacityRetainsDispatchedUnknownButReclaimsExpiredUndispatched(t *testing.T) {
 	f := contentOperationSetup(t)
 	roomContentStore.Lock()

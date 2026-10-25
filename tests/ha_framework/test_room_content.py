@@ -8,10 +8,37 @@ import voluptuous as vol
 from aiohttp import web
 from test_room_volume import RoomVolumeFrameworkTests
 
-from custom_components.podconnect.room_content import valid_selected_receipt
+from custom_components.podconnect.room_content import (
+    valid_selected_arguments,
+    valid_selected_receipt,
+)
 
 
 class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
+    def test_exact_context_kind_arguments_match_native_owner(self):
+        for kind in ("playlist", "album", "artist", "show"):
+            with self.subTest(kind=kind):
+                self.assertTrue(
+                    valid_selected_arguments(
+                        "play_context",
+                        {
+                            "context_uri": "spotify:" + kind + ":" + "A" * 22,
+                            "max_volume": 35,
+                        },
+                    )
+                )
+        for kind in ("episode", "audiobook", "station", "local"):
+            with self.subTest(kind=kind):
+                self.assertFalse(
+                    valid_selected_arguments(
+                        "play_context",
+                        {
+                            "context_uri": "spotify:" + kind + ":" + "A" * 22,
+                            "max_volume": 35,
+                        },
+                    )
+                )
+
     async def asyncSetUp(self):
         self.content_posts = []
         self.content_hold = False
