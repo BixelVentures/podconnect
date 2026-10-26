@@ -20,7 +20,191 @@ diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
-@@ -583,6 +583,75 @@
+@@ -4,6 +4,183 @@
+ #include <signal.h>
+ #include <poll.h>
+ #include "../src/input.h"
++/* Test-only predecessor parser: exact published53 source tree bc2e2895,
++ * outputs_start_journal.inc.c SHA256 35dc4d85e34ee82c3d62f09fb26a8c5c0985b9fa532b5f702fff46d135618073.
++ * Only its function name changes; no production parser or journal writes. */
++static _Thread_local struct db_start_guard rollback53_journal;
++static _Thread_local uint64_t rollback53_pidns_device, rollback53_pidns_inode;
++static _Thread_local enum output_retirement_outcome rollback53_retirement;
++static _Thread_local bool rollback53_reopen_consumed;
++#define start_journal rollback53_journal
++#define start_journal_pidns_device rollback53_pidns_device
++#define start_journal_pidns_inode rollback53_pidns_inode
++#define start_journal_retirement_outcome rollback53_retirement
++#define start_journal_retirement_reopen_consumed rollback53_reopen_consumed
++static bool
++rollback53_payload_valid(void)
++{
++  json_tokener *tok = json_tokener_new();
++  json_object *o, *v;
++  bool valid, move, has_retirement;
++  size_t n;
++  enum output_retirement_outcome retirement = OUTPUT_RETIRE_NONE;
++  uint64_t writer_epoch = 0, writer_fd = 0, pipe_device = 0, pipe_inode = 0, input_item_id = 0, admitted_epoch = 0,
++           input_epoch = 0, deadline_sec = 0, deadline_nsec = 0;
++  bool reader_ready_closed = false, reopen_consumed = false;
++  if (!tok || !start_journal.payload)
++    {
++      if (tok)
++	json_tokener_free(tok);
++      return false;
++    }
++  n = strlen(start_journal.payload);
++  o = json_tokener_parse_ex(tok, start_journal.payload, n);
++  valid = json_tokener_get_error(tok) == json_tokener_success && json_tokener_get_parse_end(tok) == n && o
++          && json_object_is_type(o, json_type_object);
++  move = valid && json_object_object_get_ex(o, "schema", &v) && v && json_object_is_type(v, json_type_string)
++         && !strcmp(json_object_get_string(v), "podconnect.output_move_journal.v1");
++#define JC(key, expected)                                                                                              \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_string)                              \
++      && !strcmp(json_object_get_string(v), expected))
++  valid = valid && (move || JC("schema", "podconnect.output_start_journal.v1")) && JC("token", start_journal.token)
++          && JC("c_process", start_journal.c_process) && JC("native_boot_id", start_journal.boot_id);
++#undef JC
++  valid = valid && json_object_object_get_ex(o, "native_pid", &v) && json_object_is_type(v, json_type_int)
++          && json_object_get_uint64(v) == start_journal.pid && json_object_object_get_ex(o, "native_start_ticks", &v)
++          && json_object_is_type(v, json_type_int) && json_object_get_uint64(v) == start_journal.proc_start_ticks;
++  valid = valid && json_object_object_get_ex(o, "native_pid_namespace_device", &v)
++          && json_object_is_type(v, json_type_int);
++  if (valid)
++    start_journal_pidns_device = json_object_get_uint64(v);
++  valid = valid && json_object_object_get_ex(o, "native_pid_namespace_inode", &v)
++          && json_object_is_type(v, json_type_int) && json_object_get_uint64(v) > 0;
++  if (valid)
++    start_journal_pidns_inode = json_object_get_uint64(v);
++  if (valid && move)
++    valid = json_object_object_get_ex(o, "move_existing_session", &v) && json_object_is_type(v, json_type_boolean)
++            && json_object_get_boolean(v);
++  has_retirement = valid && json_object_object_get_ex(o, "retirement_outcome", &v);
++  if (has_retirement)
++    {
++      const char *outcome;
++      valid = valid && json_object_object_length(o) == 58 && json_object_is_type(v, json_type_string)
++              && !strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), start_journal.payload);
++      outcome = valid ? json_object_get_string(v) : NULL;
++      if (outcome && !strcmp(outcome, "none"))
++	retirement = OUTPUT_RETIRE_NONE;
++      else if (outcome && !strcmp(outcome, "pending"))
++	retirement = OUTPUT_RETIRE_PENDING;
++      else if (outcome && !strcmp(outcome, "retired_known"))
++	retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
++      else if (outcome && !strcmp(outcome, "unknown"))
++	retirement = OUTPUT_RETIRE_UNKNOWN;
++      else
++	valid = false;
++#define JRU(key, dst)                                                                                                  \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_int)                                 \
++      && json_object_get_int64(v) >= 0 && ((dst) = json_object_get_uint64(v), true))
++#define JRB(key, dst)                                                                                                  \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_boolean)                             \
++      && ((dst) = json_object_get_boolean(v), true))
++      if (valid)
++	{
++	  bool token = json_object_object_get_ex(o, "retirement_token", &v) && v
++	               && json_object_is_type(v, json_type_string)
++	               && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                    : transport_hex(json_object_get_string(v), 32));
++	  bool reservation = json_object_object_get_ex(o, "retirement_reservation", &v) && v
++	                     && json_object_is_type(v, json_type_string)
++	                     && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                          : transport_hex(json_object_get_string(v), 32));
++	  bool incarnation = json_object_object_get_ex(o, "retirement_native_incarnation", &v) && v
++	                     && json_object_is_type(v, json_type_string)
++	                     && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                          : transport_hex(json_object_get_string(v), 32));
++	  valid = token && reservation && incarnation && JRU("retirement_writer_source_epoch", writer_epoch)
++	          && JRU("retirement_writer_fd", writer_fd) && JRU("retirement_pipe_device", pipe_device)
++	          && JRU("retirement_pipe_inode", pipe_inode) && JRU("retirement_input_item_id", input_item_id)
++	          && JRU("retirement_admitted_input_epoch", admitted_epoch)
++	          && JRU("retirement_input_epoch", input_epoch) && JRU("retirement_deadline_sec", deadline_sec)
++	          && JRU("retirement_deadline_nsec", deadline_nsec)
++	          && JRB("retirement_reader_ready_closed", reader_ready_closed)
++	          && JRB("retirement_reopen_consumed", reopen_consumed);
++	}
++#undef JRU
++#undef JRB
++      if (valid)
++	{
++	  if (retirement == OUTPUT_RETIRE_NONE)
++	    valid = !writer_epoch && !writer_fd && !pipe_device && !pipe_inode && !input_item_id && !admitted_epoch
++	            && !input_epoch && !deadline_sec && !deadline_nsec && !reader_ready_closed && !reopen_consumed;
++	  else
++	    {
++	      json_object *phase, *cancelled, *pending, *incarnation, *writer, *writer_fd_saved, *fifo_dev, *fifo_ino,
++	          *purpose, *actual_owner;
++	      valid = writer_epoch && writer_fd <= INT_MAX && pipe_device && pipe_inode && input_item_id
++	              && admitted_epoch && deadline_sec && deadline_nsec < 1000000000
++	              && json_object_object_get_ex(o, "move_existing_session", &purpose)
++	              && json_object_is_type(purpose, json_type_boolean)
++	              && (bool)json_object_get_boolean(purpose) == move
++	              && json_object_object_get_ex(o, "actual_native_owner", &actual_owner) && actual_owner
++	              && json_object_is_type(actual_owner, json_type_object)
++	              && json_object_object_get_ex(o, "phase", &phase) && json_object_is_type(phase, json_type_int)
++	              && json_object_get_int(phase) == OUTPUT_START_COMPLETED
++	              && json_object_object_get_ex(o, "cancelled", &cancelled)
++	              && json_object_is_type(cancelled, json_type_boolean) && !json_object_get_boolean(cancelled)
++	              && json_object_object_get_ex(o, "writer_pending", &pending)
++	              && json_object_is_type(pending, json_type_boolean) && !json_object_get_boolean(pending)
++	              && json_object_object_get_ex(o, "native_incarnation", &incarnation)
++	              && json_object_is_type(incarnation, json_type_string)
++	              && json_object_object_get_ex(o, "retirement_native_incarnation", &v)
++	              && !strcmp(json_object_get_string(incarnation), json_object_get_string(v))
++	              && json_object_object_get_ex(o, "writer_source_epoch", &writer)
++	              && json_object_is_type(writer, json_type_int) && json_object_get_uint64(writer) == writer_epoch
++	              && json_object_object_get_ex(o, "writer_fd", &writer_fd_saved)
++	              && json_object_is_type(writer_fd_saved, json_type_int)
++	              && json_object_get_uint64(writer_fd_saved) == writer_fd
++	              && (json_object_object_get_ex(o, "writer_pipe_device", &fifo_dev)
++	                  && json_object_is_type(fifo_dev, json_type_int)
++	                  && json_object_get_uint64(fifo_dev) == pipe_device
++	                  && json_object_object_get_ex(o, "writer_pipe_inode", &fifo_ino)
++	                  && json_object_is_type(fifo_ino, json_type_int)
++	                  && json_object_get_uint64(fifo_ino) == pipe_inode);
++	      if (valid && retirement == OUTPUT_RETIRE_PENDING)
++		valid = input_epoch == admitted_epoch && !reopen_consumed;
++	      if (valid && retirement == OUTPUT_RETIRE_RETIRED_KNOWN)
++		valid = reader_ready_closed && input_epoch > admitted_epoch;
++	      if (valid && retirement == OUTPUT_RETIRE_UNKNOWN)
++		valid = !reopen_consumed;
++	    }
++	}
++    }
++  if (valid)
++    {
++      start_journal_retirement_outcome = retirement;
++      start_journal_retirement_reopen_consumed = reopen_consumed;
++    }
++  if (o)
++    json_object_put(o);
++  json_tokener_free(tok);
++  return valid;
++}
++
++#undef start_journal
++#undef start_journal_pidns_device
++#undef start_journal_pidns_inode
++#undef start_journal_retirement_outcome
++#undef start_journal_retirement_reopen_consumed
++static void
++rollback53_probe(const char *phase, bool expected)
++{
++  if (!getenv("PC70_ROLLBACK_COMPAT"))
++    return;
++  rollback53_journal = start_journal;
++  bool readable = !start_journal.payload || rollback53_payload_valid();
++  fprintf(stderr, "ROLLBACK53 phase=%s legacy_readable=%d expected=%d journal_present=%d\n", phase, readable, expected,
++      start_journal.payload != NULL);
++  assert(readable == expected);
++}
++
+ static int
+ manual_release_recover_process_case(const char *database, bool fenced)
+ {
+@@ -583,6 +760,75 @@
    puts("PASS paused exact owner survives actual volume ACK, held-volume armed STOP and terminal UNKNOWN without replay; drained USED slot cannot borrow foreign pending context");
  }
  
@@ -96,7 +280,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
  /* Resume admission is not yet PCM: retain only the same already-paused owner. */
  static void resume_pause_carry_case(struct output_device *device,const struct output_native_owner *owner)
  {
-@@ -593,7 +662,7 @@
+@@ -593,7 +839,7 @@
    for(int mode=0;mode<4;mode++) {
      assert(transport_pause_owned(device->id));
      request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
@@ -105,7 +289,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      strcpy(request.expected_input_path_digest,route.input_path_digest);
      if(mode==1)strcpy(request.native_owner.session_id,"foreign-resume-context");
      assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
-@@ -620,7 +689,7 @@
+@@ -620,7 +866,7 @@
        }
        assert(outputs_transport_commit(&request,&result)<0 && !transport_pause_owned(device->id));
        request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
@@ -114,7 +298,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
        assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
        assert(outputs_transport_commit(&request,&result)==0);
        assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0
-@@ -687,6 +756,7 @@
+@@ -687,6 +933,7 @@
    assert(outputs_transport_commit(&request,&result)==0);
    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,46)==0);
    paused_owner_volume_case(device,owner,47);
@@ -122,7 +306,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    resume_pause_carry_case(device,owner);
    close(*writer);*writer=-1; /* Kernel-observed writer close retires retention. */
    assert(!transport_pause_owned(device->id) && !transport_pause_retained);
-@@ -935,7 +1005,7 @@
+@@ -935,7 +1182,7 @@
    struct timespec prior_expiry=transport_custody_expiry;
    uint64_t prior_generation=transport_admission_generation,prior_revision=transport_custody_revision;
    bool prior_live=transport_custody_live,prior_lost=transport_custody_lost;
@@ -131,7 +315,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    memset(request.args_digest,'e',64);request.native_owner=*owner;
    strcpy(request.expected_input_path_digest,route->input_path_digest);
    assert(outputs_transport_prepare(&request,&prepared)==0);
-@@ -976,7 +1046,7 @@
+@@ -976,7 +1223,7 @@
    device->session_epoch=epoch;
    outputs_stop_delayed_cancel();
    assert(!transport_pause_retained); /* C playback restart consumes old Pause permission. */
@@ -140,7 +324,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    assert(outputs_transport_prepare(&request,&prepared)==0);
    strcpy(request.token,prepared.command.token);
    assert(outputs_transport_commit(&request,&result)==0);
-@@ -995,6 +1065,8 @@
+@@ -995,6 +1242,8 @@
      assert(transport_pause_owned(1));
    }
    paused_owner_volume_case(device,owner,56);
@@ -149,7 +333,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    struct start_slot *prior_start=start_active;
    struct start_slot next_start=*prior_start;
    next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
-@@ -1069,6 +1141,11 @@
+@@ -1069,6 +1318,11 @@
    bool decoded_audio_packet, nonzero_pcm_input;
    uint16_t last_audio_seq;
    uint32_t last_audio_timestamp;
@@ -161,7 +345,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
  };
  /* AP2 leaves the 12-byte RTP header clear even though its audio payload is
   * encrypted. Sync/control share this fixture's UDP port but use other types. */
-@@ -1076,12 +1153,29 @@
+@@ -1076,12 +1330,29 @@
  {
    return length>12 && (packet[0]>>6)==2 && (packet[1]&0x7f)==AIRPLAY_RTP_PAYLOADTYPE;
  }
@@ -191,7 +375,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
      bool ordinary
          = getenv("PC70_RELEASE_COMPOSE")
            && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
-@@ -1135,6 +1229,52 @@
+@@ -1135,6 +1406,52 @@
    if(length<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)
      recovery_wire_fail(f,"private RTP receive failed");
  }
@@ -244,7 +428,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
  static void native_start_http(struct evhttp_request *request,void *arg)
  {
    struct native_start_wire *wire=arg;
-@@ -1163,8 +1303,10 @@
+@@ -1163,8 +1480,10 @@
      }
    else if (!strcmp(uri, "/fixture/done"))
      {
@@ -256,7 +440,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
        atomic_store(&wire->done, true);
      }
    else
-@@ -1183,16 +1325,25 @@
+@@ -1183,16 +1502,25 @@
  	  atomic_store(&wire->completed, false);
  	  atomic_store(&wire->reset_audio, true);
  	}
@@ -283,7 +467,16 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
  	}
        bool retirement = count >= 6 && !strcmp(actual.path_parts[4], "retire");
        bool result = retirement ? count == 7 && !strcmp(actual.path_parts[5], "result")
-@@ -1242,8 +1393,18 @@
+@@ -1217,6 +1545,8 @@
+       if (count == 5 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
+           && !strcmp(actual.path_parts[3], "transport") && evhttp_request_get_command(request) == EVHTTP_REQ_POST)
+ 	{
++	  if (!strcmp(actual.path_parts[4], "bound-prepare") && getenv("PC70_RELEASE_COMPOSE"))
++	    rollback53_probe("before-new-purpose", true);
+ 	  const char *pattern
+ 	      = !strcmp(actual.path_parts[4], "bound-state")             ? "/transport/bound-state$"
+ 	        : !strcmp(actual.path_parts[4], "bound-pause-confirm")   ? "/transport/bound-pause-confirm$"
+@@ -1242,8 +1572,18 @@
  	      status = route->handler(&actual);
  	      break;
  	    }
@@ -303,7 +496,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
        if (status == 200 && retirement && count == 6 && !strcmp(actual.path_parts[5], "complete"))
  	atomic_store(&wire->retired, true);
        fprintf(stderr, "ACTUAL Native→C %s status=%d body=%.*s\n", uri, status, (int)evbuffer_get_length(response),
-@@ -1292,6 +1453,13 @@
+@@ -1292,6 +1632,13 @@
  	return;
    }
    if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
@@ -317,7 +510,24 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    if (getenv("PC70_RELEASE_COMPOSE"))
      {
        bool ordinary = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary");
-@@ -1375,6 +1543,7 @@
+@@ -1322,6 +1669,7 @@
+ 	  recovery_wire_fail(f, "actual Native manual release did not durably retire exact C owner");
+ 	  return;
+ 	}
++      rollback53_probe("terminal-release-downgrade-blocked", false);
+       fprintf(stderr,
+           "PASS actual Native+C manual release class=%s durable closed gate→real worker Close→exact FIFO/AP2 "
+           "drain→terminal/reopen staging; no physical audio claim\n",
+@@ -1367,6 +1715,8 @@
+   if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))
+     fprintf(stderr,"PASS private AP2 authenticated ALAC RTP packets=%d from nonzero PCM after completed/volume/open gate\n",
+       atomic_load(&wire->audio_packets));
++  if (getenv("PC70_COLD_RESTART"))
++    rollback53_probe("new-version-fresh-start-forward-recovered", true);
+   fprintf(stderr,"PASS actual Native HTTP→C player owner→FIFO barrier→private AP2→FULL COMPLETED; Native final verdict asserted by driver\n");
+   event_base_loopbreak(f->base);
+ }
+@@ -1375,6 +1725,7 @@
    struct native_start_wire wire={.fixture=f};struct sockaddr_in address={0};
    struct timeval soon={0,1000},bound={25,0};socklen_t length=sizeof(address);pthread_t thread;
    const char *ready_path=getenv("PC_NATIVE_START_READY_FILE");assert(ready_path);
@@ -325,7 +535,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    wire.http_base=event_base_new();assert(wire.http_base);
    wire.http=evhttp_new(wire.http_base);assert(wire.http);
    evhttp_set_gencb(wire.http,native_start_http,&wire);
-@@ -1398,16 +1567,55 @@
+@@ -1398,16 +1749,57 @@
  {
    struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
    socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};struct airplay_extra *extra;
@@ -377,6 +587,8 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
 +  assert(outputs_attention_startup() == 0);
 +  start_journal_startup();
 +  if (cold_restart)
++    rollback53_probe("new-version-retained-release", false);
++  if (cold_restart)
 +    assert(outputs_start_gate_closed() && !start_journal_fault
 +           && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN);
 +  else
@@ -384,7 +596,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
    outputs_deferredev=evtimer_new(f.base,deferred_cb,NULL);outputs_buffer_duration_ms=cfg_getint(cfg_getsec(cfg,"general"),"start_buffer_ms");
    f.plain=evbuffer_new();f.listener=evconnlistener_new_bind(f.base,recovery_wire_accept,&f,LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE,2,(struct sockaddr *)&address,sizeof(address));
-@@ -1420,7 +1628,18 @@
+@@ -1420,7 +1812,18 @@
    if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
    f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
    /* Seed the real library database without invoking an unrelated scanner command consumer. */
@@ -404,7 +616,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    assert(sqlite3_exec(seed,sql,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(sql);sqlite3_close(seed);mfi.id=1;
    qp.id=mfi.id;assert(db_queue_add_by_query(&qp,0,0,-1,NULL,&item)==0);
    if(mode==24 || mode==25){
-@@ -1468,7 +1687,7 @@
+@@ -1468,7 +1871,7 @@
  	player_state = PLAY_PLAYING;
  	assert(!start_active && !start_journal.token[0] && start_route_clean_absent());
        }
@@ -413,7 +625,7 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
        {
  	struct output_device *target = calloc(1, sizeof(*target));
  	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
-@@ -2343,8 +2562,12 @@
+@@ -2343,8 +2746,12 @@
    pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
    if(outputs_deferredev)event_free(outputs_deferredev);
    if(database_ready)db_perthread_deinit();
