@@ -1099,13 +1099,21 @@ def register_command_services(hass):
         entry_id = call.data["config_entry_id"]
         data = current(hass, entry_id)
         try:
-            return await data.commands.room_transport.read(
+            controls = await data.commands.room_transport.read(
                 hass,
                 entry_id,
                 call.data["target_id"],
                 call.data["room_id"],
                 call.data["homepod_id"],
             )
+            # The external v1 offer is the existing four-button contract.
+            # Internal native readers retain seek/shuffle/repeat capabilities.
+            return {
+                **controls,
+                "actions": [
+                    action for action in _DISALLOWED if action in controls["actions"]
+                ],
+            }
         except CommandRejected as exc:
             result = {"ok": False, "error_kind": str(exc), "retry_allowed": False}
             from .speakers import ROOM_READ_REASONS

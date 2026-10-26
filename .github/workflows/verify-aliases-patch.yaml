@@ -49,7 +49,7 @@ jobs:
           done
           # These are the same final Native suffix slots used by Docker.
           # The unified tests already include the selected-content clock fixture.
-          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch; do
+          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch dealer-roomchange-native.patch dealer-roomchange-native-tests.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done

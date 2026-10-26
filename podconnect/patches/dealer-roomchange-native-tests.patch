@@ -1,0 +1,336 @@
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -609,6 +609,9 @@
+ 		}
+ 		modes = []string{mode}
+ 	}
++	if os.Getenv("PC_DEALER_ROOM_CHANGE_REGRESSION") != "" && os.Getenv("PC_NATIVE_START_MODE") == "" {
++		modes = []string{"direct-pause-current"}
++	}
+ 	for _, mode := range modes {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, _ := contentFixture(t)
+@@ -726,15 +729,24 @@
+ 			var calls []string
+ 			var receipt contentCReceipt
+ 			var mu sync.Mutex
++			var dealerMove dealerMoveWire
+ 			var owner *httptest.Server
+ 			if !external {
+ 				owner = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 					endpoint := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/start/")
+ 					mu.Lock()
+ 					defer mu.Unlock()
++					if os.Getenv("PC_DEALER_ROOM_CHANGE_REGRESSION") != "" && strings.Contains(r.URL.Path, "/move/") && !strings.Contains(r.URL.Path, "/retire/") {
++						dealerMove.reply(t, p, w, r)
++						return
++					}
+ 					if strings.HasPrefix(mode, "direct-pause-") && strings.Contains(r.URL.Path, "/transport/") {
+ 						calls = append(calls, strings.TrimPrefix(r.URL.Path, "/api/outputs/202/transport/"))
+ 						replyDirectPauseFixture(t, p, mode, w, r)
++						return
++					}
++					if os.Getenv("PC_DEALER_ROOM_CHANGE_REGRESSION") != "" && strings.Contains(r.URL.Path, "/retire/") {
++						w.WriteHeader(http.StatusConflict)
+ 						return
+ 					}
+ 					calls = append(calls, endpoint)
+@@ -1002,6 +1014,10 @@
+ 				if !external && strings.Join(calls, ",") != "state,prepare,commit,barrier,open,complete" {
+ 					t.Fatal("wrong protocol chain", calls)
+ 				}
++				if os.Getenv("PC_DEALER_ROOM_CHANGE_REGRESSION") != "" && !external {
++					testDealerRoomChangeRetainedOwner(t, p, stream, ctx, &dealerMove)
++					return
++				}
+ 				if strings.HasPrefix(mode, "direct-pause-") {
+ 					// The real START worker/source/writer remains the observed target.
+ 					p.app.mpris = mpris.DummyServer{}
+@@ -1448,6 +1464,10 @@
+ 			}
+ 			t.Log("PASS public selected FLAC START -> public completed MOVE retained actual decoder and same FIFO writer")
+ 		}
++		if os.Getenv("PC_DEALER_ROOM_CHANGE_REGRESSION") != "" {
++			testDealerRoomChangeRetainedOwner(t, p, stream, ctx, nil)
++			return
++		}
+ 		owner, e := p.roomTransportIdentity("account", "engine", room, homepod)
+ 		if e != nil {
+ 			t.Fatal(e)
+@@ -1885,7 +1905,7 @@
+ 	if json.NewDecoder(r.Body).Decode(&body) != nil {
+ 		t.Fatal("fixture body")
+ 	}
+-	action := strings.TrimPrefix(r.URL.Path, "/api/outputs/202/transport/")
++	action := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+ 	if action == "bound-pause-confirm" {
+ 		if mode == "direct-pause-unknown-confirm" {
+ 			w.WriteHeader(500)
+@@ -1902,7 +1922,7 @@
+ 		t.Fatal("no exact in-flight Native offer")
+ 	}
+ 	digest := sha256.Sum256([]byte(offer.InputPath))
+-	route := roomVolumeRoute{"00000000-0000-0000-0000-000000000001", "202", "1", "1", "1", "1", "1", "1", hex.EncodeToString(digest[:])}
++	route := roomVolumeRoute{"00000000-0000-0000-0000-000000000001", offer.Snapshot.HomePodID, "1", "1", "1", "1", "1", "1", hex.EncodeToString(digest[:])}
+ 	token := strings.Repeat("f", 32)
+ 	switch action {
+ 	case "bound-state":
+@@ -2348,3 +2368,258 @@
+ 		})
+ 	}
+ }
++
++func testDealerRoomChangeRetainedOwner(t *testing.T, p *AppPlayer, stream *player.Stream, ctx context.Context, wire *dealerMoveWire) {
++	t.Helper()
++	p.app.mpris = mpris.DummyServer{}
++	events, _ := (evtimpl.Impl{}).NewEventManager(p.app.log, nil, nil, nil, "")
++	nextSessionField(p.sess, "events", events)
++	nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++	p.logout = make(chan *AppPlayer, 1)
++	p.app.cfg.ZeroconfEnabled = true
++	nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++	// Actual existing START and optional public MOVE precede this boundary.
++	// Only the next provider decoder is inert; Dealer transfer and Pause
++	// execute their shipped bodies against the retained real FIFO/C owner.
++	aliasEvents := func() int {
++		count := 0
++		if server, ok := p.app.server.(*aliasTestServer); ok {
++			for _, event := range server.events {
++				if event.Type == "selected_alias" {
++					count++
++				}
++			}
++		}
++		return count
++	}
++	beforeAliasEvents := aliasEvents()
++	beforeAlias, beforeRevision := p.state.device.SelectedAliasId, p.aliasRevision
++	beforeStart, beforeMove := p.app.startCustody, p.app.moveCustody
++	beforeWriter, beforeGeneration := p.app.openedWriter, p.app.openedWriterGeneration
++	destination := uint32(1)
++	if beforeAlias == 1 {
++		destination = 2
++	}
++	if os.Getenv("PC_DEALER_ROOM_CHANGE_SAME_ALIAS") != "" {
++		destination = beforeAlias
++	}
++	transfer := pc13TransferState()
++	nextURI := "spotify:track:0000000000000000000003"
++	nextID, _ := librespot.SpotifyIdFromUri(nextURI)
++	nextMedia := librespot.NewMediaFromTrack(&metadatapb.Track{Gid: nextID.Id(), Name: proto.String("inert next decoder"), Duration: proto.Int32(300000), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("fixture"), Date: &metadatapb.Date{}}})
++	transfer.Playback.CurrentTrack = &connectpb.ContextTrack{Uri: nextURI}
++	transfer.Playback.Timestamp = time.Now().UnixMilli()
++	transfer.Playback.IsPaused = false
++	transfer.CurrentSession.OriginalSessionId = proto.String(p.state.player.SessionId)
++	transfer.CurrentSession.Context.Pages = []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{transfer.Playback.CurrentTrack}}}
++	req := recoveryRequest()
++	req.TargetAliasId = proto.Uint32(destination)
++	req.Command.Data, _ = proto.Marshal(transfer)
++	p.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: nextMedia}
++	p.prodInfo = &ProductInfo{}
++	if p.prefetchTimer == nil {
++		p.prefetchTimer = time.NewTimer(time.Hour)
++		defer p.prefetchTimer.Stop()
++	}
++	if os.Getenv("PC_DEALER_ROOM_CHANGE_RETAINED_MOVE") != "" {
++		if err := p.handlePlayerCommandWithSpclient(ctx, req, p.sess.Spclient()); err != nil {
++			t.Fatal("first actual Dealer MOVE", err)
++		}
++		if p.app.startCustody != nil || p.app.moveCustody == nil || !p.app.moveCustody.Terminal || p.app.moveCustody.State != "complete" {
++			t.Fatal("first actual MOVE not retained")
++		}
++		beforeAlias, beforeRevision = p.state.device.SelectedAliasId, p.aliasRevision
++		beforeStart, beforeMove = p.app.startCustody, p.app.moveCustody
++		beforeWriter, beforeGeneration = p.app.openedWriter, p.app.openedWriterGeneration
++		req.TargetAliasId = proto.Uint32(3 - beforeAlias)
++		p.secondaryStream = &player.Stream{Source: &contentInertSource{}, Media: nextMedia}
++	}
++	negative := os.Getenv("PC_DEALER_ROOM_CHANGE_NEGATIVE")
++	switch negative {
++	case "conflicting_alias":
++		req.Command.TargetAliasId = proto.Uint32(beforeAlias)
++	case "invalid_alias":
++		req.TargetAliasId = proto.Uint32(uint32(len(p.aliasRegistry) + 1))
++	case "system_initiated":
++		req.Command.Options.SystemInitiated = true
++	case "unknown_custody":
++		p.app.moveCustodyUnknown = true
++	case "cancel_before":
++		cancelled, stop := context.WithCancel(ctx)
++		stop()
++		ctx = cancelled
++	case "load_failure":
++		// This incumbent worker mode normally uses a prefetched inert decoder;
++		// supply its existing provider/event dependencies before testing failure.
++		fields := reflect.ValueOf(p.player).Elem()
++		for name, value := range map[string]any{"events": events, "sp": p.sess.Spclient()} {
++			field := fields.FieldByName(name)
++			reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.ValueOf(value))
++		}
++		p.secondaryStream = nil
++	}
++	transferErr := p.handlePlayerCommandWithSpclient(ctx, req, p.sess.Spclient())
++	if negative != "" {
++		if negative == "cancel_after_possible" || negative == "stale_after_possible" {
++			p.Close()
++		} // Join the incumbent asynchronous close before observing its fields.
++		if aliasEvents() != beforeAliasEvents {
++			t.Fatal("failed Dealer transfer published a selected alias")
++		}
++		if transferErr == nil {
++			t.Fatal("negative Dealer transfer acknowledged", negative)
++		}
++		if negative == "cancel_after_possible" || negative == "stale_after_possible" {
++			if !p.roomMoveQuarantined || p.roomMoveReservation != nil {
++				t.Fatal("uncertain MOVE lost quarantine/exact cleanup", negative)
++			}
++			if wire == nil || wire.operation.Load() == nil {
++				t.Fatal("missing actual failed MOVE operation")
++			}
++			failed := wire.operation.Load()
++			before, generation := p.app.moveCustody, p.app.openedWriterGeneration
++			failed.finish("complete")
++			failed.mu.Lock()
++			state, terminal := failed.State, failed.Terminal
++			delayedErr := p.app.supersedeMoveCustody(context.Background(), failed)
++			failed.mu.Unlock()
++			if !terminal || state != "unknown" || delayedErr == nil || !p.roomMoveQuarantined || p.app.moveCustody != before || p.app.openedWriterGeneration != generation {
++				t.Fatal("late failed-operation completion escaped quarantine/generation")
++			}
++		} else if negative == "load_failure" {
++			if !p.aliasRetired || !p.roomVolumeClosing || p.state.player.IsPlaying || p.primaryStream != nil {
++				t.Fatal("posthandoff load failure did not seal actor", transferErr)
++			}
++		} else if p.state.device.SelectedAliasId != beforeAlias || p.aliasRevision != beforeRevision || p.app.startCustody != beforeStart || p.app.moveCustody != beforeMove || p.app.openedWriter != beforeWriter {
++			t.Fatal("rejected transfer changed owner", negative, transferErr)
++		}
++		t.Logf("negative=%s transferErr=%v quarantined=%t aliasRetired=%t reservationCleared=%t", negative, transferErr, p.roomMoveQuarantined, p.aliasRetired, p.roomMoveReservation == nil)
++		return
++	}
++
++	var pause dealer.RequestPayload
++	pause.Command.Endpoint = "pause"
++	pauseErr := p.handlePlayerCommandWithSpclient(ctx, pause, p.sess.Spclient())
++	t.Logf("actual Dealer boundary priorStart=%t priorMove=%t alias=%d->%d revision=%d->%d transferErr=%v pauseErr=%v sameCustody=%t sameWriter=%t sameGeneration=%t paused=%t", beforeStart != nil, beforeMove != nil, beforeAlias, p.state.device.SelectedAliasId, beforeRevision, p.aliasRevision, transferErr, pauseErr, beforeStart == p.app.startCustody && beforeMove == p.app.moveCustody, beforeWriter == p.app.openedWriter, beforeGeneration == p.app.openedWriterGeneration, p.state.player.IsPaused)
++	if transferErr != nil {
++		t.Fatal("Dealer transfer failed before the suspected owner boundary", transferErr)
++	}
++	if pauseErr != nil {
++		t.Fatal("REGRESSION: acknowledged Dealer transfer left its Spotify Pause without current bound output owner", pauseErr)
++	}
++	expectedEvents := 1
++	if os.Getenv("PC_DEALER_ROOM_CHANGE_RETAINED_MOVE") != "" {
++		expectedEvents = 2
++	}
++	if aliasEvents()-beforeAliasEvents != expectedEvents {
++		t.Fatal("early or duplicate selected-alias publication", aliasEvents()-beforeAliasEvents, expectedEvents)
++	}
++	return
++}
++
++// This existing local C protocol double validates native requests and drives
++// actual native consume/quiesce/switch/resume/final-writer verification. It does
++// not execute OwnTone or write a C journal.
++type dealerMoveWire struct {
++	operation atomic.Pointer[moveOperation]
++	state     moveCState
++	receipt   moveCReceipt
++	calls     []string
++}
++
++func (f *dealerMoveWire) reply(t *testing.T, p *AppPlayer, w http.ResponseWriter, r *http.Request) {
++	t.Helper()
++	endpoint := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
++	f.calls = append(f.calls, endpoint)
++	var body map[string]json.RawMessage
++	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++		t.Fatal(err)
++	}
++	read := func(key string, out any) {
++		if err := json.Unmarshal(body[key], out); err != nil {
++			t.Fatalf("move %s missing %s: %v", endpoint, key, err)
++		}
++	}
++	if endpoint == "state" {
++		var old roomTransportIdentity
++		var digest string
++		read("old_native_owner", &old)
++		read("expected_input_path_digest", &digest)
++		target := strings.Split(r.URL.Path, "/")[3]
++		route := roomVolumeRoute{"00000000-0000-0000-0000-000000000001", old.HomePodID, "1", "1", "1", "1", "1", "1", digest}
++		f.state = moveCState{Schema: "podconnect.output_move_state.v1", OK: true, Ready: true, Policy: movePolicy, SessionVolume: 35, OldBaseRevision: "1", TargetBaseRevision: "1", OldRoute: route, Target: contentTarget{Process: route.Process, DeviceID: target, Incarnation: "1"}, InputDigest: digest, Paused: p.state.player.IsPaused}
++		_ = json.NewEncoder(w).Encode(f.state)
++		return
++	}
++	if endpoint == "prepare" {
++		f.receipt = moveCReceipt{OK: true, Token: strings.Repeat("f", 32), Policy: movePolicy, SessionVolume: 35, OldBaseRevision: "1", TargetBaseRevision: "1", OldRoute: f.state.OldRoute, Target: f.state.Target, InputDigest: f.state.InputDigest, InputEpoch: "0", WriterEpoch: "0", Phase: "prepared", Expires: 8000}
++		read("offer_id", &f.receipt.OfferID)
++		read("binding_id", &f.receipt.BindingID)
++		read("native_incarnation", &f.receipt.Incarnation)
++		read("native_revision", &f.receipt.Revision)
++		read("old_native_owner", &f.receipt.OldOwner)
++		read("intended_native_owner", &f.receipt.Intended)
++	} else {
++		if endpoint != "cancel" {
++			read("native_reservation_id", &f.receipt.ReservationID)
++		}
++		f.receipt.Possible = true
++		f.receipt.GateClosed = true
++		f.receipt.PinRemaining = 14000
++		f.receipt.Drained = true
++		f.receipt.Pipe = &outputPipeIdentity{Device: p.app.openedWriter.Device, Inode: p.app.openedWriter.Inode, Type: "fifo"}
++		f.receipt.Phase = map[string]string{"commit": "gate_closed_reader_ready", "barrier": "route_ready_closed", "open": "opened", "complete": "completed", "cancel": "unknown"}[endpoint]
++		if endpoint == "commit" {
++			f.operation.Store(p.roomMoveReservation.Operation)
++		}
++
++		if endpoint == "commit" && os.Getenv("PC_DEALER_ROOM_CHANGE_NEGATIVE") == "cancel_after_possible" {
++			op := p.roomMoveReservation.Operation
++			op.mu.Lock()
++			cancel := op.Cancel
++			op.mu.Unlock()
++			cancel()
++		}
++		if endpoint == "barrier" && os.Getenv("PC_DEALER_ROOM_CHANGE_NEGATIVE") == "stale_after_possible" {
++			p.aliasMu.Lock()
++			p.aliasRevision++
++			p.aliasMu.Unlock()
++		}
++
++		if endpoint == "barrier" {
++			read("writer_source_epoch", &f.receipt.WriterEpoch)
++			f.receipt.InputEpoch = f.receipt.WriterEpoch
++			route := f.state.OldRoute
++			route.DeviceID = f.state.Target.DeviceID
++			f.receipt.Route = &route
++		}
++		if endpoint == "open" || endpoint == "complete" {
++			f.receipt.GateClosed = false
++			actual := f.receipt.Intended
++			f.receipt.Actual = &actual
++		}
++	}
++	f.receipt.Schema = "podconnect.output_move_" + endpoint + ".v1"
++	_ = json.NewEncoder(w).Encode(f.receipt)
++}
++
++func TestDealerRoomChangeUsesExistingMoveOwner(t *testing.T) {
++	cases := []string{"completed_start", "completed_move", "same_alias", "conflicting_alias", "invalid_alias", "system_initiated", "unknown_custody", "cancel_before", "cancel_after_possible", "stale_after_possible", "load_failure"}
++	for _, name := range cases {
++		t.Run(name, func(t *testing.T) {
++			t.Setenv("PC_DEALER_ROOM_CHANGE_REGRESSION", "1")
++			if name == "completed_move" {
++				t.Setenv("PC_DEALER_ROOM_CHANGE_RETAINED_MOVE", "1")
++			}
++			if name == "same_alias" {
++				t.Setenv("PC_DEALER_ROOM_CHANGE_SAME_ALIAS", "1")
++			}
++			if name != "completed_start" && name != "completed_move" && name != "same_alias" {
++				t.Setenv("PC_DEALER_ROOM_CHANGE_NEGATIVE", name)
++			}
++			TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t)
++		})
++	}
++}

@@ -336,7 +336,11 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         offer = await self.room_offer()
         self.assertEqual(offer["schema"], "podconnect.room_controls.v1")
         self.assertFalse(offer["volume_supported"])
-        self.assertNotIn("volume", offer["actions"])
+        self.assertEqual(offer["actions"], ["pause", "resume", "next", "previous"])
+        internal = await self.entries[0].runtime_data.commands.room_transport.read(
+            self.hass, "account-alpha", "spotify-one", "room-alpha", "123"
+        )
+        self.assertTrue({"seek", "shuffle", "repeat"} <= set(internal["actions"]))
         self.assertEqual(
             self.room_reads[0],
             {
