@@ -1,0 +1,88 @@
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -181,11 +181,25 @@
+ static bool room_volume_undrained(void);
+ static bool transport_custody_busy(void);
+ 
++/* Return the first blocking owner from the original short-circuit evaluation.
++ * Some predicates retire expired leases: diagnostics must not evaluate them twice. */
++static const char *
++outputs_transport_busy_reason(void)
++{
++  if (transport_pin && !transport_remaining(&transport_pin_expiry)) transport_pin = NULL;
++  if (transport_pin != NULL) return "transport_pin";
++  if (room_volume_pin_busy()) return "volume_pin";
++  if (transport_custody_busy()) return "transport_custody";
++  if (room_volume_undrained()) return "volume_undrained";
++  if (outputs_start_busy()) return "start_gate_or_writer";
++  if (outputs_start_source_owned()) return "retained_source";
++  return NULL;
++}
++
+ bool
+ outputs_transport_busy(void)
+ {
+-  if (transport_pin && !transport_remaining(&transport_pin_expiry)) transport_pin = NULL;
+-  return transport_pin != NULL || room_volume_pin_busy() || transport_custody_busy() || room_volume_undrained() || outputs_start_busy() || outputs_start_source_owned();
++  return outputs_transport_busy_reason() != NULL;
+ }
+ 
+ static void
+@@ -501,8 +515,9 @@
+   if (!device->advertised) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_unadvertised\n"); return -1; }
+   if (device->type!=OUTPUT_TYPE_AIRPLAY) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: output_type\n"); return -1; }
+   if (device->prevent_playback) { DPRINTF(E_LOG, L_PLAYER, "Connect recovery denied: playback_prevented\n"); return -1; }
+-  if (outputs_transport_busy()) {
+-    DPRINTF(E_LOG, L_PLAYER,"Connect recovery denied: transport_busy\n");
++  const char *busy_reason=outputs_transport_busy_reason();
++  if (busy_reason) {
++    DPRINTF(E_LOG, L_PLAYER,"Connect recovery denied: transport_busy owner=%s\n",busy_reason);
+     /* A fresh canonical retired reader is waiting for actual PCM/autostart.
+      * This is only pre-effect busy, never staging or clean absence authority. */
+     bool retired_wait=outputs_start_retired_normal_autostart_ready(NULL);
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -236,11 +236,32 @@
+ static bool connect_diagnostic_capture;
+ static unsigned connect_diagnostic_count;
+ static const char *connect_diagnostic_message;
++static char connect_diagnostic_buffer[128];
+ void DPRINTF(int severity, int domain, const char *format, ...)
+ {
+   if (connect_diagnostic_capture && !strncmp(format,"Connect recovery denied: ",strlen("Connect recovery denied: "))) {
+-    assert(severity==E_LOG && domain==L_PLAYER && !strchr(format,'%'));
+-    connect_diagnostic_count++; connect_diagnostic_message=format;
++    va_list args, inspect;
++    int written;
++    assert(severity==E_LOG && domain==L_PLAYER);
++    va_start(args,format);
++    if (strchr(format,'%')) {
++      static const char *owners[]={"transport_pin","volume_pin","transport_custody",
++        "volume_undrained","start_gate_or_writer","retained_source"};
++      const char *owner;
++      bool allowed=false;
++      assert(!strcmp(format,"Connect recovery denied: transport_busy owner=%s\n"));
++      va_copy(inspect,args);
++      owner=va_arg(inspect,const char *);
++      va_end(inspect);
++      assert(owner);
++      for (size_t i=0;i<sizeof(owners)/sizeof(owners[0]);i++)
++        if (!strcmp(owner,owners[i])) allowed=true;
++      assert(allowed); /* Only static owner labels, never identifiers or raw errors. */
++    }
++    written=vsnprintf(connect_diagnostic_buffer,sizeof(connect_diagnostic_buffer),format,args);
++    va_end(args);
++    assert(written>=0 && (size_t)written<sizeof(connect_diagnostic_buffer));
++    connect_diagnostic_count++; connect_diagnostic_message=connect_diagnostic_buffer;
+   }
+ }
+ 
+@@ -428,7 +449,7 @@
+   a->advertised=false; connect_diagnostic_expect(1,"output_unadvertised"); a->advertised=true;
+   a->type=OUTPUT_TYPE_DUMMY; connect_diagnostic_expect(1,"output_type"); a->type=OUTPUT_TYPE_AIRPLAY;
+   a->prevent_playback=true; connect_diagnostic_expect(1,"playback_prevented"); a->prevent_playback=false;
+-  atomic_store(&start_owned_latch,true); connect_diagnostic_expect(1,"transport_busy"); atomic_store(&start_owned_latch,false);
++  atomic_store(&start_owned_latch,true); connect_diagnostic_expect(1,"transport_busy owner=retained_source"); atomic_store(&start_owned_latch,false);
+   start_journal_fault=true; connect_diagnostic_expect(1,"start_not_clean_absent"); start_journal_fault=false;
+   b->busy=true; connect_diagnostic_expect(1,"output_busy"); b->busy=false;
+   b->attention_lease=1; connect_diagnostic_expect(1,"attention_lease"); b->attention_lease=0;

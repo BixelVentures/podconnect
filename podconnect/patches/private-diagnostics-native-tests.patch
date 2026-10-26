@@ -1,0 +1,67 @@
+--- /dev/null
++++ b/daemon/connect_ownership_diagnostics_test.go
+@@ -0,0 +1,64 @@
++package daemon
++
++import (
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	"strings"
++	"testing"
++)
++
++type ownershipDiagnosticLogger struct {
++	librespot.NullLogger
++	line string
++}
++
++func (l *ownershipDiagnosticLogger) Infof(format string, args ...interface{}) {
++	l.line = fmt.Sprintf(format, args...)
++}
++
++func TestConnectOwnershipDiagnosticDistinguishesRetainedAliasWithoutIdentityLeak(t *testing.T) {
++	p, op := contentFixture(t)
++	p.app.startCustody = op
++	p.app.openedWriterOwner = p
++	p.state.device.SelectedAliasId = 2
++	p.aliasRevision = op.Intended.AliasRevision
++	actual := op.Intended
++	op.Actual = &actual
++	op.Owner = p
++	op.Capture.Session = p.sess
++	d := p.connectOwnershipDiagnostic()
++	if !d.Start || d.Move || !d.WriterOwner || !d.RetainedOwner || !d.RetainedSession || !d.RetainedAlias {
++		t.Fatalf("current owner not recognized: %+v", d)
++	}
++	p.aliasRevision++
++	d = p.connectOwnershipDiagnostic()
++	if d.RetainedAlias || !d.RetainedOwner || !d.RetainedSession {
++		t.Fatalf("alias divergence not distinguished: %+v", d)
++	}
++	logger := &ownershipDiagnosticLogger{}
++	p.app.log = logger
++	actual.AccountUserID = "PRIVATE_ACCOUNT_CANARY"
++	actual.ConnectionID = "PRIVATE_CONNECTION_CANARY"
++	actual.SessionID = "PRIVATE_SESSION_CANARY"
++	actual.RoomID = "PRIVATE_ROOM_CANARY"
++	op.Offer.OfferID = "PRIVATE_TOKEN_CANARY"
++	p.logConnectOwnershipFailure("room_handoff")
++	if strings.Contains(logger.line, "PRIVATE_") || !strings.Contains(logger.line, "retained_alias_matches=false") || !strings.Contains(logger.line, "stage=room_handoff") {
++		t.Fatal("privacy-safe diagnosis missing", logger.line)
++	}
++	if p.app.startCustody != op || p.aliasRevision != actual.AliasRevision+1 {
++		t.Fatal("diagnostic mutated owner")
++	}
++}
++
++func TestConnectOwnershipDiagnosticMoveAndUnknown(t *testing.T) {
++	p, op := contentFixture(t)
++	p.app.startCustody = nil
++	p.app.moveCustody = &moveOperation{Owner: p, Capture: &moveCapture{contentCapture: op.Capture}, Actual: &op.Intended}
++	p.app.moveCustodyUnknown = true
++	p.roomMoveQuarantined = true
++	d := p.connectOwnershipDiagnostic()
++	if d.Start || !d.Move || !d.Unknown || !d.Quarantined || !d.RetainedOwner {
++		t.Fatalf("MOVE/unknown not distinguished: %+v", d)
++	}
++}

@@ -1,0 +1,119 @@
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -248,6 +248,7 @@
+ 	if p.roomVolumeBusy() || p.app.manualReleasePending() {
+ 		if req.Command.Endpoint == "transfer" {
+ 			p.app.log.Infof("connect-recovery native reason=room_volume_busy")
++			p.logConnectOwnershipFailure("command_admission")
+ 		}
+ 		return ErrAliasConflict
+ 	}
+@@ -467,7 +468,13 @@
+ 	return nil
+ }
+ 
+-func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.RequestPayload, transferState *connectpb.TransferState, sp *spclient.Spclient) error {
++func (p *AppPlayer) handleTransferCommand(ctx context.Context, req dealer.RequestPayload, transferState *connectpb.TransferState, sp *spclient.Spclient) (transferErr error) {
++	stage := "context_prepare"
++	defer func() {
++		if transferErr != nil {
++			p.logConnectOwnershipFailure(stage)
++		}
++	}()
+ 	ctxTracks, err := tracks.NewTrackListFromContext(ctx, p.app.log, sp, transferState.CurrentSession.Context)
+ 	if err != nil {
+ 		return fmt.Errorf("failed creating track list: %w", err)
+@@ -500,9 +507,11 @@
+ 	if err := ctxTracks.ToggleShuffle(ctx, transferState.Options.ShufflingContext); err != nil {
+ 		return fmt.Errorf("failed shuffling context")
+ 	}
++	stage = "prior_owner_retire"
+ 	if err := p.retirePriorStartForDealerTransfer(ctx, req); err != nil {
+ 		return err
+ 	}
++	stage = "room_handoff"
+ 	moved, err := p.handoffDealerRoomTransfer(ctx, req)
+ 	if err != nil {
+ 		return err
+@@ -574,11 +583,13 @@
+ 	p.state.player.Index = ctxTracks.Index()
+ 
+ 	// The first process writer must be admitted by C before it is opened.
++	stage = "writer_admission"
+ 	bootstrap, err := p.dealerTransferStartRequired(req)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	// load current track into stream
++	stage = "track_load"
+ 	if err := p.loadCurrentTrackWithStart(ctx, pause, true, false, bootstrap); err != nil {
+ 		return fmt.Errorf("failed loading current track (transfer): %w", err)
+ 	}
+--- /dev/null
++++ b/daemon/connect_ownership_diagnostics.go
+@@ -0,0 +1,65 @@
++package daemon
++
++// Failure-only, observational snapshots. No IDs, tokens, account names, media or
++// raw errors leave this helper. It does not query C, verify a writer or admit work.
++type connectOwnershipDiagnostic struct {
++	Start, Move, Unknown, Retirement, WriterOwner bool
++	AliasRetired, Quarantined, Reservation        bool
++	RetainedOwner, RetainedSession, RetainedAlias bool
++}
++
++func (p *AppPlayer) connectOwnershipDiagnostic() connectOwnershipDiagnostic {
++	var d connectOwnershipDiagnostic
++	if p == nil || p.app == nil {
++		return d
++	}
++	p.aliasMu.Lock()
++	d.AliasRetired = p.aliasRetired
++	d.Quarantined = p.roomMoveQuarantined || p.roomContentQuarantined
++	d.Reservation = p.roomMoveReservation != nil
++	incarnation, registry, revision := p.aliasIncarnation, p.aliasFingerprint, p.aliasRevision
++	room, homepod := "", ""
++	if p.state != nil && p.state.device != nil {
++		selected := p.state.device.SelectedAliasId
++		for _, alias := range p.aliasRegistry {
++			if alias.ID == selected {
++				room, homepod = alias.RoomID, alias.HomePodID
++				break
++			}
++		}
++	}
++	p.aliasMu.Unlock()
++	p.app.moveCustodyMu.Lock()
++	start, move := p.app.startCustody, p.app.moveCustody
++	d.Start, d.Move = start != nil, move != nil
++	d.Unknown, d.Retirement = p.app.moveCustodyUnknown, p.app.retirementPending != nil
++	d.WriterOwner = p.app.openedWriterOwner == p
++	p.app.moveCustodyMu.Unlock()
++	matches := func(actual *roomTransportIdentity) bool {
++		return actual != nil && room != "" && homepod != "" && actual.RoomID == room && actual.HomePodID == homepod && actual.AliasIncarnation == incarnation && actual.AliasRegistry == registry && actual.AliasRevision == revision
++	}
++	// Never nest operation and process-custody locks. These flags describe the
++	// sampled retained operation, not an atomic admission or physical witness.
++	if start != nil && move == nil {
++		start.mu.Lock()
++		d.RetainedOwner = start.Owner == p
++		d.RetainedSession = p.sess != nil && start.Capture != nil && start.Capture.Session == p.sess
++		d.RetainedAlias = matches(start.Actual)
++		start.mu.Unlock()
++	} else if move != nil && start == nil {
++		move.mu.Lock()
++		d.RetainedOwner = move.Owner == p
++		d.RetainedSession = p.sess != nil && move.Capture != nil && move.Capture.Session == p.sess
++		d.RetainedAlias = matches(move.Actual)
++		move.mu.Unlock()
++	}
++	return d
++}
++
++func (p *AppPlayer) logConnectOwnershipFailure(stage string) {
++	if p == nil || p.app == nil || p.app.log == nil {
++		return
++	}
++	d := p.connectOwnershipDiagnostic()
++	p.app.log.Infof("connect-recovery native reason=ownership_failure stage=%s retained_start=%t retained_move=%t custody_unknown=%t retirement_pending=%t writer_owner_matches=%t alias_retired=%t quarantined=%t move_reserved=%t retained_owner_matches=%t retained_session_matches=%t retained_alias_matches=%t", stage, d.Start, d.Move, d.Unknown, d.Retirement, d.WriterOwner, d.AliasRetired, d.Quarantined, d.Reservation, d.RetainedOwner, d.RetainedSession, d.RetainedAlias)
++}

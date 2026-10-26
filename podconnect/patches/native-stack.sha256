@@ -41,3 +41,5 @@ aa47ea940c0109d0b8efe765a04e7a924c24bddc604e00fda0a50d8e60385e48  /patches/room-
 3f7530307311e7cc52a362fef0c0164fc23a025fe06e3f7bb60bbed208cb26bd  /patches/room-owner-parity-native-tests.patch
 4298442e6ff1ce5eded00229e5c0f3c952d95431df4039a449ed8adf22dacb36  /patches/dealer-roomchange-native.patch
 dabf7450d55ff3233c2ae3c306856dda92f4276c693186a245ac156fe6561422  /patches/dealer-roomchange-native-tests.patch
+f6295c0e04827d7e335f18d17ffa291a250d1261648362e1af5ca40f26231c09  /patches/private-diagnostics-native.patch
+1064310acf1abe961cb33bf2489714e088d9d930845fbb3a122a84f5568de9ff  /patches/private-diagnostics-native-tests.patch
