@@ -2009,8 +2009,8 @@ index fc417f4..a2e242c 100644
 +	if !reflect.DeepEqual(roomTransportActionsFor(false), []string{"pause", "resume", "next", "previous"}) {
  		t.Fatal("unsupported action included")
  	}
-+	if !reflect.DeepEqual(roomTransportActionsFor(true), []string{"pause", "resume", "next", "previous", "seek"}) {
-+		t.Fatal("typed bound seek capability missing")
++	if !reflect.DeepEqual(roomTransportActionsFor(true), []string{"pause", "resume", "next", "previous", "seek", "shuffle", "repeat"}) {
++		t.Fatal("typed bound seek/options capabilities missing")
 +	}
 +	zero := int64(0)
 +	if _, err := p.prepareRoomTransport(context.Background(), roomTransportPrepareRequest{Action: "seek", PositionMS: &zero}); err != ErrBadRequest {

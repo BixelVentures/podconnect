@@ -7,14 +7,21 @@ actual HA core integration and physical playback require their separate gates.
 
 import ast
 import asyncio
+import copy
 import json
-from pathlib import Path
-from types import SimpleNamespace
+import secrets
+import sys
 import unittest
-from unittest.mock import AsyncMock
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import ANY, AsyncMock
 from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).parents[1] / "custom_components/podconnect"
+PKG = "inert_playback_targets"
+package = ModuleType(PKG)
+package.__path__ = [str(ROOT)]
+sys.modules[PKG] = package
 
 
 class HAError(Exception):
@@ -36,7 +43,11 @@ def load_body(file, namespace=None, names=None):
         body = [n for n in body if getattr(n, "name", None) in names]
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
     ns = dict(
+        __name__=PKG + "." + Path(file).stem,
+        __package__=PKG,
         asyncio=asyncio,
+        copy=copy,
+        secrets=secrets,
         json=json,
         urlsplit=urlsplit,
         urlunsplit=urlunsplit,
@@ -52,10 +63,21 @@ def load_body(file, namespace=None, names=None):
         ),
         ns,
     )
+    module = ModuleType(ns["__name__"])
+    module.__dict__.update(ns)
+    sys.modules[module.__name__] = module
     return ns
 
 
+# Preserve shipped exception identity and entry-currentness during local imports.
+C = load_body("commands.py", names={"CommandRejected"})
+load_body(
+    "observations.py",
+    dict(DOMAIN="podconnect", HomeAssistantError=HAError),
+    names={"current"},
+)
 S = load_body("speakers.py")
+load_body("room_content.py", names={"canonical_list_track"})
 V = SimpleNamespace(
     Required=lambda key: key,
     Optional=lambda key: key,
@@ -135,8 +157,23 @@ def services(api=None, speakers=None):
         transfer=AsyncMock(),
     )
     data = SimpleNamespace(api=api, speakers=speakers, active=True)
-    entries = [SimpleNamespace(entry_id="account-A", title="Account A", runtime_data=data, options={})]
-    registered = {}
+    entries = [
+        SimpleNamespace(
+            entry_id="account-A",
+            domain="podconnect",
+            unique_id="spotify-account-A",
+            title="Account A",
+            runtime_data=data,
+            options={},
+        )
+    ]
+    api._session, api._web = object(), object()
+    data.session, data.observations = object(), object()
+    data.commands = SimpleNamespace(room_transport=SimpleNamespace(observe=AsyncMock()))
+    data.coordinator = SimpleNamespace(
+        api=api, config_entry=entries[0], owner_epoch="epoch-A", poll_sequence=1
+    )
+    registered = type("RegisteredServices", (dict,), {})()
     registry = SimpleNamespace(
         has_service=lambda domain, name: name in registered,
         async_register=lambda domain, name, handler, **kw: registered.__setitem__(
@@ -144,14 +181,49 @@ def services(api=None, speakers=None):
         ),
     )
     hass = SimpleNamespace(
-        services=registry, config_entries=SimpleNamespace(async_entries=lambda domain: entries),
-        entity_registry={}, device_registry={}, area_registry={},
+        services=registry,
+        config_entries=SimpleNamespace(
+            async_entries=lambda domain: entries,
+            async_get_entry=lambda key: next(
+                (entry for entry in entries if entry.entry_id == key), None
+            ),
+        ),
+        entity_registry={},
+        device_registry={},
+        area_registry={},
     )
+    data.coordinator.hass = hass
     T["register_target_services"](hass)
+    registered.fixture_data = data
     return hass, data, entries, registered
 
 
+def selection_context(data):
+    """Inert existing Speakers owners; actual target admission remains shipped code."""
+    if data.speakers is None:
+        data.speakers = SimpleNamespace(
+            aliases=AsyncMock(
+                return_value={
+                    **catalog(),
+                    "aliases": [dict(id=1, room_id="A", name="Native room")],
+                }
+            ),
+            rooms=AsyncMock(return_value=[dict(id="A", homepod_id="native-A")]),
+            ensure_no_owned_session=AsyncMock(),
+        )
+    data.speakers.start_identity = AsyncMock(return_value="native-player")
+    if isinstance(data.speakers, S["SpeakersClient"]):
+        data.speakers.rooms = AsyncMock(
+            return_value=[
+                dict(id="A", homepod_id="native-A"),
+                dict(id="B", homepod_id="native-B"),
+            ]
+        )
+
+
 async def invoke(reg, name, **kw):
+    if name == "move_playback":
+        selection_context(reg.fixture_data)
     return await reg[name][0](SimpleNamespace(data={"config_entry_id": "account-A", **kw}))
 
 
@@ -367,7 +439,15 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
     async def test_stable_spotify_id_and_known_paused_state(self):
         _, data, _, reg = services()
         reply = await invoke(reg, "move_playback", kind="spotify_device", target_id="device-B")
-        data.api.transfer.assert_awaited_once_with("device-B", play=False)
+        data.api.transfer.assert_awaited_once_with(
+            "device-B", play=False, execution_guard=ANY, async_execution_guard=ANY
+        )
+        self.assertTrue(
+            callable(data.api.transfer.await_args.kwargs["execution_guard"])
+        )
+        self.assertTrue(
+            callable(data.api.transfer.await_args.kwargs["async_execution_guard"])
+        )
         self.assertTrue(reply["provider_request_accepted"])
         self.assertNotIn("playing", reply)
 
@@ -405,7 +485,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(n, ast.AsyncFunctionDef) and n.name == "async_select_source"
         )
         ns = dict(
-            spotify_transfer_target=T["spotify_transfer_target"],
+            select_playback_source=T["select_playback_source"],
             SpotifyApiError=SpotifyError,
             ClientError=ClientError,
             HomeAssistantError=HAError,
@@ -418,13 +498,38 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         async def send(coro):
             await coro
 
-        entry = SimpleNamespace(entry_id="account-A", runtime_data=data)
+        entry = SimpleNamespace(
+            entry_id="account-A",
+            domain="podconnect",
+            unique_id="spotify-account-A",
+            runtime_data=data,
+        )
         hass = SimpleNamespace(config_entries=SimpleNamespace(async_get_entry=lambda key: entry))
-        coordinator = SimpleNamespace(api=data.api, config_entry=entry, hass=hass)
+        coordinator = SimpleNamespace(
+            api=data.api,
+            config_entry=entry,
+            hass=hass,
+            owner_epoch="epoch-A",
+            poll_sequence=1,
+        )
         data.coordinator = coordinator
-        obj = SimpleNamespace(coordinator=coordinator, _send=send)
+        selection_context(data)
+        obj = SimpleNamespace(
+            coordinator=coordinator,
+            _send=send,
+            _device_id="entity-device",
+            _entry_id="account-A",
+        )
         await ns["async_select_source"](obj, "Room B")
-        data.api.transfer.assert_awaited_once_with("device-B", play=False)
+        data.api.transfer.assert_awaited_once_with(
+            "device-B", play=False, execution_guard=ANY, async_execution_guard=ANY
+        )
+        self.assertTrue(
+            callable(data.api.transfer.await_args.kwargs["execution_guard"])
+        )
+        self.assertTrue(
+            callable(data.api.transfer.await_args.kwargs["async_execution_guard"])
+        )
         data.api.devices.return_value = [device("1"), device("2")]
         with self.assertRaises(HAError):
             await ns["async_select_source"](obj, "Room B")
@@ -484,7 +589,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(n, ast.AsyncFunctionDef) and n.name == "async_select_source"
         )
         ns = dict(
-            spotify_transfer_target=T["spotify_transfer_target"],
+            select_playback_source=T["select_playback_source"],
             SpotifyApiError=SpotifyError,
             ClientError=ClientError,
             HomeAssistantError=HAError,
@@ -496,12 +601,23 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             for retirement in ("unload", "runtime", "entry"):
                 with self.subTest(phase=phase, retirement=retirement):
                     _, data, _, _ = services()
-                    entry = SimpleNamespace(entry_id="account-A", runtime_data=data)
+                    entry = SimpleNamespace(
+                        entry_id="account-A",
+                        domain="podconnect",
+                        unique_id="spotify-account-A",
+                        runtime_data=data,
+                    )
                     current_entry = [entry]
                     hass = SimpleNamespace(
                         config_entries=SimpleNamespace(async_get_entry=lambda key: current_entry[0])
                     )
-                    coordinator = SimpleNamespace(api=data.api, config_entry=entry, hass=hass)
+                    coordinator = SimpleNamespace(
+                        api=data.api,
+                        config_entry=entry,
+                        hass=hass,
+                        owner_epoch="epoch-A",
+                        poll_sequence=1,
+                    )
                     data.coordinator = coordinator
                     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -515,7 +631,13 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     async def send(coro):
                         await coro
 
-                    obj = SimpleNamespace(coordinator=coordinator, _send=send)
+                    selection_context(data)
+                    obj = SimpleNamespace(
+                        coordinator=coordinator,
+                        _send=send,
+                        _device_id="entity-device",
+                        _entry_id="account-A",
+                    )
                     task = asyncio.create_task(ns["async_select_source"](obj, "Room B"))
                     try:
                         await asyncio.wait_for(entered.wait(), 1)
@@ -527,7 +649,10 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                             )
                         else:
                             current_entry[0] = SimpleNamespace(
-                                entry_id="account-A", runtime_data=data
+                                entry_id="account-A",
+                                domain="podconnect",
+                                unique_id="spotify-account-A",
+                                runtime_data=data,
                             )
                         release.set()
                         with self.assertRaises(HAError):
@@ -541,7 +666,11 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_stable_room_same_name_no_oauth_and_exact_claim(self):
         c = catalog()
-        reply = {"accepted_local": True, "binding": {**c["binding"], "room_id": "B"}}
+        reply = {
+            "accepted_local": True,
+            "idle_only": True,
+            "binding": {**c["binding"], "room_id": "B"},
+        }
         web = Web([Response(c), Response(reply)])
         _, data, _, reg = services(speakers=S["SpeakersClient"](web, "http://local:8099"))
         result = await invoke(reg, "move_playback", kind="configured_alias", target_id="B")
@@ -550,7 +679,12 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(web.calls[1][0], ("POST", "http://local:8099/api/room-switch"))
         self.assertEqual(
             web.calls[1][1]["json"],
-            {"room_id": "B", "expected_incarnation": "inc-A", "expected_registry": "registry-A"},
+            {
+                "room_id": "B",
+                "expected_incarnation": "inc-A",
+                "expected_registry": "registry-A",
+                "idle_only": True,
+            },
         )
         for _, kw in web.calls:
             self.assertEqual(kw["headers"], {"Accept": "application/json"})

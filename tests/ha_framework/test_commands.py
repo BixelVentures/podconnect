@@ -34,6 +34,7 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.command_release = asyncio.Event()
         self.command_queries = []
         self.playing = False
+        self.current_native_observation = False
         self.no_playback = False
         self.native_prepares = 0
         self.native_commits = 0
@@ -52,6 +53,47 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.calls.clear()
 
     async def _backend(self, request):
+        if self.current_native_observation and request.path == "/api/room-transport/state":
+            self.assertEqual(request.method, "GET")
+            self.assertNotIn("Authorization", request.headers)
+            self.assertEqual(
+                dict(request.query),
+                {
+                    "account_user_id": "account-alpha",
+                    "target_id": "spotify-one",
+                    "room_id": "room-alpha",
+                    "homepod_id": "123",
+                },
+            )
+            self.calls.append((request.method, request.path, None, False))
+            return web.json_response(
+                {
+                    "schema": "podconnect.room_transport_state.v1",
+                    "ok": True,
+                    "native": {
+                        **dict(request.query),
+                        "connection_id": "connection-a",
+                        "session_id": "session-a",
+                        "alias_incarnation": "fixture-incarnation",
+                        "alias_registry": "fixture-registry",
+                        "alias_revision": 7,
+                    },
+                    "route": {
+                        "process": "12345678-1234-4234-8234-123456789abc",
+                        "device_id": "123",
+                        "device_incarnation": "1",
+                        "session_epoch": "2",
+                        "route_revision": "3",
+                        "selection_revision": "4",
+                        "input_generation": "5",
+                        "input_item_id": "6",
+                        "input_path_digest": "b" * 64,
+                    },
+                    "actions": [],
+                    "effect": None,
+                    "physical_result_verified": False,
+                }
+            )
         if request.path == "/api/start-volume":
             proof = self._native_proof()
             if request.method == "GET":
@@ -362,17 +404,28 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
         self.assertEqual(self._writes(), [])
 
-    async def test_playing_transfer_to_native_uses_start_barrier(self):
+    async def test_select_playing_current_native_observes_without_start_or_transfer(self):
         self.playing = True
+        self.current_native_observation = True
+        # Inherited transport fixtures expose this same exact current output.
+        self.alpha_output = "123"
+        self.output_homepod = "123"
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
-        with patch.object(
-            data.speakers,
-            "start_identity",
-            new_callable=AsyncMock,
-            return_value="spotify-one",
+        with (
+            patch.object(
+                data.speakers,
+                "start_identity",
+                new_callable=AsyncMock,
+                return_value="spotify-one",
+            ),
+            patch.object(
+                data.speakers,
+                "room_transport_state",
+                wraps=data.speakers.room_transport_state,
+            ) as observation,
         ):
-            status, _ = await self._service(
+            status, body = await self._service(
                 "move_playback",
                 {
                     "config_entry_id": "account-alpha",
@@ -381,10 +434,25 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         self.assertEqual(status, 200)
-        self.assertEqual(self.native_prepares, 1)
-        self.assertEqual(self.native_commits, 1)
-        self.assertEqual(len(self._writes()), 1)
-        self.assertEqual(self._writes()[0][1], "/spotify/me/player")
+        self.assertEqual(
+            body["service_response"],
+            {
+                "kind": "configured_alias",
+                "target_id": "room-alpha",
+                "observed_current": True,
+                "physical_result_verified": False,
+            },
+        )
+        observation.assert_awaited_once_with(
+            {
+                "account_user_id": "account-alpha",
+                "target_id": "spotify-one",
+                "room_id": "room-alpha",
+                "homepod_id": "123",
+            }
+        )
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
+        self.assertEqual(self._writes(), [])
 
     async def test_same_session_native_output_above_approved_max_refuses_track(self):
         self.native_output_volume = 90

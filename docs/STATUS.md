@@ -1,3 +1,9 @@
+## 26 October — coordinated54/24 candidate; official CI fixture corrections
+
+PR83 head597e4e4 passed OwnTone build and manager race checks; boundary, native mapping and one inherited framework selection fixture failed. All three were independently diagnosed as stale fixture contracts, corrected without production changes and separately reviewed. Boundary baseline98/27errors became98PASS; native exact failure reproduced then focused mapping/seek/options passed; framework20 focused cases include same-current observation with zero effects and preserved true START/different-room barriers. Exact patches5f3179e4/4ae66afe/native3f753030 integrated together; checksum updated. Required official CI reruns on the new commit remain pending. No physical/install proof is claimed.
+
+User paused only long Spotify Radio continuation beyond initial pages. It is not a release blocker; normal playback startup/audio/controls/reconnect and context404 recovery remain mandatory. PC70 published53 parser compatibility+retained DB/FIFO proof supports blocked paired downgrade after purpose records with current-version forward recovery; it does not establish old-binary rollback. Earlier chronological Gate0/compatibility statements below are superseded by these bounded scope/evidence updates.
+
 ### Reviewed Control parity integration, 25 October night
 
 Shared candidate now contains independently reviewed settlement e5a480, options a3452e,
