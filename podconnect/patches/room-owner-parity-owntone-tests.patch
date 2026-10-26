@@ -325,7 +325,86 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
    wire.http_base=event_base_new();assert(wire.http_base);
    wire.http=evhttp_new(wire.http_base);assert(wire.http);
    evhttp_set_gencb(wire.http,native_start_http,&wire);
-@@ -1468,7 +1637,7 @@
+@@ -1398,16 +1567,55 @@
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+   socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};struct airplay_extra *extra;
+-  char database[]="/tmp/start35-wire-db-XXXXXX",fifo[]="/tmp/start35-wire-pipe-XXXXXX";int file=mkstemp(database),placeholder=mkstemp(fifo),writer=-1,reader=-1,item;
++  char database[PATH_MAX] = "/tmp/start35-wire-db-XXXXXX", fifo[PATH_MAX] = "/tmp/start35-wire-pipe-XXXXXX";
++  const char *cold_db = getenv("PC70_COLD_DATABASE"), *cold_fifo = getenv("PC70_COLD_FIFO");
++  bool cold = mode == 29 && cold_db && cold_fifo, cold_restart = cold && getenv("PC70_COLD_RESTART");
++  int file = -1, placeholder = -1, writer = -1, reader = -1, item;
+   bool database_ready=false,input_ready=false,worker_ready=false;pthread_t writer_thread;struct start_fifo_writer pending={0};
+   struct input_fifo_identity fd={0};struct timespec deadline;struct media_file_info mfi={0};struct query_params qp={.type=Q_ITEMS};
+-  assert(file>=0 && placeholder>=0);close(file);close(placeholder);assert(unlink(fifo)==0 && mkfifo(fifo,0600)==0);
++  if (cold)
++    {
++      assert(strlen(cold_db) < sizeof(database) && strlen(cold_fifo) < sizeof(fifo));
++      strcpy(database, cold_db);
++      strcpy(fifo, cold_fifo);
++      if (cold_restart)
++	{
++	  struct stat st;
++	  assert(stat(database, &st) == 0 && S_ISREG(st.st_mode));
++	  assert(stat(fifo, &st) == 0 && S_ISFIFO(st.st_mode));
++	}
++      else
++	{
++	  file = open(database, O_RDWR | O_CREAT | O_EXCL, 0600);
++	  assert(file >= 0);
++	  close(file);
++	  assert(mkfifo(fifo, 0600) == 0);
++	}
++      fprintf(stderr, "PC70_COLD phase=%s C_pid=%ld database=%s fifo=%s\n",
++          cold_restart ? "restart" : "terminal-release", (long)getpid(), database, fifo);
++    }
++  else
++    {
++      file = mkstemp(database);
++      placeholder = mkstemp(fifo);
++      assert(file >= 0 && placeholder >= 0);
++      close(file);
++      close(placeholder);
++      assert(unlink(fifo) == 0 && mkfifo(fifo, 0600) == 0);
++    }
+   assert(evthread_use_pthreads()==0);active_recovery_wire=&f;f.base=event_base_new();assert(f.base);evbase_player=f.base;
+   if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
+   cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
+   cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
+   if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
+-  outputs_attention_uuid(outputs_process);assert(outputs_attention_startup()==0);start_journal_startup();assert(!outputs_start_gate_closed());
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup() == 0);
++  start_journal_startup();
++  if (cold_restart)
++    assert(outputs_start_gate_closed() && !start_journal_fault
++           && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN);
++  else
++    assert(!outputs_start_gate_closed());
+   if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
+   outputs_deferredev=evtimer_new(f.base,deferred_cb,NULL);outputs_buffer_duration_ms=cfg_getint(cfg_getsec(cfg,"general"),"start_buffer_ms");
+   f.plain=evbuffer_new();f.listener=evconnlistener_new_bind(f.base,recovery_wire_accept,&f,LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE,2,(struct sockaddr *)&address,sizeof(address));
+@@ -1420,7 +1628,18 @@
+   if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
+   f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
+   /* Seed the real library database without invoking an unrelated scanner command consumer. */
+-  sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
++  sqlite3 *seed = NULL;
++  assert(sqlite3_open(database, &seed) == SQLITE_OK);
++  assert(sqlite3_enable_load_extension(seed, 1) == SQLITE_OK
++         && sqlite3_load_extension(seed, ATTENTION_TEST_SQLEXT_PATH, NULL, NULL) == SQLITE_OK);
++  char *sql
++      = sqlite3_mprintf(cold_restart ? "INSERT OR IGNORE INTO "
++                                       "files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_"
++                                       "season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)"
++                                     : "INSERT INTO "
++                                       "files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_"
++                                       "season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",
++          fifo, fifo, DATA_KIND_PIPE, MEDIA_KIND_MUSIC);
+   assert(sqlite3_exec(seed,sql,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(sql);sqlite3_close(seed);mfi.id=1;
+   qp.id=mfi.id;assert(db_queue_add_by_query(&qp,0,0,-1,NULL,&item)==0);
+   if(mode==24 || mode==25){
+@@ -1468,7 +1687,7 @@
  	player_state = PLAY_PLAYING;
  	assert(!start_active && !start_journal.token[0] && start_route_clean_absent());
        }
@@ -334,6 +413,21 @@ diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
        {
  	struct output_device *target = calloc(1, sizeof(*target));
  	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
+@@ -2343,8 +2562,12 @@
+   pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
+   if(outputs_deferredev)event_free(outputs_deferredev);
+   if(database_ready)db_perthread_deinit();
+-  db_deinit();cfg_free(cfg);unlink(database);
++  db_deinit();
++  cfg_free(cfg);
++  if (!cold)
++    unlink(database);
+   if(mode==29 && getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);unlink(metadata);}
+-  unlink(fifo);
++  if (!cold)
++    unlink(fifo);
+   return f.failed;
+ }
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
