@@ -1,0 +1,2582 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -241,7 +241,7 @@
+ 	$(GPERF_SRC) \
+ 	$(LEXER_SRC) $(PARSER_SRC)
+ airplay_callback_owner_CPPFLAGS = $(AM_CPPFLAGS) -I$(srcdir) -I$(srcdir)/outputs -I$(srcdir)/evrtsp \
+-	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\"
++	-DATTENTION_TEST_SQLEXT_PATH=\"$(abs_top_builddir)/sqlext/.libs/owntone-sqlext.so\" -DPIPE_METADATA_OWNER_TEST
+ airplay_callback_owner_CFLAGS = $(AM_CFLAGS) -ffunction-sections -fdata-sections
+ airplay_callback_owner_LDFLAGS = -Wl,--wrap=close -Wl,--wrap=evbuffer_write  -Wl,--gc-sections -Wl,--export-dynamic -Wl,--wrap=sqlite3_open -Wl,--wrap=sqlite3_unlock_notify -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=net_bind -Wl,--wrap=mdns_browse -Wl,--wrap=socket -Wl,--wrap=http_client_request -Wl,--wrap=scan_metadata_ffmpeg -Wl,--wrap=db_transaction_end -Wl,--wrap=db_transaction_rollback -Wl,--wrap=db_start_guard_save -Wl,--wrap=input_fifo_owner_get -Wl,--wrap=free_mfi -Wl,--wrap=gcry_mpi_randomize
+ EXTRA_DIST += ../tests/player_startup_owner.inc.c ../tests/rss_probe_transaction_owner.inc.c
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -13,6 +13,7 @@
+ #include <string.h>
+ #include <event2/listener.h>
+ #include <event2/bufferevent.h>
++#include <event2/thread.h>
+ #include "../src/pair_ap/pair-tlv.h"
+ 
+ /* Inert speaker persistence only. Every state, request, crypto/codec constructor,
+@@ -42,9 +43,63 @@
+ #undef calloc
+ #undef free
+ #undef db_speaker_get
+-#undef db_speaker_save
+ #include "../src/outputs/streaming.c"
+ #include "../src/player.c"
++#undef db_speaker_save
++#include "../src/httpd_internal.h"
++extern struct httpd_module httpd_jsonapi;
++extern struct input_definition input_pipe;
++int pipe_metadata_test_snapshot(uint64_t *, uint32_t *, bool *, uint64_t *);
++
++/* Actual pipe backend, named FIFOs and its existing event-loop command queue.
++ * A DB id and path may be reused; the old stop must not destroy the new watch.
++ * A real metadata read callback must run before final cleanup on that owner. */
++static int metadata_pipe_owner_case(void)
++{
++  char directory[]="/tmp/pipe-metadata-owner-XXXXXX";
++  char audio[PATH_MAX], metadata[PATH_MAX];
++  struct input_source old={.id=7}, next={.id=7};
++  uint64_t first=0, successor=0, seen=0, reads=0, before=0;
++  uint32_t id=0; bool watching=false;
++  int writer=-1, result=1;
++  if(!mkdtemp(directory))return 1;
++  snprintf(audio,sizeof(audio),"%s/audio",directory);
++  snprintf(metadata,sizeof(metadata),"%s/audio.metadata",directory);
++  if(mkfifo(audio,0600)<0 || mkfifo(metadata,0600)<0)goto done;
++  writer=open(metadata,O_RDWR|O_NONBLOCK);
++  if(writer<0 || evthread_use_pthreads()<0)goto done;
++  cfg=cfg_init(toplvl_cfg,CFGF_NONE);
++  if(!cfg)goto done;
++  cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
++  if(input_pipe.init()<0)goto done;
++  old.path=audio;next.path=audio;
++  if(input_pipe.setup(&old)<0)goto deinit;
++  if(pipe_metadata_test_snapshot(&first,&id,&watching,&reads)<0 || !watching || !first || id!=7)goto deinit;
++  if(input_pipe.setup(&next)<0)goto deinit;
++  if(pipe_metadata_test_snapshot(&successor,&id,&watching,&reads)<0 || !watching || successor<=first || id!=7)goto deinit;
++  if(input_pipe.stop(&old)<0)goto deinit;
++  if(pipe_metadata_test_snapshot(&seen,&id,&watching,&reads)<0 || !watching || seen!=successor || id!=7)goto deinit;
++  before=reads;
++  if(write(writer,"x",1)!=1)goto deinit;
++  for(int i=0;i<100;i++){
++    if(pipe_metadata_test_snapshot(&seen,&id,&watching,&reads)<0)goto deinit;
++    if(reads>before)break;
++    usleep(10000);
++  }
++  if(reads<=before || !watching || seen!=successor)goto deinit;
++  if(input_pipe.stop(&next)<0)goto deinit;
++  if(pipe_metadata_test_snapshot(&seen,&id,&watching,&reads)<0 || watching || seen)goto deinit;
++  result=0;
++ deinit:
++  if(old.input_ctx)input_pipe.stop(&old);
++  if(next.input_ctx)input_pipe.stop(&next);
++  input_pipe.deinit();
++ done:
++  if(cfg){cfg_free(cfg);cfg=NULL;}
++  if(writer>=0)close(writer);
++  unlink(metadata);unlink(audio);rmdir(directory);
++  return result;
++}
+ 
+ /* The input command closes its real old reader before opening the successor.
+  * Schedule the pipe watcher's independent reset-close in that exact interval.
+@@ -76,6 +131,7 @@
+ static uint32_t fixture_post_full_item;
+ static const char *fixture_post_full_path;
+ static bool fixture_expire_retirement_reader;
++static bool fixture_expire_manual_post_full;
+ int __real_input_fifo_owner_get(uint32_t,const char *,bool,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ int __wrap_input_fifo_owner_get(uint32_t item,const char *path,bool drain,uint64_t device,uint64_t inode,
+     const struct timespec *deadline,struct input_fifo_identity *reader)
+@@ -93,6 +149,14 @@
+ int __wrap_db_start_guard_save(const struct db_start_guard *expected,const struct db_start_guard *record)
+ {
+   int result=__real_db_start_guard_save(expected,record);
++  if (result == 0 && fixture_expire_manual_post_full && release_operation.prepared && release_operation.used)
++    {
++      release_operation.expiry.tv_sec -= 20;
++      if (start_active && release_operation.predecessor.completed_token[0]
++          && !strcmp(start_active->result.command.token, release_operation.predecessor.completed_token))
++	start_active->retirement.deadline.tv_sec -= 20;
++      fixture_expire_manual_post_full = false;
++    }
+   if(result==0 && (fixture_post_full_writer || fixture_post_full_item)){
+     json_object *payload=json_tokener_parse(record->payload),*phase;
+     bool completed=payload && json_object_object_get_ex(payload,"phase",&phase)
+@@ -132,8 +196,20 @@
+     if (p && contexts[i] == p) { contexts[i] = NULL; context_frees++; break; }
+   free(p);
+ }
++static bool pc70_real_speaker_persistence;
++int
++db_speaker_get(struct output_device *, uint64_t);
++int
++db_speaker_save(struct output_device *);
+ int fixture_speaker_get(struct output_device *device, uint64_t id)
+-{ (void)id; device->volume = 30; device->selected = false; return 0; }
++{
++  if (pc70_real_speaker_persistence)
++    return db_speaker_get(device, id);
++  (void)id;
++  device->volume = 30;
++  device->selected = false;
++  return 0;
++}
+ int fixture_speaker_save(struct output_device *device)
+ { (void)device; return 0; }
+ 
+@@ -585,7 +661,7 @@
+   struct output_attention_result result;
+   unsigned short udp_port;
+   int udp_fd,mode,phase,failed,wire,volumes,teardowns,pair_messages,start_callbacks,stop_callbacks;
+-  int short_salts,padded_salts;
++  int short_salts, padded_salts, pc70_peer_sessions;
+   struct output_attention_result handoff;
+   struct output_room_volume_request volume_command;
+   struct output_room_volume_result volume_result;
+@@ -595,6 +671,7 @@
+ 
+ static struct recovery_wire_fixture *active_recovery_wire;
+ static bool recovery_receiver_entropy, recovery_salt_red;
++static bool completed_move_real_resume;
+ static int start_partial_writes,start_partial_bytes;
+ int __real_evbuffer_write(struct evbuffer *,int);
+ int __wrap_evbuffer_write(struct evbuffer *buffer,int fd)
+@@ -675,6 +752,22 @@
+     ret=bufferevent_write(f->peer,encrypted,encrypted_length); free(encrypted);
+   } else ret=bufferevent_write_buffer(f->peer,reply);
+   evbuffer_free(reply); return ret;
++}
++
++struct held_start_reply {
++  struct recovery_wire_fixture *fixture;
++  struct event *timer;
++  uint8_t *body;
++  size_t length;
++  int code,cseq;
++};
++static void held_start_reply_send(evutil_socket_t fd,short what,void *arg)
++{
++  struct held_start_reply *held=arg;
++  (void)fd;(void)what;
++  if(recovery_wire_reply(held->fixture,held->code,held->cseq,held->body,held->length)<0)
++    recovery_wire_fail(held->fixture,"held START setup reply");
++  event_free(held->timer);free(held->body);free(held);
+ }
+ 
+ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+@@ -769,11 +862,25 @@
+       plist_array_append_item(streams,stream);plist_dict_set_item(plist,"streams",streams);
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+-    float mapped=airplay_volume_from_pct((f->mode==16 || f->mode==17 || f->mode==19 || f->mode==20 || f->mode==22 || f->mode==23 || f->mode==24 || f->mode==25) ? 27 : f->mode>=11 ? 35 : f->mode>=7 ? (f->volumes ? (f->mode==10 && f->volumes>=2 ? 45 : 44) : 27) : 60,f->device->name);
+-    char expected[64];
+-    snprintf(expected,sizeof(expected),"volume: -%d.%06d\r\n",-(int)mapped,-(int)(1000000.0*(mapped-(int)mapped)));
+-    if(!body || (size_t)bytes!=strlen(expected) || memcmp(body,expected,bytes))
+-      {recovery_wire_fail(f,"fresh BASE payload differs from durable manual60");goto done;}
++      float mapped = airplay_volume_from_pct(
++          ((f->mode == 29 && getenv("PC70_RELEASE_COMPOSE")
++               && ((!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") && f->volumes == 0)
++                   || (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && f->volumes < 2)))
++              || f->mode == 16 || (f->mode == 17 && f->phase != 4) || f->mode == 19 || f->mode == 20 || f->mode == 22
++              || f->mode == 23 || f->mode == 24 || f->mode == 25)
++              ? 27
++          : f->mode >= 11 ? 35
++          : f->mode >= 7  ? (f->volumes ? (f->mode == 10 && f->volumes >= 2 ? 45 : 44) : 27)
++                          : 60,
++          f->device->name);
++      char expected[64];
++      snprintf(
++          expected, sizeof(expected), "volume: -%d.%06d\r\n", -(int)mapped, -(int)(1000000.0 * (mapped - (int)mapped)));
++      if (!body || (size_t)bytes != strlen(expected) || memcmp(body, expected, bytes))
++	{
++	  recovery_wire_fail(f, "fresh BASE payload differs from durable manual60");
++	  goto done;
++	}
+     f->volumes++;
+     if (!f->device->session || ((f->mode < 4 || f->mode == 6) && (f->volumes != 1 || !((struct airplay_session *)f->device->session)->recovery_only)))
+       {recovery_wire_fail(f,"duplicate lax write or missing real recovery owner");goto done;}
+@@ -785,15 +892,34 @@
+     if(f->mode==9 && f->volumes==2)code=503;
+     if(f->mode==12)cseq++;
+     if(f->mode==13)code=503;
++  } else if(!strncmp(header,"FLUSH ",6)) {
++    /* Preserve existing mode17/24 FLUSH; only the explicit mode29 Pause-loss
++     * discriminator joins it. Require the same session, body and RTP-Info. */
++    if ((f->mode != 17 && !(f->mode == 24 && completed_move_real_resume)
++            && !(f->mode == 29 && (getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS") || getenv("PC70_RELEASE_COMPOSE"))))
++        || (f->mode == 17 && f->phase != 4) || bytes || !f->device->session || !strstr(header, "\r\nRTP-Info: seq="))
++      {recovery_wire_fail(f,"unexpected ordinary FLUSH");goto done;}
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+     f->teardowns++;
+-    if(f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
++    if(!(f->mode==29 && getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")) && f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25 && (db_attention_origin_get(f->device->id,&f->command.origin,&state,&proof)<0 || state!=(f->mode == 4 ? OUTPUT_RECOVERY_ALREADY_RETIRED : OUTPUT_RECOVERY_PENDING)))
+       {recovery_wire_fail(f,"BASE receipt did not preserve exact control custody");goto done;}
+   } else if(strncmp(header,"RECORD ",7) && strncmp(header,"SETPEERS ",9) && strncmp(header,"POST /auth-setup ",17))
+     {recovery_wire_fail(f,"unexpected music/metadata/request");goto done;}
+   if(plist && wplist_to_bin(&response,&response_length,plist)<0){recovery_wire_fail(f,"real plist serialization");goto done;}
+-  if(recovery_wire_reply(f,code,cseq,response,response_length)<0){recovery_wire_fail(f,"owned wire reply");goto done;}
++  if(((f->mode==29 && getenv("PC_HOLD_START_SETUP"))
++      || (f->mode==16 && f->phase==2 && getenv("PC_HOLD_MOVE_SETUP")))
++      && !strncmp(header,"GET /info ",10)){
++    struct held_start_reply *held=calloc(1,sizeof(*held));struct timeval delay={3,0};
++    if(!held){recovery_wire_fail(f,"held START allocation");goto done;}
++    held->fixture=f;held->code=code;held->cseq=cseq;held->length=response_length;
++    held->body=malloc(response_length);held->timer=evtimer_new(f->base,held_start_reply_send,held);
++    if(!held->body || !held->timer || event_add(held->timer,&delay)<0){
++      if(held->timer)event_free(held->timer);free(held->body);free(held);
++      recovery_wire_fail(f,"held START schedule");goto done;
++    }
++    memcpy(held->body,response,response_length);
++  }else if(recovery_wire_reply(f,code,cseq,response,response_length)<0){recovery_wire_fail(f,"owned wire reply");goto done;}
+   if(activate_cipher) {
+     struct pair_result *result=NULL;
+     if(pair_setup_result(NULL,&result,f->pair)<0 || !result
+@@ -812,10 +938,32 @@
+ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
++  if (f->peer && f->mode == 29 && getenv("PC70_RELEASE_COMPOSE") && f->pc70_peer_sessions == 1)
++    {
++      bool next = getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && start_active
++                  && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE
++                  && strcmp(start_active->result.command.token, release_operation.predecessor.completed_token);
++      struct output_device *old = outputs_device_get(1);
++      bool move = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && start_active
++                  && start_active->result.command.move_existing_session && start_active->result.command.device_id == 2
++                  && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE && old && !old->session
++                  && !old->selected;
++      if (next || move)
++	{
++	  bufferevent_free(f->peer);
++	  f->peer = NULL;
++	  pair_cipher_free(f->cipher);
++	  f->cipher = NULL;
++	  pair_setup_free(f->pair);
++	  f->pair = NULL;
++	  evbuffer_drain(f->plain, evbuffer_get_length(f->plain));
++	}
++    }
+   if(f->peer || length<(int)sizeof(*address) || address->sin_family!=AF_INET || ntohl(address->sin_addr.s_addr)!=INADDR_LOOPBACK)
+     {evutil_closesocket(fd);recovery_wire_fail(f,"unexpected/duplicate receiver connection");return;}
+   f->peer=bufferevent_socket_new(f->base,fd,BEV_OPT_CLOSE_ON_FREE|BEV_OPT_DEFER_CALLBACKS);
+   if(!f->peer){evutil_closesocket(fd);recovery_wire_fail(f,"peer owner allocation");return;}
++  f->pc70_peer_sessions++;
+   bufferevent_setcb(f->peer,recovery_wire_read,NULL,recovery_wire_event,f);bufferevent_enable(f->peer,EV_READ|EV_WRITE);
+ }
+ 
+@@ -1107,7 +1255,11 @@
+       if (outputs_device_start(f.device, recovery_wire_retired_start, false) != 1)
+         { recovery_wire_fail(&f, "actual old START was not queued"); goto cleanup; }
+     }
+-  else if(outputs_attention_admit(&f.command,&f.result)<0 || f.result.outcome!=OUTPUT_ATTENTION_PENDING){recovery_wire_fail(&f,"public fresh RECOVER not pending");goto cleanup;}
++  else {
++    if(mode==0 && getenv("PC_ATTENTION_RECOVER_BUSY")) atomic_store(&start_owned_latch,true);
++    if(outputs_attention_admit(&f.command,&f.result)<0 || f.result.outcome!=OUTPUT_ATTENTION_PENDING)
++      {recovery_wire_fail(&f,"public fresh RECOVER not pending");goto cleanup;}
++  }
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+   if(!f.poll || !f.deadline || evtimer_add(f.deadline,&bound) || evtimer_add(f.poll,&soon)){f.failed=1;goto cleanup;}
+   event_base_dispatch(f.base);
+@@ -1124,6 +1276,11 @@
+  volume_case_complete:
+   if(!f.failed) {char byte; if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"unexpected recovery audio/data packet");}
+  cleanup:
++  if(mode==0 && getenv("PC_ATTENTION_RECOVER_BUSY")) {
++    assert(outputs_start_source_owned() && !attention_restore_scope);
++    puts("PASS persisted original DB-origin RECOVER control-only constructor under retained busy latch; no unrelated START authority");
++    atomic_store(&start_owned_latch,false); /* Fixture process cleanup only. */
++  }
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if (mode>=7 && room_volume_pin) room_volume_pin_expiry.tv_sec-=11;
+   (void)room_volume_pin_busy();
+@@ -1162,12 +1319,28 @@
+ {
+   int mode;
+   if (!gcry_check_version(GCRYPT_VERSION)) return 1;
++  gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
++  gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
++  if (argc == 3 && (!strcmp(argv[1], "--pc70-recover-fenced") || !strcmp(argv[1], "--pc70-recover-terminal")))
++    return manual_release_recover_process_case(argv[2], !strcmp(argv[1], "--pc70-recover-fenced"));
++  if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
++  if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
++    { for(int mode=0;mode<7;mode++) if(recovery_wire_case(mode))return 1; return 0; }
+   if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
+     { recovery_salt_red = true; return recovery_wire_case(0); }
++  if (argc == 2 && !strcmp(argv[1], "--native-start-wire")) return start35_wire_case(29);
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
++  if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
++    { completed_move_real_resume=true; return start35_wire_case(24); }
+   if (argc == 2 && !strcmp(argv[1], "--queue-wire")) return start35_wire_case(24);
+   if (argc == 2 && !strcmp(argv[1], "--move-wire")) return start35_wire_case(16);
++  if (argc == 2 && !strcmp(argv[1], "--move-retire-resume-prime-wire"))
++    { retired_resume_wait=true; return start35_wire_case(17); }
++  if (argc == 2 && !strcmp(argv[1], "--move-retire-live-wire"))
++    { retired_keep_live_slot=true; return start35_wire_case(17); }
+   if (argc == 2 && !strcmp(argv[1], "--move-retire-wire")) return start35_wire_case(17);
++  if (argc == 2 && !strcmp(argv[1], "--start-retire-normal-reconnect-wire"))
++    { retired_start_reconnect=true; return start35_wire_case(18); }
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-wire")) return start35_wire_case(18);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-wire")) return start35_wire_case(26);
+   if (argc == 2 && !strcmp(argv[1], "--start-retire-closed-no-session-wire")) return start35_wire_case(27);
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -28,6 +28,64 @@
+ int input_fifo_owner_get(uint32_t item,const char *path,bool drain,uint64_t device,uint64_t inode,
+     const struct timespec *deadline,struct input_fifo_identity *out)
+ { (void)item;(void)path;(void)drain;(void)device;(void)inode;(void)deadline;(void)out;return -1; }
++
++/* No input backend in this ledger fixture: typed release effect paths deny. */
++int
++input_fifo_retire(uint32_t item, const char *path, uint64_t dev, uint64_t ino, uint64_t epoch,
++    const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  (void)item;
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)epoch;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_retire_transport(uint32_t item, const char *path, uint64_t dev, uint64_t ino, uint64_t epoch,
++    const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  return input_fifo_retire(item, path, dev, ino, epoch, deadline, out);
++}
++int
++input_fifo_retire_empty(const char *path, uint64_t dev, uint64_t ino, uint64_t epoch, const struct timespec *deadline,
++    struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)epoch;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_retire_recovered(
++    const char *path, uint64_t dev, uint64_t ino, const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)dev;
++  (void)ino;
++  (void)deadline;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_stage_reader(const char *path, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)out;
++  return -1;
++}
++int
++input_fifo_stage_release(const char *path, struct input_fifo_identity *out)
++{
++  (void)path;
++  (void)out;
++  return -1;
++}
+ 
+ /* PC12 exercises the complete existing JSON API TU. Only the synchronous
+  * player command return is controlled here; parsing and ownership stay real.
+@@ -1026,6 +1084,12 @@
+ { return outputs_transport_state_get(id,out,busy); }
+ int player_transport_result_get(const char *token, struct output_transport_result *out)
+ { return outputs_transport_result_get(token,out); }
++int
++player_transport_release_confirm(uint64_t id, const char *token, const char *prepare, uint64_t revision, bool closed,
++    struct output_transport_result *out)
++{
++  return outputs_transport_release_confirm(id, token, prepare, revision, closed, out);
++}
+ int player_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
+ { return outputs_transport_pause_confirm(id,token,prepare,revision); }
+ 
+@@ -1687,11 +1751,15 @@
+   uint64_t unique=UINT64_MAX;
+   assert(start_unique_writer_fd(&r.native_process,fifo.st_dev,fifo.st_ino,&unique) && unique==(uint64_t)writer);
+   assert(start_all_writers_closed(&r.native_process,fifo.st_dev,fifo.st_ino)==0);
++  assert(!release_fifo_has_no_writers(fifo.st_dev, fifo.st_ino) && geteuid() == 999 && getegid() == 999);
+   assert(seteuid(0)==0 && setegid(0)==0 && geteuid()==0 && getegid()==0);
+   assert(write(release[1],"x",1)==1);
+   char closed;
+   assert(read(ready[0],&closed,1)==1 && closed=='c');
+   assert(start_all_writers_closed(&r.native_process,fifo.st_dev,fifo.st_ino)==1);
++  assert(setegid(999) == 0 && seteuid(999) == 0);
++  assert(release_fifo_has_no_writers(fifo.st_dev, fifo.st_ino) && geteuid() == 999 && getegid() == 999);
++  assert(seteuid(0) == 0 && setegid(0) == 0);
+   assert(write(release[1],"x",1)==1);close(release[1]);close(ready[0]);
+   assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   assert(unlink(path)==0);
+@@ -1773,6 +1841,8 @@
+   queue_strict_wire();
+   move_actual_writer_fd_proof();
+   exact_start_durable_gate();
++  manual_release_journal_upgrade_gate();
++  manual_release_strict_wire();
+   event_free(outputs_deferredev);
+   event_base_free(evbase_player);
+   sqlite3_close(hdl); hdl=NULL; unlink(owner_database_path);
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -4,12 +4,328 @@
+ #include <signal.h>
+ #include <poll.h>
+ #include "../src/input.h"
++static int
++manual_release_recover_process_case(const char *database, bool fenced)
++{
++  assert(evthread_use_pthreads() == 0);
++  evbase_player = event_base_new();
++  assert(evbase_player);
++  cfg = cfg_init(toplvl_cfg, 0);
++  assert(cfg);
++  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", database);
++  cfg_setbool(cfg_getsec(cfg, "library"), "pipe_autostart", false);
++  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup() == 0);
++  start_journal_startup();
++  assert(!start_journal_fault && start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING);
++  pc70_real_speaker_persistence = true;
++  struct output_device saved = { .id = 1, .selected = true, .volume = 27, .name = "persisted-old-route" };
++  assert(db_speaker_save(&saved) == 0);
++  struct output_device *restored = calloc(1, sizeof(*restored));
++  assert(restored);
++  restored->id = 1;
++  restored->name = strdup("private-restored-output");
++  restored->type = OUTPUT_TYPE_AIRPLAY;
++  restored->type_name = "AirPlay";
++  restored->advertised = true;
++  assert(outputs_device_add(restored, false) == restored && !restored->selected && !restored->session);
++  puts("PASS actual SQLite selected1→outputs_device_add under startup journal gate→selected0/no session; no old route "
++       "authority restored");
++  assert(worker_init() == 0 && input_init() == 0);
++  struct output_transport_result receipt;
++  struct output_queue_writer proof = release_record.result.command.writer;
++  char token[33];
++  strcpy(token, release_record.result.command.token);
++  assert(outputs_transport_result_get(token, &receipt) == 0 && !receipt.release_terminal);
++  bool old_writer = start_proven_writer_fd(&proof.native_process, proof.writer_fd, proof.pipe_device, proof.pipe_inode);
++  assert(receipt.release_durable_pending == old_writer && receipt.release_gate_closed);
++  assert(!start_journal_payload_legacy_valid());
++  {
++    json_object *copy = json_tokener_parse(start_journal.payload), *manual, *writer;
++    char *saved = start_journal.payload;
++    if (json_object_object_get_ex(copy, "manual_release", &manual))
++      {
++	assert(json_object_object_get_ex(manual, "writer_proof", &writer));
++	json_object_object_add(writer, "source_epoch", json_object_new_uint64(proof.source_epoch + 1));
++	start_journal.payload = strdup(json_object_to_json_string_ext(copy, JSON_C_TO_STRING_PLAIN));
++	assert(start_journal.payload && !start_journal_payload_valid());
++	free(start_journal.payload);
++	start_journal.payload = saved;
++	assert(start_journal_payload_valid());
++      }
++    json_object_put(copy);
++  }
++  outputs_transport_release_recover_pending();
++  if (fenced)
++    assert(start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING
++           && outputs_start_gate_closed());
++  else
++    {
++      assert(!start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN
++             && start_retired_reopen_pending && outputs_start_gate_closed());
++      assert(strcmp(release_record.retired_c_process, release_record.result.identity.process));
++      assert(release_record.retired_epoch == 1); /* Fresh process, never imported old epoch. */
++      assert(outputs_start_retired_stage_reader() && start_retired_stage_ready);
++    }
++  input_deinit();
++  worker_deinit();
++  db_perthread_deinit();
++  db_deinit();
++  cfg_free(cfg);
++  cfg = NULL;
++  puts(fenced ? "PASS fresh C process pending release remains fenced by actual old/foreign writer"
++              : "PASS fresh C process retires pending journal using exact closed writers and fresh empty input epoch; "
++                "terminal stages reader, no old grant");
++  return 0;
++}
++static void
++manual_release_exec_recovery(const char *database, bool fenced)
++{
++  int status;
++  pid_t child = fork();
++  assert(child >= 0);
++  if (!child)
++    {
++      execl("/work/src/airplay_callback_owner", "airplay_callback_owner",
++          fenced ? "--pc70-recover-fenced" : "--pc70-recover-terminal", database, (char *)NULL);
++      _exit(127);
++    }
++  assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++}
++
++/* Actual FIFO/AP2 release path, including a read of the consumed pending
++ * operation after lost-ACK scheduling, all-FD refusal and late confirmation. */
++static void
++manual_release_actual_case(struct output_device *d, const struct output_native_owner *owner, int *writer)
++{
++  struct output_transport_request r = { .device_id = d->id, .bound = true, .native_revision = 900, .percent = -1 };
++  struct output_transport_result prepared, committed, result;
++  struct stat fifo;
++  r.native_owner = *owner;
++  strcpy(r.action, "release");
++  memset(r.native_prepare_id, '7', 32);
++  memset(r.args_digest, '8', 64);
++  assert(fstat(*writer, &fifo) == 0);
++  r.writer.writer_fd = *writer;
++  r.writer.pipe_device = fifo.st_dev;
++  r.writer.pipe_inode = fifo.st_ino;
++  r.writer.native_process.pid = getpid();
++  assert(start_boot_id(r.writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &r.writer.native_process.proc_start_ticks) == 1);
++  r.writer.source_epoch = start_active ? start_active->result.writer_source_epoch : 0;
++  r.writer.open_generation = 1;
++  strcpy(r.writer.input_path_digest, transport_input_path_digest);
++  {
++    struct output_transport_identity diagnostic;
++    uint64_t epoch = 0;
++    int identity = transport_identity_get(d->id, &diagnostic);
++    fprintf(stderr,
++        "RELEASE_DIAGNOSTIC valid=%d available=%d identity=%d writer=%d owned=%d absent=%d contexts=%d epoch=%" PRIu64
++        " source=%" PRIu64 " active=%" PRIu64 "\n",
++        native_owner_valid(owner, d->id), transport_bound_available(d->id, owner, r.native_revision), identity,
++        identity == 0 && queue_writer_current(&r.writer, &diagnostic, &epoch),
++        identity == 0 && start_route_owned(owner, &diagnostic), start_route_clean_absent(), start_contexts_drained(),
++        epoch, r.writer.source_epoch, start_active ? start_active->result.writer_source_epoch : 0);
++  }
++  {
++    struct input_fifo_identity owned = { 0 }, unchanged = { 0 };
++    struct timespec limit;
++    clock_gettime(CLOCK_MONOTONIC, &limit);
++    limit.tv_sec++;
++    struct db_queue_item *item = db_queue_fetch_byitemid(transport_input_item);
++    assert(item && item->path);
++    assert(input_fifo_owner_get(item->id, item->path, false, 0, 0, &limit, &owned) == 0);
++    assert(input_fifo_retire(item->id, item->path, owned.device, owned.inode, 0, &limit, &unchanged) < 0);
++    assert(input_fifo_retire_transport(
++               item->id, item->path, owned.device, owned.inode + 1, owned.epoch, &limit, &unchanged)
++           < 0);
++    assert(input_fifo_retire_transport(
++               item->id + 1, item->path, owned.device, owned.inode, owned.epoch, &limit, &unchanged)
++           < 0);
++    if (owned.epoch)
++      assert(input_fifo_retire_transport(item->id, item->path, owned.device, owned.inode, 0, &limit, &unchanged) < 0);
++    assert(input_fifo_owner_get(item->id, item->path, false, 0, 0, &limit, &unchanged) == 0
++           && unchanged.epoch == owned.epoch);
++    free_queue_item(item, 0);
++  }
++  struct output_device foreign = { 0 };
++  struct output_device *prior_list = outputs_device_list;
++  foreign.next = prior_list;
++  foreign.id = 999;
++  foreign.attention_restart_pending = true;
++  outputs_device_list = &foreign;
++  assert(outputs_transport_prepare(&r, &prepared) < 0 && !outputs_start_gate_closed());
++  foreign.attention_restart_pending = false;
++  foreign.attention_restoring = true;
++  assert(outputs_transport_prepare(&r, &prepared) < 0 && !outputs_start_gate_closed());
++  outputs_device_list = prior_list;
++  assert(outputs_transport_prepare(&r, &prepared) == 0 && !prepared.release_gate_closed
++         && !prepared.release_durable_pending);
++  {
++    struct output_transport_request held = prepared.command;
++    struct output_transport_result refused;
++    char journal[33];
++    strcpy(journal, start_journal.token);
++    strcpy(held.expected_input_path_digest, prepared.identity.input_path_digest);
++    transport_selection_revision++;
++    assert(outputs_transport_commit(&held, &refused) < 0 && !outputs_start_gate_closed()
++           && !strcmp(journal, start_journal.token));
++    transport_selection_revision--;
++    memset(r.native_prepare_id, '6', 32);
++    assert(outputs_transport_prepare(&r, &prepared) == 0 && !prepared.release_gate_closed);
++  }
++  r = prepared.command;
++  strcpy(r.expected_input_path_digest, prepared.identity.input_path_digest);
++  if (getenv("PC70_EXPIRE_AFTER_FULL"))
++    fixture_expire_manual_post_full = true;
++  assert(outputs_transport_commit(&r, &committed) == 0 && committed.release_gate_closed
++         && committed.release_durable_pending);
++  if (getenv("PC70_EXPIRE_AFTER_FULL"))
++    assert(!fixture_expire_manual_post_full && !committed.remaining_ms);
++  assert(outputs_transport_commit(&r, &result) < 0); /* Never retry consumed admission. */
++  assert(outputs_transport_result_get(r.token, &result) == 0 && result.release_durable_pending
++         && result.release_gate_closed && transport_identity_equal(&result.identity, &prepared.identity));
++  if (getenv("PC70_RELEASE_CRASH"))
++    {
++      const char *database = cfg_getstr(cfg_getsec(cfg, "general"), "db_path");
++      manual_release_exec_recovery(database, true); /* Exact old writer still open. */
++      close(*writer);
++      *writer = -1;
++      start_retire_sessions();
++      outputs_device_deselect(d);
++      input_deinit();
++      int signal[2], ready[2];
++      assert(pipe(signal) == 0 && pipe(ready) == 0);
++      pid_t foreign = fork();
++      assert(foreign >= 0);
++      if (!foreign)
++	{
++	  close(signal[1]);
++	  close(ready[0]);
++	  int fd = open(release_operation.record.input_path, O_RDWR | O_NONBLOCK);
++	  assert(fd >= 0);
++	  assert(write(ready[1], "r", 1) == 1);
++	  char b;
++	  assert(read(signal[0], &b, 1) == 1);
++	  close(fd);
++	  _exit(0);
++	}
++      close(signal[0]);
++      close(ready[1]);
++      char byte;
++      assert(read(ready[0], &byte, 1) == 1);
++      close(ready[0]);
++      manual_release_exec_recovery(database, true); /* Old process closed, foreign new writer remains. */
++      assert(write(signal[1], "c", 1) == 1);
++      close(signal[1]);
++      int status;
++      assert(waitpid(foreign, &status, 0) == foreign && WIFEXITED(status));
++      manual_release_exec_recovery(database, false); /* Actual exec: fresh C input epoch starts at zero. */
++      /* This parent modeled the crashed C owner and already joined its input.
++       * The successful exec child owns cold-start recovery; do not rebuild and
++       * tear down a second input owner under the old stopped fixture cmdbase. */
++      puts("PASS actual exec pending-release recovery series complete");
++      fflush(NULL);
++      exit(0);
++    }
++  assert(outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result) == 0
++         && !result.release_terminal);
++  assert(outputs_start_gate_closed() && d->selected); /* An open FD cannot be lied away by CloseDone. */
++  close(*writer);
++  *writer = -1;
++  release_operation.expiry.tv_sec -= 20;
++  int confirm
++      = outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result);
++  fprintf(stderr,
++      "RELEASE_CONFIRM rc=%d terminal=%d state=%d fault=%d route=%d writers=%d selected=%d session=%p epoch=%" PRIu64
++      " oldepoch=%" PRIu64 " staged=%d input=%" PRIu64 " oldinput=%" PRIu64 "\n",
++      confirm, result.release_terminal, release_operation.record.retirement, start_journal_fault,
++      release_route_retirable(&release_operation),
++      start_all_writers_closed(&r.writer.native_process, r.writer.pipe_device, r.writer.pipe_inode), d->selected,
++      d->session, d->session_epoch, prepared.identity.session_epoch, start_retired_stage_ready,
++      release_operation.record.retired_epoch, release_operation.record.admitted_epoch);
++  fprintf(stderr,
++      "RELEASE_ROUTE current=%" PRIu64 "/%" PRIu64 " old=%" PRIu64 "/%" PRIu64 " incarnation=%" PRIu64 "/%" PRIu64
++      " busy=%d lease=%" PRIu64 " retiring=%d restart=%d restoring=%d pin=%p volume=%d undrained=%d contexts=%d\n",
++      d->route_revision, transport_selection_revision, prepared.identity.route_revision,
++      prepared.identity.selection_revision, d->incarnation, prepared.identity.device_incarnation, d->busy,
++      d->attention_lease, d->attention_retiring_session, d->attention_restart_pending, d->attention_restoring,
++      (void *)transport_pin, room_volume_pin_busy(), room_volume_undrained(), start_contexts_drained());
++  assert(confirm == 0 && result.release_terminal);
++  assert(result.release_contexts_drained && outputs_start_gate_closed() && !d->session && !d->selected && !start_active
++         && !transport_custody_busy() && start_retired_stage_ready);
++  uint64_t selection = transport_selection_revision;
++  assert(outputs_transport_release_confirm(d->id, r.token, r.native_prepare_id, r.native_revision, true, &result) == 0
++         && result.release_terminal && selection == transport_selection_revision);
++  puts("PASS manual release actual FIFO/AP2 prepare→durable closed gate→lostACK readonly→openFD denial→late "
++       "exactClose/drain/terminal/detach; duplicate confirm no effect");
++}
++
+ struct start_fifo_writer {int fd;ssize_t written;};
+ static void *start_fifo_finish(void *arg)
+ {struct start_fifo_writer *w=arg;char bytes[4096]={0};w->written=write(w->fd,bytes,sizeof(bytes));return NULL;}
+ /* The writer remains live but paused, as at the observed second START.
+  * Cross the real deficit boundary on one real timer/FIFO read while the actual
+  * AP constructor is waiting for its private receiver response. */
++static void attention_restore_scope_negative_cases(struct output_device *device)
++{
++  struct attention_restore_constructor scope={.device=device,.start=start_active,
++    .start_phase=start_active->result.phase,.metadata_epoch=outputs_start_metadata_generation(),
++    .source_owned=outputs_start_source_owned(),.gate_closed=outputs_start_gate_closed()};
++  struct output_attention_request nested={.action=OUTPUT_ATTENTION_RELEASE};
++  assert(outputs_attention_state_get(device->id,&scope.expected)==0);
++  memcpy(scope.start_token,start_active->result.command.token,33);
++  attention_restore_scope=&scope;
++  assert(attention_restore_constructor_current(device->id));
++  uint64_t old=device->incarnation;
++  device->incarnation++;assert(!attention_restore_constructor_current(device->id));device->incarnation=old;
++  old=device->route_revision;
++  device->route_revision++;assert(!attention_restore_constructor_current(device->id));device->route_revision=old;
++  old=device->attention_revision;
++  device->attention_revision++;assert(!attention_restore_constructor_current(device->id));device->attention_revision=old;
++  old=device->session_epoch;
++  device->session_epoch++;assert(!attention_restore_constructor_current(device->id));device->session_epoch=old;
++  scope.expected.process[0]=scope.expected.process[0]=='0'?'1':'0';
++  assert(!attention_restore_constructor_current(device->id));
++  memcpy(scope.expected.process,outputs_process,37);
++  scope.start_token[0]=scope.start_token[0]=='0'?'1':'0';
++  assert(!attention_restore_constructor_current(device->id));
++  memcpy(scope.start_token,start_active->result.command.token,33);
++  scope.metadata_epoch++;assert(!attention_restore_constructor_current(device->id));scope.metadata_epoch--;
++  struct start_slot *saved=start_active;
++  start_active=NULL;assert(!attention_restore_constructor_current(device->id));start_active=saved;
++  nested.expected=scope.expected;
++  assert(attention_recovery_prepare_exact(device,&nested,OUTPUT_RECOVERY_NONE)<0 && !device->session);
++  attention_restore_scope=NULL;
++  assert(!attention_restore_constructor_current(device->id));
++  puts("PASS restoration scope rejects stale process/incarnation/session/route/revision/START token/epoch/replacement and nested constructor");
++}
++
++static void attention_start_restore_poll(int fd, short what, void *arg)
++{
++  struct recovery_wire_fixture *f=arg;
++  struct output_attention_state state;
++  struct output_attention_result result;
++  struct timeval soon={0,1000};
++  assert(outputs_attention_state_get(1,&state)==0);
++  assert(outputs_attention_result_get(state.process,state.last_release_operation,&result)==0);
++  if(result.outcome==OUTPUT_ATTENTION_PENDING){evtimer_add(f->poll,&soon);return;}
++  fprintf(stderr,"RESTORE_TERMINAL outcome=%d current=%d code=%d cseq=%d lease=%llu restoring=%d idle=%d session=%p sessions=%p masters=%p volumes=%d stops=%d pair=%d owned=%d gate=%d\n",result.outcome,result.current,result.response_code,result.request_cseq,(unsigned long long)state.lease,state.restoring,state.recovery_idle,f->device->session,airplay_sessions,airplay_master_sessions,f->volumes,f->teardowns,f->pair_messages,outputs_start_source_owned(),outputs_start_gate_closed());
++  assert(result.outcome==OUTPUT_ATTENTION_PROTOCOL_ACCEPTED && result.current
++    && result.response_code==200 && result.request_cseq>0
++    && !state.lease && !state.restoring && state.recovery_idle
++    && !f->device->session && !airplay_sessions && !airplay_master_sessions
++    && f->volumes==1 && f->teardowns==1 && f->pair_messages==2
++    && outputs_start_source_owned() && !outputs_start_gate_closed()
++    && start_active && start_active->result.phase==OUTPUT_START_COMPLETED
++    && !strcmp(start_active->result.command.token,f->start_command.token));
++  char byte;
++  assert(recv(f->udp_fd,&byte,1,MSG_DONTWAIT)<0);
++  puts("PASS exact original attention restoration through real completed-START session loss and TTL: control-only AP2/CSeq35/STOP drained, no audio or START custody clear");
++  event_base_loopbreak(f->base);
++}
++
+ static void start_route_starvation_tick(struct recovery_wire_fixture *f,bool gated)
+ {
+   struct airplay_session *session=f->device->session;
+@@ -34,10 +350,123 @@
+   }else assert(player_state==PLAY_PAUSED); /* Normal starvation still recovers. */
+ }
+ 
++/* Exercise the ordinary public command chain on the existing player owner.
++ * The private receiver still validates real SET_PARAMETER and AP2 setup. */
++static bool retired_keep_live_slot,retired_resume_wait,retired_start_reconnect;
++extern struct input_definition input_pipe;
++struct retired_connect_flow {
++  struct recovery_wire_fixture *fixture;
++  atomic_bool done;
++  int start, prime, selection;
++  bool temporary_busy,hold_before_prime;
++  atomic_bool started,continue_prime;
++};
++static void *retired_connect_commands(void *arg)
++{
++  struct retired_connect_flow *flow=arg;
++  uint64_t ids[]={1,2};
++  flow->start=player_playback_start_byid(1);
++  if(flow->hold_before_prime){
++    atomic_store(&flow->started,true);
++    while(!atomic_load(&flow->continue_prime)){struct timespec step={0,1000000};nanosleep(&step,NULL);}
++  }
++  if(flow->start>=0)flow->prime=player_volume_set_connect_recovery(2,35,&flow->temporary_busy);
++  if(flow->start>=0 && flow->prime>=0)flow->selection=player_speaker_set_connect_recovery(ids);
++  atomic_store(&flow->done,true);
++  return NULL;
++}
++static void retired_connect_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct retired_connect_flow *flow=arg;struct timeval soon={0,1000};
++  (void)fd;(void)what;
++  if(flow->hold_before_prime && atomic_load(&flow->started) && !atomic_load(&flow->continue_prime)){
++    struct output_device *old=outputs_device_get(1),*target=flow->fixture->device;
++    char packet;
++    assert(flow->start>=0 && !old->selected && !old->session && !target->selected && !target->session
++      && !airplay_sessions && !flow->fixture->peer && !outputs_start_gate_closed()
++      && recv(flow->fixture->udp_fd,&packet,1,MSG_DONTWAIT)<0);
++    atomic_store(&flow->continue_prime,true);
++  }
++  if(atomic_load(&flow->done)){
++    pb_timer_stop();event_base_loopbreak(flow->fixture->base);return;
++  }
++  evtimer_add(flow->fixture->poll,&soon);
++}
++
++struct retired_resume_flow {
++  struct recovery_wire_fixture *fixture;
++  atomic_bool done;
++  bool temporary,select_route;
++  int prime,selection;
++};
++static void *retired_resume_prime(void *arg)
++{
++  struct retired_resume_flow *flow=arg;uint64_t ids[]={1,2};
++  flow->prime=player_volume_set_connect_recovery(2,35,&flow->temporary);
++  if(flow->prime>=0 && flow->select_route)flow->selection=player_speaker_set_connect_recovery(ids);
++  atomic_store(&flow->done,true);return NULL;
++}
++static void *retired_resume_input_close(void *arg)
++{struct retired_resume_flow *flow=arg;input_deinit();atomic_store(&flow->done,true);return NULL;}
++struct retired_resume_wait {
++  struct retired_resume_flow flow;
++  pthread_t thread;
++  struct timespec began;
++  const char *saved_payload;
++  int writer,phase,base_volume;
++  uint64_t base_revision,route_revision,input_generation;
++};
++static void retired_resume_wait_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct retired_resume_wait *wait=arg;struct recovery_wire_fixture *f=wait->flow.fixture;
++  struct timeval soon={0,1000};struct timespec now;char pcm[4096]={0};
++  (void)fd;(void)what;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
++  if(wait->phase==0){
++    assert(outputs_start_gate_closed() && start_retired_reopen_pending
++      && !start_journal_retirement_reopen_consumed && !outputs_start_source_owned()
++      && !strcmp(start_journal.payload,wait->saved_payload) && !start_route_clean_absent()
++      && !f->device->selected && !f->device->session && !airplay_sessions
++      && f->volumes==0 && player_state==PLAY_STOPPED && f->device->volume==wait->base_volume
++      && f->device->base_revision==wait->base_revision && f->device->route_revision==wait->route_revision
++      && transport_input_generation==wait->input_generation);
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)<0);
++    long elapsed=(now.tv_sec-wait->began.tv_sec)*1000+(now.tv_nsec-wait->began.tv_nsec)/1000000;
++    if(elapsed>5200){
++      assert(!pthread_create(&wait->thread,NULL,retired_resume_prime,&wait->flow));wait->phase=1;
++    }
++  }else if(wait->phase==1 && atomic_load(&wait->flow.done)){
++    assert(!pthread_join(wait->thread,NULL));
++    fprintf(stderr,"explicit Resume prePCM prime=%d temporary=%d\n",wait->flow.prime,wait->flow.temporary);
++    assert(wait->flow.prime<0 && wait->flow.temporary && !f->device->selected
++      && !f->device->session && outputs_start_gate_closed()
++      && !start_journal_retirement_reopen_consumed && !strcmp(start_journal.payload,wait->saved_payload)
++      && f->device->volume==wait->base_volume && f->device->base_revision==wait->base_revision
++      && f->device->route_revision==wait->route_revision && transport_input_generation==wait->input_generation);
++    assert(write(wait->writer,pcm,sizeof(pcm))==(ssize_t)sizeof(pcm));wait->phase=2;
++  }else if(wait->phase==2 && player_state==PLAY_PLAYING && !outputs_start_gate_closed()){
++    pb_timer_stop(); /* Route proof, no unwanted private test PCM. */
++    wait->flow.temporary=false;wait->flow.select_route=true;atomic_store(&wait->flow.done,false);
++    assert(!pthread_create(&wait->thread,NULL,retired_resume_prime,&wait->flow));wait->phase=3;
++  }else if(wait->phase==3 && atomic_load(&wait->flow.done)){
++    assert(!pthread_join(wait->thread,NULL) && wait->flow.prime>=0 && wait->flow.selection>=0
++      && !wait->flow.temporary && f->device->selected && f->device->session
++      && f->device->state==OUTPUT_STATE_CONNECTED && f->device->volume==35 && f->volumes==1
++      && !outputs_start_gate_closed() && start_journal_retirement_reopen_consumed
++      && start_route_clean_absent());
++    event_base_loopbreak(f->base);return;
++  }else if(wait->phase==4 && atomic_load(&wait->flow.done)){
++    event_base_loopbreak(f->base);return;
++  }
++  evtimer_add(f->poll,&soon);
++}
++
+ static void move_wire_old_connected(struct output_device *device,enum output_device_state state)
+ {
+   struct recovery_wire_fixture *f=active_recovery_wire;
+-  if(!f || (f->mode!=16 && f->mode!=17 && f->mode!=19 && f->mode!=20 && f->mode!=22 && f->mode!=23 && f->mode!=24 && f->mode!=25) || device!=f->device || state!=OUTPUT_STATE_CONNECTED || !device->session)
++  if (!f
++      || (f->mode != 16 && f->mode != 17 && f->mode != 19 && f->mode != 20 && f->mode != 22 && f->mode != 23
++          && f->mode != 24 && f->mode != 25 && !(f->mode == 29 && getenv("PC70_RELEASE_COMPOSE")))
++      || device != f->device || state != OUTPUT_STATE_CONNECTED || !device->session)
+     {if(f)recovery_wire_fail(f,"MOVE old actual AP2 route did not connect");return;}
+   f->phase=1;event_base_loopbreak(f->base);
+ }
+@@ -85,6 +514,415 @@
+       assert(outputs_transport_commit(&q,&result)<0); /* actual reader epoch changed without authorizing a transition */
+       puts("PASS actual AP2 queue C-purpose joins configured live reader/FIFO and real writer; same Route9/volume, one-use, reader-epoch replacement denied");
+ }
++/* Volume serializes the same actor, but never changes its paused timeline. */
++static void paused_owner_volume_case(struct output_device *device,
++    const struct output_native_owner *owner,uint64_t revision)
++{
++  void *session=device->session;uint64_t epoch=device->session_epoch;
++  for (int unknown=0;unknown<2;unknown++) {
++    struct output_room_volume_request request={.device_id=device->id,.bound=true,
++      .percent=device->volume,.native_revision=revision+unknown};
++    struct output_room_volume_result prepared,result;bool busy;
++    assert(transport_pause_owned(device->id));request.native_owner=*owner;
++    memset(request.native_prepare_id,'1'+unknown,32);memset(request.args_digest,'3'+unknown,64);
++    assert(outputs_room_volume_bound_state_get(device->id,owner,&request.expected_identity,
++      &request.expected_volume_state,&busy)==0 && !busy);
++    strcpy(request.expected_input_path_digest,request.expected_identity.input_path_digest);
++    assert(outputs_room_volume_prepare(&request,&prepared)==0);request=prepared.command;
++    memset(request.native_reservation_id,'5'+unknown,32);
++    assert(outputs_room_volume_commit(&request,&result)==0
++      && (result.outcome==ROOM_VOLUME_PENDING || result.outcome==ROOM_VOLUME_ADMITTED_PENDING));
++    assert(transport_pause_retained && transport_pause_revision==request.native_revision);
++    assert(room_volume_undrained() && transport_pause_owned(device->id));
++    assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);
++    stop_timer_cb(0,0,device); /* Exact armed STOP arrives while own volume is held. */
++    assert(device->session==session && device->session_epoch==epoch && transport_pause_owned(device->id)
++      && event_pending(device->stop_timer,EV_TIMEOUT,NULL));event_del(device->stop_timer);
++    if(unknown) {
++      while(!result.possible_effect && !result.contexts_drained) {
++        assert(event_base_loop(evbase_player,EVLOOP_ONCE)==0);
++        assert(outputs_room_volume_result_get(request.token,&result)==0);
++      }
++      assert(result.possible_effect && !result.contexts_drained);
++      assert(outputs_room_volume_cancel(request.token,request.native_reservation_id,&result)==0
++        && result.outcome==ROOM_VOLUME_UNKNOWN && transport_pause_owned(device->id));
++    }
++    while(!result.contexts_drained) {
++      assert(event_base_loop(evbase_player,EVLOOP_ONCE)==0);
++      assert(outputs_room_volume_result_get(request.token,&result)==0);
++    }
++    assert(result.outcome==(unknown?ROOM_VOLUME_UNKNOWN:ROOM_VOLUME_PROTOCOL_ACCEPTED));
++    assert(transport_pause_owned(device->id) && device->session==session);
++    assert(outputs_room_volume_commit(&request,&result)<0); /* Neither accepted nor unknown can replay. */
++  }
++  /* A USED but already-drained slot must not borrow an unrelated live context. */
++  struct room_volume_slot saved=room_volume_slots[ROOM_VOLUME_SLOTS-1];
++  struct room_volume_slot *foreign=&room_volume_slots[ROOM_VOLUME_SLOTS-1];
++  assert(!foreign->result.command.token[0]);memset(foreign,0,sizeof(*foreign));
++  memset(foreign->result.command.token,'f',32);foreign->used=true;foreign->result.command.bound=true;
++  foreign->result.command.native_owner=*owner;strcpy(foreign->result.command.native_owner.session_id,"foreign-pending-context");
++  foreign->result.command.native_revision=transport_pause_revision;
++  foreign->result.identity=transport_pause_identity;
++  assert(room_volume_undrained()
++    && !room_volume_pause_custody_current(owner,&transport_pause_identity,transport_pause_revision));
++  if(start_active->result.command.move_existing_session) {
++    assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  }
++  *foreign=saved;
++  if(start_active->result.command.move_existing_session) {
++    struct output_transport_request pause={.device_id=device->id,.bound=true,.percent=-1,.native_revision=revision+2};
++    struct output_transport_result prepared,result;pause.native_owner=*owner;strcpy(pause.action,"pause");
++    memset(pause.native_prepare_id,'e',32);memset(pause.args_digest,'d',64);
++    strcpy(pause.expected_input_path_digest,transport_pause_identity.input_path_digest);
++    assert(!transport_pause_owned(device->id)); /* Clearing the foreign context never revives old retention. */
++    assert(outputs_transport_prepare(&pause,&prepared)==0);pause=prepared.command;
++    assert(outputs_transport_commit(&pause,&result)==0);
++    assert(outputs_transport_pause_confirm(device->id,pause.token,pause.native_prepare_id,pause.native_revision)==0
++      && transport_pause_owned(device->id));
++  }
++  puts("PASS paused exact owner survives actual volume ACK, held-volume armed STOP and terminal UNKNOWN without replay; drained USED slot cannot borrow foreign pending context");
++}
++
++/* Resume admission is not yet PCM: retain only the same already-paused owner. */
++static void resume_pause_carry_case(struct output_device *device,const struct output_native_owner *owner)
++{
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1};
++  struct output_transport_result prepared,result;struct output_transport_identity route;
++  uint64_t revision=transport_custody_revision;void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(transport_identity_get(device->id,&route)==0);
++  for(int mode=0;mode<4;mode++) {
++    assert(transport_pause_owned(device->id));
++    request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++    strcpy(request.action,"resume");memset(request.native_prepare_id,'0'+mode,32);memset(request.args_digest,'a',64);
++    strcpy(request.expected_input_path_digest,route.input_path_digest);
++    if(mode==1)strcpy(request.native_owner.session_id,"foreign-resume-context");
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    if(mode==2)device->session_epoch++;
++    if(mode==3) {
++      struct timespec deadline;struct input_fifo_identity reader={0};input_stop();
++      clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++      assert(input_fifo_owner_get(route.input_item_id,start_active->result.command.expected_input_path,false,0,0,&deadline,&reader)<0);
++    }
++    int accepted=outputs_transport_commit(&request,&result);
++    if(mode<2)assert(accepted==0);else assert(accepted<0);
++    if(mode==0) {
++      assert(transport_pause_retained && transport_pause_revision==request.native_revision
++        && transport_pause_owned(device->id));
++      assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);stop_timer_cb(0,0,device);
++      assert(device->session==session && device->session_epoch==epoch && transport_pause_owned(device->id)
++        && event_pending(device->stop_timer,EV_TIMEOUT,NULL));event_del(device->stop_timer);
++    }else {
++      assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++      if(mode==2)device->session_epoch--;
++      if(mode==3) {
++        struct timespec deadline;clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++        assert(input_start_fifo_exact(route.input_item_id,start_active->result.command.expected_input_path,&deadline)>=0);
++      }
++      assert(outputs_transport_commit(&request,&result)<0 && !transport_pause_owned(device->id));
++      request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++      strcpy(request.action,"pause");memset(request.native_prepare_id,'a'+mode,32);
++      assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++      assert(outputs_transport_commit(&request,&result)==0);
++      assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0
++        && transport_pause_owned(device->id));
++    }
++  }
++  puts("PASS same-owner Resume admission retains armed STOP before PCM; foreign owner/changed route/lost reader cannot carry or replay old pause");
++}
++
++/* Completed MOVE retains only its exact real writer/reader/AP2 owner. */
++static void completed_move_pause_confirmation_case(struct output_device *device,
++    const struct output_native_owner *owner,int *writer)
++{
++  struct output_transport_identity route;bool busy,start_owned,clean_absent;
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1,.native_revision=41};
++  struct output_transport_result prepared,result;
++  assert(outputs_transport_bound_state_get(device->id,owner,&route,&busy,&start_owned,&clean_absent)==0
++    && !busy && !start_owned && !clean_absent && outputs_start_move_source_transition_current());
++  strcpy(request.action,"pause");memset(request.native_prepare_id,'7',32);
++  memset(request.args_digest,'8',64);request.native_owner=*owner;
++  strcpy(request.expected_input_path_digest,route.input_path_digest);
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)==0);
++  assert(transport_pause_retained && transport_pause_owned(device->id));
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)<0);
++  void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);
++  stop_timer_cb(0,0,device);
++  assert(device->session==session && device->session_epoch==epoch
++    && transport_pause_owned(device->id) && event_pending(device->stop_timer,EV_TIMEOUT,NULL));
++  event_del(device->stop_timer);
++  request.native_revision=42;request.native_prepare_id[0]='8';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  struct output_transport_request successor=request;
++  successor.native_revision=43;successor.native_prepare_id[0]='9';successor.token[0]=0;
++  assert(outputs_transport_prepare(&successor,&prepared)==0);successor=prepared.command;
++  assert(outputs_transport_commit(&successor,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,successor.token,successor.native_prepare_id,43)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,42)<0);
++  assert(transport_custody_current(owner,&route,43) && transport_pause_owned(device->id));
++  request.native_revision=44;request.native_prepare_id[0]='a';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  device->session_epoch++;
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,44)<0);
++  device->session_epoch--;
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,44)<0);
++  assert(!transport_pause_retained);
++  request.native_revision=45;request.native_prepare_id[0]='b';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,45)==0);
++  input_stop(); /* Existing FIFO command owner closes the real old reader. */
++  struct timespec deadline;struct input_fifo_identity reader={0};
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(route.input_item_id,start_active->result.command.expected_input_path,false,0,0,&deadline,&reader)<0);
++  assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  assert(input_start_fifo_exact(route.input_item_id,start_active->result.command.expected_input_path,&deadline)>=0);
++  assert(!transport_pause_owned(device->id)); /* Reader ABA never revives old retention. */
++  request.native_revision=46;request.native_prepare_id[0]='c';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,46)==0);
++  paused_owner_volume_case(device,owner,47);
++  resume_pause_carry_case(device,owner);
++  close(*writer);*writer=-1; /* Kernel-observed writer close retires retention. */
++  assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++  puts("PASS completed MOVE Pause retains exact AP2 owner at delayed STOP; duplicate/old custody/changed session/reader loss/writer close cannot revive");
++}
++
++/* Ordinary Connect has a real current route/reader but no START retention. */
++static void ordinary_pause_confirmation_case(struct output_device *device,
++    const struct output_native_owner *owner)
++{
++  struct output_transport_identity route;bool busy,start_owned,clean_absent;
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1,.native_revision=41};
++  struct output_transport_result prepared,result;
++  assert(outputs_transport_bound_state_get(device->id,owner,&route,&busy,&start_owned,&clean_absent)==0
++    && !busy && !start_owned && clean_absent);
++  strcpy(request.action,"pause");memset(request.native_prepare_id,'7',32);
++  memset(request.args_digest,'8',64);request.native_owner=*owner;
++  strcpy(request.expected_input_path_digest,route.input_path_digest);
++  assert(outputs_transport_prepare(&request,&prepared)==0);strcpy(request.token,prepared.command.token);
++  assert(outputs_transport_commit(&request,&result)==0 && result.outcome==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)==0);
++  assert(!transport_pause_retained && !transport_pause_owned(device->id));
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,41)<0);
++  assert(!transport_pause_retained);
++  /* A later accepted command owns custody; the old completion cannot retain it. */
++  request.native_revision=42;request.native_prepare_id[0]='8';request.token[0]=0;
++  assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++  assert(outputs_transport_commit(&request,&result)==0);
++  struct output_transport_request successor=request;
++  successor.native_revision=43;successor.native_prepare_id[0]='9';successor.token[0]=0;
++  strcpy(successor.action,"resume");
++  assert(outputs_transport_prepare(&successor,&prepared)==0);successor=prepared.command;
++  assert(outputs_transport_commit(&successor,&result)==0);
++  assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,42)<0);
++  assert(transport_custody_current(owner,&route,43) && !transport_pause_retained);
++  /* No delayed completion can cross route replacement, expiry or unknown START. */
++  for (int mode=0;mode<3;mode++) {
++    request.native_revision=44+mode;request.native_prepare_id[0]='a'+mode;request.token[0]=0;
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    assert(outputs_transport_commit(&request,&result)==0);
++    struct transport_slot *slot=transport_find(request.token);assert(slot);
++    struct timespec expiry=slot->expiry;
++    if(mode==0)device->session_epoch++;
++    if(mode==1)slot->expiry.tv_sec=0;
++    if(mode==2)start_startup_quarantine=true;
++    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++    if(mode==0)device->session_epoch--;
++    if(mode==1)slot->expiry=expiry;
++    if(mode==2)start_startup_quarantine=false;
++    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++    assert(!transport_pause_retained && !transport_pause_owned(device->id));
++  }
++  puts("PASS ordinary exact effect ACK without START retention; duplicate, successor custody, changed route, expired and unknown START confirmations cannot revive");
++}
++
++struct ordinary_resume_flow {
++  struct recovery_wire_fixture *fixture;
++  int writer,phase;pthread_t thread;atomic_bool done;ssize_t written;
++  struct player_source *source;struct input_fifo_identity reader;
++  bool retain;const struct output_native_owner *owner;void *session;
++  uint64_t epoch,route;struct timespec paused_at;
++  struct output_room_volume_request volume;struct output_room_volume_result volume_result;
++};
++static void *ordinary_resume_pcm(void *arg)
++{
++  struct ordinary_resume_flow *flow=arg;
++  char pcm[400000]={0};size_t offset=0;
++  while(offset<sizeof(pcm)) {
++    ssize_t n=write(flow->writer,pcm+offset,sizeof(pcm)-offset);
++    if(n<0 && errno==EINTR)continue;
++    if(n<=0)break;
++    offset+=n;
++  }
++  flow->written=offset;atomic_store(&flow->done,true);return NULL;
++}
++static void real_move_transport(struct ordinary_resume_flow *flow,const char *action,uint64_t revision)
++{
++  struct recovery_wire_fixture *f=flow->fixture;
++  struct output_transport_request q={.device_id=f->device->id,.bound=true,.percent=-1,.native_revision=revision};
++  struct output_transport_result prepared,result;q.native_owner=*flow->owner;
++  strcpy(q.action,action);memset(q.native_prepare_id,'7',32);memset(q.args_digest,'8',64);
++  strcpy(q.expected_input_path_digest,transport_input_path_digest);
++  assert(outputs_transport_prepare(&q,&prepared)==0);q=prepared.command;
++  assert(outputs_transport_commit(&q,&result)==0 && result.outcome==0);
++  if(!strcmp(action,"pause"))
++    assert(outputs_transport_pause_confirm(f->device->id,q.token,q.native_prepare_id,revision)==0
++      && transport_pause_owned(f->device->id));
++}
++static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
++{
++  struct ordinary_resume_flow *flow=arg;struct recovery_wire_fixture *f=flow->fixture;
++  struct timeval soon={0,1000};(void)fd;(void)what;
++  if(flow->phase==-2 && atomic_load(&flow->done)) {
++    assert(!pthread_join(flow->thread,NULL) && flow->written==400000);
++    atomic_store(&flow->done,false);assert(pb_timer_start()==0);flow->phase=-1;
++  }else if(flow->phase==-1 && f->device->session
++      && ((struct airplay_session *)f->device->session)->state==AIRPLAY_STATE_STREAMING) {
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)==1);
++    if(flow->retain) {
++      real_move_transport(flow,"pause",10);
++      struct output_room_volume_request *v=&flow->volume;bool busy;
++      *v=(struct output_room_volume_request){.device_id=f->device->id,.bound=true,
++        .percent=f->device->volume,.native_revision=11,.native_owner=*flow->owner};
++      memset(v->native_prepare_id,'1',32);memset(v->args_digest,'3',64);
++      assert(outputs_room_volume_bound_state_get(f->device->id,flow->owner,&v->expected_identity,
++        &v->expected_volume_state,&busy)==0 && !busy);
++      strcpy(v->expected_input_path_digest,v->expected_identity.input_path_digest);
++      struct output_room_volume_result prepared;
++      assert(outputs_room_volume_prepare(v,&prepared)==0);*v=prepared.command;
++      memset(v->native_reservation_id,'5',32);
++      assert(outputs_room_volume_commit(v,&flow->volume_result)==0 && transport_pause_owned(f->device->id));
++      flow->phase=-3;
++    }else flow->phase=0;
++    puts("PASS pre-pause actual FIFO PCM reaches AP2 STREAMING and UDP peer");
++  }else if(flow->phase==-3) {
++    assert(outputs_room_volume_result_get(flow->volume.token,&flow->volume_result)==0
++      && transport_pause_owned(f->device->id));
++    if(flow->volume_result.contexts_drained) {
++      assert(flow->volume_result.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED
++        && f->device->session==flow->session && f->device->session_epoch==flow->epoch);
++      puts("PASS completed MOVE paused same-owner bound volume actual protocol ACK retains exact AP2 owner");
++      flow->phase=0;
++    }
++  }else if(flow->phase==0 && player_state==PLAY_PAUSED && !player_flush_pending) {
++    assert(f->device->session && event_pending(f->device->stop_timer,EV_TIMEOUT,NULL)
++      && f->device->stop_timer_session==f->device->session
++      && f->device->stop_timer_session_epoch==f->device->session_epoch);
++    assert(!clock_gettime(CLOCK_MONOTONIC,&flow->paused_at));flow->phase=1;
++  }else if(flow->phase==1) {
++    bool resume=!f->device->session;
++    if(flow->retain) {
++      struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
++      long elapsed=(now.tv_sec-flow->paused_at.tv_sec)*1000+(now.tv_nsec-flow->paused_at.tv_nsec)/1000000;
++      if(elapsed<10200)goto again;
++      struct timeval expires,now_tv;assert(!gettimeofday(&now_tv,NULL));
++      int pending=event_pending(f->device->stop_timer,EV_TIMEOUT,&expires);
++      assert(pending
++        && expires.tv_sec-now_tv.tv_sec>=8
++        && f->device->session==flow->session && f->device->session_epoch==flow->epoch
++        && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
++      puts("PASS real ten-second completed MOVE STOP timer rearms exact retained AP2 session after bound volume");
++      real_move_transport(flow,"resume",12);
++      /* The already-armed STOP may run after C ACK and before Native PCM. */
++      assert(event_pending(f->device->stop_timer,EV_TIMEOUT,NULL)
++        && f->device->stop_timer_session==flow->session
++        && f->device->stop_timer_session_epoch==flow->epoch);
++      stop_timer_cb(0,0,f->device);
++      assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
++        && ((struct airplay_session *)flow->session)->state!=AIRPLAY_STATE_TEARDOWN
++        && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
++      puts("PASS exact Resume C ACK retains same AP2 at already-armed STOP before first same-writer PCM");
++      resume=true;
++    }
++    if(resume) {
++      assert(f->device->selected && player_state==PLAY_PAUSED && pb_session.playing_now==flow->source);
++      if(!flow->retain) {
++        if(f->peer){bufferevent_free(f->peer);f->peer=NULL;}
++        pair_cipher_free(f->cipher);f->cipher=NULL;pair_setup_free(f->pair);f->pair=NULL;
++        evbuffer_drain(f->plain,evbuffer_get_length(f->plain));assert(!outputs_transport_busy());
++      }
++      char packet[2048];while(recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT)>0){}
++      assert(!pthread_create(&flow->thread,NULL,ordinary_resume_pcm,flow));flow->phase=2;
++    }
++  }else if(flow->phase==2 && atomic_load(&flow->done) && player_state==PLAY_PLAYING
++      && f->device->session
++      && ((struct airplay_session *)f->device->session)->state==AIRPLAY_STATE_STREAMING) {
++    struct timespec deadline;struct input_fifo_identity actual={0};
++    char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)==1);
++    pb_timer_stop();assert(!pthread_join(flow->thread,NULL) && flow->written==400000);
++    clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++    assert(input_fifo_owner_get(flow->source->item_id,flow->source->path,false,0,0,&deadline,&actual)==0);
++    assert(actual.device==flow->reader.device && actual.inode==flow->reader.inode
++      && actual.epoch==flow->reader.epoch && pb_session.playing_now==flow->source
++      && f->device->selected && !transport_pause_retained);
++    if(flow->retain)assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
++      && f->device->route_revision==flow->route && outputs_start_move_source_transition_current());
++    else assert(start_route_clean_absent());
++    flow->phase=3;event_base_loopbreak(f->base);return;
++  }
++ again:
++  evtimer_add(f->poll,&soon);
++}
++static void ordinary_pause_resume_case(struct recovery_wire_fixture *f,int writer)
++{
++  struct ordinary_resume_flow flow={.fixture=f,.writer=writer,.source=pb_session.playing_now,.phase=-2};
++  struct timespec deadline;struct timeval soon={0,1000},bound={20,0};
++  assert(flow.source && player_state==PLAY_PLAYING && start_route_clean_absent());
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(flow.source->item_id,flow.source->path,false,0,0,&deadline,&flow.reader)==0);
++  int flags=fcntl(writer,F_GETFL);assert(flags>=0 && fcntl(writer,F_SETFL,flags&~O_NONBLOCK)==0);
++  /* Real absence of PCM crosses the existing playback callback's deficit
++   * boundary. Run its actual FLUSH and delayed-STOP before returning PCM. */
++  /* This existing wire fixture initializes only the AirPlay backend. Real
++   * playback additionally needs the normal outputs_init buffer allocation. */
++  for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) {
++    assert(!output_buffer.data[i].evbuf);
++    output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);
++  }
++  keep_alive_timer=evtimer_new(f->base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++  assert(!pthread_create(&flow.thread,NULL,ordinary_resume_pcm,&flow));
++  event_free(f->poll);f->poll=evtimer_new(f->base,ordinary_resume_poll,&flow);assert(f->poll);
++  assert(!evtimer_add(f->deadline,&bound) && !evtimer_add(f->poll,&soon));event_base_dispatch(f->base);
++  assert(!f->failed && flow.phase==3 && fcntl(writer,F_SETFL,flags)==0);
++  puts("PASS ordinary pause real deficit/FLUSH/delayed STOP then same-writer PCM resumes actual input callback/AP2 route with same reader epoch and loaded source");
++}
++
++static void completed_move_real_pause_resume_case(struct recovery_wire_fixture *f,int writer,
++    const struct output_native_owner *owner)
++{
++  struct db_queue_item *item=db_queue_fetch_byitemid(transport_input_item);assert(item);
++  session_start(source_create(item,0));free_queue_item(item,0);session_update_read_start(0);
++  player_tick_interval.tv_nsec=50000000;
++  pb_write_deficit_max=PLAYER_WRITE_BEHIND_MAX*1000000/player_tick_interval.tv_nsec; /* Existing player_init formula. */
++  pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++  pb_timer_ev=event_new(f->base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++  cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
++  int result=-1;assert(playback_start_bh(NULL,&result)==COMMAND_END && result==0);pb_timer_stop();
++  struct ordinary_resume_flow flow={.fixture=f,.writer=writer,.source=pb_session.playing_now,.phase=-2,
++    .retain=true,.owner=owner,.session=f->device->session,.epoch=f->device->session_epoch,.route=f->device->route_revision};
++  struct timespec deadline;struct timeval soon={0,1000},bound={20,0};
++  clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
++  assert(input_fifo_owner_get(flow.source->item_id,flow.source->path,false,0,0,&deadline,&flow.reader)==0);
++  int flags=fcntl(writer,F_GETFL);assert(flags>=0 && fcntl(writer,F_SETFL,flags&~O_NONBLOCK)==0);
++  for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) {
++    assert(!output_buffer.data[i].evbuf);output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);
++  }
++  keep_alive_timer=evtimer_new(f->base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++  assert(!pthread_create(&flow.thread,NULL,ordinary_resume_pcm,&flow));
++  event_free(f->poll);f->poll=evtimer_new(f->base,ordinary_resume_poll,&flow);assert(f->poll);
++  assert(!evtimer_add(f->deadline,&bound) && !evtimer_add(f->poll,&soon));event_base_dispatch(f->base);
++  assert(!f->failed && flow.phase==3 && fcntl(writer,F_SETFL,flags)==0);
++  puts("PASS completed MOVE actual FIFO PCM→Pause→bound volume ACK→real ten-second STOP rearm→same-writer Resume PCM/UDP with SAME AP2 session/epoch/route and loaded input owner");
++  event_del(f->deadline);commands_base_free(cmdbase);cmdbase=NULL;
++  event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);
++}
++
+ /* Real constructed START/reader/writer/session; no PAUSED flag substitutes for
+  * success. Admission alone cannot retain; only the exact post-effect receipt. */
+ static void confirmed_pause_custody_case(struct output_device *device,
+@@ -104,12 +942,26 @@
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
+   assert(!transport_pause_retained); /* C commit precedes actual native effect. */
++  transport_custody_expiry.tv_sec+=5; /* Existing START custody outlives the next 10-second command. */
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
+   assert(!transport_pause_retained);
+   request.native_revision=52;request.native_prepare_id[0]='e';
+   assert(outputs_transport_prepare(&request,&prepared)==0);
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
++  assert(result.remaining_ms>0 && result.remaining_ms<=OUTPUT_TRANSPORT_TTL_MS
++    && transport_remaining(&transport_custody_expiry)>result.remaining_ms+4000);
++  {
++    struct output_transport_result queried;
++    struct transport_slot *slot=transport_find(request.token);
++    struct timespec original=slot->expiry;
++    assert(outputs_transport_result_get(request.token,&queried)==0
++      && queried.remaining_ms>0 && queried.remaining_ms<=OUTPUT_TRANSPORT_TTL_MS);
++    slot->expiry.tv_sec-=20;
++    assert(outputs_transport_result_get(request.token,&queried)==0 && !queried.remaining_ms);
++    slot->expiry=original;
++  }
++  puts("PASS bound transport ACK caps a longer shared custody to its 10-second slot; expired slot reports zero");
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)==0);
+   assert(transport_pause_owned(1));
+   assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,52)<0);
+@@ -142,6 +994,7 @@
+     assert(outputs_transport_pause_confirm(1,request.token,request.native_prepare_id,request.native_revision)<0);
+     assert(transport_pause_owned(1));
+   }
++  paused_owner_volume_case(device,owner,56);
+   struct start_slot *prior_start=start_active;
+   struct start_slot next_start=*prior_start;
+   next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
+@@ -202,6 +1055,322 @@
+   puts("PASS actual FIFO reader replacement retains an existing writer across watcher reset, with a fresh exact input epoch");
+ }
+ 
++/* The existing real AP2/FIFO fixture also accepts the actual Native test
++ * process over loopback. Only the HTTP backend adapter is test code: the linked
++ * strict production handler and synchronous player owner execute every step. */
++static int pc70_ordinary_keeper = -1;
++struct native_start_wire {
++  struct recovery_wire_fixture *fixture;
++  struct event_base *http_base;
++  struct evhttp *http;
++  atomic_bool done,completed,retired;
++  atomic_bool reset_audio;
++  atomic_int audio_packets;
++  bool decoded_audio_packet, nonzero_pcm_input;
++  uint16_t last_audio_seq;
++  uint32_t last_audio_timestamp;
++};
++/* AP2 leaves the 12-byte RTP header clear even though its audio payload is
++ * encrypted. Sync/control share this fixture's UDP port but use other types. */
++static bool native_start_audio_rtp(const unsigned char *packet,ssize_t length)
++{
++  return length>12 && (packet[0]>>6)==2 && (packet[1]&0x7f)==AIRPLAY_RTP_PAYLOADTYPE;
++}
++static void native_start_audio_poll(struct native_start_wire *wire)
++{
++  struct recovery_wire_fixture *f=wire->fixture;
++  unsigned char packet[4096];ssize_t length;
++  while((length=recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT))>0){
++    if(!native_start_audio_rtp(packet,length))continue;
++    if(!atomic_load(&wire->completed) || f->volumes<1 || outputs_start_gate_closed() || !start_active
++        || start_active->result.phase!=OUTPUT_START_COMPLETED){
++      recovery_wire_fail(f,"audio RTP crossed closed START gate");return;
++    }
++    struct airplay_session *session=f->device ? f->device->session : NULL;
++    struct airplay_master_session *master=session ? session->master_session : NULL;
++    uint16_t seq;uint32_t timestamp;size_t payload_len;
++    uint8_t nonce[12]={0},decoded[4096];gcry_cipher_hd_t cipher;
++    struct rtp_packet *source;
++    if(!session || !session->supports_encryption || !master || !master->rtp_session || length<36){
++      recovery_wire_fail(f,"audio RTP lacks negotiated encrypted session");return;
++    }
++    memcpy(&seq,packet+2,sizeof(seq));seq=ntohs(seq);
++    memcpy(&timestamp,packet+4,sizeof(timestamp));timestamp=ntohl(timestamp);
++    if(wire->decoded_audio_packet && (uint16_t)(seq-wire->last_audio_seq)!=1){
++      recovery_wire_fail(f,"audio RTP sequence did not advance by one");return;
++    }
++    if(wire->decoded_audio_packet && timestamp<=wire->last_audio_timestamp){
++      recovery_wire_fail(f,"audio RTP timestamp did not advance");return;
++    }
++    payload_len=(size_t)length-12-16-8;
++    source=rtp_packet_get(master->rtp_session,seq);
++    if(!source || source->payload_len!=payload_len || source->header[0]!=packet[0]
++        || (source->header[1]&0x7f)!=(packet[1]&0x7f) || memcmp(source->header+2,packet+2,10)){
++      recovery_wire_fail(f,"audio RTP has no matching encoded packet");return;
++    }
++    memcpy(nonce+4,packet+length-8,8);
++    cipher=chacha_open(session->shared_secret,AIRPLAY_AUDIO_KEY_LEN);
++    if(!cipher || gcry_cipher_setiv(cipher,nonce,sizeof(nonce))
++        || gcry_cipher_authenticate(cipher,packet+4,8)
++        || gcry_cipher_decrypt(cipher,decoded,payload_len,packet+12,payload_len)
++        || gcry_cipher_checktag(cipher,packet+length-8-16,16)
++        || memcmp(decoded,source->payload,payload_len)){
++      chacha_close(cipher);recovery_wire_fail(f,"audio RTP authentication/decode failed");return;
++    }
++    chacha_close(cipher);
++    for(size_t i=0;i<master->rawbuf_size;i++)
++      if(master->rawbuf[i]){wire->nonzero_pcm_input=true;break;}
++    wire->decoded_audio_packet=true;wire->last_audio_seq=seq;wire->last_audio_timestamp=timestamp;
++    atomic_fetch_add(&wire->audio_packets,1);
++  }
++  if(length<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)
++    recovery_wire_fail(f,"private RTP receive failed");
++}
++static void native_start_http(struct evhttp_request *request,void *arg)
++{
++  struct native_start_wire *wire=arg;
++  const char *uri=evhttp_request_get_uri(request);
++  struct evbuffer *response=evbuffer_new();
++  assert(response);
++  /* Done seals test admission before the player event loop is stopped. A late
++   * Native cancellation must not synchronously wait on that stopped owner. */
++  if(atomic_load(&wire->done)){
++    evhttp_send_reply(request,409,"Fixture completed",response);
++    evbuffer_free(response);return;
++  }
++  if(!strcmp(uri,"/fixture/rtp") && wire->fixture->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
++    evbuffer_add_printf(response,"{\"audio_packets\":%d}",atomic_load(&wire->audio_packets));
++    evhttp_send_reply(request,200,"OK",response);
++    }
++  else if (!strcmp(uri, "/fixture/ordinary-writer-ready") && getenv("PC70_RELEASE_COMPOSE")
++           && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++           && pc70_ordinary_keeper >= 0)
++    {
++      close(pc70_ordinary_keeper);
++      pc70_ordinary_keeper = -1;
++      evbuffer_add_printf(response, "{}");
++      evhttp_send_reply(request, 200, "OK", response);
++    }
++  else if (!strcmp(uri, "/fixture/done"))
++    {
++      evbuffer_add_printf(response, "{}");
++      evhttp_send_reply(request, 200, "OK", response);
++      atomic_store(&wire->done, true);
++    }
++  else
++    {
++      char *path = strdup(uri), *rest = path, *part;
++      struct httpd_request actual = { .in_body = evhttp_request_get_input_buffer(request), .out_body = response };
++      unsigned count = 0;
++      int status = 404;
++      assert(path);
++      while ((part = strsep(&rest, "/")) && count < ARRAY_SIZE(actual.path_parts) - 1)
++	if (*part)
++	  actual.path_parts[count++] = part;
++      if (getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && count == 5
++          && !strcmp(actual.path_parts[3], "start") && !strcmp(actual.path_parts[4], "commit"))
++	{
++	  atomic_store(&wire->completed, false);
++	  atomic_store(&wire->reset_audio, true);
++	}
++      bool move_fixture = getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move");
++      bool output_id
++          = count > 2 && (!strcmp(actual.path_parts[2], "1") || (move_fixture && !strcmp(actual.path_parts[2], "2")));
++      bool move_request = count > 3 && move_fixture && !strcmp(actual.path_parts[3], "move");
++      if (move_request && count == 5 && !strcmp(actual.path_parts[4], "commit"))
++	{
++	  wire->fixture->device = outputs_device_get(2);
++	  assert(wire->fixture->device);
++	  wire->fixture->phase = 2;
++	}
++      bool retirement = count >= 6 && !strcmp(actual.path_parts[4], "retire");
++      bool result = retirement ? count == 7 && !strcmp(actual.path_parts[5], "result")
++                               : count == 6 && !strcmp(actual.path_parts[4], "result");
++      if ((count == 5 || result || (retirement && count == 6)) && !strcmp(actual.path_parts[0], "api")
++          && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && (!strcmp(actual.path_parts[3], "start") || move_request)
++          && evhttp_request_get_command(request) == (result ? EVHTTP_REQ_GET : EVHTTP_REQ_POST))
++	{
++	  const char *pattern = retirement ? (result ? "/retire/result/" : "/retire/(prepare|")
++	                                   : (move_request ? (result ? "/move/result/" : "/move/(state|")
++	                                                   : (result ? "/start/result/" : "/start/(state|"));
++	  for (struct httpd_uri_map *route = httpd_jsonapi.handlers; route->regexp; route++)
++	    {
++	      if (strstr(route->regexp, pattern))
++		{
++		  status = route->handler(&actual);
++		  break;
++		}
++	    }
++	}
++      if (count == 5 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && !strcmp(actual.path_parts[3], "transport") && evhttp_request_get_command(request) == EVHTTP_REQ_POST)
++	{
++	  const char *pattern
++	      = !strcmp(actual.path_parts[4], "bound-state")             ? "/transport/bound-state$"
++	        : !strcmp(actual.path_parts[4], "bound-pause-confirm")   ? "/transport/bound-pause-confirm$"
++	        : !strcmp(actual.path_parts[4], "bound-release-confirm") ? "/transport/bound-release-confirm$"
++	        : (!strcmp(actual.path_parts[4], "bound-prepare") || !strcmp(actual.path_parts[4], "bound-commit"))
++	            ? "/transport/bound-(prepare|commit)$"
++	            : NULL;
++	  for (struct httpd_uri_map *route = httpd_jsonapi.handlers; pattern && route->regexp; route++)
++	    {
++	      if (strstr(route->regexp, pattern))
++		{
++		  status = route->handler(&actual);
++		  break;
++		}
++	    }
++	}
++      if (count == 6 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
++          && !strcmp(actual.path_parts[3], "transport") && !strcmp(actual.path_parts[4], "bound-result")
++          && evhttp_request_get_command(request) == EVHTTP_REQ_GET)
++	for (struct httpd_uri_map *route = httpd_jsonapi.handlers; route->regexp; route++)
++	  if (strstr(route->regexp, "/transport/bound-result/"))
++	    {
++	      status = route->handler(&actual);
++	      break;
++	    }
++      if (status == 200 && count == 5 && !strcmp(actual.path_parts[4], "complete"))
++	atomic_store(&wire->completed, true);
++      if (status == 200 && retirement && count == 6 && !strcmp(actual.path_parts[5], "complete"))
++	atomic_store(&wire->retired, true);
++      fprintf(stderr, "ACTUAL Native→C %s status=%d body=%.*s\n", uri, status, (int)evbuffer_get_length(response),
++          (char *)evbuffer_pullup(response, -1));
++      evhttp_send_reply(request, status, status == 200 ? "OK" : "Rejected", response);
++      free(path);
++    }
++  evbuffer_free(response);
++}
++static void *native_start_http_thread(void *arg)
++{
++  struct native_start_wire *wire=arg;
++  event_base_dispatch(wire->http_base);
++  return NULL;
++}
++static void native_start_done_poll(int fd,short events,void *arg)
++{
++  struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
++  struct timeval soon={0,1000};(void)fd;(void)events;
++  if (atomic_exchange(&wire->reset_audio, false))
++    {
++      unsigned char old[4096];
++      while (recv(f->udp_fd, old, sizeof(old), MSG_DONTWAIT) > 0)
++	{
++	}
++      wire->decoded_audio_packet = false;
++      wire->nonzero_pcm_input = false;
++      wire->last_audio_seq = 0;
++      wire->last_audio_timestamp = 0;
++      atomic_store(&wire->audio_packets, 0);
++    }
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
++    native_start_audio_poll(wire);
++    if(f->failed)return;
++  }
++  if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
++  if (getenv("PC70_RELEASE_COMPOSE"))
++    {
++      bool ordinary = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary");
++      if (getenv("PC70_RELEASE_NEXT_START"))
++	{
++	  if (!release_operation.terminal || !start_active || start_active->result.phase != OUTPUT_START_COMPLETED
++	      || !f->device->selected || !f->device->session || outputs_start_gate_closed()
++	      || start_journal_retirement_outcome != OUTPUT_RETIRE_NONE
++	      || strcmp(start_journal.token, start_active->result.command.token)
++	      || !strcmp(start_journal.token, release_operation.predecessor.completed_token)
++	      || !strcmp(start_journal.token, release_operation.record.result.command.token))
++	    {
++	      recovery_wire_fail(f, "manual release did not admit a genuine managed next START");
++	      return;
++	    }
++	  fprintf(stderr,
++	      "PASS actual Native+C manual release class=%s then managed fresh authenticated player/new writer genuine "
++	      "public START; old manual token not adopted\n",
++	      getenv("PC70_RELEASE_COMPOSE"));
++	  event_base_loopbreak(f->base);
++	  return;
++	}
++      if ((ordinary ? atomic_load(&wire->completed) : !atomic_load(&wire->completed)) || !release_operation.terminal
++          || start_active || outputs_start_source_owned()
++          || start_journal_retirement_outcome != OUTPUT_RETIRE_RETIRED_KNOWN || !outputs_start_gate_closed()
++          || !start_retired_stage_ready || f->device->selected || f->device->session || pc70_ordinary_keeper >= 0)
++	{
++	  recovery_wire_fail(f, "actual Native manual release did not durably retire exact C owner");
++	  return;
++	}
++      fprintf(stderr,
++          "PASS actual Native+C manual release class=%s durable closed gate→real worker Close→exact FIFO/AP2 "
++          "drain→terminal/reopen staging; no physical audio claim\n",
++          getenv("PC70_RELEASE_COMPOSE"));
++      event_base_loopbreak(f->base);
++      return;
++    }
++  if(getenv("PC_NATIVE_START_EXPECT_PAUSE_RETAINED")){
++    struct airplay_session *session=f->device->session;
++    if(!atomic_load(&wire->completed) || !start_active || start_active->result.phase!=OUTPUT_START_COMPLETED
++        || !session || session!=start_active->session || session->state!=AIRPLAY_STATE_STREAMING
++        || f->teardowns || f->volumes!=1){recovery_wire_fail(f,"Native Pause/Resume did not preserve exact live streaming START route");return;}
++    fprintf(stderr,"PASS actual Native purpose-bound Pause -> real10sSTOP rearm -> explicit Native Resume -> same AP2session STREAMING and bound controls\n");
++    event_base_loopbreak(f->base);return;
++  }
++  if(getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS")){
++    if(!atomic_load(&wire->completed) || !start_active || f->device->session || f->teardowns!=1){recovery_wire_fail(f,"Native Pause loss did not follow actual completed START and real STOP");return;}
++    fprintf(stderr,"CAUSAL RED actual Native Pause -> ordinary underrun -> real delayed STOP -> exact START AP2 session lost and bound-state409\n");
++    event_base_loopbreak(f->base);return;
++  }
++  if(atomic_load(&wire->retired)){
++    if(!atomic_load(&wire->completed) || start_active || outputs_start_source_owned()
++        || start_journal_retirement_outcome!=OUTPUT_RETIRE_RETIRED_KNOWN
++        || !outputs_start_gate_closed() || !start_retired_stage_ready
++        || f->device->selected || f->device->session || f->volumes!=1){
++      recovery_wire_fail(f,"failed Native START did not retire exact C source and stage fresh reader");return;
++    }
++    puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
++  }else if(!atomic_load(&wire->completed) || !start_active
++      || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
++      || !f->device->session || f->device->volume!=35 || f->volumes!=(getenv("PC_NATIVE_START_EXPECT_TWO")?2:1)){
++    recovery_wire_fail(f,"actual Native did not finish after real C COMPLETED/route35");return;
++  }
++  if(f->mode==29 && getenv("PC_EXPECT_PAUSED_CLOCK")
++      && (!pb_session.start_clock_pending || pb_session.start_ts.tv_sec || !outputs_start_source_owned()
++          || outputs_start_gate_closed() || atomic_load(&wire->audio_packets))){
++    recovery_wire_fail(f,"paused completed START consumed first-PCM clock");return;
++  }
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")
++      && (atomic_load(&wire->audio_packets)<1 || !wire->decoded_audio_packet || !wire->nonzero_pcm_input)){
++    recovery_wire_fail(f,"no authenticated RTP from nonzero PCM reached private peer");return;
++  }
++  if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))
++    fprintf(stderr,"PASS private AP2 authenticated ALAC RTP packets=%d from nonzero PCM after completed/volume/open gate\n",
++      atomic_load(&wire->audio_packets));
++  fprintf(stderr,"PASS actual Native HTTP→C player owner→FIFO barrier→private AP2→FULL COMPLETED; Native final verdict asserted by driver\n");
++  event_base_loopbreak(f->base);
++}
++static void native_start_wire_run(struct recovery_wire_fixture *f,const char *fifo)
++{
++  struct native_start_wire wire={.fixture=f};struct sockaddr_in address={0};
++  struct timeval soon={0,1000},bound={25,0};socklen_t length=sizeof(address);pthread_t thread;
++  const char *ready_path=getenv("PC_NATIVE_START_READY_FILE");assert(ready_path);
++  wire.http_base=event_base_new();assert(wire.http_base);
++  wire.http=evhttp_new(wire.http_base);assert(wire.http);
++  evhttp_set_gencb(wire.http,native_start_http,&wire);
++  struct evhttp_bound_socket *socket=evhttp_bind_socket_with_handle(wire.http,"127.0.0.1",0);
++  assert(socket && !getsockname(evhttp_bound_socket_get_fd(socket),(struct sockaddr *)&address,&length));
++  cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
++  assert(!pthread_create(&thread,NULL,native_start_http_thread,&wire));
++  FILE *ready=fopen(ready_path,"w");assert(ready);
++  fprintf(ready,"{\"url\":\"http://127.0.0.1:%u\",\"pipe\":\"%s\",\"homepod_id\":\"1\"}\n",ntohs(address.sin_port),fifo);
++  assert(!fclose(ready));
++  f->poll=evtimer_new(f->base,native_start_done_poll,&wire);
++  f->deadline=evtimer_new(f->base,recovery_wire_deadline,f);
++  assert(f->poll && f->deadline && !evtimer_add(f->poll,&soon) && !evtimer_add(f->deadline,&bound));
++  event_base_dispatch(f->base);
++  event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
++  evhttp_free(wire.http);event_base_free(wire.http_base);
++  commands_base_free(cmdbase);cmdbase=NULL;
++}
++
+ static int start35_wire_case(int mode)
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+@@ -211,6 +1380,7 @@
+   struct input_fifo_identity fd={0};struct timespec deadline;struct media_file_info mfi={0};struct query_params qp={.type=Q_ITEMS};
+   assert(file>=0 && placeholder>=0);close(file);close(placeholder);assert(unlink(fifo)==0 && mkfifo(fifo,0600)==0);
+   assert(evthread_use_pthreads()==0);active_recovery_wire=&f;f.base=event_base_new();assert(f.base);evbase_player=f.base;
++  if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
+   cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
+   cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
+   if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
+@@ -224,6 +1394,7 @@
+   f.device=calloc(1,sizeof(*f.device));extra=calloc(1,sizeof(*extra));assert(f.device && extra);
+   f.device->id=1;f.device->name=strdup("private-start35-native");f.device->type=OUTPUT_TYPE_AIRPLAY;f.device->type_name="AirPlay";f.device->advertised=true;
+   f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);f.device->extra_device_info=extra;extra->mdns_name=strdup(f.device->name);
++  if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
+   f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
+   /* Seed the real library database without invoking an unrelated scanner command consumer. */
+   sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
+@@ -233,6 +1404,64 @@
+     sqlite3 *shift=NULL;assert(sqlite3_open(database,&shift)==SQLITE_OK);
+     char *change=sqlite3_mprintf("UPDATE queue SET id=id+100 WHERE id=%d",item);
+     assert(sqlite3_exec(shift,change,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(change);sqlite3_close(shift);item+=100;
++  }
++  if(mode==29){
++    if(getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);assert(mkfifo(metadata,0600)==0);}
++    keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++    airplay_control_svc.socket.fd4=f.udp_fd;
++    /* outputs_init normally allocates these; avoid its unrelated discovery. */
++    for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++) { output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf); }
++    assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
++    player_tick_interval.tv_nsec=50000000;
++    pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++    pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++    if (getenv("PC70_RELEASE_COMPOSE")
++        && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move")))
++      {
++	outputs_device_select(f.device, -1);
++	f.deadline = evtimer_new(f.base, recovery_wire_deadline, &f);
++	assert(f.deadline && !evtimer_add(f.deadline, &bound));
++	assert(outputs_device_start(f.device, move_wire_old_connected, false) == 1);
++	event_base_dispatch(f.base);
++	assert(!f.failed && f.phase == 1 && f.device->session && f.device->selected);
++	event_free(f.deadline);
++	f.deadline = NULL;
++	pc70_ordinary_keeper = open(fifo, O_RDWR | O_NONBLOCK);
++	assert(pc70_ordinary_keeper >= 0);
++	clock_gettime(CLOCK_MONOTONIC, &deadline);
++	deadline.tv_sec += 4;
++	assert(input_start_fifo_exact(item, fifo, &deadline) >= 0);
++	outputs_transport_input_changed(item, fifo, true);
++	struct db_queue_item *playing = db_queue_fetch_byitemid(item);
++	assert(playing);
++	session_start(source_create(playing, 0));
++	free_queue_item(playing, 0);
++	session_update_read_start(0);
++	struct media_quality *quality = malloc(sizeof(*quality));
++	*quality = (struct media_quality){ 44100, 16, 2 };
++	session_update_read_quality(quality);
++	session_update_read(2205);
++	player_state = PLAY_PLAYING;
++	assert(!start_active && !start_journal.token[0] && start_route_clean_absent());
++      }
++    if (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++      {
++	struct output_device *target = calloc(1, sizeof(*target));
++	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
++	assert(target && target_extra);
++	target->id = 2;
++	target->name = strdup("private-move-target");
++	target->type = OUTPUT_TYPE_AIRPLAY;
++	target->type_name = "AirPlay";
++	target->advertised = true;
++	target->quality = (struct media_quality){ 44100, 16, 2 };
++	target->v4_address = strdup("127.0.0.1");
++	target->v4_port = ntohs(address.sin_port);
++	target->extra_device_info = target_extra;
++	target_extra->mdns_name = strdup(target->name);
++	assert(outputs_device_add(target, false) == target && outputs_device_volume_register(target, 65, -1) == 0);
++      }
++    native_start_wire_run(&f,fifo);goto cleanup;
+   }
+   if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){
+     struct output_device *old=f.device,*target=calloc(1,sizeof(*target));struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
+@@ -254,7 +1483,26 @@
+     assert(input_start_fifo_exact(item,fifo,&read_deadline)>=0);
+     assert(input_fifo_owner_get(item,fifo,false,0,0,&read_deadline,&fd)==0);
+     outputs_transport_input_changed(item,fifo,true);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct db_queue_item *playing=db_queue_fetch_byitemid(item);assert(playing);
++      session_start(source_create(playing,0));free_queue_item(playing,0);
++      session_update_read_start(0);
++      struct media_quality *quality=malloc(sizeof(*quality));*quality=(struct media_quality){44100,16,2};
++      player_tick_interval.tv_nsec=50000000;session_update_read_quality(quality);
++      session_update_read(2205);player_state=PLAY_PLAYING;
++      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);assert(pb_timer_fd>=0);
++      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);assert(pb_timer_ev);
++      keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
++      airplay_control_svc.socket.fd4=f.udp_fd;
++      for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++){output_buffer.data[i].evbuf=evbuffer_new();assert(output_buffer.data[i].evbuf);}
++      assert(pb_timer_start()==0);
++      if(getenv("PC_MOVE_CLOCK_PAUSED")){assert(pb_timer_stop()==0);player_state=PLAY_PAUSED;}
++    }
+     *r=(struct output_start_request){.device_id=2,.native_revision=1,.move_existing_session=true};
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      r->source_pointer=pb_session.playing_now;r->source_item_id=pb_session.playing_now->item_id;
++      r->source_paused=player_state==PLAY_PAUSED;
++    }
+     r->old_native_owner=recovery_burst_owner();
+     if(mode==24 || mode==25){memset(r->old_native_owner.alias_incarnation,'a',32);r->old_native_owner.alias_incarnation[32]=0;memset(r->old_native_owner.alias_registry,'b',64);r->old_native_owner.alias_registry[64]=0;}
+     r->old_owner_present=true;r->intended_native_owner=r->old_native_owner;
+@@ -273,7 +1521,8 @@
+       struct output_queue_writer proof={.writer_fd=0,.pipe_device=r->writer_pipe_device,
+         .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
+       proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
+-      queue_actual_same_reader(old,&r->old_native_owner,&proof,fifo);goto cleanup;
++      queue_actual_same_reader(old,&r->old_native_owner,&proof,fifo);
++      ordinary_pause_confirmation_case(old,&r->old_native_owner);goto cleanup;
+     }
+     assert(!start_journal.token[0]);
+     assert(outputs_start_state_get(r,&state)==0 && state.ready && state.session_volume_percent==27);
+@@ -284,8 +1533,14 @@
+     assert(outputs_start_commit(r,&f.start_result)<0); /* One-use rejected token cannot revive. */
+     memset(r->offer_id,'d',32);assert(outputs_start_prepare(r,&f.start_result)==0);
+     *r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
+-    assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
+-    assert(outputs_start_reader_ready(r->token,fd.device,fd.inode)==0);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct player_start_command move={.action=2,.request=r,.result=&f.start_result};int result=-1;
++      assert(start_command(&move,&result)==COMMAND_END && result==0);
++      assert(f.start_result.phase==OUTPUT_START_READER_READY && outputs_start_gate_closed());
++    }else{
++      assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
++      assert(outputs_start_reader_ready(r->token,fd.device,fd.inode)==0);
++    }
+     r->writer_source_epoch=1;r->pipe_device=fd.device;r->pipe_inode=fd.inode;r->writer_quiescent=true;
+     assert(outputs_start_barrier_begin(r,&f.start_result)==0);
+     assert(input_fifo_owner_get(item,fifo,true,fd.device,fd.inode,&read_deadline,&fd)==0 && fd.epoch);
+@@ -300,7 +1555,29 @@
+     assert(f.start_result.gate_closed && f.start_result.contexts_drained && target->session && target->volume==27
+       && f.start_result.session_volume_percent==27);
+     r->committed_native_owner=r->intended_native_owner;
+-    assert(outputs_start_open(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      struct timespec before=pb_session.pts;uint32_t position=pb_session.pos;
++      struct output_start_request bad=*r;struct output_start_result rejected;
++      struct player_start_command invalid={.action=4,.request=&bad,.result=&rejected};int result=0;
++      assert(!pb_session.start_clock_pending);
++      bad.token[0]=bad.token[0]=='a'?'b':'a';
++      assert(start_command(&invalid,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++      bad=*r;strcpy(bad.committed_native_owner.session_id,"foreign-clock-owner");result=0;
++      assert(start_command(&invalid,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++      assert(pb_session.pos==position && !memcmp(&pb_session.pts,&before,sizeof(before)));
++      struct player_start_command move={.action=4,.request=r,.result=&f.start_result};result=-1;
++      assert(start_command(&move,&result)==COMMAND_END && result==0);
++      assert(f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
++      assert(pb_session.pos==position && !memcmp(&pb_session.pts,&before,sizeof(before)));
++      if(getenv("PC_MOVE_CLOCK_PAUSED")){
++        assert(!pb_session.start_clock_pending && player_state==PLAY_PAUSED
++          && !event_pending(pb_timer_ev,EV_READ|EV_TIMEOUT,NULL));
++        result=0;assert(start_command(&move,&result)==COMMAND_END && result<0 && !pb_session.start_clock_pending);
++        puts("PASS paused MOVE OPEN never resumes or arms clock; stale/foreign/duplicate OPEN inert");
++        goto cleanup;
++      }
++      assert(pb_session.start_clock_pending);
++    }else assert(outputs_start_open(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_OPENED && !f.start_result.gate_closed);
+     r->native_mutators_drained=true;
+     if(mode==19)fixture_post_full_writer=&writer;
+     if(mode==20){fixture_post_full_item=item;fixture_post_full_path=fifo;}
+@@ -316,11 +1593,38 @@
+     }
+     assert(outputs_start_complete(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_COMPLETED
+       && transport_input_item==(uint64_t)item && !strcmp(transport_input_path_digest,r->expected_input_path_digest));
++    if(mode==16 && getenv("PC_MOVE_CLOCK_PROBE")){
++      char pcm[8820];memset(pcm,1,sizeof(pcm));assert(write(writer,pcm,sizeof(pcm))>0);
++      int bytes=0,samples=0;uint32_t position=pb_session.pos;
++      struct player_source *source=pb_session.playing_now;uint64_t input_epoch=f.start_result.input_epoch;
++      uint16_t sequence=((struct airplay_session *)target->session)->master_session->rtp_session->seqnum;
++      for(int attempt=0;attempt<200 && samples==0;attempt++){
++        assert(source_read(&bytes,&samples,pb_session.buffer,pb_session.bufsize)>=0);
++        if(samples==0)usleep(1000);
++      }
++      assert(bytes>0 && samples>0 && !pb_session.start_clock_pending && pb_session.pos==position+(uint32_t)samples
++        && pb_session.playing_now==source && f.start_result.input_epoch==input_epoch
++        && ((struct airplay_session *)target->session)->master_session->rtp_session->seqnum==sequence);
++      struct timespec anchored=pb_session.pts;struct output_start_result duplicate;
++      struct player_start_command repeat={.action=4,.request=r,.result=&duplicate};int repeat_result=0;
++      assert(start_command(&repeat,&repeat_result)==COMMAND_END && repeat_result<0
++        && !pb_session.start_clock_pending && !memcmp(&pb_session.pts,&anchored,sizeof(anchored)));
++      struct timespec wall;clock_gettime(CLOCK_MONOTONIC,&wall);
++      double age=(wall.tv_sec-pb_session.pts.tv_sec)+(wall.tv_nsec-pb_session.pts.tv_nsec)/1e9;
++      fprintf(stderr,"MOVE_CLOCK_PROBE first-positive age=%.6f samples=%d pending=%d pos=%u\n",age,samples,pb_session.start_clock_pending,pb_session.pos);
++      outputs_write(pb_session.buffer,bytes,samples,&pb_session.quality,&pb_session.pts);
++      pb_timer_stop();
++      if(age>0.5)recovery_wire_fail(&f,"MOVE first positive PCM inherited stale presentation clock");
++      goto cleanup;
++    }
+     if(mode==24){
+       struct output_queue_writer proof={.writer_fd=r->writer_fd,.pipe_device=r->writer_pipe_device,
+         .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
+       proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
+-      queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);goto cleanup;
++      queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);
++      if(completed_move_real_resume)completed_move_real_pause_resume_case(&f,writer,&r->committed_native_owner);
++      else completed_move_pause_confirmation_case(target,&r->committed_native_owner,&writer);
++      goto cleanup;
+     }
+     struct output_transport_request stale_audio={.device_id=2,.percent=-1,.bound=true,.native_revision=2};
+     struct output_transport_result stale_audio_result;
+@@ -417,6 +1721,11 @@
+     assert(outputs_start_commit(r,&observed)==0 && observed.phase==OUTPUT_START_REJECTED
+       && !observed.possible_effect && !outputs_start_gate_closed());
+     assert(!strcmp(start_journal.token,completed.token));
++    if (mode == 17 && getenv("PC70_RELEASE"))
++      {
++	manual_release_actual_case(target, &fresh_owner, &writer);
++	goto cleanup;
++      }
+     if(mode==17 || mode==22 || mode==23){
+       struct output_retirement_request retire={.device_id=2,.move_existing_session=true,
+         .native_process=completed.native_process,.writer_source_epoch=completed.writer_source_epoch,
+@@ -464,24 +1773,124 @@
+         && retirement.input_epoch>retirement.admitted_input_epoch && !target->session);
+       assert(!outputs_start_source_owned());
+       assert(start_journal_payload_valid());
+-      struct input_fifo_identity released={0};
+-      assert(input_fifo_stage_release(r->expected_input_path,&released)==0);
+-      start_active=NULL; /* Model loss of all C runtime slots at restart. */
+-      start_journal_startup();
+-      assert(start_retired_reopen_pending && outputs_start_gate_closed()
+-        && !outputs_start_source_owned() && outputs_start_retired_stage_reader());
+-      assert(outputs_retirement_result_get(2,true,retire.retirement_token,&retirement)==0
+-        && retirement.retired_witness && retirement.reader_ready_closed
+-        && retirement.durable_terminal && retirement.gate_closed);
++      if(retired_keep_live_slot){
++        /* No C reset: the exact known terminal transition already detached
++         * runtime authority and revoked only its predecessor selection. */
++        assert(!start_active && !transport_custody_busy() && !old->selected && !target->selected);
++        session_stop();status_update(PLAY_STOPPED,LISTENER_PLAYER);
++      }else{
++        struct input_fifo_identity released={0};
++        assert(input_fifo_stage_release(r->expected_input_path,&released)==0);
++        if(retired_resume_wait){
++          cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++          input_pipe.deinit();cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",true);
++          assert(input_pipe.init()==0); /* Actual pipe watcher, same drained input owner. */
++        }
++        start_active=NULL; /* Model loss of all C runtime slots at restart. */
++        transport_custody_live=false;transport_custody_lost=false;
++        session_stop();status_update(PLAY_STOPPED,LISTENER_PLAYER);
++        start_journal_startup();
++        assert(start_retired_reopen_pending && outputs_start_gate_closed()
++          && !outputs_start_source_owned() && outputs_start_retired_stage_reader());
++        assert(outputs_retirement_result_get(2,true,retire.retirement_token,&retirement)==0
++          && retirement.retired_witness && retirement.reader_ready_closed
++          && retirement.durable_terminal && retirement.gate_closed);
++      }
+       int replacement=open(r->expected_input_path,O_WRONLY|O_NONBLOCK);
+       assert(replacement>=0); /* Real new Native open succeeds before C playback. */
+-      struct db_queue_item *fresh=db_queue_fetch_byitemid(item);
+-      assert(fresh && pb_session_start(fresh,0)>=0);
+-      free_queue_item(fresh,0);
+-      assert(!outputs_start_gate_closed()
++      assert(outputs_start_retired_normal_ready(r->expected_input_path));
++      union player_arg wrong={.id=2};int denied=0;
++      assert(playback_start_id(&wrong,&denied)==COMMAND_END && denied<0);
++      transport_custody_live=true;clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry);
++      transport_custody_expiry.tv_sec+=30;
++      wrong.id=1;
++      assert(playback_start_id(&wrong,&denied)==COMMAND_END && denied<0);
++      transport_custody_live=false;
++      outputs_device_deselect(old);outputs_device_deselect(target);
++      assert(!old->selected && !target->selected && !old->session && !target->session);
++      if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}pair_cipher_free(f.cipher);f.cipher=NULL;
++      pair_setup_free(f.pair);f.pair=NULL;evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++      f.phase=4;f.volumes=0;f.teardowns=0;
++      player_tick_interval.tv_nsec=50000000;
++      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
++      assert(pb_timer_fd>=0);
++      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
++      assert(pb_timer_ev);
++      if(!cmdbase)cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++      if(retired_resume_wait){
++        /* A reboot loses slot identity, so selected flags alone cannot be
++         * promoted as a retired normal route. Reject, never guess ownership. */
++        struct input_fifo_identity released_stage={0};
++        assert(input_fifo_stage_release(r->expected_input_path,&released_stage)==0);
++        start_retired_stage_ready=false;start_retired_stage_path[0]=0;
++        target->selected=true;
++        assert(!outputs_start_retired_stage_reader() && !start_retired_stage_ready
++          && target->selected && outputs_start_gate_closed());
++        target->selected=false;
++        assert(outputs_start_retired_stage_reader());
++        assert(outputs_connect_recovery_status(2)==-2 && !outputs_connect_recovery_available(2));
++#define RETIRED_WAIT_DENY(flag) do { flag=true;assert(outputs_connect_recovery_status(2)==-1);flag=false; } while(0)
++        RETIRED_WAIT_DENY(target->busy);RETIRED_WAIT_DENY(old->attention_restart_pending);
++        RETIRED_WAIT_DENY(old->attention_restoring);RETIRED_WAIT_DENY(start_journal_fault);
++        RETIRED_WAIT_DENY(start_startup_quarantine);
++#undef RETIRED_WAIT_DENY
++        old->attention_lease=1;assert(outputs_connect_recovery_status(2)==-1);old->attention_lease=0;
++        old->attention_retiring_session=old;assert(outputs_connect_recovery_status(2)==-1);old->attention_retiring_session=NULL;
++        atomic_store(&start_owned_latch,true);assert(outputs_connect_recovery_status(2)==-1);atomic_store(&start_owned_latch,false);
++        start_active=start_find(completed.token);assert(start_active && outputs_connect_recovery_status(2)==-1);start_active=NULL;
++        char *canonical=start_journal.payload;start_journal.payload="{}";
++        assert(outputs_connect_recovery_status(2)==-1);start_journal.payload=canonical;
++        transport_custody_live=true;clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry);transport_custody_expiry.tv_sec+=30;
++        assert(outputs_connect_recovery_status(2)==-1);transport_custody_live=false;
++        assert(outputs_connect_recovery_status(2)==-2);
++        struct retired_resume_wait wait={.flow={.fixture=&f,.prime=-99,.selection=-99},
++          .writer=replacement,.saved_payload=strdup(start_journal.payload),.base_volume=target->volume,
++          .base_revision=target->base_revision,.route_revision=target->route_revision,.input_generation=transport_input_generation};
++        assert(wait.saved_payload && !clock_gettime(CLOCK_MONOTONIC,&wait.began));
++        struct timeval resume_bound={10,0};
++        event_free(f.poll);f.poll=evtimer_new(f.base,retired_resume_wait_poll,&wait);assert(f.poll);
++        assert(!evtimer_add(f.deadline,&resume_bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++        assert(!f.failed && wait.phase==3 && target->selected && target->session);
++        puts("PASS >5s paused zeroPCM causes zero flags/base/session; explicit Resume prePCM prime is typed no-effect busy; real EV_READ/by-ID42 opens journal then retry primes35/selects one actual AP2 route");
++        free((char *)wait.saved_payload);
++        wait.phase=4;atomic_store(&wait.flow.done,false);
++        assert(!pthread_create(&wait.thread,NULL,retired_resume_input_close,&wait.flow));
++        assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++        assert(!f.failed && atomic_load(&wait.flow.done) && !pthread_join(wait.thread,NULL));input_ready=false;
++        commands_base_free(cmdbase);cmdbase=NULL;event_del(f.deadline);
++        event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);close(replacement);goto cleanup;
++      }
++      struct retired_connect_flow flow={.fixture=&f,.start=-99,.prime=-99,.selection=-99};
++      pthread_t connect_thread;
++      event_free(f.poll);f.poll=evtimer_new(f.base,retired_connect_poll,&flow);assert(f.poll);
++      assert(!pthread_create(&connect_thread,NULL,retired_connect_commands,&flow));
++      assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++      assert(!f.failed && atomic_load(&flow.done) && !pthread_join(connect_thread,NULL));
++      fprintf(stderr,"retired real command chain: autostart=%d prime35=%d selection=%d volumeWrites=%d\n",flow.start,flow.prime,flow.selection,f.volumes);
++      assert(flow.start>=0 && flow.prime>=0 && flow.selection>=0 && !flow.temporary_busy);
++      assert(!outputs_start_gate_closed() && start_route_clean_absent()
++        && start_journal_retirement_reopen_consumed && !outputs_start_source_owned()
++        && player_state==PLAY_PLAYING && target->selected && target->session
++        && target->state==OUTPUT_STATE_CONNECTED && !old->selected && !old->session
++        && target->volume==35 && f.volumes==1);
++      void *normal_session=target->session;uint64_t normal_epoch=target->session_epoch;
++      uint64_t normal_route=target->route_revision;int normal_volume=target->volume;
++      assert(outputs_start_cancel(completed.token,completed.native_reservation_id,&observed)==0);
++      assert(!outputs_start_gate_closed() && target->selected && target->session==normal_session
++        && target->session_epoch==normal_epoch && target->route_revision==normal_route
++        && target->volume==normal_volume && !old->selected && !old->session
++        && start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN
+         && start_journal_retirement_reopen_consumed && !outputs_start_source_owned());
++      puts("PASS delayed retired MOVE cancel cannot close gate or retire/change fresh normal AP2 route");
++      event_del(f.deadline);commands_base_free(cmdbase);cmdbase=NULL;
++      event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);
++      if (getenv("PC70_RELEASE_ORDINARY"))
++	{
++	  manual_release_actual_case(target, &fresh_owner, &replacement);
++	  goto cleanup;
++	}
+       close(replacement);
+-      puts("PASS actual MOVE two-phase FULL retirement and fresh normal FIFO: old reader/PCM/AP2 drained, durable startup witness, staged FD permits new nonblocking writer, real player source proves reader and consumes reopen before gate");
++      puts("PASS actual MOVE FULL retirement → exact normal autostart public command → Connect prime35 → one real selected AP2 route; missing input/unrelated custody denied; terminal journal retained, no START ownership credit");
+       goto cleanup;
+     }
+     close(writer);writer=-1;
+@@ -532,6 +1941,56 @@
+   if(mode==21)fixture_post_full_writer=&writer;
+   f.poll=evtimer_new(f.base,recovery_wire_poll,&f);f.deadline=evtimer_new(f.base,recovery_wire_deadline,&f);
+   assert(f.poll && f.deadline && !evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++  if(!f.failed && getenv("PC_ATTENTION_RESTORE_CASE")){
++    assert(f.start_result.phase==OUTPUT_START_COMPLETED && f.device->session);
++    session_cleanup(f.device->session); /* Actual loss/drain; no synthetic session-ready flag. */
++    assert(!f.device->session && outputs_transport_busy());
++    struct output_attention_request duck={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5,.ttl_ms=4000};
++    struct output_attention_result duck_result,restore_result;
++    outputs_attention_uuid(duck.request_id);
++    assert(outputs_attention_state_get(1,&duck.expected)==0);
++    assert(outputs_attention_admit(&duck,&duck_result)==0
++      && duck_result.outcome==OUTPUT_ATTENTION_DESIRED_ONLY);
++    attention_restore_scope_negative_cases(f.device);
++    f.command.origin=f.device->attention_origin;
++    /* The actual old connection is closed by session_cleanup above. Retire its
++     * sequential private receiver before accepting the separate control peer. */
++    if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}
++    pair_cipher_free(f.cipher);f.cipher=NULL;pair_setup_free(f.pair);f.pair=NULL;
++    evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++    f.pair_messages=0;f.volumes=0;f.teardowns=0;
++    f.device->attention_deadline.tv_sec-=5;
++    attention_timer_cb(-1,EV_TIMEOUT,f.device); /* Existing one-shot expiry owner. */
++    struct output_attention_state after;
++    assert(outputs_attention_state_get(1,&after)==0);
++    int accepted=outputs_attention_result_get(after.process,after.last_release_operation,&restore_result);
++    fprintf(stderr,"ACTUAL_START_ATTENTION_RESTORE accepted=%d busy=%d lease=%llu restoring=%d recovery_idle=%d last_release=%llu\n",
++      accepted,outputs_transport_busy(),(unsigned long long)after.lease,after.restoring,after.recovery_idle,
++      (unsigned long long)after.last_release_operation);
++    assert(accepted==0 && restore_result.outcome==OUTPUT_ATTENTION_PENDING);
++    assert(f.device->session && ((struct airplay_session *)f.device->session)->recovery_only
++      && !attention_restore_scope && !attention_emission_current(f.device->session,NULL));
++    int unrelated;
++    assert(outputs_device_session_add(1,&unrelated)<0);
++    event_free(f.poll);f.poll=evtimer_new(f.base,attention_start_restore_poll,&f);
++    event_del(f.deadline);
++    assert(f.poll && !evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));
++    event_base_dispatch(f.base);
++    assert(!f.failed);
++    struct output_attention_request successor={.action=OUTPUT_ATTENTION_BEGIN,.cap_volume=5,.ttl_ms=4000};
++    struct output_attention_result next,old_release;
++    assert(outputs_attention_state_get(1,&successor.expected)==0);
++    assert(outputs_attention_result_get(successor.expected.process,successor.expected.last_release_operation,&old_release)==0);
++    outputs_attention_uuid(successor.request_id);
++    assert(outputs_attention_admit(&successor,&next)==0 && next.identity.lease!=old_release.identity.lease);
++    uint64_t next_lease=next.identity.lease;
++    outputs_attention_complete(&old_release,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,old_release.request_cseq);
++    outputs_attention_complete(&duck_result,OUTPUT_ATTENTION_PROTOCOL_ACCEPTED,200,old_release.request_cseq);
++    assert(f.device->attention_lease==next_lease && !f.device->attention_restoring
++      && !f.device->session && outputs_start_source_owned());
++    puts("PASS late original release/duck callbacks cannot clear successor lease or authorize an audio session");
++    goto cleanup;
++  }
+   if(!f.failed && (mode==26 || mode==27 || mode==28)){
+     struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
+       .native_process=r->native_process,.writer_source_epoch=f.start_result.writer_source_epoch,
+@@ -594,6 +2053,7 @@
+     goto cleanup;
+   }
+   if(!f.failed && mode==18){
++    struct output_start_request retired_request=*r;
+     struct output_native_owner same_app=f.start_result.command.committed_native_owner;
+     struct output_transport_identity same_route=f.start_result.route_identity;
+     strcpy(same_app.session_id,"new-phone-context");
+@@ -670,6 +2130,11 @@
+           && !busy && owned && !absent);
+       }
+     }
++    if (getenv("PC70_RELEASE"))
++      {
++	manual_release_actual_case(f.device, &same_app, &writer);
++	goto cleanup;
++      }
+     same_app.alias_revision++;
+     assert(!outputs_start_bound_owner_current(&same_app,&same_route,false));
+     struct output_retirement_request retire={.device_id=1,.move_existing_session=false,
+@@ -687,12 +2152,96 @@
+       && !retirement.retired_witness);
+     pb_timer_stop();
+     pb_session_stop();status_update(PLAY_STOPPED,LISTENER_PLAYER);
++    if(retired_start_reconnect){
++      struct start_slot *retained=start_active;
++      uint64_t revision=f.device->route_revision,selection=transport_selection_revision;
++      struct output_native_owner custody=transport_custody_owner;
++      transport_custody_owner.alias_revision++;
++      assert(!outputs_start_retired_stage_reader() && !start_retired_stage_ready
++        && start_active==retained && outputs_start_gate_closed() && f.device->selected
++        && f.device->route_revision==revision && transport_selection_revision==selection);
++      transport_custody_owner=custody;
++      struct output_device foreign={.id=999,.selected=true,.next=outputs_device_list};
++      struct output_device *saved_devices=outputs_device_list;outputs_device_list=&foreign;
++      assert(!outputs_start_retired_stage_reader() && !start_retired_stage_ready
++        && start_active==retained && foreign.selected && f.device->selected
++        && f.device->route_revision==revision && transport_selection_revision==selection);
++      outputs_device_list=saved_devices;
++      int keeper=open(r->expected_input_path,O_RDONLY|O_NONBLOCK);
++      int reopened=open(r->expected_input_path,O_WRONLY|O_NONBLOCK);
++      assert(keeper>=0 && reopened>=0);
++      assert(!outputs_start_retired_stage_reader() && !start_retired_stage_ready
++        && start_active==retained && f.device->selected && outputs_start_gate_closed());
++      close(reopened);close(keeper);
++      f.device->route_revision++;
++      assert(!outputs_start_retired_stage_reader() && !start_retired_stage_ready
++        && start_active==retained && outputs_start_gate_closed() && f.device->selected);
++      f.device->route_revision=revision;
++    }
+     assert(outputs_start_retired_stage_reader());
+     assert(outputs_retirement_result_get(1,false,retire.retirement_token,&retirement)==0
+       && retirement.ok && retirement.retired_witness && retirement.reader_ready_closed && retirement.contexts_drained
+       && retirement.input_epoch>retirement.admitted_input_epoch && !f.device->session);
++    if(retired_start_reconnect){
++      struct start_slot *historical=start_find(retired_request.token);
++      assert(historical && !start_active);
++      historical->deadline.tv_sec-=8*60*60;historical->pin_expiry.tv_sec-=8*60*60;
++      historical->retirement.deadline.tv_sec-=8*60*60;transport_custody_expiry.tv_sec-=8*60*60;
++      uint64_t generation=transport_input_generation,selection=transport_selection_revision;
++      assert(outputs_retirement_result_get(1,false,retire.retirement_token,&retirement)==0
++        && !retirement.ok && retirement.outcome==OUTPUT_RETIRE_UNKNOWN);
++      assert(!start_active && outputs_start_gate_closed() && start_retired_stage_ready
++        && !outputs_start_source_owned() && !transport_custody_busy()
++        && transport_input_generation==generation && transport_selection_revision==selection);
++    }
+     int replacement=open(r->expected_input_path,O_WRONLY|O_NONBLOCK);
+     assert(replacement>=0);
++    if(retired_start_reconnect){
++      struct output_device *old=f.device,*target=calloc(1,sizeof(*target));
++      struct airplay_extra *target_extra=calloc(1,sizeof(*target_extra));
++      assert(!start_active && !start_scope && !old->selected && !old->session
++        && outputs_start_gate_closed() && !transport_custody_busy());
++      uint64_t replay_floor=transport_custody_revision;
++      assert(replay_floor && outputs_start_cancel(retired_request.token,
++        retired_request.native_reservation_id,&f.start_result)==0
++        && !start_active && outputs_start_gate_closed() && !old->selected
++        && transport_custody_revision==replay_floor);
++      assert(target && target_extra);
++      target->id=2;target->name=strdup("private-reconnect-B");target->type=OUTPUT_TYPE_AIRPLAY;
++      target->type_name="AirPlay";target->advertised=true;target->quality=(struct media_quality){44100,16,2};
++      target->v4_address=strdup("127.0.0.1");target->v4_port=ntohs(address.sin_port);
++      target->extra_device_info=target_extra;target_extra->mdns_name=strdup(target->name);
++      target=outputs_device_add(target,false);assert(target && outputs_device_volume_register(target,65,-1)==0);
++      assert(!old->selected && !old->session && !target->selected && !target->session);
++      if(f.peer){bufferevent_free(f.peer);f.peer=NULL;}pair_cipher_free(f.cipher);f.cipher=NULL;
++      pair_setup_free(f.pair);f.pair=NULL;evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
++      f.device=target;f.volumes=0;f.teardowns=0;
++      cmdbase=commands_base_new(f.base,NULL);assert(cmdbase);
++      struct retired_connect_flow flow={.fixture=&f,.start=-99,.prime=-99,.selection=-99,.hold_before_prime=true};pthread_t thread;
++      speaker_autoselect=true; /* Old priority flags cannot choose A before B's route admission. */
++      event_free(f.poll);f.poll=evtimer_new(f.base,retired_connect_poll,&flow);assert(f.poll);
++      assert(!pthread_create(&thread,NULL,retired_connect_commands,&flow));
++      assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
++      assert(!f.failed && atomic_load(&flow.done) && !pthread_join(thread,NULL));
++      fprintf(stderr,"protected terminal next normal chain: start=%d prime=%d selection=%d old_selected=%d\n",
++        flow.start,flow.prime,flow.selection,old->selected);
++      assert(flow.start>=0 && flow.prime>=0 && flow.selection>=0 && !flow.temporary_busy
++        && !outputs_start_gate_closed() && start_route_clean_absent()
++        && !old->selected && !old->session && target->selected && target->session
++        && target->state==OUTPUT_STATE_CONNECTED && target->volume==35 && f.volumes==1);
++      const void *session=target->session;uint64_t epoch=target->session_epoch,route=target->route_revision;
++      uint64_t generation=transport_input_generation;
++      assert(outputs_start_cancel(retired_request.token,retired_request.native_reservation_id,&f.start_result)==0);
++      assert(outputs_start_complete(&retired_request,&f.start_result)<0);
++      assert(!outputs_start_gate_closed() && !start_active && !outputs_start_source_owned()
++        && target->session==session && target->session_epoch==epoch && target->route_revision==route
++        && transport_input_generation==generation && transport_custody_revision==replay_floor
++        && target->selected && !old->selected && !old->session);
++      assert(outputs_retirement_result_get(1,false,retire.retirement_token,&retirement)==0
++        && !retirement.retired_witness && !retirement.reader_ready_closed && !retirement.gate_closed);
++      puts("PASS same C protected A exact terminal retirement revokes A selection/custody then normal B by-ID/prime35/private AP2; foreign custody/route deny; old cancel/join cannot change B; result never borrows successor witness");
++      event_del(f.deadline);commands_base_free(cmdbase);cmdbase=NULL;close(replacement);goto cleanup;
++    }
+     struct output_start_request successor=*r;
+     successor.token[0]=0;successor.native_reservation_id[0]=0;
+     successor.native_revision=r->native_revision+1;
+@@ -733,14 +2282,30 @@
+     assert(!evtimer_add(f.deadline,&bound) && !evtimer_add(f.poll,&soon));event_base_dispatch(f.base);
+     assert(!f.failed && f.start_result.phase==OUTPUT_START_COMPLETED && f.volumes==1
+       && !outputs_start_gate_closed() && f.device->session);
++    {
++      struct start_slot *current=start_active;const void *session=f.device->session;
++      uint64_t epoch=f.device->session_epoch,route=f.device->route_revision,generation=transport_input_generation;
++      struct output_start_result late;
++      assert(outputs_start_cancel(retired_request.token,retired_request.native_reservation_id,&late)==0);
++      assert(outputs_start_complete(&retired_request,&late)<0);
++      assert(start_active==current && !outputs_start_gate_closed() && outputs_start_source_owned()
++        && f.device->session==session && f.device->session_epoch==epoch && f.device->route_revision==route
++        && transport_input_generation==generation && outputs_start_emission_current(f.device->id,
++          f.device->incarnation,f.device->session_epoch,f.device->session));
++      assert(outputs_retirement_result_get(1,false,retire.retirement_token,&retirement)<0);
++    }
+     start_route_starvation_tick(&f,false);
+     close(replacement);
+     fifo_live_reader_handoff_case(item,r->expected_input_path);
+     puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
+   }
+-  if(!f.failed){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
++  if(!f.failed && !(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))){char byte;if(recv(f.udp_fd,&byte,1,MSG_DONTWAIT)>=0)recovery_wire_fail(&f,"START emitted unwanted test PCM");}
+  cleanup:
+-  if((mode==18 || mode==26 || mode==27 || mode==28) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
++  if(mode==29){
++    event_free(keep_alive_timer);keep_alive_timer=NULL;
++    for(size_t i=0;i<ARRAY_SIZE(output_buffer.data);i++)evbuffer_free(output_buffer.data[i].evbuf);
++  }
++  if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
+   while(airplay_sessions)session_cleanup(airplay_sessions);
+   if(input_ready)input_deinit();
+   if(worker_ready)worker_deinit();
+@@ -752,6 +2317,8 @@
+   pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
+   if(outputs_deferredev)event_free(outputs_deferredev);
+   if(database_ready)db_perthread_deinit();
+-  db_deinit();cfg_free(cfg);unlink(database);unlink(fifo);
++  db_deinit();cfg_free(cfg);unlink(database);
++  if(mode==29 && getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);unlink(metadata);}
++  unlink(fifo);
+   return f.failed;
+ }
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -35,9 +35,50 @@
+   const char *cases[][2]={{"\"boot_id\":","\"unknown\":0,\"boot_id\":"},{"\"pid\":","\"pid\":\"1\",\"pid\":"},{"\"homepod_id\":","\"homepod_id\":\"1\",\"homepod_id\":"},{"\"room_id\":","\"unknown\":0,\"room_id\":"},{"\"native_revision\":\"100\"","\"native_revision\":true"},{"\"start_volume_percent\":35","\"start_volume_percent\":\"35\""}};
+   for(size_t i=0;i<ARRAY_SIZE(cases);i++){changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);}
+   changed=malloc(strlen(raw)+4);sprintf(changed,"%s {}",raw);assert(start_gate_http(&h,"prepare",changed)==HTTP_BADREQUEST);free(changed);
++  /* Exact fresh prepared-transfer request from the field: semantic current
++   * owner was also supplied as its own physical predecessor. Availability
++   * reads do not validate that proposed old/new session+alias lineage. */
++  struct output_start_request self=*r;struct output_start_state available;
++  self.old_owner_present=true;self.old_native_owner=self.intended_native_owner;
++  assert(outputs_start_state_get(&self,&available)==0 && available.ready);
++  json_object_object_add(body,"old_native_owner",start_journal_owner(&r->intended_native_owner));
++  changed=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  fprintf(stderr,"FIXTURE bootstrap semantic self-owner: state ready=true, old session/revision equal intended\n");
++  int bootstrap_status=start_gate_http(&h,"prepare",changed);
++  fprintf(stderr,"FIXTURE semantic self-predecessor prepare HTTP=%d\n",bootstrap_status);
++  assert(bootstrap_status==409);free(changed);
++  json_object_object_add(body,"old_native_owner",NULL);
++  /* Omitting a nonexistent predecessor is not a waiver of current custody,
++   * pending writer, UNKNOWN journal or kernel process identity refusals. */
++  bool saved_live=transport_custody_live;struct output_native_owner saved_owner=transport_custody_owner;
++  struct timespec saved_expiry=transport_custody_expiry;
++  transport_custody_live=true;transport_custody_owner=r->intended_native_owner;
++  assert(clock_gettime(CLOCK_MONOTONIC,&transport_custody_expiry)==0);transport_custody_expiry.tv_sec+=10;
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);
++  transport_custody_live=saved_live;transport_custody_owner=saved_owner;transport_custody_expiry=saved_expiry;
++  bool saved_fault=start_journal_fault;start_journal_fault=true;
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);start_journal_fault=saved_fault;
++  struct start_slot blocked={0},*saved_active=start_active;bool saved_gate=outputs_start_gate_closed();
++  blocked.writer_pending=true;blocked.result.phase=OUTPUT_START_UNKNOWN;
++  start_active=&blocked;atomic_store(&start_gate,true);
++  assert(outputs_start_state_get(r,&available)==0 && !available.ready);
++  assert(start_gate_http(&h,"prepare",raw)==409);
++  start_active=saved_active;atomic_store(&start_gate,saved_gate);
++  json_object_object_add(process,"proc_start_ticks",json_object_new_string("0"));
++  /* Zero is malformed, so use a different positive counter to reach the C owner. */
++  attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks+1);
++  changed=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"prepare",changed)==409);free(changed);
++  attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks);
++  struct stat named;assert(stat(r->expected_input_path,&named)==0 && S_ISFIFO(named.st_mode));
++  assert(start_all_writers_closed(&r->native_process,named.st_dev,named.st_ino)==1);
++  assert(!outputs_start_source_owned() && outputs_start_state_get(r,&available)==0 && available.ready);
+   assert(start_gate_http(&h,"prepare",raw)==HTTP_OK);reply=jparse_obj_from_evbuffer(h.out_body);assert(reply && json_object_object_length(reply)==27);
+   struct start_slot *slot=start_find(jparse_str_from_obj(reply,"token"));assert(slot && slot->result.phase==OUTPUT_START_PREPARED);slot->deadline.tv_sec-=9;
+   json_object_put(reply);free(raw);json_object_put(body);evbuffer_free(h.in_body);evbuffer_free(h.out_body);
++  puts("PASS bootstrap C/state ready then self-predecessor409; absent actual predecessor200 with no configured FIFO writer; live custody, UNKNOWN journal/pending writer and stale process still409");
+   puts("PASS actual START HTTP state5/8 prepare12/common27; nested process/owner duplicate and unknown keys, wrong types/trailing JSON reject before admission");
+ }
+ static int start_gate_unused_volume(struct output_device *d,const struct output_room_volume_result *r)
+@@ -60,15 +101,35 @@
+   strcpy(r.expected_input_path,path);strcpy(r.policy_revision,OUTPUT_START_POLICY);
+   gcry_md_hash_buffer(GCRY_MD_SHA256,hash,path,strlen(path));for(i=0;i<32;i++)sprintf(r.expected_input_path_digest+2*i,"%02x",hash[i]);return r;
+ }
+-static void start_gate_process_successor(const struct output_native_process *process,bool expect_retired)
++static void start_gate_process_successor(const char *path,const struct output_native_process *process,
++    const struct output_native_process *fresh,bool expect_retired,bool replaced_namespace,bool different_boot)
+ {
+   struct output_start_request r={0};struct output_start_result out;struct output_device *d;
+   /* The child begins with the parent's pre-transaction globals, not the former
+    * owner's heap. Reopen actual persistent storage as a separate C process. */
+   sqlite3_close(hdl);assert(sqlite3_open(owner_database_path,&hdl)==SQLITE_OK);
++  struct db_start_guard saved={0},changed={0};
++  if(replaced_namespace){
++    /* Model the persisted certificate from the replaced container, with the
++     * SAME kernel boot and actual dead old PID. A PID absent here proves
++     * nothing about a different PID namespace. No kernel guard is stubbed. */
++    uint64_t device,inode;json_object *payload;
++    assert(start_pid_namespace(&device,&inode) && inode<UINT64_MAX);
++    assert(db_start_guard_load(&saved)==1);changed=saved;
++    payload=json_tokener_parse(saved.payload);assert(payload);
++    json_object_object_add(payload,"native_pid_namespace_inode",json_object_new_uint64(inode+1));
++    if(different_boot){
++      const char *prior="00000000-0000-0000-0000-000000000002";
++      assert(strcmp(prior,saved.boot_id));strcpy(changed.boot_id,prior);
++      json_object_object_add(payload,"native_boot_id",json_object_new_string(prior));
++    }
++    changed.payload=strdup(json_object_to_json_string_ext(payload,JSON_C_TO_STRING_PLAIN));json_object_put(payload);
++    assert(changed.payload && db_start_guard_save(&saved,&changed)==0);
++  }
+   outputs_attention_uuid(outputs_process);start_journal_startup();
++  assert(!start_journal_fault); /* Namespace mismatch is valid evidence, not corrupt storage. */
+   assert(start_startup_quarantine && outputs_start_gate_closed() && outputs_start_busy());
+-  assert(start_old_process_retired()==expect_retired);
++  assert(start_old_process_retired()==(expect_retired && (!replaced_namespace || different_boot)));
+   assert(start_process_current(process)==!expect_retired);
+   d=outputs_device_get(1);assert(d && !d->selected);
+   outputs_device_select(d,-1);assert(!d->selected);
+@@ -77,12 +138,39 @@
+   assert(!outputs_start_metadata_current(outputs_start_metadata_generation()));
+   struct output_transport_identity route;bool busy,start_owned,clean_absent;
+   assert(outputs_transport_bound_state_get(1,&r.intended_native_owner,&route,&busy,&start_owned,&clean_absent)<0);
++  /* A fresh authenticated Native process does not inherit old RAM, token,
++   * owner or playback grant. Test the existing proper START admission only. */
++  r=start_gate_fixture_request(path,fresh);memset(r.offer_id,'e',32);
++  strcpy(r.intended_native_owner.session_id,"fresh-native-session");
++  struct output_start_state state;
++  bool admissible=expect_retired && (!replaced_namespace || different_boot);
++  assert(start_process_current(fresh));
++  assert(outputs_start_state_get(&r,&state)==0 && state.ready==admissible && state.busy==!admissible);
++  if(admissible){
++    assert(outputs_start_prepare(&r,&out)==0);r=out.command;
++    memset(r.native_reservation_id,'d',32);r.pending_native_mutators_drained=true;
++    assert(outputs_start_commit(&r,&out)==0 && out.phase==OUTPUT_START_GATE_DRAINING);
++    assert(!start_startup_quarantine && outputs_start_gate_closed() && start_active->writer_pending);
++    assert(!d->selected && !d->session); /* Admission is not AP2/audio success. */
++    if(different_boot){
++      /* Fixture restoration after successful conditional replacement only. */
++      struct db_start_guard current={0};assert(db_start_guard_load(&current)==1);
++      assert(db_start_guard_save(&current,&saved)==0);free(current.payload);
++    }
++  }else{
++    assert(outputs_start_prepare(&r,&out)<0 && !d->selected && !d->session);
++    if(replaced_namespace){
++      assert(db_start_guard_save(&changed,&saved)==0);
++      puts("PASS replaced PID namespace, same kernel boot, actual dead old PID: valid completed journal remains quarantined; generic and fresh START both deny");
++    }
++  }
++  free(changed.payload);free(saved.payload);
+   sqlite3_close(hdl);hdl=NULL;
+ }
+ static void exact_start_durable_gate(void)
+ {
+   char path[]="/tmp/start-owner-fifo-XXXXXX";int fd=mkstemp(path),status,pipes[2];pid_t native,owner,successor;
+-  struct output_native_process process={0};struct output_device *d;cfg_opt_t library[]={CFG_INT("pipe_sample_rate",44100,0),CFG_INT("pipe_bits_per_sample",16,0),CFG_END()};
++  struct output_native_process process={0},fresh={0};struct output_device *d;cfg_opt_t library[]={CFG_INT("pipe_sample_rate",44100,0),CFG_INT("pipe_bits_per_sample",16,0),CFG_END()};
+   cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
+   assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
+   assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
+@@ -92,6 +180,7 @@
+   assert(pipe(pipes)==0);native=fork();assert(native>=0);
+   if(!native){close(pipes[1]);char byte;(void)read(pipes[0],&byte,1);_exit(0);}
+   close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
++  fresh.pid=getpid();assert(start_boot_id(fresh.boot_id) && start_process_ticks(fresh.pid,&fresh.proc_start_ticks)==1);
+   struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
+   /* Both pre-open unknown and a post-open/completed record must keep a restarted
+    * C owner shut while the distinct, actually live native process remains. */
+@@ -114,11 +203,15 @@
+       sqlite3_close(hdl);_exit(0);
+     }
+     assert(waitpid(owner,&status,0)==owner && WIFEXITED(status) && WEXITSTATUS(status)==0);
+-    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(&process,false);_exit(0);}
++    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
+     assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   }
+   close(pipes[1]);assert(waitpid(native,&status,0)==native && WIFEXITED(status));
+-  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(&process,true);_exit(0);}
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,false);_exit(0);}
++  assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,true);_exit(0);}
++  assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
++  successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,false,false);_exit(0);}
+   assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
+   /* Conditional journal replacement cannot steal a newer transaction. */
+   struct db_start_guard retained={0},wrong={0};assert(db_start_guard_load(&retained)==1);wrong=retained;memset(wrong.token,'f',32);
+@@ -127,5 +220,181 @@
+   assert(db_start_guard_save(&retained,&retained)<0);
+   assert(attention_sql(sqlite3_mprintf("PRAGMA synchronous=FULL"))==0);free(retained.payload);
+   clear_devices();cfg_free(cfg);cfg=NULL;unlink(path);
+-  puts("PASS actual file-backed C owner successor processes: unknown/post-open/completed retain quarantine with live old native process; actual process retirement does not open gate; conditional/FULL journal failures reject");
+-}
++  puts("PASS file-backed C successors: live old Native rejects fresh START; actual old Native death with replaced saved PID namespace retains valid quarantine and denies fresh START; same namespace actual death or different saved kernel boot permits guarded START prepare/commit without generic selection; conditional/FULL journal failures reject");
++}
++
++/* New-purpose upgrade gate: the old parser must quarantine this record, while
++ * the new parser retains pending across owner replacement without grants. */
++static void
++manual_release_journal_upgrade_gate(void)
++{
++  struct transport_release_record r = { 0 };
++  struct output_transport_request *c = &r.result.command;
++  struct db_start_guard saved = { 0 }, next = { 0 };
++  json_object *o, *v;
++  const char *serialized;
++  char *old_payload;
++  bool old_fault = start_journal_fault;
++  assert(db_start_guard_load(&saved) == 1);
++  strcpy(c->token, "11111111111111111111111111111111");
++  strcpy(c->native_prepare_id, "22222222222222222222222222222222");
++  memset(c->args_digest, 'a', 64);
++  c->args_digest[64] = 0;
++  c->native_revision = 1;
++  c->native_owner = burst_owner();
++  c->writer.native_process.pid = getpid();
++  assert(start_boot_id(c->writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &c->writer.native_process.proc_start_ticks) == 1);
++  c->writer.writer_fd = 3;
++  c->writer.source_epoch = 1;
++  c->writer.open_generation = 1;
++  memset(c->writer.input_path_digest, 'b', 64);
++  c->writer.input_path_digest[64] = 0;
++  c->writer.pipe_device = 1;
++  c->writer.pipe_inode = 2;
++  strcpy(r.result.identity.process, outputs_process);
++  strcpy(r.result.identity.input_path_digest, c->writer.input_path_digest);
++  r.result.identity.device_id = 1;
++  r.result.identity.device_incarnation = 1;
++  r.result.identity.session_epoch = 1;
++  r.result.identity.route_revision = 1;
++  r.result.identity.selection_revision = 1;
++  r.result.identity.input_generation = 1;
++  r.result.identity.input_item_id = 1;
++  strcpy(r.input_path, "/tmp/ordinary-native-fifo");
++  r.admitted_epoch = 9;
++  r.retirement = OUTPUT_RETIRE_PENDING;
++  assert(start_pid_namespace(&r.pidns_device, &r.pidns_inode));
++  o = release_journal_json(&r);
++  serialized = json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN);
++  strcpy(next.token, c->token);
++  strcpy(next.c_process, outputs_process);
++  strcpy(next.boot_id, c->writer.native_process.boot_id);
++  next.pid = getpid();
++  next.proc_start_ticks = c->writer.native_process.proc_start_ticks;
++  next.payload = (char *)serialized;
++  assert(db_start_guard_save(&saved, &next) == 0);
++  start_journal_startup();
++  assert(!start_journal_fault && start_startup_quarantine && outputs_start_gate_closed());
++  assert(start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING && !start_route_clean_absent());
++  assert(!start_journal_payload_legacy_valid()); /* Actual prior parser body, no compatibility fiction. */
++  {
++    char *saved = start_journal.payload;
++    json_object *missing = json_tokener_parse(saved);
++    json_object_object_del(missing, "admitted_input_epoch");
++    start_journal.payload = strdup(json_object_to_json_string_ext(missing, JSON_C_TO_STRING_PLAIN));
++    assert(start_journal.payload && !start_journal_payload_valid());
++    free(start_journal.payload);
++    json_object_put(missing);
++    start_journal.payload = saved;
++    assert(start_journal_payload_valid());
++    struct transport_release_record zero = r;
++    zero.admitted_epoch = 0;
++    json_object *present = release_journal_json(&zero);
++    start_journal.payload = strdup(json_object_to_json_string_ext(present, JSON_C_TO_STRING_PLAIN));
++    assert(start_journal.payload && start_journal_payload_valid() && release_record.admitted_epoch == 0);
++    free(start_journal.payload);
++    json_object_put(present);
++    start_journal.payload = saved;
++    assert(start_journal_payload_valid());
++  }
++  json_object_object_add(o, "retirement_outcome", json_object_new_string("retired_known"));
++  json_object_object_add(o, "retired_input_epoch", json_object_new_uint64(10));
++  json_object_object_add(o, "retired_c_process", json_object_new_string(outputs_process));
++  serialized = json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN);
++  next.payload = (char *)serialized;
++  assert(db_start_guard_save(&start_journal, &next) == 0);
++  start_journal_startup();
++  assert(
++      !start_journal_fault && !start_startup_quarantine && start_retired_reopen_pending && outputs_start_gate_closed());
++  assert(!start_journal_payload_legacy_valid()); /* Terminal still requires forward recovery. */
++  old_payload = start_journal.payload;
++  start_journal.payload = strdup(old_payload);
++  assert(start_journal.payload);
++  v = json_object_new_int(1);
++  json_object_object_add(o, "unrecognized", v);
++  free(start_journal.payload);
++  start_journal.payload = strdup(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
++  assert(!start_journal_payload_valid());
++  free(start_journal.payload);
++  start_journal.payload = old_payload;
++  assert(db_start_guard_save(&start_journal, &saved) == 0);
++  start_journal_startup();
++  start_journal_fault = old_fault;
++  free(saved.payload);
++  json_object_put(o);
++  puts("PASS manual release typed journal pending/terminal survive startup; actual legacy parser rejects both; unknown "
++       "fields reject; no START token fabricated");
++}
++
++static void
++manual_release_strict_wire(void)
++{
++  struct output_transport_result r = { 0 };
++  struct output_transport_request *c = &r.command;
++  struct httpd_request h = { 0 };
++  json_object *body = json_object_new_object(), *reply;
++  char *raw;
++  h.in_body = evbuffer_new();
++  h.out_body = evbuffer_new();
++  h.path_parts[2] = "1";
++  h.path_parts[4] = "bound-prepare";
++  c->native_owner = burst_owner();
++  c->native_revision = 1;
++  memset(c->native_prepare_id, 'a', 32);
++  memset(c->args_digest, 'b', 64);
++  c->writer.native_process.pid = getpid();
++  assert(start_boot_id(c->writer.native_process.boot_id));
++  assert(start_process_ticks(getpid(), &c->writer.native_process.proc_start_ticks) == 1);
++  c->writer.open_generation = 1;
++  memset(c->writer.input_path_digest, 'c', 64);
++  c->writer.pipe_device = 1;
++  c->writer.pipe_inode = 2;
++  json_object_object_add(body, "native_prepare_id", json_object_new_string(c->native_prepare_id));
++  json_object_object_add(body, "args_digest", json_object_new_string(c->args_digest));
++  json_object_object_add(body, "action", json_object_new_string("release"));
++  transport_native_binding_json(body, &c->native_owner, c->native_revision);
++  json_object_object_add(body, "purpose", json_object_new_string("manual_release_v1"));
++  json_object_object_add(body, "writer_proof", queue_writer_json(&c->writer));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(raw);
++  evbuffer_add(h.in_body, raw, strlen(raw));
++  assert(jsonapi_reply_transport_write(&h)
++         == 409); /* Valid ordinary source_epoch0/fd0 reaches owner, inert input denies. */
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s{}", raw);
++  assert(jsonapi_reply_transport_write(&h) == HTTP_BADREQUEST);
++  json_object_object_add(body, "purpose", json_object_new_string("queue_occurrence_v1"));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_write(&h) == HTTP_BADREQUEST);
++  json_object_put(body);
++  free(raw);
++  body = json_object_new_object();
++  json_object_object_add(body, "token", json_object_new_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
++  json_object_object_add(body, "native_prepare_id", json_object_new_string(c->native_prepare_id));
++  attention_json_u64(body, "native_revision", 1);
++  json_object_object_add(body, "native_close_done", json_object_new_boolean(false));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == HTTP_BADREQUEST);
++  json_object_object_add(body, "native_close_done", json_object_new_boolean(true));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == 409);
++  json_object_object_add(body, "writer_proof", queue_writer_json(&c->writer));
++  evbuffer_drain(h.in_body, evbuffer_get_length(h.in_body));
++  evbuffer_add_printf(h.in_body, "%s", json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN));
++  assert(jsonapi_reply_transport_release_confirm(&h) == HTTP_BADREQUEST);
++  json_object_put(body);
++  reply = transport_release_json(&r, false, true);
++  assert(json_object_object_length(reply) == 16);
++  json_object_put(reply);
++  reply = transport_release_json(&r, true, true);
++  assert(json_object_object_length(reply) == 15);
++  json_object_put(reply);
++  evbuffer_free(h.in_body);
++  evbuffer_free(h.out_body);
++  puts("PASS manual release strict prepare7/commit9 and confirm4; source_epoch0/fd0 valid, "
++       "wrongpurpose/trailing/CloseDonefalse/proofreplay denied; typedACK16/result15");
++}

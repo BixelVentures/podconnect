@@ -1241,16 +1241,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // roomInfo is the per-room status row returned by /api/rooms (and embedded in the panel).
 type roomInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	HomepodName string `json:"homepod_name"`
-	HomepodID   string `json:"homepod_id"`
-	OwntoneUp   bool   `json:"owntone_up"`
-	Playing     bool   `json:"playing"`
-	Released    bool   `json:"released"`
-	NowPlaying  string `json:"now_playing"`
-	Volume      int    `json:"volume"` // 0..100, or -1 if unknown
-	Alias       bool   `json:"alias"`  // alias-mode: this room is an alias on the primary engine (no own engine)
+	Release     *roomReleaseProjection `json:"release,omitempty"`
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	HomepodName string                 `json:"homepod_name"`
+	HomepodID   string                 `json:"homepod_id"`
+	OwntoneUp   bool                   `json:"owntone_up"`
+	Playing     bool                   `json:"playing"`
+	Released    bool                   `json:"released"`
+	NowPlaying  string                 `json:"now_playing"`
+	Volume      int                    `json:"volume"` // 0..100, or -1 if unknown
+	Alias       bool                   `json:"alias"`  // alias-mode: this room is an alias on the primary engine (no own engine)
 
 	// Per-room settings (UX-1b): the EFFECTIVE values plus whether each is a per-room override (true)
 	// or inherited from the global add-on default (false), so the panel can prefill + label them.
@@ -1391,42 +1392,7 @@ func main() {
 	})
 
 	// /api/rooms — GET full multi-room status (one row per speaker); POST adds a speaker.
-	http.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			roomsItemHandler(w, r)
-			return
-		}
-		out := []roomInfo{}
-		for _, rm := range loadRooms() {
-			isAlias := rm.Idx != 0
-			gl := librespotStatus(rm.Librespot)
-			// A non-primary room has no engine of its own — don't probe it (it'd always read down). It's an
-			// alias advertised on the primary; output is routed there on selection.
-			up := isAlias
-			if !isAlias {
-				_, up = fetchOutputsFrom(rm.OwnTone)
-			}
-			info := roomInfo{
-				ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName, HomepodID: rm.HomepodID,
-				OwntoneUp:  up,
-				Alias:      isAlias,
-				Playing:    gl.Active && !gl.Paused && !gl.Stopped,
-				Released:   fileExists(releasedPath(rm)),
-				NowPlaying: nowPlaying(rm.Librespot),
-				Volume:     -1,
-
-				GraceMinutes:      roomGrace(rm),
-				GraceOverridden:   rm.GraceMinutes != nil,
-				Bitrate:           roomBitrate(rm),
-				BitrateOverridden: rm.Bitrate != "",
-			}
-			if gl.HasVol {
-				info.Volume = gl.VolPct
-			}
-			out = append(out, info)
-		}
-		writeJSON(w, map[string]any{"rooms": out})
-	})
+	http.HandleFunc("/api/rooms", roomsStateHandler)
 
 	// /api/discover — live AirPlay scan (from any running OwnTone) minus HomePods already claimed by
 	// a room, so the "Add speaker" picker only offers free HomePods.
@@ -2190,7 +2156,7 @@ var r0SettingsOpen = false; // keep the primary card's settings drawer open acro
 // --- Multi-room list (/api/rooms) ---
 async function loadRooms() {
   var data;
-  try { data = await (await fetch('api/rooms', {cache:'no-store'})).json(); }
+  try { data = await (await fetch('api/rooms?include_release=1', {cache:'no-store'})).json(); }
   catch (e) { return; }
   var wrap = document.getElementById('rooms');
   wrap.innerHTML = '';
@@ -2304,8 +2270,36 @@ async function loadRooms() {
       };
       var hrel = document.createElement('button'); hrel.className = 'ghost'; hrel.textContent = '⏏ Release for other apps';
       hrel.onclick = async function () {
-        var m = document.getElementById('hpmsg'); if (m) m.textContent = 'Released — the HomePod is free for other AirPlay apps. Press play in Spotify to take it back.';
-        try { await fetch('api/release', { method:'POST' }); } catch (e) {}
+        var m = document.getElementById('hpmsg');
+        var binding = rm.release && rm.release.owner_binding_id;
+        if (!/^[a-f0-9]{64}$/.test(binding || '') || typeof rm.id !== 'string' || !rm.id || !window.crypto || !window.crypto.getRandomValues) {
+          if (m) m.textContent = 'Release is unavailable for this room. Refresh its current state.';
+          return;
+        }
+        var random = new Uint8Array(16); window.crypto.getRandomValues(random);
+        var requestId = Array.from(random, function (v) { return v.toString(16).padStart(2, '0'); }).join('');
+        hrel.disabled = true;
+        if (m) m.textContent = 'Releasing the current connection…';
+        var result = null;
+        var confirmed = false;
+        try {
+          var response = await fetch('api/release', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ room_id:rm.id, expected_binding_id:binding, request_id:requestId }) });
+          result = await response.json();
+          confirmed = response.ok;
+        } catch (e) {}
+        if (!result || result.outcome === 'unknown') {
+          var controller = new AbortController();
+          var deadline = setTimeout(function () { controller.abort(); }, 5000);
+          try {
+            var settled = await fetch('api/release?request_id=' + encodeURIComponent(requestId), { method:'GET', cache:'no-store', signal:controller.signal });
+            result = await settled.json();
+            confirmed = settled.ok;
+          } catch (e) { result = null; }
+          finally { clearTimeout(deadline); }
+        }
+        if (confirmed && result && result.schema === 'podconnect.release_result.v1' && result.ok === true && result.outcome === 'retired' && result.terminal === true && result.contexts_drained === true && result.retry_allowed === false && result.physical_result_verified === false) {
+          if (m) m.textContent = 'Connection released. Press play in Spotify to connect again.';
+        } else if (m) m.textContent = 'Release outcome is unknown or rejected. Refresh the current state; do not repeat this request.';
       };
       hrow.appendChild(hsave); hrow.appendChild(hauto); hrow.appendChild(hrel); sp.appendChild(hrow);
     }
@@ -2498,17 +2492,7 @@ func speakerRescanHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func speakerReleaseHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	// A bare pause or empty-output PUT is not successor-bound. Refuse before
-	// either effect; Native exact-owner retirement remains its existing owner.
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusConflict)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok": false, "error": "release_unsupported", "outcome": "rejected", "retryable": false,
-	})
+	manualReleaseHandler(w, r)
 }
 
 func speakerSelectHandler(w http.ResponseWriter, r *http.Request) {

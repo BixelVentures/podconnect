@@ -49,7 +49,7 @@ func TestRoomReadReleasedOwnerReason(t *testing.T) {
 	roomTransportRPC = func(_ context.Context, _, method, path string, _ []byte) ([]byte, error) {
 		switch {
 		case strings.HasPrefix(path, "/player/room_transport/bound-state?"):
-			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, false})
+			return json.Marshal(receiverTransportState{"podconnect.native_room_transport_state.v2", true, *owner, transportActions, nil, false})
 		case path == "/api/outputs/42/transport/bound-state":
 			return json.Marshal(outputTransportState{"podconnect.output_transport_state.v2", true, *route, false, transportActions, false, false, true})
 		default:

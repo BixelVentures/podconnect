@@ -7,44 +7,45 @@ dependency-free boundary-test discovery root. No provider or speaker proof.
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
 import importlib
-from pathlib import Path
 import sys
-from tempfile import TemporaryDirectory
 import time
-from types import MappingProxyType
 import unittest
+from contextlib import AsyncExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import MappingProxyType
 from unittest.mock import patch
 
 from aiohttp import ClientConnectionError, ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
-from zeroconf import IPVersion
-
 from homeassistant import auth, bootstrap, loader
 from homeassistant.components.api import APIDomainServicesView, APIServicesView
 from homeassistant.components.http import HomeAssistantHTTP
 from homeassistant.components.zeroconf.const import DATA_INSTANCE
 from homeassistant.components.zeroconf.models import HaAsyncZeroconf, HaZeroconf
 from homeassistant.config_entries import (
-    ConfigEntries, ConfigEntry, ConfigEntryState, SIGNAL_CONFIG_ENTRY_CHANGED,
+    SIGNAL_CONFIG_ENTRY_CHANGED,
+    ConfigEntries,
+    ConfigEntry,
+    ConfigEntryState,
 )
 from homeassistant.core import HomeAssistant, SupportsResponse, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry, device_registry, entity_registry
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.config_entry_oauth2_flow import (
     LocalOAuth2Implementation,
     async_register_implementation,
 )
-
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from zeroconf import IPVersion
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 # Normal complete-module imports, not extracted handlers or a fake HA package.
 podconnect = importlib.import_module("custom_components.podconnect")
 spotify_api = importlib.import_module("custom_components.podconnect.api")
-from custom_components.podconnect.const import DOMAIN, SPOTIFY_SCOPES  # noqa: E402
+from custom_components.podconnect.const import DOMAIN, SPOTIFY_SCOPES
 
 
 class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
@@ -84,9 +85,13 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             await self.backend.start_server()
             self.stack.push_async_callback(self.backend.close)
             self.base = str(self.backend.make_url("")).rstrip("/")
-            self.stack.enter_context(patch.object(spotify_api, "SPOTIFY_API", self.base + "/spotify"))
+            self.stack.enter_context(
+                patch.object(spotify_api, "SPOTIFY_API", self.base + "/spotify")
+            )
 
-            (Path(self.temp.name) / "custom_components").symlink_to(ROOT / "custom_components", target_is_directory=True)
+            (Path(self.temp.name) / "custom_components").symlink_to(
+                ROOT / "custom_components", target_is_directory=True
+            )
             self.hass = HomeAssistant(self.temp.name)
             self.hass.config.skip_pip = True
             loader.async_setup(self.hass)
@@ -95,41 +100,66 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             # The network-none fixture has no multicast-capable interface.
             # Keep HA's real shared DNS/client owners, with real unicast zeroconf
             # explicitly bound to loopback; no discovery/service registration.
-            fixture_zc = HaZeroconf(interfaces=["127.0.0.1"], unicast=True, ip_version=IPVersion.V4Only)
+            fixture_zc = HaZeroconf(
+                interfaces=["127.0.0.1"], unicast=True, ip_version=IPVersion.V4Only
+            )
             fixture_async_zc = HaAsyncZeroconf(zc=fixture_zc)
             self.hass.data[DATA_INSTANCE] = fixture_async_zc
             self.stack.push_async_callback(fixture_async_zc.ha_async_close)
             self.hass.auth = await auth.auth_manager_from_config(self.hass, [], [])
             user = await self.hass.auth.async_create_user("Framework fixture")
-            refresh = await self.hass.auth.async_create_refresh_token(user, client_id=self.base)
+            refresh = await self.hass.auth.async_create_refresh_token(
+                user, client_id=self.base
+            )
             access = self.hass.auth.async_create_access_token(refresh)
             self.hass.http = HomeAssistantHTTP(
                 self.hass, None, None, None, ["127.0.0.1"], 0, [], "modern"
             )
             await self.hass.http.async_initialize(
-                cors_origins=[], use_x_forwarded_for=False, login_threshold=-1,
-                is_ban_enabled=False, use_x_frame_options=True,
+                cors_origins=[],
+                use_x_forwarded_for=False,
+                login_threshold=-1,
+                is_ban_enabled=False,
+                use_x_frame_options=True,
             )
             async_register_implementation(
-                self.hass, DOMAIN,
+                self.hass,
+                DOMAIN,
                 LocalOAuth2Implementation(
-                    self.hass, DOMAIN, "fixture", "fixture",
-                    self.base + "/oauth/authorize", self.base + "/oauth/token",
+                    self.hass,
+                    DOMAIN,
+                    "fixture",
+                    "fixture",
+                    self.base + "/oauth/authorize",
+                    self.base + "/oauth/token",
                 ),
             )
             self.entries = []
-            for ident, title in (("account-alpha", "Account Alpha"), ("account-beta", "Account Beta")):
+            for ident, title in (
+                ("account-alpha", "Account Alpha"),
+                ("account-beta", "Account Beta"),
+            ):
                 entry = ConfigEntry(
-                    domain=DOMAIN, entry_id=ident, version=1, minor_version=1,
-                    source="user", title=title, unique_id=ident,
-                    discovery_keys=MappingProxyType({}), subentries_data=None,
+                    domain=DOMAIN,
+                    entry_id=ident,
+                    version=1,
+                    minor_version=1,
+                    source="user",
+                    title=title,
+                    unique_id=ident,
+                    discovery_keys=MappingProxyType({}),
+                    subentries_data=None,
                     pref_disable_polling=True,
                     options={"speakers_url": self.base},
-                    data={"auth_implementation": DOMAIN, "token": {
-                        "access_token": "inert-fixture-only", "refresh_token": "inert-fixture-only",
-                        "expires_at": time.time() + 86400,
-                        "scope": " ".join(SPOTIFY_SCOPES),
-                    }},
+                    data={
+                        "auth_implementation": DOMAIN,
+                        "token": {
+                            "access_token": "inert-fixture-only",
+                            "refresh_token": "inert-fixture-only",
+                            "expires_at": time.time() + 86400,
+                            "scope": " ".join(SPOTIFY_SCOPES),
+                        },
+                    },
                 )
                 await self.hass.config_entries.async_add(entry)
                 self.assertIs(entry.state, ConfigEntryState.LOADED)
@@ -148,9 +178,16 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             )
             await self.client.start_server()
             self.stack.push_async_callback(self.client.close)
-            for module in (podconnect, spotify_api, importlib.import_module("custom_components.podconnect.targets"),
-                           importlib.import_module("custom_components.podconnect.media_player")):
-                self.assertEqual(Path(module.__file__).resolve().parent, ROOT / "custom_components/podconnect")
+            for module in (
+                podconnect,
+                spotify_api,
+                importlib.import_module("custom_components.podconnect.targets"),
+                importlib.import_module("custom_components.podconnect.media_player"),
+            ):
+                self.assertEqual(
+                    Path(module.__file__).resolve().parent,
+                    ROOT / "custom_components/podconnect",
+                )
 
     async def _cleanup(self):
         # Release only fixture-owned barriers before joining actual service work.
@@ -179,9 +216,11 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
                     for entry in hass.config_entries.async_entries(DOMAIN):
                         if entry.state is ConfigEntryState.LOADED:
                             old_data = entry.runtime_data
-                            self.assertTrue(await hass.config_entries.async_unload(entry.entry_id))
+                            self.assertTrue(
+                                await hass.config_entries.async_unload(entry.entry_id)
+                            )
                             self.assertFalse(old_data.active)
-        except BaseException as error:
+        except BaseException as error:  # noqa: BLE001 - retain cancellation while cleanup drains every owner
             retain_failure(error)
 
         # One second 15s phase: a stop failure cannot skip endpoint/zeroconf
@@ -192,17 +231,17 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 hass = getattr(self, "hass", None)
                 if hass is not None:
                     await hass.async_stop(force=True)
-        except BaseException as error:
+        except BaseException as error:  # noqa: BLE001 - retain cancellation while cleanup drains every owner
             retain_failure(error)
         finally:
             try:
                 async with asyncio.timeout_at(deadline):
                     await self.stack.aclose()
-            except BaseException as error:
+            except BaseException as error:  # noqa: BLE001 - retain cancellation while cleanup drains every owner
                 retain_failure(error)
         try:
             self.assertEqual(getattr(self, "loop_errors", []), [])
-        except BaseException as error:
+        except BaseException as error:  # noqa: BLE001 - retain cancellation while cleanup drains every owner
             retain_failure(error)
         if primary is not None:
             raise primary
@@ -214,47 +253,130 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def _backend(self, request):
         body = await request.json() if request.can_read_body else None
-        self.calls.append((request.method, request.path, body, "Authorization" in request.headers))
+        self.calls.append(
+            (request.method, request.path, body, "Authorization" in request.headers)
+        )
         if request.path == self.hold_path or (
-            self.hold_post and request.method == "POST" and request.path == "/api/room-switch"
+            self.hold_post
+            and request.method == "POST"
+            and request.path == "/api/room-switch"
         ):
             self.entered.set()
             await self.release.wait()
         if request.path.startswith("/spotify/"):
-            self.assertEqual(request.headers.get("Authorization"), "Bearer inert-fixture-only")
+            self.assertEqual(
+                request.headers.get("Authorization"), "Bearer inert-fixture-only"
+            )
             if request.method == "PUT" and request.path == "/spotify/me/player":
                 return web.Response(status=204)
             if request.path == "/spotify/me/player/devices":
-                return web.json_response({"devices": [{"id": "spotify-one", "name": "Fixture speaker",
-                    "is_restricted": False, "is_active": True, "volume_percent": 30}]})
+                return web.json_response(
+                    {
+                        "devices": [
+                            {
+                                "id": "spotify-one",
+                                "name": "Fixture speaker",
+                                "is_restricted": False,
+                                "is_active": True,
+                                "volume_percent": 30,
+                            }
+                        ]
+                    }
+                )
             if request.path == "/spotify/me/player":
-                return web.json_response({"is_playing": False, "device": {"id": "spotify-one"},
-                    "item": None, "progress_ms": 0, "repeat_state": "off", "shuffle_state": False})
+                return web.json_response(
+                    {
+                        "is_playing": False,
+                        "device": {"id": "spotify-one"},
+                        "item": None,
+                        "progress_ms": 0,
+                        "repeat_state": "off",
+                        "shuffle_state": False,
+                    }
+                )
         self.assertNotIn("Authorization", request.headers)
-        binding = {"ready": True, "incarnation": "fixture-incarnation", "registry": "fixture-registry", "room_id": "room-alpha"}
+        binding = {
+            "ready": True,
+            "incarnation": "fixture-incarnation",
+            "registry": "fixture-registry",
+            "room_id": "room-alpha",
+        }
+        if request.path == "/api/start-volume/identity":
+            return web.json_response(
+                {"schema": "podconnect.start_identity.v1", "engine_device_id": "a" * 40}
+            )
         if request.path == "/api/room-switch":
             if request.method == "GET":
-                return web.json_response({"binding": binding, "aliases": [
-                    {"id": 1, "room_id": "room-alpha", "name": "Alpha"},
-                    {"id": 2, "room_id": "room-beta", "name": "Beta"}]})
+                return web.json_response(
+                    {
+                        "binding": binding,
+                        **(
+                            {"idle_only": True}
+                            if request.query.get("idle_only") == "1"
+                            else {}
+                        ),
+                        "aliases": [
+                            {"id": 1, "room_id": "room-alpha", "name": "Alpha"},
+                            {"id": 2, "room_id": "room-beta", "name": "Beta"},
+                        ],
+                    }
+                )
             if request.method == "POST":
                 self.move_finished.set()
-                return web.json_response({"accepted_local": True, "binding": {**binding, "room_id": body["room_id"]}})
+                return web.json_response(
+                    {
+                        "accepted_local": True,
+                        "binding": {**binding, "room_id": body["room_id"]},
+                        **(
+                            {"idle_only": True} if body.get("idle_only") is True else {}
+                        ),
+                    }
+                )
         if request.path == "/api/rooms":
-            return web.json_response({"rooms": [
-                {"id": "room-alpha", "homepod_id": getattr(self, "alpha_output", "saved-output-alpha")},
-                {"id": "room-beta", "homepod_id": getattr(self, "beta_output", "saved-output-beta")}]})
+            return web.json_response(
+                {
+                    "rooms": [
+                        {
+                            "id": "room-alpha",
+                            "homepod_id": getattr(
+                                self, "alpha_output", "saved-output-alpha"
+                            ),
+                        },
+                        {
+                            "id": "room-beta",
+                            "homepod_id": getattr(
+                                self, "beta_output", "saved-output-beta"
+                            ),
+                        },
+                    ]
+                }
+            )
         if request.path == "/api/state":
-            return web.json_response({"owntone_up": True, "devices": [{"id": "output-one",
-                "name": "Observed fixture", "selected": False, "needs_auth": False}]})
-        self.fail("Unexpected inert backend request: " + request.method + " " + request.path)
+            return web.json_response(
+                {
+                    "owntone_up": True,
+                    "devices": [
+                        {
+                            "id": "output-one",
+                            "name": "Observed fixture",
+                            "selected": False,
+                            "needs_auth": False,
+                        }
+                    ],
+                }
+            )
+        self.fail(
+            "Unexpected inert backend request: " + request.method + " " + request.path
+        )
 
     def _writes(self):
         return [call for call in self.calls if call[0] in ("POST", "PUT", "DELETE")]
 
     async def _service(self, name, data, *, response=True):
         suffix = "?return_response" if response else ""
-        result = await self.client.post("/api/services/podconnect/" + name + suffix, json=data)
+        result = await self.client.post(
+            "/api/services/podconnect/" + name + suffix, json=data
+        )
         if result.status == 200:
             return result.status, await result.json()
         return result.status, await result.text()
@@ -263,26 +385,57 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(15):
             response = await self.client.get("/api/services")
             self.assertEqual(response.status, 200)
-            domain = next(row for row in await response.json() if row["domain"] == DOMAIN)
+            domain = next(
+                row for row in await response.json() if row["domain"] == DOMAIN
+            )
             services = domain["services"]
             for name in ("get_targets", "move_playback"):
                 self.assertEqual(services[name]["response"], {"optional": False})
-                self.assertIs(self.hass.services.supports_response(DOMAIN, name), SupportsResponse.ONLY)
-            self.assertFalse(services["get_targets"]["fields"]["config_entry_id"]["required"])
-            self.assertTrue(services["move_playback"]["fields"]["config_entry_id"]["required"])
+                self.assertIs(
+                    self.hass.services.supports_response(DOMAIN, name),
+                    SupportsResponse.ONLY,
+                )
+            self.assertFalse(
+                services["get_targets"]["fields"]["config_entry_id"]["required"]
+            )
+            self.assertTrue(
+                services["move_playback"]["fields"]["config_entry_id"]["required"]
+            )
             count = len(self.calls)
             status, body = await self._service("get_targets", {})
             self.assertEqual(status, 200)
             self.assertEqual(set(body), {"changed_states", "service_response"})
-            self.assertEqual(body["service_response"], {"accounts": [
-                {"config_entry_id": "account-alpha", "title": "Account Alpha"},
-                {"config_entry_id": "account-beta", "title": "Account Beta"}]})
-            self.assertEqual(len(self.calls), count)  # No implicit account/backend discovery.
-            for data in ({}, {"config_entry_id": "account-alpha", "kind": "configured_alias"},
-                         {"config_entry_id": "account-alpha", "kind": "bogus", "target_id": "room-beta"},
-                         {"config_entry_id": "account-alpha", "kind": "configured_alias", "target_id": "room-beta", "extra": True}):
+            self.assertEqual(
+                body["service_response"],
+                {
+                    "accounts": [
+                        {"config_entry_id": "account-alpha", "title": "Account Alpha"},
+                        {"config_entry_id": "account-beta", "title": "Account Beta"},
+                    ]
+                },
+            )
+            self.assertEqual(
+                len(self.calls), count
+            )  # No implicit account/backend discovery.
+            for data in (
+                {},
+                {"config_entry_id": "account-alpha", "kind": "configured_alias"},
+                {
+                    "config_entry_id": "account-alpha",
+                    "kind": "bogus",
+                    "target_id": "room-beta",
+                },
+                {
+                    "config_entry_id": "account-alpha",
+                    "kind": "configured_alias",
+                    "target_id": "room-beta",
+                    "extra": True,
+                },
+            ):
                 self.assertEqual((await self._service("move_playback", data))[0], 400)
-            self.assertEqual((await self._service("get_targets", {}, response=False))[0], 400)
+            self.assertEqual(
+                (await self._service("get_targets", {}, response=False))[0], 400
+            )
             self.assertEqual(len(self.calls), count)
             self.assertEqual(self._writes(), [])
             # Separate session uses the same actual authentication middleware.
@@ -292,21 +445,46 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_typed_catalog_id_bound_local_move_and_read_only_output(self):
         async with asyncio.timeout(15):
-            status, body = await self._service("get_targets", {"config_entry_id": "account-beta"})
+            status, body = await self._service(
+                "get_targets", {"config_entry_id": "account-beta"}
+            )
             self.assertEqual(status, 200)
             catalog = body["service_response"]
             self.assertEqual(catalog["config_entry_id"], "account-beta")
             self.assertEqual(catalog["errors"], {})
-            targets = {(row["kind"], row["target_id"]): row for row in catalog["targets"]}
-            self.assertEqual(targets[("configured_alias", "room-beta")]["homepod_id"], "saved-output-beta")
+            targets = {
+                (row["kind"], row["target_id"]): row for row in catalog["targets"]
+            }
+            self.assertEqual(
+                targets[("configured_alias", "room-beta")]["homepod_id"],
+                "saved-output-beta",
+            )
             self.assertTrue(targets[("observed_output", "output-one")]["read_only"])
-            data = {"config_entry_id": "account-beta", "kind": "configured_alias", "target_id": "room-beta"}
+            data = {
+                "config_entry_id": "account-beta",
+                "kind": "configured_alias",
+                "target_id": "room-beta",
+            }
             status, body = await self._service("move_playback", data)
             self.assertEqual(status, 200)
             self.assertTrue(body["service_response"]["accepted_local"])
             self.assertNotIn("playing", body["service_response"])
-            self.assertEqual(self._writes(), [("POST", "/api/room-switch", {
-                "room_id": "room-beta", "expected_incarnation": "fixture-incarnation", "expected_registry": "fixture-registry"}, False)])
+            self.assertEqual(
+                self._writes(),
+                [
+                    (
+                        "POST",
+                        "/api/room-switch",
+                        {
+                            "room_id": "room-beta",
+                            "expected_incarnation": "fixture-incarnation",
+                            "expected_registry": "fixture-registry",
+                            "idle_only": True,
+                        },
+                        False,
+                    )
+                ],
+            )
             data["kind"], data["target_id"] = "observed_output", "output-one"
             self.assertNotEqual((await self._service("move_playback", data))[0], 200)
             self.assertEqual(len(self._writes()), 1)
@@ -315,9 +493,18 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, 200)
             self.assertTrue(body["service_response"]["provider_request_accepted"])
             self.assertNotIn("accepted_local", body["service_response"])
-            self.assertEqual(self._writes()[1], ("PUT", "/spotify/me/player", {
-                "device_ids": ["spotify-one"], "play": False}, True))
-            self.assertEqual(len(self._writes()), 2)  # No invented resume/second command.
+            self.assertEqual(
+                self._writes()[1],
+                (
+                    "PUT",
+                    "/spotify/me/player",
+                    {"device_ids": ["spotify-one"], "play": False},
+                    True,
+                ),
+            )
+            self.assertEqual(
+                len(self._writes()), 2
+            )  # No invented resume/second command.
 
     async def test_real_room_options_save_clear_and_stale_alias_replacement(self):
         async with asyncio.timeout(20):
@@ -335,10 +522,14 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(flow["description_placeholders"], {"speaker": "Alpha"})
             # Clearing is absence, not a default that silently reselects the old room.
             self.assertEqual(
-                flow["data_schema"].schema[next(iter(flow["data_schema"].schema))].selector_type,
+                flow["data_schema"]
+                .schema[next(iter(flow["data_schema"].schema))]
+                .selector_type,
                 "area",
             )
-            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
             self.assertEqual(flow["description_placeholders"], {"speaker": "Beta"})
             flow = await self.hass.config_entries.options.async_configure(
                 flow["flow_id"], {"area_id": area.id}
@@ -362,69 +553,102 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 area.id,
             )
             for route in ("get_targets", "get_targets_with_context"):
-                _, reply = await self._service(route, {"config_entry_id": entry.entry_id})
-                self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+                _, reply = await self._service(
+                    route, {"config_entry_id": entry.entry_id}
+                )
+                self.assertFalse(
+                    any("ha_area" in t for t in reply["service_response"]["targets"])
+                )
             _, reply = await self._service(
-                "get_targets_with_room_context", {"config_entry_id": self.entries[0].entry_id}
+                "get_targets_with_room_context",
+                {"config_entry_id": self.entries[0].entry_id},
             )
-            self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+            self.assertFalse(
+                any("ha_area" in t for t in reply["service_response"]["targets"])
+            )
             # Held form cannot bind its old label to a replacement native device.
             flow = await self.hass.config_entries.options.async_init(entry.entry_id)
             flow = await self.hass.config_entries.options.async_configure(
                 flow["flow_id"], {"speakers_url": self.base}
             )
-            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
             self.beta_output = "replacement-beta"
             failed = await self.hass.config_entries.options.async_configure(
                 flow["flow_id"], {"area_id": area.id}
             )
-            self.assertEqual((failed["type"], failed["reason"]), ("abort", "speaker_changed"))
             self.assertEqual(
-                entry.options["room_areas"]["room-beta"]["homepod_id"], "saved-output-beta"
+                (failed["type"], failed["reason"]), ("abort", "speaker_changed")
+            )
+            self.assertEqual(
+                entry.options["room_areas"]["room-beta"]["homepod_id"],
+                "saved-output-beta",
             )
             _, reply = await self._service(
                 "get_targets_with_room_context", {"config_entry_id": entry.entry_id}
             )
-            self.assertFalse(any("ha_area" in t for t in reply["service_response"]["targets"]))
+            self.assertFalse(
+                any("ha_area" in t for t in reply["service_response"]["targets"])
+            )
             self.beta_output = "saved-output-beta"
             flow = await self.hass.config_entries.options.async_init(entry.entry_id)
             flow = await self.hass.config_entries.options.async_configure(
                 flow["flow_id"], {"speakers_url": self.base}
             )
-            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
-            cleared = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
+            cleared = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
             self.assertEqual(cleared["type"], "create_entry")
             self.assertNotIn("room_areas", entry.options)
             self.assertEqual(entry.options["speakers_url"], self.base)
             self.assertEqual(self._writes(), [])
 
-
-    async def test_room_options_deleted_area_and_earlier_target_change_fail_closed(self):
+    async def test_room_options_deleted_area_and_earlier_target_change_fail_closed(
+        self,
+    ):
         async with asyncio.timeout(20):
             areas = area_registry.async_get(self.hass)
             area = areas.async_create("Study")
             entry = self.entries[0]
             original = dict(entry.options)
             flow = await self.hass.config_entries.options.async_init(entry.entry_id)
-            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {"speakers_url": self.base})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"speakers_url": self.base}
+            )
             areas.async_delete(area.id)
-            rejected = await self.hass.config_entries.options.async_configure(flow["flow_id"], {"area_id": area.id})
+            rejected = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {"area_id": area.id}
+            )
             self.assertEqual(rejected["errors"], {"area_id": "area_unavailable"})
             self.assertEqual(dict(entry.options), original)
             # Earlier speaker can change between its form and the final save.
-            flow = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
+            flow = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
             self.alpha_output = "replacement-alpha"
-            rejected = await self.hass.config_entries.options.async_configure(flow["flow_id"], {})
-            self.assertEqual((rejected["type"], rejected["reason"]), ("abort", "speaker_changed"))
+            rejected = await self.hass.config_entries.options.async_configure(
+                flow["flow_id"], {}
+            )
+            self.assertEqual(
+                (rejected["type"], rejected["reason"]), ("abort", "speaker_changed")
+            )
             self.assertEqual(dict(entry.options), original)
             self.assertEqual(self._writes(), [])
 
-    async def test_live_registry_metadata_exact_account_aliases_and_entity_area_override(self):
+    async def test_live_registry_metadata_exact_account_aliases_and_entity_area_override(
+        self,
+    ):
         async with asyncio.timeout(15):
             entities = entity_registry.async_get(self.hass)
             devices = device_registry.async_get(self.hass)
             areas = area_registry.async_get(self.hass)
-            entity_id = entities.async_get_entity_id("media_player", DOMAIN, "account-beta_spotify-one")
+            entity_id = entities.async_get_entity_id(
+                "media_player", DOMAIN, "account-beta_spotify-one"
+            )
             self.assertIsNotNone(entity_id)
             entity = entities.async_get(entity_id)
             device = devices.async_get(entity.device_id)
@@ -432,57 +656,99 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn((DOMAIN, "spotify-one"), device.identifiers)
             room = areas.async_create("Frida's Værelse", aliases={"Fridas værelse"})
             override = areas.async_create("Study", aliases={"Office"})
-            devices.async_update_device(device.id, area_id=room.id, name_by_user="Bedside")
-            entities.async_update_entity(
-                entity_id, name="Speaker", aliases=[entity_registry.COMPUTED_NAME, "Little speaker"]
+            devices.async_update_device(
+                device.id, area_id=room.id, name_by_user="Bedside"
             )
-            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            entities.async_update_entity(
+                entity_id,
+                name="Speaker",
+                aliases=[entity_registry.COMPUTED_NAME, "Little speaker"],
+            )
+            status, body = await self._service(
+                "get_targets_with_context", {"config_entry_id": "account-beta"}
+            )
             self.assertEqual(status, 200)
             rows = body["service_response"]["targets"]
             target = next(row for row in rows if row["kind"] == "spotify_device")
             self.assertEqual(target["target_id"], "spotify-one")
             self.assertEqual(target["name"], "Fixture speaker")
             legacy_status, legacy_body = await self._service(
-                "get_targets", {"config_entry_id": "account-beta"})
+                "get_targets", {"config_entry_id": "account-beta"}
+            )
             self.assertEqual(legacy_status, 200)
-            self.assertEqual(legacy_body["service_response"], {
-                **body["service_response"], "targets": [
-                    {key: value for key, value in row.items() if key != "ha_context"}
-                    for row in rows]})
+            self.assertEqual(
+                legacy_body["service_response"],
+                {
+                    **body["service_response"],
+                    "targets": [
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key != "ha_context"
+                        }
+                        for row in rows
+                    ],
+                },
+            )
             services_page = await self.client.get("/api/services")
-            services = next(row["services"] for row in await services_page.json()
-                if row["domain"] == DOMAIN)
-            self.assertEqual(services["get_targets"]["fields"],
-                services["get_targets_with_context"]["fields"])
+            services = next(
+                row["services"]
+                for row in await services_page.json()
+                if row["domain"] == DOMAIN
+            )
+            self.assertEqual(
+                services["get_targets"]["fields"],
+                services["get_targets_with_context"]["fields"],
+            )
             self.assertEqual(services["get_targets"]["response"], {"optional": False})
-            self.assertEqual(services["get_targets_with_context"]["response"], {"optional": False})
+            self.assertEqual(
+                services["get_targets_with_context"]["response"], {"optional": False}
+            )
             context = target["ha_context"]
             self.assertEqual(context["entity_id"], entity_id)
             self.assertEqual(
                 context["name"],
-                entity_registry.async_get_full_entity_name(self.hass, entities.async_get(entity_id)),
+                entity_registry.async_get_full_entity_name(
+                    self.hass, entities.async_get(entity_id)
+                ),
             )
             self.assertEqual(context["aliases"], [context["name"], "Little speaker"])
             self.assertEqual(
                 context["area"],
-                {"id": room.id, "name": "Frida's Værelse", "aliases": ["Fridas værelse"]},
+                {
+                    "id": room.id,
+                    "name": "Frida's Værelse",
+                    "aliases": ["Fridas værelse"],
+                },
             )
             self.assertTrue(
-                all("ha_context" not in row for row in rows if row["kind"] != "spotify_device")
+                all(
+                    "ha_context" not in row
+                    for row in rows
+                    if row["kind"] != "spotify_device"
+                )
             )
             # The other entry has the same provider device ID, but a different HA owner.
-            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-alpha"})
+            status, body = await self._service(
+                "get_targets_with_context", {"config_entry_id": "account-alpha"}
+            )
             self.assertEqual(status, 200)
             other = next(
-                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+                row
+                for row in body["service_response"]["targets"]
+                if row["kind"] == "spotify_device"
             )
             self.assertNotEqual(other["ha_context"]["entity_id"], entity_id)
             self.assertIsNone(other["ha_context"]["area"])
             entities.async_update_entity(entity_id, area_id=override.id)
-            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            status, body = await self._service(
+                "get_targets_with_context", {"config_entry_id": "account-beta"}
+            )
             self.assertEqual(status, 200)
             target = next(
-                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+                row
+                for row in body["service_response"]["targets"]
+                if row["kind"] == "spotify_device"
             )
             self.assertEqual(
                 target["ha_context"]["area"],
@@ -491,10 +757,14 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             entities.async_update_entity(
                 entity_id, disabled_by=entity_registry.RegistryEntryDisabler.USER
             )
-            status, body = await self._service("get_targets_with_context", {"config_entry_id": "account-beta"})
+            status, body = await self._service(
+                "get_targets_with_context", {"config_entry_id": "account-beta"}
+            )
             self.assertEqual(status, 200)
             target = next(
-                row for row in body["service_response"]["targets"] if row["kind"] == "spotify_device"
+                row
+                for row in body["service_response"]["targets"]
+                if row["kind"] == "spotify_device"
             )
             self.assertNotIn("ha_context", target)
             self.assertEqual(target["target_id"], "spotify-one")
@@ -504,35 +774,61 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(15):
             old = self.entries[0].runtime_data
             self.hold_path = "/api/room-switch"
-            call = self._task(self._service("move_playback", {
-                "config_entry_id": "account-alpha", "kind": "configured_alias", "target_id": "room-beta"}))
+            call = self._task(
+                self._service(
+                    "move_playback",
+                    {
+                        "config_entry_id": "account-alpha",
+                        "kind": "configured_alias",
+                        "target_id": "room-beta",
+                    },
+                )
+            )
             await self.entered.wait()
-            self.assertTrue(await self.hass.config_entries.async_unload("account-alpha"))
+            self.assertTrue(
+                await self.hass.config_entries.async_unload("account-alpha")
+            )
             self.assertFalse(old.active)
             self.release.set()
             self.assertNotEqual((await call)[0], 200)
             self.assertEqual(self._writes(), [])
-            accounts = (await self._service("get_targets", {}))[1]["service_response"]["accounts"]
-            self.assertEqual(accounts, [{"config_entry_id": "account-beta", "title": "Account Beta"}])
+            accounts = (await self._service("get_targets", {}))[1]["service_response"][
+                "accounts"
+            ]
+            self.assertEqual(
+                accounts, [{"config_entry_id": "account-beta", "title": "Account Beta"}]
+            )
 
     async def test_real_options_reload_denies_old_call_then_new_owner_moves_once(self):
         async with asyncio.timeout(15):
             entry = self.entries[0]
             old = entry.runtime_data
             self.hold_path = "/api/room-switch"
-            data = {"config_entry_id": entry.entry_id, "kind": "configured_alias", "target_id": "room-beta"}
+            data = {
+                "config_entry_id": entry.entry_id,
+                "kind": "configured_alias",
+                "target_id": "room-beta",
+            }
             call = self._task(self._service("move_playback", data))
             await self.entered.wait()
             replacement = asyncio.Event()
 
             @callback
             def entry_changed(_change, current):
-                if current is entry and current.state is ConfigEntryState.LOADED and current.runtime_data is not old:
+                if (
+                    current is entry
+                    and current.state is ConfigEntryState.LOADED
+                    and current.runtime_data is not old
+                ):
                     replacement.set()
 
-            unsubscribe = async_dispatcher_connect(self.hass, SIGNAL_CONFIG_ENTRY_CHANGED, entry_changed)
+            unsubscribe = async_dispatcher_connect(
+                self.hass, SIGNAL_CONFIG_ENTRY_CHANGED, entry_changed
+            )
             self.stack.callback(unsubscribe)
-            changed = self.hass.config_entries.async_update_entry(entry, options={"speakers_url": self.base + "/", "fixture_revision": 2})
+            changed = self.hass.config_entries.async_update_entry(
+                entry, options={"speakers_url": self.base + "/", "fixture_revision": 2}
+            )
             self.assertTrue(changed)
             # Actual ConfigEntry LOADED publication after the update-listener reload.
             await replacement.wait()
@@ -551,11 +847,18 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(15):
             entry = self.entries[0]
             entity_id = entity_registry.async_get(self.hass).async_get_entity_id(
-                "media_player", DOMAIN, entry.entry_id + "_spotify-one")
+                "media_player", DOMAIN, entry.entry_id + "_spotify-one"
+            )
             self.assertIsNotNone(entity_id)
             self.hold_path = "/spotify/me/player/devices"
-            call = self._task(self.hass.services.async_call(
-                "media_player", "select_source", {"entity_id": entity_id, "source": "Fixture speaker"}, blocking=True))
+            call = self._task(
+                self.hass.services.async_call(
+                    "media_player",
+                    "select_source",
+                    {"entity_id": entity_id, "source": "Fixture speaker"},
+                    blocking=True,
+                )
+            )
             await self.entered.wait()
             self.assertTrue(await self.hass.config_entries.async_unload(entry.entry_id))
             self.release.set()
@@ -567,8 +870,16 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(15):
             # Hold only actual POST, after fresh catalog resolution and service admission.
             self.hold_post = True
-            call = self._task(self.client.post("/api/services/podconnect/move_playback?return_response", json={
-                "config_entry_id": "account-alpha", "kind": "configured_alias", "target_id": "room-beta"}))
+            call = self._task(
+                self.client.post(
+                    "/api/services/podconnect/move_playback?return_response",
+                    json={
+                        "config_entry_id": "account-alpha",
+                        "kind": "configured_alias",
+                        "target_id": "room-beta",
+                    },
+                )
+            )
             await self.entered.wait()
             self.assertEqual(len(self._writes()), 1)
             await self.client.session.close()

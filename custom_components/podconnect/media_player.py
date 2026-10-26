@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import math
+import re
+import time
 
 import voluptuous as vol
 from aiohttp import ClientError
@@ -28,7 +33,7 @@ from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
 from .native_start import start_guards
-from .targets import spotify_transfer_target
+from .targets import configured_alias_targets, select_playback_source
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
 # integration still loads on older cores (it just won't advertise search there).
@@ -65,7 +70,10 @@ _SEARCH_KINDS = {
     "playlists": (MediaClass.PLAYLIST, MediaType.PLAYLIST),
     # Spoken content so "play <a children's bedtime story / audiobook / podcast>" resolves to the
     # actual audiobook/show — not a random same-named song. (getattr keeps it loading on older HA.)
-    "audiobooks": (getattr(MediaClass, "AUDIOBOOK", MediaClass.PODCAST), getattr(MediaType, "AUDIOBOOK", "audiobook")),
+    "audiobooks": (
+        getattr(MediaClass, "AUDIOBOOK", MediaClass.PODCAST),
+        getattr(MediaType, "AUDIOBOOK", "audiobook"),
+    ),
     "shows": (MediaClass.PODCAST, MediaType.PODCAST),
     "episodes": (MediaClass.EPISODE, MediaType.EPISODE),
 }
@@ -95,6 +103,15 @@ async def async_setup_entry(
 ) -> None:
     """Create a media_player for each Connect device, adding new ones as they appear."""
     coordinator = entry.runtime_data.coordinator
+    speakers = entry.runtime_data.speakers
+    if speakers is not None:
+        from .speakers import SpeakersError
+
+        try:
+            async with asyncio.timeout(5):
+                await configured_alias_targets(speakers)
+        except (SpeakersError, ClientError, TimeoutError):
+            pass  # An unavailable catalogue cannot grant a selection.
     known: set[str] = set()
 
     # Taste/history "play something I like" tool for an AI assist (and the UI): play the user's
@@ -117,7 +134,10 @@ async def async_setup_entry(
                 known.add(device_id)
                 new.append(
                     PodConnectMediaPlayer(
-                        coordinator, entry.entry_id, device_id, dev.get("name") or device_id
+                        coordinator,
+                        entry.entry_id,
+                        device_id,
+                        dev.get("name") or device_id,
                     )
                 )
         if new:
@@ -127,7 +147,9 @@ async def async_setup_entry(
     entry.async_on_unload(coordinator.async_add_listener(_discover))
 
 
-class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlayerEntity):
+class PodConnectMediaPlayer(
+    CoordinatorEntity[PodConnectCoordinator], MediaPlayerEntity
+):
     """A Spotify Connect device exposed as a HA media_player."""
 
     _attr_has_entity_name = True
@@ -180,7 +202,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @property
     def _item(self) -> dict | None:
-        return self._playback.get("item") if self._is_active and self._playback else None
+        return (
+            self._playback.get("item") if self._is_active and self._playback else None
+        )
 
     @property
     def state(self) -> MediaPlayerState:
@@ -219,7 +243,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
     @property
     def media_artist(self) -> str | None:
         if self._item and self._item.get("artists"):
-            return ", ".join(a.get("name") for a in self._item["artists"] if a.get("name"))
+            return ", ".join(
+                a.get("name") for a in self._item["artists"] if a.get("name")
+            )
         return None
 
     @property
@@ -246,7 +272,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @property
     def media_position_updated_at(self):
-        return (self.coordinator.data or {}).get("fetched_at") if self._is_active else None
+        return (
+            (self.coordinator.data or {}).get("fetched_at") if self._is_active else None
+        )
 
     @property
     def media_content_id(self) -> str | None:
@@ -262,12 +290,17 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
 
     @property
     def source_list(self) -> list[str]:
-        """All available Connect devices — selecting one moves the session there."""
-        return [
+        """Display the last read alias catalogue; admission always reads it again."""
+        data = getattr(self.coordinator.config_entry, "runtime_data", None)
+        speakers = getattr(data, "speakers", None)
+        aliases = getattr(speakers, "_configured_alias_targets", ())
+        names = [row["name"] for row in aliases]
+        names.extend(
             dev["name"]
             for dev in (self.coordinator.data or {}).get("devices", [])
             if dev.get("name")
-        ]
+        )
+        return list(dict.fromkeys(names))
 
     @property
     def shuffle(self) -> bool | None:
@@ -303,90 +336,593 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
                 raise
             await self.coordinator.async_request_refresh()
             if isinstance(err, SpotifyApiError):
-                raise HomeAssistantError(f"Spotify rejected the command: {err}") from err
+                raise HomeAssistantError(
+                    f"Spotify rejected the command: {err}"
+                ) from err
             raise
         if generation == self._command_generation:
             self._optimistic_poll_floor = self.coordinator.poll_sequence
         await self.coordinator.async_request_refresh()
 
+    async def _native_command(self, action: str, args: dict | None = None) -> bool:
+        """Native HA commands enter the same account-owned Control admission once."""
+        from .commands import CommandRejected
+        from .observations import current
+        from .speakers import SpeakersError
+
+        hass = self.coordinator.hass
+        data = current(hass, self._entry_id)
+        coordinator, api, speakers, commands = (
+            data.coordinator,
+            data.api,
+            data.speakers,
+            data.commands,
+        )
+        entry, target_id = coordinator.config_entry, self._device_id
+        epoch, poll = coordinator.owner_epoch, coordinator.poll_sequence
+        binding_owner = (data.session, data.observations, api._session, api._web)
+
+        def owned(*, same_poll=True):
+            current(hass, self._entry_id, data)
+            if (
+                data.coordinator is not coordinator
+                or coordinator is not self.coordinator
+                or data.api is not api
+                or coordinator.api is not api
+                or data.speakers is not speakers
+                or data.commands is not commands
+                or hass.config_entries.async_get_entry(self._entry_id) is not entry
+                or self._device_id != target_id
+                or any(
+                    now is not expected
+                    for now, expected in zip(
+                        (data.session, data.observations, api._session, api._web),
+                        binding_owner,
+                    )
+                )
+                or coordinator.owner_epoch != epoch
+                or (same_poll and coordinator.poll_sequence != poll)
+            ):
+                raise HomeAssistantError("PodConnect command owner changed")
+
+        owned()
+        if speakers is None:
+            return False
+        try:
+            native_id = await speakers.start_identity()
+            owned()
+            if self._device_id != native_id:
+                return False
+            if commands is None:
+                raise HomeAssistantError("Native command owner unavailable")
+            # Native observations/receipts, not an optimistic HA intent, own state.
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
+            self._optimistic_repeat = None
+            self._optimistic_poll_floor = None
+            observed = data.observations.playback(self._entry_id)
+            if not observed.get("ok"):
+                raise HomeAssistantError("Native playback observation unavailable")
+            actual = await commands.room_transport.playback_output(
+                hass, self._entry_id, observed
+            )
+            owned()
+            output = actual.get("output", {})
+            binding = output.get("binding")
+            if (
+                actual.get("ok") is not True
+                or output.get("status") != "observed"
+                or not isinstance(binding, dict)
+                or binding.get("target_id") != self._device_id
+            ):
+                raise HomeAssistantError("Native route unavailable")
+            room, homepod = binding["native_room_id"], binding["homepod_id"]
+            owner = (
+                commands.room_volume if action == "volume" else commands.room_transport
+            )
+            controls = await owner.read(
+                hass, self._entry_id, self._device_id, room, homepod
+            )
+            owned()
+            identity = [self._entry_id, epoch, controls["native"], controls["route"]]
+            binding_id = hashlib.sha256(
+                json.dumps(
+                    identity, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode()
+            ).hexdigest()
+            if binding_id != binding["binding_id"]:
+                raise HomeAssistantError("Native route changed")
+            sequence = controls["next_command_sequence"]
+            if (
+                controls["status"] != "ready"
+                or action not in controls["actions"]
+                or type(sequence) is not int
+                or controls["owner_epoch"] != epoch
+                or controls["poll_sequence"] != poll
+                or time.time() >= binding["valid_until"]
+            ):
+                raise HomeAssistantError("Native command admission unavailable")
+            request = {
+                "config_entry_id": self._entry_id,
+                "kind": "spotify_device",
+                "target_id": self._device_id,
+                "owner_epoch": controls["owner_epoch"],
+                "expected_poll_sequence": controls["poll_sequence"],
+                "command_sequence": sequence,
+                "request_id": f"{epoch}:{sequence}",
+                "action": action,
+                "args": args or {},
+            }
+            context = {
+                key: controls[key]
+                for key in ("room_id", "homepod_id", "native", "route")
+            }
+            if action == "volume":
+                context["volume_state"] = controls["volume_state"]
+            result = await commands.execute(
+                hass,
+                request,
+                **{"room_volume" if action == "volume" else "room_transport": context},
+            )
+            # The owner may have completed its own refresh; only its poll may advance.
+            owned(same_poll=False)
+            if result.get("ok") is not True or result.get("outcome") != "accepted":
+                raise HomeAssistantError("Native command rejected or outcome unknown")
+            return True
+        except (CommandRejected, SpeakersError) as err:
+            raise HomeAssistantError("Native command unavailable") from err
+
     async def async_media_play(self) -> None:
+        if await self._native_command("resume"):
+            return
         self._optimistic_playing = True
         self.async_write_ha_state()
-        guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
-        await self._send(self.coordinator.api.play(self._device_id, execution_guard=guard, async_execution_guard=native_ready))
+        guard, native_ready = start_guards(
+            self.coordinator.hass,
+            self._entry_id,
+            self.coordinator.config_entry.runtime_data,
+            self._device_id,
+            expected_api=self.coordinator.api,
+        )
+        await self._send(
+            self.coordinator.api.play(
+                self._device_id,
+                execution_guard=guard,
+                async_execution_guard=native_ready,
+            )
+        )
 
     async def async_media_pause(self) -> None:
+        if await self._native_command("pause"):
+            return
         self._optimistic_playing = False
         self.async_write_ha_state()
         await self._send(self.coordinator.api.pause(self._device_id))
 
     async def async_media_next_track(self) -> None:
+        if await self._native_command("next"):
+            return
         await self._send(self.coordinator.api.next(self._device_id))
 
     async def async_media_previous_track(self) -> None:
+        if await self._native_command("previous"):
+            return
         await self._send(self.coordinator.api.previous(self._device_id))
 
     async def async_media_seek(self, position: float) -> None:
-        await self._send(self.coordinator.api.seek(int(position * 1000), self._device_id))
+        if (
+            type(position) not in (int, float)
+            or not math.isfinite(position)
+            or not 0 <= position * 1000 < 2**53
+        ):
+            raise HomeAssistantError("Invalid seek position")
+        position_ms = int(position * 1000)
+        if await self._native_command("seek", {"position_ms": position_ms}):
+            return
+        await self._send(self.coordinator.api.seek(position_ms, self._device_id))
 
     async def async_set_volume_level(self, volume: float) -> None:
-        await self._send(self.coordinator.api.set_volume(round(volume * 100), self._device_id))
+        if await self._native_command("volume", {"percent": round(volume * 100)}):
+            return
+        await self._send(
+            self.coordinator.api.set_volume(round(volume * 100), self._device_id)
+        )
 
     async def async_set_shuffle(self, shuffle: bool) -> None:
+        if type(shuffle) is not bool:
+            raise HomeAssistantError("Invalid shuffle option")
+        if await self._native_command("shuffle", {"enabled": shuffle}):
+            return
         self._optimistic_shuffle = shuffle
         self.async_write_ha_state()
         await self._send(self.coordinator.api.set_shuffle(shuffle, self._device_id))
 
     async def async_set_repeat(self, repeat: RepeatMode) -> None:
+        if repeat not in _HA_TO_SPOTIFY_REPEAT:
+            raise HomeAssistantError("Invalid repeat option")
+        mode = _HA_TO_SPOTIFY_REPEAT[repeat]
+        if await self._native_command("repeat", {"mode": mode}):
+            return
         self._optimistic_repeat = repeat
         self.async_write_ha_state()
-        await self._send(self.coordinator.api.set_repeat(_HA_TO_SPOTIFY_REPEAT.get(repeat, "off"), self._device_id))
+        await self._send(
+            self.coordinator.api.set_repeat(
+                _HA_TO_SPOTIFY_REPEAT.get(repeat, "off"), self._device_id
+            )
+        )
+
+    async def _native_selected_content(
+        self,
+        uri: str,
+        source,
+        *,
+        track_uris=None,
+        shuffle=False,
+        library_source=None,
+        library_account=None,
+        native_identity=None,
+    ) -> bool:
+        """Admit selected tracks or contexts through the exact room-content owner."""
+        from .commands import CommandRejected
+        from .observations import current
+        from .speakers import SpeakersError
+        from .targets import configured_alias_targets
+
+        hass = self.coordinator.hass
+        (
+            data,
+            coordinator,
+            api,
+            speakers,
+            commands,
+            entry,
+            target,
+            epoch,
+            poll,
+            binding_owner,
+        ) = source
+
+        def owned(*, same_poll=True):
+            current(hass, self._entry_id, data)
+            if (
+                data.coordinator is not coordinator
+                or coordinator is not self.coordinator
+                or data.api is not api
+                or coordinator.api is not api
+                or data.speakers is not speakers
+                or data.commands is not commands
+                or hass.config_entries.async_get_entry(self._entry_id) is not entry
+                or (library_account is not None and entry.unique_id != library_account)
+                or self._device_id != target
+                or any(
+                    now is not expected
+                    for now, expected in zip(
+                        (data.session, data.observations, api._session, api._web),
+                        binding_owner,
+                    )
+                )
+                or coordinator.owner_epoch != epoch
+                or (same_poll and coordinator.poll_sequence != poll)
+            ):
+                raise HomeAssistantError("PodConnect content owner changed")
+
+        owned()
+        if speakers is None:
+            return False
+        try:
+            native_id = await speakers.start_identity()
+            owned()
+            if native_identity is not None and native_id != native_identity:
+                raise HomeAssistantError("Native library identity changed")
+            if target != native_id:
+                return False
+            if commands is None:
+                raise HomeAssistantError("Native content owner unavailable")
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
+            self._optimistic_repeat = None
+            self._optimistic_poll_floor = None
+            if track_uris is not None:
+                action = "play_tracks"
+                content_args = {
+                    "track_uris": list(track_uris),
+                    "shuffle": shuffle,
+                    "library_source": library_source,
+                    "max_volume": 100,
+                }
+            elif re.fullmatch(r"spotify:track:[A-Za-z0-9]{22}", uri):
+                action, key = "play_track", "track_uri"
+                content_args = {key: uri, "max_volume": 100}
+            elif re.fullmatch(r"spotify:episode:[A-Za-z0-9]{22}", uri):
+                action, key = "play_episode", "episode_uri"
+                content_args = {key: uri, "max_volume": 100}
+            elif re.fullmatch(
+                r"spotify:(?:playlist|album|artist|show):[A-Za-z0-9]{22}", uri
+            ):
+                action, key = "play_context", "context_uri"
+                content_args = {key: uri, "max_volume": 100}
+            else:
+                raise HomeAssistantError(
+                    "Selected content is unavailable on Native output"
+                )
+
+            def selected(rows):
+                binding = rows[0]["binding"] if rows else None
+                matches = (
+                    [
+                        row
+                        for row in rows
+                        if row["target_id"] == binding["room_id"] and row["homepod_id"]
+                    ]
+                    if binding
+                    else []
+                )
+                if len(matches) != 1:
+                    raise HomeAssistantError("Native room unavailable")
+                return binding, matches[0]["homepod_id"]
+
+            first = selected(await configured_alias_targets(speakers))
+            owned()
+            room, homepod = first[0]["room_id"], first[1]
+            content = commands.room_content
+            controls = await content.read(hass, self._entry_id, target, room, homepod)
+            owned()
+            sequence = controls["next_command_sequence"]
+            if (
+                controls["status"] != "ready"
+                or action not in controls["actions"]
+                or type(sequence) is not int
+                or controls["owner_epoch"] != epoch
+                or controls["poll_sequence"] != poll
+                or controls["room_id"] != room
+                or controls["homepod_id"] != homepod
+            ):
+                raise HomeAssistantError("Native content admission unavailable")
+            request = {
+                "config_entry_id": self._entry_id,
+                "kind": "spotify_device",
+                "target_id": target,
+                "room_id": room,
+                "homepod_id": homepod,
+                "owner_epoch": epoch,
+                "expected_poll_sequence": poll,
+                "command_sequence": sequence,
+                "request_id": f"{epoch}:{sequence}",
+                "action": action,
+                "args": content_args,
+                "start_offer": controls["start_offer"],
+            }
+            prepared = False
+            started = False
+            try:
+                preparation = await content.prepare(hass, request)
+                prepared = preparation.get("state") == "staged"
+                owned(same_poll=False)
+                if not prepared:
+                    raise HomeAssistantError("Native content preparation unavailable")
+                if selected(await configured_alias_targets(speakers)) != first:
+                    raise HomeAssistantError("Native room changed")
+                owned(same_poll=False)
+                started = True
+                receipt = await content.start(hass, request)
+                owned(same_poll=False)
+                if (
+                    receipt.get("ok") is not True
+                    or receipt.get("outcome") != "accepted"
+                ):
+                    raise HomeAssistantError(
+                        "Native content rejected or outcome unknown"
+                    )
+                return True
+            finally:
+                if prepared and not started:
+                    await content.cancel(
+                        hass,
+                        {
+                            "config_entry_id": self._entry_id,
+                            "owner_epoch": epoch,
+                            "command_sequence": sequence,
+                            "request_id": request["request_id"],
+                            "offer_id": request["start_offer"]["offer_id"],
+                            "binding_id": request["start_offer"]["binding_id"],
+                        },
+                    )
+        except (CommandRejected, SpeakersError) as err:
+            raise HomeAssistantError("Native content unavailable") from err
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Play a Spotify URI — or, when media_id is NOT a spotify: URI, treat it as a free-text
         QUERY and play the top-ranked match. The query path makes the *standard*
         media_player.play_media service "play by name" in one call (so a generic caller — HA Assist,
         a voice agent, a script — can do play_media music "Dua Lipa" without a separate search step)."""
+        from .observations import current
+
+        data = current(self.coordinator.hass, self._entry_id)
+        coordinator = self.coordinator
+        source = (
+            data,
+            coordinator,
+            self.coordinator.api,
+            data.speakers,
+            data.commands,
+            self.coordinator.config_entry,
+            self._device_id,
+            coordinator.owner_epoch,
+            coordinator.poll_sequence,
+            (data.session, data.observations, data.api._session, data.api._web),
+        )
         if not media_id.startswith("spotify:"):
             query = media_id
             media_id = await self._search_top_uri(query, media_type) or ""
             if not media_id:
                 raise HomeAssistantError(f"No Spotify match for {query!r}")
+        if await self._native_selected_content(media_id, source):
+            return
         if media_id.startswith(("spotify:track:", "spotify:episode:")):
-            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
-            await self._send(self.coordinator.api.play(self._device_id, uris=[media_id], execution_guard=guard, async_execution_guard=native_ready))
+            guard, native_ready = start_guards(
+                self.coordinator.hass,
+                self._entry_id,
+                self.coordinator.config_entry.runtime_data,
+                self._device_id,
+                expected_api=self.coordinator.api,
+            )
+            await self._send(
+                self.coordinator.api.play(
+                    self._device_id,
+                    uris=[media_id],
+                    execution_guard=guard,
+                    async_execution_guard=native_ready,
+                )
+            )
         else:
-            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
-            await self._send(self.coordinator.api.play(self._device_id, context_uri=media_id, execution_guard=guard, async_execution_guard=native_ready))
+            guard, native_ready = start_guards(
+                self.coordinator.hass,
+                self._entry_id,
+                self.coordinator.config_entry.runtime_data,
+                self._device_id,
+                expected_api=self.coordinator.api,
+            )
+            await self._send(
+                self.coordinator.api.play(
+                    self._device_id,
+                    context_uri=media_id,
+                    execution_guard=guard,
+                    async_execution_guard=native_ready,
+                )
+            )
 
     async def async_play_from_library(self, source: str, shuffle: bool = False) -> None:
         """Play one of the user's own collections on THIS device — the AI tool for "play something
         I like" / "play my recent". source: liked | top_tracks | recent. Fetches the tracks and
         plays their URIs (up to 50); optional shuffle."""
-        api = self.coordinator.api
+        from .observations import current
+        from .room_content import canonical_list_track
+        from .speakers import SpeakersError
+
+        if source not in {"liked", "top_tracks", "recent"} or type(shuffle) is not bool:
+            raise HomeAssistantError("Invalid library selection")
+        hass = self.coordinator.hass
+        data = current(hass, self._entry_id)
+        coordinator, api = self.coordinator, self.coordinator.api
+        entry, target = coordinator.config_entry, self._device_id
+        account, epoch, poll = (
+            entry.unique_id,
+            coordinator.owner_epoch,
+            coordinator.poll_sequence,
+        )
+        speakers, commands = data.speakers, data.commands
+        binding_owner = (data.session, data.observations, api._session, api._web)
+        captured = (
+            data,
+            coordinator,
+            api,
+            speakers,
+            commands,
+            entry,
+            target,
+            epoch,
+            poll,
+            binding_owner,
+        )
+
+        def owned():
+            current(hass, self._entry_id, data)
+            if (
+                data.coordinator is not coordinator
+                or self.coordinator is not coordinator
+                or data.api is not api
+                or coordinator.api is not api
+                or data.speakers is not speakers
+                or data.commands is not commands
+                or hass.config_entries.async_get_entry(self._entry_id) is not entry
+                or entry.unique_id != account
+                or not account
+                or self._device_id != target
+                or coordinator.owner_epoch != epoch
+                or any(
+                    now is not before
+                    for now, before in zip(
+                        (data.session, data.observations, api._session, api._web),
+                        binding_owner,
+                    )
+                )
+            ):
+                raise HomeAssistantError("PodConnect library owner changed")
+
+        owned()
+        native_identity = None
+        if speakers is not None:
+            try:
+                native_identity = await speakers.start_identity()
+            except SpeakersError as err:
+                raise HomeAssistantError("Native library identity unavailable") from err
+            owned()
         try:
             if source == "liked":
                 items = await api.saved_tracks()
             elif source == "top_tracks":
                 items = await api.top_tracks()
-            else:  # "recent"
+            else:
                 items = await api.recently_played()
         except SpotifyApiError as err:
-            raise HomeAssistantError(f"Could not read Spotify library: {err}") from err
-        uris = [it["uri"] for it in items if it and it.get("uri")][:50]
-        if not uris:
-            raise HomeAssistantError(f"No playable tracks in Spotify library {source!r}")
+            raise HomeAssistantError("Could not read Spotify library") from err
+        owned()
+        if not isinstance(items, list) or not items:
+            raise HomeAssistantError("No playable tracks in Spotify library")
+        selected = items[:50]
+        if any(
+            not isinstance(row, dict) or not canonical_list_track(row.get("uri"))
+            for row in selected
+        ):
+            raise HomeAssistantError("Invalid Spotify library tracks")
+        uris = [row["uri"] for row in selected]
+        # The library response is metadata, not an execution offer. A routine
+        # poll may advance while reading it; admit once against the current
+        # observation only after the original account/owner checks above.
+        captured = (*captured[:8], coordinator.poll_sequence, binding_owner)
+        if await self._native_selected_content(
+            "",
+            captured,
+            track_uris=uris,
+            shuffle=shuffle,
+            library_source=source,
+            library_account=account,
+            native_identity=native_identity,
+        ):
+            return
+        owned()
         if shuffle:
-            await self._send(self.coordinator.api.set_shuffle(True, self._device_id))
-        guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, self.coordinator.config_entry.runtime_data, self._device_id, expected_api=self.coordinator.api)
-        await self._send(self.coordinator.api.play(self._device_id, uris=uris, execution_guard=guard, async_execution_guard=native_ready))
+            await self._send(api.set_shuffle(True, target))
+            owned()
+        guard, native_ready = start_guards(
+            self.coordinator.hass,
+            self._entry_id,
+            self.coordinator.config_entry.runtime_data,
+            self._device_id,
+            expected_api=self.coordinator.api,
+        )
+        await self._send(
+            api.play(
+                target,
+                uris=uris,
+                execution_guard=guard,
+                async_execution_guard=native_ready,
+            )
+        )
 
     async def _search_top_uri(self, query: str, media_type: str | None) -> str | None:
         """Use the first playable Spotify search result, preserving provider order."""
         type_map = {
-            "track": "track", "music": "track", "song": "track",
-            "artist": "artist", "album": "album", "playlist": "playlist",
-            "show": "show", "podcast": "show", "episode": "episode", "audiobook": "audiobook",
+            "track": "track",
+            "music": "track",
+            "song": "track",
+            "artist": "artist",
+            "album": "album",
+            "playlist": "playlist",
+            "show": "show",
+            "podcast": "show",
+            "episode": "episode",
+            "audiobook": "audiobook",
         }
         want = type_map.get((media_type or "").lower(), "track")
         try:
@@ -399,32 +935,25 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         return None
 
     async def async_select_source(self, source: str) -> None:
-        """ "Connect to a device": transfer the session to `source`, keeping play/pause state."""
-        entry = self.coordinator.config_entry
-        data = getattr(entry, "runtime_data", None)
-        if (
-            data is None
-            or not data.active
-            or data.coordinator is not self.coordinator
-            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
-        ):
-            raise HomeAssistantError("PodConnect account entry unavailable")
-        try:
-            device_id, is_playing = await spotify_transfer_target(self.coordinator.api, name=source)
-        except (SpotifyApiError, ClientError, TimeoutError) as err:
-            raise HomeAssistantError("Spotify target lookup failed") from err
-        if (
-            getattr(entry, "runtime_data", None) is not data
-            or not data.active
-            or data.coordinator is not self.coordinator
-            or self.coordinator.hass.config_entries.async_get_entry(entry.entry_id) is not entry
-        ):
-            raise HomeAssistantError("PodConnect account entry unavailable")
-        if is_playing:
-            guard, native_ready = start_guards(self.coordinator.hass, self._entry_id, data, device_id, expected_api=self.coordinator.api)
-            await self._send(self.coordinator.api.transfer(device_id, play=True, execution_guard=guard, async_execution_guard=native_ready))
-        else:
-            await self._send(self.coordinator.api.transfer(device_id, play=False))
+        """The entity and typed target service share the same Native admission."""
+        coordinator, target = self.coordinator, self._device_id
+
+        def entity_guard():
+            if self.coordinator is not coordinator or self._device_id != target:
+                raise HomeAssistantError("PodConnect selection entity changed")
+
+        result = await select_playback_source(
+            self.coordinator.hass,
+            self._entry_id,
+            name=source,
+            entity_guard=entity_guard,
+            send=self._send,
+        )
+        if result["kind"] == "configured_alias":
+            self._optimistic_playing = None
+            self._optimistic_shuffle = None
+            self._optimistic_repeat = None
+            self._optimistic_poll_floor = None
 
     async def _browse_category(self, category: str) -> list[BrowseMedia]:
         """Fetch one profile category as playable leaves."""
@@ -449,7 +978,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
                 return []
         except SpotifyApiError as err:
             # 403 here usually means the token predates the profile scopes — re-auth needed.
-            LOGGER.warning("Could not browse '%s' (re-auth may be needed): %s", category, err)
+            LOGGER.warning(
+                "Could not browse '%s' (re-auth may be needed): %s", category, err
+            )
             return []
         return [self._result_item(it, *kind) for it in items if it and it.get("uri")]
 
@@ -481,9 +1012,12 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
                 children_media_class=MediaClass.DIRECTORY,
             )
 
-        title = next((t for c, t, _ in _BROWSE_CATEGORIES if c == media_content_id), "Spotify")
+        title = next(
+            (t for c, t, _ in _BROWSE_CATEGORIES if c == media_content_id), "Spotify"
+        )
         child_class = next(
-            (cc for c, _, cc in _BROWSE_CATEGORIES if c == media_content_id), MediaClass.TRACK
+            (cc for c, _, cc in _BROWSE_CATEGORIES if c == media_content_id),
+            MediaClass.TRACK,
         )
         return BrowseMedia(
             title=title,
@@ -497,7 +1031,9 @@ class PodConnectMediaPlayer(CoordinatorEntity[PodConnectCoordinator], MediaPlaye
         )
 
     @staticmethod
-    def _result_item(item: dict, media_class: MediaClass, media_type: MediaType) -> BrowseMedia:
+    def _result_item(
+        item: dict, media_class: MediaClass, media_type: MediaType
+    ) -> BrowseMedia:
         """Map one Spotify object to a playable BrowseMedia (its URI is the play target)."""
         title = item.get("name") or "?"
         if media_type == MediaType.TRACK and item.get("artists"):

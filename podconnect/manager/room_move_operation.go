@@ -183,8 +183,13 @@ func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
 func roomMoveResultHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	offer, binding := q.Get("offer_id"), q.Get("binding_id")
-	if r.Method != http.MethodGet || len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
+	current := len(q) == 3 && len(q["include_current"]) == 1 && q.Get("include_current") == "1"
+	if r.Method != http.MethodGet || (!current && len(q) != 2) || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
 		http.Error(w, "arguments", 400)
+		return
+	}
+	if current {
+		roomCurrentResult(w, r, "move", offer, binding)
 		return
 	}
 	roomMoveOperation(w, r, "result", offer, binding)

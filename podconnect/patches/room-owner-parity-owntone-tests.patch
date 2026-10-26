@@ -1,0 +1,822 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -938,13 +938,13 @@
+ static void recovery_wire_accept(struct evconnlistener *listener,evutil_socket_t fd,struct sockaddr *remote,int length,void *arg)
+ {
+   struct recovery_wire_fixture *f=arg;struct sockaddr_in *address=(struct sockaddr_in *)remote;(void)listener;
+-  if (f->peer && f->mode == 29 && getenv("PC70_RELEASE_COMPOSE") && f->pc70_peer_sessions == 1)
++  if (f->peer && f->mode == 29 && (getenv("PC70_RELEASE_COMPOSE") || getenv("PC55_SEEK_MOVE")) && f->pc70_peer_sessions == 1)
+     {
+       bool next = getenv("PC70_RELEASE_NEXT_START") && release_operation.terminal && start_active
+                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE
+                   && strcmp(start_active->result.command.token, release_operation.predecessor.completed_token);
+       struct output_device *old = outputs_device_get(1);
+-      bool move = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && start_active
++      bool move = (getenv("PC55_SEEK_MOVE") || (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))) && start_active
+                   && start_active->result.command.move_existing_session && start_active->result.command.device_id == 2
+                   && start_active->result.phase == OUTPUT_START_PREPARING_ROUTE && old && !old->session
+                   && !old->selected;
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -4,6 +4,183 @@
+ #include <signal.h>
+ #include <poll.h>
+ #include "../src/input.h"
++/* Test-only predecessor parser: exact published53 source tree bc2e2895,
++ * outputs_start_journal.inc.c SHA256 35dc4d85e34ee82c3d62f09fb26a8c5c0985b9fa532b5f702fff46d135618073.
++ * Only its function name changes; no production parser or journal writes. */
++static _Thread_local struct db_start_guard rollback53_journal;
++static _Thread_local uint64_t rollback53_pidns_device, rollback53_pidns_inode;
++static _Thread_local enum output_retirement_outcome rollback53_retirement;
++static _Thread_local bool rollback53_reopen_consumed;
++#define start_journal rollback53_journal
++#define start_journal_pidns_device rollback53_pidns_device
++#define start_journal_pidns_inode rollback53_pidns_inode
++#define start_journal_retirement_outcome rollback53_retirement
++#define start_journal_retirement_reopen_consumed rollback53_reopen_consumed
++static bool
++rollback53_payload_valid(void)
++{
++  json_tokener *tok = json_tokener_new();
++  json_object *o, *v;
++  bool valid, move, has_retirement;
++  size_t n;
++  enum output_retirement_outcome retirement = OUTPUT_RETIRE_NONE;
++  uint64_t writer_epoch = 0, writer_fd = 0, pipe_device = 0, pipe_inode = 0, input_item_id = 0, admitted_epoch = 0,
++           input_epoch = 0, deadline_sec = 0, deadline_nsec = 0;
++  bool reader_ready_closed = false, reopen_consumed = false;
++  if (!tok || !start_journal.payload)
++    {
++      if (tok)
++	json_tokener_free(tok);
++      return false;
++    }
++  n = strlen(start_journal.payload);
++  o = json_tokener_parse_ex(tok, start_journal.payload, n);
++  valid = json_tokener_get_error(tok) == json_tokener_success && json_tokener_get_parse_end(tok) == n && o
++          && json_object_is_type(o, json_type_object);
++  move = valid && json_object_object_get_ex(o, "schema", &v) && v && json_object_is_type(v, json_type_string)
++         && !strcmp(json_object_get_string(v), "podconnect.output_move_journal.v1");
++#define JC(key, expected)                                                                                              \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_string)                              \
++      && !strcmp(json_object_get_string(v), expected))
++  valid = valid && (move || JC("schema", "podconnect.output_start_journal.v1")) && JC("token", start_journal.token)
++          && JC("c_process", start_journal.c_process) && JC("native_boot_id", start_journal.boot_id);
++#undef JC
++  valid = valid && json_object_object_get_ex(o, "native_pid", &v) && json_object_is_type(v, json_type_int)
++          && json_object_get_uint64(v) == start_journal.pid && json_object_object_get_ex(o, "native_start_ticks", &v)
++          && json_object_is_type(v, json_type_int) && json_object_get_uint64(v) == start_journal.proc_start_ticks;
++  valid = valid && json_object_object_get_ex(o, "native_pid_namespace_device", &v)
++          && json_object_is_type(v, json_type_int);
++  if (valid)
++    start_journal_pidns_device = json_object_get_uint64(v);
++  valid = valid && json_object_object_get_ex(o, "native_pid_namespace_inode", &v)
++          && json_object_is_type(v, json_type_int) && json_object_get_uint64(v) > 0;
++  if (valid)
++    start_journal_pidns_inode = json_object_get_uint64(v);
++  if (valid && move)
++    valid = json_object_object_get_ex(o, "move_existing_session", &v) && json_object_is_type(v, json_type_boolean)
++            && json_object_get_boolean(v);
++  has_retirement = valid && json_object_object_get_ex(o, "retirement_outcome", &v);
++  if (has_retirement)
++    {
++      const char *outcome;
++      valid = valid && json_object_object_length(o) == 58 && json_object_is_type(v, json_type_string)
++              && !strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), start_journal.payload);
++      outcome = valid ? json_object_get_string(v) : NULL;
++      if (outcome && !strcmp(outcome, "none"))
++	retirement = OUTPUT_RETIRE_NONE;
++      else if (outcome && !strcmp(outcome, "pending"))
++	retirement = OUTPUT_RETIRE_PENDING;
++      else if (outcome && !strcmp(outcome, "retired_known"))
++	retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
++      else if (outcome && !strcmp(outcome, "unknown"))
++	retirement = OUTPUT_RETIRE_UNKNOWN;
++      else
++	valid = false;
++#define JRU(key, dst)                                                                                                  \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_int)                                 \
++      && json_object_get_int64(v) >= 0 && ((dst) = json_object_get_uint64(v), true))
++#define JRB(key, dst)                                                                                                  \
++  (json_object_object_get_ex(o, key, &v) && v && json_object_is_type(v, json_type_boolean)                             \
++      && ((dst) = json_object_get_boolean(v), true))
++      if (valid)
++	{
++	  bool token = json_object_object_get_ex(o, "retirement_token", &v) && v
++	               && json_object_is_type(v, json_type_string)
++	               && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                    : transport_hex(json_object_get_string(v), 32));
++	  bool reservation = json_object_object_get_ex(o, "retirement_reservation", &v) && v
++	                     && json_object_is_type(v, json_type_string)
++	                     && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                          : transport_hex(json_object_get_string(v), 32));
++	  bool incarnation = json_object_object_get_ex(o, "retirement_native_incarnation", &v) && v
++	                     && json_object_is_type(v, json_type_string)
++	                     && (retirement == OUTPUT_RETIRE_NONE ? !*json_object_get_string(v)
++	                                                          : transport_hex(json_object_get_string(v), 32));
++	  valid = token && reservation && incarnation && JRU("retirement_writer_source_epoch", writer_epoch)
++	          && JRU("retirement_writer_fd", writer_fd) && JRU("retirement_pipe_device", pipe_device)
++	          && JRU("retirement_pipe_inode", pipe_inode) && JRU("retirement_input_item_id", input_item_id)
++	          && JRU("retirement_admitted_input_epoch", admitted_epoch)
++	          && JRU("retirement_input_epoch", input_epoch) && JRU("retirement_deadline_sec", deadline_sec)
++	          && JRU("retirement_deadline_nsec", deadline_nsec)
++	          && JRB("retirement_reader_ready_closed", reader_ready_closed)
++	          && JRB("retirement_reopen_consumed", reopen_consumed);
++	}
++#undef JRU
++#undef JRB
++      if (valid)
++	{
++	  if (retirement == OUTPUT_RETIRE_NONE)
++	    valid = !writer_epoch && !writer_fd && !pipe_device && !pipe_inode && !input_item_id && !admitted_epoch
++	            && !input_epoch && !deadline_sec && !deadline_nsec && !reader_ready_closed && !reopen_consumed;
++	  else
++	    {
++	      json_object *phase, *cancelled, *pending, *incarnation, *writer, *writer_fd_saved, *fifo_dev, *fifo_ino,
++	          *purpose, *actual_owner;
++	      valid = writer_epoch && writer_fd <= INT_MAX && pipe_device && pipe_inode && input_item_id
++	              && admitted_epoch && deadline_sec && deadline_nsec < 1000000000
++	              && json_object_object_get_ex(o, "move_existing_session", &purpose)
++	              && json_object_is_type(purpose, json_type_boolean)
++	              && (bool)json_object_get_boolean(purpose) == move
++	              && json_object_object_get_ex(o, "actual_native_owner", &actual_owner) && actual_owner
++	              && json_object_is_type(actual_owner, json_type_object)
++	              && json_object_object_get_ex(o, "phase", &phase) && json_object_is_type(phase, json_type_int)
++	              && json_object_get_int(phase) == OUTPUT_START_COMPLETED
++	              && json_object_object_get_ex(o, "cancelled", &cancelled)
++	              && json_object_is_type(cancelled, json_type_boolean) && !json_object_get_boolean(cancelled)
++	              && json_object_object_get_ex(o, "writer_pending", &pending)
++	              && json_object_is_type(pending, json_type_boolean) && !json_object_get_boolean(pending)
++	              && json_object_object_get_ex(o, "native_incarnation", &incarnation)
++	              && json_object_is_type(incarnation, json_type_string)
++	              && json_object_object_get_ex(o, "retirement_native_incarnation", &v)
++	              && !strcmp(json_object_get_string(incarnation), json_object_get_string(v))
++	              && json_object_object_get_ex(o, "writer_source_epoch", &writer)
++	              && json_object_is_type(writer, json_type_int) && json_object_get_uint64(writer) == writer_epoch
++	              && json_object_object_get_ex(o, "writer_fd", &writer_fd_saved)
++	              && json_object_is_type(writer_fd_saved, json_type_int)
++	              && json_object_get_uint64(writer_fd_saved) == writer_fd
++	              && (json_object_object_get_ex(o, "writer_pipe_device", &fifo_dev)
++	                  && json_object_is_type(fifo_dev, json_type_int)
++	                  && json_object_get_uint64(fifo_dev) == pipe_device
++	                  && json_object_object_get_ex(o, "writer_pipe_inode", &fifo_ino)
++	                  && json_object_is_type(fifo_ino, json_type_int)
++	                  && json_object_get_uint64(fifo_ino) == pipe_inode);
++	      if (valid && retirement == OUTPUT_RETIRE_PENDING)
++		valid = input_epoch == admitted_epoch && !reopen_consumed;
++	      if (valid && retirement == OUTPUT_RETIRE_RETIRED_KNOWN)
++		valid = reader_ready_closed && input_epoch > admitted_epoch;
++	      if (valid && retirement == OUTPUT_RETIRE_UNKNOWN)
++		valid = !reopen_consumed;
++	    }
++	}
++    }
++  if (valid)
++    {
++      start_journal_retirement_outcome = retirement;
++      start_journal_retirement_reopen_consumed = reopen_consumed;
++    }
++  if (o)
++    json_object_put(o);
++  json_tokener_free(tok);
++  return valid;
++}
++
++#undef start_journal
++#undef start_journal_pidns_device
++#undef start_journal_pidns_inode
++#undef start_journal_retirement_outcome
++#undef start_journal_retirement_reopen_consumed
++static void
++rollback53_probe(const char *phase, bool expected)
++{
++  if (!getenv("PC70_ROLLBACK_COMPAT"))
++    return;
++  rollback53_journal = start_journal;
++  bool readable = !start_journal.payload || rollback53_payload_valid();
++  fprintf(stderr, "ROLLBACK53 phase=%s legacy_readable=%d expected=%d journal_present=%d\n", phase, readable, expected,
++      start_journal.payload != NULL);
++  assert(readable == expected);
++}
++
+ static int
+ manual_release_recover_process_case(const char *database, bool fenced)
+ {
+@@ -583,6 +760,75 @@
+   puts("PASS paused exact owner survives actual volume ACK, held-volume armed STOP and terminal UNKNOWN without replay; drained USED slot cannot borrow foreign pending context");
+ }
+ 
++/* Seek must keep the exact paused START/MOVE owner while Native changes only
++ * its timeline. Its C ACK admits the command; the later exact Native completion
++ * confirms actual worker pause. UNKNOWN produces no completion at this private
++ * boundary; C cannot infer Native semantic state from admission alone. */
++static void seek_pause_carry_case(struct output_device *device,const struct output_native_owner *owner)
++{
++  struct output_transport_request request={.device_id=device->id,.bound=true,.percent=-1};
++  struct output_transport_result prepared,result;struct output_transport_identity route;
++  uint64_t revision=transport_custody_revision;void *session=device->session;uint64_t epoch=device->session_epoch;
++  assert(transport_identity_get(device->id,&route)==0);
++  for(int mode=0;mode<6;mode++) {
++    assert(transport_pause_owned(device->id));
++    request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++    strcpy(request.action,"seek");snprintf(request.native_prepare_id,sizeof(request.native_prepare_id),"%032" PRIx64,request.native_revision);memset(request.args_digest,'a',64);
++    strcpy(request.expected_input_path_digest,route.input_path_digest);
++    if(mode==1)strcpy(request.native_owner.session_id,"foreign-seek-context");
++    {
++      struct output_transport_request foreign=request;strcpy(foreign.native_owner.room_id,"foreign-room");
++      assert(outputs_transport_prepare(&foreign,&prepared)<0 && transport_pause_owned(device->id));
++    }
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    if(mode==2){device->session_epoch++;assert(!transport_pause_owned(device->id));}
++    if(mode==3)request.args_digest[0]='b';
++    int accepted=outputs_transport_commit(&request,&result);
++    if(mode==2 || mode==3)assert(accepted<0);else assert(accepted==0);
++    if(mode==3) {
++      assert(transport_pause_owned(device->id)); /* Rejected altered arguments cannot clear an older proven pause. */
++      assert(outputs_transport_commit(&request,&result)<0);
++      assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++      continue;
++    }
++    if(mode==0 || mode==4 || mode==5) {
++      assert(transport_pause_retained && transport_pause_revision==request.native_revision
++        && transport_pause_owned(device->id));
++      assert(outputs_device_stop_delayed(device,device_streaming_cb)==1);stop_timer_cb(0,0,device);
++      assert(device->session==session && device->session_epoch==epoch && transport_pause_owned(device->id)
++        && event_pending(device->stop_timer,EV_TIMEOUT,NULL));event_del(device->stop_timer);
++      if(mode==0) {
++        assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0);
++        assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++        assert(transport_pause_owned(device->id));continue;
++      }
++      if(mode==4) {
++        struct output_transport_request newer=request;newer.token[0]=0;newer.native_revision=++revision;
++        snprintf(newer.native_prepare_id,sizeof(newer.native_prepare_id),"%032" PRIx64,newer.native_revision);
++        assert(outputs_transport_prepare(&newer,&prepared)==0);newer=prepared.command;
++        assert(outputs_transport_commit(&newer,&result)==0);
++        assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++        assert(outputs_transport_pause_confirm(device->id,newer.token,newer.native_prepare_id,newer.native_revision)==0);
++        assert(transport_pause_owned(device->id));continue;
++      }
++      /* UNKNOWN/failed worker supplies no private effect confirmation. Actual
++       * PCM restart consumes retained custody; a C admission is not a pause ACK. */
++      outputs_stop_delayed_cancel();
++    }
++    if(mode==2)device->session_epoch--;
++    if(mode!=1 && mode!=5)assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)<0);
++    assert(!transport_pause_owned(device->id) && !transport_pause_retained);
++    assert(outputs_transport_commit(&request,&result)<0); /* Altered/old token is already consumed. */
++    request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
++    strcpy(request.action,"pause");snprintf(request.native_prepare_id,sizeof(request.native_prepare_id),"%032" PRIx64,request.native_revision);memset(request.args_digest,'a',64);
++    assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
++    assert(outputs_transport_commit(&request,&result)==0);
++    assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0
++      && transport_pause_owned(device->id));
++  }
++  puts("PASS paused START/MOVE Seek carries armed STOP, exact confirmation, duplicate/old/digest/foreign/route fences; UNKNOWN has no effect confirmation");
++}
++
+ /* Resume admission is not yet PCM: retain only the same already-paused owner. */
+ static void resume_pause_carry_case(struct output_device *device,const struct output_native_owner *owner)
+ {
+@@ -593,7 +839,7 @@
+   for(int mode=0;mode<4;mode++) {
+     assert(transport_pause_owned(device->id));
+     request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
+-    strcpy(request.action,"resume");memset(request.native_prepare_id,'0'+mode,32);memset(request.args_digest,'a',64);
++    strcpy(request.action,"resume");snprintf(request.native_prepare_id,sizeof(request.native_prepare_id),"%032" PRIx64,request.native_revision);memset(request.args_digest,'a',64);
+     strcpy(request.expected_input_path_digest,route.input_path_digest);
+     if(mode==1)strcpy(request.native_owner.session_id,"foreign-resume-context");
+     assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
+@@ -620,7 +866,7 @@
+       }
+       assert(outputs_transport_commit(&request,&result)<0 && !transport_pause_owned(device->id));
+       request.native_owner=*owner;request.native_revision=++revision;request.token[0]=0;
+-      strcpy(request.action,"pause");memset(request.native_prepare_id,'a'+mode,32);
++      strcpy(request.action,"pause");snprintf(request.native_prepare_id,sizeof(request.native_prepare_id),"%032" PRIx64,request.native_revision);
+       assert(outputs_transport_prepare(&request,&prepared)==0);request=prepared.command;
+       assert(outputs_transport_commit(&request,&result)==0);
+       assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,request.native_revision)==0
+@@ -687,6 +933,7 @@
+   assert(outputs_transport_commit(&request,&result)==0);
+   assert(outputs_transport_pause_confirm(device->id,request.token,request.native_prepare_id,46)==0);
+   paused_owner_volume_case(device,owner,47);
++  seek_pause_carry_case(device,owner);
+   resume_pause_carry_case(device,owner);
+   close(*writer);*writer=-1; /* Kernel-observed writer close retires retention. */
+   assert(!transport_pause_owned(device->id) && !transport_pause_retained);
+@@ -935,7 +1182,7 @@
+   struct timespec prior_expiry=transport_custody_expiry;
+   uint64_t prior_generation=transport_admission_generation,prior_revision=transport_custody_revision;
+   bool prior_live=transport_custody_live,prior_lost=transport_custody_lost;
+-  strcpy(request.action,"pause");memset(request.native_prepare_id,'d',32);
++  strcpy(request.action,"seek");memset(request.native_prepare_id,'d',32);
+   memset(request.args_digest,'e',64);request.native_owner=*owner;
+   strcpy(request.expected_input_path_digest,route->input_path_digest);
+   assert(outputs_transport_prepare(&request,&prepared)==0);
+@@ -976,7 +1223,7 @@
+   device->session_epoch=epoch;
+   outputs_stop_delayed_cancel();
+   assert(!transport_pause_retained); /* C playback restart consumes old Pause permission. */
+-  request.native_revision=53;request.native_prepare_id[0]='f';
++  strcpy(request.action,"pause");request.native_revision=53;request.native_prepare_id[0]='f';
+   assert(outputs_transport_prepare(&request,&prepared)==0);
+   strcpy(request.token,prepared.command.token);
+   assert(outputs_transport_commit(&request,&result)==0);
+@@ -995,6 +1242,8 @@
+     assert(transport_pause_owned(1));
+   }
+   paused_owner_volume_case(device,owner,56);
++  seek_pause_carry_case(device,owner);
++  resume_pause_carry_case(device,owner);
+   struct start_slot *prior_start=start_active;
+   struct start_slot next_start=*prior_start;
+   next_start.writer_pending=true; /* Admitted competing START replaces the C owner. */
+@@ -1069,6 +1318,11 @@
+   bool decoded_audio_packet, nonzero_pcm_input;
+   uint16_t last_audio_seq;
+   uint32_t last_audio_timestamp;
++  void *move_session;
++  uint64_t move_session_epoch;
++  struct output_transport_identity move_route;
++  uint8_t old_move_key[AIRPLAY_AUDIO_KEY_LEN];
++  atomic_bool old_move_key_valid,move_terminal_verified;
+ };
+ /* AP2 leaves the 12-byte RTP header clear even though its audio payload is
+  * encrypted. Sync/control share this fixture's UDP port but use other types. */
+@@ -1076,12 +1330,29 @@
+ {
+   return length>12 && (packet[0]>>6)==2 && (packet[1]&0x7f)==AIRPLAY_RTP_PAYLOADTYPE;
+ }
++/* Only the actual pre-MOVE negotiated key may identify a late old-route RTP
++ * packet. Unknown/new-key packets still cross the normal gate/auth checks. */
++static bool native_start_old_move_audio(struct native_start_wire *wire,const unsigned char *packet,ssize_t length)
++{
++  uint8_t nonce[12]={0},decoded[4096];gcry_cipher_hd_t cipher;size_t payload_len;
++  if(!getenv("PC55_SEEK_MOVE") || !atomic_load(&wire->old_move_key_valid) || length<36)return false;
++  payload_len=(size_t)length-12-16-8;
++  if(payload_len>sizeof(decoded))return false;
++  memcpy(nonce+4,packet+length-8,8); /* Actual AP2 packet nonce, same as target auth below. */
++  cipher=chacha_open(wire->old_move_key,AIRPLAY_AUDIO_KEY_LEN);
++  bool old=cipher && !gcry_cipher_setiv(cipher,nonce,sizeof(nonce))
++    && !gcry_cipher_authenticate(cipher,packet+4,8)
++    && !gcry_cipher_decrypt(cipher,decoded,payload_len,packet+12,payload_len)
++    && !gcry_cipher_checktag(cipher,packet+length-8-16,16);
++  chacha_close(cipher);return old;
++}
+ static void native_start_audio_poll(struct native_start_wire *wire)
+ {
+   struct recovery_wire_fixture *f=wire->fixture;
+   unsigned char packet[4096];ssize_t length;
+   while((length=recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT))>0){
+     if(!native_start_audio_rtp(packet,length))continue;
++    if(native_start_old_move_audio(wire,packet,length))continue; /* Never target audio evidence. */
+     bool ordinary
+         = getenv("PC70_RELEASE_COMPOSE")
+           && (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") || !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
+@@ -1135,6 +1406,52 @@
+   if(length<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)
+     recovery_wire_fail(f,"private RTP receive failed");
+ }
++/* Observe the real writer/reader/route before the done ACK releases Native's
++ * deferred worker.Close. This uses the incumbent player command owner; an HTTP
++ * response is never allowed to race the final live-custody observation. */
++static bool native_start_move_terminal_current(struct native_start_wire *wire)
++{
++  struct recovery_wire_fixture *f=wire->fixture;
++    struct output_device *old=outputs_device_get(1);
++    struct airplay_session *session=f->device->session;
++    struct output_transport_identity actual;
++    if(!atomic_load(&wire->completed) || !start_active
++        || start_active->result.phase!=OUTPUT_START_COMPLETED
++        || !start_active->result.command.move_existing_session || !start_active->result.actual_owner_present
++        || f->device->id!=2 || !f->device->selected || !session || session!=wire->move_session
++        || session!=start_active->session || f->device->session_epoch!=wire->move_session_epoch
++        || session->state!=AIRPLAY_STATE_STREAMING || player_state!=PLAY_PLAYING
++        || !old || old->session || old->selected || f->teardowns!=0 || f->volumes!=2 || f->pc70_peer_sessions!=2
++        || !outputs_start_move_source_transition_current()
++        || transport_identity_get(2,&actual)<0 || !transport_identity_equal(&actual,&wire->move_route)
++        || !outputs_start_bound_owner_current(&start_active->result.command.committed_native_owner,&actual,true)
++        || atomic_load(&wire->audio_packets)<1 || !wire->decoded_audio_packet || !wire->nonzero_pcm_input) {
++      struct output_transport_identity observed={0};int route_get=transport_identity_get(2,&observed);
++      bool route_equal=route_get==0 && transport_identity_equal(&observed,&wire->move_route);
++      bool owner_current=start_active && route_get==0
++        && outputs_start_bound_owner_current(&start_active->result.command.committed_native_owner,&observed,true);
++      fprintf(stderr,"PC55_MOVE_TERMINAL completed=%d active=%d phase=%d completed_phase=%d move=%d actualowner=%d device=%" PRIu64 " selected=%d session=%d capturedsession=%d slotsession=%d epoch=%" PRIu64 " capturedepoch=%" PRIu64 " stream=%d streaming_state=%d player=%d playing_state=%d old=%d oldsession=%d oldselected=%d teardowns=%d volumes=%d peers=%d transition=%d routeget=%d routeequal=%d ownercurrent=%d packets=%d decoded=%d pcm=%d\n",
++        atomic_load(&wire->completed),start_active!=NULL,start_active?(int)start_active->result.phase:-1,(int)OUTPUT_START_COMPLETED,
++        start_active?start_active->result.command.move_existing_session:0,start_active?start_active->result.actual_owner_present:0,
++        f->device->id,f->device->selected,session!=NULL,session && session==wire->move_session,
++        session && start_active && session==start_active->session,f->device->session_epoch,wire->move_session_epoch,
++        session?(int)session->state:-1,(int)AIRPLAY_STATE_STREAMING,(int)player_state,(int)PLAY_PLAYING,
++        old!=NULL,old && old->session,old && old->selected,f->teardowns,f->volumes,f->pc70_peer_sessions,
++        outputs_start_move_source_transition_current(),route_get,route_equal,owner_current,
++        atomic_load(&wire->audio_packets),wire->decoded_audio_packet,wire->nonzero_pcm_input);
++      return false;
++    }
++  return true;
++}
++static enum command_state native_start_move_terminal_on_owner(void *arg,int *retval)
++{
++  struct native_start_wire *wire=arg;
++  bool current=native_start_move_terminal_current(wire);
++  atomic_store(&wire->move_terminal_verified,current);
++  *retval=current?0:-1;
++  if(current)fprintf(stderr,"PASS synchronous pre-ACK completed MOVE current writer/reader/session/route + authenticated target PCM observation\n");
++  return COMMAND_END;
++}
+ static void native_start_http(struct evhttp_request *request,void *arg)
+ {
+   struct native_start_wire *wire=arg;
+@@ -1163,8 +1480,10 @@
+     }
+   else if (!strcmp(uri, "/fixture/done"))
+     {
++      int checked=getenv("PC55_SEEK_MOVE")
++        ? commands_exec_sync(cmdbase,native_start_move_terminal_on_owner,NULL,wire):0;
+       evbuffer_add_printf(response, "{}");
+-      evhttp_send_reply(request, 200, "OK", response);
++      evhttp_send_reply(request,checked?409:200,checked?"Final owner rejected":"OK",response);
+       atomic_store(&wire->done, true);
+     }
+   else
+@@ -1183,16 +1502,25 @@
+ 	  atomic_store(&wire->completed, false);
+ 	  atomic_store(&wire->reset_audio, true);
+ 	}
+-      bool move_fixture = getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move");
++      bool move_fixture = getenv("PC55_SEEK_MOVE") || (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"));
+       bool output_id
+           = count > 2 && (!strcmp(actual.path_parts[2], "1") || (move_fixture && !strcmp(actual.path_parts[2], "2")));
+       bool move_request = count > 3 && move_fixture && !strcmp(actual.path_parts[3], "move");
+       if (move_request && count == 5 && !strcmp(actual.path_parts[4], "commit"))
+ 	{
++          if(getenv("PC55_SEEK_MOVE")) {
++            struct output_device *old=outputs_device_get(1);
++            struct airplay_session *session=old ? old->session : NULL;
++            assert(old && old->selected && wire->fixture->device==old && session && session->supports_encryption
++              && session->state==AIRPLAY_STATE_STREAMING && !atomic_load(&wire->old_move_key_valid));
++            memcpy(wire->old_move_key,session->shared_secret,AIRPLAY_AUDIO_KEY_LEN);
++            atomic_store(&wire->old_move_key_valid,true);
++          }
+ 	  wire->fixture->device = outputs_device_get(2);
+ 	  assert(wire->fixture->device);
+ 	  wire->fixture->phase = 2;
+ 	  atomic_store(&wire->reset_audio, true);
++          if(getenv("PC55_SEEK_MOVE"))atomic_store(&wire->completed,false);
+ 	}
+       bool retirement = count >= 6 && !strcmp(actual.path_parts[4], "retire");
+       bool result = retirement ? count == 7 && !strcmp(actual.path_parts[5], "result")
+@@ -1217,6 +1545,8 @@
+       if (count == 5 && !strcmp(actual.path_parts[0], "api") && !strcmp(actual.path_parts[1], "outputs") && output_id
+           && !strcmp(actual.path_parts[3], "transport") && evhttp_request_get_command(request) == EVHTTP_REQ_POST)
+ 	{
++	  if (!strcmp(actual.path_parts[4], "bound-prepare") && getenv("PC70_RELEASE_COMPOSE"))
++	    rollback53_probe("before-new-purpose", true);
+ 	  const char *pattern
+ 	      = !strcmp(actual.path_parts[4], "bound-state")             ? "/transport/bound-state$"
+ 	        : !strcmp(actual.path_parts[4], "bound-pause-confirm")   ? "/transport/bound-pause-confirm$"
+@@ -1242,8 +1572,18 @@
+ 	      status = route->handler(&actual);
+ 	      break;
+ 	    }
+-      if (status == 200 && count == 5 && !strcmp(actual.path_parts[4], "complete"))
++      if (status == 200 && count == 5 && !strcmp(actual.path_parts[4], "complete")) {
++        if(getenv("PC55_SEEK_MOVE") && move_request) {
++          assert(wire->fixture->device->id==2 && start_active
++            && start_active->result.command.move_existing_session);
++          wire->move_session=wire->fixture->device->session;
++          assert(wire->move_session && atomic_load(&wire->old_move_key_valid)
++            && memcmp(((struct airplay_session *)wire->move_session)->shared_secret,wire->old_move_key,AIRPLAY_AUDIO_KEY_LEN));
++          wire->move_session_epoch=wire->fixture->device->session_epoch;
++          wire->move_route=start_active->result.route_identity;
++        }
+ 	atomic_store(&wire->completed, true);
++      }
+       if (status == 200 && retirement && count == 6 && !strcmp(actual.path_parts[5], "complete"))
+ 	atomic_store(&wire->retired, true);
+       fprintf(stderr, "ACTUAL Native→C %s status=%d body=%.*s\n", uri, status, (int)evbuffer_get_length(response),
+@@ -1292,6 +1632,13 @@
+ 	return;
+   }
+   if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
++  if(getenv("PC55_SEEK_MOVE")) {
++    if(!atomic_load(&wire->move_terminal_verified)) {
++      recovery_wire_fail(f,"Native completed MOVE/paused Seek/Resume did not preserve exact live target route and authenticated PCM before done ACK");return;
++    }
++    fprintf(stderr,"PASS actual Native real-FLAC public START -> public MOVE target2 -> paused Seek -> real10sSTOP retention -> Resume -> same completed MOVE AP2session STREAMING/authenticated RTP; old route cleaned/deselected without RTSP TEARDOWN\n");
++    event_base_loopbreak(f->base);return;
++  }
+   if (getenv("PC70_RELEASE_COMPOSE"))
+     {
+       bool ordinary = !strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary");
+@@ -1322,6 +1669,7 @@
+ 	  recovery_wire_fail(f, "actual Native manual release did not durably retire exact C owner");
+ 	  return;
+ 	}
++      rollback53_probe("terminal-release-downgrade-blocked", false);
+       fprintf(stderr,
+           "PASS actual Native+C manual release class=%s durable closed gate→real worker Close→exact FIFO/AP2 "
+           "drain→terminal/reopen staging; no physical audio claim\n",
+@@ -1367,6 +1715,8 @@
+   if(f->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))
+     fprintf(stderr,"PASS private AP2 authenticated ALAC RTP packets=%d from nonzero PCM after completed/volume/open gate\n",
+       atomic_load(&wire->audio_packets));
++  if (getenv("PC70_COLD_RESTART"))
++    rollback53_probe("new-version-fresh-start-forward-recovered", true);
+   fprintf(stderr,"PASS actual Native HTTP→C player owner→FIFO barrier→private AP2→FULL COMPLETED; Native final verdict asserted by driver\n");
+   event_base_loopbreak(f->base);
+ }
+@@ -1375,6 +1725,7 @@
+   struct native_start_wire wire={.fixture=f};struct sockaddr_in address={0};
+   struct timeval soon={0,1000},bound={25,0};socklen_t length=sizeof(address);pthread_t thread;
+   const char *ready_path=getenv("PC_NATIVE_START_READY_FILE");assert(ready_path);
++  assert(!getenv("PC55_SEEK_MOVE") || (!getenv("PC70_RELEASE_COMPOSE") && getenv("PC_REQUIRE_RTP_AUDIO")));
+   wire.http_base=event_base_new();assert(wire.http_base);
+   wire.http=evhttp_new(wire.http_base);assert(wire.http);
+   evhttp_set_gencb(wire.http,native_start_http,&wire);
+@@ -1398,16 +1749,57 @@
+ {
+   struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+   socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};struct airplay_extra *extra;
+-  char database[]="/tmp/start35-wire-db-XXXXXX",fifo[]="/tmp/start35-wire-pipe-XXXXXX";int file=mkstemp(database),placeholder=mkstemp(fifo),writer=-1,reader=-1,item;
++  char database[PATH_MAX] = "/tmp/start35-wire-db-XXXXXX", fifo[PATH_MAX] = "/tmp/start35-wire-pipe-XXXXXX";
++  const char *cold_db = getenv("PC70_COLD_DATABASE"), *cold_fifo = getenv("PC70_COLD_FIFO");
++  bool cold = mode == 29 && cold_db && cold_fifo, cold_restart = cold && getenv("PC70_COLD_RESTART");
++  int file = -1, placeholder = -1, writer = -1, reader = -1, item;
+   bool database_ready=false,input_ready=false,worker_ready=false;pthread_t writer_thread;struct start_fifo_writer pending={0};
+   struct input_fifo_identity fd={0};struct timespec deadline;struct media_file_info mfi={0};struct query_params qp={.type=Q_ITEMS};
+-  assert(file>=0 && placeholder>=0);close(file);close(placeholder);assert(unlink(fifo)==0 && mkfifo(fifo,0600)==0);
++  if (cold)
++    {
++      assert(strlen(cold_db) < sizeof(database) && strlen(cold_fifo) < sizeof(fifo));
++      strcpy(database, cold_db);
++      strcpy(fifo, cold_fifo);
++      if (cold_restart)
++	{
++	  struct stat st;
++	  assert(stat(database, &st) == 0 && S_ISREG(st.st_mode));
++	  assert(stat(fifo, &st) == 0 && S_ISFIFO(st.st_mode));
++	}
++      else
++	{
++	  file = open(database, O_RDWR | O_CREAT | O_EXCL, 0600);
++	  assert(file >= 0);
++	  close(file);
++	  assert(mkfifo(fifo, 0600) == 0);
++	}
++      fprintf(stderr, "PC70_COLD phase=%s C_pid=%ld database=%s fifo=%s\n",
++          cold_restart ? "restart" : "terminal-release", (long)getpid(), database, fifo);
++    }
++  else
++    {
++      file = mkstemp(database);
++      placeholder = mkstemp(fifo);
++      assert(file >= 0 && placeholder >= 0);
++      close(file);
++      close(placeholder);
++      assert(unlink(fifo) == 0 && mkfifo(fifo, 0600) == 0);
++    }
+   assert(evthread_use_pthreads()==0);active_recovery_wire=&f;f.base=event_base_new();assert(f.base);evbase_player=f.base;
+   if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
+   cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
+   cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
+   if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
+-  outputs_attention_uuid(outputs_process);assert(outputs_attention_startup()==0);start_journal_startup();assert(!outputs_start_gate_closed());
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup() == 0);
++  start_journal_startup();
++  if (cold_restart)
++    rollback53_probe("new-version-retained-release", false);
++  if (cold_restart)
++    assert(outputs_start_gate_closed() && !start_journal_fault
++           && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN);
++  else
++    assert(!outputs_start_gate_closed());
+   if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
+   outputs_deferredev=evtimer_new(f.base,deferred_cb,NULL);outputs_buffer_duration_ms=cfg_getint(cfg_getsec(cfg,"general"),"start_buffer_ms");
+   f.plain=evbuffer_new();f.listener=evconnlistener_new_bind(f.base,recovery_wire_accept,&f,LEV_OPT_CLOSE_ON_FREE|LEV_OPT_REUSEABLE,2,(struct sockaddr *)&address,sizeof(address));
+@@ -1420,7 +1812,18 @@
+   if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
+   f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
+   /* Seed the real library database without invoking an unrelated scanner command consumer. */
+-  sqlite3 *seed=NULL;assert(sqlite3_open(database,&seed)==SQLITE_OK);assert(sqlite3_enable_load_extension(seed,1)==SQLITE_OK && sqlite3_load_extension(seed,ATTENTION_TEST_SQLEXT_PATH,NULL,NULL)==SQLITE_OK);char *sql=sqlite3_mprintf("INSERT INTO files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",fifo,fifo,DATA_KIND_PIPE,MEDIA_KIND_MUSIC);
++  sqlite3 *seed = NULL;
++  assert(sqlite3_open(database, &seed) == SQLITE_OK);
++  assert(sqlite3_enable_load_extension(seed, 1) == SQLITE_OK
++         && sqlite3_load_extension(seed, ATTENTION_TEST_SQLEXT_PATH, NULL, NULL) == SQLITE_OK);
++  char *sql
++      = sqlite3_mprintf(cold_restart ? "INSERT OR IGNORE INTO "
++                                       "files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_"
++                                       "season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)"
++                                     : "INSERT INTO "
++                                       "files(id,path,virtual_path,fname,album,album_artist,idx,tv_episode_sort,tv_"
++                                       "season_num,data_kind,media_kind) VALUES(1,%Q,%Q,'spotify','','',0,0,0,%d,%d)",
++          fifo, fifo, DATA_KIND_PIPE, MEDIA_KIND_MUSIC);
+   assert(sqlite3_exec(seed,sql,NULL,NULL,NULL)==SQLITE_OK);sqlite3_free(sql);sqlite3_close(seed);mfi.id=1;
+   qp.id=mfi.id;assert(db_queue_add_by_query(&qp,0,0,-1,NULL,&item)==0);
+   if(mode==24 || mode==25){
+@@ -1468,7 +1871,7 @@
+ 	player_state = PLAY_PLAYING;
+ 	assert(!start_active && !start_journal.token[0] && start_route_clean_absent());
+       }
+-    if (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move"))
++    if (getenv("PC55_SEEK_MOVE") || (getenv("PC70_RELEASE_COMPOSE") && !strcmp(getenv("PC70_RELEASE_COMPOSE"), "move")))
+       {
+ 	struct output_device *target = calloc(1, sizeof(*target));
+ 	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
+@@ -2343,8 +2746,12 @@
+   pair_cipher_free(f.cipher);pair_setup_free(f.pair);if(f.poll)event_free(f.poll);if(f.deadline)event_free(f.deadline);if(f.udp_fd>=0)close(f.udp_fd);
+   if(outputs_deferredev)event_free(outputs_deferredev);
+   if(database_ready)db_perthread_deinit();
+-  db_deinit();cfg_free(cfg);unlink(database);
++  db_deinit();
++  cfg_free(cfg);
++  if (!cold)
++    unlink(database);
+   if(mode==29 && getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);unlink(metadata);}
+-  unlink(fifo);
++  if (!cold)
++    unlink(fifo);
+   return f.failed;
+ }
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -27,6 +27,93 @@
+   json_object_object_add(process,"boot_id",json_object_new_string(r->native_process.boot_id));attention_json_u64(process,"pid",r->native_process.pid);attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks);
+   json_object_object_add(body,"native_process",process);raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
+   assert(start_gate_http(&h,"state",raw)==HTTP_OK);free(raw);reply=jparse_obj_from_evbuffer(h.out_body);assert(reply && json_object_object_length(reply)==8);json_object_put(reply);
++  /* Read-only strict absence is stronger than ordinary START admission. */
++  json_object_object_add(body, "require_clean_absent", json_object_new_boolean(true));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_OK);
++  free(raw);
++  reply = jparse_obj_from_evbuffer(h.out_body);
++  json_object *clean, *ready, *busy;
++  assert(reply && json_object_object_length(reply) == 9 && json_object_object_get_ex(reply, "clean_absent", &clean)
++         && json_object_is_type(clean, json_type_boolean) && json_object_get_boolean(clean)
++         && json_object_object_get_ex(reply, "ready", &ready) && json_object_get_boolean(ready)
++         && json_object_object_get_ex(reply, "busy", &busy) && !json_object_get_boolean(busy));
++  json_object_put(reply);
++  struct output_device *device = outputs_device_get(1);
++  struct output_start_state strict_available;
++  uint64_t base = device->base_revision, route = device->route_revision, metadata = outputs_start_metadata_generation();
++  int volume = device->volume;
++  struct start_slot pending = { 0 };
++#define STRICT_DENIED()                                                                                                \
++  do                                                                                                                   \
++    {                                                                                                                  \
++      raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));     \
++      assert(start_gate_http(&h, "state", raw) == 409);                                                                \
++      free(raw);                                                                                                       \
++      assert(!evbuffer_get_length(h.out_body));                                                                        \
++    }                                                                                                                  \
++  while (0)
++  device->session = device;
++  assert(outputs_start_state_get(r, &strict_available) == 0 && strict_available.ready);
++  STRICT_DENIED();
++  device->session = NULL;
++  device->selected = true;
++  STRICT_DENIED();
++  device->selected = false;
++  device->busy = true;
++  STRICT_DENIED();
++  device->busy = false;
++  device->attention_restart_pending = true;
++  STRICT_DENIED();
++  device->attention_restart_pending = false;
++  start_active = &pending;
++  pending.writer_pending = true;
++  STRICT_DENIED();
++  start_active = NULL;
++  atomic_store(&start_gate, true);
++  STRICT_DENIED();
++  assert(outputs_start_gate_closed());
++  atomic_store(&start_gate, false);
++  start_scope = &pending;
++  STRICT_DENIED();
++  start_scope = NULL;
++  start_journal_fault = true;
++  STRICT_DENIED();
++  start_journal_fault = false;
++  /* A real writable descriptor of the exact registered FIFO also denies.
++   * The baseline request's distinct child owns no writer; use this process. */
++  json_object *own_process = json_object_new_object();
++  struct output_native_process own = { .pid = getpid() };
++  assert(start_boot_id(own.boot_id) && start_process_ticks(own.pid, &own.proc_start_ticks) == 1);
++  json_object_object_add(own_process, "boot_id", json_object_new_string(own.boot_id));
++  attention_json_u64(own_process, "pid", own.pid);
++  attention_json_u64(own_process, "proc_start_ticks", own.proc_start_ticks);
++  json_object_get(process);
++  json_object_object_add(body, "native_process", own_process);
++  int writer = open(r->expected_input_path, O_RDWR | O_NONBLOCK);
++  assert(writer >= 0);
++  STRICT_DENIED();
++  close(writer);
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_OK);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", json_object_new_boolean(false));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", NULL);
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_add(body, "require_clean_absent", json_object_new_string("true"));
++  raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h, "state", raw) == HTTP_BADREQUEST);
++  free(raw);
++  json_object_object_del(body, "require_clean_absent");
++  json_object_object_add(body, "native_process", process);
++  assert(device->base_revision == base && device->route_revision == route && device->volume == volume
++         && outputs_start_metadata_generation() == metadata && !start_active && !start_journal.token[0]);
++#undef STRICT_DENIED
+   json_object_object_add(body,"offer_id",json_object_new_string("ffffffffffffffffffffffffffffffff"));json_object_object_add(body,"binding_id",json_object_new_string(r->binding_id));
+   json_object_object_add(body,"content_digest",json_object_new_string(r->content_digest));attention_json_u64(body,"native_revision",r->native_revision);
+   json_object_object_add(body,"intended_native_owner",start_journal_owner(&r->intended_native_owner));
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -1373,7 +1373,12 @@
+   assert(outputs_transport_busy() && outputs_transport_current(&first));
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0
+     && !busy && !start_owned && clean_absent);
+-  r=burst_audio(&owner,2,"resume"); assert(outputs_transport_commit(&r,&last)==0);
++  /* Bound-only Seek uses the existing exact digest and admission owner. */
++  r=transport_fixture_request("seek"); assert(!transport_command_valid(&r));
++  r.bound=true;r.native_owner=owner;r.native_revision=2;assert(transport_command_valid(&r));
++  r=burst_audio(&owner,2,"seek");assert(outputs_transport_commit(&r,&last)==0);
++  assert(outputs_transport_pause_confirm(1,r.token,r.native_prepare_id,2)==0 && !transport_pause_retained);
++  r=burst_audio(&owner,3,"resume"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(!outputs_transport_current(&first) && outputs_transport_current(&last) && a->volume==base);
+   /* The same App's new Spotify session may read current state; every other
+    * owner field remains exact and stale offers keep their captured identity. */
+@@ -1386,25 +1391,25 @@
+   changed=owner; changed.alias_revision++; assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   changed=owner; snprintf(changed.homepod_id,sizeof(changed.homepod_id),"2"); assert(outputs_transport_bound_state_get(1,&changed,&identity,&busy,&start_owned,&clean_absent)<0);
+   outputs_device_select(b,-1); outputs_device_deselect(a); assert(a->selected && !b->selected);
+-  early=burst_audio(&owner,3,"pause"); newer=burst_audio(&owner,4,"resume");
++  early=burst_audio(&owner,4,"pause"); newer=burst_audio(&owner,5,"resume");
+   assert(outputs_transport_commit(&newer,&last)==0); assert(outputs_transport_commit(&early,&first)<0);
+   assert(outputs_transport_commit(&early,&first)<0); /* Stale consumed token cannot retry. */
+-  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,5,"next");
++  transport_custody_expiry.tv_sec-=9; r=burst_audio(&owner,6,"next");
+   assert(outputs_transport_commit(&r,&last)==0 && last.remaining_ms>9900); expiry=transport_custody_expiry;
+   assert(outputs_transport_result_get(r.token,&first)==0);
+   assert(expiry.tv_sec==transport_custody_expiry.tv_sec && expiry.tv_nsec==transport_custody_expiry.tv_nsec);
+-  early=burst_audio(&owner,6,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
+-  r=burst_audio(&owner,7,"pause"); assert(outputs_transport_commit(&r,&last)==0);
++  early=burst_audio(&owner,7,"previous"); transport_custody_expiry.tv_sec-=11; assert(!outputs_transport_busy());
++  r=burst_audio(&owner,8,"pause"); assert(outputs_transport_commit(&r,&last)==0);
+   assert(outputs_transport_commit(&early,&first)<0); /* Expire/fresh same-route custody ABA. */
+-  v=burst_volume(&owner,8,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
++  v=burst_volume(&owner,9,44); assert(outputs_room_volume_commit(&v,&volume)==0 && !volume.contexts_drained);
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && busy);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED && volume.contexts_drained);
+   assert(outputs_transport_bound_state_get(1,&owner,&identity,&busy,&start_owned,&clean_absent)==0 && !busy && outputs_transport_busy());
+-  v=burst_volume(&owner,9,45); assert(outputs_room_volume_commit(&v,&volume)==0);
++  v=burst_volume(&owner,10,45); assert(outputs_room_volume_commit(&v,&volume)==0);
+   assert(outputs_room_volume_before_write(v.token)); outputs_room_volume_complete(v.token,true);
+   assert(a->volume==45 && outputs_room_volume_result_get(v.token,&volume)==0 && volume.outcome==ROOM_VOLUME_PROTOCOL_ACCEPTED);
+-  v=burst_volume(&owner,10,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
++  v=burst_volume(&owner,11,46); assert(outputs_room_volume_commit(&v,&volume)==0 && outputs_room_volume_before_write(v.token));
+   assert(outputs_room_volume_cancel(v.token,v.native_reservation_id,&volume)==0 && volume.outcome==ROOM_VOLUME_UNKNOWN);
+   room_volume_find(v.token)->deadline.tv_sec-=2; transport_custody_expiry.tv_sec-=11;
+   assert(outputs_transport_busy()); /* Undrained context still quarantines even beyond custody expiry. */
+@@ -1414,7 +1419,7 @@
+   r=transport_fixture_request("pause"); r.bound=true; r.native_owner=owner; r.native_revision=UINT64_MAX;
+   assert(outputs_transport_prepare(&r,&last)<0);
+   generation=transport_admission_generation; transport_admission_generation=UINT64_MAX;
+-  r.native_revision=11; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
++  r.native_revision=12; assert(outputs_transport_prepare(&r,&last)<0); /* Commit generation cannot wrap. */
+   transport_admission_generation=generation;
+   outputs_device_session_remove(1); output_airplay.device_room_volume=NULL; clear_devices();
+   puts("PASS compatible exactnative9 audio order/stalegeneration/expiryABA/maxdeadline/nonrenewingread; sequential terminaldrained volume before10s; undrainedunknown quarantine; overflowfailclosed");
+@@ -1470,6 +1475,8 @@
+     && !json_object_get_boolean(field));
+   assert(json_object_object_get_ex(reply,"clean_absent",&field) && json_object_is_type(field,json_type_boolean)
+     && json_object_get_boolean(field));
++  assert(json_object_object_get_ex(reply,"actions",&field) && json_object_array_length(field)==5
++    && !strcmp(json_object_get_string(json_object_array_get_idx(field,4)),"seek"));
+   jparse_free(reply);
+   json_object_object_add(body,"native_prepare_id",json_object_new_string("dddddddddddddddddddddddddddddddd"));
+   json_object_object_add(body,"native_revision",json_object_new_string("20"));
+@@ -1484,6 +1491,14 @@
+     assert(count==tokens);
+   }
+   changed=malloc(strlen(raw)+4); sprintf(changed,"%s {}",raw);
++  assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
++  free(raw);json_object_object_add(body,"action",json_object_new_string("seek"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN));
++  for(i=0;i<ARRAY_SIZE(cases);i++) {
++    changed=room_volume_json_replace(raw,cases[i][0],cases[i][1]);
++    assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
++  }
++  changed=room_volume_json_replace(raw,"\"action\":\"seek\"","\"action\":\"seek\",\"position_ms\":0");
+   assert(transport_http(&hreq,"bound-prepare",changed)==HTTP_BADREQUEST);free(changed);
+   assert(transport_http(&hreq,"bound-prepare",raw)==HTTP_OK);free(raw);
+   reply=jparse_obj_from_evbuffer(hreq.out_body); assert(json_object_object_length(reply)==7);

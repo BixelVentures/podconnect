@@ -2,7 +2,9 @@
 
 import asyncio
 import copy
+import time
 import unittest
+from unittest.mock import patch
 
 import voluptuous as vol
 from aiohttp import web
@@ -22,12 +24,19 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
         self.volume_ack_corrupt = None
         self.volume_prepare_corrupt = None
         self.volume_state_corrupt = None
+        self.volume_state_reads = []
+        self.volume_effect = None
+        self.volume_state_hold = False
+        self.volume_state_entered = asyncio.Event()
+        self.volume_state_release = asyncio.Event()
         self.volume_ttl = 5000
         self.volume_outcome = "protocol_accepted"
         self.manual_percent = 27
         self.prepared_percent = None
         await super().asyncSetUp()
-        self.holds.extend((self.volume_release, self.volume_commit_release))
+        self.holds.extend(
+            (self.volume_release, self.volume_commit_release, self.volume_state_release)
+        )
         self.volume_commands = self.entries[0].runtime_data.commands
 
     def volume_snapshot(self):
@@ -57,6 +66,12 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
 
     async def _backend(self, request):
         if request.path == "/api/room-volume/state":
+            self.assertEqual(request.method, "GET")
+            self.assertNotIn("Authorization", request.headers)
+            self.volume_state_reads.append(dict(request.query))
+            self.volume_state_entered.set()
+            if self.volume_state_hold:
+                await self.volume_state_release.wait()
             value = {
                 "schema": "podconnect.room_volume_state.v1",
                 "ok": True,
@@ -64,6 +79,7 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                 "route": self.route(),
                 "volume_state": self.volume_snapshot(),
                 "actions": ["volume"],
+                "effect": self.volume_effect,
                 "physical_result_verified": False,
             }
             if self.volume_state_corrupt:
@@ -149,6 +165,42 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
             blocking=True,
             return_response=True,
         )
+
+    async def test_volume_effect_requires_matching_native_operation(self):
+        request = self.volume_request()
+        receipt = await self.volume_invoke(request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.output_observation = True
+        self.volume_effect = {
+            "prepare_id": "c" * 32,
+            "action": "volume",
+            "effect_revision": "1",
+            "native_revision": "1",
+            "native_owner": self.native(),
+        }
+
+        async def snapshot():
+            return await self.hass.services.async_call(
+                "podconnect",
+                "get_playback_snapshot",
+                {
+                    "config_entry_id": "account-alpha",
+                    "include_output": True,
+                    "include_controls": True,
+                    "request_id": request["request_id"],
+                    "command_sequence": request["command_sequence"],
+                },
+                blocking=True,
+                return_response=True,
+            )
+
+        confirmed = await snapshot()
+        self.assertEqual(confirmed["settlement"]["status"], "confirmed")
+        self.volume_effect["prepare_id"] = "d" * 32
+        self.assertNotEqual((await snapshot())["settlement"]["status"], "confirmed")
+        self.volume_effect["prepare_id"] = "c" * 32
+        self.volume_effect["native_owner"] = {**self.native(), "session_id": "foreign"}
+        self.assertNotEqual((await snapshot())["settlement"]["status"], "confirmed")
 
     async def cleanup_finished(self):
         tasks = list(self.volume_commands.room_volume.cleanups)
@@ -404,6 +456,252 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(len(self.commits()), 1)
         self.assertEqual(self.manual_percent, 27)
         self.volume_commit_release.set()
+
+    async def playback_controls_snapshot(self, **overrides):
+        self.output_observation = True
+        return await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {
+                "config_entry_id": "account-alpha",
+                "include_output": True,
+                "include_controls": True,
+                **overrides,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    async def test_volume_playback_v3_exact_read_only_projection(self):
+        commands = self.volume_commands
+        before = copy.deepcopy(
+            (
+                commands.command_sequence,
+                commands.receipts,
+                commands.room_content.records,
+                commands.room_move.records,
+                commands.room_queue.preparations,
+            )
+        )
+        captured = []
+        original = self.entries[0].runtime_data.observations.playback
+
+        def capture(entry):
+            value = original(entry)
+            captured.append(copy.deepcopy(value))
+            return value
+
+        with patch.object(
+            self.entries[0].runtime_data.observations, "playback", capture
+        ):
+            value = await self.playback_controls_snapshot()
+        self.assertEqual(value["schema"], "podconnect.playback.v3")
+        self.assertEqual(set(value), set(captured[0]) | {"output", "controls"})
+        self.assertEqual(
+            {
+                k: v
+                for k, v in value.items()
+                if k not in {"schema", "output", "controls"}
+            },
+            {k: v for k, v in captured[0].items() if k != "schema"},
+        )
+        controls = value["controls"]
+        self.assertEqual(
+            set(controls),
+            {
+                "status",
+                "reason",
+                "binding_id",
+                "valid_until",
+                "supported_actions",
+                "volume",
+            },
+        )
+        self.assertEqual((controls["status"], controls["reason"]), ("observed", None))
+        binding = value["output"]["binding"]
+        self.assertEqual(controls["binding_id"], binding["binding_id"])
+        self.assertLessEqual(controls["valid_until"], binding["valid_until"])
+        self.assertEqual(
+            controls["volume"], {"base_percent": 27, "effective_percent": 10}
+        )
+        self.assertEqual(
+            set(controls["supported_actions"]),
+            {"pause", "resume", "next", "previous", "volume"},
+        )
+        self.assertEqual(len(controls["supported_actions"]), 5)
+        self.assertEqual(
+            self.volume_state_reads,
+            [
+                {
+                    k: self.native()[k]
+                    for k in ("account_user_id", "target_id", "room_id", "homepod_id")
+                }
+            ],
+        )
+        self.assertEqual(
+            before,
+            (
+                commands.command_sequence,
+                commands.receipts,
+                commands.room_content.records,
+                commands.room_move.records,
+                commands.room_queue.preparations,
+            ),
+        )
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
+
+    async def test_volume_playback_v3_requires_output_and_keeps_v1_v2(self):
+        for overrides in (
+            {"include_output": False},
+            {"include_controls": 1},
+            {"include_controls": "true"},
+            {"include_controls": None},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(vol.Invalid):
+                await self.playback_controls_snapshot(**overrides)
+        with self.assertRaises(vol.Invalid):
+            await self.hass.services.async_call(
+                "podconnect",
+                "get_playback_snapshot",
+                {"config_entry_id": "account-alpha", "include_controls": True},
+                blocking=True,
+                return_response=True,
+            )
+        self.assertEqual((self.output_reads, self.volume_state_reads), ([], []))
+        v1 = await self.output_snapshot(False)
+        v2 = await self.output_snapshot(True)
+        explicit_v2 = await self.playback_controls_snapshot(include_controls=False)
+        self.assertEqual(v1["schema"], "podconnect.playback.v1")
+        self.assertEqual(v2["schema"], "podconnect.playback.v2")
+        self.assertEqual(explicit_v2["schema"], "podconnect.playback.v2")
+        self.assertEqual(set(v2), set(v1) | {"output"})
+        self.assertEqual(set(explicit_v2), set(v2))
+        self.assertNotIn("controls", v1)
+        self.assertNotIn("controls", v2)
+        self.assertEqual(self.volume_state_reads, [])
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_intersects_native_provider_actions(self):
+        provider = self.entries[0].runtime_data.coordinator.data["playback"]
+        provider["actions"]["disallows"] = {"pausing": True, "skipping_prev": True}
+        self.state_corrupt = lambda state: state.update(actions=["pause", "next"])
+        self.volume_commands.busy = True
+        value = await self.playback_controls_snapshot()
+        self.assertEqual(value["controls"]["status"], "observed")
+        self.assertEqual(
+            set(value["controls"]["supported_actions"]), {"next", "volume"}
+        )
+        self.assertEqual(
+            value["controls"]["volume"], {"base_percent": 27, "effective_percent": 10}
+        )
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_actionless_facts_keep_volume(self):
+        self.state_corrupt = lambda state: state.update(actions=[])
+        self.volume_state_corrupt = lambda state: state.update(actions=[])
+        provider = self.entries[0].runtime_data.coordinator.data["playback"]
+        provider["actions"]["disallows"] = {
+            "pausing": True,
+            "resuming": True,
+            "skipping_next": True,
+            "skipping_prev": True,
+        }
+        provider["device"]["supports_volume"] = False
+        value = await self.playback_controls_snapshot()
+        self.assertEqual(value["output"]["status"], "observed")
+        self.assertEqual(value["controls"]["status"], "observed")
+        self.assertEqual(value["controls"]["supported_actions"], [])
+        self.assertEqual(
+            value["controls"]["volume"], {"base_percent": 27, "effective_percent": 10}
+        )
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_foreign_native_or_route_never_publishes_volume(
+        self,
+    ):
+        for corrupt in (
+            lambda state: state["native"].update(account_user_id="foreign"),
+            lambda state: state["native"].update(alias_revision=8),
+            lambda state: state["route"].update(input_generation="9"),
+        ):
+            with self.subTest(corrupt=corrupt):
+                self.volume_state_corrupt = corrupt
+                value = await self.playback_controls_snapshot()
+                self.assertIsNone(value["controls"]["volume"])
+                self.assertNotIn("volume", value["controls"]["supported_actions"])
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_held_read_poll_or_owner_change_fails_closed(self):
+        data = self.entries[0].runtime_data
+        coordinator = data.coordinator
+        baseline, owner = copy.deepcopy(coordinator.data), coordinator.owner_epoch
+        for change in ("poll", "owner", "inactive", "expiry"):
+            with self.subTest(change=change):
+                coordinator.data = copy.deepcopy(baseline)
+                coordinator.owner_epoch = owner
+                self.volume_state_entered.clear()
+                self.volume_state_release.clear()
+                self.volume_state_hold = True
+                task = self._task(self.playback_controls_snapshot())
+                await asyncio.wait_for(self.volume_state_entered.wait(), 2)
+                try:
+                    if change == "poll":
+                        coordinator.data["poll_sequence"] += 1
+                    elif change == "owner":
+                        coordinator.owner_epoch = "replacement"
+                    elif change == "inactive":
+                        data.active = False
+                    if change == "expiry":
+                        with (
+                            patch(
+                                "custom_components.podconnect.room_transport.time"
+                            ) as clock,
+                            patch(
+                                "custom_components.podconnect.observations.time", clock
+                            ),
+                        ):
+                            clock.monotonic.return_value = time.monotonic() + 6
+                            clock.time.return_value = time.time() + 6
+                            self.assertTrue(
+                                data.observations.playback("account-alpha")["ok"]
+                            )
+                            self.volume_state_release.set()
+                            result = await task
+                    else:
+                        self.volume_state_release.set()
+                        result = await task
+                    self.assertEqual(result, {"ok": False, "error_kind": "unavailable"})
+                finally:
+                    data.active = True
+                    coordinator.owner_epoch = owner
+                    self.volume_state_release.set()
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_malformed_volume_has_no_provider_fallback(self):
+        for corrupt in (
+            lambda state: state["volume_state"].update(base_percent=True),
+            lambda state: state["volume_state"].update(effective_percent=101),
+            lambda state: state["volume_state"].pop("base_percent"),
+            lambda state: state["volume_state"].update(base_revision="07"),
+        ):
+            with self.subTest(corrupt=corrupt):
+                self.volume_state_corrupt = corrupt
+                value = await self.playback_controls_snapshot()
+                self.assertIsNone(value["controls"]["volume"])
+                self.assertNotIn("volume", value["controls"]["supported_actions"])
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+
+    async def test_volume_playback_v3_read_cancellation_propagates(self):
+        self.volume_state_hold = True
+        task = self._task(self.playback_controls_snapshot())
+        await asyncio.wait_for(self.volume_state_entered.wait(), 2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.volume_state_release.set()
+        self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
 
 
 def load_tests(loader, tests, pattern):

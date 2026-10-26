@@ -24,6 +24,8 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         self.output_release = asyncio.Event()
         self.room_posts = []
         self.room_reads = []
+        self.room_effect = None
+        self.volume_probe_unavailable = False
         self.room_hold = False
         self.room_entered = asyncio.Event()
         self.room_release = asyncio.Event()
@@ -118,12 +120,23 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
                 "ok": True,
                 "native": self.native(),
                 "route": self.route(),
-                "actions": ["pause", "resume", "next", "previous"],
+                "actions": [
+                    "pause",
+                    "resume",
+                    "next",
+                    "previous",
+                    "seek",
+                    "shuffle",
+                    "repeat",
+                ],
+                "effect": self.room_effect,
                 "physical_result_verified": False,
             }
             if self.state_corrupt:
                 self.state_corrupt(value)
             return web.json_response(value)
+        if request.path == "/api/room-volume/state" and self.volume_probe_unavailable:
+            return web.Response(status=409)
         if request.path in {
             "/api/room-transport/prepare",
             "/api/room-transport/commit",
@@ -147,6 +160,12 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
                     "volume_percent": 0,
                     "physical_result_verified": False,
                 }
+                if body["action"] == "seek":
+                    value["position_ms"] = body["position_ms"]
+                if body["action"] == "shuffle":
+                    value["shuffle_enabled"] = body["shuffle_enabled"]
+                if body["action"] == "repeat":
+                    value["repeat_mode"] = body["repeat_mode"]
                 if self.prepare_corrupt:
                     self.prepare_corrupt(value)
                 return web.json_response(value)
@@ -204,6 +223,114 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
             blocking=True,
             return_response=True,
         )
+
+    async def test_room_exact_native_effect_confirms_only_current_operation(self):
+        self.output_observation = True
+        self.volume_probe_unavailable = True
+        request = self.room_request("resume")
+        accepted = await self.room_invoke(request)
+        self.assertEqual(accepted["outcome"], "accepted")
+        self.room_effect = {
+            "prepare_id": "a" * 32,
+            "action": "resume",
+            "effect_revision": "1",
+            "native_revision": "1",
+            "native_owner": self.native(),
+        }
+        value = await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {
+                "config_entry_id": "account-alpha",
+                "include_output": True,
+                "include_controls": True,
+                "request_id": request["request_id"],
+                "command_sequence": request["command_sequence"],
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(value["settlement"]["status"], "confirmed")
+        self.assertEqual(value["settlement"]["observation"]["prepare_id"], "a" * 32)
+        for change in (
+            lambda e: e.update(prepare_id="b" * 32),
+            lambda e: e.update(action="pause"),
+            lambda e: e["native_owner"].update(session_id="foreign"),
+        ):
+            self.room_effect = copy.deepcopy(
+                {
+                    "prepare_id": "a" * 32,
+                    "action": "resume",
+                    "effect_revision": "1",
+                    "native_revision": "1",
+                    "native_owner": self.native(),
+                }
+            )
+            change(self.room_effect)
+            read = await self.hass.services.async_call(
+                "podconnect",
+                "get_playback_snapshot",
+                {
+                    "config_entry_id": "account-alpha",
+                    "include_output": True,
+                    "include_controls": True,
+                    "request_id": request["request_id"],
+                    "command_sequence": request["command_sequence"],
+                },
+                blocking=True,
+                return_response=True,
+            )
+            self.assertNotEqual(read["settlement"]["status"], "confirmed")
+
+    async def test_room_settlement_held_read_cannot_publish_replaced_owner_or_poll(
+        self,
+    ):
+        self.output_observation = True
+        self.volume_probe_unavailable = True
+        request = self.room_request("resume")
+        self.assertEqual((await self.room_invoke(request))["outcome"], "accepted")
+        data = self.entries[0].runtime_data
+        original = data.commands.room_transport.observe
+        baseline = copy.deepcopy(data.coordinator.data)
+        for change in ("owner", "poll"):
+            data.coordinator.data = copy.deepcopy(baseline)
+            epoch = data.coordinator.owner_epoch
+            entered, release = asyncio.Event(), asyncio.Event()
+            self.holds.append(release)
+            reads = 0
+
+            async def held(*args, _entered=entered, _release=release):
+                nonlocal reads
+                reads += 1
+                if reads == 2:  # The first read belongs to the guarded projection.
+                    _entered.set()
+                    await _release.wait()
+                return await original(*args)
+
+            with patch.object(data.commands.room_transport, "observe", held):
+                task = self._task(
+                    self.hass.services.async_call(
+                        "podconnect",
+                        "get_playback_snapshot",
+                        {
+                            "config_entry_id": "account-alpha",
+                            "include_output": True,
+                            "include_controls": True,
+                            "request_id": request["request_id"],
+                            "command_sequence": request["command_sequence"],
+                        },
+                        blocking=True,
+                        return_response=True,
+                    )
+                )
+                await asyncio.wait_for(entered.wait(), 2)
+                if change == "owner":
+                    data.coordinator.owner_epoch = "replacement"
+                else:
+                    data.coordinator.data["poll_sequence"] += 1
+                release.set()
+                self.assertEqual(await task, {"ok": False, "error_kind": "unavailable"})
+            data.coordinator.owner_epoch = epoch
 
     async def test_room_offer_and_four_actions_use_exact_manager_only(self):
         offer = await self.room_offer()

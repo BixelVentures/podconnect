@@ -1,3 +1,188 @@
+## 26 October — coordinated54/24 candidate; official CI fixture corrections
+
+PR83 head597e4e4 passed OwnTone build and manager race checks; boundary, native mapping and one inherited framework selection fixture failed. All three were independently diagnosed as stale fixture contracts, corrected without production changes and separately reviewed. Boundary baseline98/27errors became98PASS; native exact failure reproduced then focused mapping/seek/options passed; framework20 focused cases include same-current observation with zero effects and preserved true START/different-room barriers. Exact patches5f3179e4/4ae66afe/native3f753030 integrated together; checksum updated. Required official CI reruns on the new commit remain pending. No physical/install proof is claimed.
+
+User paused only long Spotify Radio continuation beyond initial pages. It is not a release blocker; normal playback startup/audio/controls/reconnect and context404 recovery remain mandatory. PC70 published53 parser compatibility+retained DB/FIFO proof supports blocked paired downgrade after purpose records with current-version forward recovery; it does not establish old-binary rollback. Earlier chronological Gate0/compatibility statements below are superseded by these bounded scope/evidence updates.
+
+### Reviewed Control parity integration, 25 October night
+
+Shared candidate now contains independently reviewed settlement e5a480, options a3452e,
+episode b610ce plus canonical-ID fixture e99ec6, and library ca0bdb joined by9ee17e.
+Independent composition SOURCE GO verifies exact four content actions, current
+receipt/effect fields, option dispatch and episode/list args without overwriting
+either owner. Combined actual HA commands/transport/volume86 PASS; content/library
+HA76 PASS retained plus one obsolete unsupported-episode fixture corrected to still
+unsupported audiobook and separately PASS. Combined manager race suite had exactly
+one failed old actions-array expectation in released-paused fixture: now includes
+implemented seek/shuffle/repeat while still requiring pause rejection; only that
+invalidated case reruns. No runtime patch resulted from this fixture failure.
+Ruff changed files pass except inherited unchanged observations.py:210 TRY004;
+HEAD has the identical ValueError line. Root formatted only transport fixture's new
+action array. Seek/CAS four-overlay Docker/checksum packaging received independent
+scoped GO against actual163prod/64test-asset replay. Native unified composition is
+still isolated, not integrated into these packaged overlays yet. No new version,
+release, CI, Green activation, paid provider or household effect is claimed.
+
+### Native/C seek and custody packaged after real composition
+
+Root packaged the independently reviewed singleNative source suffixb9f2cd284adc19b2c6242e88f3aade37215606be734e8b4be876bd9246cef7df and test suffix68647a79b99c7aa53d1e910c5ac9a18d232bda516afa63506e06e73582c74c2c, C source465e82c0c98fc39f325dcf50e53c28b1004629bde48fde8c81e70de54d791bc3 and consolidated C fixture41f8fd52291677331bcf23c2f9be1db22dd9d697822f41fd716a9bd27a023145. Docker/checksums apply the exact suffix after reviewed PC70/35ca prefix before tests/build. Source replay163Native production and64test/assets equals compiled b690 candidate. Receipt /private/tmp/pc54-owner-parity-integrated-20261025/RECEIPT.json SHA6cac1631d01353bf9a6f12b7290c0659220fd9f6cf79c0218b23f448f43609c0. C exact5final files were separately independently replayed; no broad test repeat.
+
+Actual corrected real-FLAC publicSTART -> publicMOVE -> duplicate/late prior callbacks -> Pause -> boundSeek500/RESTSeek0 -> real15sSTOPretention -> Resume -> playingSeek1000 passed Native0/C0 in16.81s, with independent C currentwriter/reader/route/session and authenticated nonzero target RTP before completion ACK. This is software/protocol evidence, not HomePod sound. Earlier Native0/C1 is preserved as observer-cleanup ordering failure; the fixture now synchronously observes the same strict terminal before ACK/Native cleanup, without runtime delay or relaxed source proof.
+
+Actual full Docker-prefix replay also caught a packaging-only test context error: room-release-native-tests.patch expected an unshipped private RTP block. Root reanchored only its existing four-line START-release call before incumbent NativePause (hash69d47e430a2da5aa10f68e2f45ed8201ad1f218a67f560180fdd45981435dbc4); independent74 context-onlyGO. All production stays exact7c before the new suffix. New test suffix ships only5changedGo fixtures plus one synthetic sustainedFLAC;58incumbent test/assets unchanged, no57duplicate helper copies.
+
+### Existing library play owner parity — explicit ordered list
+
+Bounded source audit confirms play_from_library still writes raw Spotify shuffle/play(uris) after its library fetch, while existing Native NewTrackListFromContext already accepts populated ContextPage.Tracks without external resolve. Lead authorizes a typed play_tracks branch inside the existing content owner:1..50 exact canonical trackURIs in original handler order including duplicates, boolean shuffle, max_volume, and finite library-source provenance. Preserve actual handler result (recently_played already deduplicates upstream); do not promise raw provider occurrences not present in that result.
+
+Capture actual HA entry/account/API/Native target/epoch before library GET, revalidate after fetch/stage/before commit, digest the immutable full ordered request and actual local source metadata. Construct only a populated ContextPage.Tracks with empty Spotify Context.URI/URL, no invented playlist/context/first-track replacement; reuse existing stage/decode/currentness/one START. For requested initial shuffle, select from the full shuffled list before first-track staging; do not accidentally keep the unshuffled first item because existing ToggleShuffle preserves selected track. Define deterministic RNG injection in existing fixture only, not production deterministic shuffle. False/no-shuffle preserves exact order.
+
+Regress actual registered HA library -> existing owner -> populated list -> decoded selected source -> single START; duplicate track occurrences, boundary50/51, malformed/empty data, source failure, stale owner after GET/stage, cancel/unknown/duplicate do not commit or fall back to rawSpotify. Subsequent next/prefetch stay within existing list owner, not per-song commands. No C list-purpose extension (existing contentDigest binds args), new resolver/broker/cache or UI change. All validators/wrappers/callers and fixture contracts traced, focused static/source/adapter gates and independent review before root integration. No network/provider/household effect authorized.
+
+### Advertised episode content parity — existing resolver only
+
+D2 caller audit shows episode is already advertised by HA browse/search, but _native_selected_content and closed RoomContent action/URI validators reject it. Native already decodes episode media and infers episode contexts. Lead authorizes an isolated smallest play_episode extension through the EXISTING content prepare/stage/decode/START owner only if source tracing confirms actual episode resolution returns the known episode decoder representation. Preserve exact max-volume/admission/current-owner/pause/UNKNOWN fences, original stage-before-commit and selected identity; no direct Spotify fallback or first-track substitution.
+
+Required regression: actual advertised HA episode call -> same closed Content owner -> actual existing episode resolver/staged media identity -> accepted START shape; metadata404/wrong-kind/owner replacement/failed decode has zero commit and preserves prior player. Trace all validators/wrappers/schema/callers and keep current track/playlist/album/artist/show bytes or existing behavior. No chapter/audiobook regex widening: that provider mapping is not yet established. No library-list fiction or new content resolver/broker. One isolated writer, focused adapter/source tests plus independent review, root hunk-integrates after other shared owner deltas. No provider/household effect is authorized.
+
+### Advertised shuffle/repeat owner parity — bounded implementation authorized
+
+Read-only D2 caller audit finds actual HA shuffle/repeat methods still optimistically assigning state and writing Spotify WebAPI, while Native actor already owns setOptions. A fake route through GuardedTransport would Pause/Resume or write C and is forbidden: options change the existing list/options owner, not playback transport. Hypothesis: exact bound option admission plus staged list preparation removes this bypass without disturbing paused state, writer, source, position or route.
+
+Lead authorizes an isolated minimal typed extension in existing Commands/RoomTransport/Native owners: shuffle(enabled:boolean), repeat(mode:off|context|track), exact args digest/current owner/source/route/intent and existing one-use receipt/UNKNOWN policy. Validate real restrictions and propagate option errors. Existing ToggleShuffle can shuffle a partial live list after a page error; use existing detached clone/preparation and current-owner revalidation, commit only complete successful preparation. No new broker, C transport purpose, physical Pause/Resume, action-value success inference, UI change or feature hiding. Preserve proven external-device adapter. Trace all changed option signatures/callers (Dealer/MPRIS/REST/HA) before freeze.
+
+Regression: actual HA setter -> bound option owner -> same current Native writer/list; pause/position/source remain unchanged. Page failure/stale owner/cancel/replacement/duplicate/UNKNOWN never mutates live options/list or falls back to raw API. Successful shuffle preserves exact occurrence identities/provider order inputs; repeat mapping matches existing owner. Readonly closed-v3 legacy projections remain compatible. Source/static/causal adapter evidence plus independent review required; root alone integrates separate patches after seek/custody/settlement hunks. No household effects. SelectSource/library/episode/audiobook remain separately explicit work, not silently declared complete by options parity.
+
+### Actual START-to-MOVE custody replacement — causal owner correction authorized
+
+Corrected Native seek/Previous source on approved35ca baseline (163inventory24769fedc9680d199ed0ee3da0b6422c48ebf23f1006f7f0508df6385477856d) reached actual real-FLAC publicSTART -> C completedMOVE200 to target2/sameFIFOepoch2 -> Native completion, then exact current-custody assertion failed before Seek. Preserved /private/tmp/pc55-seek-owner-20261025/failed-corrected-start-to-move-6585/ logs; C wait timeout follows Native failure and is not the cause. Source installCompletedMoveCustody sets moveCustody without clearing prior startCustody; completedWriterCurrent then correctly rejects dual custody. This is a first-losing-boundary runtime RED, not a test timeout or permission problem.
+
+Lead authorizes the smallest existing-owner correction: capture prior START/MOVE custody and existing registered writer identity during current MOVE capture; revalidate normal source/worker/route/epoch/intent and pending/quarantine fences. Only after actual C completion and normal Native verification, atomically replace exactly that captured prior custody with the new MOVE under existing custody lock. Return failure/UNKNOWN if prior owner/writer changed; never clear a successor or report accepted after a failed CAS. Do not retire/Close the reused writer, invent journal state, use unconditional start=nil, add a second custody owner, or alter current seek/PCM behavior.
+
+Invariant/chain: accepted START writer -> exact current MOVE capture -> closed-route transition -> actual C new target custody -> Native verified replacement -> retained controls/Seek/Resume; same FIFO source and independent C ownership remain authoritative. Regression must reproduce START->MOVE old dual-custody rejection, prove replacement only for exact prior owner/writer, preserve ordinary->MOVE and MOVE->MOVE, reject delayed/duplicate/foreign completion and stale prior callbacks without changing successor. Trace existing lock order and cleanup/cancel paths; no new lock order inversion. Reuse frozen seek and C reviews; independently review this distinct source increment and rerun only invalidated composed MOVE/software neighbors. No household effects or physical proof.
+
+### Seek Control/manager source integrated; Native composition pending
+
+Root applied frozen control-manager-seek.patch5d546b410f76038525b58cc01028a08be89709e71cc8bb85bbe02a5a2ceb9be4 after exact base apply-check; all11 final file pins match SOURCE-PINScb2beaaab1257c9603af83294d300a8da361b0ec12b5ace50ab265d2f5759eb6. Independent fault_diagnostics87 SOURCE GO found noP1/P2, covering typed zero/nonzero args, exact digest/owner/one-use/UNKNOWN, unchanged proven nonNative behavior and closed passive-v3 compatibility through actual PV/canonicalJS. Existing focused evidence is reused. Native/C source and genuine pausedSTART/MOVE worker composition remain separate; no Ready-for-QA, release/install or physical claim. No shared Native/C packaging changed by this increment.
+
+## Active54/Control24 — D2 single-owner implementation
+
+## Integrated PC70 source checkpoint — no release
+
+Root packaged independently reviewed Native aa47 + MOVE35ca and C24808 into the existing Docker stack, including the causal test increments. Actual isolated MOVE->durable release->real Close/join->independent C terminal/drain succeeds Native0/C0 with physical_result_verified:false; receipt /private/tmp/pc70-manual-release-20261025/C-MOVE-COMPOSE-a6bb-GREEN.json. Clean packaged replay matches all163Native production files/5changedtests and scoped C pins; final target2 fixture matches ed5d95cc. Current Dockerfile2f95056c includes all8hash-pinned patches. No officialCI/release/Greeninstall in this source phase. HA seek/shuffle/repeat and correlated settlement, PC13 gate0 and full compatible acceptance remain open. Seek work is isolated and excluded from this checkpoint.
+
+Lead/releaseowner /root; actualbase917b2e092c0ebe40c1fa987bc781188dc9b34692,
+treeb51c6fdb075c17df7717a113a8a2b46a5c24e372, restoredexact5publishedControl23blobs
+on53base and verifiedfulltree; exactpublichead/mergecommit hashes imported through
+GitHubplugin. Candidate /private/tmp/pc54-control24-single-owner-20261025,
+branchcodex/pc54-control24-single-owner. LastverifiedGreen53/23; no install/effect now.
+CanonicalapprovedD2plan is docs/LEAD-PLAN.md in PodVoice91candidate; plan97/98/97
+doesnotconstitute SOURCE or physicalGO. Rootowns integration and sharedSTATUS.
+
+Observed: media_player genericNative-targetplayback/volume bypasses boundCommands
+and usesSpotifyAPI, unlike touch/currentselectedvoice. Playback.v2 has no actual
+volume/read-onlyaffordances or request-correlatedsettlement; UI compensates with
+passiveexecutableoffers and actionmatchers. Hypothesis: routeverifiedNativeHAcallers
+throughsameexistingCommands/content/transport/volume owners and projecttheiractual
+read-onlystatus and settlement toremoveclientcompensation aftercomposedproof.
+KeepHAactor/PVpermissions distinct; unknownNativeclassificationneverWebAPIfallback.
+
+Chain: HA/MCP/touchintent -> exactactualaccount/Nativeidentity/currentroomroute ->
+sameCommandsadmission/sequence -> Native/C -> request-correlatedreceipt/current
+observation -> surface; nativevoiceplayback/duckrestore/close/rearmstayownedbyPV.
+Invariants: oneeffectowner; freshauthority/owner/route; truthfulsourceclock/volume;
+atmostonce/UNKNOWNnoreplay; source/readknowledge notanexecutiongrant; privatepayload
+notlogged/published. No newbroker/globalstore, audio/VAD tuning or effect tests.
+
+PC70observedmanualreleaseunsupported. Approvedproposal extendsEXISTINGboundtransport
+andCretirementjournal withclosedmanual_release_v1/transport_releasepurpose forordinary
+routesaswellasSTART/MOVE. Exactserverreadbinding -> durableCprepare/gateclosed ACK
+BEFOREcapturedNativeClose/joinoutsideactor -> independentCclosedwriter/drain/exactold
+selectionproof -> terminalreceipt. No fakeSTARTtoken, generic404success ornewowner
+effects. Cowner/journalfeasibility+upgrade/reboot/downgrade gate precedesadoption.
+PC13actualsuccessfulstationcontinuationprotocol is Gate0; no guessedautoplayrenewal.
+
+PC70 causal update before implementation: START/MOVE manual-release must retain
+its genuine predecessor plus a closed typed nested manual_release in the SAME
+existing retirement journal, so the manual token/arguments/owner/writer and terminal
+proof survive a C crash. Old53 rejects typed variants; forward-only recovery remains
+mandatory after such a write. Fresh process drain/proof cannot reuse old monotonic
+input epochs/deadlines as authority. The exact consumed manual-operation pointer
+owns failure retirement; OutputFailed must not enter competing automatic retirement
+or synchronous actor Close. Only the captured worker's Close after actual durable
+C-prepare ACK may run outside actor/locks; a specifically proven same-failure alias
+retirement can be distinguished from foreign source/session/generation changes.
+Unknown provenance remains UNKNOWN with no Close or rollback shortcut. Existing
+managed Zeroconf logout/replacement is reused only after exact C terminal and old
+custody clear, then next real START must pass; unsupported non-Zeroconf rejects before
+prepare. These are draft fixes for discovered crash/deadlock/reconnect races, not GO.
+
+Plannedregressions: actualHA/MCP/entity andtouchsharedowner/concurrency/currentness;
+v1/v2unchanged+v3closedDTOactualvolume/nooffers; commandssettlementforeignepoch,
+sourcechanges/timeout/UNKNOWN; Native/C releaseSTART/MOVE/ordinary pausedplaying,
+lostACK/cancel/stale/crash/recovery; readonlyprotocolartifacts forstationthen2page
+continuation/EOF/Next/prefetch. Reuseunchangedchecks; highriskindependentreviewbefore
+onefinalofficialCI perrepo andonecompatiblecombinedGreenwindow. Noresultsclaimed.
+
+Rollbackkeeps53/23compatibleimages/component/options/policy/data. Newpurposewrites
+forbidone-sidedoldC/Native downgrade orjournalsletning; onlycurrentnewpairterminalized
+andlegacy-readabletransactionstate permitsoldpairrestore, otherwiseforwardrecovery.
+Source/lifecycle/APIownerproofandcausaltests mustpassbeforefreeze. ActualHomePod
+sound, LED/timer/Stop andphysicalacceptance remainseparatelaterhumanseries.
+
+### HA track/playlist selected-content — independent SOURCE GO
+
+Incrementc2523b848cd31638e0583bfb85c255091a49b8c1efcef91173936de384d389e6
+is independently reviewed GO with final runtimebd03f97b29e0eb857b5006bcf95cc5dcebe546dc451e755e18a26839f0619a4b.
+Actual registered HA exact Native track/playlist uses RoomContent read/prepare/start,
+Native fixed startup35 unchanged under HA actor max100 ceiling. Exact alias catalog,
+account/API/session/poll/source and final same-room checks are retained. Cancellation
+uses existing owner cleanup; UNKNOWN never falls back/replays. Pre-reservation poll
+checks stay strict; post-reservation routine poll advances defer to canonical owner's
+fresh floor/sequence/identity admission. The review finding below is resolved by a
+held-staging monotonic-poll regression.22 actual HA cases plus invalidated old method
+and optimistic-field assertion pass; formatter/lint pass. Other Native URI kinds,
+library, seek/shuffle/repeat and source selection remain explicit parity work.
+
+### HA selected-content increment — review finding before freeze
+
+Actual HA track/playlist caller now stages through existing RoomContent, but lead
+review found its post-prepare caller guard still required the pre-staging poll number.
+RoomContent intentionally permits newer monotonic observations after reservation;
+metadata staging may take32s while ordinary HA polling advances. Hypothesis: exact
+owner/alias/API/session guards after reservation must defer poll-floor/current sequence
+admission to RoomContent.start instead of cancelling valid work on routine refresh.
+Add held-prepare -> same-owner poll advance -> staged exact START regression; older
+poll/owner/alias replacement, cancellation and UNKNOWN still reject/no fallback.
+This increment is not SOURCE GO until the finding is fixed and final pins reviewed.
+
+### HA entity shared-owner transport — independent SOURCE GO
+
+Formatted packet4763e3a18149c23032f373712ec397d787a943d16a7f21de6a9256b35795de1e,
+media_player SHAbe780ca22836fc93dd7a8af8b23f250b1fc60911ef99858ae389b67a26977691,
+and focused HA fixture385401b07e232dc5a29c5cbf6dba968f323d492f916668b3955d74e1a4eb859c
+have independent SOURCE GO. Actual HA pause bypass RED -> GREEN and11 actual HA
+cases cover all5operations, shared busy, stale poll/route/expiry, sequence, UNKNOWN
+and classification failures. Formatter AST identity retains tested behavior.
+Configured Native Play/resume/Pause/Next/Previous/Volume now use bound Commands;
+there is no Spotify fallback after Native failure and no optimistic accepted truth.
+Proven non-Native and no-config legacy behavior remain distinct. Seek/shuffle/repeat,
+selected content/library and source selection remain open; selected track/playlist
+caller reuse is the next separate increment. No new public release or Green effects.
+
+### Control24 read-only v3 — independent SOURCE GO
+
+Exact frozen six-file patch44fce2add49f0051a6c2c4a0cb5c36b6eea2542a33c1af9aa943cfa88da81be4
+and SOURCE-PINS19494285aa14b8e93ebe23d1c2289f9bda9a6c1bdf498608943f5ebd1769340a
+received independent adversarial SOURCE GO;29 affected actual HA cases pass.
+Both v3 opt-ins are required, v1/v2 unchanged; reads create no offers/sequences or
+effects, retain original source/5s freshness and recheck owner after Native/C waits.
+Actual action intersection and base/effective volume are observation, not authority.
+Settlement reads existing receipts only; no correlated Native effect echo exists,
+so accepted/current-looking playback cannot become confirmed. Pending/rejected/
+superseded/unknown are honest intermediate outcomes. PV adapter, HA ingress, Native
+settlement, queue occurrence, PC70/PC13, integration/release/Green remain open.
+
 ## Control23 source result — reviewed, not yet installed
 
 Root implemented paired wall/monotonic clock capture before queue metadata work.

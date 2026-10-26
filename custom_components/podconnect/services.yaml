@@ -638,9 +638,9 @@ prepare_room_selected_content:
       required: true
       selector:
         select:
-          options: [play_track, play_context]
+          options: [play_track, play_context, play_episode]
     args:
-      description: Exactly track_uri or context_uri plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
+      description: Exactly track_uri, context_uri or episode_uri for the selected action, plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
       required: true
       selector:
         object:
@@ -701,9 +701,9 @@ start_room_selected_content:
       required: true
       selector:
         select:
-          options: [play_track, play_context]
+          options: [play_track, play_context, play_episode]
     args:
-      description: Exactly track_uri or context_uri plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
+      description: Exactly track_uri, context_uri or episode_uri for the selected action, plus max_volume as an integer 35 to 100; server-resolved source and human-approved ceiling.
       required: true
       selector:
         object:

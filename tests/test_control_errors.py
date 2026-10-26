@@ -4,9 +4,11 @@ Only the method is extracted, so these are unit regressions, not HA integration 
 """
 import ast
 import asyncio
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
+
+from test_playback_targets import PKG, HAError, T, selection_context, services
 
 SOURCE = Path(__file__).parents[1] / 'custom_components/podconnect/media_player.py'
 
@@ -15,15 +17,21 @@ class SpotifyApiError(Exception):
     pass
 
 
-class HomeAssistantError(Exception):
-    pass
+HomeAssistantError = HAError
 
 
 def load_send(name="_send"):
     tree = ast.parse(SOURCE.read_text())
     method = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
     module = ast.Module(body=[method], type_ignores=[])
-    namespace = dict(asyncio=asyncio, SpotifyApiError=SpotifyApiError, HomeAssistantError=HomeAssistantError)
+    namespace = dict(
+        __name__=PKG + ".media_player",
+        __package__=PKG,
+        asyncio=asyncio,
+        SpotifyApiError=SpotifyApiError,
+        HomeAssistantError=HomeAssistantError,
+        select_playback_source=T["select_playback_source"],
+    )
     exec(compile(module, str(SOURCE), 'exec'), namespace)
     return namespace[name]
 
@@ -65,6 +73,9 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
     async def test_library_errors_and_empty_results_do_not_play(self):
         for result in (SpotifyApiError('HTTP 403'), []):
             entity = Mock()
+            _, runtime, _, _ = services()
+            entity.coordinator = runtime.coordinator
+            entity._entry_id, entity._device_id = "account-A", "entity-device"
             entity._command_generation = 0
             entity.coordinator.poll_sequence = 0
             entity.coordinator.api.saved_tracks = AsyncMock()
@@ -88,6 +99,9 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_search_match_does_not_play(self):
         entity = Mock()
+        _, runtime, _, _ = services()
+        entity.coordinator = runtime.coordinator
+        entity._entry_id, entity._device_id = "account-A", "entity-device"
         entity._command_generation = 0
         entity.coordinator.poll_sequence = 0
         entity._search_top_uri = AsyncMock(return_value=None)
@@ -98,9 +112,14 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_device_does_not_transfer(self):
         entity = Mock()
+        _, runtime, _, _ = services()
+        entity.coordinator = runtime.coordinator
+        entity._entry_id, entity._device_id = "account-A", "entity-device"
         entity._command_generation = 0
         entity.coordinator.poll_sequence = 0
         entity.coordinator.data = {'devices': []}
+        entity.coordinator.api.devices.return_value = []
+        selection_context(runtime)
         entity._send = AsyncMock()
         with self.assertRaisesRegex(HomeAssistantError, 'unavailable'):
             await load_send('async_select_source')(entity, 'Kitchen')

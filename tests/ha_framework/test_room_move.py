@@ -2,7 +2,10 @@
 
 import asyncio
 import copy
+import hashlib
+import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import voluptuous as vol
 from aiohttp import web
@@ -12,6 +15,79 @@ from custom_components.podconnect.room_move import valid_move_receipt
 
 
 class RoomMoveFrameworkTests(RoomContentFrameworkTests):
+    async def test_current_completed_move_rejects_later_operation(self):
+        request = self.move_request()
+        self.assertEqual(
+            (await self.move_invoke("prepare_room_move_playback", request))["state"],
+            "staged",
+        )
+        receipt = await self.move_invoke("move_room_playback", request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        data = self.entries[0].runtime_data
+        native = {
+            **self.native(),
+            "target_id": request["target_id"],
+            "room_id": request["room_id"],
+            "homepod_id": request["homepod_id"],
+        }
+        route = {**self.route(), "device_id": request["homepod_id"]}
+        identity = [request["config_entry_id"], request["owner_epoch"], native, route]
+        binding_id = hashlib.sha256(
+            json.dumps(
+                identity, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode()
+        ).hexdigest()
+        projection = {
+            "output": {
+                "binding": {
+                    "target_id": request["target_id"],
+                    "native_room_id": request["room_id"],
+                    "homepod_id": request["homepod_id"],
+                    "binding_id": binding_id,
+                }
+            }
+        }
+        witness = {
+            "schema": "podconnect.native_completed_current.v1",
+            "offer_id": request["move_offer"]["offer_id"],
+            "binding_id": request["move_offer"]["binding_id"],
+            "operation_id": request["move_offer"]["offer_id"],
+            "native": native,
+            "route": route,
+            "target": {
+                "process": route["process"],
+                "device_id": route["device_id"],
+                "device_incarnation": route["device_incarnation"],
+            },
+            "physical_result_verified": False,
+        }
+        with (
+            patch.object(
+                data.speakers, "room_move_current", AsyncMock(return_value=witness)
+            ),
+            patch.object(
+                data.commands.room_transport,
+                "observe",
+                AsyncMock(return_value={"native": native, "route": route}),
+            ),
+        ):
+
+            async def read():
+                return await data.commands.settlement(
+                    self.hass,
+                    request["config_entry_id"],
+                    request["request_id"],
+                    request["command_sequence"],
+                    projection,
+                )
+
+            self.assertEqual((await read())["status"], "confirmed")
+            witness["operation_id"] = "f" * 32
+            self.assertEqual((await read())["status"], "unknown")
+            witness["operation_id"] = request["move_offer"]["offer_id"]
+            data.commands.command_sequence += 1
+            self.assertEqual((await read())["status"], "superseded")
+
     async def asyncSetUp(self):
         self.move_posts = []
         self.move_hold = False

@@ -16,9 +16,11 @@ on:
       - ".github/fixtures/**"
   workflow_dispatch:
 
+# Keep producers and the composed-fixture consumer on one supported ABI.
+# ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -45,10 +47,12 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/selected-content-clock-native.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/selected-content-clock-native.patch"
-          git apply "$fixture_dir/selected-content-clock-native.patch"
+          # These are the same final Native suffix slots used by Docker.
+          # The unified tests already include the selected-content clock fixture.
+          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
       - name: Test Native queue, transport, output and retained packages
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
       - name: Reuse tested Native package cache for composed fixture binary
@@ -65,7 +69,7 @@ jobs:
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -148,23 +152,14 @@ jobs:
           sed "s@ /patches/@ $patch_dir/@" "$patch_dir/move-first-pcm-clock-owntone.sha256" | sha256sum -c -
           git apply --check "$patch_dir/move-first-pcm-clock-owntone.patch"
           git apply "$patch_dir/move-first-pcm-clock-owntone.patch"
-          # Fixture-only macro scope; no production OwnTone source or Docker image change.
-          fixture_dir="$GITHUB_WORKSPACE/.github/fixtures"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/airplay-callback-owner-db-save.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/airplay-callback-owner-db-save.patch"
-          git apply "$fixture_dir/airplay-callback-owner-db-save.patch"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-retired-autostart-ci.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/connect-retired-autostart-ci.patch"
-          git apply "$fixture_dir/connect-retired-autostart-ci.patch"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-resume-prepcm-busy-ci.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/connect-resume-prepcm-busy-ci.patch"
-          git apply "$fixture_dir/connect-resume-prepcm-busy-ci.patch"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/connect-retired-owner-detach-ci.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/connect-retired-owner-detach-ci.patch"
-          git apply "$fixture_dir/connect-retired-owner-detach-ci.patch"
-          sed "s@ .github/fixtures/@ $fixture_dir/@" "$fixture_dir/ordinary-pause-ack-ci.sha256" | sha256sum -c -
-          git apply --check "$fixture_dir/ordinary-pause-ack-ci.patch"
-          git apply "$fixture_dir/ordinary-pause-ack-ci.patch"
+          # The same Docker suffix includes the prior five CI-only fixtures.
+          for checksum in room-release-owntone.sha256 room-owner-parity-owntone.sha256; do
+            sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$checksum" | sha256sum -c -
+          done
+          for patch in room-release-owntone.patch room-release-owntone-tests.patch room-release-owntone-timer-tests.patch room-release-owntone-target2-tests.patch room-owner-parity-owntone.patch room-owner-parity-owntone-tests.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -216,7 +211,7 @@ jobs:
 
   selected-start-clock:
     needs: [build-fork, build-owntone]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -248,3 +243,6 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_METADATA_PRESENT=1 PC_REQUIRE_RTP_AUDIO=1 PC_HOLD_START_SETUP=1 PC_REQUIRE_FIRST_SYNC_CLOCK=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-selected-rtp
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_METADATA_PRESENT=1 PC_REQUIRE_RTP_AUDIO=1 PC_LATE_PAUSED_RESUME=1 PC_REQUIRE_FIRST_SYNC_CLOCK=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-paused
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_START_EXPECT_PAUSE_RETAINED=1 PC_NATIVE_START_EXPECT_PAUSE_LOSS=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-native-pause
+          cold_root="$(mktemp -d /tmp/pc70-cold.XXXXXX)"
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_REQUIRE_RTP_AUDIO=1 PC70_ROLLBACK_COMPAT=1 PC70_COLD_DATABASE="$cold_root/release.db" PC70_COLD_FIFO="$cold_root/release.fifo" PC70_RELEASE_COMPOSE=move python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-selected-rtp
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_REQUIRE_RTP_AUDIO=1 PC70_ROLLBACK_COMPAT=1 PC70_COLD_DATABASE="$cold_root/release.db" PC70_COLD_FIFO="$cold_root/release.fifo" PC70_COLD_RESTART=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-selected-rtp

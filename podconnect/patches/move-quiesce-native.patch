@@ -1,0 +1,133 @@
+--- a/output/start35.go
++++ b/output/start35.go
+@@ -25,10 +25,13 @@
+ 		return err
+ 	}
+ 	defer out.lock.Unlock()
++	return out.withStartLockLocked(apply, false)
++}
++func (out *pipeOutput) withStartLockLocked(apply func(PipeIdentity, func(bool)) error, preserveMovePCM bool) error {
+ 	if out.closed {
+ 		return fmt.Errorf("start pipe closed")
+ 	}
+-	if out.startFenced.Load() {
++	if out.startFenced.Load() && !preserveMovePCM {
+ 		out.pendingPCM = nil
+ 		out.pendingErr = nil
+ 	}
+--- a/output/room_move.go
++++ b/output/room_move.go
+@@ -1,6 +1,12 @@
+ package output
+ 
+-import "strconv"
++import (
++	"context"
++	"errors"
++	"os"
++	"strconv"
++	"time"
++)
+ 
+ // MovePipeIdentity is the actual writer descriptor and its fstat identity.
+ // FD is a private transport proof, never a pathname or public control field.
+@@ -36,3 +42,73 @@
+ 	out.startFenced.Store(fenced)
+ 	out.cond.Broadcast()
+ }
++
++// MoveControlPipeOutput adds the existing pipe control interruption only for an
++// admitted MOVE quiesce. Read-only transport observations keep WithStartLock.
++type MoveControlPipeOutput interface {
++	MovePipeOutput
++	OpenedWriterIdentity() MovePipeIdentity
++	WithMoveControlLock(context.Context, func(PipeIdentity, func(bool)) error) error
++	WithMoveLock(context.Context, func(PipeIdentity, func(bool)) error) error
++}
++
++func (out *pipeOutput) WithMoveControlLock(ctx context.Context, apply func(PipeIdentity, func(bool)) error) (err error) {
++	if err = ctx.Err(); err != nil {
++		return err
++	}
++	if err = LockTransport(ctx, &out.control); err != nil {
++		return err
++	}
++	if err = ctx.Err(); err != nil {
++		out.control.Unlock()
++		return err
++	}
++	out.controlPending.Store(true)
++	var announcementErr error
++	if !out.fileClosed {
++		if e := out.file.SetWriteDeadline(time.Now()); e != nil && !errors.Is(e, os.ErrClosed) {
++			announcementErr = e
++		}
++	}
++
++	// This is the same single waiter/ownership transfer as LockTransport.
++	// Cancellation returns to the caller; the waiter joins the interrupted
++	// write before restoring its deadline and broadcasting under the lock.
++	if !out.lock.TryLock() {
++		acquired := make(chan struct{})
++		go func() {
++			out.lock.Lock()
++			select {
++			case acquired <- struct{}{}:
++			case <-ctx.Done():
++				_ = out.unlockControl()
++			}
++		}()
++		select {
++		case <-acquired:
++		case <-ctx.Done():
++			return errors.Join(announcementErr, ctx.Err())
++		}
++	}
++	defer func() { err = errors.Join(err, out.unlockControl()) }()
++	if err = ctx.Err(); err != nil {
++		return errors.Join(announcementErr, err)
++	}
++	if announcementErr != nil {
++		return announcementErr
++	}
++	return out.withStartLockLocked(apply, true)
++}
++
++// WithMoveLock retains the already quiesced writer's unread PCM through its
++// alias switch, resume or abort. It does not announce a control interruption.
++func (out *pipeOutput) WithMoveLock(ctx context.Context, apply func(PipeIdentity, func(bool)) error) error {
++	if err := LockTransport(ctx, &out.lock); err != nil {
++		return err
++	}
++	defer out.lock.Unlock()
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	return out.withStartLockLocked(apply, true)
++}
+--- a/player/room_move.go
++++ b/player/room_move.go
+@@ -75,7 +75,22 @@
+ 			return result, fmt.Errorf("move snapshot unavailable or epoch exhausted")
+ 		}
+ 	}
+-	err = pipe.WithStartLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
++	withLock := pipe.WithStartLock
++	if command.phase == "switch" || command.phase == "resume" || command.phase == "abort" {
++		controlled, ok := pipe.(output.MoveControlPipeOutput)
++		if !ok {
++			return result, fmt.Errorf("move state owner unavailable")
++		}
++		withLock = controlled.WithMoveLock
++	}
++	if command.phase == "quiesce" {
++		controlled, ok := pipe.(output.MoveControlPipeOutput)
++		if !ok || command.ctx.Err() != nil || command.pipe != controlled.OpenedWriterIdentity() || command.epoch != strconv.FormatUint(p.startEpoch, 10) || p.movePipe != command.pipe || p.moveSource != command.expectedSource || p.movePlaying != command.wasPlaying {
++			return result, fmt.Errorf("move control owner changed")
++		}
++		withLock = controlled.WithMoveControlLock
++	}
++	err = withLock(command.ctx, func(identity output.PipeIdentity, _ func(bool)) error {
+ 		lock, ok := source.cond.L.(*sync.Mutex)
+ 		if !ok {
+ 			return fmt.Errorf("native source lock unavailable")

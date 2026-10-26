@@ -1,0 +1,1803 @@
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -262,3 +262,5 @@
+ EXTRA_DIST += ../tests/start_streaming_owner.inc.c
+ 
+ EXTRA_DIST += outputs_queue.inc.c httpd_jsonapi_queue.inc.c
++
++EXTRA_DIST += outputs_release.inc.c httpd_jsonapi_release.inc.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1925,6 +1925,7 @@
+ { return transport_parse_body_limit(buffer,1024); }
+ 
+ #include "httpd_jsonapi_transport_bound.inc.c"
++#include "httpd_jsonapi_release.inc.c"
+ 
+ static int
+ jsonapi_reply_transport_write(struct httpd_request *hreq)
+@@ -1934,21 +1935,32 @@
+   bool bound=!strncmp(hreq->path_parts[4],"bound-",6);
+   const char *phase=hreq->path_parts[4]+(bound?6:0);
+   json_object *body=(bound ? transport_parse_body_limit(hreq->in_body,8192) : transport_parse_body(hreq->in_body)), *reply, *percent;
+-  bool commit=!strcmp(phase,"commit"), volume,queue;
++  bool commit = !strcmp(phase, "commit"), volume, queue, release;
+   int expected, ret=HTTP_BADREQUEST;
+   if (!body || !json_object_is_type(body,json_type_object)
+       || safe_atou64(hreq->path_parts[2],&request.device_id)<0
+       || !transport_json_string(body,"native_prepare_id",request.native_prepare_id,sizeof(request.native_prepare_id))
+       || !transport_json_string(body,"args_digest",request.args_digest,sizeof(request.args_digest))
+       || !transport_json_string(body,"action",request.action,sizeof(request.action))) goto out;
+-  volume=!strcmp(request.action,"volume");queue=!strcmp(request.action,"queue");
++  volume = !strcmp(request.action, "volume");
++  queue = !strcmp(request.action, "queue");
++  release = !strcmp(request.action, "release");
++  if (release && !bound)
++    goto out;
+   if(queue && !bound)goto out;
+   request.bound=bound;
+-  expected=3+(commit?2:0)+(volume?1:0)+(bound?2:0)+(queue?2:0);
++  expected = 3 + (commit ? 2 : 0) + (volume ? 1 : 0) + (bound ? 2 : 0) + (queue ? 2 : 0) + (release ? 2 : 0);
+   if (bound && transport_native_parse(body,&request.native_owner,&request.native_revision)<0) goto out;
+   if(queue && (!queue_wire_hex(request.native_owner.alias_incarnation,32) || !queue_wire_hex(request.native_owner.alias_registry,64)))goto out;
+   if (json_object_object_length(body)!=expected) goto out;
+   if(queue && (queue_selection_parse(body,&request.queue,&request.native_owner)<0 || queue_writer_parse(body,&request.writer)<0))goto out;
++  if (release)
++    {
++      char purpose[32];
++      if (!transport_json_string(body, "purpose", purpose, sizeof(purpose)) || strcmp(purpose, "manual_release_v1")
++          || queue_writer_parse(body, &request.writer) < 0)
++	goto out;
++    }
+   if (commit && (!transport_json_string(body,"token",request.token,sizeof(request.token))
+       || !transport_json_string(body,"expected_input_path_digest",request.expected_input_path_digest,sizeof(request.expected_input_path_digest)))) goto out;
+   if(queue && commit && strcmp(request.expected_input_path_digest,request.writer.input_path_digest))goto out;
+@@ -1960,6 +1972,11 @@
+     }
+   ret=409;
+   if ((commit ? player_transport_commit(&request,&result) : player_transport_prepare(&request,&result))<0) goto out;
++  if (release && commit)
++    {
++      ret = transport_json_reply(hreq, transport_release_json(&result, false, true));
++      goto out;
++    }
+   reply=json_object_new_object();
+   json_object_object_add(reply,"schema",json_object_new_string(queue ? (commit ? "podconnect.output_queue_commit.v1" : "podconnect.output_queue_prepare.v1") : bound ? (commit ? "podconnect.output_transport_commit.v2" : "podconnect.output_transport_prepare.v2") : (commit ? "podconnect.output_transport_commit.v1" : "podconnect.output_transport_prepare.v1")));
+   json_object_object_add(reply,"ok",json_object_new_boolean(true));
+@@ -1994,6 +2011,9 @@
+   bool bound=!strcmp(hreq->path_parts[4],"bound-result");
+   if (safe_atou64(hreq->path_parts[2],&id)<0
+       || player_transport_result_get(hreq->path_parts[5],&result)<0 || result.identity.device_id!=id || bound!=result.command.bound || !strcmp(result.command.action,"queue")) return HTTP_NOTFOUND;
++  if (!strcmp(result.command.action, "release"))
++    return transport_json_reply(
++        hreq, transport_release_json(&result, !result.release_durable_pending || result.release_terminal, true));
+   reply=json_object_new_object();
+   json_object_object_add(reply,"schema",json_object_new_string(bound ? "podconnect.output_transport_result.v2" : "podconnect.output_transport_result.v1"));
+   if (bound) transport_native_binding_json(reply,&result.command.native_owner,result.command.native_revision);
+@@ -5152,114 +5172,118 @@
+   return HTTP_OK;
+ }
+ 
+-
+-static struct httpd_uri_map adm_handlers[] =
+-  {
+-    { HTTPD_METHOD_GET,    "^/api/config$",                                jsonapi_reply_config },
+-    { HTTPD_METHOD_GET,    "^/api/settings$",                              jsonapi_reply_settings_get },
+-    { HTTPD_METHOD_GET,    "^/api/settings/[A-Za-z0-9_]+$",                jsonapi_reply_settings_category_get },
+-    { HTTPD_METHOD_GET,    "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",  jsonapi_reply_settings_option_get },
+-    { HTTPD_METHOD_PUT,    "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",  jsonapi_reply_settings_option_put },
+-    { HTTPD_METHOD_DELETE, "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",  jsonapi_reply_settings_option_delete },
+-    { HTTPD_METHOD_GET,    "^/api/library$",                               jsonapi_reply_library },
+-    { HTTPD_METHOD_GET |
+-      HTTPD_METHOD_PUT,    "^/api/update$",                                jsonapi_reply_update },
+-    { HTTPD_METHOD_PUT,    "^/api/rescan$",                                jsonapi_reply_meta_rescan },
+-    { HTTPD_METHOD_GET,    "^/api/spotify-logout$",                        jsonapi_reply_spotify_logout },
+-    { HTTPD_METHOD_GET,    "^/api/spotify$",                               jsonapi_reply_spotify },
+-    { HTTPD_METHOD_GET,    "^/api/pairing$",                               jsonapi_reply_pairing_get },
+-    { HTTPD_METHOD_POST,   "^/api/pairing$",                               jsonapi_reply_pairing_pair },
+-    { HTTPD_METHOD_POST,   "^/api/lastfm-login$",                          jsonapi_reply_lastfm_login },
+-    { HTTPD_METHOD_GET,    "^/api/lastfm-logout$",                         jsonapi_reply_lastfm_logout },
+-    { HTTPD_METHOD_GET,    "^/api/lastfm$",                                jsonapi_reply_lastfm },
+-    { HTTPD_METHOD_POST,   "^/api/verification$",                          jsonapi_reply_verification },
+-
+-    { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
+-    { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
+-    { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/start/(state|prepare|commit|barrier|open|complete|cancel)$", jsonapi_reply_start_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/start/result/[a-f0-9]+$", jsonapi_reply_start_result },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/move/(state|prepare|commit|barrier|open|complete|cancel)$", jsonapi_reply_move_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/move/result/[a-f0-9]+$", jsonapi_reply_move_result },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/(start|move)/retire/(prepare|complete)$", jsonapi_reply_retirement_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/(start|move)/retire/result/[a-f0-9]+$", jsonapi_reply_retirement_result },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-state$", jsonapi_reply_transport_bound_state },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-pause-confirm$", jsonapi_reply_transport_pause_confirm },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/bound-(prepare|commit)$", jsonapi_reply_transport_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/bound-result/[a-f0-9]+$", jsonapi_reply_transport_result },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/bound-state$", jsonapi_reply_room_volume_state },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/bound-(prepare|commit|cancel)$", jsonapi_reply_room_volume_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/bound-result/[a-f0-9]+$", jsonapi_reply_room_volume_result },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/state$", jsonapi_reply_room_volume_state },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/volume/(prepare|commit|cancel)$", jsonapi_reply_room_volume_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/volume/result/[a-f0-9]+$", jsonapi_reply_room_volume_result },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/state$", jsonapi_reply_transport_state },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/prepare$", jsonapi_reply_transport_write },
+-    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/transport/commit$", jsonapi_reply_transport_write },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/transport/result/[a-f0-9-]+$", jsonapi_reply_transport_result },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_get },
+-    { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/attention$",        jsonapi_reply_output_attention_put },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/attention/[[:digit:]]+$", jsonapi_reply_output_attention_result },
+-    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
+-    { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
+-    { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
+-
+-    { HTTPD_METHOD_GET,    "^/api/player$",                                jsonapi_reply_player },
+-    { HTTPD_METHOD_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
+-    { HTTPD_METHOD_PUT,    "^/api/player/pause$",                          jsonapi_reply_player_pause },
+-    { HTTPD_METHOD_PUT,    "^/api/player/stop$",                           jsonapi_reply_player_stop },
+-    { HTTPD_METHOD_PUT,    "^/api/player/toggle$",                         jsonapi_reply_player_toggle },
+-    { HTTPD_METHOD_PUT,    "^/api/player/next$",                           jsonapi_reply_player_next },
+-    { HTTPD_METHOD_PUT,    "^/api/player/previous$",                       jsonapi_reply_player_previous },
+-    { HTTPD_METHOD_PUT,    "^/api/player/shuffle$",                        jsonapi_reply_player_shuffle },
+-    { HTTPD_METHOD_PUT,    "^/api/player/repeat$",                         jsonapi_reply_player_repeat },
+-    { HTTPD_METHOD_PUT,    "^/api/player/consume$",                        jsonapi_reply_player_consume },
+-    { HTTPD_METHOD_PUT,    "^/api/player/volume$",                         jsonapi_reply_player_volume },
+-    { HTTPD_METHOD_PUT,    "^/api/player/seek$",                           jsonapi_reply_player_seek },
+-
+-    { HTTPD_METHOD_GET,    "^/api/queue$",                                 jsonapi_reply_queue },
+-    { HTTPD_METHOD_PUT,    "^/api/queue/clear$",                           jsonapi_reply_queue_clear },
+-    { HTTPD_METHOD_POST,   "^/api/queue/items/add$",                       jsonapi_reply_queue_tracks_add },
+-    { HTTPD_METHOD_PUT,    "^/api/queue/items/[[:digit:]]+$",              jsonapi_reply_queue_tracks_update },
+-    { HTTPD_METHOD_PUT,    "^/api/queue/items/now_playing$",               jsonapi_reply_queue_tracks_update },
+-    { HTTPD_METHOD_DELETE, "^/api/queue/items/[[:digit:]]+$",              jsonapi_reply_queue_tracks_delete },
+-    { HTTPD_METHOD_POST,   "^/api/queue/save$",                            jsonapi_reply_queue_save},
+-
+-    { HTTPD_METHOD_GET,    "^/api/library/playlists$",                     jsonapi_reply_library_playlists },
+-    { HTTPD_METHOD_GET,    "^/api/library/playlists/[[:digit:]]+$",        jsonapi_reply_library_playlist_get },
+-    { HTTPD_METHOD_PUT,    "^/api/library/playlists/[[:digit:]]+$",        jsonapi_reply_library_playlist_put },
+-    { HTTPD_METHOD_GET,    "^/api/library/playlists/[[:digit:]]+/tracks$", jsonapi_reply_library_playlist_tracks },
+-    { HTTPD_METHOD_PUT,    "^/api/library/playlists/[[:digit:]]+/tracks",  jsonapi_reply_library_playlist_tracks_put_byid},
+-//    { HTTPD_METHOD_POST,   "^/api/library/playlists/[[:digit:]]+/tracks$", jsonapi_reply_library_playlists_tracks },
+-    { HTTPD_METHOD_DELETE, "^/api/library/playlists/[[:digit:]]+$",        jsonapi_reply_library_playlist_delete },
+-    { HTTPD_METHOD_GET,    "^/api/library/playlists/[[:digit:]]+/playlists", jsonapi_reply_library_playlist_playlists },
+-    { HTTPD_METHOD_GET,    "^/api/library/artists$",                       jsonapi_reply_library_artists },
+-    { HTTPD_METHOD_GET,    "^/api/library/artists/[[:digit:]]+$",          jsonapi_reply_library_artist },
+-    { HTTPD_METHOD_GET,    "^/api/library/artists/[[:digit:]]+/albums$",   jsonapi_reply_library_artist_albums },
+-    { HTTPD_METHOD_GET,    "^/api/library/albums$",                        jsonapi_reply_library_albums },
+-    { HTTPD_METHOD_GET,    "^/api/library/albums/[[:digit:]]+$",           jsonapi_reply_library_album },
+-    { HTTPD_METHOD_GET,    "^/api/library/albums/[[:digit:]]+/tracks$",    jsonapi_reply_library_album_tracks },
+-    { HTTPD_METHOD_PUT,    "^/api/library/albums/[[:digit:]]+/tracks$",    jsonapi_reply_library_album_tracks_put_byid },
+-    { HTTPD_METHOD_PUT,    "^/api/library/tracks$",                        jsonapi_reply_library_tracks_put },
+-    { HTTPD_METHOD_GET,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_get_byid },
+-    { HTTPD_METHOD_PUT,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_put_byid },
+-    { HTTPD_METHOD_GET,    "^/api/library/tracks/[[:digit:]]+/playlists$", jsonapi_reply_library_track_playlists },
+-    { HTTPD_METHOD_GET,    "^/api/library/(genres|composers)$",            jsonapi_reply_library_browse },
+-    { HTTPD_METHOD_GET,    "^/api/library/(genres|composers)/.*$",         jsonapi_reply_library_browseitem },
+-    { HTTPD_METHOD_GET,    "^/api/library/count$",                         jsonapi_reply_library_count },
+-    { HTTPD_METHOD_GET,    "^/api/library/files$",                         jsonapi_reply_library_files },
+-    { HTTPD_METHOD_POST,   "^/api/library/add$",                           jsonapi_reply_library_add },
+-    { HTTPD_METHOD_PUT,    "^/api/library/backup$",                        jsonapi_reply_library_backup },
+-
+-    { HTTPD_METHOD_GET,    "^/api/search$",                                jsonapi_reply_search },
+-
+-    { HTTPD_METHOD_GET,    "^/api/listenbrainz$",                          jsonapi_reply_listenbrainz },
+-    { HTTPD_METHOD_POST,   "^/api/listenbrainz/token$",                    jsonapi_reply_listenbrainz_token_add },
+-    { HTTPD_METHOD_DELETE, "^/api/listenbrainz/token$",                    jsonapi_reply_listenbrainz_token_delete },
+-
+-    { 0, NULL, NULL }
+-  };
+-
++static struct httpd_uri_map adm_handlers[] = {
++  { HTTPD_METHOD_GET,                    "^/api/config$",                                                                         jsonapi_reply_config                           },
++  { HTTPD_METHOD_GET,                    "^/api/settings$",                                                                       jsonapi_reply_settings_get                     },
++  { HTTPD_METHOD_GET,                    "^/api/settings/[A-Za-z0-9_]+$",                                                         jsonapi_reply_settings_category_get            },
++  { HTTPD_METHOD_GET,                    "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",                                           jsonapi_reply_settings_option_get              },
++  { HTTPD_METHOD_PUT,                    "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",                                           jsonapi_reply_settings_option_put              },
++  { HTTPD_METHOD_DELETE,                 "^/api/settings/[A-Za-z0-9_]+/[A-Za-z0-9_]+$",                                           jsonapi_reply_settings_option_delete           },
++  { HTTPD_METHOD_GET,                    "^/api/library$",                                                                        jsonapi_reply_library                          },
++  { HTTPD_METHOD_GET | HTTPD_METHOD_PUT, "^/api/update$",                                                                         jsonapi_reply_update                           },
++  { HTTPD_METHOD_PUT,                    "^/api/rescan$",                                                                         jsonapi_reply_meta_rescan                      },
++  { HTTPD_METHOD_GET,                    "^/api/spotify-logout$",                                                                 jsonapi_reply_spotify_logout                   },
++  { HTTPD_METHOD_GET,                    "^/api/spotify$",                                                                        jsonapi_reply_spotify                          },
++  { HTTPD_METHOD_GET,                    "^/api/pairing$",                                                                        jsonapi_reply_pairing_get                      },
++  { HTTPD_METHOD_POST,                   "^/api/pairing$",                                                                        jsonapi_reply_pairing_pair                     },
++  { HTTPD_METHOD_POST,                   "^/api/lastfm-login$",                                                                   jsonapi_reply_lastfm_login                     },
++  { HTTPD_METHOD_GET,                    "^/api/lastfm-logout$",                                                                  jsonapi_reply_lastfm_logout                    },
++  { HTTPD_METHOD_GET,                    "^/api/lastfm$",                                                                         jsonapi_reply_lastfm                           },
++  { HTTPD_METHOD_POST,                   "^/api/verification$",                                                                   jsonapi_reply_verification                     },
++
++  { HTTPD_METHOD_GET,                    "^/api/outputs$",                                                                        jsonapi_reply_outputs                          },
++  { HTTPD_METHOD_PUT,                    "^/api/outputs/set$",                                                                    jsonapi_reply_outputs_set                      },
++  { HTTPD_METHOD_POST,                   "^/api/select-outputs$",                                                                 jsonapi_reply_outputs_set                      }, // deprecated: use "/api/outputs/set"
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/start/(state|prepare|commit|barrier|open|complete|cancel)$",
++   jsonapi_reply_start_write                                                                                                                                                     },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/start/result/[a-f0-9]+$",                                    jsonapi_reply_start_result                     },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/move/(state|prepare|commit|barrier|open|complete|cancel)$",
++   jsonapi_reply_move_write                                                                                                                                                      },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/move/result/[a-f0-9]+$",                                     jsonapi_reply_move_result                      },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/(start|move)/retire/(prepare|complete)$",
++   jsonapi_reply_retirement_write                                                                                                                                                },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/(start|move)/retire/result/[a-f0-9]+$",
++   jsonapi_reply_retirement_result                                                                                                                                               },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/bound-state$",                                     jsonapi_reply_transport_bound_state            },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/bound-pause-confirm$",
++   jsonapi_reply_transport_pause_confirm                                                                                                                                         },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/bound-release-confirm$",
++   jsonapi_reply_transport_release_confirm                                                                                                                                       },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/bound-(prepare|commit)$",                          jsonapi_reply_transport_write                  },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/transport/bound-result/[a-f0-9]+$",                          jsonapi_reply_transport_result                 },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/volume/bound-state$",                                        jsonapi_reply_room_volume_state                },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/volume/bound-(prepare|commit|cancel)$",
++   jsonapi_reply_room_volume_write                                                                                                                                               },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/volume/bound-result/[a-f0-9]+$",                             jsonapi_reply_room_volume_result               },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/volume/state$",                                              jsonapi_reply_room_volume_state                },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/volume/(prepare|commit|cancel)$",                            jsonapi_reply_room_volume_write                },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/volume/result/[a-f0-9]+$",                                   jsonapi_reply_room_volume_result               },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/transport/state$",                                           jsonapi_reply_transport_state                  },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/prepare$",                                         jsonapi_reply_transport_write                  },
++  { HTTPD_METHOD_POST,                   "^/api/outputs/[[:digit:]]+/transport/commit$",                                          jsonapi_reply_transport_write                  },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/transport/result/[a-f0-9-]+$",                               jsonapi_reply_transport_result                 },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/attention$",                                                 jsonapi_reply_output_attention_get             },
++  { HTTPD_METHOD_PUT,                    "^/api/outputs/[[:digit:]]+/attention$",                                                 jsonapi_reply_output_attention_put             },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+/attention/[[:digit:]]+$",                                    jsonapi_reply_output_attention_result          },
++  { HTTPD_METHOD_GET,                    "^/api/outputs/[[:digit:]]+$",                                                           jsonapi_reply_outputs_get_byid                 },
++  { HTTPD_METHOD_PUT,                    "^/api/outputs/[[:digit:]]+$",                                                           jsonapi_reply_outputs_put_byid                 },
++  { HTTPD_METHOD_PUT,                    "^/api/outputs/[[:digit:]]+/toggle$",                                                    jsonapi_reply_outputs_toggle_byid              },
++
++  { HTTPD_METHOD_GET,                    "^/api/player$",                                                                         jsonapi_reply_player                           },
++  { HTTPD_METHOD_PUT,                    "^/api/player/play$",                                                                    jsonapi_reply_player_play                      },
++  { HTTPD_METHOD_PUT,                    "^/api/player/pause$",                                                                   jsonapi_reply_player_pause                     },
++  { HTTPD_METHOD_PUT,                    "^/api/player/stop$",                                                                    jsonapi_reply_player_stop                      },
++  { HTTPD_METHOD_PUT,                    "^/api/player/toggle$",                                                                  jsonapi_reply_player_toggle                    },
++  { HTTPD_METHOD_PUT,                    "^/api/player/next$",                                                                    jsonapi_reply_player_next                      },
++  { HTTPD_METHOD_PUT,                    "^/api/player/previous$",                                                                jsonapi_reply_player_previous                  },
++  { HTTPD_METHOD_PUT,                    "^/api/player/shuffle$",                                                                 jsonapi_reply_player_shuffle                   },
++  { HTTPD_METHOD_PUT,                    "^/api/player/repeat$",                                                                  jsonapi_reply_player_repeat                    },
++  { HTTPD_METHOD_PUT,                    "^/api/player/consume$",                                                                 jsonapi_reply_player_consume                   },
++  { HTTPD_METHOD_PUT,                    "^/api/player/volume$",                                                                  jsonapi_reply_player_volume                    },
++  { HTTPD_METHOD_PUT,                    "^/api/player/seek$",                                                                    jsonapi_reply_player_seek                      },
++
++  { HTTPD_METHOD_GET,                    "^/api/queue$",                                                                          jsonapi_reply_queue                            },
++  { HTTPD_METHOD_PUT,                    "^/api/queue/clear$",                                                                    jsonapi_reply_queue_clear                      },
++  { HTTPD_METHOD_POST,                   "^/api/queue/items/add$",                                                                jsonapi_reply_queue_tracks_add                 },
++  { HTTPD_METHOD_PUT,                    "^/api/queue/items/[[:digit:]]+$",                                                       jsonapi_reply_queue_tracks_update              },
++  { HTTPD_METHOD_PUT,                    "^/api/queue/items/now_playing$",                                                        jsonapi_reply_queue_tracks_update              },
++  { HTTPD_METHOD_DELETE,                 "^/api/queue/items/[[:digit:]]+$",                                                       jsonapi_reply_queue_tracks_delete              },
++  { HTTPD_METHOD_POST,                   "^/api/queue/save$",                                                                     jsonapi_reply_queue_save                       },
++
++  { HTTPD_METHOD_GET,                    "^/api/library/playlists$",                                                              jsonapi_reply_library_playlists                },
++  { HTTPD_METHOD_GET,                    "^/api/library/playlists/[[:digit:]]+$",                                                 jsonapi_reply_library_playlist_get             },
++  { HTTPD_METHOD_PUT,                    "^/api/library/playlists/[[:digit:]]+$",                                                 jsonapi_reply_library_playlist_put             },
++  { HTTPD_METHOD_GET,                    "^/api/library/playlists/[[:digit:]]+/tracks$",                                          jsonapi_reply_library_playlist_tracks          },
++  { HTTPD_METHOD_PUT,                    "^/api/library/playlists/[[:digit:]]+/tracks",                                           jsonapi_reply_library_playlist_tracks_put_byid },
++  //    { HTTPD_METHOD_POST,   "^/api/library/playlists/[[:digit:]]+/tracks$", jsonapi_reply_library_playlists_tracks },
++  { HTTPD_METHOD_DELETE,                 "^/api/library/playlists/[[:digit:]]+$",                                                 jsonapi_reply_library_playlist_delete          },
++  { HTTPD_METHOD_GET,                    "^/api/library/playlists/[[:digit:]]+/playlists",                                        jsonapi_reply_library_playlist_playlists       },
++  { HTTPD_METHOD_GET,                    "^/api/library/artists$",                                                                jsonapi_reply_library_artists                  },
++  { HTTPD_METHOD_GET,                    "^/api/library/artists/[[:digit:]]+$",                                                   jsonapi_reply_library_artist                   },
++  { HTTPD_METHOD_GET,                    "^/api/library/artists/[[:digit:]]+/albums$",                                            jsonapi_reply_library_artist_albums            },
++  { HTTPD_METHOD_GET,                    "^/api/library/albums$",                                                                 jsonapi_reply_library_albums                   },
++  { HTTPD_METHOD_GET,                    "^/api/library/albums/[[:digit:]]+$",                                                    jsonapi_reply_library_album                    },
++  { HTTPD_METHOD_GET,                    "^/api/library/albums/[[:digit:]]+/tracks$",                                             jsonapi_reply_library_album_tracks             },
++  { HTTPD_METHOD_PUT,                    "^/api/library/albums/[[:digit:]]+/tracks$",                                             jsonapi_reply_library_album_tracks_put_byid    },
++  { HTTPD_METHOD_PUT,                    "^/api/library/tracks$",                                                                 jsonapi_reply_library_tracks_put               },
++  { HTTPD_METHOD_GET,                    "^/api/library/tracks/[[:digit:]]+$",                                                    jsonapi_reply_library_tracks_get_byid          },
++  { HTTPD_METHOD_PUT,                    "^/api/library/tracks/[[:digit:]]+$",                                                    jsonapi_reply_library_tracks_put_byid          },
++  { HTTPD_METHOD_GET,                    "^/api/library/tracks/[[:digit:]]+/playlists$",                                          jsonapi_reply_library_track_playlists          },
++  { HTTPD_METHOD_GET,                    "^/api/library/(genres|composers)$",                                                     jsonapi_reply_library_browse                   },
++  { HTTPD_METHOD_GET,                    "^/api/library/(genres|composers)/.*$",                                                  jsonapi_reply_library_browseitem               },
++  { HTTPD_METHOD_GET,                    "^/api/library/count$",                                                                  jsonapi_reply_library_count                    },
++  { HTTPD_METHOD_GET,                    "^/api/library/files$",                                                                  jsonapi_reply_library_files                    },
++  { HTTPD_METHOD_POST,                   "^/api/library/add$",                                                                    jsonapi_reply_library_add                      },
++  { HTTPD_METHOD_PUT,                    "^/api/library/backup$",                                                                 jsonapi_reply_library_backup                   },
++
++  { HTTPD_METHOD_GET,                    "^/api/search$",                                                                         jsonapi_reply_search                           },
++
++  { HTTPD_METHOD_GET,                    "^/api/listenbrainz$",                                                                   jsonapi_reply_listenbrainz                     },
++  { HTTPD_METHOD_POST,                   "^/api/listenbrainz/token$",                                                             jsonapi_reply_listenbrainz_token_add           },
++  { HTTPD_METHOD_DELETE,                 "^/api/listenbrainz/token$",                                                             jsonapi_reply_listenbrainz_token_delete        },
++
++  { 0,                                   NULL,                                                                                    NULL                                           }
++};
+ 
+ /* ------------------------------- JSON API --------------------------------- */
+ 
+--- /dev/null
++++ b/src/httpd_jsonapi_release.inc.c
+@@ -0,0 +1,65 @@
++/* Release never borrows the generic accepted transport receipt. */
++static json_object *
++transport_release_json(const struct output_transport_result *r, bool result, bool commit)
++{
++  json_object *o = json_object_new_object();
++  json_object_object_add(o, "schema",
++      json_object_new_string(
++          result ? "podconnect.output_transport_release_result.v1" : "podconnect.output_transport_release_prepare.v1"));
++  json_object_object_add(
++      o, "ok", json_object_new_boolean(result ? r->release_terminal : !commit || r->release_durable_pending));
++  json_object_object_add(o, "token", json_object_new_string(r->command.token));
++  json_object_object_add(o, "native_prepare_id", json_object_new_string(r->command.native_prepare_id));
++  json_object_object_add(o, "args_digest", json_object_new_string(r->command.args_digest));
++  transport_native_binding_json(o, &r->command.native_owner, r->command.native_revision);
++  json_object_object_add(o, "identity", transport_identity_json(&r->identity));
++  json_object_object_add(o, "writer_proof", queue_writer_json(&r->command.writer));
++  json_object_object_add(o, "purpose", json_object_new_string("manual_release_v1"));
++  if (result)
++    {
++      json_object_object_add(o, "outcome",
++          json_object_new_string(r->release_terminal ? "retired"
++                                 : r->outcome == -1  ? "rejected"
++                                                     : "unknown"));
++      json_object_object_add(o, "terminal", json_object_new_boolean(r->release_terminal));
++      json_object_object_add(o, "contexts_drained", json_object_new_boolean(r->release_contexts_drained));
++      json_object_object_add(o, "retry_allowed", json_object_new_boolean(false));
++    }
++  else
++    {
++      json_object_object_add(o, "phase", json_object_new_string(commit ? "committed" : "prepared"));
++      json_object_object_add(o, "outcome",
++          json_object_new_string(!commit                      ? "prepared"
++                                 : r->release_durable_pending ? "pending"
++                                                              : "unknown"));
++      json_object_object_add(o, "gate_closed", json_object_new_boolean(r->release_gate_closed));
++      json_object_object_add(o, "durable_pending", json_object_new_boolean(r->release_durable_pending));
++      json_object_object_add(o, "remaining_ms", json_object_new_int(r->remaining_ms));
++    }
++  json_object_object_add(o, "physical_result_verified", json_object_new_boolean(false));
++  return o;
++}
++static int
++jsonapi_reply_transport_release_confirm(struct httpd_request *hreq)
++{
++  json_object *body = transport_parse_body_limit(hreq->in_body, 1024), *closed;
++  struct output_transport_result result;
++  char token[33], prepare[33];
++  uint64_t id, revision;
++  int ret = HTTP_BADREQUEST;
++  if (!body || json_object_object_length(body) != 4 || safe_atou64(hreq->path_parts[2], &id) < 0
++      || !transport_json_string(body, "token", token, sizeof(token)) || !queue_wire_hex(token, 32)
++      || !transport_json_string(body, "native_prepare_id", prepare, sizeof(prepare)) || !queue_wire_hex(prepare, 32)
++      || transport_native_counter(body, "native_revision", &revision) < 0 || !revision || revision == UINT64_MAX
++      || !json_object_object_get_ex(body, "native_close_done", &closed)
++      || !json_object_is_type(closed, json_type_boolean) || !json_object_get_boolean(closed))
++    goto out;
++  ret = 409;
++  if (player_transport_release_confirm(id, token, prepare, revision, true, &result) < 0)
++    goto out;
++  ret = transport_json_reply(hreq, transport_release_json(&result, true, true));
++out:
++  if (body)
++    jparse_free(body);
++  return ret;
++}
+--- a/src/input.h
++++ b/src/input.h
+@@ -109,7 +109,12 @@
+ int input_fifo_owner_get(uint32_t,const char *,bool,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ /* Return 0 after FIFO EOF, 1 after EAGAIN, or -1 on failed retirement.
+  * The caller must prove that no native writer remains for an EAGAIN result. */
++int
++input_fifo_retire_transport(
++    uint32_t, const char *, uint64_t, uint64_t, uint64_t, const struct timespec *, struct input_fifo_identity *);
+ int input_fifo_retire(uint32_t,const char *,uint64_t,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
++int
++input_fifo_retire_recovered(const char *, uint64_t, uint64_t, const struct timespec *, struct input_fifo_identity *);
+ int input_fifo_retire_empty(const char *,uint64_t,uint64_t,uint64_t,const struct timespec *,struct input_fifo_identity *);
+ 
+ struct input_definition
+--- a/src/input_fifo_barrier.inc.c
++++ b/src/input_fifo_barrier.inc.c
+@@ -75,17 +75,18 @@
+ struct input_fifo_retire_command {
+   uint32_t item_id;const char *path;uint64_t device,inode,epoch;
+   struct timespec deadline;struct input_fifo_identity *out;
++  bool transport_release; /* Only a typed manual release may capture epoch zero. */
+ };
+ static enum command_state input_fifo_retire_exact(void *arg,int *retval)
+ {
+   struct input_fifo_retire_command *c=arg;struct input_source *source=&input_now_reading;
+   int drained;
+   *retval=-1;
+-  if(!c->out || !input_fifo_deadline(&c->deadline) || source->type!=INPUT_TYPE_PIPE
+-      || !source->open || source->item_id!=c->item_id || !source->path
+-      || strcmp(source->path,c->path) || !c->device || !c->inode || !c->epoch
+-      || input_fifo_epoch!=c->epoch || input_fifo_epoch==UINT64_MAX
+-      || !inputs[source->type]->fifo_retire)return COMMAND_END;
++  if (!c->out || !input_fifo_deadline(&c->deadline) || source->type != INPUT_TYPE_PIPE || !source->open
++      || source->item_id != c->item_id || !source->path || strcmp(source->path, c->path) || !c->device || !c->inode
++      || (!c->epoch && !c->transport_release) || input_fifo_epoch != c->epoch || input_fifo_epoch == UINT64_MAX
++      || !inputs[source->type]->fifo_retire)
++    return COMMAND_END;
+   /* The backend descriptor and source evbuf are only touched on cmdbase.
+    * Its read callback cannot interleave with this command. */
+   drained=inputs[source->type]->fifo_retire(source,c->device,c->inode,&c->deadline,c->out);
+@@ -103,6 +104,26 @@
+   if(!path || !deadline || !out)return -1;
+   struct input_fifo_retire_command command={.item_id=item,.path=path,.device=device,.inode=inode,
+     .epoch=expected_epoch,.deadline=*deadline,.out=out};
++  return commands_exec_sync(cmdbase, input_fifo_retire_exact, NULL, &command);
++}
++
++/* Ordinary Connect can own the first reader before any START barrier. Zero
++ * is its exact observed epoch, not an omitted proof; all other checks are the
++ * same existing input-thread retirement command. */
++int
++input_fifo_retire_transport(uint32_t item, const char *path, uint64_t device, uint64_t inode, uint64_t expected_epoch,
++    const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  if (!path || !deadline || !out)
++    return -1;
++  struct input_fifo_retire_command command = { .item_id = item,
++    .path = path,
++    .device = device,
++    .inode = inode,
++    .epoch = expected_epoch,
++    .deadline = *deadline,
++    .out = out,
++    .transport_release = true };
+   return commands_exec_sync(cmdbase,input_fifo_retire_exact,NULL,&command);
+ }
+ 
+@@ -180,3 +201,34 @@
+   struct input_fifo_start_command c={.item_id=item,.path=path,.deadline=*deadline};
+   return commands_exec_sync(cmdbase,input_fifo_start_exact,NULL,&c);
+ }
++
++/* Recovery proves absence in this C process; a previous process's numeric
++ * reader epoch is never imported. This cannot stop or adopt a live source. */
++static enum command_state
++input_fifo_retire_recovered_exact(void *arg, int *retval)
++{
++  struct input_fifo_retire_command *c = arg;
++  struct stat st;
++  *retval = -1;
++  if (!c || !c->out || !input_fifo_deadline(&c->deadline) || input_now_reading.open || input_fifo_staged_fd >= 0
++      || input_fifo_epoch == UINT64_MAX || stat(c->path, &st) < 0 || !S_ISFIFO(st.st_mode)
++      || (uint64_t)st.st_dev != c->device || (uint64_t)st.st_ino != c->inode)
++    return COMMAND_END;
++  flush(NULL);
++  input_fifo_epoch++;
++  c->out->device = c->device;
++  c->out->inode = c->inode;
++  c->out->epoch = input_fifo_epoch;
++  *retval = input_fifo_deadline(&c->deadline) ? 0 : -1;
++  return COMMAND_END;
++}
++int
++input_fifo_retire_recovered(
++    const char *path, uint64_t device, uint64_t inode, const struct timespec *deadline, struct input_fifo_identity *out)
++{
++  if (!path || !deadline || !out)
++    return -1;
++  struct input_fifo_retire_command c
++      = { .path = path, .device = device, .inode = inode, .deadline = *deadline, .out = out };
++  return commands_exec_sync(cmdbase, input_fifo_retire_recovered_exact, NULL, &c);
++}
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -318,9 +318,17 @@
+     && transport_identity_equal(&operation->identity,&state);
+ }
+ 
++static int
++release_prepare(const struct output_transport_request *, struct output_transport_result *);
++static int
++release_commit(const struct output_transport_request *, struct output_transport_result *);
++static int
++release_result(const char *, struct output_transport_result *);
+ int
+ outputs_transport_prepare(const struct output_transport_request *request, struct output_transport_result *result)
+ {
++  if (request && !strcmp(request->action, "release"))
++    return release_prepare(request, result);
+   struct output_transport_identity identity;
+   struct transport_slot *slot=NULL;
+   size_t i;uint64_t queue_reader_epoch=0;
+@@ -356,6 +364,8 @@
+ int
+ outputs_transport_commit(const struct output_transport_request *request, struct output_transport_result *result)
+ {
++  if (request && !strcmp(request->action, "release"))
++    return release_commit(request, result);
+   struct transport_slot *slot;
+   struct output_transport_identity identity;uint64_t queue_reader_epoch=0;
+   if (!request || !result || !(slot=transport_find(request->token)) || slot->used) return -1;
+@@ -408,6 +418,8 @@
+ int
+ outputs_transport_result_get(const char *token, struct output_transport_result *result)
+ {
++  if (release_result(token, result) == 0)
++    return 0;
+   struct transport_slot *slot=transport_find(token);
+   if (!slot || !slot->used || !result) return -1;
+   *result=slot->result;
+@@ -451,8 +463,27 @@
+ static void base_revision_advance(struct output_device *);
+ static void vol_adjust(void);
+ #include "proc_native_scope.inc.c"
++struct start_slot;
++struct start_retirement;
++static bool
++release_retirement_consumed(const struct start_retirement *);
++static bool
++release_journal_payload_valid(json_object *);
++static bool
++release_predecessor_payload_valid(json_object *);
++static bool
++release_wrap_predecessor(struct start_slot *, json_object *);
++static bool
++release_reopen_json(json_object *);
++static bool
++release_is_typed_journal(void);
++static const char *
++release_record_token(void);
++static bool
++release_retired_owner_detach(void);
+ #include "outputs_start.inc.c"
+ #include "outputs_queue.inc.c"
++#include "outputs_release.inc.c"
+ 
+ /* Called only on the output owner thread immediately before a distinguished
+  * Connect recovery mutation. No selected session is required to prove absence. */
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -132,6 +132,7 @@
+   struct output_transport_request command;
+   unsigned remaining_ms;
+   int outcome; /* 0 accepted, 1 pending, -1 failed, -2 unknown */
++  bool release_gate_closed, release_durable_pending, release_terminal, release_contexts_drained;
+ };
+ int outputs_queue_state_get(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_transport_identity *,bool *);
+ int outputs_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+@@ -139,6 +140,9 @@
+ int outputs_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int outputs_transport_result_get(const char *, struct output_transport_result *);
++int
++outputs_transport_release_confirm(
++    uint64_t, const char *, const char *, uint64_t, bool, struct output_transport_result *);
+ int outputs_transport_pause_confirm(uint64_t,const char *,const char *,uint64_t);
+ bool outputs_transport_current(const struct output_transport_result *);
+ bool outputs_transport_busy(void);
+@@ -229,6 +233,8 @@
+ bool outputs_start_retired_normal_ready(const char *);
+ bool outputs_start_retired_normal_autostart_ready(const char *path);
+ bool outputs_start_retired_stage_reader(void);
++void
++outputs_transport_release_recover_pending(void);
+ bool outputs_start_retired_stage_release_for_start(void);
+ bool outputs_start_retired_normal_admit(uint32_t,const char *);
+ bool outputs_start_source_current(const char *,const char **,struct timespec *);
+--- /dev/null
++++ b/src/outputs_release.inc.c
+@@ -0,0 +1,982 @@
++/* Ordinary manual release uses the existing durable singleton, but never a
++ * fabricated completed START. Old binaries reject this schema and quarantine. */
++struct transport_release_record {
++  struct output_transport_result result;
++  char input_path[4096], retired_c_process[37];
++  uint64_t pidns_device, pidns_inode, admitted_epoch, retired_epoch;
++  enum output_retirement_outcome retirement;
++  bool reopen_consumed;
++};
++static struct transport_release_record release_record;
++
++static const char *
++release_record_token(void)
++{
++  return release_record.result.command.token;
++}
++
++static bool
++release_json_string(json_object *o, const char *key, char *out, size_t size)
++{
++  json_object *v;
++  const char *s;
++  size_t n;
++  if (!json_object_object_get_ex(o, key, &v) || !json_object_is_type(v, json_type_string))
++    return false;
++  s = json_object_get_string(v);
++  n = json_object_get_string_len(v);
++  if (!n || strlen(s) != n || n >= size)
++    return false;
++  memcpy(out, s, n + 1);
++  return true;
++}
++static bool
++release_json_u64(json_object *o, const char *key, uint64_t *out)
++{
++  json_object *v;
++  if (!json_object_object_get_ex(o, key, &v) || !json_object_is_type(v, json_type_int) || json_object_get_int64(v) < 0)
++    return false;
++  *out = json_object_get_uint64(v);
++  return true;
++}
++static bool
++release_json_bool(json_object *o, const char *key, bool *out)
++{
++  json_object *v;
++  if (!json_object_object_get_ex(o, key, &v) || !json_object_is_type(v, json_type_boolean))
++    return false;
++  *out = json_object_get_boolean(v);
++  return true;
++}
++static bool
++release_owner_parse(json_object *o, struct output_native_owner *v)
++{
++  if (!o || !json_object_is_type(o, json_type_object) || json_object_object_length(o) != 9)
++    return false;
++#define RS(k) release_json_string(o, #k, v->k, sizeof(v->k))
++  return RS(account_user_id) && RS(target_id) && RS(room_id) && RS(homepod_id) && RS(connection_id) && RS(session_id)
++         && RS(alias_incarnation) && RS(alias_registry) && release_json_u64(o, "alias_revision", &v->alias_revision);
++#undef RS
++}
++static json_object *
++release_writer_json(const struct output_queue_writer *v)
++{
++  json_object *o = json_object_new_object(), *process = json_object_new_object(), *pipe = json_object_new_object();
++  json_object_object_add(process, "boot_id", json_object_new_string(v->native_process.boot_id));
++  json_object_object_add(process, "pid", json_object_new_uint64(v->native_process.pid));
++  json_object_object_add(process, "proc_start_ticks", json_object_new_uint64(v->native_process.proc_start_ticks));
++  json_object_object_add(o, "native_process", process);
++  json_object_object_add(o, "writer_fd", json_object_new_uint64(v->writer_fd));
++  json_object_object_add(o, "source_epoch", json_object_new_uint64(v->source_epoch));
++  json_object_object_add(o, "open_generation", json_object_new_uint64(v->open_generation));
++  json_object_object_add(o, "input_path_digest", json_object_new_string(v->input_path_digest));
++  json_object_object_add(pipe, "device", json_object_new_uint64(v->pipe_device));
++  json_object_object_add(pipe, "inode", json_object_new_uint64(v->pipe_inode));
++  json_object_object_add(pipe, "type", json_object_new_string("fifo"));
++  json_object_object_add(o, "pipe_identity", pipe);
++  return o;
++}
++static bool
++release_writer_parse(json_object *o, struct output_queue_writer *v)
++{
++  json_object *p, *f;
++  char type[8];
++  return o && json_object_is_type(o, json_type_object) && json_object_object_length(o) == 6
++         && json_object_object_get_ex(o, "native_process", &p) && json_object_is_type(p, json_type_object)
++         && json_object_object_length(p) == 3
++         && release_json_string(p, "boot_id", v->native_process.boot_id, sizeof(v->native_process.boot_id))
++         && release_json_u64(p, "pid", &v->native_process.pid) && v->native_process.pid
++         && v->native_process.pid <= INT_MAX
++         && release_json_u64(p, "proc_start_ticks", &v->native_process.proc_start_ticks)
++         && v->native_process.proc_start_ticks && release_json_u64(o, "writer_fd", &v->writer_fd)
++         && v->writer_fd <= INT_MAX && release_json_u64(o, "source_epoch", &v->source_epoch)
++         && release_json_u64(o, "open_generation", &v->open_generation) && v->open_generation
++         && release_json_string(o, "input_path_digest", v->input_path_digest, sizeof(v->input_path_digest))
++         && transport_hex(v->input_path_digest, 64) && json_object_object_get_ex(o, "pipe_identity", &f)
++         && json_object_is_type(f, json_type_object) && json_object_object_length(f) == 3
++         && release_json_u64(f, "device", &v->pipe_device) && v->pipe_device
++         && release_json_u64(f, "inode", &v->pipe_inode) && v->pipe_inode
++         && release_json_string(f, "type", type, sizeof(type)) && !strcmp(type, "fifo");
++}
++static json_object *
++release_identity_json(const struct output_transport_identity *v)
++{
++  json_object *o = json_object_new_object();
++#define RJ(k) json_object_object_add(o, #k, json_object_new_uint64(v->k))
++  json_object_object_add(o, "process", json_object_new_string(v->process));
++  json_object_object_add(o, "input_path_digest", json_object_new_string(v->input_path_digest));
++  RJ(device_id);
++  RJ(device_incarnation);
++  RJ(session_epoch);
++  RJ(route_revision);
++  RJ(selection_revision);
++  RJ(input_generation);
++  RJ(input_item_id);
++#undef RJ
++  return o;
++}
++static bool
++release_identity_parse(json_object *o, struct output_transport_identity *v)
++{
++  if (!o || !json_object_is_type(o, json_type_object) || json_object_object_length(o) != 9)
++    return false;
++#define RI(k) release_json_u64(o, #k, &v->k)
++  return release_json_string(o, "process", v->process, sizeof(v->process))
++         && release_json_string(o, "input_path_digest", v->input_path_digest, sizeof(v->input_path_digest))
++         && RI(device_id) && RI(device_incarnation) && RI(session_epoch) && RI(route_revision) && RI(selection_revision)
++         && RI(input_generation) && RI(input_item_id);
++#undef RI
++}
++static json_object *
++release_journal_json(const struct transport_release_record *r)
++{
++  const struct output_transport_request *c = &r->result.command;
++  json_object *o = json_object_new_object();
++#define JS(k, v) json_object_object_add(o, k, json_object_new_string(v))
++#define JN(k, v) json_object_object_add(o, k, json_object_new_uint64(v))
++  JS("schema", "podconnect.output_transport_release_journal.v1");
++  JS("purpose", "manual_release_v1");
++  JS("token", c->token);
++  JS("c_process", r->result.identity.process);
++  JS("native_boot_id", c->writer.native_process.boot_id);
++  JN("native_pid", c->writer.native_process.pid);
++  JN("native_start_ticks", c->writer.native_process.proc_start_ticks);
++  JN("native_pid_namespace_device", r->pidns_device);
++  JN("native_pid_namespace_inode", r->pidns_inode);
++  JS("native_prepare_id", c->native_prepare_id);
++  JS("args_digest", c->args_digest);
++  JN("native_revision", c->native_revision);
++  json_object_object_add(o, "native_owner", start_journal_owner(&c->native_owner));
++  json_object_object_add(o, "writer_proof", release_writer_json(&c->writer));
++  json_object_object_add(o, "identity", release_identity_json(&r->result.identity));
++  JS("retired_c_process", r->retired_c_process);
++  JS("input_path", r->input_path);
++  JN("admitted_input_epoch", r->admitted_epoch);
++  JN("retired_input_epoch", r->retired_epoch);
++  JS("retirement_outcome", r->retirement == OUTPUT_RETIRE_RETIRED_KNOWN ? "retired_known"
++                           : r->retirement == OUTPUT_RETIRE_PENDING     ? "pending"
++                                                                        : "unknown");
++  json_object_object_add(o, "retirement_reopen_consumed", json_object_new_boolean(r->reopen_consumed));
++#undef JS
++#undef JN
++  return o;
++}
++static bool
++release_journal_parse(json_object *o, const struct db_start_guard *guard)
++{
++  struct transport_release_record r = { 0 };
++  struct output_transport_request *c = &r.result.command;
++  json_object *owner, *writer, *identity;
++  char purpose[32], outcome[32], boot[37], process[37];
++  uint64_t pid, ticks;
++  json_object *saved_schema;
++  if (!json_object_object_get_ex(o, "schema", &saved_schema) || !json_object_is_type(saved_schema, json_type_string)
++      || strcmp(json_object_get_string(saved_schema), "podconnect.output_transport_release_journal.v1")
++      || json_object_object_length(o) != 21
++      || strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), guard->payload)
++      || !release_json_string(o, "purpose", purpose, sizeof(purpose)) || strcmp(purpose, "manual_release_v1")
++      || !release_json_string(o, "token", c->token, sizeof(c->token)) || !transport_hex(c->token, 32)
++      || strcmp(c->token, guard->token) || !release_json_string(o, "c_process", process, sizeof(process))
++      || strcmp(process, guard->c_process) || !release_json_string(o, "native_boot_id", boot, sizeof(boot))
++      || strcmp(boot, guard->boot_id) || !release_json_u64(o, "native_pid", &pid) || pid != guard->pid
++      || !release_json_u64(o, "native_start_ticks", &ticks) || ticks != guard->proc_start_ticks
++      || !release_json_u64(o, "native_pid_namespace_device", &r.pidns_device)
++      || !release_json_u64(o, "native_pid_namespace_inode", &r.pidns_inode) || !r.pidns_inode
++      || !release_json_string(o, "native_prepare_id", c->native_prepare_id, sizeof(c->native_prepare_id))
++      || !transport_hex(c->native_prepare_id, 32)
++      || !release_json_string(o, "args_digest", c->args_digest, sizeof(c->args_digest))
++      || !transport_hex(c->args_digest, 64) || !release_json_u64(o, "native_revision", &c->native_revision)
++      || !c->native_revision || c->native_revision == UINT64_MAX
++      || !json_object_object_get_ex(o, "native_owner", &owner) || !release_owner_parse(owner, &c->native_owner)
++      || !json_object_object_get_ex(o, "writer_proof", &writer) || !release_writer_parse(writer, &c->writer)
++      || !json_object_object_get_ex(o, "identity", &identity) || !release_identity_parse(identity, &r.result.identity)
++      || strcmp(process, r.result.identity.process) || !r.result.identity.device_id || !r.result.identity.input_item_id
++      || strcmp(boot, c->writer.native_process.boot_id) || pid != c->writer.native_process.pid
++      || ticks != c->writer.native_process.proc_start_ticks
++      || strcmp(c->writer.input_path_digest, r.result.identity.input_path_digest)
++      || !native_owner_valid(&c->native_owner, r.result.identity.device_id)
++      || !release_json_string(o, "input_path", r.input_path, sizeof(r.input_path)) || r.input_path[0] != '/'
++      || !release_json_u64(o, "admitted_input_epoch", &r.admitted_epoch)
++      || !release_json_u64(o, "retired_input_epoch", &r.retired_epoch)
++      || !release_json_bool(o, "retirement_reopen_consumed", &r.reopen_consumed)
++      || !release_json_string(o, "retirement_outcome", outcome, sizeof(outcome)))
++    return false;
++  if (!strcmp(outcome, "pending"))
++    r.retirement = OUTPUT_RETIRE_PENDING;
++  else if (!strcmp(outcome, "retired_known"))
++    r.retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
++  else if (!strcmp(outcome, "unknown"))
++    r.retirement = OUTPUT_RETIRE_UNKNOWN;
++  else
++    return false;
++  json_object *retired_process;
++  if (!json_object_object_get_ex(o, "retired_c_process", &retired_process)
++      || !json_object_is_type(retired_process, json_type_string))
++    return false;
++  const char *retired = json_object_get_string(retired_process);
++  if (r.retirement == OUTPUT_RETIRE_RETIRED_KNOWN)
++    {
++      if (strlen(retired) != 36 || !r.retired_epoch
++          || (!strcmp(retired, process) && r.retired_epoch <= r.admitted_epoch))
++	return false;
++      strcpy(r.retired_c_process, retired);
++    }
++  else if (*retired || r.reopen_consumed || r.retired_epoch)
++    return false;
++  c->device_id = r.result.identity.device_id;
++  c->bound = true;
++  c->percent = -1;
++  strcpy(c->action, "release");
++  release_record = r;
++  start_journal_pidns_device = r.pidns_device;
++  start_journal_pidns_inode = r.pidns_inode;
++  start_journal_retirement_outcome = r.retirement;
++  start_journal_retirement_reopen_consumed = r.reopen_consumed;
++  return true;
++}
++
++static bool
++release_journal_payload_valid(json_object *o)
++{
++  return release_journal_parse(o, &start_journal);
++}
++static bool
++release_is_typed_journal(void)
++{
++  json_object *o, *v;
++  bool valid = false;
++  if (!start_journal.payload)
++    return false;
++  o = json_tokener_parse(start_journal.payload);
++  if (o && json_object_object_get_ex(o, "schema", &v) && json_object_is_type(v, json_type_string))
++    {
++      const char *schema = json_object_get_string(v);
++      valid = !strcmp(schema, "podconnect.output_transport_release_journal.v1")
++              || !strcmp(schema, "podconnect.output_manual_release_start_journal.v1")
++              || !strcmp(schema, "podconnect.output_manual_release_move_journal.v1");
++    }
++  if (o)
++    json_object_put(o);
++  return valid;
++}
++
++struct transport_release_operation {
++  struct transport_release_record record;
++  struct output_retirement_request predecessor;
++  const void *session;
++  struct timespec expiry;
++  bool prepared, used, effect_pending, durable, terminal;
++};
++static struct transport_release_operation release_operation;
++
++static void
++release_observe(struct output_transport_result *out)
++{
++  *out = release_operation.record.result;
++  out->remaining_ms = transport_remaining(&release_operation.expiry);
++  out->release_gate_closed = outputs_start_gate_closed();
++  out->release_durable_pending = release_operation.durable;
++  out->release_terminal = release_operation.terminal;
++  out->release_contexts_drained = start_contexts_drained();
++  out->outcome = release_operation.terminal         ? 0
++                 : release_operation.durable        ? 1
++                 : release_operation.effect_pending ? -2
++                 : release_operation.used           ? -1
++                                                    : 0;
++}
++static bool
++release_route_retirable(const struct transport_release_operation *);
++static bool
++release_protected_owned(const struct output_native_owner *owner, const struct output_transport_identity *identity)
++{
++  struct output_transport_identity actual;
++  return start_active && start_retirement_source_current(start_active, &actual)
++         && transport_identity_equal(&actual, identity) && outputs_start_bound_owner_current(owner, identity, false);
++}
++static bool
++release_current(struct transport_release_operation *op, bool admission)
++{
++  struct output_transport_identity actual;
++  uint64_t epoch = 0;
++  struct output_transport_request *c = &op->record.result.command;
++  return (!admission || transport_remaining(&op->expiry)) && !outputs_start_gate_closed() && release_route_retirable(op)
++         && transport_bound_available(c->device_id, &c->native_owner, c->native_revision)
++         && transport_identity_get(c->device_id, &actual) == 0
++         && transport_identity_equal(&actual, &op->record.result.identity)
++         && queue_writer_current(&c->writer, &actual, &epoch) && epoch == op->record.admitted_epoch
++         && (op->predecessor.completed_token[0]
++                 ? start_active && !strcmp(start_active->result.command.token, op->predecessor.completed_token)
++                       && release_protected_owned(&c->native_owner, &actual)
++                 : start_route_clean_absent()
++                       || (!start_active && !start_scope && !strcmp(start_journal.token, c->token)
++                           && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING));
++}
++static int
++release_prepare(const struct output_transport_request *request, struct output_transport_result *out)
++{
++  struct transport_release_operation op = { 0 };
++  struct output_transport_identity identity;
++  struct output_device *d;
++  struct db_queue_item *item;
++  uint64_t epoch = 0;
++  if (!request || !out || !request->bound || !request->native_revision || request->native_revision == UINT64_MAX
++      || !transport_hex(request->native_prepare_id, 32) || !transport_hex(request->args_digest, 64)
++      || !native_owner_valid(&request->native_owner, request->device_id)
++      || (release_operation.prepared && !release_operation.terminal
++          && (release_operation.effect_pending
++              || (!release_operation.used && transport_remaining(&release_operation.expiry))))
++      || !transport_bound_available(request->device_id, &request->native_owner, request->native_revision)
++      || transport_identity_get(request->device_id, &identity) < 0
++      || !queue_writer_current(&request->writer, &identity, &epoch) || !(d = outputs_device_get(request->device_id))
++      || !start_contexts_drained() || !(item = db_queue_fetch_byitemid(identity.input_item_id)))
++    return -1;
++  bool path = item->path && item->path[0] == '/' && strlen(item->path) < sizeof(op.record.input_path);
++  if (path)
++    strcpy(op.record.input_path, item->path);
++  free_queue_item(item, 0);
++  if (!path)
++    return -1;
++  op.record.result.command = *request;
++  op.record.result.identity = identity;
++  op.record.admitted_epoch = epoch;
++  op.session = d->session;
++  if (!release_route_retirable(&op))
++    return -1;
++  if (release_protected_owned(&request->native_owner, &identity))
++    {
++      struct start_slot *s = start_active;
++      if (!s || request->writer.source_epoch != s->result.writer_source_epoch
++          || request->writer.writer_fd != s->result.command.writer_fd
++          || request->writer.pipe_device != s->result.pipe_device || request->writer.pipe_inode != s->result.pipe_inode
++          || strcmp(request->writer.native_process.boot_id, s->result.command.native_process.boot_id)
++          || request->writer.native_process.pid != s->result.command.native_process.pid
++          || request->writer.native_process.proc_start_ticks != s->result.command.native_process.proc_start_ticks)
++	return -1;
++      op.predecessor.device_id = request->device_id;
++      op.predecessor.move_existing_session = s->result.command.move_existing_session;
++      strcpy(op.predecessor.completed_token, s->result.command.token);
++      strcpy(op.predecessor.native_reservation_id, request->native_prepare_id);
++      strcpy(op.predecessor.native_incarnation, s->result.command.native_incarnation);
++      op.predecessor.native_process = request->writer.native_process;
++      op.predecessor.writer_source_epoch = request->writer.source_epoch;
++      op.predecessor.writer_fd = request->writer.writer_fd;
++      op.predecessor.pipe_device = request->writer.pipe_device;
++      op.predecessor.pipe_inode = request->writer.pipe_inode;
++      op.predecessor.input_epoch = epoch;
++    }
++  else if (!start_route_clean_absent())
++    return -1;
++  if (!start_pid_namespace(&op.record.pidns_device, &op.record.pidns_inode)
++      || clock_gettime(CLOCK_MONOTONIC, &op.expiry) < 0)
++    return -1;
++  op.expiry.tv_sec += 10;
++  op.prepared = true;
++  char uuid[37];
++  size_t j = 0;
++  outputs_attention_uuid(uuid);
++  for (size_t i = 0; i < 36; i++)
++    if (uuid[i] != '-')
++      op.record.result.command.token[j++] = uuid[i];
++  op.record.result.command.token[j] = 0;
++  release_operation = op;
++  release_observe(out);
++  return 0;
++}
++static int
++release_journal_save(struct transport_release_record *r)
++{
++  json_object *o = release_journal_json(r), *outer = NULL, *manual;
++  struct db_start_guard next = { 0 };
++  int ret;
++  char *copy;
++  if (!o)
++    return -1;
++  const struct output_queue_writer *w = &r->result.command.writer;
++  /* A recovery update retains the genuine predecessor unchanged. A new
++   * ordinary release on a later route must replace, never inherit, it. */
++  if (start_journal.payload && strcmp(start_journal.token, r->result.command.token))
++    {
++      outer = json_tokener_parse(start_journal.payload);
++      if (outer && json_object_object_get_ex(outer, "manual_release", &manual)
++          && json_object_is_type(manual, json_type_object))
++	{
++	  json_object *saved;
++	  if (json_object_object_get_ex(manual, "token", &saved) && json_object_is_type(saved, json_type_string)
++	      && !strcmp(json_object_get_string(saved), r->result.command.token))
++	    {
++	      json_object_object_add(outer, "manual_release", o);
++	      o = outer;
++	      outer = NULL;
++	      next = start_journal;
++	    }
++	}
++      if (outer)
++	json_object_put(outer);
++    }
++  if (!next.token[0])
++    {
++      strcpy(next.token, r->result.command.token);
++      strcpy(next.c_process, r->result.identity.process);
++      strcpy(next.boot_id, w->native_process.boot_id);
++      next.pid = w->native_process.pid;
++      next.proc_start_ticks = w->native_process.proc_start_ticks;
++    }
++  next.payload = (char *)json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN);
++  copy = next.payload ? strdup(next.payload) : NULL;
++  ret = copy ? db_start_guard_save(&start_journal, &next) : -1;
++  if (ret == 0)
++    {
++      free(start_journal.payload);
++      start_journal = next;
++      start_journal.payload = copy;
++      release_record = *r;
++      start_journal_pidns_device = r->pidns_device;
++      start_journal_pidns_inode = r->pidns_inode;
++      start_journal_retirement_outcome = r->retirement;
++      start_journal_retirement_reopen_consumed = r->reopen_consumed;
++    }
++  else
++    free(copy);
++  json_object_put(o);
++  return ret;
++}
++static int
++release_commit(const struct output_transport_request *request, struct output_transport_result *out)
++{
++  struct transport_release_operation *op = &release_operation;
++  const struct output_transport_request *saved = &op->record.result.command;
++  struct output_retirement_result retired;
++  if (!request || !out || !op->prepared || op->used || strcmp(request->token, saved->token))
++    return -1;
++  op->used = true;
++  if (strcmp(request->native_prepare_id, saved->native_prepare_id) || strcmp(request->action, "release")
++      || strcmp(request->args_digest, saved->args_digest) || !request->bound
++      || !native_owner_equal(&request->native_owner, &saved->native_owner)
++      || request->native_revision != saved->native_revision || !queue_writer_equal(&request->writer, &saved->writer)
++      || strcmp(request->expected_input_path_digest, op->record.result.identity.input_path_digest)
++      || !release_current(op, true))
++    return -1;
++  if (op->predecessor.completed_token[0])
++    {
++      if (outputs_retirement_prepare(&op->predecessor, &retired) < 0)
++	return -1;
++      op->effect_pending = true;
++      if (!start_journal_payload_valid() || strcmp(release_record.result.command.token, saved->token))
++	{
++	  start_journal_fault = true;
++	  start_gate_set(true);
++	  release_observe(out);
++	  return 0;
++	}
++      if (retired.ok && retired.durable_pending && retired.gate_closed && retired.reader_ready_closed)
++	{
++	  strcpy(op->predecessor.retirement_token, retired.command.retirement_token);
++	  op->durable = true;
++	}
++      release_observe(out);
++      return 0;
++    }
++  op->record.retirement = OUTPUT_RETIRE_PENDING;
++  op->effect_pending = true;
++  if (release_journal_save(&op->record) < 0)
++    {
++      start_journal_fault = true;
++      start_gate_set(true);
++      release_observe(out);
++      return 0;
++    }
++  /* The write may have waited. Do not acknowledge permission to close Native
++   * unless the exact reader, writer and route still match behind the gate. */
++  bool current = start_journal_payload_valid() && !strcmp(release_record.result.command.token, saved->token)
++                 && release_current(op, false);
++  start_gate_set(true);
++  atomic_store(&start_owned_latch, true);
++  struct input_fifo_identity reader = { 0 };
++  struct timespec deadline;
++  if (!current || clock_gettime(CLOCK_MONOTONIC, &deadline) < 0)
++    {
++      release_observe(out);
++      return 0;
++    }
++  deadline.tv_nsec += 100000000;
++  if (deadline.tv_nsec >= 1000000000)
++    {
++      deadline.tv_sec++;
++      deadline.tv_nsec -= 1000000000;
++    }
++  if (input_fifo_owner_get(
++          op->record.result.identity.input_item_id, op->record.input_path, false, 0, 0, &deadline, &reader)
++          < 0
++      || reader.device != saved->writer.pipe_device || reader.inode != saved->writer.pipe_inode
++      || reader.epoch != op->record.admitted_epoch
++      || !start_proven_writer_fd(
++          &saved->writer.native_process, saved->writer.writer_fd, saved->writer.pipe_device, saved->writer.pipe_inode))
++    {
++      release_observe(out);
++      return 0;
++    }
++  op->durable = true;
++  release_observe(out);
++  return 0;
++}
++static int
++release_result(const char *token, struct output_transport_result *out)
++{
++  if (!out || !token)
++    return -1;
++  if (release_operation.prepared && !strcmp(token, release_operation.record.result.command.token))
++    {
++      release_observe(out);
++      return 0;
++    }
++  if (start_journal_fault || !release_is_typed_journal() || !start_journal_payload_valid()
++      || strcmp(token, release_record.result.command.token))
++    return -1;
++  *out = release_record.result;
++  out->release_gate_closed = outputs_start_gate_closed();
++  out->release_terminal = start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN && start_retired_stage_ready
++                          && start_contexts_drained();
++  out->release_contexts_drained = start_contexts_drained();
++  out->outcome = out->release_terminal ? 0 : -2;
++  /* Only the exact consumed producer may finish closing after a lost reply.
++   * This read grants no mutation/replay and never adopts a new route or PID. */
++  uint64_t fd = 0;
++  const struct output_queue_writer *w = &out->command.writer;
++  if (start_startup_quarantine && start_journal_retirement_outcome == OUTPUT_RETIRE_PENDING
++      && outputs_start_gate_closed()
++      && start_proven_writer_fd(&w->native_process, w->writer_fd, w->pipe_device, w->pipe_inode)
++      && start_unique_writer_fd(&w->native_process, w->pipe_device, w->pipe_inode, &fd) && fd == w->writer_fd)
++    {
++      out->release_durable_pending = true;
++      out->outcome = 1;
++    }
++  return 0;
++}
++
++static bool
++release_route_retirable(const struct transport_release_operation *op)
++{
++  const struct output_transport_identity *r = &op->record.result.identity;
++  struct output_device *d = outputs_device_get(r->device_id), *scan;
++  if (!d || !d->selected || d->incarnation != r->device_incarnation || d->route_revision != r->route_revision
++      || r->selection_revision == UINT64_MAX
++      || transport_selection_revision != (d->session ? r->selection_revision : r->selection_revision + 1) || d->busy
++      || d->attention_lease || d->attention_retiring_session || d->attention_restart_pending || d->attention_restoring
++      || (d->session ? d->session != op->session || d->session_epoch != r->session_epoch
++                     : d->session_epoch != r->session_epoch + 1))
++    return false;
++  for (scan = outputs_device_list; scan; scan = scan->next)
++    if (scan != d
++        && (scan->selected || scan->session || scan->busy || scan->attention_lease || scan->attention_retiring_session
++            || scan->attention_restart_pending || scan->attention_restoring))
++      return false;
++  return !transport_pin && !room_volume_pin_busy() && !room_volume_undrained() && start_contexts_drained();
++}
++static bool
++release_retired_owner_detach(void)
++{
++  struct transport_release_operation *op = &release_operation;
++  struct output_transport_identity *r = &op->record.result.identity;
++  struct output_device *d = outputs_device_get(r->device_id);
++  if (!op->prepared || op->predecessor.completed_token[0] || op->record.retirement != OUTPUT_RETIRE_RETIRED_KNOWN
++      || strcmp(start_journal.token, op->record.result.command.token) || !outputs_start_gate_closed()
++      || !release_route_retirable(op) || d->session
++      || start_all_writers_closed(&op->record.result.command.writer.native_process,
++             op->record.result.command.writer.pipe_device, op->record.result.command.writer.pipe_inode)
++             != 1)
++    return false;
++  if (transport_custody_busy()
++      && (!native_owner_equal(&transport_custody_owner, &op->record.result.command.native_owner)
++          || !transport_identity_equal(&transport_custody_identity, r)))
++    return false;
++  uint64_t route = d->route_revision, selection = transport_selection_revision;
++  if (route == UINT64_MAX || selection == UINT64_MAX)
++    return false;
++  outputs_device_deselect(d);
++  if (d->selected || d->route_revision != route + 1 || transport_selection_revision != selection + 1)
++    return false;
++  if (transport_custody_live)
++    {
++      transport_custody_live = false;
++      transport_custody_lost = true;
++      transport_generation_advance();
++    }
++  return true;
++}
++int
++outputs_transport_release_confirm(uint64_t id, const char *token, const char *prepare, uint64_t revision, bool closed,
++    struct output_transport_result *out)
++{
++  struct transport_release_operation *op = &release_operation;
++  const struct output_transport_request *c = &op->record.result.command;
++  struct output_retirement_result retired;
++  struct input_fifo_identity reader = { 0 };
++  struct timespec deadline;
++  if (!op->prepared && out && closed && release_is_typed_journal() && start_journal_payload_valid())
++    {
++      const struct output_transport_request *saved = &release_record.result.command;
++      if (id != saved->device_id || strcmp(token, saved->token) || strcmp(prepare, saved->native_prepare_id)
++          || revision != saved->native_revision)
++	return -1;
++      outputs_transport_release_recover_pending();
++      if (start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN && !start_retired_stage_ready)
++	outputs_start_retired_stage_reader();
++      return release_result(token, out);
++    }
++  if (!out || !op->prepared || !op->used || !op->durable || !closed || id != c->device_id || strcmp(token, c->token)
++      || strcmp(prepare, c->native_prepare_id) || revision != c->native_revision)
++    return -1;
++  if (op->terminal)
++    {
++      release_observe(out);
++      return 0;
++    }
++  if (!outputs_start_gate_closed() || start_journal_fault)
++    {
++      release_observe(out);
++      return 0;
++    }
++  if (start_all_writers_closed(&c->writer.native_process, c->writer.pipe_device, c->writer.pipe_inode) != 1)
++    {
++      release_observe(out);
++      return 0;
++    }
++  if (op->predecessor.completed_token[0])
++    {
++      op->predecessor.native_close_done = true;
++      if (outputs_retirement_complete(&op->predecessor, &retired) == 0 && retired.durable_terminal
++          && outputs_start_retired_stage_reader())
++	op->terminal = true;
++      release_observe(out);
++      return 0;
++    }
++  if (strcmp(start_journal.token, c->token) || start_journal_retirement_outcome != OUTPUT_RETIRE_PENDING
++      || !release_route_retirable(op)
++      || start_all_writers_closed(&c->writer.native_process, c->writer.pipe_device, c->writer.pipe_inode) != 1
++      || clock_gettime(CLOCK_MONOTONIC, &deadline) < 0)
++    {
++      release_observe(out);
++      return 0;
++    }
++  deadline.tv_sec++;
++  int ret = input_fifo_retire_transport(op->record.result.identity.input_item_id, op->record.input_path,
++      c->writer.pipe_device, c->writer.pipe_inode, op->record.admitted_epoch, &deadline, &reader);
++  if (ret < 0)
++    ret = input_fifo_retire_empty(op->record.input_path, c->writer.pipe_device, c->writer.pipe_inode,
++        op->record.admitted_epoch, &deadline, &reader);
++  if (ret < 0 || reader.device != c->writer.pipe_device || reader.inode != c->writer.pipe_inode
++      || reader.epoch <= op->record.admitted_epoch || !release_route_retirable(op)
++      || start_all_writers_closed(&c->writer.native_process, c->writer.pipe_device, c->writer.pipe_inode) != 1)
++    {
++      release_observe(out);
++      return 0;
++    }
++  outputs_transport_input_changed(0, NULL, false);
++  outputs_metadata_purge();
++  start_retire_sessions();
++  if (!start_contexts_drained())
++    {
++      release_observe(out);
++      return 0;
++    }
++  op->record.retired_epoch = reader.epoch;
++  strcpy(op->record.retired_c_process, outputs_process);
++  op->record.retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
++  if (release_journal_save(&op->record) < 0)
++    {
++      start_journal_fault = true;
++      release_observe(out);
++      return 0;
++    }
++  atomic_store(&start_owned_latch, false);
++  start_retired_reopen_pending = true;
++  op->terminal = outputs_start_retired_stage_reader();
++  release_observe(out);
++  return 0;
++}
++
++/* Recovery has no live Native admission to exclude a successor. Inspect the
++ * visible process namespace, not merely the old PID. Ambiguous visibility is
++ * fenced; no privilege or numeric-PID fallback is introduced. */
++static bool
++release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
++{
++  DIR *processes = opendir("/proc");
++  struct dirent *process, *entry;
++  bool valid = processes != NULL;
++  char directory[80], path[128], line[256], *end;
++  struct stat st;
++  if (!processes || !device || !inode)
++    {
++      if (processes)
++	closedir(processes);
++      return false;
++    }
++  while (valid)
++    {
++      errno = 0;
++      process = readdir(processes);
++      if (!process)
++	{
++	  if (errno)
++	    valid = false;
++	  break;
++	}
++      if (process->d_name[0] < '0' || process->d_name[0] > '9')
++	continue;
++      errno = 0;
++      unsigned long pid = strtoul(process->d_name, &end, 10);
++      if (errno || *end || !pid || pid > INT_MAX)
++	{
++	  valid = false;
++	  break;
++	}
++      if (snprintf(directory, sizeof(directory), "/proc/%lu/fd", pid) >= (int)sizeof(directory))
++	{
++	  valid = false;
++	  break;
++	}
++      DIR *fds = opendir(directory);
++      if (!fds)
++	{
++	  if (errno == ENOENT)
++	    continue;
++	  valid = false;
++	  break;
++	}
++      while (valid)
++	{
++	  errno = 0;
++	  entry = readdir(fds);
++	  if (!entry)
++	    {
++	      if (errno)
++		valid = false;
++	      break;
++	    }
++	  if (entry->d_name[0] == '.')
++	    continue;
++	  errno = 0;
++	  unsigned long fd = strtoul(entry->d_name, &end, 10);
++	  if (errno || *end || fd > INT_MAX
++	      || snprintf(path, sizeof(path), "%s/%lu", directory, fd) >= (int)sizeof(path))
++	    {
++	      valid = false;
++	      break;
++	    }
++	  if (stat(path, &st) < 0)
++	    {
++	      if (errno == ENOENT)
++		continue;
++	      valid = false;
++	      break;
++	    }
++	  if (!S_ISFIFO(st.st_mode) || (uint64_t)st.st_dev != device || (uint64_t)st.st_ino != inode)
++	    continue;
++	  if (snprintf(path, sizeof(path), "/proc/%lu/fdinfo/%lu", pid, fd) >= (int)sizeof(path))
++	    {
++	      valid = false;
++	      break;
++	    }
++	  FILE *info = fopen(path, "r");
++	  unsigned long flags = 0;
++	  bool found = false;
++	  if (!info)
++	    {
++	      valid = false;
++	      break;
++	    }
++	  while (fgets(line, sizeof(line), info))
++	    if (!strncmp(line, "flags:", 6))
++	      {
++		errno = 0;
++		flags = strtoul(line + 6, &end, 8);
++		found = !errno && end != line + 6 && (*end == '\n' || !*end);
++		break;
++	      }
++	  fclose(info);
++	  if (!found || (flags & O_ACCMODE) != O_RDONLY)
++	    valid = false;
++	}
++      closedir(fds);
++    }
++  closedir(processes);
++  return valid;
++}
++
++static bool
++release_fifo_has_no_writers(uint64_t device, uint64_t inode)
++{
++  struct proc_native_scope scope = { 0 };
++  if (!proc_native_scope_enter(&scope))
++    return false;
++  bool valid = release_fifo_has_no_writers_raw(device, inode);
++  proc_native_scope_leave(&scope);
++  return valid;
++}
++
++void
++outputs_transport_release_recover_pending(void)
++{
++  struct output_device *d;
++  struct input_fifo_identity reader = { 0 };
++  struct timespec deadline;
++  /* Called once after input_init and before player emission can start. A
++   * persisted token is evidence to retire, never authority for a new route. */
++  if (start_journal_fault || !start_startup_quarantine || !start_journal.payload || !release_is_typed_journal()
++      || !start_journal_payload_valid() || start_journal_retirement_outcome != OUTPUT_RETIRE_PENDING
++      || !strcmp(start_journal.c_process, outputs_process) || start_active || start_scope || transport_pin
++      || transport_custody_busy() || room_volume_pin_busy() || !start_contexts_drained())
++    return;
++  for (d = outputs_device_list; d; d = d->next)
++    if (d->selected || d->session || d->busy || d->attention_lease || d->attention_retiring_session
++        || d->attention_restart_pending || d->attention_restoring)
++      return;
++  struct transport_release_record r = release_record;
++  const struct output_queue_writer *w = &r.result.command.writer;
++  if (start_all_writers_closed(&w->native_process, w->pipe_device, w->pipe_inode) != 1
++      || !release_fifo_has_no_writers(w->pipe_device, w->pipe_inode) || clock_gettime(CLOCK_MONOTONIC, &deadline) < 0)
++    return;
++  deadline.tv_sec++;
++  if (input_fifo_retire_recovered(r.input_path, w->pipe_device, w->pipe_inode, &deadline, &reader) < 0
++      || reader.device != w->pipe_device || reader.inode != w->pipe_inode || !reader.epoch
++      || start_all_writers_closed(&w->native_process, w->pipe_device, w->pipe_inode) != 1
++      || !release_fifo_has_no_writers(w->pipe_device, w->pipe_inode) || !start_contexts_drained())
++    return;
++  r.retired_epoch = reader.epoch;
++  strcpy(r.retired_c_process, outputs_process);
++  r.retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
++  if (release_journal_save(&r) < 0)
++    {
++      start_journal_fault = true;
++      return;
++    }
++  start_startup_quarantine = false;
++  atomic_store(&start_owned_latch, false);
++  start_retired_reopen_pending = true;
++}
++
++/* Keep the genuine START/MOVE proof and its database identity. Only this exact
++ * consumed manual operation may add its typed receipt to predecessor writes. */
++static bool
++release_wrap_predecessor(struct start_slot *s, json_object *o)
++{
++  struct transport_release_operation *op = &release_operation;
++  if (!op->prepared || !op->used || !op->predecessor.completed_token[0]
++      || strcmp(s->result.command.token, op->predecessor.completed_token))
++    return true;
++  if (s->retirement.outcome != OUTPUT_RETIRE_PENDING && s->retirement.outcome != OUTPUT_RETIRE_RETIRED_KNOWN
++      && s->retirement.outcome != OUTPUT_RETIRE_UNKNOWN)
++    return false;
++  op->record.retirement = s->retirement.outcome;
++  if (s->retirement.outcome == OUTPUT_RETIRE_RETIRED_KNOWN)
++    {
++      op->record.retired_epoch = s->retirement.input_epoch;
++      strcpy(op->record.retired_c_process, outputs_process);
++    }
++  json_object_object_add(o, "schema",
++      json_object_new_string(s->result.command.move_existing_session
++                                 ? "podconnect.output_manual_release_move_journal.v1"
++                                 : "podconnect.output_manual_release_start_journal.v1"));
++  json_object_object_add(o, "manual_release", release_journal_json(&op->record));
++  return true;
++}
++static bool
++release_predecessor_payload_valid(json_object *o)
++{
++  json_object *schema, *manual, *copy, *actual_owner, *route;
++  struct db_start_guard predecessor = start_journal, guard = start_journal;
++  struct output_native_owner owner = { 0 };
++  struct output_transport_identity identity = { 0 };
++  char manual_token[33], reservation[33], path[4096];
++  uint64_t n;
++  bool move, valid = false;
++  if (json_object_object_length(o) != 59 || !json_object_object_get_ex(o, "schema", &schema)
++      || !json_object_is_type(schema, json_type_string) || !json_object_object_get_ex(o, "manual_release", &manual)
++      || !json_object_is_type(manual, json_type_object)
++      || strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), start_journal.payload))
++    return false;
++  move = !strcmp(json_object_get_string(schema), "podconnect.output_manual_release_move_journal.v1");
++  copy = json_tokener_parse(start_journal.payload);
++  if (!copy)
++    return false;
++  json_object_object_del(copy, "manual_release");
++  json_object_object_add(copy, "schema",
++      json_object_new_string(move ? "podconnect.output_move_journal.v1" : "podconnect.output_start_journal.v1"));
++  predecessor.payload = (char *)json_object_to_json_string_ext(copy, JSON_C_TO_STRING_PLAIN);
++  if (!start_journal_payload_legacy_valid_for(&predecessor))
++    goto out;
++  enum output_retirement_outcome prior = start_journal_retirement_outcome;
++  bool prior_reopen = start_journal_retirement_reopen_consumed;
++  if (prior == OUTPUT_RETIRE_NONE || !release_json_string(manual, "token", manual_token, sizeof(manual_token))
++      || !strcmp(manual_token, start_journal.token))
++    goto out;
++  strcpy(guard.token, manual_token);
++  guard.payload = (char *)json_object_to_json_string_ext(manual, JSON_C_TO_STRING_PLAIN);
++  if (!release_journal_parse(manual, &guard))
++    goto out;
++  const struct output_transport_request *c = &release_record.result.command;
++#define EQN(k, expected) (release_json_u64(o, k, &n) && n == (expected))
++  valid = json_object_object_get_ex(o, "actual_native_owner", &actual_owner)
++          && release_owner_parse(actual_owner, &owner) && native_owner_completed_continuity(&c->native_owner, &owner)
++          && json_object_object_get_ex(o, "route_identity", &route) && release_identity_parse(route, &identity)
++          && !strcmp(identity.process, release_record.result.identity.process) && identity.device_id == c->device_id
++          && identity.device_incarnation == release_record.result.identity.device_incarnation
++          && identity.session_epoch == release_record.result.identity.session_epoch
++          && identity.route_revision == release_record.result.identity.route_revision
++          && identity.selection_revision == release_record.result.identity.selection_revision
++          && !strcmp(identity.input_path_digest, c->writer.input_path_digest)
++          && release_json_string(o, "input_path", path, sizeof(path)) && !strcmp(path, release_record.input_path)
++          && release_json_string(o, "retirement_reservation", reservation, sizeof(reservation))
++          && !strcmp(reservation, c->native_prepare_id) && release_json_u64(o, "native_revision", &n)
++          && c->native_revision > n && EQN("retirement_writer_fd", c->writer.writer_fd)
++          && EQN("retirement_writer_source_epoch", c->writer.source_epoch)
++          && EQN("retirement_pipe_device", c->writer.pipe_device) && EQN("retirement_pipe_inode", c->writer.pipe_inode)
++          && EQN("retirement_input_item_id", release_record.result.identity.input_item_id)
++          && EQN("retirement_admitted_input_epoch", release_record.admitted_epoch)
++          && (prior == release_record.retirement
++              || (prior == OUTPUT_RETIRE_PENDING && release_record.retirement == OUTPUT_RETIRE_RETIRED_KNOWN
++                  && strcmp(release_record.retired_c_process, start_journal.c_process)))
++          && (!prior_reopen || release_record.reopen_consumed);
++#undef EQN
++out:
++  json_object_put(copy);
++  return valid;
++}
++static bool
++release_reopen_json(json_object *o)
++{
++  json_object *manual, *state;
++  if (json_object_object_get_ex(o, "manual_release", &manual))
++    {
++      if (!json_object_is_type(manual, json_type_object)
++          || !json_object_object_get_ex(manual, "retirement_outcome", &state)
++          || !json_object_is_type(state, json_type_string) || strcmp(json_object_get_string(state), "retired_known"))
++	return false;
++      json_object_object_add(manual, "retirement_reopen_consumed", json_object_new_boolean(true));
++      if (json_object_object_get_ex(o, "retirement_outcome", &state) && json_object_is_type(state, json_type_string)
++          && !strcmp(json_object_get_string(state), "retired_known"))
++	json_object_object_add(o, "retirement_reopen_consumed", json_object_new_boolean(true));
++    }
++  else
++    json_object_object_add(o, "retirement_reopen_consumed", json_object_new_boolean(true));
++  return true;
++}
++
++/* The admission expired before FULL, or this is an unrelated legacy task:
++ * keep its original window. A consumed exact durable manual release owns only
++ * cleanup and uses fresh bounded reader/drain waits, never a new effect. */
++static bool
++release_retirement_consumed(const struct start_retirement *retirement)
++{
++  struct transport_release_operation *op = &release_operation;
++  struct start_slot *s = start_active;
++  return s && retirement == &s->retirement && op->prepared && op->used && op->predecessor.completed_token[0]
++         && !strcmp(s->result.command.token, op->predecessor.completed_token)
++         && !strcmp(start_journal.c_process, outputs_process) && release_is_typed_journal()
++         && start_journal_payload_valid()
++         && !strcmp(release_record.result.command.token, op->record.result.command.token)
++         && !strcmp(release_record.result.command.native_prepare_id, op->record.result.command.native_prepare_id)
++         && (release_record.retirement == OUTPUT_RETIRE_PENDING
++             || release_record.retirement == OUTPUT_RETIRE_RETIRED_KNOWN);
++}
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -310,12 +310,16 @@
+   bool custody;
+   uint64_t route_revision,selection_revision;
+   if(!s){
+-    if(start_scope || transport_custody_busy())return false;
+-    for(scan=outputs_device_list;scan;scan=scan->next)
+-      if(scan->selected || scan->session || scan->busy || scan->attention_lease
+-          || scan->attention_retiring_session || scan->attention_restart_pending
+-          || scan->attention_restoring)return false;
+-    return true;
++      if (release_is_typed_journal() && start_journal_payload_valid()
++          && !strcmp(start_journal.token, release_record_token()) && !strcmp(start_journal.c_process, outputs_process))
++	return release_retired_owner_detach();
++      if (start_scope || transport_custody_busy())
++	return false;
++      for (scan = outputs_device_list; scan; scan = scan->next)
++	if (scan->selected || scan->session || scan->busy || scan->attention_lease || scan->attention_retiring_session
++	    || scan->attention_restart_pending || scan->attention_restoring)
++	  return false;
++      return true;
+   }
+   t=&s->retirement;
+   if((start_scope && start_scope!=s) || s->cancelled || s->writer_pending
+@@ -910,6 +914,8 @@
+ }
+ static bool start_retirement_window(const struct start_retirement *retirement)
+ {
++  if (release_retirement_consumed(retirement))
++    return true;
+   struct timespec now;
+   return retirement && clock_gettime(CLOCK_MONOTONIC,&now)==0
+     && (now.tv_sec<retirement->deadline.tv_sec
+@@ -1059,8 +1065,10 @@
+   start_gate_set(true);
+   if(clock_gettime(CLOCK_MONOTONIC,&deadline)<0)goto unknown;
+   deadline.tv_sec++;
+-  if(deadline.tv_sec>t->deadline.tv_sec
+-      || (deadline.tv_sec==t->deadline.tv_sec && deadline.tv_nsec>t->deadline.tv_nsec))deadline=t->deadline;
++  if (!release_retirement_consumed(t)
++      && (deadline.tv_sec > t->deadline.tv_sec
++          || (deadline.tv_sec == t->deadline.tv_sec && deadline.tv_nsec > t->deadline.tv_nsec)))
++    deadline = t->deadline;
+   drained=has_reader
+     ? input_fifo_retire(t->input_item_id,s->result.command.expected_input_path,t->pipe_device,t->pipe_inode,
+         t->admitted_input_epoch,&deadline,&reader)
+@@ -1129,8 +1137,9 @@
+   if(clock_gettime(CLOCK_MONOTONIC,&deadline)<0){t->outcome=OUTPUT_RETIRE_UNKNOWN;start_retirement_observe(s,out);return 0;}
+   deadline.tv_nsec+=100000000;
+   if(deadline.tv_nsec>=1000000000){deadline.tv_sec++;deadline.tv_nsec-=1000000000;}
+-  if(deadline.tv_sec>t->deadline.tv_sec
+-      || (deadline.tv_sec==t->deadline.tv_sec && deadline.tv_nsec>t->deadline.tv_nsec))
++  if (!release_retirement_consumed(t)
++      && (deadline.tv_sec > t->deadline.tv_sec
++          || (deadline.tv_sec == t->deadline.tv_sec && deadline.tv_nsec > t->deadline.tv_nsec)))
+     deadline=t->deadline;
+   if(!start_retirement_window(t)
+       || input_fifo_owner_get(t->input_item_id,s->result.command.expected_input_path,false,0,0,&deadline,&reader)<0
+--- a/src/outputs_start_journal.inc.c
++++ b/src/outputs_start_journal.inc.c
+@@ -184,23 +184,31 @@
+   result=start_process_ticks(start_journal.pid,&ticks);
+   return result==0 || (result==1 && ticks!=start_journal.proc_start_ticks);
+ }
+-static bool start_journal_payload_valid(void)
++static bool
++start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
+ {
+   json_tokener *tok=json_tokener_new();json_object *o,*v;bool valid,move,has_retirement;size_t n;
+   enum output_retirement_outcome retirement=OUTPUT_RETIRE_NONE;
+   uint64_t writer_epoch=0,writer_fd=0,pipe_device=0,pipe_inode=0,input_item_id=0,admitted_epoch=0,input_epoch=0,deadline_sec=0,deadline_nsec=0;
+   bool reader_ready_closed=false,reopen_consumed=false;
+-  if(!tok || !start_journal.payload){if(tok)json_tokener_free(tok);return false;}
+-  n=strlen(start_journal.payload);o=json_tokener_parse_ex(tok,start_journal.payload,n);
++  if (!tok || !record->payload)
++    {
++      if (tok)
++	json_tokener_free(tok);
++      return false;
++    }
++  n = strlen(record->payload);
++  o = json_tokener_parse_ex(tok, record->payload, n);
+   valid=json_tokener_get_error(tok)==json_tokener_success && json_tokener_get_parse_end(tok)==n && o && json_object_is_type(o,json_type_object);
+   move=valid && json_object_object_get_ex(o,"schema",&v) && v && json_object_is_type(v,json_type_string)
+     && !strcmp(json_object_get_string(v),"podconnect.output_move_journal.v1");
+ #define JC(key,expected) (json_object_object_get_ex(o,key,&v) && v && json_object_is_type(v,json_type_string) && !strcmp(json_object_get_string(v),expected))
+-  valid=valid && (move || JC("schema","podconnect.output_start_journal.v1")) && JC("token",start_journal.token)
+-    && JC("c_process",start_journal.c_process) && JC("native_boot_id",start_journal.boot_id);
++  valid = valid && (move || JC("schema", "podconnect.output_start_journal.v1")) && JC("token", record->token)
++          && JC("c_process", record->c_process) && JC("native_boot_id", record->boot_id);
+ #undef JC
+-  valid=valid && json_object_object_get_ex(o,"native_pid",&v) && json_object_is_type(v,json_type_int) && json_object_get_uint64(v)==start_journal.pid
+-    && json_object_object_get_ex(o,"native_start_ticks",&v) && json_object_is_type(v,json_type_int) && json_object_get_uint64(v)==start_journal.proc_start_ticks;
++  valid = valid && json_object_object_get_ex(o, "native_pid", &v) && json_object_is_type(v, json_type_int)
++          && json_object_get_uint64(v) == record->pid && json_object_object_get_ex(o, "native_start_ticks", &v)
++          && json_object_is_type(v, json_type_int) && json_object_get_uint64(v) == record->proc_start_ticks;
+   valid=valid && json_object_object_get_ex(o,"native_pid_namespace_device",&v) && json_object_is_type(v,json_type_int);
+   if(valid)start_journal_pidns_device=json_object_get_uint64(v);
+   valid=valid && json_object_object_get_ex(o,"native_pid_namespace_inode",&v) && json_object_is_type(v,json_type_int) && json_object_get_uint64(v)>0;
+@@ -209,9 +217,8 @@
+   has_retirement=valid && json_object_object_get_ex(o,"retirement_outcome",&v);
+   if(has_retirement){
+     const char *outcome;
+-    valid=valid && json_object_object_length(o)==58
+-      && json_object_is_type(v,json_type_string)
+-      && !strcmp(json_object_to_json_string_ext(o,JSON_C_TO_STRING_PLAIN),start_journal.payload);
++    valid = valid && json_object_object_length(o) == 58 && json_object_is_type(v, json_type_string)
++            && !strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), record->payload);
+     outcome=valid ? json_object_get_string(v) : NULL;
+     if(outcome && !strcmp(outcome,"none"))retirement=OUTPUT_RETIRE_NONE;
+     else if(outcome && !strcmp(outcome,"pending"))retirement=OUTPUT_RETIRE_PENDING;
+@@ -277,6 +284,42 @@
+     }
+   }
+   if(valid){start_journal_retirement_outcome=retirement;start_journal_retirement_reopen_consumed=reopen_consumed;}
++  if (o)
++    json_object_put(o);
++  json_tokener_free(tok);
++  return valid;
++}
++static bool
++start_journal_payload_legacy_valid(void)
++{
++  return start_journal_payload_legacy_valid_for(&start_journal);
++}
++static bool
++start_journal_payload_valid(void)
++{
++  json_tokener *tok = json_tokener_new();
++  json_object *o = NULL, *schema;
++  bool valid = false;
++  if (!tok || !start_journal.payload)
++    {
++      if (tok)
++	json_tokener_free(tok);
++      return false;
++    }
++  size_t n = strlen(start_journal.payload);
++  o = json_tokener_parse_ex(tok, start_journal.payload, n);
++  if (json_tokener_get_error(tok) == json_tokener_success && json_tokener_get_parse_end(tok) == n && o
++      && json_object_is_type(o, json_type_object) && json_object_object_get_ex(o, "schema", &schema)
++      && json_object_is_type(schema, json_type_string))
++    {
++      if (!strcmp(json_object_get_string(schema), "podconnect.output_transport_release_journal.v1"))
++	valid = release_journal_payload_valid(o);
++      else if (!strcmp(json_object_get_string(schema), "podconnect.output_manual_release_start_journal.v1")
++               || !strcmp(json_object_get_string(schema), "podconnect.output_manual_release_move_journal.v1"))
++	valid = release_predecessor_payload_valid(o);
++      else
++	valid = start_journal_payload_legacy_valid();
++    }
+   if(o)json_object_put(o);
+   json_tokener_free(tok);return valid;
+ }
+@@ -358,6 +401,11 @@
+   json_object_object_add(route,"process",json_object_new_string(s->result.route_identity.process));json_object_object_add(route,"input_path_digest",json_object_new_string(s->result.route_identity.input_path_digest));
+ #undef JS
+ #undef JN
++  if (!release_wrap_predecessor(s, o))
++    {
++      json_object_put(o);
++      return -1;
++    }
+   serialized=json_object_to_json_string_ext(o,JSON_C_TO_STRING_PLAIN);r.payload=(char *)serialized;
+   ret=serialized ? db_start_guard_save(&start_journal,&r) : -1;
+   if(ret==0){char *copy=strdup(serialized);if(!copy)ret=-1;else{free(start_journal.payload);start_journal=r;start_journal.payload=copy;atomic_store(&start_owned_latch,true);start_journal_pidns_device=ns_device;start_journal_pidns_inode=ns_inode;
+@@ -381,7 +429,11 @@
+   if(start_journal_retirement_reopen_consumed)return 0;
+   o=json_tokener_parse(start_journal.payload);
+   if(!o || !json_object_is_type(o,json_type_object)){if(o)json_object_put(o);return -1;}
+-  json_object_object_add(o,"retirement_reopen_consumed",json_object_new_boolean(true));
++  if (!release_reopen_json(o))
++    {
++      json_object_put(o);
++      return -1;
++    }
+   serialized=json_object_to_json_string_ext(o,JSON_C_TO_STRING_PLAIN);
+   next=start_journal;next.payload=(char *)serialized;
+   ret=serialized ? db_start_guard_save(&start_journal,&next) : -1;
+--- a/src/player.c
++++ b/src/player.c
+@@ -3178,6 +3178,7 @@
+   struct output_transport_result *result;
+   struct output_transport_identity *identity;
+   bool *busy,*start_owned,*clean_absent;
++  bool native_close_done;
+   const char *token,*prepare;
+   uint64_t id,revision;
+   int action;
+@@ -3186,10 +3187,15 @@
+ transport_command(void *arg, int *retval)
+ {
+   struct player_transport_command *c=arg;
+-  if (c->action!=2 && (!pb_session.playing_now || pb_session.playing_now!=pb_session.source_list
+-      || pb_session.reading_now!=pb_session.playing_now))
++  if (c->action != 2 && c->action != 7
++      && (!pb_session.playing_now || pb_session.playing_now != pb_session.source_list
++          || pb_session.reading_now != pb_session.playing_now))
+     { *retval=-1; return COMMAND_END; }
+-  if (c->action==6) *retval=outputs_transport_pause_confirm(c->id,c->token,c->prepare,c->revision);
++  if (c->action == 7)
++    *retval
++        = outputs_transport_release_confirm(c->id, c->token, c->prepare, c->revision, c->native_close_done, c->result);
++  else if (c->action == 6)
++    *retval = outputs_transport_pause_confirm(c->id, c->token, c->prepare, c->revision);
+   else if (c->action==0) *retval=outputs_transport_prepare(c->request,c->result);
+   else if (c->action==1) *retval=outputs_transport_commit(c->request,c->result);
+   else if (c->action==2) *retval=outputs_transport_result_get(c->token,c->result);
+@@ -3197,6 +3203,19 @@
+   else if (c->action==4) *retval=outputs_transport_bound_state_get(c->id,c->owner,c->identity,c->busy,c->start_owned,c->clean_absent);
+   else *retval=outputs_transport_state_get(c->id,c->identity,c->busy);
+   return COMMAND_END;
++}
++int
++player_transport_release_confirm(uint64_t id, const char *token, const char *prepare, uint64_t revision, bool closed,
++    struct output_transport_result *out)
++{
++  struct player_transport_command c = { .id = id,
++    .token = token,
++    .prepare = prepare,
++    .revision = revision,
++    .native_close_done = closed,
++    .result = out,
++    .action = 7 };
++  return commands_exec_sync(cmdbase, transport_command, NULL, &c);
+ }
+ int player_transport_pause_confirm(uint64_t id,const char *token,const char *prepare,uint64_t revision)
+ {
+@@ -4340,6 +4359,7 @@
+       DPRINTF(E_FATAL, L_PLAYER, "Input initiation failed\n");
+       goto error_outputs_deinit;
+     }
++  outputs_transport_release_recover_pending();
+   if(outputs_start_retired_normal_staging(NULL) && !outputs_start_retired_stage_reader())
+     DPRINTF(E_WARN,L_PLAYER,"Retired native PIPE could not stage a fresh reader; emission gate remains closed\n");
+ 
+--- a/src/player.h
++++ b/src/player.h
+@@ -245,6 +245,9 @@
+ int player_transport_prepare(const struct output_transport_request *, struct output_transport_result *);
+ int player_transport_commit(const struct output_transport_request *, struct output_transport_result *);
+ int player_transport_result_get(const char *, struct output_transport_result *);
++int
++player_transport_release_confirm(
++    uint64_t, const char *, const char *, uint64_t, bool, struct output_transport_result *);
+ int player_transport_pause_confirm(uint64_t,const char *,const char *,uint64_t);
+ int player_transport_state_get(uint64_t, struct output_transport_identity *, bool *);
+ 

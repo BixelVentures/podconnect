@@ -1,0 +1,1226 @@
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -634,6 +634,10 @@
+ 				}
+ 				p.app.cfg.DeviceAliasHomePodIDs[1] = "1"
+ 				p.aliasRegistry[1].HomePodID = "1"
++				if os.Getenv("PC70_RELEASE_COMPOSE") == "move" {
++					p.app.cfg.DeviceAliasHomePodIDs[0] = "2"
++					p.initAliasRegistry()
++				}
+ 			}
+ 
+ 			p.app.cfg.AudioOutputPipe = path
+@@ -1149,11 +1153,56 @@
+ // Keeps real public commit dispatch/actor park/worker and actual C. Provider
+ // decoding is deliberately seeded here so this case isolates the next boundary.
+ func testSelectedContentCommitActualC(t *testing.T, p *AppPlayer, worker *player.Player, stream *player.Stream, mode string) {
++	testSelectedContentCommitActualCOnServer(t, p, worker, stream, mode, nil)
++}
++func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker *player.Player, stream *player.Stream, mode string, supplied *ConcreteApiServer) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
++	if os.Getenv("PC70_RELEASE_COMPOSE") == "ordinary" || os.Getenv("PC70_RELEASE_COMPOSE") == "move" {
++		p.roomMoveSteps = make(chan moveStep) // Same actor-step channel as the incumbent MOVE owner fixture.
++		nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++		p.primaryStream = stream
++		p.app.server = &StubApiServer{log: p.app.log}
++		p.app.mpris = mpris.DummyServer{}
++		p.state.player.IsPlaying = true
++		p.state.player.IsPaused = false
++		p.state.active = true
++		source := stream.Source.(*contentInertSource)
++		source.finite = true
++		source.remaining = 30 * 44100 * 2
++		if err := worker.SetPrimaryStream(source, false, false); err != nil {
++			t.Fatal("ordinary real writer", err)
++		}
++		response, err := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/ordinary-writer-ready", "application/json", strings.NewReader("{}"))
++		if err != nil {
++			t.Fatal(err)
++		}
++		response.Body.Close()
++		if response.StatusCode != 200 {
++			t.Fatal("ordinary C reader", response.StatusCode)
++		}
++		server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			for req := range server.requests {
++				if !p.dispatchAPIAndPark(ctx, req) {
++					return
++				}
++			}
++		}()
++		defer func() { close(server.requests); <-done }()
++		if os.Getenv("PC70_RELEASE_COMPOSE") == "move" {
++			testManualReleaseComposedMOVE(t, p, server)
++		}
++		testManualReleaseComposed(t, p, server)
++		return
++	}
+ 	p.primaryStream = nil
+-	p.app.mpris = mpris.DummyServer{}
+-	p.app.server = &StubApiServer{log: p.app.log}
++	if supplied == nil {
++		p.app.mpris = mpris.DummyServer{}
++		p.app.server = &StubApiServer{log: p.app.log}
++	}
+ 	if mode == "actual-c-selected-successor" {
+ 		p.primaryStream = stream
+ 		if _, e := p.startPreparedDealerTransfer(ctx, false, 0); e != nil {
+@@ -1183,19 +1232,24 @@
+ 		}
+ 		p.state.tracks = list
+ 	}
+-	p.prefetchTimer = time.NewTimer(time.Hour)
+-	defer p.prefetchTimer.Stop()
+-	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
+-	actorDone := make(chan struct{})
+-	go func() {
+-		defer close(actorDone)
+-		for req := range server.requests {
+-			if !p.dispatchAPIAndPark(ctx, req) {
+-				return
+-			}
+-		}
+-	}()
+-	defer func() { close(server.requests); <-actorDone }()
++	if supplied == nil {
++		p.prefetchTimer = time.NewTimer(time.Hour)
++		defer p.prefetchTimer.Stop()
++	}
++	server := supplied
++	if server == nil {
++		server = &ConcreteApiServer{requests: make(chan ApiRequest)}
++		actorDone := make(chan struct{})
++		go func() {
++			defer close(actorDone)
++			for req := range server.requests {
++				if !p.dispatchAPIAndPark(ctx, req) {
++					return
++				}
++			}
++		}()
++		defer func() { close(server.requests); <-actorDone }()
++	}
+ 	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r1", "1"})
+ 	if err != nil {
+ 		t.Fatal("capture", err)
+@@ -1237,6 +1291,10 @@
+ 	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
+ 		t.Fatal("selected state not observed", err)
+ 	}
++	if os.Getenv("PC70_RELEASE_COMPOSE") == "start" {
++		testManualReleaseComposed(t, p, server)
++		return
++	}
+ 	if mode == "actual-c-native-pause" {
+ 		owner, e := p.roomTransportIdentity("account", "engine", "r1", "1")
+ 		if e != nil {
+--- a/daemon/room_queue_test.go
++++ b/daemon/room_queue_test.go
+@@ -5,6 +5,9 @@
+ 	"encoding/json"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/tracks"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+@@ -153,3 +156,122 @@
+ 		t.Fatal("failed bound read consumed an unrelated observation")
+ 	}
+ }
++
++// Bound publication fixture only: its private actor/writer proof is inert. It
++// does not fabricate an authenticated provider session or execute a queue jump.
++func queuePresentationFixture(t *testing.T) (*nativeQueueOffer, *nativeQueueOffer) {
++	p, op := queueAdmittedFixture(t)
++	p.state.tracks = &tracks.List{}
++	identity := op.Snapshot.roomTransportIdentity
++	prior := &nativeQueueOffer{
++		State: p.state, Tracks: p.state.tracks, Alias: *p.aliasBinding(),
++		BoundOwner: &identity, PlayerState: p.state.player, Session: p.sess,
++		Player: p.player, Primary: p.primaryStream, Generation: p.roomTransportGeneration,
++		Writer: op.Writer, Expires: time.Now().Add(-time.Second),
++		Snapshot: nativeQueueSnapshot{
++			Schema: "podconnect.native_queue.v1", TargetID: identity.TargetID,
++			RoomID: identity.RoomID, AccountUserID: identity.AccountUserID,
++			ConnectionID: identity.ConnectionID, SessionID: identity.SessionID,
++			AliasIncarnation: identity.AliasIncarnation,
++			ObservationID:    strings.Repeat("a", 32), QueueRevision: 0,
++			Items: []nativeQueueItem{
++				{ID: strings.Repeat("b", 24), Position: 0, URI: "spotify:track:1111111111111111111111", Queued: true},
++				{ID: strings.Repeat("c", 24), Position: 1, URI: "spotify:track:1111111111111111111111", Queued: true},
++			},
++		},
++	}
++	fresh := *prior
++	fresh.Expires = time.Now().Add(9 * time.Second)
++	fresh.Snapshot.ObservationID = strings.Repeat("d", 32)
++	fresh.Snapshot.ExpiresAfterMS = 9000
++	fresh.Snapshot.Items = append([]nativeQueueItem(nil), prior.Snapshot.Items...)
++	fresh.Snapshot.Items[0].ID = strings.Repeat("e", 24)
++	fresh.Snapshot.Items[1].ID = strings.Repeat("f", 24)
++	writer := *prior.Writer
++	fresh.Writer = &writer
++	return prior, &fresh
++}
++
++func TestQueuePresentationIDsSurviveOnlySameBoundQueue(t *testing.T) {
++	prior, fresh := queuePresentationFixture(t)
++	observation, expiry, writer := fresh.Snapshot.ObservationID, fresh.Expires, fresh.Writer
++	retainQueuePresentation(prior, fresh)
++	for index, row := range fresh.Snapshot.Items {
++		if row.ID != prior.Snapshot.Items[index].ID {
++			t.Fatal("unchanged bound queue lost its opaque presentation occurrence", index)
++		}
++	}
++	if fresh.Snapshot.ObservationID == prior.Snapshot.ObservationID || fresh.Snapshot.ObservationID != observation || fresh.Expires != expiry || fresh.Writer != writer || !prior.Expires.Before(time.Now()) {
++		t.Fatal("presentation reuse altered fresh observation/writer/expiry or reused an old lease")
++	}
++	fresh.Snapshot.Items[0].ID = "mutated"
++	if prior.Snapshot.Items[0].ID != strings.Repeat("b", 24) {
++		t.Fatal("fresh rows alias retained presentation")
++	}
++}
++
++func TestQueuePresentationIDsNeverBridgeChangedOwnerOrDuplicateReplacement(t *testing.T) {
++	for _, change := range []string{"nil", "consumed", "list", "state", "player-state", "session", "player", "primary", "generation", "bound-owner", "alias", "writer", "account", "connection", "session-id", "revision", "position", "uri", "queued", "count", "truncated", "old-id", "duplicate-id", "unbound"} {
++		t.Run(change, func(t *testing.T) {
++			prior, fresh := queuePresentationFixture(t)
++			switch change {
++			case "nil":
++				retainQueuePresentation(prior, nil)
++				return
++			case "consumed":
++				prior = nil
++			case "list":
++				fresh.Tracks = &tracks.List{}
++			case "state":
++				fresh.State = &State{}
++			case "player-state":
++				fresh.PlayerState = &connectpb.PlayerState{}
++			case "session":
++				fresh.Session = &session.Session{}
++			case "player":
++				fresh.Player = &player.Player{}
++			case "primary":
++				fresh.Primary = &player.Stream{}
++			case "generation":
++				fresh.Generation++
++			case "bound-owner":
++				changed := *fresh.BoundOwner
++				changed.AliasRevision++
++				fresh.BoundOwner = &changed
++			case "alias":
++				fresh.Alias.Incarnation = "new"
++			case "writer":
++				fresh.Writer.Wire.Generation = "2"
++			case "account":
++				fresh.Snapshot.AccountUserID = "other"
++			case "connection":
++				fresh.Snapshot.ConnectionID = "other"
++			case "session-id":
++				fresh.Snapshot.SessionID = "other"
++			case "revision":
++				fresh.Snapshot.QueueRevision++
++			case "position":
++				fresh.Snapshot.Items[0].Position = 1
++			case "uri":
++				fresh.Snapshot.Items[0].URI = "spotify:track:2222222222222222222222"
++			case "queued":
++				fresh.Snapshot.Items[0].Queued = false
++			case "count":
++				fresh.Snapshot.Items = fresh.Snapshot.Items[:1]
++			case "truncated":
++				fresh.Snapshot.Truncated = true
++			case "old-id":
++				prior.Snapshot.Items[0].ID = "invalid"
++			case "duplicate-id":
++				prior.Snapshot.Items[0].ID = prior.Snapshot.Items[1].ID
++			case "unbound":
++				fresh.BoundOwner = nil
++			}
++			want := fresh.Snapshot.Items[0].ID
++			retainQueuePresentation(prior, fresh)
++			if fresh.Snapshot.Items[0].ID != want {
++				t.Fatal("stale/ambiguous occurrence IDs reused", change)
++			}
++		})
++	}
++}
+--- /dev/null
++++ b/daemon/room_release_test.go
+@@ -0,0 +1,967 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"github.com/coder/websocket"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"reflect"
++	"runtime"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++	"unsafe"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/dealer"
++	"github.com/devgianlu/go-librespot/mpris"
++	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++// Existing authenticated-getter fields are seeded; the worker, FIFO, process,
++// fd, epoch, offer consumption, HTTP and Close are production code. No provider.
++func manualReleaseFixture(t *testing.T, purposes ...string) (*AppPlayer, *nativeTransportOffer) {
++	p, offer, _ := manualReleaseReaderFixture(t, purposes...)
++	return p, offer
++}
++func manualReleaseReaderFixture(t *testing.T, purposes ...string) (*AppPlayer, *nativeTransportOffer, func()) {
++	t.Helper()
++	if _, ok := nativeContentProcess(); !ok {
++		t.Skip("Linux process proof")
++	}
++	p, _ := roomTransportAdmittedFixture(t)
++	p.app.log = &librespot.NullLogger{}
++	p.app.cfg.ZeroconfEnabled = true
++	p.app.logoutCh = make(chan *AppPlayer, 1)
++	p.logout = p.app.logoutCh
++	p.app.currentPlayer = p
++	p.app.currentDone = make(chan struct{})
++	p.stop = make(chan struct{}, 1)
++	p.app.cfg.AudioBackend = "pipe"
++	p.app.cfg.AudioOutputPipeFormat = "s16le"
++	p.app.cfg.ExternalVolume = true
++	p.state.tracks = &tracks.List{}
++	path := filepath.Join(t.TempDir(), "release.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { reader.Close() })
++	p.app.cfg.AudioOutputPipe = path
++	actual, err := player.NewPlayer(&player.Options{Log: p.app.log, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++		return p.app.withNewOutput(p, create)
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	p.player = actual
++	t.Cleanup(actual.Close)
++	var source librespot.AudioSource = &contentInertSource{}
++	if len(purposes) > 0 && purposes[0] == "blocked" {
++		held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++		t.Cleanup(held.CancelRead)
++		source = held
++	}
++	if err := actual.SetPrimaryStream(source, true, false); err != nil {
++		t.Fatal(err)
++	}
++	p.primaryStream = &player.Stream{Source: source}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := actual.Start35(context.Background(), "quiesce", nil, source, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := actual.Start35Prepared(context.Background(), "resume", nil, source, pipe, epoch, true, guard); err != nil {
++		t.Fatal(err)
++	}
++
++	p.state.player.IsPaused = true
++	p.hasSpotConnId = true
++	p.hasInitialConnectState = true
++	p.playbackReadyCh = make(chan struct{})
++	close(p.playbackReadyCh)
++	access := ap.NewAccesspoint(p.app.log, nil, "fixture")
++	left, right := net.Pipe()
++	t.Cleanup(func() { left.Close(); right.Close() })
++	fields := reflect.ValueOf(access).Elem()
++	setAP := func(name string, value reflect.Value) {
++		field := fields.FieldByName(name)
++		reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(value)
++	}
++	setAP("conn", reflect.ValueOf(left))
++	setAP("encConn", reflect.New(fields.FieldByName("encConn").Type().Elem()))
++
++	f := reflect.ValueOf(access).Elem().FieldByName("welcome")
++	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")}))
++	nextSessionField(p.sess, "ap", access)
++	nextSessionField(p.sess, "events", &failureSessionEvents{})
++	nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++	if len(purposes) > 0 && purposes[0] == "pause" {
++		p.app.server = &StubApiServer{log: p.app.log}
++		p.app.mpris = mpris.DummyServer{}
++		p.state.player.Options = &connectpb.ContextPlayerOptions{}
++		p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++		p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++		list, e := tracks.NewTrackListFromContext(context.Background(), p.app.log, nil, &connectpb.Context{Uri: p.state.player.Track.Uri, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{{Uri: p.state.player.Track.Uri}}}}})
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = list.TrySeek(context.Background(), func(*connectpb.ContextTrack) bool { return true }); e != nil {
++			t.Fatal(e)
++		}
++		p.state.tracks = list
++		nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++			return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++		})))
++		nextSessionField(p.sess, "events", &releasePauseEvents{})
++	}
++	identity, err := p.roomTransportIdentity("account", "engine", "r0", "101")
++	if err != nil {
++		t.Fatal(err)
++	}
++	writer, err := p.captureQueueWriter(context.Background(), identity, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(purposes) > 0 && purposes[0] != "pause" && purposes[0] != "blocked" {
++		pipe := &outputPipeIdentity{Device: writer.Wire.Pipe.Device, Inode: writer.Wire.Pipe.Inode, Type: "fifo"}
++		capture := &contentCapture{Player: actual, Session: p.sess, Process: writer.Wire.Process}
++		if purposes[0] == "start" {
++			p.app.startCustody = &contentOperation{Owner: p, Capture: capture, Terminal: true, State: "complete", Epoch: writer.Wire.Epoch, Actual: &identity, CReceipt: &contentCReceipt{Phase: "completed", Actual: &identity, WriterEpoch: writer.Wire.Epoch, Pipe: pipe}}
++		} else {
++			p.app.moveCustody = &moveOperation{Owner: p, Capture: &moveCapture{contentCapture: capture}, Terminal: true, State: "complete", Epoch: writer.Wire.Epoch, Actual: &identity, Pipe: p.app.openedWriter, CReceipt: &moveCReceipt{Phase: "completed", Actual: &identity, WriterEpoch: writer.Wire.Epoch, Pipe: pipe}}
++		}
++	}
++	expected := &releaseOwnerDescriptor{releaseOwnerSchema, identity, writer.Wire}
++	_, err = p.prepareRoomTransportVersion(context.Background(), roomTransportPrepareRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", Action: "release", ExpectedReleaseOwner: expected}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	offer := p.roomTransportOffer
++	if _, err := p.consumeRoomTransportVersion(context.Background(), roomTransportConsumeRequest{offer.Snapshot.PrepareID, context.Background()}, true); err != nil {
++		t.Fatal(err)
++	}
++	return p, offer, func() { _ = reader.Close() }
++}
++func manualReleaseRoute(offer *nativeTransportOffer) roomVolumeRoute {
++	return roomVolumeRoute{"11111111-1111-1111-1111-111111111111", offer.Snapshot.HomePodID, "1", "1", "1", "1", "1", "1", offer.Writer.Wire.InputDigest}
++}
++func manualReleaseACK(offer *nativeTransportOffer, token string) releasePrepareACK {
++	physical := false
++	return releasePrepareACK{"podconnect.output_transport_release_prepare.v1", true, "committed", token, offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, offer.Snapshot.roomTransportIdentity, offer.NativeRevision, manualReleaseRoute(offer), offer.Writer.Wire, manualReleasePurpose, "pending", true, true, 5000, &physical}
++}
++func manualReleaseTerminal(offer *nativeTransportOffer, token string) releaseCResult {
++	physical := false
++	return releaseCResult{"podconnect.output_transport_release_result.v1", true, token, offer.Snapshot.PrepareID, offer.Snapshot.ArgsDigest, offer.Snapshot.roomTransportIdentity, offer.NativeRevision, manualReleaseRoute(offer), offer.Writer.Wire, manualReleasePurpose, "retired", true, true, false, &physical}
++}
++func TestManualReleaseActualWorkerNoCloseBeforeDurableACKAndExactTerminal(t *testing.T) {
++	for _, mode := range []string{"retired", "prepare409", "lost-ack", "late-owner", "missing-durable", "foreign-terminal", "missing-false", "active-start", "active-move", "client-cancel", "expired-after-admission", "lost-ack-recovered", "concurrent-close", "later-read-recovery", "crash-pending", "late-intent", "late-writer", "held-ordinary-prepare", "held-rest-mutations", "output-failure", "output-failure-foreign", "ap-failure", "ap-failure-foreign", "held-content-move-claims", "held-worker-pause", "same-writer-progress", "blocked-read"} {
++		t.Run(mode, func(t *testing.T) {
++			var p *AppPlayer
++			var offer *nativeTransportOffer
++			var closeReader func()
++			if mode == "active-start" {
++				p, offer = manualReleaseFixture(t, "start")
++			} else if mode == "active-move" {
++				p, offer = manualReleaseFixture(t, "move")
++			} else if mode == "blocked-read" {
++				p, offer = manualReleaseFixture(t, "blocked")
++			} else if mode == "held-worker-pause" || mode == "same-writer-progress" {
++				p, offer = manualReleaseFixture(t, "pause")
++			} else {
++				p, offer, closeReader = manualReleaseReaderFixture(t)
++			}
++			var heldMove *moveCapture
++
++			clientCtx, cancelClient := context.WithCancel(context.Background())
++			defer cancelClient()
++			token := strings.Repeat("e", 32)
++			commits, confirms, reads := 0, 0, 0
++			normalCloseDone := make(chan struct{})
++			var server *ConcreteApiServer
++			c := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if strings.HasSuffix(r.URL.Path, "/bound-commit") {
++					commits++
++					if mode == "client-cancel" {
++						cancelClient()
++					}
++					var body map[string]json.RawMessage
++					if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 9 {
++						t.Error("commit must be exact nine fields")
++					}
++					if p.player.Closed() {
++						t.Error("Close preceded durable C ACK")
++					}
++					if mode == "prepare409" {
++						w.WriteHeader(409)
++						return
++					}
++					if mode == "lost-ack" || mode == "lost-ack-recovered" || mode == "later-read-recovery" || mode == "crash-pending" {
++						w.WriteHeader(502)
++						return
++					}
++					if mode == "held-content-move-claims" {
++						if _, err := server.roomTransportAsk(context.Background(), ApiRequestType("pc70_fixture_content_move_claims"), nil); err != nil {
++							t.Error(err)
++						}
++					}
++					if mode == "ap-failure" || mode == "ap-failure-foreign" {
++						if _, err := server.roomTransportAsk(context.Background(), ApiRequestType("pc70_fixture_enter_failed"), nil); err != nil {
++							t.Error(err)
++						}
++						if mode == "ap-failure-foreign" {
++							p.app.moveCustodyMu.Lock()
++							p.app.openedWriterOwner = &AppPlayer{}
++							p.app.openedWriterGeneration++
++							p.app.moveCustodyMu.Unlock()
++						}
++					}
++					if mode == "output-failure" || mode == "output-failure-foreign" {
++						source := p.primaryStream.Source.(*contentInertSource)
++						source.finite = true
++						source.remaining = 44100 * 2
++						closeReader()
++						if err := p.player.Play(); err != nil {
++							t.Error(err)
++						}
++						deadline := time.After(2 * time.Second)
++						var failed player.Event
++					waitFailure:
++						for {
++							select {
++							case event := <-p.player.Receive():
++								if event.Type == player.EventTypeOutputFailed {
++									failed = event
++									break waitFailure
++								}
++							case <-deadline:
++								t.Error("missing real EPIPE failure")
++								w.WriteHeader(502)
++								return
++							}
++						}
++						if _, err := server.roomTransportAsk(context.Background(), ApiRequestType("pc70_fixture_output_failure"), &failed); err != nil {
++							t.Error(err)
++						}
++						if p.player.Closed() || !p.aliasRetired || p.roomTransportPending != offer || p.roomRetirement != nil || offer.ReleaseFailure == nil {
++							t.Error("failure crossed Close or competing retirement before durable ACK")
++						}
++						if mode == "output-failure-foreign" {
++							p.aliasMu.Lock()
++							p.aliasRevision++
++							p.aliasMu.Unlock()
++						}
++					}
++					if mode == "blocked-read" {
++						held := offer.Primary.Source.(*retirementHeldRead)
++						if err := p.player.Play(); err != nil {
++							t.Error(err)
++						}
++						select {
++						case <-held.entered:
++						case <-time.After(time.Second):
++							t.Error("real raw read did not enter")
++						}
++						if held.cancel.Load() {
++							t.Error("read interrupted before durable ACK")
++						}
++					}
++					if mode == "same-writer-progress" {
++						first := p.primaryStream.Source.(*contentInertSource)
++						first.finite = true
++						first.remaining = 0
++						second := &contentInertSource{}
++						p.player.SetSecondaryStream(second)
++						if err := p.player.Play(); err != nil {
++							t.Error(err)
++						}
++						deadline := time.After(time.Second)
++						progressed := false
++						for !progressed {
++							select {
++							case event := <-p.player.Receive():
++								if event.Type != player.EventTypeNotPlaying {
++									continue
++								}
++								if _, err := server.roomTransportAsk(context.Background(), ApiRequestType("pc70_fixture_output_failure"), &event); err != nil {
++									t.Error(err)
++								}
++								progressed = true
++							case <-deadline:
++								t.Error("real secondary promotion event missing")
++								progressed = true
++							}
++						}
++						if p.primaryStream.Source != first {
++							t.Error("actor invented a new source during consumed release")
++						}
++					}
++					if mode == "held-worker-pause" {
++						if err := p.player.Pause(); err != nil {
++							t.Error(err)
++						}
++						for {
++							select {
++							case event := <-p.player.Receive():
++								if event.Type != player.EventTypePause {
++									continue
++								}
++								if _, err := server.roomTransportAsk(context.Background(), ApiRequestType("pc70_fixture_output_failure"), &event); err != nil {
++									t.Error(err)
++								}
++							case <-time.After(time.Second):
++								t.Error("worker Pause event missing")
++							}
++							break
++						}
++					}
++					if mode == "held-rest-mutations" {
++						before := p.roomTransportGeneration
++						for _, typ := range []ApiRequestType{ApiRequestTypePause, ApiRequestTypeSetVolume} {
++							if _, err := server.roomTransportAsk(context.Background(), typ, nil); err == nil {
++								t.Error("REST mutation accepted during release", typ)
++							}
++						}
++						if p.roomTransportGeneration != before {
++							t.Error("rejectedRESTmutation invalidated release")
++						}
++					}
++					if mode == "held-ordinary-prepare" {
++						before := p.roomNativeIntent
++						_, err := server.roomTransportAsk(context.Background(), apiRoomBoundPrepare, roomTransportPrepareRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", Action: "pause"})
++						if err == nil || p.roomNativeIntent != before {
++							t.Error("held release allowed ordinary prepare to advance intent", err)
++						}
++					}
++					if mode == "late-intent" {
++						p.aliasMu.Lock()
++						p.roomNativeIntent++
++						p.aliasMu.Unlock()
++					}
++					if mode == "late-writer" {
++						p.app.moveCustodyMu.Lock()
++						p.app.openedWriterOwner = &AppPlayer{}
++						p.app.openedWriterGeneration++
++						p.app.moveCustodyMu.Unlock()
++					}
++					if mode == "late-owner" {
++						p.aliasMu.Lock()
++						p.aliasRevision++
++						p.aliasMu.Unlock()
++					}
++					if mode == "expired-after-admission" {
++						offer.Expires = time.Now().Add(-time.Second)
++						p.discardExpiredRoomTransport()
++					}
++					if mode == "concurrent-close" {
++						go func() { p.Close(); close(normalCloseDone) }()
++						select {
++						case <-normalCloseDone:
++							t.Error("normal Close crossed unresolved C commit")
++						case <-time.After(10 * time.Millisecond):
++						}
++					}
++					ack := manualReleaseACK(offer, token)
++					if mode == "missing-durable" {
++						ack.DurablePending = false
++					}
++					json.NewEncoder(w).Encode(ack)
++					return
++				}
++				if strings.HasSuffix(r.URL.Path, "/bound-release-confirm") {
++					confirms++
++					if !p.player.Closed() {
++						t.Error("confirm before joined worker Close")
++					}
++					var body map[string]json.RawMessage
++					if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 4 || string(body["native_close_done"]) != "true" {
++						t.Error("confirm must be exact four fields")
++					}
++				} else if strings.Contains(r.URL.Path, "/bound-result/") {
++					reads++
++					if mode == "later-read-recovery" {
++						if reads == 1 {
++							w.WriteHeader(502)
++						} else {
++							json.NewEncoder(w).Encode(manualReleaseACK(offer, token))
++						}
++						return
++					}
++					if mode == "crash-pending" {
++						w.WriteHeader(502)
++						return
++					}
++					if mode == "lost-ack-recovered" {
++						json.NewEncoder(w).Encode(manualReleaseACK(offer, token))
++						return
++					}
++				} else {
++					t.Error("unbound or old retirement endpoint", r.URL.Path)
++				}
++				result := manualReleaseTerminal(offer, token)
++				if mode == "foreign-terminal" {
++					result.Writer.Generation = "999"
++				}
++				if mode == "missing-false" {
++					result.Physical = nil
++				}
++				json.NewEncoder(w).Encode(result)
++			}))
++			defer c.Close()
++			offer.OwnToneURL = c.URL
++			p.app.cfg.RoomTransportOwnToneURL = c.URL
++			if mode == "held-content-move-claims" {
++				var err error
++				heldMove, err = p.captureMove(roomVolumeScope{"account", "engine", "r1", "202"})
++				if err != nil {
++					t.Fatal("before-release heldMOVEcapture", err)
++				}
++			}
++
++			server = &ConcreteApiServer{requests: make(chan ApiRequest)}
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for req := range server.requests {
++					if req.Type == ApiRequestType("pc70_fixture_content_move_claims") {
++						testManualReleaseBlockedContentMoveClaims(t, p, heldMove)
++						req.Reply(nil, nil)
++						continue
++					}
++					if req.Type == ApiRequestType("pc70_fixture_enter_failed") {
++						p.clearRoomTransport()
++						req.Reply(nil, nil)
++						p.runFailedTransport(server.requests, nil)
++						return
++					}
++					if req.Type == ApiRequestType("pc70_fixture_output_failure") {
++						p.handlePlayerEvent(context.Background(), req.Data.(*player.Event))
++						req.Reply(nil, nil)
++						continue
++					}
++					value, err := p.handleApiRequest(context.Background(), req)
++					req.Reply(value, err)
++				}
++			}()
++			var value any
++			var err error
++			if mode == "client-cancel" {
++				p.roomTransportOffer = offer
++				p.roomTransportPending = nil
++				body := `{"prepare_id":"` + offer.Snapshot.PrepareID + `","own_tone_token":"` + token + `"}`
++				request := httptest.NewRequest(http.MethodPost, "/room/transport/bound-commit", strings.NewReader(body)).WithContext(clientCtx)
++				response := httptest.NewRecorder()
++				server.handleRoomTransportCommit(response, request)
++				var result releaseResult
++				err = json.Unmarshal(response.Body.Bytes(), &result)
++				value = result
++			} else {
++				value, err = server.commitRoomRelease(offer, token)
++			}
++			if mode == "later-read-recovery" || mode == "crash-pending" {
++				if value.(releaseResult).Outcome != "unknown" || p.player.Closed() {
++					t.Fatal("missing ACK/read was not retained unknown")
++				}
++				offer.Expires = time.Now().Add(-time.Second)
++				p.discardExpiredRoomTransport()
++				response := httptest.NewRecorder()
++				server.handleRoomReleaseResult(response, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-result?prepare_id="+offer.Snapshot.PrepareID, nil))
++				var observed releaseResult
++				if e := json.Unmarshal(response.Body.Bytes(), &observed); e != nil {
++					t.Fatal(e, response.Body.String())
++				}
++				value = observed
++			}
++
++			if mode == "ap-failure-foreign" {
++				p.stop <- struct{}{}
++			}
++			close(server.requests)
++			<-done
++			if err != nil {
++				t.Fatal(err)
++			}
++			if mode == "retired" {
++				forwardServer := &ConcreteApiServer{requests: make(chan ApiRequest)}
++				p.app.server = forwardServer
++				forwardCtx, stopForward := context.WithCancel(context.Background())
++				forwardDone := make(chan struct{})
++				go func() { defer close(forwardDone); p.app.forwardAPI(forwardCtx) }()
++				observed := httptest.NewRecorder()
++				forwardServer.handleRoomReleaseResult(observed, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-result?prepare_id="+offer.Snapshot.PrepareID, nil))
++				stopForward()
++				<-forwardDone
++				var retained releaseResult
++				if observed.Code != 200 || json.Unmarshal(observed.Body.Bytes(), &retained) != nil || retained.Outcome != "retired" {
++					t.Fatal("closed actor lost same-operation receipt", observed.Code, observed.Body.String())
++				}
++			}
++			result := value.(releaseResult)
++			expected := "unknown"
++			if mode == "retired" || mode == "client-cancel" || mode == "active-start" || mode == "active-move" || mode == "expired-after-admission" || mode == "lost-ack-recovered" || mode == "concurrent-close" || mode == "later-read-recovery" || mode == "held-ordinary-prepare" || mode == "held-rest-mutations" || mode == "output-failure" || mode == "ap-failure" || mode == "held-content-move-claims" || mode == "held-worker-pause" || mode == "same-writer-progress" || mode == "blocked-read" {
++				expected = "retired"
++			}
++			if mode == "prepare409" {
++				expected = "rejected"
++			}
++			if result.Outcome != expected || commits != 1 {
++				t.Fatalf("got %+v commits=%d", result, commits)
++			}
++			shouldClose := mode == "retired" || mode == "client-cancel" || mode == "active-start" || mode == "active-move" || mode == "expired-after-admission" || mode == "lost-ack-recovered" || mode == "concurrent-close" || mode == "later-read-recovery" || mode == "held-ordinary-prepare" || mode == "held-rest-mutations" || mode == "output-failure" || mode == "ap-failure" || mode == "held-content-move-claims" || mode == "held-worker-pause" || mode == "same-writer-progress" || mode == "blocked-read" || mode == "foreign-terminal" || mode == "missing-false"
++			if p.player.Closed() != shouldClose {
++				t.Fatalf("Close=%v expected %v", p.player.Closed(), shouldClose)
++			}
++			if shouldClose && confirms != 1 {
++				t.Fatal("missing final confirm")
++			}
++			if !shouldClose && confirms != 0 {
++				t.Fatal("unadmitted Close confirmed")
++			}
++			if expected == "unknown" {
++				offer.Expires = time.Now().Add(-time.Second)
++				offer.discardPrepared()
++				calls := 0
++				if _, err := p.app.withNewOutput(&AppPlayer{}, func() (output.Output, error) { calls++; return nil, nil }); err == nil || calls != 0 || p.app.manualRelease != offer {
++					t.Fatal("unknown released persistent writer fence")
++				}
++			}
++			if expected == "retired" {
++				if p.app.manualRelease != nil || p.app.openedWriterOwner != nil || p.app.startCustody != nil || p.app.moveCustody != nil {
++					t.Fatal("terminal did not release captured custody")
++				}
++				calls := 0
++				_, _ = p.app.withNewOutput(&AppPlayer{}, func() (output.Output, error) { calls++; return nil, context.Canceled })
++				if calls != 1 {
++					t.Fatal("fresh output remains fenced after exact terminal")
++				}
++			}
++			if mode == "concurrent-close" {
++				select {
++				case <-normalCloseDone:
++				case <-time.After(time.Second):
++					t.Fatal("normal Close did not join released rendezvous")
++				}
++			}
++			if (mode == "lost-ack" || mode == "lost-ack-recovered") && reads != 1 {
++				t.Fatal("lost ACK must read same operation once")
++			}
++		})
++	}
++}
++func TestManualReleaseReadonlyObservationKeepsPreparedOfferAndRejectsStaleOwner(t *testing.T) {
++	p, offer := manualReleaseFixture(t)
++	// Include-release remains a read even while this exact prepare holds a fence.
++	value, err := p.roomTransportStateVersion(context.Background(), roomTransportStateRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", IncludeRelease: true}, true)
++	if err != nil || value == nil || p.roomTransportPending != offer {
++		t.Fatal("readonly descriptor self-invalidated release", err)
++	}
++	stale := &releaseOwnerDescriptor{releaseOwnerSchema, offer.Snapshot.roomTransportIdentity, offer.Writer.Wire}
++	stale.Writer.Generation = "999"
++	if _, err := p.prepareRoomTransportVersion(context.Background(), roomTransportPrepareRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", Action: "release", ExpectedReleaseOwner: stale}, true); err == nil {
++		t.Fatal("held stale writer admitted")
++	}
++}
++
++// Existing selected-content compose runner owns C and a private AP2 peer. This
++// helper traverses the public Native endpoints and real C transport endpoints.
++func testManualReleaseComposed(t *testing.T, p *AppPlayer, server *ConcreteApiServer) {
++	t.Helper()
++	p.app.cfg.ZeroconfEnabled = true
++	p.app.logoutCh = make(chan *AppPlayer, 1)
++	p.logout = p.app.logoutCh
++	p.app.currentPlayer = p
++	p.app.currentDone = make(chan struct{})
++	base := p.app.cfg.RoomTransportOwnToneURL
++	binding := p.aliasBinding()
++	if binding == nil || !binding.Ready {
++		t.Fatal("release selected binding")
++	}
++	room, pod := binding.RoomID, ""
++	for _, alias := range p.aliasRegistry {
++		if alias.RoomID == room {
++			pod = alias.HomePodID
++		}
++	}
++	if pod == "" {
++		t.Fatal("release currenthomepod")
++	}
++	query := "/player/room_transport/bound-state?account_user_id=account&target_id=engine&room_id=" + room + "&homepod_id=" + pod + "&include_release=true"
++	read := httptest.NewRecorder()
++	server.handleRoomTransportState(read, httptest.NewRequest(http.MethodGet, query, nil))
++	var observed struct {
++		Schema   string                 `json:"schema"`
++		Ready    bool                   `json:"ready"`
++		Identity roomTransportIdentity  `json:"identity"`
++		Actions  []string               `json:"actions"`
++		Physical bool                   `json:"physical_result_verified"`
++		Release  releaseOwnerDescriptor `json:"release"`
++	}
++	if read.Code != 200 || strictContentJSON(read.Body.Bytes(), &observed) != nil {
++		stack := make([]byte, 1<<20)
++		t.Logf("descriptor failure goroutines:\n%s", stack[:runtime.Stack(stack, true)])
++		t.Fatal("actual readonly Native release descriptor", read.Code, read.Body.String())
++	}
++	request := roomTransportPrepareRequest{AccountUserID: "account", TargetID: "engine", RoomID: room, HomePodID: pod, Action: "release", ExpectedReleaseOwner: &observed.Release}
++	raw, _ := json.Marshal(request)
++	prepared := httptest.NewRecorder()
++	server.handleRoomTransportPrepare(prepared, httptest.NewRequest(http.MethodPost, "/player/room_transport/bound-prepare", strings.NewReader(string(raw))))
++	if prepared.Code != 200 {
++		t.Fatal("actual Native release prepare", prepared.Code, prepared.Body.String())
++	}
++	var snapshot roomTransportSnapshot
++	if json.Unmarshal(prepared.Body.Bytes(), &snapshot) != nil || snapshot.Purpose != manualReleasePurpose || snapshot.WriterProof == nil {
++		t.Fatal("release snapshot", prepared.Body.String())
++	}
++	body := struct {
++		PrepareID string                `json:"native_prepare_id"`
++		Digest    string                `json:"args_digest"`
++		Action    string                `json:"action"`
++		Owner     roomTransportIdentity `json:"native_owner"`
++		Revision  string                `json:"native_revision"`
++		Purpose   string                `json:"purpose"`
++		Writer    queueWriterWire       `json:"writer_proof"`
++	}{snapshot.PrepareID, snapshot.ArgsDigest, "release", snapshot.roomTransportIdentity, snapshot.NativeRevision, manualReleasePurpose, *snapshot.WriterProof}
++	var cprepared struct {
++		Schema   string                `json:"schema"`
++		OK       bool                  `json:"ok"`
++		Token    string                `json:"token"`
++		Identity roomVolumeRoute       `json:"identity"`
++		Owner    roomTransportIdentity `json:"native_owner"`
++		Revision string                `json:"native_revision"`
++		Expires  int                   `json:"expires_after_ms"`
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	client := &http.Client{Timeout: 12 * time.Second}
++	if _, err := releaseHTTP(ctx, client, http.MethodPost, base+"/api/outputs/"+pod+"/transport/bound-prepare", body, &cprepared); err != nil || cprepared.Schema != "podconnect.output_transport_prepare.v2" || !cprepared.OK || cprepared.Owner != snapshot.roomTransportIdentity || cprepared.Revision != snapshot.NativeRevision {
++		t.Fatal("actual C release prepare", err, cprepared)
++	}
++	nextSessionField(p.sess, "events", &failureSessionEvents{})
++	nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++	raw, _ = json.Marshal(roomTransportCommitRequest{snapshot.PrepareID, cprepared.Token})
++	committed := httptest.NewRecorder()
++	server.handleRoomTransportCommit(committed, httptest.NewRequest(http.MethodPost, "/player/room_transport/bound-commit", strings.NewReader(string(raw))))
++	var result releaseResult
++	if committed.Code != 200 || strictContentJSON(committed.Body.Bytes(), &result) != nil || result.Outcome != "retired" || !result.OK || !result.Terminal || !result.Drained || !p.player.Closed() {
++		t.Fatal("actual Native+C release didnotterminalize", committed.Code, committed.Body.String())
++	}
++	// A result read must recover the same receipt without a second effect.
++	reread := httptest.NewRecorder()
++	server.handleRoomReleaseResult(reread, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-result?prepare_id="+snapshot.PrepareID, nil))
++	if reread.Code != 200 {
++		t.Fatal("terminal reread", reread.Code, reread.Body.String())
++	}
++	calls := 0
++	_, _ = p.app.withNewOutput(&AppPlayer{}, func() (output.Output, error) { calls++; return nil, context.Canceled })
++	if calls != 1 {
++		t.Fatal("actual terminal retained fresh-writer fence")
++	}
++	if os.Getenv("PC70_RELEASE_NEXT_START") == "1" {
++		testManualReleaseManagedNextSTART(t, p)
++		return
++	}
++	response, err := http.Post(base+"/fixture/done", "application/json", strings.NewReader("{}"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != 200 {
++		t.Fatal("C release done", response.StatusCode)
++	}
++	t.Log("PASS actual Native readonly/prepare -> actual C durablecommit -> actual AppPlayer.Close/workerjoin -> actual C independent closedwriter/drain terminal -> same-operation receipt/freshwriter admission; no physical acceptance")
++}
++
++// Reuse the selected-content provider fixture, real App replacement, fresh Run,
++// API forwarder and worker. Only authenticated provider transport is seeded.
++func testManualReleaseManagedNextSTART(t *testing.T, old *AppPlayer) {
++	t.Helper()
++	app := old.app
++	app.mpris = mpris.DummyServer{}
++	select {
++	case captured := <-app.logoutCh:
++		if captured != old {
++			t.Fatal("logout lost captured owner")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("managed terminal didnotpublish logout")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	ws := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		conn, err := websocket.Accept(w, r, nil)
++		if err != nil {
++			return
++		}
++		defer conn.CloseNow()
++		_, _, _ = conn.Read(ctx)
++	}))
++	defer ws.Close()
++	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ws.URL, "http"), nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	set := func(object any, name string, value reflect.Value) {
++		field := reflect.ValueOf(object).Elem().FieldByName(name)
++		reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(value)
++	}
++	sealRecv := func(object any) {
++		field := reflect.ValueOf(object).Elem().FieldByName("recvLoopOnce")
++		(*sync.Once)(unsafe.Pointer(field.UnsafeAddr())).Do(func() {})
++	}
++	api := &ConcreteApiServer{requests: make(chan ApiRequest), log: app.log}
++	app.server = api
++	var fresh *AppPlayer
++	runDone, err := app.replaceAppPlayer(ctx, old, func(context.Context) (*AppPlayer, error) {
++		fresh, _ = contentFixture(t)
++		fresh.app = app
++		fresh.initAliasRegistry()
++		fresh.state.device.SelectedAliasId = 2
++		fresh.logout = app.logoutCh
++		fresh.stop = make(chan struct{}, 1)
++		fresh.volumeUpdate = make(chan float32, 1)
++		fresh.prefetchTimer = time.NewTimer(time.Hour)
++		fresh.hasSpotConnId = true
++		fresh.hasInitialConnectState = true
++		fresh.playbackReadyCh = make(chan struct{})
++		close(fresh.playbackReadyCh)
++		access := ap.NewAccesspoint(app.log, nil, "fixture")
++		left, right := net.Pipe()
++		t.Cleanup(func() { left.Close(); right.Close() })
++		set(access, "conn", reflect.ValueOf(left))
++		field := reflect.ValueOf(access).Elem().FieldByName("encConn")
++		set(access, "encConn", reflect.New(field.Type().Elem()))
++		set(access, "welcome", reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")}))
++		sealRecv(access)
++		nextSessionField(fresh.sess, "ap", access)
++		d := dealer.NewDealer(app.log, &http.Client{}, nil, nil)
++		set(d, "conn", reflect.ValueOf(conn))
++		sealRecv(d)
++		nextSessionField(fresh.sess, "dealer", d)
++		options := &player.Options{Log: app.log, AudioBackend: "pipe", AudioOutputPipe: app.cfg.AudioOutputPipe, AudioOutputPipeFormat: "s16le", ExternalVolume: true, WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			return app.withNewOutput(fresh, create)
++		}}
++		configureSelectedStage(t, fresh, options)
++		var e error
++		fresh.player, e = player.NewPlayer(options)
++		if e != nil {
++			return nil, e
++		}
++		return fresh, nil
++	})
++	if err != nil || fresh == nil || app.currentPlayer != fresh || fresh == old || fresh.sess == old.sess || fresh.player == old.player {
++		t.Fatal("actualmanagedreplacement", err)
++	}
++	forwardDone := make(chan struct{})
++	go func() { defer close(forwardDone); app.forwardAPI(ctx) }()
++	defer func() {
++		fresh.Close()
++		if runDone != nil {
++			<-runDone
++		}
++		cancel()
++		<-forwardDone
++	}()
++	// The next START is a new admission, never old release or old START custody.
++	if app.manualRelease != nil || app.startCustody != nil || app.moveCustody != nil || fresh.roomManualRelease != nil {
++		t.Fatal("replacement inherited released custody")
++	}
++	previous := os.Getenv("PC70_RELEASE_COMPOSE")
++	os.Setenv("PC70_RELEASE_COMPOSE", "")
++	defer os.Setenv("PC70_RELEASE_COMPOSE", previous)
++	testSelectedContentCommitActualCOnServer(t, fresh, fresh.player, &player.Stream{Source: &contentInertSource{}}, "actual-c-selected-rtp", api)
++	if app.openedWriterOwner != fresh || app.startCustody == nil || app.startCustody.Owner != fresh || fresh.player.Closed() {
++		t.Fatal("fresh START didnotown newwriter")
++	}
++	t.Log("PASS managedsamechannel logout -> actualreplaceAppPlayer -> freshRun/APIforwarder -> publicfreshSTART/actualC completed withoutrestart oroldcustody")
++}
++
++func TestManualReleaseManagedReadAndPrepareRejectUnsupportedPublisher(t *testing.T) {
++	for _, mode := range []string{"non-zeroconf", "missing-publisher", "foreign-publisher"} {
++		t.Run(mode, func(t *testing.T) {
++			p, offer := manualReleaseFixture(t)
++			intent := p.roomNativeIntent
++			switch mode {
++			case "non-zeroconf":
++				p.app.cfg.ZeroconfEnabled = false
++			case "missing-publisher":
++				p.logout = nil
++			case "foreign-publisher":
++				p.logout = make(chan *AppPlayer, 1)
++			}
++			scope := roomTransportStateRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", IncludeRelease: true}
++			if _, err := p.roomTransportStateVersion(context.Background(), scope, true); err == nil {
++				t.Fatal("unsupported release advertised")
++			}
++			request := roomTransportPrepareRequest{AccountUserID: "account", TargetID: "engine", RoomID: "r0", HomePodID: "101", Action: "release", ExpectedReleaseOwner: &releaseOwnerDescriptor{releaseOwnerSchema, offer.Snapshot.roomTransportIdentity, offer.Writer.Wire}}
++			if _, err := p.prepareRoomTransportVersion(context.Background(), request, true); err == nil || p.roomNativeIntent != intent {
++				t.Fatal("unsupported release prepared or invalidated currentintent")
++			}
++			scope.IncludeRelease = false
++			if _, err := p.roomTransportStateVersion(context.Background(), scope, true); err != nil {
++				t.Fatal("legacy readonly state regressed", err)
++			}
++		})
++	}
++}
++
++func TestManualReleaseConsumedHandoffDeadlineReadRecoveryAndStaleOwner(t *testing.T) {
++	p, offer := manualReleaseFixture(t)
++	op := offer.ReleaseOperation
++	terminal := releaseOutcome(offer, "retired")
++	op.TerminalC = &terminal
++	op.HandoffPending = true
++	op.CommitAttempted = true
++	op.Token = strings.Repeat("e", 32)
++	// This component fixture seeds known C retirement; only incumbent channel
++	// delivery/recovery is exercised here, never a physical retirement claim.
++	p.app.manualReleaseReceipt = offer
++	p.app.logoutCh = make(chan *AppPlayer)
++	p.logout = p.app.logoutCh
++	op.Logout = p.logout
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	server := &ConcreteApiServer{}
++	unknown := server.finishReleaseHandoff(ctx, offer)
++	if unknown.Outcome != "unknown" || !unknown.Drained || op.Receipt != nil || !op.HandoffPending || p.player.Closed() {
++		t.Fatal("deadline discarded unfinished handoff or repeated Close")
++	}
++	received := make(chan *AppPlayer, 1)
++	go func() { received <- <-p.logout }()
++	value, err := server.runRoomRelease(offer, "", false)
++	if err != nil || value.(releaseResult).Outcome != "retired" || op.HandoffPending {
++		t.Fatal("same read didnotfinish captured handoff", err, value)
++	}
++	select {
++	case target := <-received:
++		if target != p {
++			t.Fatal("wrong logoutowner")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("no capturedlogout")
++	}
++	// A second observation cannot enqueue another packet or repeat effects.
++	value, err = server.runRoomRelease(offer, "", false)
++	if err != nil || value.(releaseResult).Outcome != "retired" || p.player.Closed() {
++		t.Fatal("terminal read changed worker")
++	}
++	op.Receipt = nil
++	op.HandoffPending = true
++	p.app.currentPlayer = &AppPlayer{}
++	value, err = server.runRoomRelease(offer, "", false)
++	if err != nil || value.(releaseResult).Outcome != "unknown" || !op.HandoffPending {
++		t.Fatal("unverified foreignowner inherited retirement authority")
++	}
++	op.Mu.Lock()
++	inflight, err := server.runRoomRelease(offer, "", false)
++	op.Mu.Unlock()
++	if err != nil || inflight.(releaseResult).Outcome != "unknown" {
++		t.Fatal("inflight read waited or claimed completion")
++	}
++}
++
++func testManualReleaseComposedMOVE(t *testing.T, p *AppPlayer, server *ConcreteApiServer) {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	observed := httptest.NewRecorder()
++	server.handleMoveControls(observed, httptest.NewRequest(http.MethodGet, "/player/room_move/controls?account_user_id=account&target_id=engine&room_id=r0&homepod_id=2", nil))
++	var fields struct {
++		Schema   string                 `json:"schema"`
++		Ready    bool                   `json:"ready"`
++		Scope    roomVolumeScope        `json:"scope"`
++		Actions  []string               `json:"actions"`
++		Offer    moveOffer              `json:"move_offer"`
++		Physical bool                   `json:"physical_result_verified"`
++		Registry string                 `json:"alias_registry"`
++		Digest   string                 `json:"input_path_digest"`
++		OwnTone  string                 `json:"own_tone_url"`
++		OldOwner *roomTransportIdentity `json:"old_native_owner"`
++	}
++	if observed.Code != 200 || strictContentJSON(observed.Body.Bytes(), &fields) != nil || fields.OldOwner == nil || fields.OldOwner.HomePodID != "1" {
++		stack := make([]byte, 1<<20)
++		t.Logf("MOVE controls failure goroutines:\n%s", stack[:runtime.Stack(stack, true)])
++		t.Fatal("actualMOVEcontrols", observed.Code, observed.Body.String())
++	}
++	raw, _ := json.Marshal(movePrepareRequest{fields.Scope, fields.Offer, "move_existing_session", moveArgs{}})
++	prepared := httptest.NewRecorder()
++	server.handleMovePrepare(prepared, httptest.NewRequest(http.MethodPost, "/player/room_move/prepare", strings.NewReader(string(raw))))
++	var receipt moveReceipt
++	if prepared.Code != 200 || json.Unmarshal(prepared.Body.Bytes(), &receipt) != nil || receipt.State != "staged" {
++		t.Fatal("actualMOVEprepare", prepared.Code, prepared.Body.String())
++	}
++	raw, _ = json.Marshal(moveIDRequest{fields.Offer.OfferID, fields.Offer.BindingID})
++	committed := httptest.NewRecorder()
++	server.handleMoveCommit(committed, httptest.NewRequest(http.MethodPost, "/player/room_move/commit", strings.NewReader(string(raw))))
++	if committed.Code != 200 || json.Unmarshal(committed.Body.Bytes(), &receipt) != nil || !receipt.Accepted {
++		stack := make([]byte, 1<<20)
++		t.Logf("MOVE commit failure goroutines:\n%s", stack[:runtime.Stack(stack, true)])
++		t.Fatal("actualMOVEcommit", committed.Code, committed.Body.String())
++	}
++	if _, err := server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil); err == nil {
++		t.Fatal("unexpectednoop")
++	}
++	if p.app.startCustody != nil || p.app.moveCustody == nil || p.app.moveCustody.Owner != p || p.aliasBinding().RoomID != "r0" {
++		t.Fatal("actualMOVE not currenttargetcustody")
++	}
++	t.Log("PASS realordinary Nativewriter -> actualpublicNativeMOVE -> actualC HomePod2completed -> capturedMOVEcustody, no fabricatedslot")
++}
++
++func testManualReleaseBlockedContentMoveClaims(t *testing.T, p *AppPlayer, heldMove *moveCapture) {
++	ctx := context.Background()
++	opened := false
++	if _, err := p.app.withNewOutput(p, func() (output.Output, error) { opened = true; return nil, nil }); err == nil || opened {
++		t.Error("consumed release allowed actual new-writer registration")
++	}
++	before := p.roomNativeIntent
++	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r0", "101"})
++	if err != nil {
++		t.Error("freshcontentcapture fixture", err)
++		return
++	}
++	value, err := p.offerContent(contentOfferActorRequest{Capture: capture, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "101", "1"}, Context: ctx})
++	if err != nil {
++		t.Error(err)
++		return
++	}
++	content := value.(*contentOperation)
++	request := contentPrepareRequest{capture.Scope, content.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
++	if _, err := p.claimContent(contentActorRequest{Operation: content, Context: ctx, Request: request}); err == nil || p.roomNativeIntent != before || content.Claimed {
++		t.Error("contentclaim advanced consumedreleaseintent")
++	}
++	if _, err := p.captureMove(roomVolumeScope{"account", "engine", "r1", "202"}); err == nil {
++		t.Error("new mechanicalMOVE snapshot created while release consumed")
++	}
++	moveCapture := heldMove
++	if moveCapture == nil || !p.moveCurrentLocked(moveCapture) {
++		t.Error("heldMOVEcapture stale before attempted claim")
++		return
++	}
++	move := &moveOperation{Owner: p, Capture: moveCapture, Offer: moveOffer{"podconnect.room_output_move_offer.v1", strings.Repeat("a", 32), strings.Repeat("b", 64), moveCapture.Incarnation, movePolicy, 35, 5000}, Expires: time.Now().Add(5 * time.Second)}
++	moveRequest := movePrepareRequest{moveCapture.Scope, move.Offer, "move_existing_session", moveArgs{}}
++	if _, err := p.claimMove(moveActorRequest{Operation: move, Context: ctx, Request: moveRequest}); err == nil || p.roomNativeIntent != before || move.Claimed {
++		t.Error("MOVEclaim advanced consumedreleaseintent")
++	}
++}
++
++type releasePauseEvents struct{ failureSessionEvents }
++
++func (*releasePauseEvents) OnPlayerPause(*player.Stream, string, bool, *connectpb.PlayOrigin, *connectpb.ProvidedTrack, int64) {
++}
++
++func (*releasePauseEvents) OnPlayerEnd(*player.Stream, int64) {}

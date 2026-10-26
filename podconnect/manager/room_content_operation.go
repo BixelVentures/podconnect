@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,6 +39,100 @@ type roomContentResult struct {
 	Physical  bool    `json:"physical_result_verified"`
 }
 
+type roomCurrentTarget struct {
+	Process     string `json:"process"`
+	Device      string `json:"device_id"`
+	Incarnation string `json:"device_incarnation"`
+}
+type roomCurrentWitness struct {
+	Schema    string                  `json:"schema"`
+	Offer     string                  `json:"offer_id"`
+	Binding   string                  `json:"binding_id"`
+	Operation string                  `json:"operation_id"`
+	Native    roomTransportIdentity   `json:"native"`
+	Route     outputTransportIdentity `json:"route"`
+	Target    roomCurrentTarget       `json:"target"`
+	Physical  bool                    `json:"physical_result_verified"`
+}
+
+func decodeRoomCurrent(raw []byte, offer, binding string, scope roomTransportScope) (roomCurrentWitness, error) {
+	var witness roomCurrentWitness
+	_, err := contentFields(raw, "schema", "offer_id", "binding_id", "operation_id", "native", "route", "target", "physical_result_verified")
+	if err != nil || decodeQueueManagerJSON(raw, &witness) != nil || witness.Schema != "podconnect.native_completed_current.v1" || witness.Offer != offer || witness.Binding != binding || witness.Operation != offer || witness.Physical || !validTransportIdentity(witness.Native, scope) || !validOutputTransportIdentity(witness.Route, scope.Homepod) || witness.Target.Process != witness.Route.Process || witness.Target.Device != scope.Homepod || witness.Target.Incarnation != witness.Route.Incarnation {
+		return witness, fmt.Errorf("invalid current owner witness")
+	}
+	return witness, nil
+}
+
+func roomCurrentResult(w http.ResponseWriter, r *http.Request, kind, offer, binding string) {
+	var nativeURL string
+	var scope roomTransportScope
+	var originalContent *roomContentRecord
+	var originalMove *roomMoveRecord
+	if kind == "content" {
+		roomContentStore.Lock()
+		record := roomContentStore.Records[offer]
+		valid := record != nil && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && roomContentBindingCurrent(record.Binding)
+		if valid {
+			nativeURL, scope = record.Binding.NativeURL, record.Request.Scope
+			originalContent = record
+		}
+		roomContentStore.Unlock()
+		if !valid {
+			http.Error(w, "not current", http.StatusConflict)
+			return
+		}
+	} else {
+		roomMoveStore.Lock()
+		record := roomMoveStore.Records[offer]
+		valid := record != nil && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && roomContentBindingCurrent(record.Binding)
+		if valid {
+			nativeURL, scope = record.Binding.NativeURL, record.Request.Scope
+			originalMove = record
+		}
+		roomMoveStore.Unlock()
+		if !valid {
+			http.Error(w, "not current", http.StatusConflict)
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	path := "/player/room_" + kind + "/result?" + url.Values{"offer_id": {offer}, "binding_id": {binding}, "include_current": {"1"}}.Encode()
+	rpc := roomContentRPC
+	if kind == "move" {
+		rpc = roomMoveRPC
+	}
+	raw, err := rpc(ctx, nativeURL, http.MethodGet, path, nil)
+	witness, parseErr := decodeRoomCurrent(raw, offer, binding, scope)
+	if err != nil || parseErr != nil || ctx.Err() != nil {
+		http.Error(w, "current owner unavailable", http.StatusConflict)
+		return
+	}
+	if kind == "content" {
+		roomContentStore.Lock()
+		record := roomContentStore.Records[offer]
+		valid := record != nil && record == originalContent && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && record.Binding.NativeURL == nativeURL && roomContentBindingCurrent(record.Binding)
+		roomContentStore.Unlock()
+		if !valid {
+			http.Error(w, "owner replaced", http.StatusConflict)
+			return
+		}
+	} else {
+		roomMoveStore.Lock()
+		record := roomMoveStore.Records[offer]
+		valid := record != nil && record == originalMove && record.Request.Offer.Binding == binding && record.Dispatched && !record.Cancelled && record.Result.State == "complete" && record.Result.Operation != nil && *record.Result.Operation == offer && record.Binding.NativeURL == nativeURL && roomContentBindingCurrent(record.Binding)
+		roomMoveStore.Unlock()
+		if !valid {
+			http.Error(w, "owner replaced", http.StatusConflict)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(witness)
+}
+
 type roomContentRecord struct {
 	Binding    roomContentBinding
 	Request    roomContentRequest
@@ -53,7 +149,9 @@ var roomContentStore = struct {
 	Records map[string]*roomContentRecord
 }{Records: make(map[string]*roomContentRecord)}
 
-var contentURI = regexp.MustCompile(`^spotify:(track|playlist):[A-Za-z0-9]{22}$`)
+var contentTrackURI = regexp.MustCompile(`^spotify:track:[A-Za-z0-9]{22}$`)
+var contentEpisodeURI = regexp.MustCompile(`^spotify:episode:[A-Za-z0-9]{22}$`)
+var contentContextURI = regexp.MustCompile(`^spotify:(playlist|album|artist|show):[A-Za-z0-9]{22}$`)
 var roomContentRPC = doRoomContentRPC
 
 // The native critical section has its own immutable twelve-second cutoff.
@@ -99,16 +197,36 @@ func decodeRoomContentRequest(raw []byte) (roomContentRequest, error) {
 	if err != nil || decodeQueueManagerJSON(fields["scope"], &request.Scope) != nil || decodeQueueManagerJSON(fields["start_offer"], &request.Offer) != nil || json.Unmarshal(fields["action"], &request.Action) != nil || !validTransportScope(request.Scope) || !validRoomContentOffer(request.Offer) {
 		return request, fmt.Errorf("invalid content request")
 	}
-	key, prefix := "track_uri", "spotify:track:"
+	if request.Action == "play_tracks" {
+		args, err := contentFields(fields["args"], "track_uris", "shuffle", "library_source", "max_volume")
+		var uris []string
+		var shuffle *bool
+		var source string
+		var ceiling int
+		if err != nil || json.Unmarshal(args["track_uris"], &uris) != nil || len(uris) < 1 || len(uris) > 50 || json.Unmarshal(args["shuffle"], &shuffle) != nil || shuffle == nil || json.Unmarshal(args["library_source"], &source) != nil || !slices.Contains([]string{"liked", "top_tracks", "recent"}, source) || json.Unmarshal(args["max_volume"], &ceiling) != nil || ceiling < 35 || ceiling > 100 {
+			return request, fmt.Errorf("invalid content arguments")
+		}
+		for _, uri := range uris {
+			id, valid := new(big.Int).SetString(strings.TrimPrefix(uri, "spotify:track:"), 62)
+			if !contentTrackURI.MatchString(uri) || !valid || id.BitLen() > 128 {
+				return request, fmt.Errorf("invalid content track")
+			}
+		}
+		request.Args = map[string]any{"track_uris": uris, "shuffle": *shuffle, "library_source": source, "max_volume": ceiling}
+		return request, nil
+	}
+	key, uriPattern := "track_uri", contentTrackURI
 	if request.Action == "play_context" {
-		key, prefix = "context_uri", "spotify:playlist:"
+		key, uriPattern = "context_uri", contentContextURI
+	} else if request.Action == "play_episode" {
+		key, uriPattern = "episode_uri", contentEpisodeURI
 	} else if request.Action != "play_track" {
 		return request, fmt.Errorf("invalid action")
 	}
 	args, err := contentFields(fields["args"], key, "max_volume")
 	var uri string
 	var ceiling int
-	if err != nil || json.Unmarshal(args[key], &uri) != nil || json.Unmarshal(args["max_volume"], &ceiling) != nil || !contentURI.MatchString(uri) || len(uri) != len(prefix)+22 || uri[:len(prefix)] != prefix || ceiling < 35 || ceiling > 100 {
+	if err != nil || json.Unmarshal(args[key], &uri) != nil || json.Unmarshal(args["max_volume"], &ceiling) != nil || !uriPattern.MatchString(uri) || ceiling < 35 || ceiling > 100 {
 		return request, fmt.Errorf("invalid content arguments")
 	}
 	request.Args = map[string]any{key: uri, "max_volume": ceiling}
@@ -225,8 +343,13 @@ func roomContentPrepareHandler(w http.ResponseWriter, r *http.Request) {
 func roomContentResultHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	offer, binding := q.Get("offer_id"), q.Get("binding_id")
-	if r.Method != http.MethodGet || len(q) != 2 || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
+	current := len(q) == 3 && len(q["include_current"]) == 1 && q.Get("include_current") == "1"
+	if r.Method != http.MethodGet || (!current && len(q) != 2) || len(q["offer_id"]) != 1 || len(q["binding_id"]) != 1 || !queueObservationPattern.MatchString(offer) || !transportDigest.MatchString(binding) {
 		http.Error(w, "arguments", 400)
+		return
+	}
+	if current {
+		roomCurrentResult(w, r, "content", offer, binding)
 		return
 	}
 	roomContentOperation(w, r, "result", offer, binding)

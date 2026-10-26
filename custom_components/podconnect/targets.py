@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import secrets
 
 import voluptuous as vol
 from aiohttp import ClientError
@@ -20,7 +22,6 @@ from homeassistant.helpers import (
 
 from .api import SpotifyApiError
 from .const import CONF_ROOM_AREAS, DOMAIN
-from .native_start import start_guards
 from .speakers import SpeakersError
 
 
@@ -131,7 +132,7 @@ async def configured_alias_targets(speakers) -> list[dict]:
     # Separate GETs are observations, never a write-admission snapshot.
     if any(r["room_id"] not in saved for r in catalog["aliases"]):
         raise SpeakersError("Configured room association unavailable")
-    return [
+    targets = [
         {
             "kind": "configured_alias",
             "target_id": r["room_id"],
@@ -141,6 +142,297 @@ async def configured_alias_targets(speakers) -> list[dict]:
         }
         for r in catalog["aliases"]
     ]
+    # Display knowledge only. Every write resolves the live catalogue again.
+    speakers._configured_alias_targets = copy.deepcopy(targets)
+    return targets
+
+
+async def select_playback_source(
+    hass,
+    entry_id,
+    *,
+    name=None,
+    kind=None,
+    target_id=None,
+    entity_guard=None,
+    send=None,
+):
+    """Both HA adapters enter the existing room/release owners once."""
+    if (name is None) == (kind is None or target_id is None) or (
+        kind is not None and kind not in {"configured_alias", "spotify_device"}
+    ):
+        raise HomeAssistantError("Invalid source selection")
+    from .commands import CommandRejected
+    from .observations import current
+    from .speakers import SpeakersError
+
+    data = current(hass, entry_id)
+    coordinator, api, speakers, commands, entry = (
+        data.coordinator,
+        data.api,
+        data.speakers,
+        data.commands,
+        data.coordinator.config_entry,
+    )
+    epoch, poll = coordinator.owner_epoch, coordinator.poll_sequence
+    account = entry.unique_id
+    binding_owner = (data.session, data.observations, api._session, api._web)
+
+    def owned(*, same_poll=True):
+        current(hass, entry_id, data)
+        if entity_guard is not None:
+            entity_guard()
+        if (
+            data.coordinator is not coordinator
+            or data.api is not api
+            or coordinator.api is not api
+            or data.speakers is not speakers
+            or data.commands is not commands
+            or hass.config_entries.async_get_entry(entry_id) is not entry
+            or entry.unique_id != account
+            or coordinator.owner_epoch != epoch
+            or (same_poll and coordinator.poll_sequence != poll)
+            or any(
+                now is not expected
+                for now, expected in zip(
+                    (data.session, data.observations, api._session, api._web),
+                    binding_owner,
+                )
+            )
+        ):
+            raise HomeAssistantError("PodConnect selection owner changed")
+        return True
+
+    owned()
+    if speakers is None or commands is None:
+        raise HomeAssistantError("Native selection identity unavailable")
+    try:
+        native_id = await speakers.start_identity()
+        owned()
+        aliases = await configured_alias_targets(speakers)
+        owned()
+        devices = spotify_devices(await api.devices())
+        owned()
+        playback = await api.playback_state()
+        owned()
+        if playback is not None and (
+            not isinstance(playback, dict)
+            or type(playback.get("is_playing")) is not bool
+        ):
+            raise HomeAssistantError("Current playback state unavailable")
+        alias_matches = (
+            [row for row in aliases if row["name"] == name]
+            if name is not None
+            else [
+                row
+                for row in aliases
+                if kind == "configured_alias" and row["target_id"] == target_id
+            ]
+        )
+        device_matches = (
+            [row for row in devices if row["name"] == name]
+            if name is not None
+            else [
+                row
+                for row in devices
+                if kind == "spotify_device" and row["id"] == target_id
+            ]
+        )
+        if (
+            not alias_matches
+            and len(device_matches) == 1
+            and device_matches[0]["id"] == native_id
+        ):
+            binding = aliases[0]["binding"] if aliases else None
+            alias_matches = [
+                row
+                for row in aliases
+                if binding and row["target_id"] == binding["room_id"]
+            ]
+            if len(alias_matches) != 1:
+                raise HomeAssistantError("Native selected alias unavailable")
+        if (
+            len(alias_matches) > 1
+            or len(device_matches) > 1
+            or (alias_matches and any(row["id"] != native_id for row in device_matches))
+        ):
+            raise HomeAssistantError("Source name is ambiguous")
+        native_playback = (
+            isinstance(playback, dict)
+            and isinstance(playback.get("device"), dict)
+            and playback["device"].get("id") == native_id
+        )
+        if alias_matches:
+            selected = alias_matches[0]
+            if not selected["homepod_id"]:
+                raise HomeAssistantError("Configured output unavailable")
+            if not native_playback:
+                result = await speakers.move(
+                    selected["target_id"],
+                    {
+                        "binding": selected["binding"],
+                        "aliases": [{"room_id": row["target_id"]} for row in aliases],
+                    },
+                    idle_only=True,
+                    execution_guard=owned,
+                )
+                owned()
+                return {
+                    "kind": "configured_alias",
+                    "target_id": selected["target_id"],
+                    **result,
+                }
+            move = commands.room_move
+            room, homepod = selected["target_id"], selected["homepod_id"]
+            if room == selected["binding"]["room_id"]:
+                await commands.room_transport.observe(
+                    hass, entry_id, native_id, room, homepod
+                )
+                owned()
+                return {
+                    "kind": "configured_alias",
+                    "target_id": room,
+                    "observed_current": True,
+                    "physical_result_verified": False,
+                }
+            controls = await move.read(hass, entry_id, native_id, room, homepod)
+            owned()
+            sequence = controls["next_command_sequence"]
+            if (
+                controls["status"] != "ready"
+                or "move_existing_session" not in controls["actions"]
+                or type(sequence) is not int
+                or controls["owner_epoch"] != epoch
+                or controls["poll_sequence"] != poll
+            ):
+                raise HomeAssistantError("Native move admission unavailable")
+            request = {
+                "config_entry_id": entry_id,
+                "kind": "spotify_device",
+                "target_id": native_id,
+                "room_id": room,
+                "homepod_id": homepod,
+                "owner_epoch": epoch,
+                "expected_poll_sequence": poll,
+                "command_sequence": sequence,
+                "request_id": f"{epoch}:{sequence}",
+                "action": "move_existing_session",
+                "args": {},
+                "move_offer": controls["move_offer"],
+            }
+            prepared = started = False
+            try:
+                preparation = await move.prepare(hass, request)
+                prepared = preparation.get("state") == "staged"
+                owned(same_poll=False)
+                if not prepared:
+                    raise HomeAssistantError("Native move preparation unavailable")
+                latest = await configured_alias_targets(speakers)
+                owned(same_poll=False)
+                if [
+                    row for row in latest if row["target_id"] == selected["target_id"]
+                ] != [selected]:
+                    raise HomeAssistantError("Configured output changed")
+                started = True
+                result = await move.start(hass, request)
+                owned(same_poll=False)
+                if result.get("ok") is not True or result.get("outcome") != "accepted":
+                    raise HomeAssistantError("Native move rejected or outcome unknown")
+                return {
+                    "kind": "configured_alias",
+                    "target_id": selected["target_id"],
+                    **result,
+                }
+            finally:
+                if prepared and not started:
+                    await move.cancel(
+                        hass,
+                        {
+                            "config_entry_id": entry_id,
+                            "owner_epoch": epoch,
+                            "command_sequence": sequence,
+                            "request_id": request["request_id"],
+                            "offer_id": request["move_offer"]["offer_id"],
+                            "binding_id": request["move_offer"]["binding_id"],
+                        },
+                    )
+        if (
+            len(device_matches) != 1
+            or device_matches[0]["is_restricted"]
+            or device_matches[0]["id"] == native_id
+            or playback is None
+        ):
+            raise HomeAssistantError("External source unavailable")
+        binding = aliases[0]["binding"] if aliases else None
+        if not binding:
+            raise HomeAssistantError("Native release owner unavailable")
+
+        async def release_owner():
+            matches = [
+                row
+                for row in aliases
+                if row["target_id"] == binding["room_id"] and row["homepod_id"]
+            ]
+            if len(matches) != 1:
+                raise HomeAssistantError("Native release route unavailable")
+            await commands.room_transport.observe(
+                hass, entry_id, native_id, binding["room_id"], matches[0]["homepod_id"]
+            )
+            owned()
+
+        await speakers.ensure_no_owned_session(
+            binding["room_id"],
+            secrets.token_hex(16),
+            execution_guard=owned,
+            owner_guard=release_owner,
+        )
+        owned()
+
+        async def external_ready():
+            # Token refresh and release can yield; resolve the exact external
+            # target again immediately before its existing provider adapter.
+            rows = spotify_devices(await api.devices())
+            owned()
+            matches = [row for row in rows if row["id"] == device_matches[0]["id"]]
+            if (
+                len(matches) != 1
+                or matches[0]["is_restricted"]
+                or (name is not None and matches[0]["name"] != name)
+            ):
+                raise HomeAssistantError("External source changed")
+            # A new Native actor can appear during OAuth or the device read.
+            # Observe its current absence once; never release or retry that actor.
+            idle = await speakers.aliases(idle_only=True)
+            owned()
+            if any(
+                idle["binding"][key] != binding[key] for key in ("room_id", "registry")
+            ):
+                raise HomeAssistantError("Native idle selection changed")
+
+        transfer = api.transfer(
+            device_matches[0]["id"],
+            play=playback["is_playing"],
+            execution_guard=owned,
+            async_execution_guard=external_ready,
+        )
+        if send is None:
+            await transfer
+        else:
+            await send(transfer)
+        return {
+            "kind": "spotify_device",
+            "target_id": device_matches[0]["id"],
+            "provider_request_accepted": True,
+            "play": playback["is_playing"],
+        }
+    except (
+        CommandRejected,
+        SpeakersError,
+        SpotifyApiError,
+        ClientError,
+        TimeoutError,
+    ) as err:
+        raise HomeAssistantError("Source selection unavailable") from err
 
 
 def _configured_ha_area(hass, entry, target) -> dict | None:
@@ -309,39 +601,12 @@ def register_target_services(hass) -> None:
         return await catalogue(call, with_context=True, with_rooms=True)
 
     async def move_playback(call):
-        data = current(call.data["config_entry_id"])
-        kind, target = call.data["kind"], call.data["target_id"]
-        if kind not in ("configured_alias", "spotify_device", "observed_output"):
-            raise HomeAssistantError("Unknown playback target kind")
-        if kind == "observed_output":
-            raise HomeAssistantError("Observed outputs are read-only")
-        try:
-            if kind == "configured_alias":
-                if data.speakers is None:
-                    raise HomeAssistantError("Speakers connection is not configured")
-                catalog = await data.speakers.aliases()
-                current(call.data["config_entry_id"], data)
-                return {
-                    "kind": kind,
-                    "target_id": target,
-                    **await data.speakers.move(target, catalog),
-                }
-            device, playing = await spotify_transfer_target(data.api, target_id=target)
-            current(call.data["config_entry_id"], data)
-            async with asyncio.timeout(10):
-                if playing:
-                    guard, native_ready = start_guards(hass, call.data["config_entry_id"], data, device)
-                    await data.api.transfer(device, play=True, execution_guard=guard, async_execution_guard=native_ready)
-                else:
-                    await data.api.transfer(device, play=False)
-            return {
-                "kind": kind,
-                "target_id": device,
-                "provider_request_accepted": True,
-                "play": playing,
-            }
-        except (SpotifyApiError, ClientError, SpeakersError, TimeoutError) as err:
-            raise HomeAssistantError("Playback move failed; outcome unknown") from err
+        return await select_playback_source(
+            hass,
+            call.data["config_entry_id"],
+            kind=call.data["kind"],
+            target_id=call.data["target_id"],
+        )
 
     for name, handler, schema in (
         (

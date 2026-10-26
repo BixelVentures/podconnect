@@ -1,0 +1,193 @@
+diff --git a/src/outputs.c b/src/outputs.c
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -246,7 +246,8 @@
+     && r->writer.writer_fd<=INT_MAX && r->writer.pipe_device && r->writer.pipe_inode;
+   if (!strcmp(r->action,"volume")) return r->percent >= 0 && r->percent <= 100;
+   return r->percent == -1 && (!strcmp(r->action,"pause") || !strcmp(r->action,"resume")
+-      || !strcmp(r->action,"next") || !strcmp(r->action,"previous"));
++      || !strcmp(r->action,"next") || !strcmp(r->action,"previous")
++      || (r->bound && !strcmp(r->action,"seek")));
+ }
+ 
+ static int
+@@ -391,7 +392,7 @@
+   if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+       || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry))) return -1;
+   if (request->bound) {
+-    bool keep_pause=!strcmp(request->action,"resume")
++    bool keep_pause=(!strcmp(request->action,"resume") || !strcmp(request->action,"seek"))
+       && native_owner_equal(&request->native_owner,&transport_pause_owner)
+       && transport_identity_equal(&slot->result.identity,&transport_pause_identity)
+       && transport_pause_owned(request->device_id);
+@@ -399,7 +400,7 @@
+           slot->admission_generation,&slot->result.identity)) return -1;
+     if (keep_pause) {
+       transport_pause_revision=request->native_revision;
+-      transport_pause_retained=true; /* Actual PCM restart owns timer cancellation. */
++      transport_pause_retained=true; /* Actual PCM restart owns timer cancellation, also across a paused seek. */
+     }
+     if (!strcmp(request->action,"queue") && (!queue_writer_current(&request->writer,&identity,&queue_reader_epoch)
+         || queue_reader_epoch!=slot->queue_reader_epoch || !transport_remaining(&slot->expiry)
+@@ -439,14 +440,18 @@
+   if (!slot->used || !slot->result.command.bound || slot->result.outcome!=0
+       || (strcmp(slot->result.command.action,"pause")
+           && strcmp(slot->result.command.action,"next")
+-          && strcmp(slot->result.command.action,"previous"))
++          && strcmp(slot->result.command.action,"previous")
++          && strcmp(slot->result.command.action,"seek"))
+       || slot->result.command.device_id!=id
+       || strcmp(slot->result.command.native_prepare_id,prepare)
+       || slot->result.command.native_revision!=revision
+       || !transport_remaining(&slot->expiry)
+       || !transport_custody_current(&slot->result.command.native_owner,
+           &slot->result.identity,revision)) return -1;
+-  /* The exact Native effect also exists on an ordinary proven route. Its ACK
++  /* Native calls this private completion only after the actual worker remains
++   * paused. Seek uses that same effect boundary, including a fresh paused START
++   * with no earlier Pause command; C commit alone never creates retention.
++   * The exact Native effect also exists on an ordinary proven route. Its ACK
+    * grants no START resource retention; normal FIFO suspend/resume still owns
+    * that output's lifecycle. Unknown START ownership must never pass here. */
+   if (!start_route_owned(&slot->result.command.native_owner,&slot->result.identity)
+diff --git a/src/httpd_jsonapi_transport_bound.inc.c b/src/httpd_jsonapi_transport_bound.inc.c
+--- a/src/httpd_jsonapi_transport_bound.inc.c
++++ b/src/httpd_jsonapi_transport_bound.inc.c
+@@ -52,7 +52,7 @@
+   uint64_t id; bool busy,start_owned=false,clean_absent=false,queue=false; size_t i;
+   struct output_queue_writer writer={0};
+   json_object *body=transport_parse_body_limit(hreq->in_body,8192),*reply,*actions;
+-  const char *names[]={"pause","resume","next","previous"}; int ret=HTTP_BADREQUEST;
++  const char *names[]={"pause","resume","next","previous","seek"}; int ret=HTTP_BADREQUEST;
+   if(body && json_object_object_length(body)==2)queue=true;
+   if (!body || json_object_object_length(body)!=(queue?2:1) || (queue && queue_writer_parse(body,&writer)<0) || transport_native_parse(body,&owner,NULL)<0
+       || safe_atou64(hreq->path_parts[2],&id)<0) goto out;
+diff --git a/src/httpd_jsonapi_start.inc.c b/src/httpd_jsonapi_start.inc.c
+--- a/src/httpd_jsonapi_start.inc.c
++++ b/src/httpd_jsonapi_start.inc.c
+@@ -79,14 +79,29 @@
+   json_object *body=transport_parse_body_limit(hreq->in_body,16384),*value,*reply;int ret=HTTP_BADREQUEST;
+   if(!body || safe_atou64(hreq->path_parts[2],&r.device_id)<0)goto out;
+   if(!strcmp(phase,"state")){
+-    if(json_object_object_length(body)!=5 || start_json_common(body,&r,false,true)<0)goto out;
+-    ret=409;if(player_start_state_get(&r,&state)<0)goto out;
+-    reply=json_object_new_object();json_object_object_add(reply,"schema",json_object_new_string("podconnect.output_start_state.v1"));
+-    json_object_object_add(reply,"ok",json_object_new_boolean(true));json_object_object_add(reply,"ready",json_object_new_boolean(state.ready));
+-    json_object_object_add(reply,"busy",json_object_new_boolean(state.busy));json_object_object_add(reply,"policy_revision",json_object_new_string(OUTPUT_START_POLICY));
+-    json_object_object_add(reply,"start_volume_percent",json_object_new_int(35));
+-    json_object_object_add(reply,"target_identity",start_target_json(state.process,state.device_id,state.device_incarnation));
+-    json_object_object_add(reply,"physical_result_verified",json_object_new_boolean(false));ret=transport_json_reply(hreq,reply);goto out;
++      bool strict = json_object_object_get_ex(body, "require_clean_absent", &value);
++      if (json_object_object_length(body) != (strict ? 6 : 5)
++          || (strict && (!json_object_is_type(value, json_type_boolean) || !json_object_get_boolean(value)))
++          || start_json_common(body, &r, false, true) < 0)
++	goto out;
++      r.require_clean_absent = strict;
++      ret = 409;
++      if (player_start_state_get(&r, &state) < 0)
++	goto out;
++      reply = json_object_new_object();
++      json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_start_state.v1"));
++      json_object_object_add(reply, "ok", json_object_new_boolean(true));
++      json_object_object_add(reply, "ready", json_object_new_boolean(state.ready));
++      json_object_object_add(reply, "busy", json_object_new_boolean(state.busy));
++      json_object_object_add(reply, "policy_revision", json_object_new_string(OUTPUT_START_POLICY));
++      json_object_object_add(reply, "start_volume_percent", json_object_new_int(35));
++      json_object_object_add(
++          reply, "target_identity", start_target_json(state.process, state.device_id, state.device_incarnation));
++      if (r.require_clean_absent)
++	json_object_object_add(reply, "clean_absent", json_object_new_boolean(state.clean_absent));
++      json_object_object_add(reply, "physical_result_verified", json_object_new_boolean(false));
++      ret = transport_json_reply(hreq, reply);
++      goto out;
+   }
+   if(!strcmp(phase,"prepare") || !strcmp(phase,"commit")){
+     bool prepare=!strcmp(phase,"prepare");
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -551,6 +551,47 @@
+     if (scan->session && !outputs[scan->type]->device_start_retire) return false;
+   return true;
+ }
++/* Strict idle proof is a read, never retirement/admission or pin expiry.
++ * Reuse the actual START absence/drain and configured Native FIFO proof. */
++static bool
++start_clean_absent_read(const struct output_start_request *r)
++{
++  struct output_device *scan;
++  struct stat before, after;
++  bool absent = start_route_clean_absent();
++  /* A detached, durably completed manual release is quiet while its autostart
++   * gate remains closed. This read neither reopens it nor grants START. */
++  if (!absent && !start_active && !start_scope && !outputs_start_source_owned() && outputs_start_gate_closed()
++      && !start_journal_fault && !start_startup_quarantine && start_retired_reopen_pending && start_retired_stage_ready
++      && !start_journal_retirement_reopen_consumed && start_journal.token[0]
++      && !strcmp(start_journal.c_process, outputs_process) && release_is_typed_journal()
++      && start_journal_payload_valid() && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN)
++    {
++      json_object *record = json_tokener_parse(start_journal.payload), *path;
++      absent = record && json_object_object_get_ex(record, "input_path", &path)
++               && json_object_is_type(path, json_type_string)
++               && !strcmp(json_object_get_string(path), r->expected_input_path);
++      if (record)
++	json_object_put(record);
++    }
++  if (!outputs_process[0] || r->old_owner_present || r->move_existing_session
++      || !start_process_current(&r->native_process) || !absent
++      || (transport_pin && transport_remaining(&transport_pin_expiry))
++      || (room_volume_pin && !room_volume_pin->result.command.bound && transport_remaining(&room_volume_pin_expiry))
++      || (transport_custody_live && transport_remaining(&transport_custody_expiry)) || transport_generation_exhausted
++      || !start_contexts_drained())
++    return false;
++  for (scan = outputs_device_list; scan; scan = scan->next)
++    if (scan->selected || scan->session || scan->busy || scan->prevent_playback || scan->attention_lease
++        || scan->attention_retiring_session || scan->attention_restart_pending || scan->attention_restoring)
++      return false;
++  if (stat(r->expected_input_path, &before) < 0 || !S_ISFIFO(before.st_mode)
++      || start_all_writers_closed(&r->native_process, before.st_dev, before.st_ino) != 1
++      || stat(r->expected_input_path, &after) < 0 || !S_ISFIFO(after.st_mode) || before.st_dev != after.st_dev
++      || before.st_ino != after.st_ino)
++    return false;
++  return start_process_current(&r->native_process);
++}
+ int outputs_start_state_get(const struct output_start_request *r,struct output_start_state *out)
+ {
+   struct output_device *d,*old=NULL;struct output_transport_identity old_identity;char digest[65];
+@@ -560,7 +601,16 @@
+     if(!move_old_owner_current(r,&old,&old_identity))return -1;
+     out->old_route_identity=old_identity;out->old_base_revision=old->base_revision;
+     out->target_base_revision=d->base_revision;out->session_volume_percent=old->volume;
+-  }
++    }
++  if (r->require_clean_absent)
++    {
++      if (!start_clean_absent_read(r))
++	return -1;
++      out->ready = true;
++      out->busy = false;
++      out->clean_absent = true;
++      return 0;
++    }
+   out->ready=start_available(r);out->busy=!out->ready;return 0;
+ }
+ static void start_retire_sessions(void)
+diff --git a/src/outputs.h b/src/outputs.h
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -165,6 +165,7 @@
+   struct output_native_owner old_native_owner,intended_native_owner,committed_native_owner;
+   bool old_owner_present,pending_native_mutators_drained,writer_quiescent,native_mutators_drained;
+   bool move_existing_session;
++  bool require_clean_absent;
+   bool source_paused;
+   const void *source_pointer;
+   uint64_t source_item_id;
+@@ -192,6 +193,7 @@
+   uint64_t old_base_revision,target_base_revision;
+   int session_volume_percent;
+   bool paused;
++  bool clean_absent;
+ };
+ int outputs_start_state_get(const struct output_start_request *,struct output_start_state *);
+ int outputs_start_prepare(const struct output_start_request *,struct output_start_result *);

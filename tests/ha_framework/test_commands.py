@@ -34,6 +34,7 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.command_release = asyncio.Event()
         self.command_queries = []
         self.playing = False
+        self.current_native_observation = False
         self.no_playback = False
         self.native_prepares = 0
         self.native_commits = 0
@@ -52,6 +53,47 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.calls.clear()
 
     async def _backend(self, request):
+        if self.current_native_observation and request.path == "/api/room-transport/state":
+            self.assertEqual(request.method, "GET")
+            self.assertNotIn("Authorization", request.headers)
+            self.assertEqual(
+                dict(request.query),
+                {
+                    "account_user_id": "account-alpha",
+                    "target_id": "spotify-one",
+                    "room_id": "room-alpha",
+                    "homepod_id": "123",
+                },
+            )
+            self.calls.append((request.method, request.path, None, False))
+            return web.json_response(
+                {
+                    "schema": "podconnect.room_transport_state.v1",
+                    "ok": True,
+                    "native": {
+                        **dict(request.query),
+                        "connection_id": "connection-a",
+                        "session_id": "session-a",
+                        "alias_incarnation": "fixture-incarnation",
+                        "alias_registry": "fixture-registry",
+                        "alias_revision": 7,
+                    },
+                    "route": {
+                        "process": "12345678-1234-4234-8234-123456789abc",
+                        "device_id": "123",
+                        "device_incarnation": "1",
+                        "session_epoch": "2",
+                        "route_revision": "3",
+                        "selection_revision": "4",
+                        "input_generation": "5",
+                        "input_item_id": "6",
+                        "input_path_digest": "b" * 64,
+                    },
+                    "actions": [],
+                    "effect": None,
+                    "physical_result_verified": False,
+                }
+            )
         if request.path == "/api/start-volume":
             proof = self._native_proof()
             if request.method == "GET":
@@ -284,11 +326,54 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             "media_player", "podconnect", "account-alpha_spotify-one"
         )
         self.assertIsNotNone(entity_id)
-        with patch.object(
-            data.speakers,
-            "start_identity",
-            new_callable=AsyncMock,
-            return_value="spotify-one",
+        controls = {
+            "status": "ready",
+            "actions": ["play_track"],
+            "next_command_sequence": 1,
+            "owner_epoch": data.coordinator.owner_epoch,
+            "poll_sequence": data.coordinator.poll_sequence,
+            "room_id": "room-alpha",
+            "homepod_id": "saved-output-alpha",
+            "start_offer": {
+                "schema": "podconnect.room_content_offer.v1",
+                "offer_id": "a" * 32,
+                "binding_id": "b" * 64,
+                "native_incarnation": "c" * 32,
+                "policy_revision": "d" * 64,
+                "start_volume_percent": 35,
+                "expires_after_ms": 5000,
+            },
+        }
+        with (
+            patch.object(
+                data.speakers,
+                "start_identity",
+                new_callable=AsyncMock,
+                return_value="spotify-one",
+            ),
+            patch.object(
+                data.commands.room_content,
+                "read",
+                new_callable=AsyncMock,
+                return_value=controls,
+            ) as read,
+            patch.object(
+                data.commands.room_content,
+                "prepare",
+                new_callable=AsyncMock,
+                return_value={"state": "staged"},
+            ) as prepare,
+            patch.object(
+                data.commands.room_content,
+                "start",
+                new_callable=AsyncMock,
+                return_value={
+                    "ok": True,
+                    "outcome": "accepted",
+                    "accepted_selected_content": True,
+                    "start_volume_percent": 35,
+                },
+            ) as start,
         ):
             await self.hass.services.async_call(
                 "media_player",
@@ -300,21 +385,47 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 },
                 blocking=True,
             )
-        self.assertEqual(self.native_prepares, 1)
-        self.assertEqual(self.native_commits, 1)
-        self.assertEqual(len(self._writes()), 1)
+        read.assert_awaited_once_with(
+            self.hass,
+            "account-alpha",
+            "spotify-one",
+            "room-alpha",
+            "saved-output-alpha",
+        )
+        prepare.assert_awaited_once()
+        start.assert_awaited_once()
+        request = prepare.await_args.args[1]
+        self.assertIs(request, start.await_args.args[1])
+        self.assertEqual(
+            request["args"],
+            {"track_uri": "spotify:track:" + "C" * 22, "max_volume": 100},
+        )
+        self.assertEqual(request["start_offer"]["start_volume_percent"], 35)
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
+        self.assertEqual(self._writes(), [])
 
-    async def test_playing_transfer_to_native_uses_start_barrier(self):
+    async def test_select_playing_current_native_observes_without_start_or_transfer(self):
         self.playing = True
+        self.current_native_observation = True
+        # Inherited transport fixtures expose this same exact current output.
+        self.alpha_output = "123"
+        self.output_homepod = "123"
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
-        with patch.object(
-            data.speakers,
-            "start_identity",
-            new_callable=AsyncMock,
-            return_value="spotify-one",
+        with (
+            patch.object(
+                data.speakers,
+                "start_identity",
+                new_callable=AsyncMock,
+                return_value="spotify-one",
+            ),
+            patch.object(
+                data.speakers,
+                "room_transport_state",
+                wraps=data.speakers.room_transport_state,
+            ) as observation,
         ):
-            status, _ = await self._service(
+            status, body = await self._service(
                 "move_playback",
                 {
                     "config_entry_id": "account-alpha",
@@ -323,10 +434,25 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         self.assertEqual(status, 200)
-        self.assertEqual(self.native_prepares, 1)
-        self.assertEqual(self.native_commits, 1)
-        self.assertEqual(len(self._writes()), 1)
-        self.assertEqual(self._writes()[0][1], "/spotify/me/player")
+        self.assertEqual(
+            body["service_response"],
+            {
+                "kind": "configured_alias",
+                "target_id": "room-alpha",
+                "observed_current": True,
+                "physical_result_verified": False,
+            },
+        )
+        observation.assert_awaited_once_with(
+            {
+                "account_user_id": "account-alpha",
+                "target_id": "spotify-one",
+                "room_id": "room-alpha",
+                "homepod_id": "123",
+            }
+        )
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
+        self.assertEqual(self._writes(), [])
 
     async def test_same_session_native_output_above_approved_max_refuses_track(self):
         self.native_output_volume = 90
@@ -936,3 +1062,200 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.invoke(request), first)
         self.assertEqual(self._writes(), [])
         self.assertEqual(self.native_commits, 1)
+
+    async def settlement_snapshot(self, request, **overrides):
+        return await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {
+                "config_entry_id": request["config_entry_id"],
+                "include_output": True,
+                "include_controls": True,
+                "request_id": request["request_id"],
+                "command_sequence": request["command_sequence"],
+                **overrides,
+            },
+            blocking=True,
+            return_response=True,
+        )
+
+    async def test_command_settlement_pending_acceptance_never_confirms_later_clock(
+        self,
+    ):
+        self.command_hold = True
+        request = self.request("next")
+        task = self._task(self.invoke(request))
+        await asyncio.wait_for(self.command_entered.wait(), 2)
+        owner = self.entries[0].runtime_data.commands
+        before = copy.deepcopy(owner.receipts)
+        pending = (await self.settlement_snapshot(request))["settlement"]
+        self.assertEqual(
+            pending,
+            {
+                "schema": "podconnect.command_settlement.v1",
+                "status": "pending",
+                "request_id": request["request_id"],
+                "command_sequence": request["command_sequence"],
+                "owner_epoch": request["owner_epoch"],
+                "observation": None,
+            },
+        )
+        self.assertEqual(owner.receipts, before)
+        self.assertEqual(len(self._writes()), 1)
+        self.command_release.set()
+        accepted = await task
+        self.assertEqual(accepted["outcome"], "accepted")
+        data = self.entries[0].runtime_data.coordinator.data
+        data["playback"].update(progress_ms=10000, timestamp=123456)
+        after = copy.deepcopy(owner.receipts)
+        for _ in range(2):
+            read = await self.settlement_snapshot(request)
+            self.assertEqual(read["schema"], "podconnect.playback.v3")
+            self.assertEqual(read["playback"]["progress_ms"], 10000)
+            self.assertEqual(read["settlement"]["status"], "unknown")
+            self.assertIsNone(read["settlement"]["observation"])
+        self.assertEqual(owner.receipts, after)
+        self.assertEqual(await self.invoke(request), accepted)
+        self.assertEqual(len(self._writes()), 1)
+
+    async def test_command_settlement_pair_schema_and_legacy_read_are_strict(self):
+        request = self.request()
+        for overrides in (
+            {"request_id": None},
+            {"command_sequence": None},
+            {"command_sequence": True},
+            {"command_sequence": 0},
+            {"command_sequence": 2**53},
+            {"include_controls": False},
+            {"include_output": False},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(vol.Invalid):
+                await self.settlement_snapshot(request, **overrides)
+        for missing in ("request_id", "command_sequence"):
+            values = {
+                "config_entry_id": "account-alpha",
+                "include_output": True,
+                "include_controls": True,
+                "request_id": request["request_id"],
+                "command_sequence": 1,
+            }
+            del values[missing]
+            with self.subTest(missing=missing), self.assertRaises(vol.Invalid):
+                await self.hass.services.async_call(
+                    "podconnect",
+                    "get_playback_snapshot",
+                    values,
+                    blocking=True,
+                    return_response=True,
+                )
+        legacy = await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {"config_entry_id": "account-alpha"},
+            blocking=True,
+            return_response=True,
+        )
+        self.assertEqual(legacy["schema"], "podconnect.playback.v1")
+        self.assertNotIn("controls", legacy)
+        self.assertNotIn("settlement", legacy)
+        self.assertEqual(self._writes(), [])
+
+    async def test_command_settlement_cancel_before_send_is_rejected_not_replayed(self):
+        data = self.entries[0].runtime_data
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.holds.append(release)
+
+        async def held():
+            entered.set()
+            await release.wait()
+
+        request = self.request("next")
+        with patch.object(data.session, "async_ensure_token_valid", held):
+            task = self._task(data.commands.execute(self.hass, request))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        result = await self.settlement_snapshot(request)
+        self.assertEqual(result["settlement"]["status"], "rejected")
+        self.assertIsNone(result["settlement"]["observation"])
+        self.assertEqual(self._writes(), [])
+
+    async def test_command_settlement_timeout_foreign_and_evicted_remain_unknown(self):
+        self.command_hold = True
+        request = self.request("next")
+        with patch.object(commands, "COMMAND_TIMEOUT_S", 0.05):
+            receipt = await self.invoke(request)
+        self.assertEqual(receipt["outcome"], "unknown")
+        self.assertEqual(
+            (await self.settlement_snapshot(request))["settlement"]["status"], "unknown"
+        )
+        foreign = await self.settlement_snapshot(request, request_id="foreign:1")
+        self.assertEqual(foreign["settlement"]["status"], "unknown")
+        other = await self.settlement_snapshot(request, config_entry_id="account-beta")
+        self.assertEqual(other["settlement"]["status"], "unknown")
+        self.assertIsNone(other["settlement"]["observation"])
+        owner = self.entries[0].runtime_data.commands
+        owner.receipts.clear()
+        self.assertEqual(
+            (await self.settlement_snapshot(request))["settlement"]["status"], "unknown"
+        )
+        self.assertEqual((await self.invoke(request))["error_kind"], "stale_command")
+        self.assertEqual(len(self._writes()), 1)
+        self.command_release.set()
+
+    async def test_command_settlement_later_admission_supersedes_only_known_receipt(
+        self,
+    ):
+        first = self.request("next")
+        self.assertEqual((await self.invoke(first))["outcome"], "accepted")
+        second = self.request("next")
+        self.assertEqual((await self.invoke(second))["outcome"], "accepted")
+        before = copy.deepcopy(self.entries[0].runtime_data.commands.receipts)
+        result = await self.settlement_snapshot(first)
+        self.assertEqual(result["settlement"]["status"], "superseded")
+        self.assertIsNone(result["settlement"]["observation"])
+        self.assertEqual(self.entries[0].runtime_data.commands.receipts, before)
+        self.assertEqual(len(self._writes()), 2)
+
+    async def test_command_settlement_reloaded_owner_cannot_expose_prior_receipt(self):
+        request = self.request("next")
+        self.assertEqual((await self.invoke(request))["outcome"], "accepted")
+        old_owner = self.entries[0].runtime_data.commands
+        old_receipts = copy.deepcopy(old_owner.receipts)
+        self.assertTrue(await self.hass.config_entries.async_reload("account-alpha"))
+        new_owner = self.entries[0].runtime_data.commands
+        self.assertIsNot(new_owner, old_owner)
+        value = await self.settlement_snapshot(request)
+        self.assertEqual(value["settlement"]["status"], "unknown")
+        self.assertEqual(value["settlement"]["owner_epoch"], new_owner.owner_epoch)
+        self.assertIsNone(value["settlement"]["observation"])
+        self.assertEqual(new_owner.receipts, {})
+        self.assertEqual(old_owner.receipts, old_receipts)
+        self.assertEqual(len(self._writes()), 1)
+
+    async def test_command_settlement_is_inside_original_public_response_bound(self):
+        self.no_playback = True
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        request = self.request("next")
+        base = await self.hass.services.async_call(
+            "podconnect",
+            "get_playback_snapshot",
+            {
+                "config_entry_id": "account-alpha",
+                "include_output": True,
+                "include_controls": True,
+            },
+            blocking=True,
+            return_response=True,
+        )
+        self.assertTrue(base["ok"])
+        with patch(
+            "custom_components.podconnect.observations.PUBLIC_MAX_BYTES",
+            len(json.dumps(base).encode()) + 20,
+        ):
+            self.assertEqual(
+                await self.settlement_snapshot(request),
+                {"ok": False, "error_kind": "malformed_response"},
+            )
+        self.assertEqual(self._writes(), [])

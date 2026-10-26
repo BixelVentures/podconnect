@@ -23,7 +23,7 @@ import (
 	"unicode/utf8"
 )
 
-var transportActions = []string{"pause", "resume", "next", "previous"}
+var transportActions = []string{"pause", "resume", "next", "previous", "seek", "shuffle", "repeat"}
 var transportUUID = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
 var transportDecimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,19})$`)
 var transportDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -55,8 +55,26 @@ type receiverTransportState struct {
 	Ready    bool                  `json:"ready"`
 	Identity roomTransportIdentity `json:"identity"`
 	Actions  []string              `json:"actions"`
+	Effect   *receiverRoomEffect   `json:"effect,omitempty"`
 	Physical bool                  `json:"physical_result_verified"`
 }
+type receiverRoomEffect struct {
+	PrepareID string                `json:"prepare_id"`
+	Action    string                `json:"action"`
+	Revision  string                `json:"effect_revision"`
+	Intent    string                `json:"native_revision"`
+	Owner     roomTransportIdentity `json:"native_owner"`
+}
+
+func validReceiverRoomEffect(effect *receiverRoomEffect, owner roomTransportIdentity) bool {
+	if effect == nil {
+		return true
+	}
+	revision, revisionErr := strconv.ParseUint(effect.Revision, 10, 64)
+	intent, intentErr := strconv.ParseUint(effect.Intent, 10, 64)
+	return effect.Owner == owner && queueObservationPattern.MatchString(effect.PrepareID) && (slices.Contains(transportActions, effect.Action) || effect.Action == "volume") && transportDecimal.MatchString(effect.Revision) && revisionErr == nil && revision > 0 && transportDecimal.MatchString(effect.Intent) && intentErr == nil && intent > 0
+}
+
 type outputTransportState struct {
 	Schema      string                  `json:"schema"`
 	OK          bool                    `json:"ok"`
@@ -85,6 +103,9 @@ type receiverTransportPrepare struct {
 	Digest         string `json:"args_digest"`
 	Expires        int    `json:"expires_after_ms"`
 	IntentRevision string `json:"native_revision"`
+	PositionMS     *int64 `json:"position_ms,omitempty"`
+	ShuffleEnabled *bool  `json:"shuffle_enabled,omitempty"`
+	RepeatMode     string `json:"repeat_mode,omitempty"`
 }
 type outputTransportPrepare struct {
 	Schema   string                  `json:"schema"`
@@ -102,11 +123,14 @@ type roomTransportScope struct {
 	Account string `json:"account_user_id"`
 }
 type roomTransportRequest struct {
-	Scope   roomTransportScope      `json:"scope"`
-	Native  roomTransportIdentity   `json:"native"`
-	Route   outputTransportIdentity `json:"route"`
-	Action  string                  `json:"action"`
-	Percent int                     `json:"volume_percent"`
+	Scope          roomTransportScope      `json:"scope"`
+	Native         roomTransportIdentity   `json:"native"`
+	Route          outputTransportIdentity `json:"route"`
+	Action         string                  `json:"action"`
+	Percent        int                     `json:"volume_percent"`
+	PositionMS     *int64                  `json:"position_ms,omitempty"`
+	ShuffleEnabled *bool                   `json:"shuffle_enabled,omitempty"`
+	RepeatMode     string                  `json:"repeat_mode,omitempty"`
 }
 type roomTransportOffer struct {
 	Request roomTransportRequest
@@ -120,6 +144,11 @@ var roomTransportStore struct {
 	sync.Mutex
 	Busy  bool
 	Offer *roomTransportOffer
+	// Last manual disconnect receipt shares this owner's admission/replay lock.
+	ReleaseRequest    roomReleaseRequest
+	ReleaseResult     roomReleaseResult
+	ReleasePresent    bool
+	ReleaseNativeBase string
 }
 var errTransportClaim = errors.New("room transport unavailable")
 var errTransportReceiver = errors.New("native room transport unavailable")
@@ -204,7 +233,7 @@ func readRoomTransportState(ctx context.Context, s roomTransportScope) (startCla
 	}
 	q := url.Values{"account_user_id": {s.Account}, "target_id": {s.Target}, "room_id": {s.Room}, "homepod_id": {s.Homepod}}
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_transport/bound-state?"+q.Encode(), nil)
-	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_transport_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validTransportActions(n.Actions) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
+	if err != nil || decodeQueueManagerJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_transport_state.v2" || !n.Ready || n.Physical || !validTransportIdentity(n.Identity, s) || !validTransportActions(n.Actions) || !validReceiverRoomEffect(n.Effect, n.Identity) || n.Identity.Incarnation != claim.Proof.AliasBinding.Incarnation || n.Identity.Registry != claim.Proof.AliasBinding.Registry {
 		return claim, n, o, startRouteUnknown, errTransportReceiver
 	}
 	boundState, _ := json.Marshal(map[string]any{"native_owner": n.Identity})
@@ -382,12 +411,12 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	actions := []string{}
 	if !o.Busy {
 		for _, a := range n.Actions {
-			if slices.Contains(o.Actions, a) && !(claim.Released && claim.Paused && a == "pause") {
+			if (slices.Contains(o.Actions, a) || transportOptionAction(a)) && !(claim.Released && claim.Paused && a == "pause") {
 				actions = append(actions, a)
 			}
 		}
 	}
-	writeJSON(w, map[string]any{"schema": "podconnect.room_transport_state.v1", "ok": true, "native": n.Identity, "route": o.Identity, "actions": actions, "physical_result_verified": false})
+	writeJSON(w, map[string]any{"schema": "podconnect.room_transport_state.v1", "ok": true, "native": n.Identity, "route": o.Identity, "actions": actions, "effect": n.Effect, "physical_result_verified": false})
 }
 func decodeTransportBody(r *http.Request, out any) error {
 	if r.URL.RawQuery != "" {
@@ -398,7 +427,21 @@ func decodeTransportBody(r *http.Request, out any) error {
 	if err != nil || len(raw) > 8192 {
 		return fmt.Errorf("body rejected")
 	}
-	return decodeQueueManagerJSON(raw, out)
+	if err := decodeQueueManagerJSON(raw, out); err != nil {
+		return err
+	}
+	if body, ok := out.(*roomTransportRequest); ok {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			return fmt.Errorf("arguments")
+		}
+		for key, action := range map[string]string{"shuffle_enabled": "shuffle", "repeat_mode": "repeat"} {
+			if value, has := fields[key]; has && (body.Action != action || bytes.Equal(bytes.TrimSpace(value), []byte("null"))) {
+				return fmt.Errorf("invalid option field")
+			}
+		}
+	}
+	return nil
 }
 func acquireRoomTransport() bool {
 	roomTransportStore.Lock()
@@ -420,7 +463,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body roomTransportRequest
-	if decodeTransportBody(r, &body) != nil || !validTransportScope(body.Scope) || !validTransportIdentity(body.Native, body.Scope) || !validOutputTransportIdentity(body.Route, body.Scope.Homepod) || !slices.Contains(transportActions, body.Action) || body.Percent < 0 || body.Percent > 100 || body.Action != "volume" && body.Percent != 0 {
+	if decodeTransportBody(r, &body) != nil || !validTransportScope(body.Scope) || !validTransportIdentity(body.Native, body.Scope) || !validOutputTransportIdentity(body.Route, body.Scope.Homepod) || !slices.Contains(transportActions, body.Action) || !validTransportPosition(body.Action, body.PositionMS) || !validTransportOptions(body.Action, body.ShuffleEnabled, body.RepeatMode) || body.Percent < 0 || body.Percent > 100 || body.Action != "volume" && body.Percent != 0 {
 		http.Error(w, "arguments", 400)
 		return
 	}
@@ -437,19 +480,50 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	claim, n, o, err := readRoomTransport(ctx, body.Scope)
 	if err != nil || n.Identity != body.Native || o.Identity != body.Route || o.Busy ||
 		claim.Released && claim.Paused && body.Action == "pause" ||
-		!slices.Contains(n.Actions, body.Action) || !slices.Contains(o.Actions, body.Action) {
+		!slices.Contains(n.Actions, body.Action) || (!transportOptionAction(body.Action) && !slices.Contains(o.Actions, body.Action)) {
 		http.Error(w, "stale room transport", 409)
 		return
 	}
 	request := map[string]any{"account_user_id": body.Scope.Account, "target_id": body.Scope.Target, "room_id": body.Scope.Room, "homepod_id": body.Scope.Homepod, "action": body.Action, "volume_percent": body.Percent}
+	if body.PositionMS != nil {
+		request["position_ms"] = *body.PositionMS
+	}
+	if transportOptionAction(body.Action) {
+		request["options_route"] = body.Route
+	}
+	if body.ShuffleEnabled != nil {
+		request["shuffle_enabled"] = *body.ShuffleEnabled
+	}
+	if body.RepeatMode != "" {
+		request["repeat_mode"] = body.RepeatMode
+	}
 	encoded, _ := json.Marshal(request)
 	started := time.Now()
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodPost, "/player/room_transport/bound-prepare", encoded)
 	var prepared receiverTransportPrepare
 	// Embedded structs are decoded by encoding/json, but strict field presence must
 	// validate their flattened identity independently of queue's struct walker.
-	if err != nil || decodeTransportPrepare(raw, &prepared) != nil || prepared.Schema != "podconnect.native_room_transport.v2" || !queueObservationPattern.MatchString(prepared.PrepareID) || prepared.roomTransportIdentity != body.Native || prepared.Action != body.Action || prepared.Percent != body.Percent || !transportDigest.MatchString(prepared.Digest) || prepared.Expires != 5000 || !validBoundNativeRevision(prepared.IntentRevision) || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
+	if err != nil || decodeTransportPrepare(raw, &prepared) != nil || prepared.Schema != "podconnect.native_room_transport.v2" || !queueObservationPattern.MatchString(prepared.PrepareID) || prepared.roomTransportIdentity != body.Native || prepared.Action != body.Action || prepared.Percent != body.Percent || !sameTransportPosition(prepared.PositionMS, body.PositionMS) || !sameTransportOptions(prepared.ShuffleEnabled, body.ShuffleEnabled, prepared.RepeatMode, body.RepeatMode) || !transportDigest.MatchString(prepared.Digest) || prepared.Expires != 5000 || !validBoundNativeRevision(prepared.IntentRevision) || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
 		http.Error(w, "native preparation unavailable", 409)
+		return
+	}
+	if transportOptionAction(body.Action) {
+		remaining := 5000 - int(time.Since(started).Milliseconds())
+		if remaining <= 0 {
+			http.Error(w, "expired", 409)
+			return
+		}
+		roomTransportStore.Lock()
+		roomTransportStore.Offer = &roomTransportOffer{Request: body, Native: prepared, Claim: claim, Expires: started.Add(5 * time.Second)}
+		roomTransportStore.Unlock()
+		response := map[string]any{"schema": "podconnect.room_transport_prepare.v1", "ok": true, "prepare_id": prepared.PrepareID, "expires_after_ms": remaining, "native": body.Native, "route": body.Route, "action": body.Action, "volume_percent": body.Percent, "physical_result_verified": false}
+		if body.ShuffleEnabled != nil {
+			response["shuffle_enabled"] = *body.ShuffleEnabled
+		}
+		if body.RepeatMode != "" {
+			response["repeat_mode"] = body.RepeatMode
+		}
+		writeJSON(w, response)
 		return
 	}
 	outputArgs := map[string]any{"native_prepare_id": prepared.PrepareID, "action": body.Action, "args_digest": prepared.Digest, "native_owner": prepared.roomTransportIdentity, "native_revision": prepared.IntentRevision}
@@ -467,14 +541,49 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	roomTransportStore.Lock()
 	roomTransportStore.Offer = &roomTransportOffer{body, prepared, output, claim, started.Add(5 * time.Second)}
 	roomTransportStore.Unlock()
-	writeJSON(w, map[string]any{"schema": "podconnect.room_transport_prepare.v1", "ok": true, "prepare_id": prepared.PrepareID, "expires_after_ms": remaining, "native": body.Native, "route": body.Route, "action": body.Action, "volume_percent": body.Percent, "physical_result_verified": false})
+	response := map[string]any{"schema": "podconnect.room_transport_prepare.v1", "ok": true, "prepare_id": prepared.PrepareID, "expires_after_ms": remaining, "native": body.Native, "route": body.Route, "action": body.Action, "volume_percent": body.Percent, "physical_result_verified": false}
+	if body.PositionMS != nil {
+		response["position_ms"] = *body.PositionMS
+	}
+	writeJSON(w, response)
+}
+
+func transportOptionAction(action string) bool { return action == "shuffle" || action == "repeat" }
+func validTransportOptions(action string, enabled *bool, mode string) bool {
+	if action == "shuffle" {
+		return enabled != nil && mode == ""
+	}
+	if action == "repeat" {
+		return enabled == nil && (mode == "off" || mode == "context" || mode == "track")
+	}
+	return enabled == nil && mode == ""
+}
+func sameTransportOptions(a, b *bool, x, y string) bool {
+	return x == y && (a == nil && b == nil || a != nil && b != nil && *a == *b)
+}
+func validTransportPosition(action string, position *int64) bool {
+	if action != "seek" {
+		return position == nil
+	}
+	return position != nil && *position >= 0 && *position < 1<<53
+}
+func sameTransportPosition(a, b *int64) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 // queueRequiredJSON intentionally skips anonymous fields; explicitly require
 // every flat native field, then use the same duplicate/unknown/trailing guard.
 func decodeTransportPrepare(raw []byte, out *receiverTransportPrepare) error {
 	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil || len(fields) != 16 {
+	var action string
+	if json.Unmarshal(raw, &fields) != nil || json.Unmarshal(fields["action"], &action) != nil {
+		return fmt.Errorf("native fields rejected")
+	}
+	expected := 16
+	if action == "seek" || transportOptionAction(action) {
+		expected++
+	}
+	if len(fields) != expected {
 		return fmt.Errorf("native fields rejected")
 	}
 	for _, key := range []string{"schema", "prepare_id", "account_user_id", "target_id", "room_id", "homepod_id", "connection_id", "session_id", "alias_incarnation", "alias_registry", "alias_revision", "action", "volume_percent", "args_digest", "expires_after_ms", "native_revision"} {
@@ -482,7 +591,13 @@ func decodeTransportPrepare(raw []byte, out *receiverTransportPrepare) error {
 			return fmt.Errorf("native field missing")
 		}
 	}
-	return decodeQueueManagerJSON(raw, out)
+	if err := decodeQueueManagerJSON(raw, out); err != nil {
+		return err
+	}
+	if !validTransportPosition(out.Action, out.PositionMS) || !validTransportOptions(out.Action, out.ShuffleEnabled, out.RepeatMode) {
+		return fmt.Errorf("invalid position")
+	}
+	return nil
 }
 func transportCommitHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -530,6 +645,10 @@ func transportCommitHandler(w http.ResponseWriter, r *http.Request) {
 		Physical  bool   `json:"physical_result_verified"`
 	}
 	accepted := err == nil && decodeQueueManagerJSON(raw, &ack) == nil && ack.Schema == "podconnect.native_room_transport_commit.v2" && ack.Accepted && ack.PrepareID == body.PrepareID && !ack.Physical
+	if accepted && transportOptionAction(offer.Request.Action) {
+		_, native, route, err := readRoomTransport(ctx, offer.Request.Scope)
+		accepted = err == nil && native.Identity == offer.Request.Native && route.Identity == offer.Request.Route
+	}
 	outcome := "unknown"
 	if accepted {
 		outcome = "accepted"
