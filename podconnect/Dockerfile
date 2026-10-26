@@ -109,6 +109,10 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/dealer-roomchange-native.patch \
   && git apply --check /patches/dealer-roomchange-native-tests.patch \
   && git apply /patches/dealer-roomchange-native-tests.patch \
+  && git apply --check /patches/private-diagnostics-native.patch \
+  && git apply /patches/private-diagnostics-native.patch \
+  && git apply --check /patches/private-diagnostics-native-tests.patch \
+  && git apply /patches/private-diagnostics-native-tests.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -179,6 +183,8 @@ COPY patches/room-release-owntone.sha256 /patches/room-release-owntone.sha256
 COPY patches/room-owner-parity-owntone.patch /patches/room-owner-parity-owntone.patch
 COPY patches/room-owner-parity-owntone-tests.patch /patches/room-owner-parity-owntone-tests.patch
 COPY patches/room-owner-parity-owntone.sha256 /patches/room-owner-parity-owntone.sha256
+COPY patches/private-diagnostics-owntone.patch /patches/private-diagnostics-owntone.patch
+COPY patches/private-diagnostics-owntone.sha256 /patches/private-diagnostics-owntone.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
@@ -265,6 +271,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && git apply /patches/room-owner-parity-owntone.patch \
   && git apply --check /patches/room-owner-parity-owntone-tests.patch \
   && git apply /patches/room-owner-parity-owntone-tests.patch \
+  && sha256sum -c /patches/private-diagnostics-owntone.sha256 \
+  && git apply --check /patches/private-diagnostics-owntone.patch \
+  && git apply /patches/private-diagnostics-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
