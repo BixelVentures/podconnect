@@ -39,3 +39,5 @@ aa47ea940c0109d0b8efe765a04e7a924c24bddc604e00fda0a50d8e60385e48  /patches/room-
 541fabcc4da592178a7485ceabf2b3c65ff4854d4785d19565187bf0d9b7bd40  /patches/move-quiesce-native-tests.patch
 7bb386d9eb8375f90fb403d0111286733a8fdae07cd1739df5edc1e77cc4345e  /patches/room-owner-parity-native.patch
 3f7530307311e7cc52a362fef0c0164fc23a025fe06e3f7bb60bbed208cb26bd  /patches/room-owner-parity-native-tests.patch
+4298442e6ff1ce5eded00229e5c0f3c952d95431df4039a449ed8adf22dacb36  /patches/dealer-roomchange-native.patch
+dabf7450d55ff3233c2ae3c306856dda92f4276c693186a245ac156fe6561422  /patches/dealer-roomchange-native-tests.patch

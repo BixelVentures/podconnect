@@ -1,0 +1,185 @@
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -384,7 +384,7 @@
+ 	}
+ }
+ 
+-func (p *AppPlayer) commitPlayerCommand(req dealer.RequestPayload) {
++func (p *AppPlayer) commitPlayerCommand(req dealer.RequestPayload, deferAliasEvent ...bool) {
+ 	p.state.lastCommand = &req
+ 
+ 	// device-aliases: when the controller picks a room, the selected alias arrives as target_alias_id at
+@@ -412,7 +412,9 @@
+ 			p.state.device.SelectedAliasId = *aliasId
+ 			binding := p.aliasBindingLocked()
+ 			p.aliasMu.Unlock()
+-			p.emitSelectedAlias(*aliasId, binding)
++			if len(deferAliasEvent) == 0 || !deferAliasEvent[0] {
++				p.emitSelectedAlias(*aliasId, binding)
++			}
+ 		}
+ 	}
+ }
+@@ -501,8 +503,11 @@
+ 	if err := p.retirePriorStartForDealerTransfer(ctx, req); err != nil {
+ 		return err
+ 	}
+-
+-	p.commitPlayerCommand(req)
++	moved, err := p.handoffDealerRoomTransfer(ctx, req)
++	if err != nil {
++		return err
++	}
++	p.commitPlayerCommand(req, moved)
+ 
+ 	p.state.lastTransferTimestamp = transferState.Playback.Timestamp
+ 
+@@ -578,10 +583,10 @@
+ 		return fmt.Errorf("failed loading current track (transfer): %w", err)
+ 	}
+ 
+-	p.app.server.Emit(&ApiEvent{
+-		Type: ApiEventTypeActive,
+-	})
+-
++	if moved {
++		p.emitSelectedAlias(p.state.device.SelectedAliasId, p.aliasBinding())
++	}
++	p.app.server.Emit(&ApiEvent{Type: ApiEventTypeActive})
+ 	return nil
+ }
+ 
+@@ -1244,3 +1249,84 @@
+ 	}
+ 	return p.waitRoomVolumeReservation(ctx)
+ }
++
++// The authenticated Dealer actor uses the existing MOVE owner before publishing
++// a different room. A completed START/MOVE cannot be routed by legacy recovery.
++func (p *AppPlayer) handoffDealerRoomTransfer(parent context.Context, req dealer.RequestPayload) (bool, error) {
++	if p.app == nil || p.app.cfg == nil || p.app.cfg.AudioBackend != "pipe" || !p.app.cfg.ExternalVolume || p.app.cfg.RoomTransportOwnToneURL == "" {
++		return false, nil
++	}
++	p.app.moveCustodyMu.Lock()
++	owned := p.app.startCustody != nil || p.app.moveCustody != nil
++	blocked := p.app.moveCustodyUnknown || p.app.retirementPending != nil
++	p.app.moveCustodyMu.Unlock()
++	if blocked {
++		return false, ErrAliasConflict
++	}
++	if !owned {
++		return false, nil
++	} // Existing ordinary/unbound route keeps its owner.
++	requested := req.TargetAliasId
++	if requested == nil {
++		requested = req.Command.TargetAliasId
++	}
++	if req.TargetAliasId != nil && req.Command.TargetAliasId != nil && *req.TargetAliasId != *req.Command.TargetAliasId {
++		return false, ErrAliasConflict
++	}
++	if requested == nil || *requested == 0 {
++		return false, nil
++	}
++	p.aliasMu.Lock()
++	valid := p.state != nil && p.state.device != nil && !p.aliasRetired && int(*requested) <= len(p.aliasRegistry) && p.aliasRegistry[*requested-1].ID == *requested
++	same := valid && p.state.device.SelectedAliasId == *requested
++	var destination ApiAlias
++	if valid {
++		destination = p.aliasRegistry[*requested-1]
++	}
++	p.aliasMu.Unlock()
++	if !valid {
++		return false, ErrAliasConflict
++	}
++	if same {
++		return false, nil
++	}
++	if req.Command.Endpoint != "transfer" || len(req.Command.Data) == 0 || req.Command.Options.SystemInitiated || req.Command.PlayOptions.SystemInitiated || req.SentByDeviceId == "" || len(req.SentByDeviceId) > 160 || p.sess == nil {
++		return false, ErrAliasConflict
++	}
++	account, authenticated := p.sess.BoundUsername()
++	if !authenticated || destination.RoomID == "" || destination.HomePodID == "" {
++		return false, ErrAliasConflict
++	}
++	ctx, cancel := context.WithTimeout(parent, 16*time.Second) // Existing public MOVE commit bound.
++	defer cancel()
++	capture, err := p.captureMove(roomVolumeScope{account, p.app.deviceId, destination.RoomID, destination.HomePodID})
++	if err != nil {
++		return false, err
++	}
++	state, err := capture.readCState(ctx)
++	if err != nil {
++		return false, err
++	}
++	value, err := p.offerMove(moveOfferActorRequest{Capture: capture, State: state, Context: ctx})
++	if err != nil {
++		return false, err
++	}
++	op := value.(*moveOperation)
++	op.onDealerActor = true
++	_, err = p.claimMove(moveActorRequest{Operation: op, Context: ctx, Request: movePrepareRequest{Scope: capture.Scope, Offer: op.Offer, Action: "move_existing_session", Args: moveArgs{}}})
++	if err != nil {
++		return false, err
++	}
++	op.prepare(ctx)
++	op.commit(ctx, nil)
++	// The actor-local path uses exactly the public path's reservation cleanup,
++	// deadline fence and UNKNOWN quarantine before accepting another command.
++	open := p.waitMoveReservation(ctx)
++	op.mu.Lock()
++	complete := op.Terminal && op.State == "complete"
++	op.mu.Unlock()
++	if !open || !complete || ctx.Err() != nil {
++		return false, ErrAliasConflict
++	}
++	return true, nil
++}
+--- a/daemon/room_move.go
++++ b/daemon/room_move.go
+@@ -66,6 +66,7 @@
+ 	WriterGeneration uint64
+ }
+ type moveOperation struct {
++	onDealerActor                                                                                        bool
+ 	mu                                                                                                   sync.Mutex
+ 	Owner                                                                                                *AppPlayer
+ 	Capture                                                                                              *moveCapture
+--- a/daemon/room_move_actor.go
++++ b/daemon/room_move_actor.go
+@@ -83,6 +83,9 @@
+ }
+ 
+ func (op *moveOperation) actorStep(ctx context.Context, phase string) error {
++	if op.onDealerActor {
++		return op.Owner.applyMoveStep(moveStep{Operation: op, Phase: phase, Context: ctx})
++	}
+ 	reply := make(chan error, 1)
+ 	select {
+ 	case op.Owner.roomMoveSteps <- moveStep{op, phase, ctx, reply}:
+@@ -115,7 +118,7 @@
+ 			op.mu.Lock()
+ 			completed := op.State == "complete"
+ 			op.mu.Unlock()
+-			if completed && p.primaryStream == op.Capture.Primary && p.primaryStream.Source == op.Capture.Source && p.state.player == op.Capture.PlayerState && p.state.tracks == op.Capture.Tracks && p.state.player.SessionId == op.Capture.SessionID {
++			if completed && !op.onDealerActor && p.primaryStream == op.Capture.Primary && p.primaryStream.Source == op.Capture.Source && p.state.player == op.Capture.PlayerState && p.state.tracks == op.Capture.Tracks && p.state.player.SessionId == op.Capture.SessionID {
+ 				p.emitSelectedAlias(op.Capture.TargetAlias, p.aliasBinding())
+ 			}
+ 			p.aliasMu.Lock()
+--- a/daemon/room_move_execute.go
++++ b/daemon/room_move_execute.go
+@@ -143,7 +143,14 @@
+ 		failed()
+ 		return
+ 	}
+-	_, err := server.roomTransportAsk(ctx, apiMoveConsume, moveActorRequest{Operation: op, Context: ctx})
++	var err error
++	if op.onDealerActor {
++		_, err = op.Owner.consumeMove(moveActorRequest{Operation: op, Context: ctx})
++	} else if server == nil {
++		err = ErrAliasConflict
++	} else {
++		_, err = server.roomTransportAsk(ctx, apiMoveConsume, moveActorRequest{Operation: op, Context: ctx})
++	}
+ 	if err != nil {
+ 		op.cancelMove()
+ 		failed()
