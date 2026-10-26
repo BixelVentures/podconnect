@@ -16,9 +16,11 @@ on:
       - ".github/fixtures/**"
   workflow_dispatch:
 
+# Keep producers and the composed-fixture consumer on one supported ABI.
+# ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +69,7 @@ jobs:
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -209,7 +211,7 @@ jobs:
 
   selected-start-clock:
     needs: [build-fork, build-owntone]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
