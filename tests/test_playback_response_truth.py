@@ -2,15 +2,29 @@
 
 import asyncio
 import json
+import sys
 import time
 import unittest
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from test_playback_targets import load_body
+from test_playback_targets import PKG, load_body
 
-API = load_body(
+
+def load_isolated(file, namespace, names):
+    name = PKG + "." + file.removesuffix(".py")
+    previous = sys.modules.get(name)
+    try:
+        return load_body(file, namespace, names)
+    finally:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+
+
+API = load_isolated(
     "api.py",
     {
         "SPOTIFY_API": "https://example.invalid",
@@ -19,7 +33,7 @@ API = load_body(
     },
     {"SpotifyApiError", "SpotifyApi"},
 )
-OBS = load_body(
+OBS = load_isolated(
     "observations.py",
     {
         "time": time,
@@ -39,7 +53,7 @@ class CoordinatorBase:
         return cls
 
 
-COORD = load_body(
+COORD = load_isolated(
     "coordinator.py",
     {
         "asyncio": asyncio,
