@@ -1,3 +1,7 @@
+## Control 0.10.26 — preserve playback response truth
+
+- Treat only HTTP 204 as an empty playback response; reject malformed non-204 playback responses instead of publishing fresh idle. Speakers 0.26.56 is unchanged.
+
 ## Control 0.10.23 — preserve native queue freshness
 
 - Keep the original native queue expiry while preparing track metadata, so processing time cannot invalidate an otherwise fresh queue in PodVoice. Preserve both wall-clock and monotonic source deadlines; command authorization and one-use execution are unchanged.
