@@ -46,6 +46,7 @@ class SpotifyApi:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         max_bytes: int | None = None,
+        playback_response: bool = False,
         execution_guard: Callable[[], bool] | None = None,
         async_execution_guard: Callable[[], Awaitable[None]] | None = None,
         on_send: Callable[[], None] | None = None,
@@ -115,6 +116,16 @@ class SpotifyApi:
                 raise SpotifyApiError(
                     f"{method} {path} -> {resp.status}: {await resp.text()}"
                 )
+            if playback_response:
+                if resp.status != 200 or resp.content_type != "application/json":
+                    raise SpotifyApiError("Invalid playback response")
+                try:
+                    playback = await resp.json()
+                except (ValueError, UnicodeDecodeError) as err:
+                    raise SpotifyApiError("Invalid playback response") from err
+                if not isinstance(playback, dict):
+                    raise SpotifyApiError("Invalid playback response")
+                return playback
             if resp.content_type == "application/json":
                 return await resp.json()
             return None
@@ -126,7 +137,7 @@ class SpotifyApi:
 
     async def playback_state(self) -> dict[str, Any] | None:
         """GET /me/player (None when nothing is playing)."""
-        return await self._request("GET", "/me/player")
+        return await self._request("GET", "/me/player", playback_response=True)
 
     async def queue(self) -> dict[str, Any]:
         """Bounded account-wide queue read; credentials never leave this owner."""
