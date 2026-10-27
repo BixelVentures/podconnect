@@ -185,6 +185,9 @@ COPY patches/room-owner-parity-owntone-tests.patch /patches/room-owner-parity-ow
 COPY patches/room-owner-parity-owntone.sha256 /patches/room-owner-parity-owntone.sha256
 COPY patches/private-diagnostics-owntone.patch /patches/private-diagnostics-owntone.patch
 COPY patches/private-diagnostics-owntone.sha256 /patches/private-diagnostics-owntone.sha256
+COPY patches/retire-diagnostics-owntone.patch /patches/retire-diagnostics-owntone.patch
+COPY patches/retire-diagnostics-tests.patch /patches/retire-diagnostics-tests.patch
+COPY patches/retire-diagnostics-owntone.sha256 /patches/retire-diagnostics-owntone.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
@@ -274,6 +277,11 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/private-diagnostics-owntone.sha256 \
   && git apply --check /patches/private-diagnostics-owntone.patch \
   && git apply /patches/private-diagnostics-owntone.patch \
+  && sha256sum -c /patches/retire-diagnostics-owntone.sha256 \
+  && git apply --check /patches/retire-diagnostics-owntone.patch \
+  && git apply /patches/retire-diagnostics-owntone.patch \
+  && git apply --check /patches/retire-diagnostics-tests.patch \
+  && git apply /patches/retire-diagnostics-tests.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
