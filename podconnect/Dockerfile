@@ -119,6 +119,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/blocked-decoder-controls-native-tests.patch \
   && git apply --check /patches/queue-metadata-background-native.patch \
   && git apply /patches/queue-metadata-background-native.patch \
+  && git apply --check /patches/dealer-fieldcodes-native.patch \
+  && git apply /patches/dealer-fieldcodes-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -194,6 +196,8 @@ COPY patches/private-diagnostics-owntone.sha256 /patches/private-diagnostics-own
 COPY patches/retire-diagnostics-owntone.patch /patches/retire-diagnostics-owntone.patch
 COPY patches/retire-diagnostics-tests.patch /patches/retire-diagnostics-tests.patch
 COPY patches/retire-diagnostics-owntone.sha256 /patches/retire-diagnostics-owntone.sha256
+COPY patches/retire-fieldcodes-owntone.patch /patches/retire-fieldcodes-owntone.patch
+COPY patches/retire-fieldcodes-owntone.sha256 /patches/retire-fieldcodes-owntone.sha256
 COPY patches/owntone-queue.sha256 /patches/owntone-queue.sha256
 RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/owntone-server.git /src \
   && cd /src \
@@ -288,11 +292,16 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && git apply /patches/retire-diagnostics-owntone.patch \
   && git apply --check /patches/retire-diagnostics-tests.patch \
   && git apply /patches/retire-diagnostics-tests.patch \
+  && sha256sum -c /patches/retire-fieldcodes-owntone.sha256 \
+  && git apply --check /patches/retire-fieldcodes-owntone.patch \
+  && git apply /patches/retire-fieldcodes-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
   && make -j"$(nproc)" \
   && { make check || { cat src/test-suite.log; exit 1; }; } \
+  && src/airplay_callback_owner --retirement-difference \
+  && src/airplay_callback_owner --start-retire-wire \
   && src/airplay_callback_owner --queue-wire \
   && src/airplay_callback_owner --queue-connect-wire \
   && src/airplay_callback_owner --start-retire-closed-wire \
