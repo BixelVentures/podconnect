@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -790,6 +791,10 @@ func runExplicitResumeBridgeCase(t *testing.T, mode string) {
 		}
 	}
 	var primes, selections, transports atomic.Int32
+	var firstBusy sync.Once
+	busyRelease := make(chan struct{})
+	var releaseBusy sync.Once
+	defer releaseBusy.Do(func() { close(busyRelease) })
 	var permit atomic.Bool
 	if mode != "resume_busy" {
 		permit.Store(true)
@@ -805,6 +810,9 @@ func runExplicitResumeBridgeCase(t *testing.T, mode string) {
 				return nil, errors.New("UNKNOWN after send")
 			}
 			if !permit.Load() {
+				if mode == "resume_busy" {
+					firstBusy.Do(func() { <-busyRelease })
+				}
 				return temporaryBusyReply(), nil
 			}
 		}
@@ -838,7 +846,8 @@ func runExplicitResumeBridgeCase(t *testing.T, mode string) {
 	}
 	f.rt.live.applySourceEvent(glSource{run: f.rt.live.runEpoch, phase: f.rt.live.phaseEpoch}, grant.Type, grant.Data)
 	f.rt.live.mu.Lock()
-	until := f.rt.live.connectRecovery.until
+	credit := f.rt.live.connectRecovery
+	until := credit.until
 	f.rt.live.mu.Unlock()
 	time.Sleep(250 * time.Millisecond)
 	if primes.Load() != 0 || selections.Load() != 0 {
@@ -864,11 +873,25 @@ func runExplicitResumeBridgeCase(t *testing.T, mode string) {
 		t.Fatal("new explicit Resume never attempted")
 	}
 	if mode == "resume_busy" {
-		f.rt.live.mu.Lock()
-		sameDeadline := f.rt.live.connectRecovery != nil && f.rt.live.connectRecovery.until.Equal(until)
-		f.rt.live.mu.Unlock()
-		if !sameDeadline || selections.Load() != 0 {
-			t.Fatal("pre-effect busy spent/extended credit or selected")
+		// The request counter advances before the synthetic response is returned.
+		// Wait for the same consumed credit to be restored after that response.
+		releaseBusy.Do(func() { close(busyRelease) })
+		deadline := time.Now().Add(time.Second)
+		for {
+			f.rt.live.mu.Lock()
+			current := f.rt.live.connectRecovery
+			valid := current == credit && current != nil && current.until.Equal(until)
+			f.rt.live.mu.Unlock()
+			if selections.Load() != 0 || (current != nil && !valid) {
+				t.Fatal("pre-effect busy replaced/extended credit or selected")
+			}
+			if valid {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("pre-effect busy did not restore credit")
+			}
+			time.Sleep(time.Millisecond)
 		}
 		permit.Store(true)
 	}
