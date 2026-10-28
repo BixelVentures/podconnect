@@ -1,3 +1,8 @@
+## Speakers 0.26.59 — immutable publication after fixture repair
+
+- Publish the reviewed queue-metadata candidate with the deterministic recovery fixture. Runtime and Control 0.10.27 are unchanged from the 0.26.58 candidate.
+- Use a new immutable image version because 0.26.58 was already published for one architecture before the test-only correction.
+
 ## Speakers 0.26.58 / Control 0.10.27 — queue metadata
 
 - Resolve metadata for native queue occurrences in the background so titles, artists and artwork can appear on a later ordinary queue read without delaying playback controls.
