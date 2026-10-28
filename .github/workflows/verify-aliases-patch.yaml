@@ -49,7 +49,7 @@ jobs:
           done
           # These are the same final Native suffix slots used by Docker.
           # The unified tests already include the selected-content clock fixture.
-          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch dealer-roomchange-native.patch dealer-roomchange-native-tests.patch private-diagnostics-native.patch private-diagnostics-native-tests.patch; do
+          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch dealer-roomchange-native.patch dealer-roomchange-native-tests.patch private-diagnostics-native.patch private-diagnostics-native-tests.patch blocked-decoder-controls-native.patch blocked-decoder-controls-native-tests.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
@@ -153,10 +153,10 @@ jobs:
           git apply --check "$patch_dir/move-first-pcm-clock-owntone.patch"
           git apply "$patch_dir/move-first-pcm-clock-owntone.patch"
           # The same Docker suffix includes the prior five CI-only fixtures.
-          for checksum in room-release-owntone.sha256 room-owner-parity-owntone.sha256 private-diagnostics-owntone.sha256; do
+          for checksum in room-release-owntone.sha256 room-owner-parity-owntone.sha256 private-diagnostics-owntone.sha256 retire-diagnostics-owntone.sha256; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$checksum" | sha256sum -c -
           done
-          for patch in room-release-owntone.patch room-release-owntone-tests.patch room-release-owntone-timer-tests.patch room-release-owntone-target2-tests.patch room-owner-parity-owntone.patch room-owner-parity-owntone-tests.patch private-diagnostics-owntone.patch; do
+          for patch in room-release-owntone.patch room-release-owntone-tests.patch room-release-owntone-timer-tests.patch room-release-owntone-target2-tests.patch room-owner-parity-owntone.patch room-owner-parity-owntone-tests.patch private-diagnostics-owntone.patch retire-diagnostics-owntone.patch retire-diagnostics-tests.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
@@ -185,6 +185,14 @@ jobs:
           sudo -n make check
           sudo -n src/outputs_attention_owner --deployed-uid-proc
           sudo -n src/airplay_callback_owner --queue-wire
+          sudo -n env PC_RETIRE_DIAGNOSTIC_TEST=1 timeout 25 src/airplay_callback_owner --start-retire-wire > /tmp/retire-diagnostics.log 2>&1
+          test "$(grep -c 'START retirement rejected:' /tmp/retire-diagnostics.log)" = 7
+          for reason in request_missing result_missing session_changed writer_epoch input_epoch pipe_inode writer_fd; do
+            test "$(grep -c "START retirement rejected: $reason$" /tmp/retire-diagnostics.log)" = 1
+          done
+          grep -q 'RETIRE_DIAGNOSTIC_NEGATIVES_DONE' /tmp/retire-diagnostics.log
+          grep -q 'PASS actual START35 full fresh successor' /tmp/retire-diagnostics.log
+          ! sed -n '/RETIRE_DIAGNOSTIC_NEGATIVES_DONE/,$p' /tmp/retire-diagnostics.log | grep -q 'START retirement rejected:'
           sudo -n env PC_ATTENTION_RESTORE_CASE=1 src/airplay_callback_owner --start-retire-wire
           sudo -n env PC_ATTENTION_RECOVER_BUSY=1 src/airplay_callback_owner --attention-recovery-wire
           sudo -n src/airplay_callback_owner --metadata-pipe-owner

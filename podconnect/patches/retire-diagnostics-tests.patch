@@ -1,0 +1,21 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2389,6 +2389,18 @@
+     struct output_retirement_result retirement;
+     memcpy(retire.completed_token,r->token,33);memcpy(retire.native_incarnation,r->native_incarnation,33);
+     memset(retire.native_reservation_id,'1',32);
++    if(getenv("PC_RETIRE_DIAGNOSTIC_TEST")){
++      struct output_retirement_request wrong=retire;
++      assert(outputs_retirement_prepare(NULL,&retirement)<0);
++      assert(outputs_retirement_prepare(&retire,NULL)<0);
++      void *saved=f.device->session;f.device->session=NULL;
++      assert(outputs_retirement_prepare(&retire,&retirement)<0);f.device->session=saved;
++      wrong.writer_source_epoch++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++      wrong=retire;wrong.input_epoch++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++      wrong=retire;wrong.pipe_inode++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++      wrong=retire;wrong.writer_fd++;assert(outputs_retirement_prepare(&wrong,&retirement)<0);
++      fprintf(stderr,"RETIRE_DIAGNOSTIC_NEGATIVES_DONE\n");
++    }
+     assert(outputs_retirement_prepare(&retire,&retirement)==0 && retirement.ok
+       && retirement.outcome==OUTPUT_RETIRE_PENDING && retirement.reader_ready_closed && retirement.gate_closed);
+     memcpy(retire.retirement_token,retirement.command.retirement_token,33);

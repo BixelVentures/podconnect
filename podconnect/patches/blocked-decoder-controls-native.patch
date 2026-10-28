@@ -1,0 +1,843 @@
+--- a/output/driver-pipe.go
++++ b/output/driver-pipe.go
+@@ -23,6 +23,7 @@
+ 	control        sync.Mutex
+ 	pendingPCM     []byte
+ 	pendingErr     error
++	readDone       chan struct{}
+ 	reader         librespot.Float32Reader
+ 	file           *os.File
+ 	openedWriter   MovePipeIdentity
+@@ -134,7 +135,17 @@
+ 		}
+ 
+ 		if len(out.pendingPCM) == 0 && out.pendingErr == nil {
++			done := make(chan struct{})
++			out.readDone = done
++			out.lock.Unlock()
+ 			n, err := out.reader.Read(floats)
++			out.lock.Lock()
++			out.readDone = nil
++			close(done)
++			if out.closed {
++				out.lock.Unlock()
++				break
++			}
+ 			out.pendingErr = err
+ 			// START fencing may race an old source read. Its bytes may not cross
+ 			// the boundary, including a suffix retained by an ordinary Pause.
+@@ -155,7 +166,7 @@
+ 				out.pendingPCM = bytes[:out.transform(floats[:n], bytes)]
+ 			}
+ 		}
+-		if out.controlPending.Load() {
++		if out.paused || out.controlPending.Load() {
+ 			out.lock.Unlock()
+ 			continue
+ 		}
+@@ -176,7 +187,13 @@
+ 			}
+ 		}
+ 		if errors.Is(out.pendingErr, io.EOF) {
+-			out.paused = true
++			switched := false
++			if source, ok := out.reader.(interface{ ResolveDeferredEOF() bool }); ok {
++				switched = source.ResolveDeferredEOF()
++			}
++			if !switched {
++				out.paused = true
++			}
+ 		} else if out.pendingErr != nil {
+ 			out.err <- out.pendingErr
+ 			out.closed = true
+@@ -245,6 +262,27 @@
+ 	return out.unlockControl()
+ }
+ 
++// WithSourceReplacement interrupts only an abandoned source, then joins the
++// returned read before publishing its replacement under the writer boundary.
++func (out *pipeOutput) WithSourceReplacement(apply func(func(bool)) error) error {
++	if err := out.lockControl(); err != nil {
++		return err
++	}
++	if out.closed {
++		return errors.Join(fmt.Errorf("pipe output closed"), out.unlockControl())
++	}
++	if out.readDone != nil {
++		if source, ok := out.reader.(interface{ CancelActiveRead() }); ok {
++			source.CancelActiveRead()
++		}
++		_ = out.joinReadLocked(context.Background())
++	}
++	out.pendingPCM = nil
++	out.pendingErr = nil
++	err := apply(func(paused bool) { out.paused = paused })
++	return errors.Join(err, out.unlockControl())
++}
++
+ // WithSourceChange joins the current writer before discarding its unwritten
+ // suffix and mutating the source. Seek preserves the current paused state;
+ // source replacement can publish its requested state under this same lock.
+@@ -255,6 +293,9 @@
+ 	if out.closed {
+ 		return errors.Join(fmt.Errorf("pipe output closed"), out.unlockControl())
+ 	}
++	if out.readDone != nil {
++		return errors.Join(fmt.Errorf("source read in progress"), out.unlockControl())
++	}
+ 	out.pendingPCM = nil
+ 	out.pendingErr = nil
+ 	err := apply(func(paused bool) { out.paused = paused })
+@@ -289,6 +330,12 @@
+ 		out.fileClosed = true
+ 	}
+ 	out.closed = true
++	if out.readDone != nil {
++		if source, ok := out.reader.(interface{ CancelActiveRead() }); ok {
++			source.CancelActiveRead()
++		}
++		_ = out.joinReadLocked(context.Background())
++	}
+ 	out.pendingPCM = nil
+ 	out.pendingErr = nil
+ 	return errors.Join(closeErr, out.unlockControl())
+@@ -344,6 +391,9 @@
+ 	if out.closed || out.fileClosed || out.startFenced.Load() {
+ 		return fmt.Errorf("seek pipe unavailable")
+ 	}
++	if err = out.joinReadLocked(ctx); err != nil {
++		return err
++	}
+ 	info, err := out.file.Stat()
+ 	if err != nil {
+ 		return err
+@@ -358,3 +408,28 @@
+ 	}
+ 	return apply(actual, out.paused, func() { out.pendingPCM = nil; out.pendingErr = nil })
+ }
++
++// joinReadLocked preserves the existing owner proof: callbacks cannot credit a
++// source/route while a preceding decoder read is still in flight.
++func (out *pipeOutput) joinReadLocked(ctx context.Context) error {
++	for out.readDone != nil {
++		done := out.readDone
++		out.lock.Unlock()
++		select {
++		case <-done:
++		case <-ctx.Done():
++			out.lock.Lock()
++			return ctx.Err()
++		}
++		out.lock.Lock()
++	}
++	return nil
++}
++
++// WithGuardedReplacement preserves the captured writer and clears old pending
++// bytes only inside the already-authorized source mutation.
++func (out *pipeOutput) WithGuardedReplacement(ctx context.Context, apply func(MovePipeIdentity, func(), func(bool)) error) error {
++	return out.WithGuardedSourceChange(ctx, func(id MovePipeIdentity, _ bool, drop func()) error {
++		return apply(id, drop, func(paused bool) { out.paused = paused; out.cond.Broadcast() })
++	})
++}
+--- a/output/start35.go
++++ b/output/start35.go
+@@ -21,10 +21,22 @@
+ 
+ func (out *pipeOutput) FenceStart() { out.startFenced.Store(true) }
+ func (out *pipeOutput) WithStartLock(ctx context.Context, apply func(PipeIdentity, func(bool)) error) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if err := LockTransport(ctx, &out.control); err != nil {
++		return err
++	}
++	defer out.control.Unlock()
+ 	if err := LockTransport(ctx, &out.lock); err != nil {
+ 		return err
+ 	}
+ 	defer out.lock.Unlock()
++	out.controlPending.Store(true)
++	defer func() { out.controlPending.Store(false); out.cond.Broadcast() }()
++	if err := out.joinReadLocked(ctx); err != nil {
++		return err
++	}
+ 	return out.withStartLockLocked(apply, false)
+ }
+ func (out *pipeOutput) withStartLockLocked(apply func(PipeIdentity, func(bool)) error, preserveMovePCM bool) error {
+--- a/output/room_move.go
++++ b/output/room_move.go
+@@ -97,18 +97,46 @@
+ 	if announcementErr != nil {
+ 		return announcementErr
+ 	}
++	if err = out.joinReadLocked(ctx); err != nil {
++		return err
++	}
+ 	return out.withStartLockLocked(apply, true)
+ }
+ 
+ // WithMoveLock retains the already quiesced writer's unread PCM through its
+ // alias switch, resume or abort. It does not announce a control interruption.
+ func (out *pipeOutput) WithMoveLock(ctx context.Context, apply func(PipeIdentity, func(bool)) error) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if err := LockTransport(ctx, &out.control); err != nil {
++		return err
++	}
++	defer out.control.Unlock()
+ 	if err := LockTransport(ctx, &out.lock); err != nil {
+ 		return err
+ 	}
+ 	defer out.lock.Unlock()
+-	if err := ctx.Err(); err != nil {
++	out.controlPending.Store(true)
++	defer func() { out.controlPending.Store(false); out.cond.Broadcast() }()
++	if err := out.joinReadLocked(ctx); err != nil {
+ 		return err
+ 	}
+ 	return out.withStartLockLocked(apply, true)
+ }
++
++// WithPauseVerifyLock permits only read-only current-writer verification for
++// an already-bound Pause; source mutations still require the normal read join.
++func (out *pipeOutput) WithPauseVerifyLock(ctx context.Context, apply func(PipeIdentity, func(bool)) error) error {
++	if err := LockTransport(ctx, &out.lock); err != nil {
++		return err
++	}
++	defer out.lock.Unlock()
++	if ctx != nil && ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if out.controlPending.Load() {
++		return errors.New("writer control pending")
++	}
++	return out.withStartLockLocked(apply, true)
++}
+--- a/player/source.go
++++ b/player/source.go
+@@ -10,12 +10,17 @@
+ )
+ 
+ type SwitchingAudioSource struct {
+-	source      map[bool]librespot.AudioSource
+-	which       bool
+-	cond        *sync.Cond
+-	retiring    atomic.Bool
+-	active      atomic.Pointer[activeAudioRead]
+-	pendingDone atomic.Uint64
++	source             map[bool]librespot.AudioSource
++	which              bool
++	cond               *sync.Cond
++	retiring           atomic.Bool
++	active             atomic.Pointer[activeAudioRead]
++	pendingDone        atomic.Uint64
++	lastPosition       atomic.Int64
++	generation         atomic.Uint64
++	asyncRead          bool
++	deferredEOF        *activeAudioRead
++	deferredGeneration uint64
+ 
+ 	done chan struct{}
+ }
+@@ -27,15 +32,37 @@
+ // CancelRead is a one-way retirement fence. It never waits for the source
+ // mutex, which the active raw Read holds, and does not close the decoder.
+ func (s *SwitchingAudioSource) CancelRead() {
++	s.cond.L.Lock()
+ 	s.retiring.Store(true)
+ 	s.cond.Broadcast()
+-	if read := s.active.Load(); read != nil {
++	read := s.active.Load()
++	s.cond.L.Unlock()
++	if read != nil {
+ 		if source, ok := read.source.(interface{ CancelRead() }); ok {
+ 			source.CancelRead()
+ 		}
+ 	}
+ }
+ 
++// CancelActiveRead abandons one generation without lifting terminal retirement.
++func (s *SwitchingAudioSource) CancelActiveRead() {
++	s.cond.L.Lock()
++	s.generation.Add(1)
++	s.cond.Broadcast()
++	read := s.active.Load()
++	s.cond.L.Unlock()
++	if read != nil {
++		if source, ok := read.source.(interface{ CancelRead() }); ok {
++			source.CancelRead()
++		}
++	}
++}
++func (s *SwitchingAudioSource) IsCurrent(source librespot.AudioSource) bool {
++	s.cond.L.Lock()
++	defer s.cond.L.Unlock()
++	return s.source[s.which] == source
++}
++
+ func NewSwitchingAudioSource() *SwitchingAudioSource {
+ 	return &SwitchingAudioSource{
+ 		source: map[bool]librespot.AudioSource{},
+@@ -44,11 +71,23 @@
+ 	}
+ }
+ 
+-func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) {
++func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) bool {
+ 	s.cond.L.Lock()
+ 	defer s.cond.L.Unlock()
++	if s.retiring.Load() {
++		return false
++	}
++	s.generation.Add(1)
+ 	s.source[s.which] = source
++	if s.asyncRead {
++		if source != nil {
++			s.lastPosition.Store(source.PositionMs())
++		} else {
++			s.lastPosition.Store(0)
++		}
++	}
+ 	s.cond.Broadcast()
++	return true
+ }
+ 
+ func (s *SwitchingAudioSource) SetSecondary(source librespot.AudioSource) {
+@@ -68,54 +107,99 @@
+ 
+ func (s *SwitchingAudioSource) Read(p []float32) (n int, err error) {
+ 	s.cond.L.Lock()
+-	defer s.cond.L.Unlock()
+-
++	generation := s.generation.Load()
+ 	for s.source[s.which] == nil {
+ 		if s.retiring.Load() {
++			s.cond.L.Unlock()
+ 			return 0, io.EOF
+ 		}
++		if s.asyncRead && s.generation.Load() != generation {
++			s.cond.L.Unlock()
++			return 0, nil
++		}
+ 		s.cond.Wait()
+ 	}
+ 	if s.retiring.Load() {
++		s.cond.L.Unlock()
+ 		return 0, io.EOF
+ 	}
+-
+-	read := &activeAudioRead{source: s.source[s.which]}
++	if s.asyncRead && s.generation.Load() != generation {
++		s.cond.L.Unlock()
++		return 0, nil
++	}
++	which := s.which
++	read := &activeAudioRead{source: s.source[which]}
+ 	s.active.Store(read)
+ 	if s.retiring.Load() {
+ 		if source, ok := read.source.(interface{ CancelRead() }); ok {
+ 			source.CancelRead()
+ 		}
+ 		s.active.CompareAndSwap(read, nil)
++		s.cond.L.Unlock()
+ 		return 0, io.EOF
+ 	}
++	if s.asyncRead {
++		s.cond.L.Unlock()
++	}
+ 	n, err = read.source.Read(p)
++	if s.asyncRead {
++		s.cond.L.Lock()
++	}
++	defer s.cond.L.Unlock()
+ 	s.active.CompareAndSwap(read, nil)
++	if s.retiring.Load() || s.generation.Load() != generation || s.which != which || s.source[which] != read.source {
++		return 0, nil
++	}
++	if s.asyncRead {
++		s.lastPosition.Store(read.source.PositionMs())
++	}
++	if errors.Is(err, io.EOF) && s.asyncRead {
++		s.deferredEOF = read
++		s.deferredGeneration = generation
++		return n, io.EOF
++	}
+ 	if errors.Is(err, io.EOF) {
+-		// Wakeups coalesce, but each EOF remains counted. Sending while holding
+-		// the source/output locks must never block CloseDone.
+ 		s.pendingDone.Add(1)
+ 		select {
+ 		case s.done <- struct{}{}:
+ 		default:
+ 		}
+-
+-		// if there's no other source just let the EOF through
+ 		if s.source[!s.which] == nil {
+ 			return n, err
+ 		}
+-
+-		// delete current source and switch to the other one
+ 		delete(s.source, s.which)
+ 		s.which = !s.which
+-
+-		// ignore the EOF, we have mode data
++		if s.asyncRead {
++			s.lastPosition.Store(s.source[s.which].PositionMs())
++		}
+ 		return n, nil
+-	} else if err != nil {
+-		return n, err
+ 	}
++	return n, err
++}
+ 
+-	return n, nil
++// ResolveDeferredEOF runs only after the output has emitted every retained
++// sample. A replaced/abandoned lease cannot advance the successor.
++func (s *SwitchingAudioSource) ResolveDeferredEOF() bool {
++	s.cond.L.Lock()
++	defer s.cond.L.Unlock()
++	read := s.deferredEOF
++	generation := s.deferredGeneration
++	s.deferredEOF = nil
++	if read == nil || s.retiring.Load() || s.generation.Load() != generation || s.source[s.which] != read.source {
++		return false
++	}
++	s.pendingDone.Add(1)
++	select {
++	case s.done <- struct{}{}:
++	default:
++	}
++	if s.source[!s.which] == nil {
++		return false
++	}
++	delete(s.source, s.which)
++	s.which = !s.which
++	s.lastPosition.Store(s.source[s.which].PositionMs())
++	return true
+ }
+ 
+ func (s *SwitchingAudioSource) SetPositionMs(pos int64) error {
+@@ -126,18 +210,32 @@
+ 		return nil
+ 	}
+ 
+-	return s.source[s.which].SetPositionMs(pos)
++	if s.active.Load() != nil {
++		return errors.New("source read in progress")
++	}
++	s.generation.Add(1)
++	if err := s.source[s.which].SetPositionMs(pos); err != nil {
++		return err
++	}
++	s.lastPosition.Store(s.source[s.which].PositionMs())
++	return nil
+ }
+ 
+ func (s *SwitchingAudioSource) PositionMs() int64 {
++	if s.asyncRead && s.active.Load() != nil {
++		return s.lastPosition.Load()
++	}
+ 	s.cond.L.Lock()
+ 	defer s.cond.L.Unlock()
+-
+ 	if s.source[s.which] == nil {
+ 		return 0
+ 	}
+-
+-	return s.source[s.which].PositionMs()
++	if s.active.Load() != nil {
++		return s.lastPosition.Load()
++	}
++	pos := s.source[s.which].PositionMs()
++	s.lastPosition.Store(pos)
++	return pos
+ }
+ 
+ func (s *SwitchingAudioSource) Close() error {
+--- a/player/start35.go
++++ b/player/start35.go
+@@ -161,6 +161,9 @@
+ 			if command.ctx.Err() != nil {
+ 				return command.ctx.Err()
+ 			}
++			if source.retiring.Load() {
++				return fmt.Errorf("source retired")
++			}
+ 			if source.source[source.which] != command.expected {
+ 				return start35VerificationError("source_changed")
+ 			}
+@@ -209,6 +212,9 @@
+ 			return e
+ 		}
+ 		defer lock.Unlock()
++		if source.retiring.Load() {
++			return fmt.Errorf("source retired")
++		}
+ 		if source.source[source.which] != command.expected {
+ 			return fmt.Errorf("start source changed")
+ 		}
+@@ -225,7 +231,13 @@
+ 				setPaused(true)
+ 			case "publish":
+ 				displaced = append(displaced, source.source[source.which], source.source[!source.which])
++				source.generation.Add(1)
+ 				source.source[source.which] = command.source
++				if command.source != nil {
++					source.lastPosition.Store(command.source.PositionMs())
++				} else {
++					source.lastPosition.Store(0)
++				}
+ 				delete(source.source, !source.which)
+ 				source.cond.Broadcast()
+ 				// Drop every pre-barrier EOF/player callback while its source is locked.
+--- a/player/player.go
++++ b/player/player.go
+@@ -231,6 +231,7 @@
+ 		closeDone: make(chan struct{}),
+ 	}
+ 
++	p.source.asyncRead = opts.AudioBackend == "pipe"
+ 	if opts.AudioBackend == "pipe" {
+ 		p.newPausedOutput = func(source librespot.Float32Reader, volume float32) (output.Output, error) {
+ 			create := func() (output.Output, error) {
+@@ -366,25 +367,48 @@
+ 					p.log.Debugf("created new output device")
+ 				}
+ 
+-				// Pipe source mutation and old-suffix discard share the writer join.
+-				if data.drop && p.newPausedOutput != nil {
++				// All primary replacements join the old reader, not only drop.
++				if p.newPausedOutput != nil && !source.IsCurrent(data.source) {
+ 					pipe, ok := out.(interface {
++						WithSourceReplacement(func(func(bool)) error) error
++					})
++					if !ok {
++						cmd.resp <- fmt.Errorf("pipe output lacks source replacement boundary")
++						break
++					}
++					if err := pipe.WithSourceReplacement(func(setPaused func(bool)) error {
++						setPaused(true)
++						if !source.SetPrimary(data.source) {
++							return fmt.Errorf("source retired")
++						}
++						return nil
++					}); err != nil {
++						cmd.resp <- err
++						break
++					}
++				} else if p.newPausedOutput != nil && data.drop {
++					pipe, ok := out.(interface {
+ 						WithSourceChange(func(func(bool)) error) error
+ 					})
+ 					if !ok {
+-						cmd.resp <- fmt.Errorf("pipe output lacks source mutation boundary")
++						cmd.resp <- fmt.Errorf("pipe output lacks source change boundary")
+ 						break
+ 					}
+ 					if err := pipe.WithSourceChange(func(setPaused func(bool)) error {
+-						setPaused(true) // Existing Pause/Resume below publishes the requested state.
+-						source.SetPrimary(data.source)
++						setPaused(true)
++						if !source.SetPrimary(data.source) {
++							return fmt.Errorf("source retired")
++						}
+ 						return nil
+ 					}); err != nil {
+ 						cmd.resp <- err
+ 						break
+ 					}
+-				} else {
+-					source.SetPrimary(data.source)
++				} else if p.newPausedOutput == nil {
++					if !source.SetPrimary(data.source) {
++						cmd.resp <- fmt.Errorf("source retired")
++						break
++					}
+ 				}
+ 				outputFailurePending = false
+ 				if data.paused {
+@@ -455,17 +479,21 @@
+ 				cmd.resp <- struct{}{}
+ 				p.ev <- Event{Type: EventTypeStop}
+ 			case playerCmdSeek:
++				seek := cmd.data.(playerSeekCommand)
+ 				if out != nil {
+ 					if p.newPausedOutput != nil {
+ 						pipe, ok := out.(interface {
+-							WithSourceChange(func(func(bool)) error) error
++							WithGuardedSourceChange(context.Context, func(output.MovePipeIdentity, bool, func()) error) error
+ 						})
+ 						if !ok {
+ 							cmd.resp <- fmt.Errorf("pipe output lacks source mutation boundary")
+ 							break
+ 						}
+-						cmd.resp <- pipe.WithSourceChange(func(_ func(bool)) error { return source.SetPositionMs(cmd.data.(int64)) })
+-					} else if err := source.SetPositionMs(cmd.data.(int64)); err != nil {
++						cmd.resp <- pipe.WithGuardedSourceChange(seek.ctx, func(_ output.MovePipeIdentity, _ bool, drop func()) error {
++							drop()
++							return source.SetPositionMs(seek.position)
++						})
++					} else if err := source.SetPositionMs(seek.position); err != nil {
+ 						cmd.resp <- err
+ 					} else if err = out.Drop(); err != nil {
+ 						cmd.resp <- err
+@@ -565,7 +593,12 @@
+ }
+ 
+ func (p *Player) Close() {
+-	p.closeOnce.Do(func() { p.cmd <- playerCmd{typ: playerCmdClose} })
++	p.closeOnce.Do(func() {
++		if p.source != nil && p.source.asyncRead {
++			p.source.CancelRead()
++		}
++		p.cmd <- playerCmd{typ: playerCmdClose}
++	})
+ 	<-p.closeDone
+ }
+ 
+@@ -655,10 +688,23 @@
+ 	}
+ }
+ 
+-func (p *Player) SeekMs(pos int64) error {
+-	resp := make(chan any, 1)
+-	if !p.sendCommand(playerCmd{typ: playerCmdSeek, data: pos, resp: resp}) {
++type playerSeekCommand struct {
++	ctx      context.Context
++	position int64
++}
++
++func (p *Player) SeekMs(pos int64) error { return p.SeekMsContext(context.Background(), pos) }
++func (p *Player) SeekMsContext(ctx context.Context, pos int64) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	resp := make(chan any, 1)
++	select {
++	case <-p.closeDone:
+ 		return fmt.Errorf("player closed")
++	case <-ctx.Done():
++		return ctx.Err()
++	case p.cmd <- playerCmd{typ: playerCmdSeek, data: playerSeekCommand{ctx, pos}, resp: resp}:
+ 	}
+ 	result, ok := p.commandResult(resp)
+ 	if !ok {
+@@ -667,7 +713,6 @@
+ 	if err := result; err != nil {
+ 		return err.(error)
+ 	}
+-
+ 	return nil
+ }
+ 
+--- a/player/room_transport.go
++++ b/player/room_transport.go
+@@ -82,6 +82,9 @@
+ 				return err
+ 			}
+ 			defer lock.Unlock()
++			if source.retiring.Load() {
++				return fmt.Errorf("source retired")
++			}
+ 			if source.source[source.which] != command.expectedSource || command.expectedSource == nil {
+ 				return fmt.Errorf("native primary source changed")
+ 			}
+@@ -93,9 +96,11 @@
+ 			}
+ 			drop()
+ 			// Decoder/network seek is outside the alias/owner publication callback.
++			source.generation.Add(1)
+ 			if err := command.expectedSource.SetPositionMs(*command.positionMS); err != nil {
+ 				return err
+ 			}
++			source.lastPosition.Store(command.expectedSource.PositionMs())
+ 			if err := command.context.Err(); err != nil {
+ 				return err
+ 			}
+@@ -110,6 +115,7 @@
+ 		return fmt.Errorf("guarded pipe output unavailable")
+ 	}
+ 	var displaced []librespot.AudioSource
++	var discard func()
+ 	apply := func(setPaused func(bool)) error {
+ 		lock, ok := source.cond.L.(*sync.Mutex)
+ 		if !ok {
+@@ -119,15 +125,27 @@
+ 			return err
+ 		}
+ 		defer lock.Unlock()
++		if source.retiring.Load() {
++			return fmt.Errorf("source retired")
++		}
+ 		if (command.context != nil && command.context.Err() != nil) || source.source[source.which] != command.expectedSource {
+ 			return fmt.Errorf("native primary source changed")
+ 		}
++		var replacementPosition int64
++		if command.source != nil {
++			replacementPosition = command.source.PositionMs()
++		}
+ 		// Both possibly blocking locks precede the deadline/owner test. The guarded
+ 		// callback is only local assignment; it never seeks, reads, writes or awaits.
+ 		return command.guard(func() {
+ 			if command.source != nil {
++				if discard != nil {
++					discard()
++				}
+ 				displaced = append(displaced, source.source[source.which], source.source[!source.which])
++				source.generation.Add(1)
+ 				source.source[source.which] = command.source
++				source.lastPosition.Store(replacementPosition)
+ 				delete(source.source, !source.which)
+ 				source.cond.Broadcast()
+ 			}
+@@ -135,7 +153,21 @@
+ 		})
+ 	}
+ 	var err error
+-	if command.writer != nil {
++	if command.source != nil {
++		replacement, ok := (*out).(interface {
++			WithGuardedReplacement(context.Context, func(output.MovePipeIdentity, func(), func(bool)) error) error
++		})
++		if !ok {
++			return fmt.Errorf("guarded source replacement unavailable")
++		}
++		err = replacement.WithGuardedReplacement(command.context, func(actual output.MovePipeIdentity, drop func(), setPaused func(bool)) error {
++			if command.writer != nil && (actual != *command.writer || command.epoch == "" || command.epoch != fmt.Sprint(p.startEpoch) || p.movePhase != "") {
++				return fmt.Errorf("queue writer or source epoch changed")
++			}
++			discard = drop
++			return apply(setPaused)
++		})
++	} else if command.writer != nil {
+ 		writer, ok := (*out).(output.MovePipeOutput)
+ 		if !ok {
+ 			return fmt.Errorf("queue writer owner unavailable")
+--- a/player/room_move.go
++++ b/player/room_move.go
+@@ -57,7 +57,7 @@
+ 	if command.ctx == nil || (command.expectedSource == nil && command.phase != "fence") || (command.guard == nil && command.phase != "snapshot" && command.phase != "abort" && command.phase != "fence") {
+ 		return result, fmt.Errorf("incomplete move command")
+ 	}
+-	if command.phase != "snapshot" && command.phase != "inspect" && command.phase != "quiesce" && command.phase != "switch" && command.phase != "resume" && command.phase != "abort" && command.phase != "fence" && command.phase != "verify" {
++	if command.phase != "snapshot" && command.phase != "inspect" && command.phase != "quiesce" && command.phase != "switch" && command.phase != "resume" && command.phase != "abort" && command.phase != "fence" && command.phase != "verify" && command.phase != "verify-pause" && command.phase != "verify-current" {
+ 		return result, fmt.Errorf("bad move phase")
+ 	}
+ 	if *out == nil {
+@@ -76,6 +76,15 @@
+ 		}
+ 	}
+ 	withLock := pipe.WithStartLock
++	if command.phase == "verify-pause" || command.phase == "verify-current" {
++		verify, ok := pipe.(interface {
++			WithPauseVerifyLock(context.Context, func(output.PipeIdentity, func(bool)) error) error
++		})
++		if !ok {
++			return result, fmt.Errorf("pause writer verification unavailable")
++		}
++		withLock = verify.WithPauseVerifyLock
++	}
+ 	if command.phase == "switch" || command.phase == "resume" || command.phase == "abort" {
+ 		controlled, ok := pipe.(output.MoveControlPipeOutput)
+ 		if !ok {
+@@ -102,6 +111,9 @@
+ 		if e := command.ctx.Err(); e != nil {
+ 			return e
+ 		}
++		if (command.phase == "verify-pause" || command.phase == "verify-current") && source.retiring.Load() {
++			return fmt.Errorf("source retired")
++		}
+ 		if command.phase != "fence" && source.source[source.which] != command.expectedSource {
+ 			return fmt.Errorf("native primary source changed")
+ 		}
+@@ -120,7 +132,7 @@
+ 			}
+ 			return command.guard(func() { result.Pipe, result.Epoch = writer, currentEpoch })
+ 		}
+-		if command.phase == "verify" {
++		if command.phase == "verify" || (command.phase == "verify-pause" || command.phase == "verify-current") {
+ 			if p.movePhase != "" || writer != command.pipe || command.epoch == "" || command.epoch != currentEpoch || pipe.PausedUnderStartLock() == command.wasPlaying || pipe.FencedUnderStartLock() {
+ 				return fmt.Errorf("move final source, writer, or paused state changed")
+ 			}
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -570,7 +570,7 @@
+ 	// seek before play to ensure we are at the correct stream position
+ 	seekPos := p.state.trackPosition()
+ 	seekPos = max(0, min(seekPos, int64(p.primaryStream.Media.Duration())))
+-	if err := p.player.SeekMs(seekPos); err != nil {
++	if err := p.player.SeekMsContext(ctx, seekPos); err != nil {
+ 		return fmt.Errorf("failed seeking before play: %w", err)
+ 	}
+ 
+@@ -626,7 +626,7 @@
+ 	position = max(0, min(position, int64(p.primaryStream.Media.Duration())))
+ 
+ 	p.app.log.Debugf("seek track to %dms", position)
+-	if err := p.player.SeekMs(position); err != nil {
++	if err := p.player.SeekMsContext(ctx, position); err != nil {
+ 		return err
+ 	}
+ 
+--- a/daemon/room_completed_writer.go
++++ b/daemon/room_completed_writer.go
+@@ -60,7 +60,7 @@
+ 			return nil, ErrAliasConflict
+ 		}
+ 	}
+-	current, err := p.verifyCompletedWriter(request.ctx, owner)
++	current, err := p.verifyCompletedWriterPhase(request.ctx, owner, "verify-current")
+ 	if err != nil || current == nil || current.start != request.content || current.move != request.move || request.ctx.Err() != nil {
+ 		return nil, ErrAliasConflict
+ 	}
+@@ -160,6 +160,10 @@
+ // This is the existing RoomMove verify worker phase, which performs no move
+ // mutation. It joins the real output and source locks and fstats the writer.
+ func (p *AppPlayer) verifyCompletedWriter(ctx context.Context, identity roomTransportIdentity) (*completedWriter, error) {
++	return p.verifyCompletedWriterPhase(ctx, identity, "verify")
++}
++
++func (p *AppPlayer) verifyCompletedWriterPhase(ctx context.Context, identity roomTransportIdentity, phase string) (*completedWriter, error) {
+ 	current, err := p.app.completedWriterCurrent(p, identity)
+ 	if err != nil || current == nil {
+ 		return current, err
+@@ -169,7 +173,7 @@
+ 	}
+ 	source := p.primaryStream.Source
+ 	paused := p.state.player.IsPaused
+-	_, _, err = p.player.RoomMove(ctx, "verify", source, current.writer, current.epoch, !paused, func(mutate func()) error {
++	_, _, err = p.player.RoomMove(ctx, phase, source, current.writer, current.epoch, !paused, func(mutate func()) error {
+ 		p.aliasMu.Lock()
+ 		defer p.aliasMu.Unlock()
+ 		fresh, err := p.app.completedWriterCurrent(p, identity)
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -446,7 +446,13 @@
+ 		return nil, ErrAliasConflict
+ 	}
+ 	if bound {
+-		offer.CompletedWriter, err = p.verifyCompletedWriter(ctx, identity)
++		if request.Action == "pause" {
++			offer.CompletedWriter, err = p.verifyCompletedWriterPhase(ctx, identity, "verify-pause")
++		} else if request.Action == "resume" {
++			offer.CompletedWriter, err = p.verifyCompletedWriterPhase(ctx, identity, "verify-current")
++		} else {
++			offer.CompletedWriter, err = p.verifyCompletedWriter(ctx, identity)
++		}
+ 		if err != nil {
+ 			return nil, err
+ 		}
+--- a/daemon/room_volume.go
++++ b/daemon/room_volume.go
+@@ -305,7 +305,7 @@
+ 	}
+ 	var completed *completedWriter
+ 	if bound {
+-		completed, err = p.verifyCompletedWriter(ctx, identity)
++		completed, err = p.verifyCompletedWriterPhase(ctx, identity, "verify-current")
+ 		if err != nil {
+ 			return nil, err
+ 		}

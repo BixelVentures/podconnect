@@ -43,3 +43,5 @@ aa47ea940c0109d0b8efe765a04e7a924c24bddc604e00fda0a50d8e60385e48  /patches/room-
 dabf7450d55ff3233c2ae3c306856dda92f4276c693186a245ac156fe6561422  /patches/dealer-roomchange-native-tests.patch
 f6295c0e04827d7e335f18d17ffa291a250d1261648362e1af5ca40f26231c09  /patches/private-diagnostics-native.patch
 1064310acf1abe961cb33bf2489714e088d9d930845fbb3a122a84f5568de9ff  /patches/private-diagnostics-native-tests.patch
+dc8aa32ca5fe525fc53f3131814aed6f5ee48491d092d0a4b9b86fee7b01ba54  /patches/blocked-decoder-controls-native.patch
+1c8ab6f19e84973742ad2ae72a24a6e7d05d29983f1d64f8edccaff29e19d7c0  /patches/blocked-decoder-controls-native-tests.patch

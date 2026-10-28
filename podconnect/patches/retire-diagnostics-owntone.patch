@@ -1,0 +1,103 @@
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -981,23 +981,47 @@
+     && reader.device==s->result.pipe_device && reader.inode==s->result.pipe_inode
+     && reader.epoch==s->result.input_epoch;
+ }
++/* Closed, content-free reason codes; preserve admission ordering and evaluate
++ * each original predicate exactly once. These logs do not grant authority. */
++#define RETIRE_REJECT_BOOL(test, reason) do { if (test) { \
++  DPRINTF(E_LOG, L_PLAYER, "START retirement rejected: " reason "\n"); return false; \
++} } while (0)
++#define RETIRE_REJECT_INT(test, reason) do { if (test) { \
++  DPRINTF(E_LOG, L_PLAYER, "START retirement rejected: " reason "\n"); return -1; \
++} } while (0)
+ static bool start_retirement_source_current(struct start_slot *s,struct output_transport_identity *route)
+ {
+   struct output_device *d;
+-  if(!s || s!=start_active || s->cancelled || s->writer_pending
+-      || s->result.phase!=OUTPUT_START_COMPLETED || s->retirement.outcome!=OUTPUT_RETIRE_NONE
+-      || !outputs_start_source_owned() || outputs_start_gate_closed() || start_startup_quarantine
+-      || start_journal_fault || strcmp(start_journal.token,s->result.command.token)
+-      || strcmp(start_journal.c_process,outputs_process) || !start_contexts_drained()
+-      || transport_pin || room_volume_pin_busy() || room_volume_undrained()
+-      || !(d=outputs_device_get(s->result.command.device_id)) || !d->selected
+-      || d->session!=s->session || d->incarnation!=s->result.target_incarnation
+-      || d->session_epoch!=s->target_epoch)return false;
++  RETIRE_REJECT_BOOL(!s,"source_missing");
++  RETIRE_REJECT_BOOL(s!=start_active,"source_not_active");
++  RETIRE_REJECT_BOOL(s->cancelled,"source_cancelled");
++  RETIRE_REJECT_BOOL(s->writer_pending,"writer_pending");
++  RETIRE_REJECT_BOOL(s->result.phase!=OUTPUT_START_COMPLETED,"source_not_completed");
++  RETIRE_REJECT_BOOL(s->retirement.outcome!=OUTPUT_RETIRE_NONE,"retirement_existing");
++  RETIRE_REJECT_BOOL(!outputs_start_source_owned(),"source_not_owned");
++  RETIRE_REJECT_BOOL(outputs_start_gate_closed(),"gate_closed");
++  RETIRE_REJECT_BOOL(start_startup_quarantine,"startup_quarantine");
++  RETIRE_REJECT_BOOL(start_journal_fault,"journal_fault");
++  RETIRE_REJECT_BOOL(strcmp(start_journal.token,s->result.command.token),"journal_token");
++  RETIRE_REJECT_BOOL(strcmp(start_journal.c_process,outputs_process),"journal_process");
++  RETIRE_REJECT_BOOL(!start_contexts_drained(),"contexts_not_drained");
++  RETIRE_REJECT_BOOL(transport_pin,"transport_pin");
++  RETIRE_REJECT_BOOL(room_volume_pin_busy(),"volume_pin");
++  RETIRE_REJECT_BOOL(room_volume_undrained(),"volume_undrained");
++  RETIRE_REJECT_BOOL(!(d=outputs_device_get(s->result.command.device_id)),"device_missing");
++  RETIRE_REJECT_BOOL(!d->selected,"device_not_selected");
++  RETIRE_REJECT_BOOL(d->session!=s->session,"session_changed");
++  RETIRE_REJECT_BOOL(d->incarnation!=s->result.target_incarnation,"device_incarnation");
++  RETIRE_REJECT_BOOL(d->session_epoch!=s->target_epoch,"session_epoch");
+   if(s->result.command.move_existing_session){
+-    if(!start_move_route_current(s,route,false) || !start_move_reader_current(s,route,false))return false;
+-  }else if(transport_identity_get(d->id,route)<0
+-      || !transport_identity_equal(route,&s->result.route_identity))return false;
+-  return start_retirement_reader(s,route);
++    RETIRE_REJECT_BOOL(!start_move_route_current(s,route,false),"move_route");
++    RETIRE_REJECT_BOOL(!start_move_reader_current(s,route,false),"move_reader");
++  }else{
++    RETIRE_REJECT_BOOL(transport_identity_get(d->id,route)<0,"route_missing");
++    RETIRE_REJECT_BOOL(!transport_identity_equal(route,&s->result.route_identity),"route_changed");
++  }
++  RETIRE_REJECT_BOOL(!start_retirement_reader(s,route),"reader_changed");
++  return true;
+ }
+ static bool start_retirement_closed_source_current(struct start_slot *s,bool pending,bool *reader_current)
+ {
+@@ -1148,20 +1172,25 @@
+   struct start_slot *s;struct start_retirement *t;struct output_transport_identity route;
+   struct input_fifo_identity reader={0};struct timespec deadline;char uuid[37];size_t i,j=0;
+   if(r && r->writer_already_closed)return start_retirement_prepare_closed(r,out);
+-  if(!r || !out || !(s=start_find(r->completed_token)) || s->result.command.device_id!=r->device_id
+-      || s->result.command.move_existing_session!=r->move_existing_session
+-      || !transport_hex(r->native_reservation_id,32) || !transport_hex(r->native_incarnation,32)
+-      || !start_retirement_source_current(s,&route)
+-      || strcmp(r->native_reservation_id,s->result.command.native_reservation_id)==0
+-      || strcmp(r->native_incarnation,s->result.command.native_incarnation)
+-      || strcmp(r->native_process.boot_id,s->result.command.native_process.boot_id)
+-      || r->native_process.pid!=s->result.command.native_process.pid
+-      || r->native_process.proc_start_ticks!=s->result.command.native_process.proc_start_ticks
+-      || r->writer_source_epoch!=s->result.writer_source_epoch
+-      || r->input_epoch!=s->result.input_epoch || r->pipe_device!=s->result.pipe_device
+-      || r->pipe_inode!=s->result.pipe_inode
+-      || r->writer_fd!=s->result.command.writer_fd
+-      || !start_proven_writer_fd(&r->native_process,r->writer_fd,r->pipe_device,r->pipe_inode))return -1;
++  RETIRE_REJECT_INT(!r,"request_missing");
++  RETIRE_REJECT_INT(!out,"result_missing");
++  RETIRE_REJECT_INT(!(s=start_find(r->completed_token)),"token_missing");
++  RETIRE_REJECT_INT(s->result.command.device_id!=r->device_id,"device_mismatch");
++  RETIRE_REJECT_INT(s->result.command.move_existing_session!=r->move_existing_session,"purpose_mismatch");
++  RETIRE_REJECT_INT(!transport_hex(r->native_reservation_id,32),"reservation_format");
++  RETIRE_REJECT_INT(!transport_hex(r->native_incarnation,32),"incarnation_format");
++  if(!start_retirement_source_current(s,&route))return -1;
++  RETIRE_REJECT_INT(strcmp(r->native_reservation_id,s->result.command.native_reservation_id)==0,"reservation_reused");
++  RETIRE_REJECT_INT(strcmp(r->native_incarnation,s->result.command.native_incarnation),"incarnation_mismatch");
++  RETIRE_REJECT_INT(strcmp(r->native_process.boot_id,s->result.command.native_process.boot_id),"process_boot");
++  RETIRE_REJECT_INT(r->native_process.pid!=s->result.command.native_process.pid,"process_pid");
++  RETIRE_REJECT_INT(r->native_process.proc_start_ticks!=s->result.command.native_process.proc_start_ticks,"process_start");
++  RETIRE_REJECT_INT(r->writer_source_epoch!=s->result.writer_source_epoch,"writer_epoch");
++  RETIRE_REJECT_INT(r->input_epoch!=s->result.input_epoch,"input_epoch");
++  RETIRE_REJECT_INT(r->pipe_device!=s->result.pipe_device,"pipe_device");
++  RETIRE_REJECT_INT(r->pipe_inode!=s->result.pipe_inode,"pipe_inode");
++  RETIRE_REJECT_INT(r->writer_fd!=s->result.command.writer_fd,"writer_fd");
++  RETIRE_REJECT_INT(!start_proven_writer_fd(&r->native_process,r->writer_fd,r->pipe_device,r->pipe_inode),"writer_unproven");
+   t=&s->retirement;
+   if(clock_gettime(CLOCK_MONOTONIC,&t->deadline)<0)return -1;
+   t->deadline.tv_sec+=8;t->outcome=OUTPUT_RETIRE_PENDING;
