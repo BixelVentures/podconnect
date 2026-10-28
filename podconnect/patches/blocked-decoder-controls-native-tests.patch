@@ -162,7 +162,7 @@
 +}
 --- /dev/null
 +++ b/daemon/blocked_decoder_regression_test.go
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,637 @@
 +package daemon
 +
 +import (
@@ -604,9 +604,11 @@
 +		t.Fatal(err)
 +	}
 +	close(source.firstRelease)
-+	// Joining source verifies that the paused read has returned and pending PCM/EOF exists.
-+	if _, err = owner.player.Start35CurrentSource(context.Background()); err != nil {
-+		t.Fatal(err)
++	// Verify joins the in-flight read and preserves its paused PCM/EOF before DROP.
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if _, _, err = owner.player.RoomMove(ctx, "verify", source, writer, "1", false, guard); err != nil {
++		t.Fatal("join paused source read", err)
 +	}
 +	for {
 +		select {
