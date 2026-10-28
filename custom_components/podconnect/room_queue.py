@@ -245,14 +245,10 @@ class RoomQueue:
         queue = value["queue"]
         if (
             not isinstance(queue, dict)
-            or set(queue)
-            != {
-                "observation_id",
-                "queue_revision",
-                "expires_after_ms",
-                "items",
-                "truncated",
-            }
+            or set(queue) not in (
+                {"observation_id", "queue_revision", "expires_after_ms", "items", "truncated"},
+                {"observation_id", "queue_revision", "expires_after_ms", "items", "truncated", "metadata"},
+            )
             or not _hex(queue["observation_id"], _H32)
             or not _int(queue["queue_revision"], 0, 2**53 - 1)
             or not _int(queue["expires_after_ms"], 1, 10000)
@@ -308,6 +304,27 @@ class RoomQueue:
             for row in cache.get("items", []):
                 if isinstance(row, dict) and isinstance(row.get("uri"), str):
                     metadata[row["uri"]] = row
+        native_metadata = queue.get("metadata")
+        if isinstance(native_metadata, dict):
+            native_uris = {row["uri"] for row in queue["items"]}
+            for uri, label in native_metadata.items():
+                if uri not in native_uris or not isinstance(label, dict):
+                    continue
+                name, artist = label.get("name"), label.get("artist")
+                if (
+                    not isinstance(name, str)
+                    or not 1 <= len(name) <= 256
+                    or not isinstance(artist, str)
+                    or not 1 <= len(artist) <= 512
+                ):
+                    continue
+                image = label.get("artwork")
+                artwork = (
+                    {"kind": "album_cover", "provider": "spotify", "url": image}
+                    if isinstance(image, str)
+                    else None
+                )
+                metadata[uri] = {"name": name, "artists": [artist], "artwork": artwork}
         items = []
         for row in queue["items"]:
             label = metadata.get(row["uri"], {})

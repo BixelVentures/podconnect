@@ -70,14 +70,18 @@ class SpeakersClient:
         *,
         budget: int = 5,
         room_read_reason: bool = False,
+        queue_metadata: bool = False,
     ):
+        headers = {"Accept": "application/json"}
+        if queue_metadata:
+            headers["X-Podconnect-Queue-Metadata"] = "1"
         try:
             async with asyncio.timeout(budget):
                 async with self._web.request(
                     method,
                     self._base + path,
                     json=body,
-                    headers={"Accept": "application/json"},
+                    headers=headers,
                     allow_redirects=False,
                     timeout=ClientTimeout(total=budget - 1),
                 ) as response:
@@ -627,7 +631,9 @@ class SpeakersClient:
         )
 
     async def room_queue_state(self, scope):
-        return await self._request("GET", "/api/room-queue/state?" + urlencode(scope))
+        return await self._request(
+            "GET", "/api/room-queue/state?" + urlencode(scope), queue_metadata=True
+        )
 
     async def prepare_room_queue(self, scope, native, route, queue):
         return await self._request(

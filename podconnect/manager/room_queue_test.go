@@ -14,6 +14,7 @@ import (
 )
 
 type roomQueueFixture struct {
+	Metadata           map[string]queueDisplayMetadata
 	Scope              roomTransportScope
 	Owner              roomTransportIdentity
 	Route              outputTransportIdentity
@@ -74,7 +75,7 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 		}
 		switch {
 		case strings.HasPrefix(path, "/player/room_transport/bound-queue?"):
-			return json.Marshal(nativeRoomQueueState{"podconnect.native_room_queue_state.v1", true, roomQueuePurpose, f.Owner, strings.Repeat("a", 32), 7, 10000, []queueNativeItem{{strings.Repeat("1", 24), 0, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", true}, {strings.Repeat("2", 24), 1, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", false}}, false, f.Writer, false})
+			return json.Marshal(nativeRoomQueueState{"podconnect.native_room_queue_state.v1", true, roomQueuePurpose, f.Owner, strings.Repeat("a", 32), 7, 10000, []queueNativeItem{{strings.Repeat("1", 24), 0, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", true}, {strings.Repeat("2", 24), 1, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", false}}, f.Metadata, false, f.Writer, false})
 		case path == "/api/outputs/42/transport/bound-state":
 			var request struct {
 				Owner  roomTransportIdentity `json:"native_owner"`
@@ -168,6 +169,42 @@ func roomQueueCommit(t *testing.T) *httptest.ResponseRecorder {
 	roomQueueCommitHandler(out, httptest.NewRequest(http.MethodPost, "/api/room-queue/commit", strings.NewReader(`{"prepare_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)))
 	return out
 }
+func TestRoomQueueMetadataNegotiationPreservesOldAndNewClients(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		headers  []string
+		metadata bool
+		expect   bool
+	}{
+		{"old client old-shaped native", nil, false, false},
+		{"old client new manager", nil, true, false},
+		{"new client new manager", []string{"1"}, true, true},
+		{"new client old-shaped native", []string{"1"}, false, false},
+		{"unsupported header", []string{"2"}, true, false},
+		{"duplicate headers", []string{"1", "1"}, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newRoomQueueFixture(t)
+			if test.metadata {
+				f.Metadata = map[string]queueDisplayMetadata{"spotify:track:AAAAAAAAAAAAAAAAAAAAAA": {Name: "Song", Artist: "Artist", Artwork: "https://i.scdn.co/image/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+			}
+			q := url.Values{"account_user_id": {f.Scope.Account}, "target_id": {f.Scope.Target}, "room_id": {f.Scope.Room}, "homepod_id": {f.Scope.Homepod}}
+			request := httptest.NewRequest(http.MethodGet, "/api/room-queue/state?"+q.Encode(), nil)
+			for _, value := range test.headers {
+				request.Header.Add("X-Podconnect-Queue-Metadata", value)
+			}
+			result := httptest.NewRecorder()
+			roomQueueStateHandler(result, request)
+			if result.Code != 200 || strings.Contains(result.Body.String(), `"metadata"`) != test.expect || !strings.Contains(result.Body.String(), `"id":"111111111111111111111111"`) || !strings.Contains(result.Body.String(), `"id":"222222222222222222222222"`) {
+				t.Fatal(result.Code, result.Body.String())
+			}
+			if len(f.Writes) != 0 {
+				t.Fatal("read dispatched command", f.Writes)
+			}
+		})
+	}
+}
+
 func TestRoomQueueExactDuplicateOccurrenceStagesThenCommitsOnce(t *testing.T) {
 	f := newRoomQueueFixture(t)
 	if read := f.read(t); read.Code != 200 || !strings.Contains(read.Body.String(), `"play_queue_occurrence"`) {

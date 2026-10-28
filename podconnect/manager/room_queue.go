@@ -42,18 +42,24 @@ type queueWriterProof struct {
 	OpenGeneration string            `json:"open_generation"`
 	InputDigest    string            `json:"input_path_digest"`
 }
+type queueDisplayMetadata struct {
+	Name    string `json:"name"`
+	Artist  string `json:"artist"`
+	Artwork string `json:"artwork,omitempty"`
+}
 type nativeRoomQueueState struct {
-	Schema      string                `json:"schema"`
-	Ready       bool                  `json:"ready"`
-	Purpose     string                `json:"purpose"`
-	Owner       roomTransportIdentity `json:"native_owner"`
-	Observation string                `json:"observation_id"`
-	Revision    uint64                `json:"queue_revision"`
-	Expires     int                   `json:"expires_after_ms"`
-	Items       []queueNativeItem     `json:"items"`
-	Truncated   bool                  `json:"truncated"`
-	Writer      queueWriterProof      `json:"writer_proof"`
-	Physical    bool                  `json:"physical_result_verified"`
+	Schema      string                          `json:"schema"`
+	Ready       bool                            `json:"ready"`
+	Purpose     string                          `json:"purpose"`
+	Owner       roomTransportIdentity           `json:"native_owner"`
+	Observation string                          `json:"observation_id"`
+	Revision    uint64                          `json:"queue_revision"`
+	Expires     int                             `json:"expires_after_ms"`
+	Items       []queueNativeItem               `json:"items"`
+	Metadata    map[string]queueDisplayMetadata `json:"metadata,omitempty"`
+	Truncated   bool                            `json:"truncated"`
+	Writer      queueWriterProof                `json:"writer_proof"`
+	Physical    bool                            `json:"physical_result_verified"`
 }
 type outputRoomQueueState struct {
 	Schema   string                  `json:"schema"`
@@ -325,7 +331,11 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 	roomQueueStore.Read = &read
 	roomQueueStore.Unlock()
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": map[string]any{"observation_id": n.Observation, "queue_revision": n.Revision, "expires_after_ms": remaining, "items": n.Items, "truncated": n.Truncated}, "actions": []string{"play_queue_occurrence"}, "physical_result_verified": false})
+	queue := map[string]any{"observation_id": n.Observation, "queue_revision": n.Revision, "expires_after_ms": remaining, "items": n.Items, "truncated": n.Truncated}
+	if values := r.Header.Values("X-Podconnect-Queue-Metadata"); len(values) == 1 && values[0] == "1" && len(n.Metadata) > 0 {
+		queue["metadata"] = n.Metadata
+	}
+	writeJSON(w, map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": queue, "actions": []string{"play_queue_occurrence"}, "physical_result_verified": false})
 }
 
 func decodeRoomQueueBody(r *http.Request, out any) error {

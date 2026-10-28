@@ -16,6 +16,7 @@ from test_room_transport import RoomTransportFrameworkTests
 class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
     async def asyncSetUp(self):
         self.queue_reads = []
+        self.queue_headers = []
         self.queue_posts = []
         self.queue_hold = False
         self.queue_entered = asyncio.Event()
@@ -68,6 +69,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
     async def _backend(self, request):
         if request.path == "/api/room-queue/state":
             self.queue_reads.append(dict(request.query))
+            self.queue_headers.append(request.headers.get("X-Podconnect-Queue-Metadata"))
             value = {
                 "schema": "podconnect.room_queue_state.v1",
                 "ok": True,
@@ -411,6 +413,28 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
             self.assertEqual(
                 [row["name"] for row in value["items"]], ["Nummer i køen"] * 2
             )
+
+    async def test_cold_queue_enriches_exact_native_occurrences(self):
+        data = self.entries[0].runtime_data
+        data.observations._queue_cache = None
+        uri = "spotify:track:" + "0" * 22
+        self.queue_corrupt_state = lambda value: value["queue"].update(metadata={
+            uri: {"name": "Faktisk køsang", "artist": "Faktisk kunstner", "artwork": "https://i.scdn.co/image/" + "a" * 40},
+            "spotify:track:" + "1" * 22: {"name": "Foreign", "artist": "Other"},
+        })
+        value = await self.queue_read()
+        self.assertEqual(self.queue_headers[-1], "1")
+        self.assertEqual([row["name"] for row in value["items"]], ["Faktisk køsang"] * 2)
+        self.assertEqual([row["artist"] for row in value["items"]], ["Faktisk kunstner"] * 2)
+        self.assertEqual([row["artwork"] for row in value["items"]], ["https://i.scdn.co/image/" + "a" * 40] * 2)
+        self.assertNotEqual(value["items"][0]["option_id"], value["items"][1]["option_id"])
+
+    async def test_new_control_accepts_old_manager_queue_shape(self):
+        self.entries[0].runtime_data.observations._queue_cache = None
+        value = await self.queue_read()
+        self.assertEqual(self.queue_headers[-1], "1")
+        self.assertEqual([row["name"] for row in value["items"]], ["Nummer i køen"] * 2)
+        self.assertNotEqual(value["items"][0]["option_id"], value["items"][1]["option_id"])
 
     async def test_queue_prepared_deadline_expired_before_commit_no_send(self):
         body, prepared = await self.stage()
