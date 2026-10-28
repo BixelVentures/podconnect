@@ -45,3 +45,4 @@ f6295c0e04827d7e335f18d17ffa291a250d1261648362e1af5ca40f26231c09  /patches/priva
 1064310acf1abe961cb33bf2489714e088d9d930845fbb3a122a84f5568de9ff  /patches/private-diagnostics-native-tests.patch
 dc8aa32ca5fe525fc53f3131814aed6f5ee48491d092d0a4b9b86fee7b01ba54  /patches/blocked-decoder-controls-native.patch
 e19c26159cf722cc41515e30c950257e3f51bab25c24d7a0cbf4cd7d8ea7d10c  /patches/blocked-decoder-controls-native-tests.patch
+63996e7c2a3ddcdf4208674b543be4774a42cb29a9adb2a822a1cc881358b55e  /patches/queue-metadata-background-native.patch

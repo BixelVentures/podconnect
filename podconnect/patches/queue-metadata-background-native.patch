@@ -1,0 +1,733 @@
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -57,6 +57,7 @@
+ 	roomTransportGeneration          uint64
+ 	roomTransportGenerationExhausted bool
+ 	queueOccurrenceOffer             *nativeQueueOffer
++	queueMetadata                    queueMetadataCache
+ 	app                              *App
+ 	sess                             *session.Session
+ 
+@@ -681,6 +682,7 @@
+ 	switch req.Type {
+ 	case apiRoomBoundQueue:
+ 		return p.observeRoomQueue(ctx, req.Data.(roomTransportStateRequest))
++
+ 	case apiMoveObserve:
+ 		return p.captureMove(req.Data.(roomVolumeScope))
+ 	case apiMoveOffer:
+@@ -1076,6 +1078,7 @@
+ 	p.roomCloseDone = done
+ 	p.roomCloseMu.Unlock()
+ 	defer close(done)
++	p.queueMetadata.close()
+ 	p.retireAliases()
+ 	if p.stop != nil {
+ 		p.stop <- struct{}{}
+--- a/daemon/room_queue.go
++++ b/daemon/room_queue.go
+@@ -3,14 +3,20 @@
+ // Queue is a distinct same-writer transport purpose. Preparation never changes
+ // the live cursor/source; only the existing guarded worker may publish it.
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
++	extpb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	metapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"math/big"
+ 	"net/http"
+ 	"path/filepath"
+ 	"strconv"
++	"strings"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+@@ -54,18 +60,24 @@
+ 	Generation uint64
+ 	Until      time.Time
+ }
++type queueMetadata struct {
++	Name    string `json:"name"`
++	Artist  string `json:"artist"`
++	Artwork string `json:"artwork,omitempty"`
++}
+ type queueStateResponse struct {
+-	Schema        string                `json:"schema"`
+-	Ready         bool                  `json:"ready"`
+-	Purpose       string                `json:"purpose"`
+-	Owner         roomTransportIdentity `json:"native_owner"`
+-	ObservationID string                `json:"observation_id"`
+-	Revision      uint64                `json:"queue_revision"`
+-	Expires       int                   `json:"expires_after_ms"`
+-	Items         []nativeQueueItem     `json:"items"`
+-	Truncated     bool                  `json:"truncated"`
+-	Writer        queueWriterWire       `json:"writer_proof"`
+-	Physical      bool                  `json:"physical_result_verified"`
++	Metadata      map[string]queueMetadata `json:"metadata,omitempty"`
++	Schema        string                   `json:"schema"`
++	Ready         bool                     `json:"ready"`
++	Purpose       string                   `json:"purpose"`
++	Owner         roomTransportIdentity    `json:"native_owner"`
++	ObservationID string                   `json:"observation_id"`
++	Revision      uint64                   `json:"queue_revision"`
++	Expires       int                      `json:"expires_after_ms"`
++	Items         []nativeQueueItem        `json:"items"`
++	Truncated     bool                     `json:"truncated"`
++	Writer        queueWriterWire          `json:"writer_proof"`
++	Physical      bool                     `json:"physical_result_verified"`
+ }
+ type queuePrepareResponse struct {
+ 	Schema    string                `json:"schema"`
+@@ -263,7 +275,11 @@
+ 	}
+ 	retainQueuePresentation(previous, offer)
+ 	p.queueOccurrenceOffer = offer
+-	return queueStateResponse{"podconnect.native_room_queue_state.v1", true, queuePurpose, identity, offer.Snapshot.ObservationID, offer.Snapshot.QueueRevision, min(remaining, 10000), offer.Snapshot.Items, offer.Snapshot.Truncated, writer.Wire, false}, nil
++	var metadata map[string]queueMetadata
++	if client := p.sess.Spclient(); client != nil {
++		metadata = p.queueMetadata.readAndWarm(identity.AccountUserID, p.sess, client, offer.Snapshot.Items)
++	}
++	return queueStateResponse{Schema: "podconnect.native_room_queue_state.v1", Ready: true, Purpose: queuePurpose, Owner: identity, ObservationID: offer.Snapshot.ObservationID, Revision: offer.Snapshot.QueueRevision, Expires: min(remaining, 10000), Items: offer.Snapshot.Items, Truncated: offer.Snapshot.Truncated, Writer: writer.Wire, Physical: false, Metadata: metadata}, nil
+ }
+ func validRoomQueueObservation(offer *nativeQueueOffer) bool {
+ 	if offer == nil || offer.Snapshot.QueueRevision >= 1<<53 || len(offer.Snapshot.Items) > 20 {
+@@ -435,3 +451,76 @@
+ 	data, err := s.roomTransportAsk(ctx, apiRoomBoundQueue, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, false})
+ 	roomTransportResponse(w, data, err)
+ }
++
++// readQueueMetadata is display-only and runs on the HTTP goroutine, never the player actor.
++func readQueueMetadata(ctx context.Context, client interface {
++	ExtendedMetadata(context.Context, *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error)
++}, rows []nativeQueueItem) map[string]queueMetadata {
++	request := &extpb.BatchedEntityRequest{}
++	allowed := make(map[string]bool, len(rows))
++	for _, row := range rows {
++		if !allowed[row.URI] {
++			allowed[row.URI] = true
++			request.EntityRequest = append(request.EntityRequest, &extpb.EntityRequest{EntityUri: row.URI, Query: []*extpb.ExtensionQuery{{ExtensionKind: extpb.ExtensionKind_TRACK_V4}}})
++		}
++	}
++	if len(request.EntityRequest) == 0 {
++		return nil
++	}
++	reply, err := client.ExtendedMetadata(ctx, request)
++	if err != nil || ctx.Err() != nil || reply == nil {
++		return nil
++	}
++	result := make(map[string]queueMetadata)
++	metadataBytes := 0
++	for _, group := range reply.GetExtendedMetadata() {
++		if group.GetExtensionKind() != extpb.ExtensionKind_TRACK_V4 {
++			continue
++		}
++		for _, row := range group.GetExtensionData() {
++			uri := row.GetEntityUri()
++			if !allowed[uri] || row.GetHeader().GetStatusCode() != 200 || row.GetExtensionData() == nil {
++				continue
++			}
++			var track metapb.Track
++			if row.GetExtensionData().UnmarshalTo(&track) != nil {
++				continue
++			}
++			id, ok := new(big.Int).SetString(strings.TrimPrefix(uri, "spotify:track:"), 62)
++			if !ok || id.BitLen() > 128 || !bytes.Equal(track.GetGid(), id.FillBytes(make([]byte, 16))) {
++				continue
++			}
++			name := track.GetName()
++			if !utf8.ValidString(name) || len(name) < 1 || len(name) > 256 {
++				continue
++			}
++			artists := []string{}
++			for _, artist := range track.GetArtist() {
++				value := artist.GetName()
++				if !utf8.ValidString(value) || len(value) < 1 || len(value) > 256 || len(artists) >= 20 {
++					artists = nil
++					break
++				}
++				artists = append(artists, value)
++			}
++			if len(artists) == 0 {
++				continue
++			}
++			joined := strings.Join(artists, ", ")
++			if len(joined) > 512 {
++				continue
++			}
++			label := queueMetadata{Name: name, Artist: joined}
++			if image := track.GetAlbum().GetCoverGroup().GetImage(); len(image) > 0 && len(image[0].GetFileId()) == 20 {
++				label.Artwork = "https://i.scdn.co/image/" + hex.EncodeToString(image[0].GetFileId())
++			}
++			encoded, err := json.Marshal(label)
++			if err != nil || len(encoded)+len(uri)+metadataBytes > 6000 {
++				continue
++			}
++			metadataBytes += len(encoded) + len(uri)
++			result[uri] = label
++		}
++	}
++	return result
++}
+--- /dev/null
++++ b/daemon/room_queue_metadata_cache.go
+@@ -0,0 +1,136 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"sync"
++	"time"
++
++	extpb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	"github.com/devgianlu/go-librespot/session"
++)
++
++type queueMetadataFetcher interface {
++	ExtendedMetadata(context.Context, *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error)
++}
++
++// queueMetadataCache owns display hints only. Queue authority never depends on it.
++type queueMetadataCache struct {
++	mu               sync.Mutex
++	account          string
++	session          *session.Session
++	values           map[string]queueMetadata
++	attempted        map[string]time.Time
++	relevant         []string
++	cancel           context.CancelFunc
++	generation       uint64
++	activeGeneration uint64
++	closed           bool
++}
++
++// prune keeps only the current 20 distinct URIs and at most 6 KiB of hints.
++func (c *queueMetadataCache) prune(now time.Time) {
++	values := make(map[string]queueMetadata)
++	attempted := make(map[string]time.Time)
++	size := 0
++	for _, uri := range c.relevant {
++		until, ok := c.attempted[uri]
++		if !ok || !now.Before(until) {
++			continue
++		}
++		attempted[uri] = until
++		if value, ok := c.values[uri]; ok {
++			encoded, err := json.Marshal(value)
++			if err == nil && size+len(uri)+len(encoded) <= 6000 {
++				values[uri] = value
++				size += len(uri) + len(encoded)
++			}
++		}
++	}
++	c.values, c.attempted = values, attempted
++}
++
++func (c *queueMetadataCache) readAndWarm(account string, owner *session.Session, client queueMetadataFetcher, rows []nativeQueueItem) map[string]queueMetadata {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed || owner == nil || client == nil || account == "" {
++		return nil
++	}
++	if c.account != account || c.session != owner {
++		if c.cancel != nil {
++			c.cancel()
++		}
++		c.generation++
++		c.account = account
++		c.session = owner
++		c.values = nil
++		c.attempted = nil
++	}
++	c.relevant = nil
++	seen := map[string]bool{}
++	for _, row := range rows {
++		if !seen[row.URI] && len(c.relevant) < 20 {
++			seen[row.URI] = true
++			c.relevant = append(c.relevant, row.URI)
++		}
++	}
++	c.prune(time.Now())
++	result := make(map[string]queueMetadata)
++	missing := make([]nativeQueueItem, 0, len(c.relevant))
++	for _, uri := range c.relevant {
++		if value, ok := c.values[uri]; ok {
++			result[uri] = value
++		}
++		if _, ok := c.attempted[uri]; !ok {
++			missing = append(missing, nativeQueueItem{URI: uri})
++		}
++	}
++	if len(missing) > 0 && c.cancel == nil {
++		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++		c.cancel = cancel
++		c.generation++
++		gen := c.generation
++		c.activeGeneration = gen
++		go func() {
++			defer cancel()
++			values := readQueueMetadata(ctx, client, missing)
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			if c.activeGeneration == gen {
++				c.cancel = nil
++			}
++			if c.closed || c.generation != gen || c.session != owner || c.account != account {
++				return
++			}
++			if c.values == nil {
++				c.values = make(map[string]queueMetadata)
++			}
++			if c.attempted == nil {
++				c.attempted = make(map[string]time.Time)
++			}
++			until := time.Now().Add(30 * time.Second)
++			for _, row := range missing {
++				c.attempted[row.URI] = until
++				if value, ok := values[row.URI]; ok {
++					c.values[row.URI] = value
++				}
++			}
++			c.prune(time.Now())
++		}()
++	}
++	return result
++}
++func (c *queueMetadataCache) close() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.closed = true
++	c.generation++
++	if c.cancel != nil {
++		c.cancel()
++		c.cancel = nil
++	}
++	c.values = nil
++	c.attempted = nil
++	c.relevant = nil
++	c.session = nil
++}
+--- /dev/null
++++ b/daemon/room_queue_metadata_test.go
+@@ -0,0 +1,416 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	librespot "github.com/devgianlu/go-librespot"
++	extpb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
++	metapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"github.com/devgianlu/go-librespot/session"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/anypb"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type metadataFixture struct {
++	reply   *extpb.BatchedExtensionResponse
++	err     error
++	calls   int
++	request *extpb.BatchedEntityRequest
++	wait    bool
++}
++
++func (f *metadataFixture) ExtendedMetadata(ctx context.Context, r *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error) {
++	f.calls++
++	f.request = r
++	if f.wait {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}
++	return f.reply, f.err
++}
++func TestQueueMetadataColdLookupExactURIAndFailSoft(t *testing.T) {
++	uri := "spotify:track:0000000000000000000001"
++	foreign := "spotify:track:BBBBBBBBBBBBBBBBBBBBBB"
++	id, err := librespot.SpotifyIdFromUri(uri)
++	if err != nil {
++		t.Fatal(err)
++	}
++	track := &metapb.Track{Gid: id.Id(), Name: proto.String("Song"), Artist: []*metapb.Artist{{Name: proto.String("Artist")}}, Album: &metapb.Album{CoverGroup: &metapb.ImageGroup{Image: []*metapb.Image{{FileId: make([]byte, 20)}}}}}
++	data, err := anypb.New(track)
++	if err != nil {
++		t.Fatal(err)
++	}
++	entry := func(key string) *extpb.EntityExtensionData {
++		return &extpb.EntityExtensionData{EntityUri: key, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data}
++	}
++	f := &metadataFixture{reply: &extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{{ExtensionKind: extpb.ExtensionKind_TRACK_V4, ExtensionData: []*extpb.EntityExtensionData{entry(uri), entry(foreign)}}}}}
++	rows := []nativeQueueItem{{ID: "one", URI: uri}, {ID: "two", URI: uri}}
++	out := readQueueMetadata(context.Background(), f, rows)
++	if len(f.request.EntityRequest) != 1 || len(out) != 1 || out[uri].Name != "Song" || out[uri].Artist != "Artist" || out[uri].Artwork != "https://i.scdn.co/image/0000000000000000000000000000000000000000" {
++		t.Fatalf("metadata projection %#v", out)
++	}
++	track.Gid = make([]byte, 16)
++	mismatched, err := anypb.New(track)
++	if err != nil {
++		t.Fatal(err)
++	}
++	f.reply.ExtendedMetadata[0].ExtensionData = []*extpb.EntityExtensionData{{EntityUri: uri, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: mismatched}}
++	if got := readQueueMetadata(context.Background(), f, rows); len(got) != 0 {
++		t.Fatal("foreign metadata GID published", got)
++	}
++	overflow := "spotify:track:AAAAAAAAAAAAAAAAAAAAAA"
++	f.reply.ExtendedMetadata[0].ExtensionData = []*extpb.EntityExtensionData{{EntityUri: overflow, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: mismatched}}
++	if got := readQueueMetadata(context.Background(), f, []nativeQueueItem{{URI: overflow}}); len(got) != 0 {
++		t.Fatal("overflow ID published", got)
++	}
++	f.err = errors.New("unavailable")
++	if got := readQueueMetadata(context.Background(), f, rows); len(got) != 0 {
++		t.Fatal("failed lookup published", got)
++	}
++	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
++	defer cancel()
++	f.err = nil
++	if got := readQueueMetadata(ctx, f, rows); len(got) != 0 {
++		t.Fatal("expired lookup published", got)
++	}
++}
++
++func TestQueueMetadataSlowProviderReturnsWithinDeadline(t *testing.T) {
++	f := &metadataFixture{wait: true}
++	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
++	defer cancel()
++	start := time.Now()
++	got := readQueueMetadata(ctx, f, []nativeQueueItem{{URI: "spotify:track:0000000000000000000001"}})
++	if len(got) != 0 || time.Since(start) > time.Second {
++		t.Fatal("metadata timeout did not fail soft", got)
++	}
++}
++
++type heldMetadataFixture struct {
++	entered chan struct{}
++	release chan struct{}
++	reply   *extpb.BatchedExtensionResponse
++}
++
++func (f *heldMetadataFixture) ExtendedMetadata(ctx context.Context, _ *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error) {
++	close(f.entered)
++	select {
++	case <-f.release:
++		return f.reply, nil
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++}
++func TestQueueMetadataBackgroundDoesNotDelayQueueOrPauseAndRejectsOldOwner(t *testing.T) {
++	uri := "spotify:track:0000000000000000000001"
++	id, err := librespot.SpotifyIdFromUri(uri)
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, _ := anypb.New(&metapb.Track{Gid: id.Id(), Name: proto.String("Song"), Artist: []*metapb.Artist{{Name: proto.String("Artist")}}})
++	reply := &extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{{ExtensionKind: extpb.ExtensionKind_TRACK_V4, ExtensionData: []*extpb.EntityExtensionData{{EntityUri: uri, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data}}}}}
++	rows := []nativeQueueItem{{ID: "1", Position: 0, URI: uri}, {ID: "2", Position: 1, URI: uri}}
++	cache := &queueMetadataCache{}
++	defer cache.close()
++	owner := &session.Session{}
++	slow := &heldMetadataFixture{entered: make(chan struct{}), release: make(chan struct{}), reply: reply}
++	before := time.Now()
++	first := cache.readAndWarm("account", owner, slow, rows)
++	if len(first) != 0 || time.Since(before) > 200*time.Millisecond {
++		t.Fatal("cold queue waited for metadata")
++	}
++	select {
++	case <-slow.entered:
++	case <-time.After(time.Second):
++		t.Fatal("warm did not start")
++	}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	_, p, _ := retirementOwnerFixture(t, srv.URL, "start")
++	done := make(chan error, 1)
++	go func() { done <- p.player.Pause() }()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("Pause blocked by metadata")
++	}
++	close(slow.release)
++	deadline := time.Now().Add(time.Second)
++	for {
++		got := cache.readAndWarm("account", owner, slow, rows)
++		if got[uri].Name == "Song" {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("later ordinary read lost metadata")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	replacement := &session.Session{}
++	blocked := &heldMetadataFixture{entered: make(chan struct{}), release: make(chan struct{}), reply: reply}
++	if got := cache.readAndWarm("foreign", replacement, blocked, rows); len(got) != 0 {
++		t.Fatal("old account metadata leaked", got)
++	}
++	select {
++	case <-blocked.entered:
++	case <-time.After(time.Second):
++		t.Fatal("new account warm not started")
++	}
++	cache.close()
++	close(blocked.release)
++	if got := cache.readAndWarm("foreign", replacement, blocked, rows); len(got) != 0 {
++		t.Fatal("closed cache published", got)
++	}
++	p.player.Close()
++}
++
++func TestQueueMetadataBackgroundRejectsLateOldAccount(t *testing.T) {
++	cache := &queueMetadataCache{}
++	defer cache.close()
++	uri := "spotify:track:0000000000000000000001"
++	rows := []nativeQueueItem{{URI: uri}}
++	oldOwner, newOwner := &session.Session{}, &session.Session{}
++	old := &heldMetadataFixture{entered: make(chan struct{}), release: make(chan struct{})}
++	cache.readAndWarm("old", oldOwner, old, rows)
++	select {
++	case <-old.entered:
++	case <-time.After(time.Second):
++		t.Fatal("old read did not start")
++	}
++	fresh := &heldMetadataFixture{entered: make(chan struct{}), release: make(chan struct{})}
++	if got := cache.readAndWarm("new", newOwner, fresh, rows); len(got) != 0 {
++		t.Fatal("foreign metadata leaked", got)
++	}
++	deadline := time.Now().Add(time.Second)
++	for {
++		cache.readAndWarm("new", newOwner, fresh, rows)
++		select {
++		case <-fresh.entered:
++			goto started
++		default:
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("cancelled old lookup did not retire")
++		}
++		time.Sleep(time.Millisecond)
++	}
++started:
++	cache.close()
++	close(old.release)
++	close(fresh.release)
++	if got := cache.readAndWarm("new", newOwner, fresh, rows); len(got) != 0 {
++		t.Fatal("late metadata after close", got)
++	}
++}
++
++// Real HTTP scheduling and local Pause with a synthetic metadata source and queue actor.
++func TestQueueMetadataHTTPResponseAndPauseDoNotWaitForWarm(t *testing.T) {
++	uri := "spotify:track:0000000000000000000001"
++	id, err := librespot.SpotifyIdFromUri(uri)
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, _ := anypb.New(&metapb.Track{Gid: id.Id(), Name: proto.String("Song"), Artist: []*metapb.Artist{{Name: proto.String("Artist")}}})
++	wire, _ := proto.Marshal(&extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{{ExtensionKind: extpb.ExtensionKind_TRACK_V4, ExtensionData: []*extpb.EntityExtensionData{{EntityUri: uri, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data}}}}})
++	entered, release := make(chan struct{}), make(chan struct{})
++	client := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		close(entered)
++		select {
++		case <-release:
++		case <-r.Context().Done():
++			return nil, r.Context().Err()
++		}
++		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(wire))}, nil
++	}))
++	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer sink.Close()
++	_, p, _ := retirementOwnerFixture(t, sink.URL, "start")
++	p.sess = &session.Session{}
++	defer p.player.Close()
++	defer p.queueMetadata.close()
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	done := make(chan struct{})
++	rows := []nativeQueueItem{{ID: "000000000000000000000001", Position: 0, URI: uri}, {ID: "000000000000000000000002", Position: 1, URI: uri}}
++	go func() {
++		defer close(done)
++		for req := range server.requests {
++			switch req.Type {
++			case apiRoomBoundQueue:
++				req.Reply(queueStateResponse{Expires: 9000, Items: rows, Metadata: p.queueMetadata.readAndWarm("account", p.sess, client, rows)}, nil)
++			case ApiRequestTypePause:
++				req.Reply(nil, p.player.Pause())
++			default:
++				req.Reply(nil, ErrBadRequest)
++			}
++		}
++	}()
++	defer func() { close(server.requests); <-done }()
++	read := func() *httptest.ResponseRecorder {
++		out := httptest.NewRecorder()
++		server.handleRoomQueue(out, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-queue?account_user_id=account&target_id=engine&room_id=r0&homepod_id=1", nil))
++		return out
++	}
++	start := time.Now()
++	first := read()
++	if first.Code != 200 || time.Since(start) > 200*time.Millisecond {
++		t.Fatal("cold read waited", first.Code)
++	}
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("warm not started")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++	defer cancel()
++	if _, err := server.roomTransportAsk(ctx, ApiRequestTypePause, nil); err != nil {
++		t.Fatal("actual player pause blocked", err)
++	}
++	close(release)
++	deadline := time.Now().Add(time.Second)
++	for {
++		p.queueMetadata.mu.Lock()
++		ready := p.queueMetadata.cancel == nil
++		p.queueMetadata.mu.Unlock()
++		if ready {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("warm did not settle")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	second := read()
++	if second.Code != 200 || !bytes.Contains(second.Body.Bytes(), []byte(`"name":"Song"`)) || !bytes.Contains(second.Body.Bytes(), []byte(`"id":"000000000000000000000001"`)) || !bytes.Contains(second.Body.Bytes(), []byte(`"id":"000000000000000000000002"`)) {
++		t.Fatal("later read lost metadata or occurrences", second.Code, second.Body.String())
++	}
++}
++
++type lateMetadataFixture struct {
++	entered chan struct{}
++	release chan struct{}
++	reply   *extpb.BatchedExtensionResponse
++}
++
++func (f *lateMetadataFixture) ExtendedMetadata(_ context.Context, _ *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error) {
++	close(f.entered)
++	<-f.release
++	return f.reply, nil
++}
++func TestQueueMetadataLateOldAccountCannotPublish(t *testing.T) {
++	uri := "spotify:track:0000000000000000000001"
++	id, err := librespot.SpotifyIdFromUri(uri)
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, _ := anypb.New(&metapb.Track{Gid: id.Id(), Name: proto.String("Old account"), Artist: []*metapb.Artist{{Name: proto.String("Artist")}}})
++	reply := &extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{{ExtensionKind: extpb.ExtensionKind_TRACK_V4, ExtensionData: []*extpb.EntityExtensionData{{EntityUri: uri, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data}}}}}
++	rows := []nativeQueueItem{{URI: uri}}
++	oldOwner, newOwner := &session.Session{}, &session.Session{}
++	cache := &queueMetadataCache{}
++	defer cache.close()
++	old := &lateMetadataFixture{entered: make(chan struct{}), release: make(chan struct{}), reply: reply}
++	cache.readAndWarm("old", oldOwner, old, rows)
++	select {
++	case <-old.entered:
++	case <-time.After(time.Second):
++		t.Fatal("old not started")
++	}
++	newClient := &heldMetadataFixture{entered: make(chan struct{}), release: make(chan struct{})}
++	if got := cache.readAndWarm("new", newOwner, newClient, rows); len(got) != 0 {
++		t.Fatal("old data leaked", got)
++	}
++	close(old.release)
++	deadline := time.Now().Add(time.Second)
++	for {
++		got := cache.readAndWarm("new", newOwner, newClient, rows)
++		if len(got) != 0 {
++			t.Fatal("late old data published", got)
++		}
++		select {
++		case <-newClient.entered:
++			goto started
++		default:
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("old lookup never retired")
++		}
++		time.Sleep(time.Millisecond)
++	}
++started:
++	cache.close()
++	close(newClient.release)
++}
++
++type sequenceMetadataFixture struct{ calls atomic.Int32 }
++
++func (f *sequenceMetadataFixture) ExtendedMetadata(_ context.Context, req *extpb.BatchedEntityRequest) (*extpb.BatchedExtensionResponse, error) {
++	f.calls.Add(1)
++	group := &extpb.EntityExtensionDataArray{ExtensionKind: extpb.ExtensionKind_TRACK_V4}
++	for _, item := range req.EntityRequest {
++		id, err := librespot.SpotifyIdFromUri(item.EntityUri)
++		if err != nil {
++			return nil, err
++		}
++		data, err := anypb.New(&metapb.Track{Gid: id.Id(), Name: proto.String(item.EntityUri), Artist: []*metapb.Artist{{Name: proto.String("Artist")}}})
++		if err != nil {
++			return nil, err
++		}
++		group.ExtensionData = append(group.ExtensionData, &extpb.EntityExtensionData{EntityUri: item.EntityUri, Header: &extpb.EntityExtensionDataHeader{StatusCode: 200}, ExtensionData: data})
++	}
++	return &extpb.BatchedExtensionResponse{ExtendedMetadata: []*extpb.EntityExtensionDataArray{group}}, nil
++}
++func TestQueueMetadataBackgroundExtendingQueueRetainsPriorLabels(t *testing.T) {
++	cache := &queueMetadataCache{}
++	defer cache.close()
++	owner := &session.Session{}
++	client := &sequenceMetadataFixture{}
++	a, b := "spotify:track:0000000000000000000001", "spotify:track:0000000000000000000002"
++	first := []nativeQueueItem{{URI: a}}
++	both := []nativeQueueItem{{URI: a}, {URI: b}}
++	wait := func() {
++		deadline := time.Now().Add(time.Second)
++		for {
++			cache.mu.Lock()
++			done := cache.cancel == nil
++			cache.mu.Unlock()
++			if done {
++				return
++			}
++			if time.Now().After(deadline) {
++				t.Fatal("warm did not finish")
++			}
++			time.Sleep(time.Millisecond)
++		}
++	}
++	cache.readAndWarm("account", owner, client, first)
++	wait()
++	got := cache.readAndWarm("account", owner, client, both)
++	if got[a].Name != a {
++		t.Fatal("existing label lost when queue extended", got)
++	}
++	wait()
++	for i := 0; i < 10; i++ {
++		got = cache.readAndWarm("account", owner, client, both)
++		if got[a].Name != a || got[b].Name != b {
++			t.Fatal("labels oscillated", got)
++		}
++	}
++	if calls := client.calls.Load(); calls != 2 {
++		t.Fatal("unexpected repeated provider lookups", calls)
++	}
++	cache.mu.Lock()
++	defer cache.mu.Unlock()
++	if len(cache.values) > 20 || len(cache.attempted) > 20 {
++		t.Fatal("unbounded metadata cache")
++	}
++}

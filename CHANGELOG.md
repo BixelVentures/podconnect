@@ -1,3 +1,9 @@
+## Speakers 0.26.58 / Control 0.10.27 — queue metadata
+
+- Resolve metadata for native queue occurrences in the background so titles, artists and artwork can appear on a later ordinary queue read without delaying playback controls.
+- Keep native occurrence identities and order authoritative. Negotiate optional display metadata so older and newer Speakers and Control versions remain compatible.
+- Provider failure or unavailable metadata leaves the existing fallback; publication, installation and physical playback remain separate verification steps.
+
 ## Control 0.10.26 — preserve playback response truth
 
 - Treat only HTTP 204 as an empty playback response; reject malformed non-204 playback responses instead of publishing fresh idle. Speakers 0.26.56 is unchanged.
