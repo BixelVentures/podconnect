@@ -1,3 +1,9 @@
+## Speakers 0.26.60 — precise rejection diagnostics
+
+- Record the content-free command category and first rejected ownership field when playback control or transfer is refused.
+- Preserve the existing admission guards, UNKNOWN handling and playback behavior; no automatic action retries.
+- This release accompanies the PodVoice music-recovery repair. These diagnostics do not claim the remaining physical playback fault is resolved.
+
 ## Speakers 0.26.59 — immutable publication after fixture repair
 
 - Publish the reviewed queue-metadata candidate with the deterministic recovery fixture. Runtime and Control 0.10.27 are unchanged from the 0.26.58 candidate.

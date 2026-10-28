@@ -1,0 +1,75 @@
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -989,6 +989,20 @@
+ #define RETIRE_REJECT_INT(test, reason) do { if (test) { \
+   DPRINTF(E_LOG, L_PLAYER, "START retirement rejected: " reason "\n"); return -1; \
+ } } while (0)
++/* Called only after route identity was captured; labels never contain values. */
++static const char *start_retirement_route_difference(const struct output_transport_identity *a,const struct output_transport_identity *b)
++{
++  if(strcmp(a->process,b->process))return "process";
++  if(a->device_id!=b->device_id)return "device";
++  if(a->device_incarnation!=b->device_incarnation)return "incarnation";
++  if(a->session_epoch!=b->session_epoch)return "session";
++  if(a->route_revision!=b->route_revision)return "route";
++  if(a->selection_revision!=b->selection_revision)return "selection";
++  if(a->input_generation!=b->input_generation)return "input_generation";
++  if(a->input_item_id!=b->input_item_id)return "input_item";
++  if(strcmp(a->input_path_digest,b->input_path_digest))return "input_digest";
++  return NULL;
++}
+ static bool start_retirement_source_current(struct start_slot *s,struct output_transport_identity *route)
+ {
+   struct output_device *d;
+@@ -1018,7 +1032,11 @@
+     RETIRE_REJECT_BOOL(!start_move_reader_current(s,route,false),"move_reader");
+   }else{
+     RETIRE_REJECT_BOOL(transport_identity_get(d->id,route)<0,"route_missing");
+-    RETIRE_REJECT_BOOL(!transport_identity_equal(route,&s->result.route_identity),"route_changed");
++    if(!transport_identity_equal(route,&s->result.route_identity)){
++      const char *difference=start_retirement_route_difference(route,&s->result.route_identity);
++      DPRINTF(E_LOG,L_PLAYER,"START retirement rejected: route_changed field=%s\n",difference ? difference : "other");
++      return false;
++    }
+   }
+   RETIRE_REJECT_BOOL(!start_retirement_reader(s,route),"reader_changed");
+   return true;
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1328,6 +1328,18 @@
+     { for(int mode=0;mode<7;mode++) if(recovery_wire_case(mode))return 1; return 0; }
+   if (argc == 2 && !strcmp(argv[1], "--recovery-salt-red"))
+     { recovery_salt_red = true; return recovery_wire_case(0); }
++  if (argc == 2 && !strcmp(argv[1], "--retirement-difference")) {
++    struct output_transport_identity a={0}, b={0};
++    assert(!start_retirement_route_difference(&a,&b) && transport_identity_equal(&a,&b));
++#define DIFF(field,value,label) do { b.field=value; assert(!transport_identity_equal(&a,&b)); assert(!strcmp(start_retirement_route_difference(&a,&b),label)); b.field=0; } while(0)
++    strcpy(b.process,"x"); assert(!strcmp(start_retirement_route_difference(&a,&b),"process")); b.process[0]=0;
++    DIFF(device_id,1,"device"); DIFF(device_incarnation,1,"incarnation"); DIFF(session_epoch,1,"session");
++    DIFF(route_revision,1,"route"); DIFF(selection_revision,1,"selection"); DIFF(input_generation,1,"input_generation"); DIFF(input_item_id,1,"input_item");
++    strcpy(b.input_path_digest,"x"); assert(!strcmp(start_retirement_route_difference(&a,&b),"input_digest"));
++    b.device_id=1; assert(!strcmp(start_retirement_route_difference(&a,&b),"device"));
++#undef DIFF
++    puts("PASS fixed first-difference classification matches route rejection"); return 0;
++  }
+   if (argc == 2 && !strcmp(argv[1], "--native-start-wire")) return start35_wire_case(29);
+   if (argc == 2 && !strcmp(argv[1], "--queue-connect-wire")) return start35_wire_case(25);
+   if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2305,6 +2305,15 @@
+     strcpy(same_app.connection_id,"new-phone-connection");
+     assert(outputs_start_bound_owner_current(&same_app,&same_route,false)
+       && outputs_start_bound_owner_current(&same_app,&same_route,true));
++    {
++      struct output_transport_identity probe;
++      assert(start_retirement_source_current(start_active,&probe));
++      f.device->route_revision++;
++      assert(!start_retirement_source_current(start_active,&probe));
++      f.device->route_revision--;
++      assert(start_retirement_source_current(start_active,&probe));
++      puts("PASS live completed START route mismatch rejected; restored identity accepted");
++    }
+     confirmed_pause_custody_case(f.device,&same_app,&same_route);
+     {
+       struct output_transport_identity observed;
