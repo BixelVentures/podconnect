@@ -113,6 +113,10 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/private-diagnostics-native.patch \
   && git apply --check /patches/private-diagnostics-native-tests.patch \
   && git apply /patches/private-diagnostics-native-tests.patch \
+  && git apply --check /patches/blocked-decoder-controls-native.patch \
+  && git apply /patches/blocked-decoder-controls-native.patch \
+  && git apply --check /patches/blocked-decoder-controls-native-tests.patch \
+  && git apply /patches/blocked-decoder-controls-native-tests.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 

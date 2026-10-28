@@ -1,0 +1,964 @@
+--- a/player/room_transport_test.go
++++ b/player/room_transport_test.go
+@@ -21,6 +21,13 @@
+ 	close(o.entered)
+ 	<-o.gate
+ 	return f(func(v bool) { o.paused = v })
++}
++func (o *transportTestOutput) WithGuardedReplacement(ctx context.Context, f func(output.MovePipeIdentity, func(), func(bool)) error) error {
++	return o.WithTransportLock(ctx, func(set func(bool)) error { return f(output.MovePipeIdentity{}, func() {}, set) })
++}
++func (*transportTestOutput) FenceStart() {}
++func (o *transportTestOutput) WithStartLock(ctx context.Context, f func(output.PipeIdentity, func(bool)) error) error {
++	return o.WithTransportLock(ctx, func(set func(bool)) error { return f(output.PipeIdentity{}, set) })
+ }
+ func (*transportTestOutput) Pause() error            { return nil }
+ func (*transportTestOutput) Resume() error           { return nil }
+@@ -221,6 +228,11 @@
+ 	writer output.MovePipeIdentity
+ }
+ 
++func (o *transportSeekOutput) WithSourceReplacement(f func(func(bool)) error) error {
++	return o.Output.(interface {
++		WithSourceReplacement(func(func(bool)) error) error
++	}).WithSourceReplacement(f)
++}
+ func (o *transportSeekOutput) WithGuardedSourceChange(ctx context.Context, apply func(output.MovePipeIdentity, bool, func()) error) error {
+ 	return o.Output.(interface {
+ 		WithGuardedSourceChange(context.Context, func(output.MovePipeIdentity, bool, func()) error) error
+--- a/player/pipe_liveness_test.go
++++ b/player/pipe_liveness_test.go
+@@ -36,6 +36,17 @@
+ 	bad     bool
+ }
+ 
++func (o *replacementOutput) WithSourceReplacement(apply func(func(bool)) error) error {
++	return o.Output.(interface {
++		WithSourceReplacement(func(func(bool)) error) error
++	}).WithSourceReplacement(func(setPaused func(bool)) error {
++		if o.next != nil {
++			o.bad = o.next.reads.Load() != 0
++			o.dropped = true
++		}
++		return apply(setPaused)
++	})
++}
+ func (o *replacementOutput) WithSourceChange(apply func(func(bool)) error) error {
+ 	return o.Output.(interface {
+ 		WithSourceChange(func(func(bool)) error) error
+--- /dev/null
++++ b/player/source_read_lease_test.go
+@@ -0,0 +1,111 @@
++package player
++
++import (
++	"bytes"
++	"io"
++	"runtime"
++	"sync"
++	"testing"
++	"time"
++)
++
++type delayedLeaseSource struct {
++	entered   chan struct{}
++	release   chan struct{}
++	cancelled chan struct{}
++	once      sync.Once
++}
++
++func (s *delayedLeaseSource) Read(p []float32) (int, error) {
++	close(s.entered)
++	<-s.release
++	p[0] = 0.5
++	return 1, io.EOF
++}
++func (s *delayedLeaseSource) CancelRead()             { s.once.Do(func() { close(s.cancelled) }) }
++func (*delayedLeaseSource) PositionMs() int64         { return 91 }
++func (*delayedLeaseSource) SetPositionMs(int64) error { return nil }
++func TestAbandonedReadSuppressesLatePCMAndEOFAfterSameSourceABA(t *testing.T) {
++	s := NewSwitchingAudioSource()
++	s.asyncRead = true
++	old := &delayedLeaseSource{entered: make(chan struct{}), release: make(chan struct{}), cancelled: make(chan struct{})}
++	s.SetPrimary(old)
++	result := make(chan struct {
++		n   int
++		err error
++	}, 1)
++	go func() {
++		n, e := s.Read(make([]float32, 2))
++		result <- struct {
++			n   int
++			err error
++		}{n, e}
++	}()
++	select {
++	case <-old.entered:
++	case <-time.After(time.Second):
++		t.Fatal("read not entered")
++	}
++	s.CancelActiveRead()
++	<-old.cancelled
++	s.SetPrimary(old)
++	close(old.release)
++	select {
++	case v := <-result:
++		if v.n != 0 || v.err != nil {
++			t.Fatalf("stale data crossed lease: %v", v)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("old read not joined")
++	}
++	if s.TakeDone() != 0 {
++		t.Fatal("old EOF crossed lease")
++	}
++	select {
++	case <-s.Done():
++		t.Fatal("old EOF signalled successor")
++	default:
++	}
++}
++func TestTerminalReadFenceCannotBeResetBySetPrimary(t *testing.T) {
++	s := NewSwitchingAudioSource()
++	s.asyncRead = true
++	s.CancelRead()
++	s.SetPrimary(&retirementEOFSource{})
++	if _, err := s.Read(make([]float32, 1)); err != io.EOF {
++		t.Fatalf("terminal fence revived: %v", err)
++	}
++}
++
++func TestCancelWaitingNilSourceWakesOnlyOldLease(t *testing.T) {
++	s := NewSwitchingAudioSource()
++	s.asyncRead = true
++	done := make(chan error, 1)
++	go func() { _, e := s.Read(make([]float32, 1)); done <- e }()
++	// Observe that the old read entered Cond.Wait before cancelling its lease.
++	deadline := time.Now().Add(time.Second)
++	for {
++		buf := make([]byte, 1<<16)
++		n := runtime.Stack(buf, true)
++		if bytes.Contains(buf[:n], []byte("(*SwitchingAudioSource).Read")) && bytes.Contains(buf[:n], []byte("sync.(*Cond).Wait")) {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("nil-source read did not wait")
++		}
++		runtime.Gosched()
++	}
++	s.CancelActiveRead()
++	select {
++	case e := <-done:
++		if e != nil {
++			t.Fatalf("old wait returned %v", e)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("old nil-source wait did not wake")
++	}
++	fresh := &retirementEOFSource{}
++	if !s.SetPrimary(fresh) {
++		t.Fatal("generic cancellation sealed wrapper")
++	}
++}
+--- /dev/null
++++ b/daemon/blocked_decoder_regression_test.go
+@@ -0,0 +1,635 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/player"
++	"github.com/devgianlu/go-librespot/session"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestBlockedDecoderControlLiveness(t *testing.T) {
++	for _, mode := range []string{"position", "pause", "stop_after_prepare_409"} {
++		t.Run(mode, func(t *testing.T) {
++			prepare := make(chan struct{}, 1)
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				prepare <- struct{}{}
++				w.WriteHeader(http.StatusConflict)
++			}))
++			defer srv.Close()
++			_, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++			writer := owner.app.openedWriter
++			current, err := owner.player.Start35CurrentSource(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++			defer held.CancelRead()
++			guard := func(mutate func()) error { mutate(); return nil }
++			if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++				t.Fatal(err)
++			}
++			if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case <-held.entered:
++			case <-time.After(time.Second):
++				t.Fatal("decoder not entered")
++			}
++			done := make(chan struct{})
++			go func() {
++				if mode == "position" {
++					_ = owner.player.PositionMs()
++				} else if mode == "pause" {
++					_ = owner.player.Pause()
++				} else {
++					owner.beginStopRetirement()
++					owner.player.Stop()
++				}
++				close(done)
++			}()
++			if mode == "stop_after_prepare_409" {
++				select {
++				case <-prepare:
++				case <-time.After(time.Second):
++					held.CancelRead()
++					t.Fatal("prepare not reached")
++				}
++			}
++			blocked := false
++			select {
++			case <-done:
++			case <-time.After(300 * time.Millisecond):
++				blocked = true
++			}
++			held.CancelRead()
++			select {
++			case <-done:
++			case <-time.After(time.Second):
++				t.Fatal("cleanup failed")
++			}
++			owner.player.Close()
++			if blocked {
++				t.Errorf("RED: %s waits on blocked decoder despite bounded writer control", mode)
++			}
++		})
++	}
++}
++
++type retainedPCMRead struct {
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++	sent    atomic.Bool
++}
++
++func (s *retainedPCMRead) Read(samples []float32) (int, error) {
++	if s.sent.Swap(true) {
++		return 0, io.EOF
++	}
++	s.once.Do(func() { close(s.entered) })
++	<-s.release
++	samples[0] = 0.5
++	return 1, nil
++}
++func (*retainedPCMRead) PositionMs() int64         { return 23 }
++func (*retainedPCMRead) SetPositionMs(int64) error { return nil }
++func TestHeldReadPauseRetainsPCMAndStopAllowsFreshSource(t *testing.T) {
++	for _, mode := range []string{"pause_resume", "guarded_pause_resume", "stop_replace"} {
++		t.Run(mode, func(t *testing.T) {
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++			defer srv.Close()
++			_, owner, fd := retirementOwnerFixture(t, srv.URL, "start")
++			if mode == "stop_replace" {
++				owner.app.startCustody = nil
++			} // Generic unbound Stop; no UNKNOWN clearance is tested here.
++			writer := owner.app.openedWriter
++			path, err := os.Readlink("/proc/self/fd/" + fd)
++			if err != nil {
++				t.Fatal(err)
++			}
++			reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer reader.Close()
++			if err = syscall.SetNonblock(int(reader.Fd()), true); err != nil {
++				t.Fatal(err)
++			}
++			current, err := owner.player.Start35CurrentSource(context.Background())
++			if err != nil {
++				t.Fatal(err)
++			}
++			held := &retainedPCMRead{entered: make(chan struct{}), release: make(chan struct{})}
++			guard := func(m func()) error { m(); return nil }
++			if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++				t.Fatal(err)
++			}
++			if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++				t.Fatal(err)
++			}
++			select {
++			case <-held.entered:
++			case <-time.After(time.Second):
++				t.Fatal("no held read")
++			}
++			if mode == "pause_resume" || mode == "guarded_pause_resume" {
++				if mode == "guarded_pause_resume" {
++					err = owner.player.GuardedTransport(context.Background(), true, nil, held, guard)
++				} else {
++					err = owner.player.Pause()
++				}
++				if err != nil {
++					t.Fatal(err)
++				}
++				close(held.release)
++				var buf [2]byte
++				deadline := time.Now().Add(100 * time.Millisecond)
++				for time.Now().Before(deadline) {
++					n, e := syscall.Read(int(reader.Fd()), buf[:])
++					if n > 0 {
++						t.Fatal("PCM escaped while paused")
++					}
++					if e != nil && !errors.Is(e, syscall.EAGAIN) {
++						t.Fatal(e)
++					}
++					time.Sleep(time.Millisecond)
++				}
++				if err = owner.player.Play(); err != nil {
++					t.Fatal(err)
++				}
++				deadline = time.Now().Add(time.Second)
++				n := 0
++				for n <= 0 && time.Now().Before(deadline) {
++					n, _ = syscall.Read(int(reader.Fd()), buf[:])
++					if n <= 0 {
++						time.Sleep(time.Millisecond)
++					}
++				}
++				if n != 2 || buf != [2]byte{0, 64} {
++					t.Fatalf("held PCM not preserved: %x %d", buf, n)
++				}
++			} else {
++				done := make(chan struct{})
++				go func() { owner.player.Stop(); close(done) }()
++				// This synthetic source is intentionally non-cancellable; Stop must wait for
++				// the exact old read and must not grant a replacement before it joins.
++				select {
++				case <-done:
++					t.Fatal("Stop returned before non-cancellable read joined")
++				case <-time.After(50 * time.Millisecond):
++				}
++				close(held.release)
++				select {
++				case <-done:
++				case <-time.After(time.Second):
++					t.Fatal("Stop did not join")
++				}
++				fresh := &contentInertSource{}
++				if err = owner.player.SetPrimaryStream(fresh, true, false); err != nil {
++					t.Fatalf("fresh source after Stop: %v", err)
++				}
++				if err = owner.player.Play(); err != nil {
++					t.Fatalf("new source cannot play: %v", err)
++				}
++			}
++			owner.player.Close()
++		})
++	}
++}
++
++func TestDaemonPauseDuringHeldReadUsesLastConfirmedPosition(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	app, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++	app.cfg = &Config{}
++	app.log = &librespot.NullLogger{}
++	owner.state = pc13ExistingPlayer(t, true).state
++	owner.sess = &session.Session{}
++	owner.prefetchTimer = time.NewTimer(time.Hour)
++	defer owner.prefetchTimer.Stop()
++	writer := app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer held.CancelRead()
++	owner.primaryStream = &player.Stream{Source: held}
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("no held read")
++	}
++	done := make(chan error, 1)
++	go func() { done <- owner.pause(context.Background()) }()
++	select {
++	case err = <-done:
++		if err != nil {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		held.CancelRead()
++		t.Fatal("daemon pause blocked")
++	}
++	if !owner.state.player.IsPaused {
++		t.Fatal("daemon did not publish paused state")
++	}
++	held.CancelRead()
++	owner.player.Close()
++}
++
++func TestHeldPCMEOFDoesNotAdvanceSecondaryBeforePauseResume(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	_, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++	writer := owner.app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retainedPCMRead{entered: make(chan struct{}), release: make(chan struct{})}
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("read not held")
++	}
++	next := &contentInertSource{}
++	owner.player.SetSecondaryStream(next)
++	for {
++		select {
++		case <-owner.player.Receive():
++		default:
++			goto drained
++		}
++	}
++drained:
++	if err = owner.player.GuardedTransport(context.Background(), true, nil, held, guard); err != nil {
++		t.Fatal(err)
++	}
++	close(held.release)
++	time.Sleep(50 * time.Millisecond)
++	if got, e := owner.player.Start35CurrentSource(context.Background()); e != nil || got != held {
++		t.Fatal("secondary advanced during Pause", e)
++	}
++	for {
++		select {
++		case ev := <-owner.player.Receive():
++			if ev.Type == player.EventTypeNotPlaying {
++				t.Fatal("EOF delivered during Pause")
++			}
++		default:
++			goto checked
++		}
++	}
++checked:
++	if err = owner.player.Play(); err != nil {
++		t.Fatal(err)
++	}
++	limit := time.Now().Add(time.Second)
++	for {
++		got, e := owner.player.Start35CurrentSource(context.Background())
++		if e != nil {
++			t.Fatal(e)
++		}
++		if got == next {
++			break
++		}
++		if time.Now().After(limit) {
++			t.Fatal("secondary did not advance after Resume")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	owner.player.Close()
++}
++
++func TestStopDuringNilSourceWaitAllowsNextSource(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "nil-source.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	worker, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path, AudioOutputPipeFormat: "s16le"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = worker.SetPrimaryStream(nil, false, false); err != nil {
++		t.Fatal(err)
++	}
++	limit := time.Now().Add(time.Second)
++	for {
++		buf := make([]byte, 1<<17)
++		n := runtime.Stack(buf, true)
++		if bytes.Contains(buf[:n], []byte("(*SwitchingAudioSource).Read")) && bytes.Contains(buf[:n], []byte("sync.(*Cond).Wait")) {
++			break
++		}
++		if time.Now().After(limit) {
++			t.Fatal("nil source was not waiting")
++		}
++		runtime.Gosched()
++	}
++	done := make(chan struct{})
++	go func() { worker.Stop(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("Stop stuck on nil-source wait")
++	}
++	if err = worker.SetPrimaryStream(&contentInertSource{}, true, false); err != nil {
++		t.Fatalf("new source after nil Stop: %v", err)
++	}
++	worker.Close()
++}
++
++type sameDropPCM struct {
++	firstEntered chan struct{}
++	firstRelease chan struct{}
++	nextEntered  chan struct{}
++	nextRelease  chan struct{}
++	calls        atomic.Int32
++	once         sync.Once
++}
++
++func (s *sameDropPCM) Read(samples []float32) (int, error) {
++	switch s.calls.Add(1) {
++	case 1:
++		close(s.firstEntered)
++		<-s.firstRelease
++		samples[0] = 0.5
++		return 1, io.EOF
++	case 2:
++		close(s.nextEntered)
++		<-s.nextRelease
++		samples[0] = 0.25
++		return 1, nil
++	default:
++		return 0, io.EOF
++	}
++}
++func (s *sameDropPCM) CancelRead()             { s.once.Do(func() { close(s.nextRelease) }) }
++func (*sameDropPCM) PositionMs() int64         { return 0 }
++func (*sameDropPCM) SetPositionMs(int64) error { return nil }
++func TestSameSourceDropDiscardsPendingPCMAndEOF(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	_, owner, fd := retirementOwnerFixture(t, srv.URL, "start")
++	writer := owner.app.openedWriter
++	path, err := os.Readlink("/proc/self/fd/" + fd)
++	if err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	if err = syscall.SetNonblock(int(reader.Fd()), true); err != nil {
++		t.Fatal(err)
++	}
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	source := &sameDropPCM{firstEntered: make(chan struct{}), firstRelease: make(chan struct{}), nextEntered: make(chan struct{}), nextRelease: make(chan struct{})}
++	defer source.CancelRead()
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", source, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, source, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-source.firstEntered:
++	case <-time.After(time.Second):
++		t.Fatal("old read not entered")
++	}
++	if err = owner.player.Pause(); err != nil {
++		t.Fatal(err)
++	}
++	close(source.firstRelease)
++	// Joining source verifies that the paused read has returned and pending PCM/EOF exists.
++	if _, err = owner.player.Start35CurrentSource(context.Background()); err != nil {
++		t.Fatal(err)
++	}
++	for {
++		select {
++		case <-owner.player.Receive():
++		default:
++			goto drainedSame
++		}
++	}
++drainedSame:
++	if err = owner.player.SetPrimaryStream(source, true, true); err != nil {
++		t.Fatal("same-source drop", err)
++	}
++	if err = owner.player.Play(); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-source.nextEntered:
++	case <-time.After(time.Second):
++		t.Fatal("fresh read did not start")
++	}
++	var buf [2]byte
++	n, e := syscall.Read(int(reader.Fd()), buf[:])
++	if n > 0 {
++		t.Fatalf("old PCM escaped: %x", buf)
++	}
++	if e != nil && !errors.Is(e, syscall.EAGAIN) {
++		t.Fatal(e)
++	}
++	for {
++		select {
++		case event := <-owner.player.Receive():
++			if event.Type == player.EventTypeNotPlaying {
++				t.Fatal("old EOF escaped")
++			}
++		default:
++			goto checkedSame
++		}
++	}
++checkedSame:
++	source.CancelRead()
++	limit := time.Now().Add(time.Second)
++	n = 0
++	for n <= 0 && time.Now().Before(limit) {
++		n, _ = syscall.Read(int(reader.Fd()), buf[:])
++		if n <= 0 {
++			time.Sleep(time.Millisecond)
++		}
++	}
++	if n != 2 || buf != [2]byte{0, 32} {
++		t.Fatalf("new PCM missing: %x %d", buf, n)
++	}
++	owner.player.Close()
++}
++
++func TestPauseOnlyWriterVerificationWithHeldReadRejectsStaleProofs(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	app, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++	writer := app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer held.CancelRead()
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("read not held")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	got, epoch, err := owner.player.RoomMove(ctx, "verify-pause", held, writer, "1", true, guard)
++	if err != nil || got != writer || epoch != "1" {
++		t.Fatalf("pause-only verification: %v", err)
++	}
++	for _, mode := range []string{"source", "writer", "epoch", "owner"} {
++		candidate := writer
++		source := librespot.AudioSource(held)
++		candidateEpoch := "1"
++		checks := 0
++		if mode == "source" {
++			source = &contentInertSource{}
++		}
++		if mode == "writer" {
++			candidate.FD = "99999"
++		}
++		if mode == "epoch" {
++			candidateEpoch = "2"
++		}
++		reject := func(m func()) error {
++			checks++
++			if mode == "owner" {
++				return errors.New("stale owner")
++			}
++			m()
++			return nil
++		}
++		if _, _, e := owner.player.RoomMove(ctx, "verify-pause", source, candidate, candidateEpoch, true, reject); e == nil {
++			t.Fatalf("%s accepted", mode)
++		}
++		if mode != "owner" && checks != 0 {
++			t.Fatalf("%s reached guard", mode)
++		}
++		if mode == "owner" && checks != 1 {
++			t.Fatal("owner guard not checked")
++		}
++	}
++	owner.player.InterruptRetiringRead()
++	if _, _, e := owner.player.RoomMove(ctx, "verify-pause", held, writer, "1", true, guard); e == nil {
++		t.Fatal("terminal source proof accepted")
++	}
++	held.CancelRead()
++	owner.player.Close()
++}
++
++func TestCurrentObservationWriterVerificationWithHeldReadRejectsStaleProofs(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	app, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++	writer := app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer held.CancelRead()
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("read not held")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	got, epoch, err := owner.player.RoomMove(ctx, "verify-current", held, writer, "1", true, guard)
++	if err != nil || got != writer || epoch != "1" {
++		t.Fatalf("pause-only verification: %v", err)
++	}
++	for _, mode := range []string{"source", "writer", "epoch", "owner"} {
++		candidate := writer
++		source := librespot.AudioSource(held)
++		candidateEpoch := "1"
++		checks := 0
++		if mode == "source" {
++			source = &contentInertSource{}
++		}
++		if mode == "writer" {
++			candidate.FD = "99999"
++		}
++		if mode == "epoch" {
++			candidateEpoch = "2"
++		}
++		reject := func(m func()) error {
++			checks++
++			if mode == "owner" {
++				return errors.New("stale owner")
++			}
++			m()
++			return nil
++		}
++		if _, _, e := owner.player.RoomMove(ctx, "verify-current", source, candidate, candidateEpoch, true, reject); e == nil {
++			t.Fatalf("%s accepted", mode)
++		}
++		if mode != "owner" && checks != 0 {
++			t.Fatalf("%s reached guard", mode)
++		}
++		if mode == "owner" && checks != 1 {
++			t.Fatal("owner guard not checked")
++		}
++	}
++	owner.player.InterruptRetiringRead()
++	if _, _, e := owner.player.RoomMove(ctx, "verify-current", held, writer, "1", true, guard); e == nil {
++		t.Fatal("terminal source proof accepted")
++	}
++	held.CancelRead()
++	owner.player.Close()
++}
+--- a/daemon/room_completed_writer_test.go
++++ b/daemon/room_completed_writer_test.go
+@@ -2,11 +2,20 @@
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"github.com/devgianlu/go-librespot/ap"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
++	"google.golang.org/protobuf/proto"
+ 	"io"
++	"net"
+ 	"os"
+ 	"path/filepath"
++	"reflect"
+ 	"syscall"
+ 	"testing"
++	"time"
++	"unsafe"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+@@ -88,6 +97,28 @@
+ 	if value, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err != nil || value.(completedCurrentWitness).Operation != op.Offer.OfferID {
+ 		t.Fatal("current completed START did not prove its exact writer", err)
+ 	}
++	for _, change := range []string{"source", "writer", "epoch", "terminal", "alias"} {
++		switch change {
++		case "source":
++			p.primaryStream.Source = old
++		case "writer":
++			p.app.openedWriter.FD = "99999"
++		case "epoch":
++			op.Epoch = "999"
++		case "terminal":
++			op.Terminal = false
++		case "alias":
++			p.aliasRevision++
++		}
++		if _, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err == nil {
++			t.Fatalf("stale %s accepted for current result", change)
++		}
++		p.primaryStream.Source = selected
++		p.app.openedWriter.FD = actualFD
++		op.Epoch = epoch
++		op.Terminal = true
++		p.aliasRevision = owned.AliasRevision
++	}
+ 	p.app.startCustody = nil
+ 	if _, err := p.completedCurrent(completedCurrentRequest{content: op, ctx: context.Background()}); err == nil {
+ 		t.Fatal("retired START still proved current after custody moved")
+@@ -149,3 +180,111 @@
+ 		t.Fatal("old operation crossed a new track source boundary")
+ 	}
+ }
++
++func TestHeldReadBoundResumeAndVolumePrepare(t *testing.T) {
++	p, op := contentFixture(t)
++	path := filepath.Join(t.TempDir(), "pcm.fifo")
++	if err := syscall.Mkfifo(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	actual, err := player.NewPlayer(&player.Options{
++		Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", WithNewOutput: func(create func() (output.Output, error)) (output.Output, error) {
++			out, err := create()
++			if err == nil {
++				p.app.openedWriter = out.(interface {
++					OpenedWriterIdentity() output.MovePipeIdentity
++				}).OpenedWriterIdentity()
++			}
++			return out, err
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer actual.Close()
++	old := &normalPhoneSource{1}
++	selected := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer selected.CancelRead()
++	if err := actual.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	pipe, epoch, err := actual.Start35(context.Background(), "quiesce", nil, old, output.PipeIdentity{}, "", guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = actual.Start35(context.Background(), "publish", selected, old, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = actual.Start35(context.Background(), "resume", nil, selected, pipe, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-selected.entered:
++	case <-time.After(time.Second):
++		t.Fatal("read not held")
++	}
++	if err := actual.Pause(); err != nil {
++		t.Fatal(err)
++	}
++	p.state.player.IsPaused = true
++	p.player, op.Capture.Player = actual, actual
++	p.primaryStream.Source = selected
++	op.Capture.Session = p.sess
++	op.Epoch = epoch
++	owned := op.Intended
++	p.aliasRevision = owned.AliasRevision
++	p.state.device.SelectedAliasId = 2
++	op.Actual = &owned
++	op.CReceipt = &contentCReceipt{Phase: "completed", Actual: &owned, WriterEpoch: epoch,
++		Pipe:   &outputPipeIdentity{Device: pipe.Device, Inode: pipe.Inode, Type: pipe.Type},
++		Route:  &roomVolumeRoute{Process: "11111111-1111-1111-1111-111111111111", DeviceID: owned.HomePodID, DeviceIncarnation: "1", SessionEpoch: "1", RouteRevision: "1", SelectionRevision: "1", InputGeneration: "1", InputItemID: "1", InputPathDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
++		Target: contentTarget{Process: "11111111-1111-1111-1111-111111111111", DeviceID: owned.HomePodID, Incarnation: "1"}}
++	op.Terminal, op.State = true, "complete"
++	p.app.startCustody = op
++	p.spotConnId, p.state.player.SessionId = "accepted-new-connection", "new-phone-session"
++	p.hasInitialConnectState = true
++	identity := owned
++	identity.ConnectionID, identity.SessionID = p.spotConnId, p.state.player.SessionId
++	op.Actual, op.CReceipt.Actual = &identity, &identity
++
++	access := ap.NewAccesspoint(p.app.log, nil, "fixture")
++	left, right := net.Pipe()
++	defer left.Close()
++	defer right.Close()
++	fields := reflect.ValueOf(access).Elem()
++	for name, value := range map[string]reflect.Value{"conn": reflect.ValueOf(left), "encConn": reflect.New(fields.FieldByName("encConn").Type().Elem()), "welcome": reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("account")})} {
++		f := fields.FieldByName(name)
++		reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(value)
++	}
++	nextSessionField(p.sess, "ap", access)
++	p.hasSpotConnId = true
++	p.playbackReadyCh = make(chan struct{})
++	close(p.playbackReadyCh)
++	scope := roomVolumeScope{identity.AccountUserID, identity.TargetID, identity.RoomID, identity.HomePodID}
++	digest := sha256.Sum256([]byte(p.app.cfg.AudioOutputPipe))
++	route := roomVolumeRoute{Process: "00000000-0000-0000-0000-000000000001", DeviceID: identity.HomePodID, DeviceIncarnation: "1", SessionEpoch: "1", RouteRevision: "1", SelectionRevision: "1", InputGeneration: "1", InputItemID: "1", InputPathDigest: hex.EncodeToString(digest[:])}
++	binding := roomVolumeBinding{scope, identity, route, roomVolumeState{"7", "2", 27, 27}, "volume", 40}
++	for _, name := range []string{"resume", "volume"} {
++		t.Run(name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++			defer cancel()
++			var err error
++			if name == "resume" {
++				_, err = p.prepareRoomTransportVersion(ctx, roomTransportPrepareRequest{AccountUserID: scope.AccountUserID, TargetID: scope.TargetID, RoomID: scope.RoomID, HomePodID: scope.HomePodID, Action: "resume", Context: ctx}, true)
++			} else {
++				_, err = p.prepareRoomVolumeVersion(ctx, roomVolumePrepareActorRequest{binding, ctx}, true)
++			}
++			if err != nil {
++				t.Fatalf("bound %s prepare during held read: %v context=%v", name, err, ctx.Err())
++			}
++		})
++	}
++	selected.CancelRead()
++}
