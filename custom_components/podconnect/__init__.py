@@ -8,16 +8,19 @@ from dataclasses import dataclass
 
 import aiohttp
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import (
     HomeAssistant,
     ServiceCall,
     ServiceResponse,
     SupportsResponse,
 )
-from homeassistant.exceptions import HomeAssistantError, ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.config_entry_oauth2_flow import (
     ImplementationUnavailableError,
@@ -25,15 +28,16 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
     async_get_config_entry_implementation,
 )
 
+from .account_diagnostic_service import register_account_diagnostic_service
 from .api import SpotifyApi, SpotifyApiError
 from .artwork import spotify_album_artwork
-from .account_diagnostic_service import register_account_diagnostic_service
 from .commands import PlaybackCommands, register_command_services
-from .const import CONF_SPEAKERS_URL, DOMAIN, LOGGER, SPOTIFY_SCOPES
+from .const import CONF_SPEAKERS_URL, DOMAIN, SPOTIFY_SCOPES
+from .const import LOGGER as LOGGER
 from .coordinator import PodConnectCoordinator
 from .observations import ObservationReader, current, register_observation_services
-from .speakers import SpeakersClient
 from .playlist_catalogue import register_playlist_search
+from .speakers import SpeakersClient
 from .targets import register_target_services
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER]
@@ -50,6 +54,7 @@ class PodConnectData:
     active: bool = False
     observations: ObservationReader | None = None
     commands: PlaybackCommands | None = None
+    configuration_identity: tuple[str | None, str, str] | None = None
 
 
 PodConnectConfigEntry = ConfigEntry[PodConnectData]
@@ -81,7 +86,9 @@ def _search_limit(value: object) -> int:
     return value
 
 
-def _search_projection(result: object, entry_id: str, query: str, limit: int) -> ServiceResponse:
+def _search_projection(
+    result: object, entry_id: str, query: str, limit: int
+) -> ServiceResponse:
     """Return a bounded, closed Spotify search sample, never provider rows."""
     if not isinstance(result, dict):
         raise HomeAssistantError("Spotify search returned malformed data")
@@ -143,7 +150,9 @@ def _search_projection(result: object, entry_id: str, query: str, limit: int) ->
     return response
 
 
-def _track_list(items: list[dict], config_entry_id: str | None = None) -> ServiceResponse:
+def _track_list(
+    items: list[dict], config_entry_id: str | None = None
+) -> ServiceResponse:
     """Map raw Spotify tracks to a closed list with optional validated album art."""
     tracks = []
     for track in items:
@@ -188,22 +197,27 @@ def _library_owner(hass, config_entry_id=None):
 
 def _register_services(hass: HomeAssistant) -> None:
     """Register the response-returning library services once (idempotent across config entries)."""
+
     def _make(method_name: str):
         async def _handler(call: ServiceCall) -> ServiceResponse:
-            entry, owner = _library_owner(
-                hass, call.data.get("config_entry_id")
-            )
+            entry, owner = _library_owner(hass, call.data.get("config_entry_id"))
             try:
                 items = await getattr(owner.api, method_name)()
             except SpotifyApiError as err:
-                raise HomeAssistantError(f"Spotify library request failed: {err}") from err
+                raise HomeAssistantError(
+                    f"Spotify library request failed: {err}"
+                ) from err
             current(hass, entry.entry_id, owner)
             return _track_list(items, entry.entry_id)
 
         return _handler
 
     # service name -> SpotifyApi method
-    for svc, method in (("top_tracks", "top_tracks"), ("recently_played", "recently_played"), ("liked", "saved_tracks")):
+    for svc, method in (
+        ("top_tracks", "top_tracks"),
+        ("recently_played", "recently_played"),
+        ("liked", "saved_tracks"),
+    ):
         if not hass.services.has_service(DOMAIN, svc):
             hass.services.async_register(
                 DOMAIN,
@@ -220,6 +234,7 @@ def _register_services(hass: HomeAssistant) -> None:
             )
 
     if not hass.services.has_service(DOMAIN, "search_tracks"):
+
         async def _search(call: ServiceCall) -> ServiceResponse:
             entry_id = call.data["config_entry_id"]
             query = call.data["query"]
@@ -250,8 +265,23 @@ def _register_services(hass: HomeAssistant) -> None:
         )
 
 
+def _configuration_identity(
+    entry: PodConnectConfigEntry,
+) -> tuple[str | None, str, str]:
+    """Configuration requiring a new owner; OAuth token refresh retains its session."""
+    return (
+        entry.unique_id,
+        json.dumps(dict(entry.options), sort_keys=True),
+        json.dumps(
+            {key: value for key, value in entry.data.items() if key != CONF_TOKEN},
+            sort_keys=True,
+        ),
+    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -> bool:
     """Set up PodConnect from a config entry."""
+    configuration_identity = _configuration_identity(entry)
     try:
         implementation = await async_get_config_entry_implementation(hass, entry)
     except ImplementationUnavailableError as err:
@@ -273,7 +303,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
 
     base = entry.options.get(CONF_SPEAKERS_URL)
     speakers = SpeakersClient(async_get_clientsession(hass), base) if base else None
-    entry.runtime_data = PodConnectData(api=api, coordinator=coordinator, session=session, speakers=speakers)
+    if configuration_identity != _configuration_identity(entry):
+        raise ConfigEntryNotReady("PodConnect configuration changed during setup")
+    entry.runtime_data = PodConnectData(
+        api=api,
+        coordinator=coordinator,
+        session=session,
+        speakers=speakers,
+        configuration_identity=configuration_identity,
+    )
     entry.runtime_data.observations = ObservationReader(coordinator, api)
     entry.runtime_data.commands = PlaybackCommands(entry.runtime_data)
     _register_services(hass)
@@ -300,5 +338,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) 
 
 
 async def _options_updated(hass: HomeAssistant, entry: PodConnectConfigEntry) -> None:
-    """Replace the entry-owned client through the normal HA unload/setup path."""
+    """Replace owners for configuration changes, never routine OAuth token renewal."""
+    data = getattr(entry, "runtime_data", None)
+    if data is None or data.configuration_identity == _configuration_identity(entry):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
