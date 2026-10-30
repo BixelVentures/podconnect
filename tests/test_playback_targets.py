@@ -833,8 +833,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_unload_and_options_reload_owners(self):
         ns = load_body(
             "__init__.py",
-            dict(PLATFORMS=["media_player"]),
-            names={"async_unload_entry", "_options_updated"},
+            dict(PLATFORMS=["media_player"], json=json, CONF_TOKEN="token"),
+            names={"async_unload_entry", "_options_updated", "_configuration_identity"},
         )
         hass, data, entries, reg = services()
         hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
@@ -846,6 +846,12 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(data.active)
         with self.assertRaises(HAError):
             await invoke(reg, "get_targets")
+        entries[0].data = {"token": "old", "auth_implementation": "spotify"}
+        data.configuration_identity = ns["_configuration_identity"](entries[0])
+        entries[0].data["token"] = "renewed"
+        await ns["_options_updated"](hass, entries[0])
+        hass.config_entries.async_reload.assert_not_awaited()
+        entries[0].options["speakers_url"] = "http://changed"
         await ns["_options_updated"](hass, entries[0])
         hass.config_entries.async_reload.assert_awaited_once_with("account-A")
 
@@ -864,6 +870,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
 
             entry = SimpleNamespace(
                 entry_id="account-A",
+                unique_id="spotify-account-A",
+                data={"token": "old", "auth_implementation": "spotify"},
                 options={"speakers_url": "http://local"},
                 async_on_unload=lambda fn: registered.append(fn),
                 add_update_listener=lambda fn: ("listener", fn),
@@ -900,6 +908,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     register_command_services=lambda h: command_registrations.append(h),
                     register_account_diagnostic_service=lambda h: diagnostic_registrations.append(h),
                     CONF_SPEAKERS_URL="speakers_url",
+                    CONF_TOKEN="token",
+                    json=json,
                     SpeakersClient=S["SpeakersClient"],
                     async_get_clientsession=lambda h: Web([]),
                     PodConnectData=lambda **kw: SimpleNamespace(**kw, active=False),
@@ -911,7 +921,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     _options_updated=object(),
                     PLATFORMS=["media_player"],
                 ),
-                names={"async_setup_entry"},
+                names={"async_setup_entry", "_configuration_identity"},
             )
             if failure:
                 with self.assertRaisesRegex(RuntimeError, "platform failed"):
