@@ -1,3 +1,7 @@
+## Control 0.10.28 — retain runtime on OAuth renewal
+
+- Keep the active runtime when OAuth credentials are renewed; a real configuration or reauthentication change still reloads the entry.
+
 ## Speakers 0.26.60 — precise rejection diagnostics
 
 - Record the content-free command category and first rejected ownership field when playback control or transfer is refused.
