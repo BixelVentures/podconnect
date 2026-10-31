@@ -312,3 +312,95 @@ index 67c13e0..05817d7 100644
 +
 +func (*contentStateError) Error() string { return ErrAliasConflict.Error() }
 +func (*contentStateError) Unwrap() error { return ErrAliasConflict }
+--- a/daemon/room_retirement.go
++++ b/daemon/room_retirement.go
+@@ -4,6 +4,7 @@
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"io"
+ 	"net/http"
+ 	"strconv"
+@@ -143,8 +144,20 @@
+ }
+ 
+ func (app *App) prepareCompletedRetirementFor(owner *AppPlayer) *retirementAttempt {
++	// Fixed enums only: no account, target, request, response or error values.
++	outcome, reason := "skipped", "no_matching_custody"
++	defer func() {
++		if app.log != nil {
++			if outcome == "request_failed" || outcome == "receipt_rejected" {
++				app.log.Warnf("retirement_prepare outcome=%s reason=%s", outcome, reason)
++			} else {
++				app.log.Infof("retirement_prepare outcome=%s reason=%s", outcome, reason)
++			}
++		}
++	}()
+ 	app.moveCustodyMu.Lock()
+ 	if app.moveCustodyUnknown || app.retirementPending != nil {
++		reason = "custody_uncertain"
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+ 	}
+@@ -182,6 +195,7 @@
+ 		return nil
+ 	}
+ 	if owner == nil || owner.player == nil {
++		reason = "owner_unavailable"
+ 		app.moveCustodyUnknown = true
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+@@ -191,12 +205,14 @@
+ 		!volumeCounter(a.writerEpoch) || a.writerEpoch == "0" || !volumeCounter(a.inputEpoch) || a.inputEpoch == "0" ||
+ 		!volumeCounter(app.openedWriter.FD) || app.openedWriter.Type != "fifo" || !volumeCounter(app.openedWriter.Device) ||
+ 		!volumeCounter(app.openedWriter.Inode) || app.openedWriter.Inode == "0" || !roomTransportURL(a.baseURL) {
++		reason = "invalid_witness"
+ 		app.moveCustodyUnknown = true
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+ 	}
+ 	reservation, err := randomQueueID(16)
+ 	if err != nil {
++		reason = "reservation_unavailable"
+ 		app.moveCustodyUnknown = true
+ 		app.moveCustodyMu.Unlock()
+ 		return nil
+@@ -219,17 +235,28 @@
+ 		InputEpoch  string             `json:"expected_input_epoch"`
+ 	}{a.completed, a.reservation, a.incarnation, a.process, a.writerEpoch, a.writer.FD,
+ 		outputPipeIdentity{Device: a.writer.Device, Inode: a.writer.Inode, Type: a.writer.Type}, a.inputEpoch}, &reply)
+-	if err != nil || !volumeHex32.MatchString(reply.RetirementToken) {
++	if err != nil {
++		outcome, reason = "request_failed", "unavailable"
++		if errors.Is(err, context.DeadlineExceeded) {
++			reason = "timeout"
++		}
+ 		app.retirementFailed(&a)
+ 		return nil
+ 	}
++	if !volumeHex32.MatchString(reply.RetirementToken) {
++		outcome, reason = "receipt_rejected", "invalid_token"
++		app.retirementFailed(&a)
++		return nil
++	}
+ 	a.retirement = reply.RetirementToken
+ 	if !a.validPrepare(reply) {
++		outcome, reason = "receipt_rejected", "invalid_receipt"
+ 		app.retirementFailed(&a)
+ 		return nil
+ 	}
+ 	app.moveCustodyMu.Lock()
+ 	if app.moveCustodyUnknown || !app.retirementCurrentLocked(&a) {
++		reason = "owner_changed"
+ 		if app.retirementPending == &a {
+ 			app.moveCustodyUnknown = true
+ 		}
+@@ -242,6 +269,7 @@
+ 	// reader. Interrupt an in-flight network read without waiting for the
+ 	// output/source locks that the read itself may hold.
+ 	owner.player.InterruptRetiringRead()
++	outcome, reason = "prepared", "none"
+ 	return &a
+ }
+ 
