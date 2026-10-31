@@ -300,17 +300,17 @@ index 2dc76c3..6521e80 100644
 +		until := time.Now().Add(3 * time.Second)
 +		for {
 +			op.mu.Lock()
-+			phase := op.State
++			phase, stagedStream := op.State, op.Stream
 +			op.mu.Unlock()
-+			if phase == "staged" {
++			if phase == "staged" && stagedStream != nil {
++				stream = stagedStream
 +				break
 +			}
-+			if phase != "staging" || time.Now().After(until) {
++			if (phase != "staging" && phase != "staged") || time.Now().After(until) {
 +				t.Fatal("actual stage did not produce stream", phase)
 +			}
 +			time.Sleep(time.Millisecond)
 +		}
-+		stream = op.Stream
 +		t.Log("public prepare -> actual ContextResolve/metadata/key/storage/AES/FLAC/NewStream staged")
 +	}
 +	body, _ := json.Marshal(contentIDRequest{op.Offer.OfferID, op.Offer.BindingID})
