@@ -42,13 +42,24 @@
      bool retired_wait=outputs_start_retired_normal_autostart_ready(NULL);
 --- a/tests/outputs_attention_owner.c
 +++ b/tests/outputs_attention_owner.c
-@@ -236,11 +236,32 @@
+@@ -233,14 +233,43 @@
+   .device_volume_set = unexpected_legacy_send,
+ };
+ 
++static bool start_state_diagnostic_capture;
++static unsigned start_state_diagnostic_count;
++static char start_state_diagnostic_message[128];
  static bool connect_diagnostic_capture;
  static unsigned connect_diagnostic_count;
  static const char *connect_diagnostic_message;
 +static char connect_diagnostic_buffer[128];
  void DPRINTF(int severity, int domain, const char *format, ...)
  {
++  if (start_state_diagnostic_capture && !strncmp(format,"START state rejected: ",strlen("START state rejected: "))) {
++    va_list args; assert(severity==E_LOG && (domain==L_PLAYER || domain==L_HTTPD));
++    va_start(args,format); int written=vsnprintf(start_state_diagnostic_message,sizeof(start_state_diagnostic_message),format,args); va_end(args);
++    assert(written>=0 && (size_t)written<sizeof(start_state_diagnostic_message)); start_state_diagnostic_count++;
++  }
    if (connect_diagnostic_capture && !strncmp(format,"Connect recovery denied: ",strlen("Connect recovery denied: "))) {
 -    assert(severity==E_LOG && domain==L_PLAYER && !strchr(format,'%'));
 -    connect_diagnostic_count++; connect_diagnostic_message=format;
@@ -77,7 +88,7 @@
    }
  }
  
-@@ -428,7 +449,7 @@
+@@ -428,7 +457,7 @@
    a->advertised=false; connect_diagnostic_expect(1,"output_unadvertised"); a->advertised=true;
    a->type=OUTPUT_TYPE_DUMMY; connect_diagnostic_expect(1,"output_type"); a->type=OUTPUT_TYPE_AIRPLAY;
    a->prevent_playback=true; connect_diagnostic_expect(1,"playback_prevented"); a->prevent_playback=false;
@@ -86,3 +97,305 @@
    start_journal_fault=true; connect_diagnostic_expect(1,"start_not_clean_absent"); start_journal_fault=false;
    b->busy=true; connect_diagnostic_expect(1,"output_busy"); b->busy=false;
    b->attention_lease=1; connect_diagnostic_expect(1,"attention_lease"); b->attention_lease=0;
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -246,23 +246,38 @@
+ }
+ static bool start_old_owner_equal(const struct output_start_request *a,const struct output_start_request *b)
+ { return a->old_owner_present==b->old_owner_present && (!a->old_owner_present || native_owner_equal(&a->old_native_owner,&b->old_native_owner)); }
+-static bool start_pipe_registered(const struct output_start_request *r,char digest[65])
++static bool start_pipe_registered_reason(const struct output_start_request *r,char digest[65],const char **reason)
+ {
+   struct media_file_info *mfi; struct stat st; uint32_t id; size_t i; unsigned char hash[32];
+   static const char hex[]="0123456789abcdef";
+-  if (!cfg || cfg_getint(cfg_getsec(cfg,"library"),"pipe_sample_rate")!=44100
+-      || cfg_getint(cfg_getsec(cfg,"library"),"pipe_bits_per_sample")!=16 || !r || r->expected_input_path[0]!='/' || !transport_hex(r->expected_input_path_digest,64)
+-      || !(id=db_file_id_bypath(r->expected_input_path)) || !(mfi=db_file_fetch_byid(id))) return false;
+-  bool valid=mfi->path && !strcmp(mfi->path,r->expected_input_path) && mfi->data_kind==DATA_KIND_PIPE
+-
+-    && stat(mfi->path,&st)==0 && S_ISFIFO(st.st_mode);
++#define FIFO_CHECK(test, label) do { if (test) { if (reason) *reason=label; return false; } } while (0)
++  FIFO_CHECK(!cfg,"fifo_config");
++  FIFO_CHECK(cfg_getint(cfg_getsec(cfg,"library"),"pipe_sample_rate")!=44100,"fifo_sample_rate");
++  FIFO_CHECK(cfg_getint(cfg_getsec(cfg,"library"),"pipe_bits_per_sample")!=16,"fifo_sample_bits");
++  FIFO_CHECK(!r,"fifo_request");
++  FIFO_CHECK(r->expected_input_path[0]!='/',"fifo_absolute_path");
++  FIFO_CHECK(!transport_hex(r->expected_input_path_digest,64),"fifo_digest_format");
++  FIFO_CHECK(!(id=db_file_id_bypath(r->expected_input_path)),"fifo_db_lookup");
++  FIFO_CHECK(!(mfi=db_file_fetch_byid(id)),"fifo_db_fetch");
++  bool valid=true;
++#define FIFO_MFI_CHECK(test,label) do { if (valid && (test)) { if (reason) *reason=label; valid=false; } } while (0)
++  FIFO_MFI_CHECK(!mfi->path,"fifo_db_path_missing");
++  FIFO_MFI_CHECK(strcmp(mfi->path,r->expected_input_path),"fifo_db_path_mismatch");
++  FIFO_MFI_CHECK(mfi->data_kind!=DATA_KIND_PIPE,"fifo_db_kind");
++  FIFO_MFI_CHECK(stat(mfi->path,&st)!=0,"fifo_stat");
++  FIFO_MFI_CHECK(!S_ISFIFO(st.st_mode),"fifo_file_type");
+   if (valid) {
+     gcry_md_hash_buffer(GCRY_MD_SHA256,hash,mfi->path,strlen(mfi->path));
+     for(i=0;i<32;i++) { digest[2*i]=hex[hash[i]>>4];digest[2*i+1]=hex[hash[i]&15]; } digest[64]=0;
+-    valid=!strcmp(digest,r->expected_input_path_digest);
++    FIFO_MFI_CHECK(strcmp(digest,r->expected_input_path_digest),"fifo_digest_mismatch");
+   }
+-  free_mfi(mfi,0);return valid;
++  free_mfi(mfi,0);
++#undef FIFO_MFI_CHECK
++#undef FIFO_CHECK
++  return valid;
+ }
++static bool start_pipe_registered(const struct output_start_request *r,char digest[65])
++{ return start_pipe_registered_reason(r,digest,NULL); }
+ 
+ /* The retired old producer is a durable fact, not a new START grant. This
+  * permits only staging of the existing normal configured PIPE while the
+@@ -511,7 +526,7 @@
+     && r->old_owner_present && start_active->result.actual_owner_present
+     && native_owner_equal(&r->old_native_owner,&start_active->result.command.committed_native_owner);
+ }
+-static bool start_available(const struct output_start_request *r)
++static bool start_available_reason(const struct output_start_request *r, bool diagnostic)
+ {
+   struct output_device *d=outputs_device_get(r->device_id),*scan; char digest[65];
+   struct output_device *old=NULL;struct output_transport_identity old_identity;
+@@ -531,26 +546,39 @@
+       if(scan->selected && scan!=old)return false;
+     return true;
+   }
+-  if (!d || !outputs_process[0] || !d->advertised || d->type!=OUTPUT_TYPE_AIRPLAY
+-      || d->incarnation==UINT64_MAX || d->session_epoch>=UINT64_MAX-1 || d->route_revision==UINT64_MAX
+-      || d->base_revision==UINT64_MAX || d->attention_revision==UINT64_MAX
+-      || outputs[d->type]->disabled || !outputs_streaming_exclusive_available()
+-      || !outputs[d->type]->device_start35 || !outputs[d->type]->device_start_retire
+-      || outputs_start_metadata_generation()==UINT64_MAX || transport_generation_exhausted || transport_admission_generation==UINT64_MAX
+-      || transport_pin || room_volume_pin_busy() || room_volume_undrained()
+-      || !start_journal_admission(r)
+-      || !start_process_current(&r->native_process)
+-      || !transport_hex(r->native_incarnation,32) || !start_pipe_registered(r,digest)) return false;
+-  if (transport_custody_busy() && (!r->old_owner_present || !native_owner_equal(&r->old_native_owner,&transport_custody_owner))) return false;
++  /* Each predicate retains original short-circuit order and is evaluated once. */
++#define START_CHECK(test, reason) do { if (test) { if (diagnostic) DPRINTF(E_LOG,L_PLAYER,"START state rejected: " reason "\n"); return false; } } while (0)
++  START_CHECK(!d,"target_missing");
++  START_CHECK(!outputs_process[0],"output_process");
++  START_CHECK(!d->advertised,"target_unadvertised");
++  START_CHECK(d->type!=OUTPUT_TYPE_AIRPLAY,"target_type");
++  START_CHECK(d->incarnation==UINT64_MAX || d->session_epoch>=UINT64_MAX-1 || d->route_revision==UINT64_MAX || d->base_revision==UINT64_MAX || d->attention_revision==UINT64_MAX,"target_generation");
++  START_CHECK(outputs[d->type]->disabled,"output_disabled");
++  START_CHECK(!outputs_streaming_exclusive_available(),"output_exclusive");
++  START_CHECK(!outputs[d->type]->device_start35 || !outputs[d->type]->device_start_retire,"output_capability");
++  START_CHECK(outputs_start_metadata_generation()==UINT64_MAX || transport_generation_exhausted || transport_admission_generation==UINT64_MAX,"generation");
++  START_CHECK(transport_pin,"transport_pin");
++  START_CHECK(room_volume_pin_busy(),"volume_pin");
++  START_CHECK(room_volume_undrained(),"volume_undrained");
++  START_CHECK(!start_journal_admission(r),"journal");
++  START_CHECK(!start_process_current(&r->native_process),"native_process");
++  START_CHECK(!transport_hex(r->native_incarnation,32),"native_incarnation");
++  START_CHECK(!start_pipe_registered(r,digest),"fifo_registration");
++  START_CHECK(transport_custody_busy() && (!r->old_owner_present || !native_owner_equal(&r->old_native_owner,&transport_custody_owner)),"transport_custody");
+   if (start_active && outputs_start_gate_closed() && !start_old_process_retired()
+       && start_journal_retirement_outcome!=OUTPUT_RETIRE_RETIRED_KNOWN) {
+-    if (start_active->writer_pending || transport_remaining(&start_active->pin_expiry)
+-        || !start_contexts_drained() || (start_active->result.phase!=OUTPUT_START_UNKNOWN && start_active->result.phase!=OUTPUT_START_CANCELLED)) return false;
++    START_CHECK(start_active->writer_pending,"writer_pending");
++    START_CHECK(transport_remaining(&start_active->pin_expiry),"start_pin");
++    START_CHECK(!start_contexts_drained(),"contexts_undrained");
++    START_CHECK(start_active->result.phase!=OUTPUT_START_UNKNOWN && start_active->result.phase!=OUTPUT_START_CANCELLED,"start_phase");
+   }
+   for(scan=outputs_device_list;scan;scan=scan->next)
+-    if (scan->session && !outputs[scan->type]->device_start_retire) return false;
++    START_CHECK(scan->session && !outputs[scan->type]->device_start_retire,"session_retire_capability");
+   return true;
++#undef START_CHECK
+ }
++static bool start_available(const struct output_start_request *r)
++{ return start_available_reason(r,false); }
+ /* Strict idle proof is a read, never retirement/admission or pin expiry.
+  * Reuse the actual START absence/drain and configured Native FIFO proof. */
+ static bool
+@@ -595,7 +623,17 @@
+ int outputs_start_state_get(const struct output_start_request *r,struct output_start_state *out)
+ {
+   struct output_device *d,*old=NULL;struct output_transport_identity old_identity;char digest[65];
+-  if (!r || !out || !transport_hex(r->native_incarnation,32) || !start_pipe_registered(r,digest) || !(d=outputs_device_get(r->device_id)) || !d->advertised || d->type!=OUTPUT_TYPE_AIRPLAY) return -1;
++#define START_STATE_CHECK(test, reason) do { if (test) { DPRINTF(E_LOG,L_PLAYER,"START state rejected: " reason "\n"); return -1; } } while (0)
++  START_STATE_CHECK(!r || !out,"arguments");
++  START_STATE_CHECK(!transport_hex(r->native_incarnation,32),"native_incarnation");
++  const char *fifo_reason = NULL;
++  if (!start_pipe_registered_reason(r,digest,&fifo_reason)) {
++    DPRINTF(E_LOG,L_PLAYER,"START state rejected: %s\n",fifo_reason); return -1;
++  }
++  START_STATE_CHECK(!(d=outputs_device_get(r->device_id)),"target_missing");
++  START_STATE_CHECK(!d->advertised,"target_unadvertised");
++  START_STATE_CHECK(d->type!=OUTPUT_TYPE_AIRPLAY,"target_type");
++#undef START_STATE_CHECK
+   memset(out,0,sizeof(*out));memcpy(out->process,outputs_process,37);out->device_id=d->id;out->device_incarnation=d->incarnation;
+   if(r->move_existing_session){
+     if(!move_old_owner_current(r,&old,&old_identity))return -1;
+@@ -611,7 +649,7 @@
+       out->clean_absent = true;
+       return 0;
+     }
+-  out->ready=start_available(r);out->busy=!out->ready;return 0;
++  out->ready=start_available_reason(r,true);out->busy=!out->ready;return 0;
+ }
+ static void start_retire_sessions(void)
+ {
+--- a/src/player_start.inc.c
++++ b/src/player_start.inc.c
+@@ -40,7 +40,7 @@
+   int action;uint64_t id;const struct output_start_request *request;const char *token,*reservation;
+   struct output_start_state *state;struct output_start_result *result;
+   const struct output_retirement_request *retirement_request;
+-  struct output_retirement_result *retirement_result;bool move;
++  struct output_retirement_result *retirement_result;bool move;bool state_entered;
+ };
+ static bool move_source_current(const struct output_start_request *r,bool writer_required)
+ {
+@@ -61,7 +61,10 @@
+ {
+   struct player_start_command *c=arg;struct output_start_result observed;
+   if(c->action==0){
+-    *retval=c->request->move_existing_session && !move_source_current(c->request,true) ? -1 : outputs_start_state_get(c->request,c->state);
++    c->state_entered=true;
++    if (c->request->move_existing_session && !move_source_current(c->request,true)) {
++      DPRINTF(E_LOG,L_PLAYER,"START state rejected: move_source\n"); *retval=-1;
++    } else *retval=outputs_start_state_get(c->request,c->state);
+     if(!*retval && c->request->move_existing_session)c->state->paused=player_state==PLAY_PAUSED;
+   }
+   else if(c->action==1){
+@@ -141,7 +144,7 @@
+   return COMMAND_END;
+ }
+ int player_start_state_get(const struct output_start_request *r,struct output_start_state *out)
+-{struct player_start_command c={.action=0,.request=r,.state=out};return commands_exec_sync(cmdbase,start_command,NULL,&c);}
++{struct player_start_command c={.action=0,.request=r,.state=out};int ret=commands_exec_sync(cmdbase,start_command,NULL,&c);if(ret<0 && !c.state_entered)DPRINTF(E_LOG,L_PLAYER,"START state rejected: dispatch\n");return ret;}
+ int player_start_prepare(const struct output_start_request *r,struct output_start_result *out)
+ {struct player_start_command c={.action=1,.request=r,.result=out};return commands_exec_sync(cmdbase,start_command,NULL,&c);}
+ int player_start_commit(const struct output_start_request *r,struct output_start_result *out)
+--- a/src/httpd_jsonapi_start.inc.c
++++ b/src/httpd_jsonapi_start.inc.c
+@@ -58,36 +58,47 @@
+ {
+   json_object *v;return json_object_object_get_ex(body,key,&v) && json_object_is_type(v,json_type_boolean) && json_object_get_boolean(v);
+ }
+-static int start_json_common(json_object *body,struct output_start_request *r,bool prepare,bool state)
++static int start_json_common(json_object *body,struct output_start_request *r,bool prepare,bool state,const char **reason)
+ {
+-  if(!transport_json_string(body,"native_incarnation",r->native_incarnation,sizeof(r->native_incarnation)))return -1;
+-  if((prepare || state) && (!transport_json_string(body,"expected_input_path",r->expected_input_path,sizeof(r->expected_input_path))
+-      || !transport_json_string(body,"expected_input_path_digest",r->expected_input_path_digest,sizeof(r->expected_input_path_digest))))return -1;
+-  if(prepare || state){
++#define START_JSON_CHECK(test, label) do { if (test) { if (reason) *reason=label; return -1; } } while (0)
++  START_JSON_CHECK(!transport_json_string(body,"native_incarnation",r->native_incarnation,sizeof(r->native_incarnation)),"request_incarnation");
++  if (prepare || state) {
++    START_JSON_CHECK(!transport_json_string(body,"expected_input_path",r->expected_input_path,sizeof(r->expected_input_path)),"request_path");
++    START_JSON_CHECK(!transport_json_string(body,"expected_input_path_digest",r->expected_input_path_digest,sizeof(r->expected_input_path_digest)),"request_digest");
+     json_object *process;
+-    if(!json_object_object_get_ex(body,"native_process",&process) || !json_object_is_type(process,json_type_object) || json_object_object_length(process)!=3
+-        || !transport_json_string(process,"boot_id",r->native_process.boot_id,sizeof(r->native_process.boot_id))
+-        || transport_native_counter(process,"pid",&r->native_process.pid)<0 || !r->native_process.pid
+-        || transport_native_counter(process,"proc_start_ticks",&r->native_process.proc_start_ticks)<0 || !r->native_process.proc_start_ticks)return -1;
++    START_JSON_CHECK(!json_object_object_get_ex(body,"native_process",&process),"request_process_missing");
++    START_JSON_CHECK(!json_object_is_type(process,json_type_object),"request_process_type");
++    START_JSON_CHECK(json_object_object_length(process)!=3,"request_process_shape");
++    START_JSON_CHECK(!transport_json_string(process,"boot_id",r->native_process.boot_id,sizeof(r->native_process.boot_id)),"request_boot");
++    START_JSON_CHECK(transport_native_counter(process,"pid",&r->native_process.pid)<0 || !r->native_process.pid,"request_pid");
++    START_JSON_CHECK(transport_native_counter(process,"proc_start_ticks",&r->native_process.proc_start_ticks)<0 || !r->native_process.proc_start_ticks,"request_start_ticks");
+   }
+-  if(start_json_owner(body,"old_native_owner",&r->old_native_owner,true,&r->old_owner_present)<0)return -1;
++  START_JSON_CHECK(start_json_owner(body,"old_native_owner",&r->old_native_owner,true,&r->old_owner_present)<0,"request_old_owner");
++#undef START_JSON_CHECK
+   return 0;
+ }
+ static int jsonapi_reply_start_write(struct httpd_request *hreq)
+ {
+   const char *phase=hreq->path_parts[4];struct output_start_request r={0};struct output_start_result result;struct output_start_state state;
+   json_object *body=transport_parse_body_limit(hreq->in_body,16384),*value,*reply;int ret=HTTP_BADREQUEST;
+-  if(!body || safe_atou64(hreq->path_parts[2],&r.device_id)<0)goto out;
++  if(!body) { if(!strcmp(phase,"state")) DPRINTF(E_LOG,L_HTTPD,"START state rejected: request_body\n"); goto out; }
++  if(safe_atou64(hreq->path_parts[2],&r.device_id)<0) { if(!strcmp(phase,"state")) DPRINTF(E_LOG,L_HTTPD,"START state rejected: request_target\n"); goto out; }
+   if(!strcmp(phase,"state")){
+       bool strict = json_object_object_get_ex(body, "require_clean_absent", &value);
+-      if (json_object_object_length(body) != (strict ? 6 : 5)
+-          || (strict && (!json_object_is_type(value, json_type_boolean) || !json_object_get_boolean(value)))
+-          || start_json_common(body, &r, false, true) < 0)
+-	goto out;
++      if (json_object_object_length(body) != (strict ? 6 : 5)) {
++        DPRINTF(E_LOG,L_HTTPD,"START state rejected: request_shape\n"); goto out;
++      }
++      if (strict && (!json_object_is_type(value, json_type_boolean) || !json_object_get_boolean(value))) {
++        DPRINTF(E_LOG,L_HTTPD,"START state rejected: request_strict\n"); goto out;
++      }
++      const char *reason = NULL;
++      if (start_json_common(body, &r, false, true, &reason) < 0) {
++        DPRINTF(E_LOG,L_HTTPD,"START state rejected: %s\n", reason); goto out;
++      }
+       r.require_clean_absent = strict;
+       ret = 409;
+       if (player_start_state_get(&r, &state) < 0)
+-	goto out;
++        goto out;
+       reply = json_object_new_object();
+       json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_start_state.v1"));
+       json_object_object_add(reply, "ok", json_object_new_boolean(true));
+@@ -105,7 +116,7 @@
+   }
+   if(!strcmp(phase,"prepare") || !strcmp(phase,"commit")){
+     bool prepare=!strcmp(phase,"prepare");
+-    if(json_object_object_length(body)!=(prepare?12:9) || start_json_common(body,&r,prepare,false)<0
++    if(json_object_object_length(body)!=(prepare?12:9) || start_json_common(body,&r,prepare,false,NULL)<0
+         || !transport_json_string(body,"offer_id",r.offer_id,sizeof(r.offer_id)) || !transport_json_string(body,"binding_id",r.binding_id,sizeof(r.binding_id))
+         || !transport_json_string(body,"content_digest",r.content_digest,sizeof(r.content_digest))
+         || transport_native_counter(body,"native_revision",&r.native_revision)<0 || !r.native_revision || r.native_revision==UINT64_MAX)goto out;
+--- a/src/httpd_jsonapi_move.inc.c
++++ b/src/httpd_jsonapi_move.inc.c
+@@ -50,7 +50,7 @@
+   body=transport_parse_body_limit(hreq->in_body,16384);
+   if(!body || safe_atou64(hreq->path_parts[2],&r.device_id)<0 || !r.device_id)goto out;
+   if(!strcmp(phase,"state")){
+-    if(json_object_object_length(body)!=8 || start_json_common(body,&r,false,true)<0 || !r.old_owner_present
++    if(json_object_object_length(body)!=8 || start_json_common(body,&r,false,true,NULL)<0 || !r.old_owner_present
+         || move_json_writer(body,&r)<0)goto out;
+     ret=409;if(player_start_state_get(&r,&state)<0)goto out;
+     reply=json_object_new_object();
+@@ -72,7 +72,7 @@
+   if(!strcmp(phase,"prepare") || !strcmp(phase,"commit")){
+     bool prepare=!strcmp(phase,"prepare");
+     if(json_object_object_length(body)!=(prepare?13:8)
+-        || start_json_common(body,&r,prepare,false)<0 || !r.old_owner_present
++        || start_json_common(body,&r,prepare,false,NULL)<0 || !r.old_owner_present
+         || !transport_json_string(body,"offer_id",r.offer_id,sizeof(r.offer_id))
+         || !transport_json_string(body,"binding_id",r.binding_id,sizeof(r.binding_id))
+         || transport_native_counter(body,"native_revision",&r.native_revision)<0 || !r.native_revision || r.native_revision==UINT64_MAX)goto out;
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -27,6 +27,31 @@
+   json_object_object_add(process,"boot_id",json_object_new_string(r->native_process.boot_id));attention_json_u64(process,"pid",r->native_process.pid);attention_json_u64(process,"proc_start_ticks",r->native_process.proc_start_ticks);
+   json_object_object_add(body,"native_process",process);raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
+   assert(start_gate_http(&h,"state",raw)==HTTP_OK);free(raw);reply=jparse_obj_from_evbuffer(h.out_body);assert(reply && json_object_object_length(reply)==8);json_object_put(reply);
++  /* Closed JSON and C target validation emit only fixed first-reason enums. */
++  start_state_diagnostic_capture=true; start_state_diagnostic_count=0;
++  json_object_object_add(body,"expected_input_path",json_object_new_int(7));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"state",raw)==HTTP_BADREQUEST);free(raw);
++  assert(start_state_diagnostic_count==1 && !strcmp(start_state_diagnostic_message,"START state rejected: request_path\n"));start_state_diagnostic_count=0;
++  json_object_object_add(body,"expected_input_path",json_object_new_string(r->expected_input_path));
++  json_object_object_add(body,"native_incarnation",json_object_new_string("bad"));
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string("bad"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"state",raw)==409);free(raw);
++  assert(start_state_diagnostic_count==1 && !strcmp(start_state_diagnostic_message,"START state rejected: native_incarnation\n"));start_state_diagnostic_count=0;
++  json_object_object_add(body,"native_incarnation",json_object_new_string(r->native_incarnation));
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string("bad"));
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"state",raw)==409);free(raw);
++  assert(start_state_diagnostic_count==1 && !strcmp(start_state_diagnostic_message,"START state rejected: fifo_digest_format\n"));start_state_diagnostic_count=0;
++  json_object_object_add(body,"expected_input_path_digest",json_object_new_string(r->expected_input_path_digest));
++  attention_json_u64(process,"pid",99999999);
++  raw=strdup(json_object_to_json_string_ext(body,JSON_C_TO_STRING_PLAIN|JSON_C_TO_STRING_NOSLASHESCAPE));
++  assert(start_gate_http(&h,"state",raw)==HTTP_OK);free(raw);
++  reply=jparse_obj_from_evbuffer(h.out_body);json_object *notready;
++  assert(reply && json_object_object_get_ex(reply,"ready",&notready) && !json_object_get_boolean(notready));json_object_put(reply);
++  assert(start_state_diagnostic_count==1 && !strcmp(start_state_diagnostic_message,"START state rejected: native_process\n"));start_state_diagnostic_capture=false;
++  attention_json_u64(process,"pid",r->native_process.pid);
+   /* Read-only strict absence is stronger than ordinary START admission. */
+   json_object_object_add(body, "require_clean_absent", json_object_new_boolean(true));
+   raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));

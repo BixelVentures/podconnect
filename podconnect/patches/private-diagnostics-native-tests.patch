@@ -70,7 +70,7 @@ diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
 index c807ed6..0b7351d 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -10,6 +10,7 @@ import (
+@@ -10,6 +10,7 @@
  	"encoding/binary"
  	"encoding/hex"
  	"encoding/json"
@@ -78,10 +78,13 @@ index c807ed6..0b7351d 100644
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/ap"
-@@ -2623,3 +2624,101 @@ func TestDealerRoomChangeUsesExistingMoveOwner(t *testing.T) {
- 		})
- 	}
- }
+@@ -2620,6 +2621,161 @@
+ 				t.Setenv("PC_DEALER_ROOM_CHANGE_NEGATIVE", name)
+ 			}
+ 			TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t)
++		})
++	}
++}
 +
 +func TestContentReadFailureStagesKeepExistingResponseAndNoEffects(t *testing.T) {
 +	for _, stage := range []string{"playback_not_ready", "capture_unavailable", "c_output_read", "offer_unavailable"} {
@@ -144,7 +147,11 @@ index c807ed6..0b7351d 100644
 +			log.mu.Lock()
 +			lines := append([]string(nil), log.lines...)
 +			log.mu.Unlock()
-+			if len(lines) != 1 || lines[0] != "content_read_failed stage="+stage {
++			want := "content_read_failed stage=" + stage
++			if stage == "c_output_read" {
++				want += " reason=status_409"
++			}
++			if len(lines) != 1 || lines[0] != want {
 +				t.Fatalf("nonclosed diagnostic: %q", lines)
 +			}
 +			if !errors.Is(errContentPlaybackNotReady, ErrAliasConflict) || errContentPlaybackNotReady.Error() != ErrAliasConflict.Error() {
@@ -180,3 +187,56 @@ index c807ed6..0b7351d 100644
 +		t.Fatalf("readiness classification changed: %v", err)
 +	}
 +}
++
++func TestContentCStateReportsFirstSafeReason(t *testing.T) {
++	for _, reason := range []string{"status_409", "status_other", "schema", "schema_version", "not_ok", "not_ready", "busy", "policy", "volume", "target", "output_process", "output_incarnation", "physical"} {
++		t.Run(reason, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if reason == "status_409" {
++					w.WriteHeader(409)
++					return
++				}
++				if reason == "status_other" {
++					w.WriteHeader(403)
++					return
++				}
++				if reason == "schema" {
++					_, _ = w.Write([]byte(`{"private":"secret"}`))
++					return
++				}
++				state := contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "987654", "1"}}
++				switch reason {
++				case "schema_version":
++					state.Schema = "wrong"
++				case "not_ok":
++					state.OK = false
++				case "not_ready":
++					state.Ready = false
++					state.Busy = true // first failure remains readiness
++				case "busy":
++					state.Busy = true
++				case "policy":
++					state.Policy = "wrong"
++				case "volume":
++					state.Percent = 0
++				case "target":
++					state.Target.DeviceID = "other"
++				case "output_process":
++					state.Target.Process = "wrong"
++				case "output_incarnation":
++					state.Target.Incarnation = "0"
++				case "physical":
++					state.Physical = true
++				}
++				_ = json.NewEncoder(w).Encode(state)
++			}))
++			defer server.Close()
++			c := contentCapture{Scope: roomVolumeScope{"private-account", "private-target", "r0", "987654"}, OwnTone: server.URL}
++			_, err := c.readCState(context.Background())
++			var diagnostic *contentStateError
++			if !errors.As(err, &diagnostic) || !errors.Is(err, ErrAliasConflict) || diagnostic.stage != reason {
++				t.Fatalf("unexpected safe reason: %v", err)
++			}
+ 		})
+ 	}
+ }
