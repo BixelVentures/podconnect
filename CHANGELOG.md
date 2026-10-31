@@ -1,3 +1,8 @@
+## Speakers 0.26.63 — explain retirement preparation
+
+- Log content-free Native retirement-preparation outcomes using fixed reason codes, preserving the existing ownership, retry and journal rules.
+- Cover completed music shutdown and persistent-journal recovery with the existing composed Native and C fixture. The historical live failure cause remains unconfirmed.
+
 ## Speakers 0.26.62 — isolate output-start rejection
 
 - Identify the first rejected output-start condition with content-free reason codes. Preserve admission, playback and retry behavior.
