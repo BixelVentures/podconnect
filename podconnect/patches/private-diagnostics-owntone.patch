@@ -399,3 +399,73 @@
    /* Read-only strict absence is stronger than ordinary START admission. */
    json_object_object_add(body, "require_clean_absent", json_object_new_boolean(true));
    raw = strdup(json_object_to_json_string_ext(body, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1697,7 +1697,10 @@
+         || f->device->selected || f->device->session || f->volumes!=1){
+       recovery_wire_fail(f,"failed Native START did not retire exact C source and stage fresh reader");return;
+     }
+-    puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
++    if (getenv("PC_SHUTDOWN_JOURNAL"))
++      puts("PASS actual completed START Native Close -> C pending -> exact writer joined -> durable retired_known");
++    else
++      puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
+   }else if(!atomic_load(&wire->completed) || !start_active
+       || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
+       || !f->device->session || f->device->volume!=35 || f->volumes!=(getenv("PC_NATIVE_START_EXPECT_TWO")?2:1)){
+@@ -1792,12 +1795,25 @@
+   if(db_init(ATTENTION_TEST_SQLEXT_PATH)<0 || db_perthread_init()<0){f.failed=1;goto cleanup;}database_ready=true;
+   outputs_attention_uuid(outputs_process);
+   assert(outputs_attention_startup() == 0);
++  if (getenv("PC_JOURNAL_INJECT_UNKNOWN")) {
++    struct db_start_guard saved={0}, changed={0};
++    assert(cold_restart && db_start_guard_load(&saved)==1);
++    json_object *record=json_tokener_parse(saved.payload); assert(record);
++    json_object *ns=NULL;assert(json_object_object_get_ex(record,"native_pid_namespace_inode",&ns));
++    uint64_t inode=json_object_get_uint64(ns);assert(inode && inode<UINT64_MAX);
++    json_object_object_add(record,"native_pid_namespace_inode",json_object_new_uint64(inode+1));
++    json_object_object_add(record,"retirement_outcome",json_object_new_string("unknown"));
++    json_object_object_add(record,"retirement_reopen_consumed",json_object_new_boolean(false));
++    changed=saved;changed.payload=strdup(json_object_to_json_string_ext(record,JSON_C_TO_STRING_PLAIN));
++    assert(changed.payload && db_start_guard_save(&saved,&changed)==0);
++    json_object_put(record);free(saved.payload);free(changed.payload);
++  }
+   start_journal_startup();
+-  if (cold_restart)
++  if (cold_restart && !getenv("PC_JOURNAL_INJECT_UNKNOWN"))
+     rollback53_probe("new-version-retained-release", false);
+   if (cold_restart)
+     assert(outputs_start_gate_closed() && !start_journal_fault
+-           && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN);
++           && start_journal_retirement_outcome == (getenv("PC_JOURNAL_INJECT_UNKNOWN") ? OUTPUT_RETIRE_UNKNOWN : OUTPUT_RETIRE_RETIRED_KNOWN));
+   else
+     assert(!outputs_start_gate_closed());
+   if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
+@@ -1890,6 +1906,27 @@
+ 	  target_extra->supports_encryption = 1;
+ 	assert(outputs_device_add(target, false) == target && outputs_device_volume_register(target, 65, -1) == 0);
+       }
++    if (getenv("PC_JOURNAL_RELOAD_READ")) {
++      struct output_start_request probe={.device_id=1}; struct output_start_state read={0};
++      unsigned char hash[32]; static const char hex[]="0123456789abcdef";
++      bool unknown=getenv("PC_JOURNAL_INJECT_UNKNOWN")!=NULL;
++      assert(cold_restart && start_journal_retirement_outcome==(unknown ? OUTPUT_RETIRE_UNKNOWN : OUTPUT_RETIRE_RETIRED_KNOWN));
++      assert(start_boot_id(probe.native_process.boot_id)); probe.native_process.pid=getpid();
++      assert(start_process_ticks(probe.native_process.pid,&probe.native_process.proc_start_ticks)==1);
++      memset(probe.native_incarnation,'d',32);strcpy(probe.expected_input_path,fifo);
++      gcry_md_hash_buffer(GCRY_MD_SHA256,hash,fifo,strlen(fifo));
++      for(size_t i=0;i<32;i++){probe.expected_input_path_digest[i*2]=hex[hash[i]>>4];probe.expected_input_path_digest[i*2+1]=hex[hash[i]&15];}
++      assert(outputs_start_state_get(&probe,&read)==0);
++      assert(outputs_start_gate_closed());
++      if (unknown) {
++        assert(!read.ready && read.busy && start_startup_quarantine);
++        fprintf(stderr,"PASS fresh C reloaded UNKNOWN and denies guarded state; gate remains closed\n");
++      } else {
++        assert(read.ready && !read.busy);
++        fprintf(stderr,"PASS fresh C reloaded durable retired_known and offers guarded state; gate remains closed\n");
++      }
++      goto cleanup;
++    }
+     native_start_wire_run(&f,fifo);goto cleanup;
+   }
+   if(mode==16 || mode==17 || mode==19 || mode==20 || mode==22 || mode==23 || mode==24 || mode==25){

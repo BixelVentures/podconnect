@@ -78,7 +78,32 @@ index c807ed6..0b7351d 100644
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/ap"
-@@ -2620,6 +2621,161 @@
+@@ -1416,6 +1417,24 @@
+ 		t.Log("PASS real episode decoder/publicNativeSTART accepted same guarded writer/custody/digest/result shape with synthetic C wire ACK; no actual C/physical claim")
+ 		return
+ 	}
++	if os.Getenv("PC_SHUTDOWN_JOURNAL") != "" {
++		p.app.moveCustodyMu.Lock()
++		normal := p.app.startCustody == op && op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed"
++		p.app.moveCustodyMu.Unlock()
++		if !normal {
++			t.Fatal("fresh actual START lacks completed custody")
++		}
++		// The fixture has no connected Dealer; instantiate the existing inert owner for Close.
++		nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++		p.Close()
++		p.app.moveCustodyMu.Lock()
++		retired := worker.Closed() && p.app.startCustody == nil && p.app.retirementPending == nil && !p.app.moveCustodyUnknown
++		p.app.moveCustodyMu.Unlock()
++		if !retired {
++			t.Fatal("normal shutdown did not finish actual C retirement")
++		}
++		t.Log("PASS fresh completed START -> real Native Close -> actual C retirement")
++	}
+ 	if os.Getenv("PC70_RELEASE_COMPOSE") == "start" {
+ 		testManualReleaseComposed(t, p, server)
+ 		return
+@@ -2620,6 +2639,161 @@
  				t.Setenv("PC_DEALER_ROOM_CHANGE_NEGATIVE", name)
  			}
  			TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t)
@@ -157,9 +182,9 @@ index c807ed6..0b7351d 100644
 +			if !errors.Is(errContentPlaybackNotReady, ErrAliasConflict) || errContentPlaybackNotReady.Error() != ErrAliasConflict.Error() {
 +				t.Fatal("readiness error changed conflict classification")
 +			}
-+		})
-+	}
-+}
+ 		})
+ 	}
+ }
 +
 +func TestContentCaptureNamesMissingInitialReadinessWithoutChangingConflict(t *testing.T) {
 +	p, _ := contentFixture(t)
@@ -237,6 +262,6 @@ index c807ed6..0b7351d 100644
 +			if !errors.As(err, &diagnostic) || !errors.Is(err, ErrAliasConflict) || diagnostic.stage != reason {
 +				t.Fatalf("unexpected safe reason: %v", err)
 +			}
- 		})
- 	}
- }
++		})
++	}
++}

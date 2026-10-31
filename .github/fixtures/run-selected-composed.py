@@ -12,6 +12,10 @@ root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)
 env = dict(os.environ, PC_NATIVE_START_READY_FILE=str(ready))
+if env.get("PC_SHUTDOWN_JOURNAL"):
+    for item in (root / "shutdown-songs.db", root / "shutdown-music.fifo"):
+        item.unlink(missing_ok=True)
+    env.update(PC70_COLD_DATABASE=str(root / "shutdown-songs.db"), PC70_COLD_FIFO=str(root / "shutdown-music.fifo"))
 if mode == "actual-c-selected-successor":
     env["PC_NATIVE_START_EXPECT_TWO"] = "1"
 with (
@@ -55,6 +59,21 @@ with (
     except subprocess.TimeoutExpired:
         c.kill()
         c_status = c.wait()
+    if not n.returncode and not c_status and env.get("PC_SHUTDOWN_JOURNAL"):
+        import shutil
+        shutil.copyfile(env["PC70_COLD_DATABASE"], root / "shutdown-terminal.db")
+        with (root / "shutdown-reload.log").open("w") as reload_log:
+            reload_env = dict(env, PC70_COLD_RESTART="1", PC_JOURNAL_RELOAD_READ="1")
+            reloaded = subprocess.run(["src/airplay_callback_owner", "--native-start-wire"], env=reload_env, stdout=reload_log, stderr=subprocess.STDOUT, check=False)
+        if reloaded.returncode:
+            raise SystemExit("C journal reload failed; see shutdown-reload.log")
+        unknown_db = root / "shutdown-unknown.db"
+        shutil.copyfile(root / "shutdown-terminal.db", unknown_db)
+        with (root / "shutdown-unknown.log").open("w") as unknown_log:
+            unknown_env = dict(reload_env, PC70_COLD_DATABASE=str(unknown_db), PC_JOURNAL_INJECT_UNKNOWN="1")
+            unknown = subprocess.run(["src/airplay_callback_owner", "--native-start-wire"], env=unknown_env, stdout=unknown_log, stderr=subprocess.STDOUT, check=False)
+        if unknown.returncode:
+            raise SystemExit("C UNKNOWN journal reload failed; see shutdown-unknown.log")
     skew_ms = None
     if not n.returncode and not c_status and os.getenv("PC_REQUIRE_FIRST_SYNC_CLOCK"):
         match = re.search(
@@ -81,3 +100,4 @@ with (
             and (skew_ms is None or skew_ms > 500)
         )
     )
+
