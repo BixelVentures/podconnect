@@ -1,3 +1,7 @@
+## Speakers 0.26.61 — identify rejected passive music start
+
+- Log the first failed content-start read stage without account, media, tokens or raw payloads. No start, retry or admission behavior changes.
+
 ## Control 0.10.28 — retain runtime on OAuth renewal
 
 - Keep the active runtime when OAuth credentials are renewed; a real configuration or reauthentication change still reloads the entry.
