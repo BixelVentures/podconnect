@@ -1,3 +1,7 @@
+## Speakers 0.26.64 — repair selected-start test synchronization
+
+- Synchronize the existing selected-start fixture when capturing the staged stream. Playback and admission behavior are unchanged.
+
 ## Speakers 0.26.63 — explain retirement preparation
 
 - Log content-free Native retirement-preparation outcomes using fixed reason codes, preserving the existing ownership, retry and journal rules.
