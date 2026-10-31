@@ -148,7 +148,7 @@ diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
 index 67c13e0..05817d7 100644
 --- a/daemon/room_content_http.go
 +++ b/daemon/room_content_http.go
-@@ -3,6 +3,7 @@ package daemon
+@@ -3,6 +3,7 @@
  import (
  	"context"
  	"encoding/json"
@@ -156,7 +156,7 @@ index 67c13e0..05817d7 100644
  	"io"
  	"net/http"
  	"time"
-@@ -79,26 +80,35 @@ func (s *ConcreteApiServer) handleContentControls(w http.ResponseWriter, r *http
+@@ -79,26 +80,40 @@
  	defer cancel()
  	value, err := s.roomTransportAsk(ctx, apiContentObserve, scope)
  	if err != nil {
@@ -176,7 +176,12 @@ index 67c13e0..05817d7 100644
  	}
  	state, err := capture.readCState(ctx)
  	if err != nil {
-+		s.log.Warnf("content_read_failed stage=c_output_read")
++		stage := "other"
++		var stateErr *contentStateError
++		if errors.As(err, &stateErr) {
++			stage = stateErr.stage
++		}
++		s.log.Warnf("content_read_failed stage=c_output_read reason=%s", stage)
  		roomTransportResponse(w, nil, err)
  		return
  	}
@@ -192,3 +197,118 @@ index 67c13e0..05817d7 100644
  		roomTransportResponse(w, nil, ErrAliasConflict)
  		return
  	}
+--- a/daemon/room_content_c.go
++++ b/daemon/room_content_c.go
+@@ -85,16 +85,27 @@
+ 	return decoder.Decode(out)
+ }
+ func contentHTTP(ctx context.Context, method, url string, payload, out any) error {
++	return contentHTTPStage(ctx, method, url, payload, out, nil)
++}
++
++func contentHTTPStage(ctx context.Context, method, url string, payload, out any, stage *string) error {
++	fail := func(value string) {
++		if stage != nil {
++			*stage = value
++		}
++	}
+ 	var body io.Reader
+ 	if payload != nil {
+ 		raw, err := json.Marshal(payload)
+ 		if err != nil {
++			fail("request_encode")
+ 			return err
+ 		}
+ 		body = bytes.NewReader(raw)
+ 	}
+ 	req, err := http.NewRequestWithContext(ctx, method, url, body)
+ 	if err != nil {
++		fail("request_create")
+ 		return err
+ 	}
+ 	if payload != nil {
+@@ -103,14 +114,32 @@
+ 	client := &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAliasConflict }}
+ 	reply, err := client.Do(req)
+ 	if err != nil {
++		fail("transport")
+ 		return err
+ 	}
+ 	defer reply.Body.Close()
+ 	raw, err := io.ReadAll(io.LimitReader(reply.Body, 16385))
+-	if err != nil || len(raw) > 16384 || reply.StatusCode != 200 {
++	if err != nil {
++		fail("response_read")
+ 		return ErrAliasConflict
+ 	}
+-	return strictContentJSON(raw, out)
++	if len(raw) > 16384 {
++		fail("response_size")
++		return ErrAliasConflict
++	}
++	if reply.StatusCode != 200 {
++		if reply.StatusCode == 409 {
++			fail("status_409")
++		} else {
++			fail("status_other")
++		}
++		return ErrAliasConflict
++	}
++	err = strictContentJSON(raw, out)
++	if err != nil {
++		fail("schema")
++	}
++	return err
+ }
+ func (c *contentCapture) endpoint(suffix string) string {
+ 	return strings.TrimSuffix(c.OwnTone, "/") + "/api/outputs/" + c.Scope.HomePodID + "/start/" + suffix
+@@ -126,10 +155,36 @@
+ }
+ func (c *contentCapture) readCState(ctx context.Context) (contentCState, error) {
+ 	var state contentCState
+-	err := contentHTTP(ctx, "POST", c.endpoint("state"), c.stateRequest(), &state)
+-	if err != nil || state.Schema != "podconnect.output_start_state.v1" || !state.OK || !state.Ready || state.Busy || state.Policy != start35Policy || state.Percent != 35 || state.Target.DeviceID != c.Scope.HomePodID || !volumeUUID.MatchString(state.Target.Process) || !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0" || state.Physical {
+-		return state, ErrAliasConflict
++	stage := ""
++	err := contentHTTPStage(ctx, "POST", c.endpoint("state"), c.stateRequest(), &state, &stage)
++	if err != nil {
++		return state, &contentStateError{stage}
+ 	}
++	switch {
++	case state.Schema != "podconnect.output_start_state.v1":
++		stage = "schema_version"
++	case !state.OK:
++		stage = "not_ok"
++	case !state.Ready:
++		stage = "not_ready"
++	case state.Busy:
++		stage = "busy"
++	case state.Policy != start35Policy:
++		stage = "policy"
++	case state.Percent != 35:
++		stage = "volume"
++	case state.Target.DeviceID != c.Scope.HomePodID:
++		stage = "target"
++	case !volumeUUID.MatchString(state.Target.Process):
++		stage = "output_process"
++	case !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0":
++		stage = "output_incarnation"
++	case state.Physical:
++		stage = "physical"
++	}
++	if stage != "" {
++		return state, &contentStateError{stage}
++	}
+ 	return state, nil
+ }
+ func (op *contentOperation) cPrepareBody() any {
+@@ -211,3 +266,9 @@
+ 	op.mu.Unlock()
+ 	return reply, nil
+ }
++
++// Private enum only; never include response data or transport errors.
++type contentStateError struct{ stage string }
++
++func (*contentStateError) Error() string { return ErrAliasConflict.Error() }
++func (*contentStateError) Unwrap() error { return ErrAliasConflict }

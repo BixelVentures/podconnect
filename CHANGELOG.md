@@ -1,3 +1,7 @@
+## Speakers 0.26.62 — isolate output-start rejection
+
+- Identify the first rejected output-start condition with content-free reason codes. Preserve admission, playback and retry behavior.
+
 ## Speakers 0.26.61 — identify rejected passive music start
 
 - Log the first failed content-start read stage without account, media, tokens or raw payloads. No start, retry or admission behavior changes.
