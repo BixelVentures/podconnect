@@ -65,3 +65,118 @@
 +		t.Fatalf("MOVE/unknown not distinguished: %+v", d)
 +	}
 +}
+
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index c807ed6..0b7351d 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"encoding/binary"
+ 	"encoding/hex"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/ap"
+@@ -2623,3 +2624,101 @@ func TestDealerRoomChangeUsesExistingMoveOwner(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestContentReadFailureStagesKeepExistingResponseAndNoEffects(t *testing.T) {
++	for _, stage := range []string{"playback_not_ready", "capture_unavailable", "c_output_read", "offer_unavailable"} {
++		t.Run(stage, func(t *testing.T) {
++			log := &contentFailureLog{}
++			var cReads, effects atomic.Int32
++			c := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.Method != "POST" || r.URL.Path != "/api/outputs/987654/start/state" {
++					effects.Add(1)
++					w.WriteHeader(500)
++					return
++				}
++				cReads.Add(1)
++				if stage == "c_output_read" {
++					w.WriteHeader(409)
++					return
++				}
++				_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: 35, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "987654", "1"}})
++			}))
++			defer c.Close()
++			server := &ConcreteApiServer{log: log, requests: make(chan ApiRequest)}
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for req := range server.requests {
++					switch req.Type {
++					case apiContentObserve:
++						if stage == "playback_not_ready" {
++							req.Reply(nil, errContentPlaybackNotReady)
++						} else if stage == "capture_unavailable" {
++							req.Reply(nil, ErrAliasConflict)
++						} else {
++							req.Reply(&contentCapture{Scope: roomVolumeScope{"private-account-marker", "private-target-marker", "r0", "987654"}, OwnTone: c.URL}, nil)
++						}
++					case apiContentOffer:
++						req.Reply(nil, ErrAliasConflict)
++					default:
++						effects.Add(1)
++						req.Reply(nil, ErrAliasConflict)
++					}
++				}
++			}()
++			rec := httptest.NewRecorder()
++			server.handleContentControls(rec, httptest.NewRequest("GET", "/player/room_content/controls?account_user_id=private-account-marker&target_id=private-target-marker&room_id=r0&homepod_id=987654", nil))
++			close(server.requests)
++			<-done
++			if rec.Code != 409 || rec.Body.Len() != 0 {
++				t.Fatalf("response changed: %d %s", rec.Code, rec.Body.String())
++			}
++			if effects.Load() != 0 {
++				t.Fatal("read dispatched an effect")
++			}
++			wantReads := int32(0)
++			if stage == "c_output_read" || stage == "offer_unavailable" {
++				wantReads = 1
++			}
++			if cReads.Load() != wantReads {
++				t.Fatal("C read count", cReads.Load())
++			}
++			log.mu.Lock()
++			lines := append([]string(nil), log.lines...)
++			log.mu.Unlock()
++			if len(lines) != 1 || lines[0] != "content_read_failed stage="+stage {
++				t.Fatalf("nonclosed diagnostic: %q", lines)
++			}
++			if !errors.Is(errContentPlaybackNotReady, ErrAliasConflict) || errContentPlaybackNotReady.Error() != ErrAliasConflict.Error() {
++				t.Fatal("readiness error changed conflict classification")
++			}
++		})
++	}
++}
++
++func TestContentCaptureNamesMissingInitialReadinessWithoutChangingConflict(t *testing.T) {
++	p, _ := contentFixture(t)
++	access := ap.NewAccesspoint(&librespot.NullLogger{}, nil, "fixture")
++	left, right := net.Pipe()
++	defer left.Close()
++	defer right.Close()
++	fields := reflect.ValueOf(access).Elem()
++	set := func(name string, v reflect.Value) {
++		f := fields.FieldByName(name)
++		reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(v)
++	}
++	set("conn", reflect.ValueOf(left))
++	set("encConn", reflect.New(fields.FieldByName("encConn").Type().Elem()))
++	set("welcome", reflect.ValueOf(&pb.APWelcome{CanonicalUsername: proto.String("private-account-marker")}))
++	nextSessionField(p.sess, "ap", access)
++	if p.player == nil {
++		p.player = &player.Player{}
++	}
++	p.hasSpotConnId = true
++	p.hasInitialConnectState = false
++	p.playbackReadyCh = make(chan struct{})
++	capture, err := p.captureContent(roomVolumeScope{"private-account-marker", "private-target-marker", "r0", "987654"})
++	if capture != nil || !errors.Is(err, errContentPlaybackNotReady) || !errors.Is(err, ErrAliasConflict) || err.Error() != ErrAliasConflict.Error() {
++		t.Fatalf("readiness classification changed: %v", err)
++	}
++}

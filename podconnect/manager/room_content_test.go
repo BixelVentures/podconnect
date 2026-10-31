@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func contentStateFixture(t *testing.T) (*nativeRoomContentControls, *roomContentBinding) {
@@ -102,4 +104,71 @@ func TestContentStateRejectsMixedOwnerConfigurationAndUnavailableSchemas(t *test
 			t.Fatal("extra asserted authority accepted")
 		}
 	})
+}
+
+func TestContentStateFailureStagesPreserveReadOnlyContractAndPrivateData(t *testing.T) {
+	for _, stage := range []string{"configured_binding", "native_read", "closed_schema", "native_not_ready", "scope_binding", "offer_policy", "actions", "configuration_changed", "offer_expired", ""} {
+		t.Run(stage, func(t *testing.T) {
+			state, binding := contentStateFixture(t)
+			var lines bytes.Buffer
+			writer, flags, prefix := log.Writer(), log.Flags(), log.Prefix()
+			log.SetOutput(&lines)
+			log.SetFlags(0)
+			log.SetPrefix("")
+			t.Cleanup(func() { log.SetOutput(writer); log.SetFlags(flags); log.SetPrefix(prefix) })
+			originalRead := roomContentRPC
+			reads := 0
+			roomContentRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
+				reads++
+				raw, err := originalRead(ctx, base, method, path, body)
+				switch stage {
+				case "native_read":
+					return nil, fmt.Errorf("private-native-error-with-account-and-content")
+				case "closed_schema":
+					return []byte(`{"private-native-body-with-content":true}`), nil
+				case "configuration_changed":
+					roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
+				case "offer_expired":
+					time.Sleep(5 * time.Millisecond)
+				}
+				return raw, err
+			}
+			switch stage {
+			case "configured_binding":
+				roomContentBindingNow = func(roomTransportScope) (roomContentBinding, bool) { return roomContentBinding{}, false }
+			case "native_not_ready":
+				state.Ready = false
+			case "scope_binding":
+				state.Scope.Account = "private-foreign-account"
+			case "offer_policy":
+				state.Offer.Policy = "private-foreign-policy"
+			case "actions":
+				state.Actions = []string{"private-invalid-action"}
+			case "offer_expired":
+				state.Offer.Expires = 1
+			}
+			q := url.Values{"account_user_id": {binding.Scope.Account}, "target_id": {binding.Scope.Target}, "room_id": {binding.Scope.Room}, "homepod_id": {binding.Scope.Homepod}}
+			w := httptest.NewRecorder()
+			roomContentStateHandler(w, httptest.NewRequest("GET", "/api/room-content/state?"+q.Encode(), nil))
+			if stage == "" {
+				if w.Code != 200 || lines.Len() != 0 {
+					t.Fatal("valid idle read changed or logged", w.Code, lines.String())
+				}
+			} else {
+				if w.Code != 409 || w.Body.String() != "content unavailable\n" {
+					t.Fatal("failure response changed", w.Code, w.Body.String())
+				}
+				if lines.String() != "content_read_failed stage="+stage+"\n" {
+					t.Fatal("wrong stage or private data logged", lines.String())
+				}
+			}
+			wantReads := 1
+			if stage == "configured_binding" {
+				wantReads = 0
+			}
+			if reads != wantReads {
+				t.Fatal("passive read count changed", reads)
+			}
+		})
+	}
 }

@@ -117,3 +117,78 @@
 +	d := p.connectOwnershipDiagnostic()
 +	p.app.log.Infof("connect-recovery native reason=ownership_failure stage=%s retained_start=%t retained_move=%t custody_unknown=%t retirement_pending=%t writer_owner_matches=%t alias_retired=%t quarantined=%t move_reserved=%t retained_owner_matches=%t retained_session_matches=%t retained_alias_matches=%t", stage, d.Start, d.Move, d.Unknown, d.Retirement, d.WriterOwner, d.AliasRetired, d.Quarantined, d.Reservation, d.RetainedOwner, d.RetainedSession, d.RetainedAlias)
 +}
+
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index 4e08a2f..f8e0245 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -243,10 +243,20 @@ func (p *AppPlayer) contentBusyLocked() bool {
+ 	// An elapsed deadline alone cannot open a scheduling gap for another owner.
+ 	return p.roomContentQuarantined || p.roomContentReservation != nil || p.moveBusyLocked()
+ }
++
++// Same conflict classification and text; only the read handler names this stage.
++var errContentPlaybackNotReady = fmt.Errorf("%w", ErrAliasConflict)
++
+ func (p *AppPlayer) captureContent(scope roomVolumeScope, readonly ...bool) (*contentCapture, error) {
+ 	actualAccount, authenticated := p.sess.BoundUsername()
+ 	actualProcess, processOK := nativeContentProcess()
+-	if !processOK || !authenticated || p.app == nil || p.app.cfg == nil || p.sess == nil || p.player == nil || p.state == nil || p.state.player == nil || p.state.device == nil || !p.playbackReady() || actualAccount != scope.AccountUserID || scope.AccountUserID == "" || p.app.deviceId != scope.TargetID || p.spotConnId == "" || p.app.cfg.AudioBackend != "pipe" || p.app.cfg.AudioOutputPipeFormat != "s16le" || !p.app.cfg.ExternalVolume || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) {
++	if !processOK || !authenticated || p.app == nil || p.app.cfg == nil || p.sess == nil || p.player == nil || p.state == nil || p.state.player == nil || p.state.device == nil {
++		return nil, ErrAliasConflict
++	}
++	if !p.playbackReady() {
++		return nil, errContentPlaybackNotReady
++	}
++	if actualAccount != scope.AccountUserID || scope.AccountUserID == "" || p.app.deviceId != scope.TargetID || p.spotConnId == "" || p.app.cfg.AudioBackend != "pipe" || p.app.cfg.AudioOutputPipeFormat != "s16le" || !p.app.cfg.ExternalVolume || !filepath.IsAbs(p.app.cfg.AudioOutputPipe) || !roomTransportURL(p.app.cfg.RoomTransportOwnToneURL) {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	actualSource, sourceErr := p.player.Start35CurrentSource(context.Background())
+diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
+index 67c13e0..05817d7 100644
+--- a/daemon/room_content_http.go
++++ b/daemon/room_content_http.go
+@@ -3,6 +3,7 @@ package daemon
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"io"
+ 	"net/http"
+ 	"time"
+@@ -79,26 +80,35 @@ func (s *ConcreteApiServer) handleContentControls(w http.ResponseWriter, r *http
+ 	defer cancel()
+ 	value, err := s.roomTransportAsk(ctx, apiContentObserve, scope)
+ 	if err != nil {
++		stage := "capture_unavailable"
++		if errors.Is(err, errContentPlaybackNotReady) {
++			stage = "playback_not_ready"
++		}
++		s.log.Warnf("content_read_failed stage=%s", stage)
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+ 	capture, ok := value.(*contentCapture)
+ 	if !ok || capture == nil {
++		s.log.Warnf("content_read_failed stage=capture_unavailable")
+ 		roomTransportResponse(w, nil, ErrAliasConflict)
+ 		return
+ 	}
+ 	state, err := capture.readCState(ctx)
+ 	if err != nil {
++		s.log.Warnf("content_read_failed stage=c_output_read")
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+ 	value, err = s.roomTransportAsk(ctx, apiContentOffer, contentOfferActorRequest{capture, state.Target, ctx})
+ 	if err != nil {
++		s.log.Warnf("content_read_failed stage=offer_unavailable")
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+ 	op, ok := value.(*contentOperation)
+ 	if !ok || op == nil || !s.roomContents.put(op) {
++		s.log.Warnf("content_read_failed stage=offer_unavailable")
+ 		roomTransportResponse(w, nil, ErrAliasConflict)
+ 		return
+ 	}
