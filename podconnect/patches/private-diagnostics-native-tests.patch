@@ -78,7 +78,32 @@ index c807ed6..0b7351d 100644
  	"fmt"
  	librespot "github.com/devgianlu/go-librespot"
  	"github.com/devgianlu/go-librespot/ap"
-@@ -2620,6 +2621,161 @@
+@@ -1416,6 +1417,24 @@
+ 		t.Log("PASS real episode decoder/publicNativeSTART accepted same guarded writer/custody/digest/result shape with synthetic C wire ACK; no actual C/physical claim")
+ 		return
+ 	}
++	if os.Getenv("PC_SHUTDOWN_JOURNAL") != "" {
++		p.app.moveCustodyMu.Lock()
++		normal := p.app.startCustody == op && op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed"
++		p.app.moveCustodyMu.Unlock()
++		if !normal {
++			t.Fatal("fresh actual START lacks completed custody")
++		}
++		// The fixture has no connected Dealer; instantiate the existing inert owner for Close.
++		nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++		p.Close()
++		p.app.moveCustodyMu.Lock()
++		retired := worker.Closed() && p.app.startCustody == nil && p.app.retirementPending == nil && !p.app.moveCustodyUnknown
++		p.app.moveCustodyMu.Unlock()
++		if !retired {
++			t.Fatal("normal shutdown did not finish actual C retirement")
++		}
++		t.Log("PASS fresh completed START -> real Native Close -> actual C retirement")
++	}
+ 	if os.Getenv("PC70_RELEASE_COMPOSE") == "start" {
+ 		testManualReleaseComposed(t, p, server)
+ 		return
+@@ -2620,6 +2639,161 @@
  				t.Setenv("PC_DEALER_ROOM_CHANGE_NEGATIVE", name)
  			}
  			TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t)
@@ -157,9 +182,9 @@ index c807ed6..0b7351d 100644
 +			if !errors.Is(errContentPlaybackNotReady, ErrAliasConflict) || errContentPlaybackNotReady.Error() != ErrAliasConflict.Error() {
 +				t.Fatal("readiness error changed conflict classification")
 +			}
-+		})
-+	}
-+}
+ 		})
+ 	}
+ }
 +
 +func TestContentCaptureNamesMissingInitialReadinessWithoutChangingConflict(t *testing.T) {
 +	p, _ := contentFixture(t)
@@ -236,6 +261,123 @@ index c807ed6..0b7351d 100644
 +			var diagnostic *contentStateError
 +			if !errors.As(err, &diagnostic) || !errors.Is(err, ErrAliasConflict) || diagnostic.stage != reason {
 +				t.Fatalf("unexpected safe reason: %v", err)
++			}
++		})
++	}
++}
+--- a/daemon/room_retirement_test.go
++++ b/daemon/room_retirement_test.go
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -768,7 +769,106 @@
+ 			}
+ 			if app.moveCustodyUnknown || app.startCustody != nextOp || app.retirementPending != nextAttempt || app.openedWriterOwner != next || app.openedWriterGeneration != generation {
+ 				t.Fatal("late old C receipt cleared or poisoned the successor")
++			}
++		})
++	}
++}
++
++type retirementPrepareCapture struct {
++	librespot.NullLogger
++	mu    sync.Mutex
++	lines []string
++}
++
++func (l *retirementPrepareCapture) Infof(format string, args ...interface{}) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.lines = append(l.lines, "info "+fmt.Sprintf(format, args...))
++}
++func (l *retirementPrepareCapture) Warnf(format string, args ...interface{}) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.lines = append(l.lines, "warn "+fmt.Sprintf(format, args...))
++}
++
++func TestRetirementPrepareEmitsOneContentFreeOutcome(t *testing.T) {
++	for _, tc := range []struct{ name, want string }{
++		{"no_custody", "info retirement_prepare outcome=skipped reason=no_matching_custody"},
++		{"custody_uncertain", "info retirement_prepare outcome=skipped reason=custody_uncertain"},
++		{"invalid_witness", "info retirement_prepare outcome=skipped reason=invalid_witness"},
++		{"owner_unavailable", "info retirement_prepare outcome=skipped reason=owner_unavailable"},
++		{"request_failed", "warn retirement_prepare outcome=request_failed reason=unavailable"},
++		{"invalid_token", "warn retirement_prepare outcome=receipt_rejected reason=invalid_token"},
++		{"invalid_receipt", "warn retirement_prepare outcome=receipt_rejected reason=invalid_receipt"},
++		{"owner_changed", "info retirement_prepare outcome=skipped reason=owner_changed"},
++		{"prepared", "info retirement_prepare outcome=prepared reason=none"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var app *App
++			var writer output.MovePipeIdentity
++			calls := 0
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				calls++
++				if tc.name == "request_failed" {
++					http.Error(w, "private-remote-body", http.StatusServiceUnavailable)
++					return
++				}
++				var body map[string]json.RawMessage
++				if json.NewDecoder(r.Body).Decode(&body) != nil {
++					t.Error("request malformed")
++					return
++				}
++				var reservation string
++				_ = json.Unmarshal(body["native_reservation_id"], &reservation)
++				receipt := retirementReply("start", "prepare", reservation, writer)
++				if tc.name == "invalid_token" {
++					receipt.RetirementToken = "private-invalid-token"
++				}
++				if tc.name == "invalid_receipt" {
++					receipt.DurablePending = false
++				}
++				if tc.name == "owner_changed" {
++					app.moveCustodyMu.Lock()
++					app.moveCustodyUnknown = true
++					app.moveCustodyMu.Unlock()
++				}
++				_ = json.NewEncoder(w).Encode(receipt)
++			}))
++			defer server.Close()
++			var owner *AppPlayer
++			app, owner, _ = retirementOwnerFixture(t, server.URL, "start")
++			worker := owner.player
++			defer worker.Close()
++			writer = app.openedWriter
++			log := &retirementPrepareCapture{}
++			app.log = log
++			switch tc.name {
++			case "no_custody":
++				app.startCustody = nil
++			case "custody_uncertain":
++				app.moveCustodyUnknown = true
++			case "invalid_witness":
++				app.openedWriter.FD = "invalid-private-marker"
++			case "owner_unavailable":
++				owner.player = nil
+ 			}
++			result := app.prepareCompletedRetirementFor(owner)
++			if (result != nil) != (tc.name == "prepared") {
++				t.Fatal("prepare result changed")
++			}
++			wantCalls := 1
++			if tc.name == "no_custody" || tc.name == "custody_uncertain" || tc.name == "invalid_witness" || tc.name == "owner_unavailable" {
++				wantCalls = 0
++			}
++			if calls != wantCalls {
++				t.Fatalf("unexpected request count: %d", calls)
++			}
++			log.mu.Lock()
++			lines := append([]string(nil), log.lines...)
++			log.mu.Unlock()
++			if len(lines) != 1 || lines[0] != tc.want {
++				t.Fatalf("diagnostic was not exactly one closed enum: %q", lines)
 +			}
  		})
  	}
