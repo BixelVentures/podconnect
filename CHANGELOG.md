@@ -1,3 +1,7 @@
+## Control 0.10.29 — identify available queue metadata
+
+- Mark queue titles as known only when real metadata is available, preserving queue occurrence identities.
+
 ## Speakers 0.26.64 — repair selected-start test synchronization
 
 - Synchronize the existing selected-start fixture when capturing the staged stream. Playback and admission behavior are unchanged.

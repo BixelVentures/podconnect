@@ -393,6 +393,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(
             [row["name"] for row in value["items"]], ["Faktisk køsang"] * 2
         )
+        self.assertEqual([row["metadata_known"] for row in value["items"]], [True, True])
         self.assertEqual(
             [row["artist"] for row in value["items"]], ["Faktisk kunstner"] * 2
         )
@@ -413,6 +414,27 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
             self.assertEqual(
                 [row["name"] for row in value["items"]], ["Nummer i køen"] * 2
             )
+            self.assertEqual([row["metadata_known"] for row in value["items"]], [False, False])
+
+    async def test_queue_late_metadata_is_structural_and_preserves_occurrences(self):
+        data = self.entries[0].runtime_data
+        data.observations._queue_cache = None
+        cold = await self.queue_read()
+        self.assertEqual([row["metadata_known"] for row in cold["items"]], [False, False])
+        data.observations._queue_cache = {
+            "ok": True,
+            "config_entry_id": "account-alpha",
+            "owner_epoch": data.coordinator.owner_epoch,
+            "items": [{"uri": "spotify:track:" + "0" * 22, "name": "Nummer i køen", "artists": []}],
+        }
+        data.observations._queue_cached_at = time.monotonic()
+        warm = await self.queue_read()
+        self.assertEqual([row["metadata_known"] for row in warm["items"]], [True, True])
+        self.assertEqual([row["name"] for row in warm["items"]], ["Nummer i køen"] * 2)
+        for key in ("option_id", "index", "uri"):
+            self.assertEqual([row[key] for row in cold["items"]], [row[key] for row in warm["items"]])
+        self.assertEqual(cold["queue"]["queue_revision"], warm["queue"]["queue_revision"])
+        self.assertEqual(self.queue_posts, [])
 
     async def test_cold_queue_enriches_exact_native_occurrences(self):
         data = self.entries[0].runtime_data
@@ -425,6 +447,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         value = await self.queue_read()
         self.assertEqual(self.queue_headers[-1], "1")
         self.assertEqual([row["name"] for row in value["items"]], ["Faktisk køsang"] * 2)
+        self.assertEqual([row["metadata_known"] for row in value["items"]], [True, True])
         self.assertEqual([row["artist"] for row in value["items"]], ["Faktisk kunstner"] * 2)
         self.assertEqual([row["artwork"] for row in value["items"]], ["https://i.scdn.co/image/" + "a" * 40] * 2)
         self.assertNotEqual(value["items"][0]["option_id"], value["items"][1]["option_id"])
