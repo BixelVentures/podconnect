@@ -329,11 +329,8 @@ class RoomQueue:
         for row in queue["items"]:
             label = metadata.get(row["uri"], {})
             name = label.get("name")
-            name = (
-                name
-                if isinstance(name, str) and 1 <= len(name) <= 256
-                else "Nummer i køen"
-            )
+            metadata_known = isinstance(name, str) and 1 <= len(name) <= 256 and bool(name.strip())
+            name = name if metadata_known else "Nummer i køen"
             artists = label.get("artists", [])
             artist = (
                 ", ".join(artists)[:512]
@@ -348,6 +345,7 @@ class RoomQueue:
                     "index": row["position"],
                     "uri": row["uri"],
                     "name": name,
+                    "metadata_known": metadata_known,
                     "artist": artist,
                     "artwork": artwork["url"] if artwork else None,
                 }
