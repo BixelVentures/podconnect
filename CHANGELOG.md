@@ -1,3 +1,7 @@
+## Speakers 0.26.65 — isolated radio playback
+
+- Add the isolated radio worker and guarded handoff between radio and Spotify output.
+
 ## Control 0.10.29 — identify available queue metadata
 
 - Mark queue titles as known only when real metadata is available, preserving queue occurrence identities.
