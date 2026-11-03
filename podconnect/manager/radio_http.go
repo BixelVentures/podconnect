@@ -5,12 +5,39 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 var radioOwner = newRadioCoordinator(nil)
 
+// readRadioTransportToken guards the external manager radio routes. Keep
+// older configurations working until the dedicated option is set.
+func readRadioTransportToken() string {
+	raw, err := os.ReadFile(filepath.Join(dataDir, "options.json"))
+	if err != nil {
+		return ""
+	}
+	var options struct {
+		RadioTransportToken string          `json:"radio_transport_token"`
+		AttentionToken      json.RawMessage `json:"attention_token"`
+	}
+	if json.Unmarshal(raw, &options) != nil {
+		return ""
+	}
+	if token := strings.TrimSpace(options.RadioTransportToken); token != "" {
+		return token
+	}
+	var legacy string
+	if json.Unmarshal(options.AttentionToken, &legacy) != nil {
+		return ""
+	}
+	return strings.TrimSpace(legacy)
+}
+
 func radioAuthed(r *http.Request) bool {
-	token := readAttentionToken()
+	token := readRadioTransportToken()
 	given := r.Header.Get("X-PodConnect-Token")
 	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(given)) == 1
 }

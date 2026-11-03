@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -183,6 +184,70 @@ func TestRadioHTTPAuthAndStrictJSON(t *testing.T) {
 		if w.Code != 400 {
 			t.Fatal(w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestRadioTransportTokenScope(t *testing.T) {
+	old := dataDir
+	defer func() { dataDir = old }()
+	dataDir = t.TempDir()
+	options := filepath.Join(dataDir, "options.json")
+	const attention = "attention-fixture"
+	const radio = "radio-transport-fixture"
+	const native = "native-worker-fixture"
+	endpoints := []struct {
+		path    string
+		handler http.HandlerFunc
+	}{
+		{"/api/radio/state", radioStateHandler},
+		{"/api/radio/action", radioActionHandler},
+		{"/api/radio/result", radioResultHandler},
+	}
+	for _, config := range []struct {
+		name     string
+		options  string
+		accepted string
+	}{
+		{"dedicated", `{"attention_token":"attention-fixture","radio_transport_token":"radio-transport-fixture","radio_native_token":"native-worker-fixture"}`, radio},
+		{"dedicated_with_invalid_attention", `{"attention_token":false,"radio_transport_token":"radio-transport-fixture"}`, radio},
+		{"legacy", `{"attention_token":"attention-fixture","radio_native_token":"native-worker-fixture"}`, attention},
+		{"blank", `{"attention_token":"attention-fixture","radio_transport_token":"  "}`, attention},
+		{"invalid", `{"attention_token":"attention-fixture","radio_transport_token":true}`, ""},
+		{"missing", `{"radio_native_token":"native-worker-fixture"}`, ""},
+	} {
+		t.Run(config.name, func(t *testing.T) {
+			if err := os.WriteFile(options, []byte(config.options), 0600); err != nil {
+				t.Fatal(err)
+			}
+			for _, endpoint := range endpoints {
+				for _, credential := range []string{"", attention, radio, native} {
+					// An authorized but invalid method proves admission without
+					// consulting or changing the active radio owner.
+					r := httptest.NewRequest(http.MethodPut, endpoint.path, nil)
+					r.Header.Set("X-PodConnect-Token", credential)
+					w := httptest.NewRecorder()
+					endpoint.handler(w, r)
+					want := http.StatusUnauthorized
+					if credential != "" && credential == config.accepted {
+						want = http.StatusMethodNotAllowed
+					}
+					if w.Code != want {
+						t.Errorf("%s credential scope: got %d, want %d", endpoint.path, w.Code, want)
+					}
+				}
+			}
+			if config.name == "dedicated" {
+				r := httptest.NewRequest(http.MethodPost, "/api/attention", nil)
+				r.Header.Set("X-PodConnect-Token", radio)
+				if attentionAuthed(r) {
+					t.Fatal("radio credential admitted on the attention lane")
+				}
+				r.Header.Set("X-PodConnect-Token", attention)
+				if !attentionAuthed(r) {
+					t.Fatal("attention credential lost its existing admission")
+				}
+			}
+		})
 	}
 }
 
