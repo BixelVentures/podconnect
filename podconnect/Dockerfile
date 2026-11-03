@@ -121,6 +121,9 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/queue-metadata-background-native.patch \
   && git apply --check /patches/dealer-fieldcodes-native.patch \
   && git apply /patches/dealer-fieldcodes-native.patch \
+  && sha256sum -c /patches/radio-handoff-native.sha256 \
+  && git apply --check /patches/radio-handoff-native.patch \
+  && git apply /patches/radio-handoff-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -140,6 +143,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # --- OwnTone (AirPlay 2 sender) — built from source (no ARM64 package exists) ---
 ARG OWNTONE_REF=29.2
+COPY patches/radio-handoff-owntone.patch /patches/radio-handoff-owntone.patch
+COPY patches/radio-handoff-owntone.sha256 /patches/radio-handoff-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -295,6 +300,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/retire-fieldcodes-owntone.sha256 \
   && git apply --check /patches/retire-fieldcodes-owntone.patch \
   && git apply /patches/retire-fieldcodes-owntone.patch \
+  && sha256sum -c /patches/radio-handoff-owntone.sha256 \
+  && git apply --check /patches/radio-handoff-owntone.patch \
+  && git apply /patches/radio-handoff-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
@@ -317,6 +325,19 @@ RUN chmod +x /usr/local/bin/go-librespot
 
 # Dedicated user for OwnTone (it drops privileges to this uid).
 RUN useradd -r -s /usr/sbin/nologin owntone || true
+
+# Radio gets a different permanent identity and a fixed-target pre-exec helper.
+# Existing Spotify processes, users and resource limits are left untouched.
+RUN useradd -r -s /usr/sbin/nologin podradio
+RUN test -x /usr/bin/prlimit \
+  && test "$(id -u podradio)" != "$(id -u owntone)" \
+  && test "$(id -g podradio)" != "$(id -g owntone)"
+COPY radio-worker/worker.c /tmp/podconnect-radio-worker.c
+RUN mkdir -p /usr/libexec \
+  && cc -O2 -Wall -Wextra -Werror -o /usr/libexec/podconnect-radio-worker /tmp/podconnect-radio-worker.c \
+  && chown root:root /usr/libexec/podconnect-radio-worker \
+  && chmod 0755 /usr/libexec/podconnect-radio-worker \
+  && rm /tmp/podconnect-radio-worker.c
 
 # PodConnect manager binary (serves the Ingress picker UI)
 COPY --from=manager-build /podconnect-manager /usr/local/bin/podconnect-manager

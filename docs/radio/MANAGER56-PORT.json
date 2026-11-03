@@ -1,0 +1,13 @@
+{
+  "schema": "podconnect.radio.manager56-port.v1",
+  "released_base": "d70895e8dbe763c181f9639c12be4411bc11e65c",
+  "core_checkpoint": "c1ea4c7cb6aafef3905e21de40a3e9ab1bbe9ee5",
+  "old_feature_checkpoint": "614835c1381ba508c5a285427ba9744db4cffa14",
+  "port": "all radio source files plus additive main/render/config hooks; released Docker stack retained",
+  "all_manager_race_result": "PASS 90.199s after journal privacy change",
+  "all_manager_race_log": "/private/tmp/radio-manager56-journal-final-race.log",
+  "archive_fixture": "C41 historical schema-at-capture data only; not latest C acceptance",
+  "default_activation": false,
+  "installation": false,
+  "merge": false
+}

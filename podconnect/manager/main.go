@@ -1340,10 +1340,18 @@ func startRoomBridge(room *Room) {
 }
 
 func main() {
+	radioGuardianEntry() // exact private-radio guardian exits before ordinary startup
+	radioWorkerGuardianEntry()
 	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	store = newRoomStore()
 	mgr = newRoomManager(store)
+	// Radio prepares only its own private settings. A failed radio opt-in must
+	// never prevent the existing Spotify service from starting.
+	if err := ensureRadioWorkerSettings(); err != nil {
+		log.Printf("radio: private startup settings unavailable")
+	}
+	radioOwner = configuredRadioOwner()
 
 	// Single-engine: run ONLY the primary room's engine. The other rooms are Spotify device-aliases
 	// advertised on it (one session = no contention); output is routed per alias by the primary bridge.
@@ -1355,6 +1363,8 @@ func main() {
 		mgr.ensureRunning(rm)
 		startRoomBridge(rm)
 	}
+
+	startConfiguredRadioBuiltin(signals, radioOwner)
 
 	lastCount := -1
 
@@ -1458,6 +1468,12 @@ func main() {
 	http.HandleFunc("/api/start-volume/identity", startIdentityRequest)
 	http.HandleFunc("/api/start-volume/commit", commitStartRequest)
 	http.HandleFunc("/api/select", speakerSelectHandler)
+
+	// Radio is additive and defaults off; existing release handlers retain ownership.
+	http.HandleFunc("/api/radio/state", radioStateHandler)
+	http.HandleFunc("/api/radio/action", radioActionHandler)
+	http.HandleFunc("/api/radio/result", radioResultHandler)
+	http.HandleFunc("/api/radio/native-preempt", radioNativePreemptHandler)
 
 	http.HandleFunc("/api/test", speakerTestHandler)
 

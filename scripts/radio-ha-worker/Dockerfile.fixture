@@ -1,0 +1,6 @@
+FROM podview-radio-local-candidate:20261028-release57
+RUN useradd -r -s /usr/sbin/nologin podradio
+COPY bin/podconnect-radio-worker /usr/libexec/podconnect-radio-worker
+COPY bin/fixture-exec /usr/sbin/owntone
+# This image is an explicitly inert composed test, not a shipping service image.
+# S6 /init remains canonical; unrelated production services are masked at run.
