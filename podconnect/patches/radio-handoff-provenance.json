@@ -1,8 +1,8 @@
 {
   "schema": "podconnect.radio-release64-feature-overlays.v1",
-  "status": "SOURCE_COMPOSED_HA_WORKER_RUNTIME_PENDING",
+  "status": "SOFTWARE_QUALIFIED_STANDARD_HA_WORKER_INERT_EDGES",
   "release_commit": "b028bc80733b7061e660ba8b97c0d84508ac5a89",
-  "runtime_default": "disabled_pending_qualification",
+  "runtime_default": "enabled_idle_no_receiver_or_audio_until_explicit_input",
   "installation": false,
   "merge": false,
   "physical_acceptance": false,
@@ -28,9 +28,12 @@
     "c_required_wire_modes": "PASS7",
     "package_hash_lines": "79 current pre-radio lines checked, zero mismatch",
     "native_production_build": "PASS normal stripped go-librespot and separately named daemon test fixture; offline linux/arm64 Go1.25.11",
-    "composed_radio_runtime": "not run by this agent",
+    "composed_radio_runtime": "PASS9/9 ordinary S6/default rights, exact52 production files, no delegated cgroup, inert providers/receivers",
     "browser": "not run; no UI changes",
-    "service_or_hardware": "not run; all deps inert/offline"
+    "service_or_hardware": "not run; all deps inert/offline",
+    "actual_c_decoder_startup": "PASS production C64 init/idle75HTTP200, hard limits; repeat-init causal cases retained",
+    "source_observation_and_pairing_restart": "Observed failures fixed and causal regressions/runtime cases PASS",
+    "readiness_limit": "One earlier unclassified cold-start fixture refusal retained; not claimed causally fixed. Final9 exact-source scenarios PASS."
   },
   "released_patch_files_unchanged": {
     "podconnect/patches/aliases-v0.7.3.patch": "5233c2f94094ca834a747294e31ed1d904a132e437af343c56563a339b99cdea",
@@ -145,7 +148,8 @@
   },
   "resource_contract": "HA worker: fixed non-root UID, hard AS/tasks/FD, no process descendants, pidfd guardian, sampled CPU/RSS fail-stop; legacy cgroup evidence not inherited",
   "scope_limits": [
-    "Actual combined HA worker radio/Spotify runtime remains pending",
-    "No installation or physical acceptance implied"
+    "No Green/Supervisor capability inspection, installation or physical acceptance",
+    "Provider/receiver integration uses explicitly inert edges; separate live DR URL reads200 for all5",
+    "Sampled CPU/RSS stop protection is not a cgroup quota; actual hard AS/task/FD limits checked"
   ]
 }

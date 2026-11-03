@@ -288,3 +288,46 @@
 +	t.Log("VERIFIED actual sender SIGKILL -> joined dead pidfd -> UNKNOWN; restored manager remains blocked; passive reads do not replay or launch")
 +	return true
 +}
+--- a/radio_producer_discovery_external_test.go
++++ b/radio_producer_discovery_external_test.go
+@@ -9,6 +9,7 @@
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
++	"syscall"
+ 	"testing"
+ 	"time"
+ )
+@@ -56,10 +57,13 @@
+ 	sender := p.sender.(*radioProducerSenderClient).supervisor
+ 	sender.mu.Lock()
+ 	pid := sender.cmd.Process.Pid
++	credential := sender.cmd.SysProcAttr.Credential
+ 	sender.mu.Unlock()
+-	credential, err := radioServiceCredential()
+-	if err != nil {
+-		t.Fatal(err)
++	if credential == nil || credential.Uid == 0 {
++		t.Fatal("actual sender service credential unavailable")
++	}
++	if err := sender.productionEvidence(pid); err != nil {
++		t.Fatal("actual sender UID/kernel evidence:", err)
+ 	}
+ 	oldPID, err := strconv.Atoi(os.Getenv("PC_RADIO_CHAIN_OLD_PID"))
+ 	if err != nil || oldPID <= 1 {
+@@ -110,6 +114,15 @@
+ 		if err = os.Rename(temporary, path); err != nil {
+ 			t.Fatal(err)
+ 		}
++		marker, err := os.Lstat(path)
++		if err != nil {
++			t.Fatal(err)
++		}
++		stat, ok := marker.Sys().(*syscall.Stat_t)
++		if !ok || stat.Uid != entry.uid || stat.Nlink != 1 || marker.Mode().Perm() != 0600 {
++			t.Fatal("marker identity differs from actual service UID")
++		}
++		t.Logf("VERIFIED inert %s discovery marker kernel UID=%d; actual supervised sender UID=%d PID=%d", entry.key, stat.Uid, credential.Uid, pid)
+ 	}
+ 	until := time.Now().Add(8 * time.Second)
+ 	for {
