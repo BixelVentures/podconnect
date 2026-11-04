@@ -632,7 +632,9 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                 self.assertNotIn("volume", value["controls"]["supported_actions"])
         self.assertEqual((self.room_posts, self.volume_posts, self.calls), ([], [], []))
 
-    async def test_volume_playback_v3_held_read_poll_or_owner_change_fails_closed(self):
+    async def test_volume_playback_v3_held_read_retains_routine_poll_but_rejects_owner_change(
+        self,
+    ):
         data = self.entries[0].runtime_data
         coordinator = data.coordinator
         baseline, owner = copy.deepcopy(coordinator.data), coordinator.owner_epoch
@@ -648,6 +650,7 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                 try:
                     if change == "poll":
                         coordinator.data["poll_sequence"] += 1
+                        coordinator.data["playback"]["progress_ms"] += 1000
                     elif change == "owner":
                         coordinator.owner_epoch = "replacement"
                     elif change == "inactive":
@@ -671,7 +674,17 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                     else:
                         self.volume_state_release.set()
                         result = await task
-                    self.assertEqual(result, {"ok": False, "error_kind": "unavailable"})
+                    if change == "poll":
+                        self.assertTrue(result.get("ok"), result)
+                        self.assertEqual(result["controls"]["status"], "observed")
+                        self.assertIn("pause", result["controls"]["supported_actions"])
+                        self.assertEqual(
+                            result["poll_sequence"], baseline["poll_sequence"]
+                        )
+                    else:
+                        self.assertEqual(
+                            result, {"ok": False, "error_kind": "unavailable"}
+                        )
                 finally:
                     data.active = True
                     coordinator.owner_epoch = owner

@@ -299,13 +299,13 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
             self.holds.append(release)
             reads = 0
 
-            async def held(*args, _entered=entered, _release=release):
+            async def held(*args, _entered=entered, _release=release, **kwargs):
                 nonlocal reads
                 reads += 1
                 if reads == 2:  # The first read belongs to the guarded projection.
                     _entered.set()
                     await _release.wait()
-                return await original(*args)
+                return await original(*args, **kwargs)
 
             with patch.object(data.commands.room_transport, "observe", held):
                 task = self._task(
@@ -725,17 +725,17 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
     async def test_playback_output_account_changes_during_await_cannot_mix(self):
         coordinator = self.entries[0].runtime_data.coordinator
         baseline = copy.deepcopy(coordinator.data)
-        for change in ("poll", "body", "expiry", "owner"):
+        for change in ("body", "expiry", "owner"):
             coordinator.data = copy.deepcopy(baseline)
             self.output_entered.clear()
             self.output_release.clear()
             self.output_hold = True
             task = self._task(self.output_snapshot())
             await asyncio.wait_for(self.output_entered.wait(), timeout=2)
-            if change == "poll":
-                coordinator.data["poll_sequence"] += 1
-            elif change == "body":
-                coordinator.data["playback"]["progress_ms"] += 1
+            if change == "body":
+                coordinator.data["playback"]["is_playing"] = not coordinator.data[
+                    "playback"
+                ]["is_playing"]
             elif change == "expiry":
                 coordinator.data["playback_observed_monotonic"] -= 16
             else:
@@ -743,6 +743,26 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
             self.output_release.set()
             value = await task
             self.assertEqual(value, {"ok": False, "error_kind": "unavailable"})
+        self.assertEqual(self.calls, [])
+
+    async def test_playback_output_routine_poll_during_read_preserves_controls(self):
+        coordinator = self.entries[0].runtime_data.coordinator
+        before = copy.deepcopy(coordinator.data)
+        self.output_entered.clear()
+        self.output_release.clear()
+        self.output_hold = True
+        task = self._task(self.output_snapshot())
+        await asyncio.wait_for(self.output_entered.wait(), timeout=2)
+        coordinator.data["poll_sequence"] += 1
+        coordinator.data["playback"]["progress_ms"] += 1000
+        self.output_release.set()
+        value = await task
+        self.assertTrue(value.get("ok"), value)
+        self.assertEqual(value["output"]["status"], "observed")
+        self.assertEqual(value["poll_sequence"], before["poll_sequence"])
+        self.assertEqual(
+            value["playback"]["progress_ms"], before["playback"]["progress_ms"]
+        )
         self.assertEqual(self.calls, [])
 
     async def test_playback_output_changed_native_owner_is_not_a_binding(self):
