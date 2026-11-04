@@ -48,6 +48,26 @@ def _text(value):
     return isinstance(value, str) and 1 <= len(value) <= 1024
 
 
+def same_playback_read(before, after):
+    """Routine polls may advance progress while the captured read remains fresh."""
+
+    def playback(source):
+        value = source[5]
+        return (
+            {key: item for key, item in value.items() if key != "progress_ms"}
+            if isinstance(value, dict)
+            else value
+        )
+
+    return (
+        before[:2] == after[:2]
+        and after[2] >= before[2]
+        and after[3] >= before[3]
+        and after[4] >= before[4]
+        and playback(before) == playback(after)
+    )
+
+
 def valid_identity(native, route, scope):
     if (
         not isinstance(native, dict)
@@ -167,7 +187,7 @@ class RoomTransport:
             copy.deepcopy(raw["playback"]),
         )
 
-    async def observe(self, hass, entry, target, room, homepod):
+    async def observe(self, hass, entry, target, room, homepod, *, passive=False):
         """Validate passive Native/C facts without requiring a permitted action."""
         from .commands import CommandRejected
 
@@ -182,7 +202,8 @@ class RoomTransport:
             raise rejected from exc
         if self.scope(hass, entry, target, room, homepod) != scope:
             raise CommandRejected("native_account_unproven")
-        if self.observation_source(hass, entry) != before:
+        after = self.observation_source(hass, entry)
+        if not (same_playback_read(before, after) if passive else after == before):
             raise CommandRejected("stale_observation")
         if (
             not _snapshot(
@@ -265,7 +286,7 @@ class RoomTransport:
             )
 
             def guard():
-                if self.observation_source(hass, entry) != source:
+                if not same_playback_read(source, self.observation_source(hass, entry)):
                     raise CommandRejected("stale_observation")
                 if time.monotonic() >= deadline or time.time() >= valid_until:
                     raise CommandRejected("stale_observation")
@@ -288,7 +309,7 @@ class RoomTransport:
                     return aggregate("route_unavailable")
                 room, homepod = catalog["binding"]["room_id"], selected[0]["id"]
                 state = await self.observe(
-                    hass, entry, target["target_id"], room, homepod
+                    hass, entry, target["target_id"], room, homepod, passive=True
                 )
                 guard()
                 native = state["native"]
@@ -350,7 +371,7 @@ class RoomTransport:
                         "supported_actions": actions,
                         "volume": volume,
                     }
-                # Poll sequence/progress fence this publication above, but do not
+                # Account/playback identity and the original TTL fence publication, but do not
                 # turn the same physical route into a new identity each poll.
                 identity = [entry, source[1], native, state["route"]]
                 binding_id = hashlib.sha256(

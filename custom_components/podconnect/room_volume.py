@@ -7,7 +7,7 @@ import copy
 import re
 import time
 
-from .room_transport import valid_effect, valid_identity
+from .room_transport import same_playback_read, valid_effect, valid_identity
 from .speakers import SpeakersError
 
 _TOKEN = re.compile(r"[a-f0-9]{32}")
@@ -169,6 +169,11 @@ class RoomVolume:
         context = {"room_id": room, "homepod_id": homepod}
         scope = self._scope(hass, entry, target, context)
         before = self.commands.controls(entry, target)
+        source = (
+            self.commands.room_transport.observation_source(hass, entry)
+            if passive
+            else None
+        )
         try:
             state = await self.commands.data.speakers.room_volume_state(scope)
         except SpeakersError as exc:
@@ -176,7 +181,13 @@ class RoomVolume:
         if self._scope(hass, entry, target, context) != scope:
             raise CommandRejected("native_account_unproven")
         latest = self.commands.controls(entry, target)
-        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
+        if (
+            not same_playback_read(
+                source, self.commands.room_transport.observation_source(hass, entry)
+            )
+            if passive
+            else any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence"))
+        ):
             raise CommandRejected("stale_observation")
         if (
             not isinstance(state, dict)
