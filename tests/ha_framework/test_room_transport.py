@@ -414,6 +414,121 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
             self.assertEqual(len(self.room_posts), 1)
         self.assertEqual(self._writes(), [])
 
+    async def test_pause_track_transition_during_prepare_keeps_bound_output(self):
+        self.playing = True
+        data = self.entries[0].runtime_data
+        await data.coordinator.async_refresh()
+        playback = data.coordinator.data["playback"]
+        playback["item"] = {
+            "type": "track", "uri": "spotify:track:old", "name": "Old",
+            "artists": [], "duration_ms": 100000,
+        }
+        offer = await self.room_offer()
+        self.assertIn("pause", offer["actions"])
+        request = self.room_request("pause")
+        self.room_hold = True
+        task = self._task(self.room_invoke(request))
+        await asyncio.wait_for(self.room_entered.wait(), 2)
+        playback["item"] = {
+            "type": "track", "uri": "spotify:track:new", "name": "New",
+            "artists": [], "duration_ms": 100000,
+        }
+        data.coordinator.data["poll_sequence"] += 1
+        self.room_release.set()
+        receipt = await task
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.assertTrue(receipt["accepted_native"])
+        self.assertFalse(receipt["retry_allowed"])
+        self.assertEqual(
+            [path for path, _ in self.room_posts],
+            ["/api/room-transport/prepare", "/api/room-transport/commit"],
+        )
+        self.assertEqual(self._writes(), [])
+
+    async def test_pause_observation_advances_before_admission(self):
+        self.playing = True
+        data = self.entries[0].runtime_data
+        for change in ("progress", "track"):
+            self.room_posts.clear()
+            await data.coordinator.async_refresh()
+            playback = data.coordinator.data["playback"]
+            playback["item"] = {
+                "type": "track", "uri": "spotify:track:old", "name": "Old",
+                "artists": [], "duration_ms": 100000,
+            }
+            offer = await self.room_offer()
+            self.assertIn("pause", offer["actions"])
+            request = self.room_request("pause")
+            self.assertEqual(request["expected_poll_sequence"], offer["poll_sequence"])
+            if change == "progress":
+                playback["progress_ms"] = 1000
+            else:
+                playback["item"] = {
+                    "type": "track", "uri": "spotify:track:new", "name": "New",
+                    "artists": [], "duration_ms": 100000,
+                }
+            data.coordinator.data["poll_sequence"] += 1
+            receipt = await self.room_invoke(request)
+            self.assertEqual(receipt["outcome"], "accepted", change)
+            self.assertTrue(receipt["accepted_native"], change)
+            self.assertEqual(
+                [p for p, _ in self.room_posts],
+                ["/api/room-transport/prepare", "/api/room-transport/commit"],
+                change,
+            )
+
+    async def test_pause_newer_poll_does_not_bypass_sequence_floor_or_future_poll(self):
+        self.playing = True
+        data = self.entries[0].runtime_data
+        await data.coordinator.async_refresh()
+        request = self.room_request("pause")
+        data.coordinator.data["poll_sequence"] += 1
+        data.commands.poll_floor = request["expected_poll_sequence"]
+        result = await self.room_invoke(request)
+        self.assertEqual(result["error_kind"], "awaiting_observation")
+        request = self.room_request("pause", expected_poll_sequence=999)
+        result = await self.room_invoke(request)
+        self.assertEqual(result["error_kind"], "stale_observation")
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual(self._writes(), [])
+
+    async def test_pause_newer_poll_still_denies_changed_authority_or_capability(self):
+        self.playing = True
+        data = self.entries[0].runtime_data
+        for change in ("owner", "target", "capability", "route", "account"):
+            self.room_posts.clear()
+            self.room_entered.clear()
+            self.room_release.clear()
+            self.room_hold = True
+            self.prepare_corrupt = None
+            data.coordinator.owner_epoch = data.commands.owner_epoch
+            await data.coordinator.async_refresh()
+            request = self.room_request("pause")
+            if change == "route":
+                self.prepare_corrupt = lambda value: value["route"].update(
+                    input_item_id="7"
+                )
+            task = self._task(self.room_invoke(request))
+            await asyncio.wait_for(self.room_entered.wait(), 2)
+            data.coordinator.data["poll_sequence"] += 1
+            if change == "owner":
+                data.coordinator.owner_epoch = "replaced"
+            elif change == "account":
+                self.hass.config_entries.async_update_entry(
+                    self.entries[0], unique_id="other-account"
+                )
+            elif change == "target":
+                data.coordinator.data["playback"]["device"]["id"] = "other-target"
+            elif change == "capability":
+                data.coordinator.data["playback"]["actions"]["disallows"]["pausing"] = True
+            self.room_release.set()
+            receipt = await task
+            self.assertEqual(receipt["outcome"], "rejected", change)
+            self.assertEqual(
+                [p for p, _ in self.room_posts], ["/api/room-transport/prepare"], change
+            )
+        self.assertEqual(self._writes(), [])
+
     async def test_room_prepare_expired_in_transit_never_commits(self):
         self.ttl = 1
         self.room_hold = True

@@ -796,7 +796,14 @@ class PlaybackCommands:
                 )
                 if (
                     observed["owner_epoch"] != epoch
-                    or observed["poll_sequence"] != sequence
+                    or (
+                        observed["poll_sequence"] != sequence
+                        and not (
+                            room_transport is not None
+                            and action == "pause"
+                            and observed["poll_sequence"] > sequence
+                        )
+                    )
                 ):
                     raise CommandRejected("stale_observation")
                 # busy belongs to this exact in-flight request; the prior terminal
