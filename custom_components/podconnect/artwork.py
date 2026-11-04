@@ -10,21 +10,28 @@ ARTWORK_MAX_URL_LENGTH = 512
 _ARTWORK_PATH = re.compile(r"^/image/[A-Za-z0-9_-]{1,128}$")
 
 
-def _allowed_spotify_image_url(value: object, *, canonical: bool = False) -> str | None:
+def _allowed_spotify_image_url(
+    value: object, *, canonical: bool = False, playlist: bool = False
+) -> str | None:
     if not isinstance(value, str) or not 1 <= len(value) <= ARTWORK_MAX_URL_LENGTH:
         return None
     try:
         parsed = urlsplit(value)
         if (
             parsed.scheme != "https"
-            or parsed.hostname != ARTWORK_HOST
+            or parsed.hostname
+            not in (
+                {ARTWORK_HOST, "image-cdn-fa.spotifycdn.com", "image-cdn-ak.spotifycdn.com"}
+                if playlist
+                else {ARTWORK_HOST}
+            )
             or parsed.username is not None
             or parsed.password is not None
             or parsed.port is not None
             or parsed.query
             or parsed.fragment
             or not _ARTWORK_PATH.fullmatch(parsed.path)
-            or (canonical and value != f"https://{ARTWORK_HOST}{parsed.path}")
+            or (canonical and value != f"https://{parsed.hostname}{parsed.path}")
         ):
             return None
     except ValueError:
@@ -73,7 +80,7 @@ def spotify_playlist_artwork(playlist: object) -> dict | None:
     for image in images:
         if not isinstance(image, dict):
             continue
-        url = _allowed_spotify_image_url(image.get("url"), canonical=True)
+        url = _allowed_spotify_image_url(image.get("url"), canonical=True, playlist=True)
         if url is not None:
             return {"kind": "playlist_cover", "provider": "spotify", "url": url}
     return None
