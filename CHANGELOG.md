@@ -1,3 +1,7 @@
+## Control 0.10.31 — show genuine Spotify playlist covers
+
+- Preserve official Spotify playlist CDN covers in playlist search without widening album artwork or arbitrary URL admission.
+
 ## Control 0.10.30 — preserve controls across routine playback polls
 
 - Keep passive room playback and volume observations valid when a routine Spotify poll only advances progress. Retain the captured observation deadline and strict action ownership checks.

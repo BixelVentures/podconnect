@@ -65,9 +65,7 @@ def _raw_playlist(images):
 
 def test_default_projection_keeps_legacy_rows_for_podvoice64():
     project = _project_playlists(_artwork_module())
-    result = project(
-        _raw_playlist([{"url": VALID_URL}]), "entry-a", "epoch-a", "jazz", 3
-    )
+    result = project(_raw_playlist([{"url": VALID_URL}]), "entry-a", "epoch-a", "jazz", 3)
     assert result["playlists"] == [{"uri": PLAYLIST_URI, "name": "Actual playlist"}]
 
 
@@ -139,9 +137,7 @@ def test_invalid_images_leave_playlist_valid_without_cover():
         )
         assert result["playlists"] == [{"uri": PLAYLIST_URI, "name": "Actual playlist"}]
 
-    missing = project(
-        _raw_playlist([]), "entry-a", "epoch-a", "jazz", 3, include_artwork=True
-    )
+    missing = project(_raw_playlist([]), "entry-a", "epoch-a", "jazz", 3, include_artwork=True)
     assert missing["playlists"] == [{"uri": PLAYLIST_URI, "name": "Actual playlist"}]
 
     oversized = project(
@@ -158,12 +154,8 @@ def test_invalid_images_leave_playlist_valid_without_cover():
 class TestPlaylistCoverProjection(unittest.TestCase):
     def test_control_compatibility_contract(self):
         project = _project_playlists(_artwork_module())
-        legacy = project(
-            _raw_playlist([{"url": VALID_URL}]), "entry-a", "epoch-a", "jazz", 3
-        )
-        self.assertEqual(
-            legacy["playlists"], [{"uri": PLAYLIST_URI, "name": "Actual playlist"}]
-        )
+        legacy = project(_raw_playlist([{"url": VALID_URL}]), "entry-a", "epoch-a", "jazz", 3)
+        self.assertEqual(legacy["playlists"], [{"uri": PLAYLIST_URI, "name": "Actual playlist"}])
 
         opted_in = project(
             _raw_playlist([{"url": VALID_URL}]),
@@ -186,11 +178,30 @@ class TestPlaylistCoverProjection(unittest.TestCase):
             3,
             include_artwork=True,
         )
-        self.assertEqual(
-            invalid["playlists"], [{"uri": PLAYLIST_URI, "name": "Actual playlist"}]
-        )
+        self.assertEqual(invalid["playlists"], [{"uri": PLAYLIST_URI, "name": "Actual playlist"}])
 
         descriptor = (ROOT / "services.yaml").read_text()
         service = descriptor.split("search_playlists:", 1)[1].split("\n\n", 1)[0]
         self.assertIn("include_artwork:\n      required: false", service)
         self.assertIn("default: false", service)
+
+
+def test_actual_spotify_playlist_cdn_does_not_expand_album_or_arbitrary_urls():
+    artwork = _artwork_module()
+    for host in ["image-cdn-fa.spotifycdn.com", "image-cdn-ak.spotifycdn.com"]:
+        url = f"https://{host}/image/ab67706c0000da848a8fc555493a58db7da9fc94"
+        assert artwork.spotify_playlist_artwork({"images": [{"url": url}]}) == {
+            "kind": "playlist_cover",
+            "provider": "spotify",
+            "url": url,
+        }
+        assert artwork.spotify_album_artwork({"album": {"images": [{"url": url}]}}) is None
+        for bad in [
+            url + "?x=1",
+            url + "#x",
+            url.replace(host, host + ".evil.invalid"),
+            url.replace(host, "user@" + host),
+            url.replace(host, host + ":443"),
+            url.replace("/image/", "/other/"),
+        ]:
+            assert artwork.spotify_playlist_artwork({"images": [{"url": bad}]}) is None
