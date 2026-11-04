@@ -494,8 +494,9 @@ class RoomTransport:
             or not 1 <= prepared["expires_after_ms"] <= 5000
         ):
             raise CommandRejected("room_transport_unavailable")
-        # Last local owner/account/poll checks, after the awaited prepare, before
-        # the irreversible commit request. Native/C perform final mutator checks.
+        # Pause targets the same bound output, not a particular track. A newer
+        # observation may advance while prepare waits; recheck current action and
+        # owner here while Native/C retain the exact route fence at commit.
         guard()
         if (
             self.scope(hass, entry, target, context["room_id"], context["homepod_id"])

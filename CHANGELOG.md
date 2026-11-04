@@ -1,3 +1,7 @@
+## Control 0.10.32 — pause the bound output across track updates
+
+- Allow an explicit native room Pause to use a newer playback observation for the same owner and output, including track transitions. Preserve capability, target, command sequence, prepare expiry and Native route checks.
+
 ## Control 0.10.31 — show genuine Spotify playlist covers
 
 - Preserve official Spotify playlist CDN covers in playlist search without widening album artwork or arbitrary URL admission.
