@@ -1,3 +1,7 @@
+## Control 0.10.33 — diagnose failed playback reads
+
+- Record content-free failure and recovery outcomes for the existing playback/device reads, without extra requests, retries or changes to playback availability and command authority. This improves diagnosis; it does not claim to fix the intermittent music failure.
+
 ## Control 0.10.32 — pause the bound output across track updates
 
 - Allow an explicit native room Pause to use a newer playback observation for the same owner and output, including track transitions. Preserve capability, target, command sequence, prepare expiry and Native route checks.

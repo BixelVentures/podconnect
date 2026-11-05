@@ -1,0 +1,37 @@
+{
+  "base": "73512c95cc4d2755ccd9631a46e24c7abcdf1c02",
+  "pins": {
+    "custom_components/podconnect/coordinator.py": "d00a40c98b26ed40fc47148a8037e900785f40ff4a19c937a746c9d3ad37b274",
+    "custom_components/podconnect/api.py": "d3dd26fe31ddabd2504cc053a60f333929677a298b30e634c838f520fe181d66",
+    "tests/test_control_poll_truth.py": "644fe62dcc2fcb0e71665ad0ae6f362ccb3331f0d4ee8b25c7862e6f3e903364",
+    "tests/ha_framework/test_room_transport.py": "78547a8640cedf6cbc4716159029417f16ca26a71717d89e9c917a24a820dc27"
+  },
+  "review": "Astra scoped SOURCE GO on exact runtime pins",
+  "checks": {
+    "boundary_and_playback_response": "21 PASS",
+    "ruff_and_format": "PASS",
+    "python312_ast": "PASS",
+    "actual_ha_framework": {
+      "result": "1 PASS exit0",
+      "image": "ghcr.io/home-assistant/home-assistant@sha256:56690a89c79a0de98035e1719f8324a92d5859c1192ff45adb0230ea81cb42a5",
+      "network": "none",
+      "case": "test_room_transport.RoomTransportFrameworkTests.test_devices_failure_after_playback_keeps_snapshot_unavailable_then_recovers",
+      "provider": "inert loopback HTTP only",
+      "read_count": 3,
+      "effects": 0,
+      "preserved_failure_result": {
+        "ok": false,
+        "error_kind": "unavailable"
+      },
+      "failure_record": "one, playback success/devices error/status503",
+      "recovery_record": "one after next normally successful poll"
+    }
+  },
+  "not_proven": [
+    "original user music failure cause",
+    "live provider failure",
+    "publication",
+    "installation",
+    "audible or physical acceptance"
+  ]
+}
