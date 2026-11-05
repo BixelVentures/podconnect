@@ -38,13 +38,13 @@ def entity():
         decorator_list=[],
     )
     module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
-    ns = dict(
-        asyncio=asyncio,
-        Base=Base,
-        SpotifyApiError=SpotifyApiError,
-        HomeAssistantError=HomeAssistantError,
-    )
-    exec(compile(module, "<shipped control methods>", "exec"), ns)
+    ns = {
+        "asyncio": asyncio,
+        "Base": Base,
+        "SpotifyApiError": SpotifyApiError,
+        "HomeAssistantError": HomeAssistantError,
+    }
+    exec(compile(module, "<shipped control methods>", "exec"), ns)  # noqa: S102 - Shipped methods only.
     obj = ns["Entity"]()
     obj.writes = 0
     obj._command_generation = 0
@@ -140,7 +140,7 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
             for n in ast.walk(tree)
             if isinstance(n, ast.FunctionDef) and n.name == "_check_command_owner"
         )
-        exec(
+        exec(  # noqa: S102 - Shipped coordinator methods only.
             compile(
                 ast.Module(body=[owner_check, method], type_ignores=[]),
                 "<shipped coordinator>",
@@ -178,3 +178,310 @@ class PollTruthTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertIsNone(obj._optimistic_playing)
         obj.coordinator.async_request_refresh.assert_not_awaited()
+
+
+class PollUpdateFailed(Exception):
+    pass
+
+
+class CoordinatorReadDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    def rig(self, playback=None, devices=None, logger=None):
+        import hashlib
+
+        from test_playback_response_truth import API
+
+        tree = ast.parse(
+            (ROOT / "custom_components/podconnect/coordinator.py").read_text()
+        )
+        methods = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in {"_check_command_owner", "_async_update_data"}
+        ]
+        logger = logger or Mock()
+        namespace = {
+            "asyncio": asyncio,
+            "hashlib": hashlib,
+            "LOGGER": logger,
+            "SpotifyApiError": API["SpotifyApiError"],
+            "UpdateFailed": PollUpdateFailed,
+            "Any": object,
+            "time": time,
+            "dt_util": SimpleNamespace(utcnow=lambda: 7),
+        }
+        exec(  # noqa: S102 - Execute only the existing shipped methods, as above.
+            compile(
+                ast.Module(body=methods, type_ignores=[]),
+                "<shipped coordinator reads>",
+                "exec",
+            ),
+            namespace,
+        )
+        obj = SimpleNamespace(
+            poll_sequence=0,
+            owner_epoch="PRIVATE-owner",
+            command_owner_guard=lambda: True,
+            api=SimpleNamespace(
+                playback_state=playback or AsyncMock(return_value=None),
+                devices=devices or AsyncMock(return_value=[]),
+            ),
+        )
+        obj._check_command_owner = lambda: namespace["_check_command_owner"](obj)
+        return obj, lambda: namespace["_async_update_data"](obj), logger, namespace
+
+    def records(self, logger, name):
+        return [
+            call.args[0] % call.args[1:]
+            for call in getattr(logger, name).call_args_list
+        ]
+
+    async def test_devices_only_failure_after_playback_success_and_one_recovery(self):
+        import hashlib
+
+        from test_playback_response_truth import API
+
+        played = asyncio.Event()
+
+        async def playback():
+            played.set()
+            return {"PRIVATE-track": "PRIVATE-content"}
+
+        error = API["SpotifyApiError"]("PRIVATE-provider-body", status=503)
+
+        async def devices():
+            await played.wait()
+            raise error
+
+        obj, poll, logger, _ = self.rig(playback, devices)
+        with self.assertRaises(PollUpdateFailed) as raised:
+            await poll()
+        self.assertEqual(
+            str(raised.exception), "PRIVATE-provider-body"
+        )  # Original legacy exception.
+        self.assertIs(raised.exception.__cause__, error)
+        expected_ref = hashlib.sha256(b"PRIVATE-owner:1").hexdigest()[:16]
+        self.assertEqual(
+            self.records(logger, "warning"),
+            [
+                f"playback_poll event=failed poll_ref={expected_ref} kind=spotify_api playback=success playback_kind=none playback_status=0 devices=error devices_kind=spotify_api devices_status=503"
+            ],
+        )
+        self.assertFalse(logger.info.called)
+        obj.api.devices = AsyncMock(return_value=[])
+        self.assertEqual(
+            (await poll())["playback"], {"PRIVATE-track": "PRIVATE-content"}
+        )
+        await poll()
+        recovered_ref = hashlib.sha256(b"PRIVATE-owner:2").hexdigest()[:16]
+        self.assertEqual(
+            self.records(logger, "info"),
+            [
+                f"playback_poll event=recovered poll_ref={recovered_ref} previous_ref={expected_ref}"
+            ],
+        )
+        self.assertEqual(len(self.records(logger, "warning")), 1)
+        self.assertTrue(
+            all(
+                "PRIVATE" not in text
+                for text in self.records(logger, "warning")
+                + self.records(logger, "info")
+            )
+        )
+
+    async def test_failure_record_follows_original_awaited_cancel_cleanup(self):
+        from test_playback_response_truth import API
+
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+
+        async def playback():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.set()
+
+        error = API["SpotifyApiError"]("original", status=429)
+
+        async def devices():
+            await entered.wait()
+            raise error
+
+        logger = Mock()
+        logger.warning.side_effect = lambda *args: self.assertTrue(cleaned.is_set())
+        _, poll, _, _ = self.rig(playback, devices, logger)
+        with self.assertRaises(PollUpdateFailed):
+            await poll()
+        message = self.records(logger, "warning")[0]
+        self.assertIn(
+            "playback=cancelled playback_kind=none playback_status=0", message
+        )
+        self.assertIn(
+            "devices=error devices_kind=spotify_api devices_status=429", message
+        )
+        self.assertEqual(logger.warning.call_count, 1)
+
+    async def test_outer_cancellation_remains_cancelled_and_logs_after_cleanup(self):
+        entered = [asyncio.Event(), asyncio.Event()]
+        cleaned = [False, False]
+
+        async def read(index):
+            entered[index].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned[index] = True
+
+        logger = Mock()
+        logger.warning.side_effect = lambda *args: self.assertTrue(all(cleaned))
+        _, poll, _, _ = self.rig(lambda: read(0), lambda: read(1), logger)
+        task = asyncio.create_task(poll())
+        await asyncio.gather(*(event.wait() for event in entered))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        message = self.records(logger, "warning")[0]
+        self.assertIn("kind=outer_cancelled", message)
+        self.assertIn("playback=cancelled", message)
+        self.assertIn("devices=cancelled", message)
+        self.assertEqual(logger.warning.call_count, 1)
+
+    async def test_final_owner_guard_failure_is_not_recovery_even_two_reads_succeed(
+        self,
+    ):
+        from test_playback_response_truth import API
+
+        obj, poll, logger, _ = self.rig()
+        obj.api.devices = AsyncMock(
+            side_effect=API["SpotifyApiError"]("prior", status=500)
+        )
+        with self.assertRaises(PollUpdateFailed):
+            await poll()
+        obj.api.devices = AsyncMock(return_value=[])
+        checks = iter(
+            (True, True, True, False)
+        )  # entry, playback, gather, final delivery.
+        obj.command_owner_guard = lambda: next(checks)
+        with self.assertRaisesRegex(PollUpdateFailed, "Observation owner replaced"):
+            await poll()
+        self.assertEqual(logger.info.call_count, 0)
+        self.assertIn(
+            "kind=owner_changed playback=success", self.records(logger, "warning")[-1]
+        )
+        self.assertIn("devices=success", self.records(logger, "warning")[-1])
+        obj.command_owner_guard = lambda: True
+        await poll()
+        await poll()
+        self.assertEqual(logger.info.call_count, 1)
+
+    async def test_diagnostic_logger_and_hash_failures_preserve_original_results(self):
+        from test_playback_response_truth import API
+
+        for fault in ("logger", "logger_cancel", "hash"):
+            with self.subTest(fault=fault):
+                error = API["SpotifyApiError"]("legacy-original", status=503)
+                obj, poll, logger, ns = self.rig(devices=AsyncMock(side_effect=error))
+                if fault in {"logger", "logger_cancel"}:
+                    sink_error = (
+                        asyncio.CancelledError()
+                        if fault == "logger_cancel"
+                        else RuntimeError("sink failed")
+                    )
+                    logger.warning.side_effect = sink_error
+                    logger.info.side_effect = sink_error
+                else:
+                    ns["hashlib"] = SimpleNamespace(
+                        sha256=Mock(side_effect=RuntimeError("hash failed"))
+                    )
+                with self.assertRaises(PollUpdateFailed) as caught:
+                    await poll()
+                self.assertIs(caught.exception.__cause__, error)
+                self.assertEqual(str(caught.exception), "legacy-original")
+                obj.api.devices = AsyncMock(return_value=[])
+                self.assertEqual((await poll())["devices"], [])
+                await poll()
+                self.assertLessEqual(logger.info.call_count, 1)
+
+    async def test_status_only_exact_bounded_int_is_logged(self):
+        from test_playback_response_truth import API
+
+        for status in (True, "503", 99, 600, None, 100, 599):
+            with self.subTest(status=status):
+                _, poll, logger, _ = self.rig(
+                    devices=AsyncMock(
+                        side_effect=API["SpotifyApiError"]("PRIVATE", status=status)
+                    )
+                )
+                with self.assertRaises(PollUpdateFailed):
+                    await poll()
+                expected = status if type(status) is int and 100 <= status <= 599 else 0
+                self.assertIn(
+                    f"devices_status={expected}", self.records(logger, "warning")[0]
+                )
+
+    async def test_api_error_status_metadata_preserves_message_and_response_reads(self):
+        from test_playback_response_truth import API
+
+        class Response:
+            content_type = "text/plain"
+
+            def __init__(self, status):
+                self.headers = {"Retry-After": "17"}
+                self.status, self.text_reads = status, 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def text(self):
+                self.text_reads += 1
+                return "original-body"
+
+        for status in (401, 429, 503):
+            with self.subTest(status=status):
+                response = Response(status)
+                api = API["SpotifyApi"].__new__(API["SpotifyApi"])
+                api._session = SimpleNamespace(
+                    async_ensure_token_valid=AsyncMock(),
+                    token={"access_token": "inert"},
+                )
+                api._web = SimpleNamespace(request=Mock(return_value=response))
+                with self.assertRaises(API["SpotifyApiError"]) as caught:
+                    await api._request("GET", "/me/player")
+                self.assertEqual(caught.exception.status, status)
+                self.assertEqual(
+                    str(caught.exception),
+                    "rate limited (retry-after=17s)"
+                    if status == 429
+                    else f"GET /me/player -> {status}: original-body",
+                )
+                self.assertEqual(response.text_reads, 0 if status == 429 else 1)
+                self.assertEqual(api._web.request.call_count, 1)
+
+    async def test_failure_reference_uses_captured_owner_and_local_sequence(self):
+        import hashlib
+
+        from test_playback_response_truth import API
+
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def devices():
+            entered.set()
+            await release.wait()
+            raise API["SpotifyApiError"]("PRIVATE-content", status=503)
+
+        obj, poll, logger, _ = self.rig(devices=devices)
+        task = asyncio.create_task(poll())
+        await entered.wait()
+        obj.owner_epoch = "PRIVATE-replacement"
+        obj.poll_sequence = 900
+        release.set()
+        with self.assertRaises(PollUpdateFailed):
+            await task
+        original_ref = hashlib.sha256(b"PRIVATE-owner:1").hexdigest()[:16]
+        self.assertIn(f"poll_ref={original_ref}", self.records(logger, "warning")[0])
+        self.assertNotIn("PRIVATE", self.records(logger, "warning")[0])

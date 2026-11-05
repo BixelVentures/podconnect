@@ -1,3 +1,9 @@
+## Bounded existing-poll diagnostic · 5 November 2026 candidate
+
+The existing coordinator may log playback_poll event=failed with a16hex poll_ref derived from captured owner incarnation/poll sequence, one closed poll kind and each existing read's state/kind/HTTPstatus. State is pending/success/error/cancelled; kinds are fixed categories, not exception names/text. HTTPstatus is0 when unavailable, otherwise an exact integer100–599. Only failed polls are logged; after the next normal success and final owner check, event=recovered joins the previous_ref once. No URLs, account/device/track IDs, response bodies or tokens occur in this new record. Existing HA exception logging is unchanged legacy behavior.
+
+This introduces no provider read, retry, partial snapshot, action authority or response-schema field. Failure remains unavailable, cancellation propagates and telemetry failure cannot alter behavior. Match the diagnostic to the normal existing unavailable read by timing/current owner; do not infer an account/field cause from a different poll. Actual provider attribution still requires the field failure observation. [Exact source and inert HA evidence](read-diagnostics-receipt-20261105.json).
+
 # Account-owned playback and queue observations
 
 These additive Control services are intended for server consumers such as PodVoice.

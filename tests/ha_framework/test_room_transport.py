@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import voluptuous as vol
 from aiohttp import web
-from test_commands import CommandFrameworkTests
+from test_commands import CommandFrameworkTests, SpotifyApiError
 
 
 class RoomTransportFrameworkTests(CommandFrameworkTests):
@@ -692,6 +692,75 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
             blocking=True,
             return_response=True,
         )
+
+    async def test_devices_failure_after_playback_keeps_snapshot_unavailable_then_recovers(
+        self,
+    ):
+        coordinator = self.entries[0].runtime_data.coordinator
+        baseline = await self.output_snapshot()
+        self.assertTrue(baseline["ok"])
+        playback_complete = asyncio.Event()
+        playback_state = coordinator.api.playback_state
+
+        async def successful_playback():
+            value = await playback_state()
+            playback_complete.set()
+            return value
+
+        async def failed_devices():
+            await playback_complete.wait()
+            raise SpotifyApiError("private diagnostic sentinel", status=503)
+
+        with self.assertLogs("custom_components.podconnect", level="INFO") as captured:
+            with (
+                patch.object(coordinator.api, "playback_state", successful_playback),
+                patch.object(coordinator.api, "devices", failed_devices),
+            ):
+                await coordinator.async_refresh()
+                self.assertTrue(playback_complete.is_set())
+                self.assertFalse(coordinator.last_update_success)
+                self.assertEqual(
+                    await self.output_snapshot(),
+                    {"ok": False, "error_kind": "unavailable"},
+                )
+            await coordinator.async_refresh()
+            recovered = await self.output_snapshot()
+
+        self.assertTrue(coordinator.last_update_success)
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(recovered["observation"]["status"], "fresh")
+        self.assertGreater(recovered["poll_sequence"], baseline["poll_sequence"])
+        self.assertEqual(recovered["output"]["status"], "observed")
+        self.assertEqual(self.room_posts, [])
+        self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
+        self.assertCountEqual(
+            self.calls,
+            [
+                ("GET", "/spotify/me/player", None, True),
+                ("GET", "/spotify/me/player", None, True),
+                ("GET", "/spotify/me/player/devices", None, True),
+            ],
+        )
+        diagnostic = [
+            record.getMessage()
+            for record in captured.records
+            if record.getMessage().startswith("playback_poll ")
+        ]
+        self.assertEqual(len(diagnostic), 2)
+        self.assertRegex(
+            diagnostic[0],
+            r"^playback_poll event=failed poll_ref=[a-f0-9]{16} "
+            r"kind=spotify_api playback=success playback_kind=none "
+            r"playback_status=0 devices=error devices_kind=spotify_api "
+            r"devices_status=503$",
+        )
+        failure_ref = diagnostic[0].split("poll_ref=", 1)[1].split()[0]
+        self.assertRegex(
+            diagnostic[1],
+            rf"^playback_poll event=recovered poll_ref=[a-f0-9]{{16}} "
+            rf"previous_ref={failure_ref}$",
+        )
+        self.assertNotIn("private diagnostic sentinel", " ".join(diagnostic))
 
     async def test_playback_output_default_v1_remains_closed_and_read_free(self):
         value = await self.output_snapshot(False)

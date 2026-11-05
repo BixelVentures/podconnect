@@ -110,11 +110,13 @@ class SpotifyApi:
                 return None
             if resp.status == 429:
                 raise SpotifyApiError(
-                    f"rate limited (retry-after={resp.headers.get('Retry-After')}s)"
+                    f"rate limited (retry-after={resp.headers.get('Retry-After')}s)",
+                    status=resp.status,
                 )
             if resp.status >= 400:
                 raise SpotifyApiError(
-                    f"{method} {path} -> {resp.status}: {await resp.text()}"
+                    f"{method} {path} -> {resp.status}: {await resp.text()}",
+                    status=resp.status,
                 )
             if playback_response:
                 if resp.status != 200 or resp.content_type != "application/json":
