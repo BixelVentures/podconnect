@@ -1,3 +1,8 @@
+## Control 0.10.37 — opt-in native room seeking
+
+- Clients can request seek capability through the existing playback and room-control reads with `include_seek`. The default response remains unchanged for older clients.
+- Explicit seek uses the existing native room command, absolute position validation and exact owner/route checks; read requests never start playback.
+
 ## Control 0.10.36 — changes from other apps show up fast
 
 - Fire a `podconnect_playback_changed` Home Assistant event once per real playback change (play/pause, track, device, volume, shuffle, repeat), after the new state is published. Dashboards such as PodView refresh on it instead of polling.
