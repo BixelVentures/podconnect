@@ -1,3 +1,7 @@
+## Speakers 0.26.67 — distinguish journal denials during music start
+
+- Record the first journal denial category in the existing OwnTone start log. Playback and journal admission stay the same.
+
 ## Control 0.10.34 — diagnose rejected queue reads
 
 - Record the reason an existing queue read failed, with a short reference to the observed playback poll when available. The diagnostics preserve queue admission, command outcomes, and request counts.
