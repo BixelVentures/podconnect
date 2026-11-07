@@ -410,6 +410,12 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
                 )
             self.room_release.set()
             result = await task
+            if replacement == "poll":
+                # A newer Web API poll is not a changed room: the idempotent
+                # intent still commits on the exact Speakers-fenced route.
+                self.assertEqual(result["outcome"], "accepted")
+                self.assertEqual(len(self.room_posts), 2)
+                continue
             self.assertEqual(result["outcome"], "rejected")
             self.assertEqual(len(self.room_posts), 1)
         self.assertEqual(self._writes(), [])
@@ -477,19 +483,24 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
                 change,
             )
 
-    async def test_pause_newer_poll_does_not_bypass_sequence_floor_or_future_poll(self):
+    async def test_room_intent_does_not_wait_for_poll_floor_or_newer_poll(self):
+        """Pause/next must work immediately after a prior command (snappy UI)."""
         self.playing = True
         data = self.entries[0].runtime_data
         await data.coordinator.async_refresh()
         request = self.room_request("pause")
         data.coordinator.data["poll_sequence"] += 1
-        data.commands.poll_floor = request["expected_poll_sequence"]
+        data.commands.poll_floor = data.coordinator.data["poll_sequence"]
         result = await self.room_invoke(request)
-        self.assertEqual(result["error_kind"], "awaiting_observation")
-        request = self.room_request("pause", expected_poll_sequence=999)
-        result = await self.room_invoke(request)
-        self.assertEqual(result["error_kind"], "stale_observation")
-        self.assertEqual(self.room_posts, [])
+        self.assertEqual(result["outcome"], "accepted")
+        offer = await self.room_offer()
+        self.assertIn("next", offer["actions"])
+        result = await self.room_invoke(self.room_request("next"))
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(
+            [p for p, _ in self.room_posts],
+            ["/api/room-transport/prepare", "/api/room-transport/commit"] * 2,
+        )
         self.assertEqual(self._writes(), [])
 
     async def test_pause_newer_poll_still_denies_changed_authority_or_capability(self):

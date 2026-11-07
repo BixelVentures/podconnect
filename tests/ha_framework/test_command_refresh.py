@@ -93,13 +93,15 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(self.manual_percent, 27)
         print(f"INERT_BURST_SECONDS={elapsed:.6f}", flush=True)
 
-    async def test_refresh_slow_provider_stays_awaiting_until_real_response(self):
+    async def test_refresh_slow_provider_keeps_room_controls_ready(self):
+        """A slow Web API must never grey out Play/Next after Pause."""
         self.refresh_hold = True
         result = await self.room_invoke(self.room_request("pause"))
         self.assertEqual(result["outcome"], "accepted")
         offered = await self.room_offer()
-        self.assertEqual(offered["status"], "awaiting_observation")
-        self.assertEqual(offered["actions"], [])
+        self.assertEqual(offered["status"], "ready")
+        self.assertIn("resume", offered["actions"])
+        self.assertIn("next", offered["actions"])
         self.assertLessEqual(
             offered["poll_sequence"], result["observe_after_poll_sequence"]
         )
@@ -116,6 +118,18 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(self.playback_reads, 1)
         self.assertEqual(len(self.room_posts), 2)
 
+    async def test_refresh_followups_settle_lagging_provider_state(self):
+        """Spotify lags after a command; short follow-ups must re-read it."""
+        coordinator = self.entries[0].runtime_data.coordinator
+        coordinator._FOLLOWUP_DELAYS_S = (0.05, 0.15)
+        result = await self.room_invoke(self.room_request("pause"))
+        self.assertEqual(result["outcome"], "accepted")
+        await self.demand_done()
+        reads = self.playback_reads
+        await asyncio.sleep(0.5)
+        self.assertEqual(self.playback_reads, reads + 2)
+        self.assertEqual(self._writes(), [])
+
     async def test_refresh_scheduled_poll_serializes_before_demand_without_regression(
         self,
     ):
@@ -130,7 +144,7 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         old_poll = self._task(coordinator._async_refresh(scheduled=True))
         await asyncio.wait_for(self.refresh_entered.wait(), 2)
         result = await self.room_invoke(self.room_request("pause"))
-        self.assertEqual((await self.room_offer())["status"], "awaiting_observation")
+        self.assertEqual((await self.room_offer())["status"], "ready")
         self.assertEqual(self.playback_reads, 1)
         self.refresh_release.set()
         await old_poll
@@ -296,7 +310,7 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(self.room_posts, [])
         self.assertEqual(self._writes(), [])
 
-    async def test_refresh_native_phase_current_poll_still_required_before_commit(self):
+    async def test_refresh_native_phase_newer_poll_does_not_reject_intent(self):
         self.state_corrupt = lambda value: value.update(actions=["resume"])
         self.room_hold = True
         task = self._task(self.room_invoke(self.room_request("resume")))
@@ -304,8 +318,8 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         await self.entries[0].runtime_data.coordinator.async_refresh()
         self.room_release.set()
         result = await task
-        self.assertEqual(result["error_kind"], "stale_observation")
-        self.assertEqual(len(self.room_posts), 1)
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(len(self.room_posts), 2)
         self.assertEqual(self._writes(), [])
 
     async def test_refresh_native_phase_foreign_current_room_never_commits(self):

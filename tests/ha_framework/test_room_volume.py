@@ -322,6 +322,7 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
 
     async def test_volume_held_prepare_poll_owner_or_account_change_denies(self):
         for operation in ("poll", "owner", "account"):
+            percent_before = self.manual_percent
             self.volume_posts.clear()
             self.volume_entered.clear()
             self.volume_release.clear()
@@ -341,10 +342,16 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
                 )
             self.volume_release.set()
             result = await task
-            self.assertEqual(result["outcome"], "rejected")
             await self.cleanup_finished()
+            if operation == "poll":
+                # A newer Web API poll is not a changed route; volume is an
+                # idempotent intent fenced by Speakers at commit.
+                self.assertEqual(result["outcome"], "accepted")
+                self.assertEqual(len(self.commits()), 1)
+                continue
+            self.assertEqual(result["outcome"], "rejected")
             self.assertEqual(self.commits(), [])
-        self.assertEqual(self.manual_percent, 27)
+            self.assertEqual(self.manual_percent, percent_before)
         self.assertEqual(self._writes(), [])
 
     async def test_volume_changed_prepare_binding_or_percent_never_commits(self):

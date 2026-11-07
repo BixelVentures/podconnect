@@ -168,7 +168,7 @@ class RoomVolume:
 
         context = {"room_id": room, "homepod_id": homepod}
         scope = self._scope(hass, entry, target, context)
-        before = self.commands.controls(entry, target)
+        before = self.commands.controls(entry, target, intent=True)
         source = (
             self.commands.room_transport.observation_source(hass, entry)
             if passive
@@ -180,7 +180,7 @@ class RoomVolume:
             raise CommandRejected("room_volume_unavailable") from exc
         if self._scope(hass, entry, target, context) != scope:
             raise CommandRejected("native_account_unproven")
-        latest = self.commands.controls(entry, target)
+        latest = self.commands.controls(entry, target, intent=True)
         if (
             not same_playback_read(
                 source, self.commands.room_transport.observation_source(hass, entry)
