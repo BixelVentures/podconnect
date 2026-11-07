@@ -1,3 +1,7 @@
+## Control 0.10.34 — diagnose rejected queue reads
+
+- Record the reason an existing queue read failed, with a short reference to the observed playback poll when available. The diagnostics preserve queue admission, command outcomes, and request counts.
+
 ## Control 0.10.33 — diagnose failed playback reads
 
 - Record content-free failure and recovery outcomes for the existing playback/device reads, without extra requests, retries or changes to playback availability and command authority. This improves diagnosis; it does not claim to fix the intermittent music failure.

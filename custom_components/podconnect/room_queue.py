@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -23,6 +25,7 @@ _H24 = re.compile(r"[a-f0-9]{24}")
 _H64 = re.compile(r"[a-f0-9]{64}")
 _DEC = re.compile(r"0|[1-9][0-9]{0,19}")
 _TRACK = re.compile(r"spotify:track:[A-Za-z0-9]{22}")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _hex(value, pattern):
@@ -158,6 +161,30 @@ class RoomQueue:
         self.observations = {}
         self.preparations = {}
         self.read_revision = 0
+        self._queue_read_log_after = {}
+
+    def _trace_read_failure(self, reason, observed=None):
+        try:
+            now = time.monotonic()
+            if now < self._queue_read_log_after.get(reason, 0):
+                return
+            self._queue_read_log_after[reason] = now + 10
+            poll_ref = "none"
+            if observed is not None:
+                epoch, sequence = observed["owner_epoch"], observed["poll_sequence"]
+                if (
+                    isinstance(epoch, str)
+                    and 1 <= len(epoch) <= 160
+                    and type(sequence) is int
+                ):
+                    poll_ref = hashlib.sha256(
+                        f"{epoch}:{sequence}".encode()
+                    ).hexdigest()[:16]
+            _LOGGER.warning(
+                "room_queue_read event=failed reason=%s poll_ref=%s", reason, poll_ref
+            )
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            return  # Diagnostic failures must preserve the original rejection.
 
     def _scope(self, hass, entry, target, room, homepod):
         from .commands import CommandRejected
@@ -207,20 +234,37 @@ class RoomQueue:
     async def read(self, hass, entry, target, room, homepod):
         from .commands import CommandRejected
 
-        scope = self._scope(hass, entry, target, room, homepod)
-        before = self.commands.controls(entry, target)
-        self.read_revision += 1
-        revision = self.read_revision
-        self.observations.clear()
-        started = time.monotonic()
-        value = await self.commands.data.speakers.room_queue_state(scope)
-        latest = self.commands.controls(entry, target)
-        if (
-            self._scope(hass, entry, target, room, homepod) != scope
-            or revision != self.read_revision
-            or any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence"))
-        ):
-            raise CommandRejected("stale_observation")
+        observed = None
+        reason = "scope_unavailable"
+        try:
+            scope = self._scope(hass, entry, target, room, homepod)
+            reason = "playback_before_unavailable"
+            before = self.commands.controls(entry, target)
+            observed = before
+            self.read_revision += 1
+            revision = self.read_revision
+            self.observations.clear()
+            started = time.monotonic()
+            reason = "speakers_unavailable"
+            value = await self.commands.data.speakers.room_queue_state(scope)
+            reason = "playback_after_unavailable"
+            latest = self.commands.controls(entry, target)
+            observed = latest
+            reason = "scope_changed"
+            if self._scope(hass, entry, target, room, homepod) != scope:
+                raise CommandRejected("stale_observation")
+            reason = "read_revision_changed"
+            if revision != self.read_revision:
+                raise CommandRejected("stale_observation")
+            reason = "owner_epoch_changed"
+            if before["owner_epoch"] != latest["owner_epoch"]:
+                raise CommandRejected("stale_observation")
+            reason = "poll_sequence_changed"
+            if before["poll_sequence"] != latest["poll_sequence"]:
+                raise CommandRejected("stale_observation")
+        except (CommandRejected, SpeakersError):
+            self._trace_read_failure(reason, observed)
+            raise
         keys = {
             "schema",
             "ok",
@@ -239,8 +283,11 @@ class RoomQueue:
             or value["purpose"] != PURPOSE
             or value["physical_result_verified"] is not False
             or value["actions"] not in ([], [ACTION])
-            or not identity(value["native"], value["route"], scope)
         ):
+            self._trace_read_failure("native_response_invalid", latest)
+            raise CommandRejected("room_queue_unavailable")
+        if not identity(value["native"], value["route"], scope):
+            self._trace_read_failure("native_route_identity_invalid", latest)
             raise CommandRejected("room_queue_unavailable")
         queue = value["queue"]
         if (
@@ -256,6 +303,7 @@ class RoomQueue:
             or not isinstance(queue["items"], list)
             or len(queue["items"]) > 20
         ):
+            self._trace_read_failure("queue_payload_invalid", latest)
             raise CommandRejected("room_queue_unavailable")
         seen = set()
         for index, row in enumerate(queue["items"]):
@@ -269,6 +317,7 @@ class RoomQueue:
                 or not _hex(row["uri"], _TRACK)
                 or type(row["queued"]) is not bool
             ):
+                self._trace_read_failure("queue_rows_invalid", latest)
                 raise CommandRejected("room_queue_unavailable")
             seen.add(row["id"])
         from datetime import datetime
@@ -282,6 +331,7 @@ class RoomQueue:
             (observation["max_age_ms"] - observation["age_ms"]) / 1000,
         )
         if remaining <= 0:
+            self._trace_read_failure("queue_expired", latest)
             raise CommandRejected("room_queue_expired")
         self.observations[queue["observation_id"]] = {
             "value": copy.deepcopy(value),
