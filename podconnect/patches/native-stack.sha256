@@ -47,3 +47,4 @@ dc8aa32ca5fe525fc53f3131814aed6f5ee48491d092d0a4b9b86fee7b01ba54  /patches/block
 e19c26159cf722cc41515e30c950257e3f51bab25c24d7a0cbf4cd7d8ea7d10c  /patches/blocked-decoder-controls-native-tests.patch
 63996e7c2a3ddcdf4208674b543be4774a42cb29a9adb2a822a1cc881358b55e  /patches/queue-metadata-background-native.patch
 a15b9c18b2e38a617e1cc9af2ec28b62bb818c25d94985cb50bf9729c0d930b0  /patches/dealer-fieldcodes-native.patch
+68769882dd15ebf873cccff3c354baa4062ed762ffd16625d61e018b094cade7  /patches/queue-occurrence-continuity-native.patch

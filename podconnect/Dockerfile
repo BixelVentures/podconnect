@@ -124,6 +124,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && sha256sum -c /patches/radio-handoff-native.sha256 \
   && git apply --check /patches/radio-handoff-native.patch \
   && git apply /patches/radio-handoff-native.patch \
+  && git apply --check /patches/queue-occurrence-continuity-native.patch \
+  && git apply /patches/queue-occurrence-continuity-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 

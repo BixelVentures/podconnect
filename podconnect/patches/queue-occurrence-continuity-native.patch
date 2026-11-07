@@ -1,0 +1,307 @@
+diff --git a/daemon/player.go b/daemon/player.go
+index 4b64225..5d5e80e 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -61,6 +61,7 @@ type AppPlayer struct {
+ 	roomTransportGeneration          uint64
+ 	roomTransportGenerationExhausted bool
+ 	queueOccurrenceOffer             *nativeQueueOffer
++	queuePresentationContinuation    *nativeQueueOffer
+ 	queueMetadata                    queueMetadataCache
+ 	app                              *App
+ 	sess                             *session.Session
+diff --git a/daemon/queue_occurrence.go b/daemon/queue_occurrence.go
+index bde3920..42df3e9 100644
+--- a/daemon/queue_occurrence.go
++++ b/daemon/queue_occurrence.go
+@@ -77,6 +77,15 @@ type nativeQueueOffer struct {
+ // retainQueuePresentation is called only after a fresh bound observation has
+ // captured its writer and passed current owner checks. It never grants authority.
+ func retainQueuePresentation(previous, fresh *nativeQueueOffer) {
++	if !sameQueuePresentationScope(previous, fresh) ||
++		previous.Snapshot.Truncated != fresh.Snapshot.Truncated ||
++		len(previous.Snapshot.Items) != len(fresh.Snapshot.Items) {
++		return
++	}
++	copyQueuePresentationPrefix(previous.Snapshot.Items, fresh.Snapshot.Items)
++}
++
++func sameQueuePresentationScope(previous, fresh *nativeQueueOffer) bool {
+ 	if previous == nil || fresh == nil || previous == fresh ||
+ 		previous.BoundOwner == nil || fresh.BoundOwner == nil ||
+ 		*previous.BoundOwner != *fresh.BoundOwner ||
+@@ -90,31 +99,38 @@ func retainQueuePresentation(previous, fresh *nativeQueueOffer) {
+ 		previous.Writer == nil || fresh.Writer == nil || previous.Writer.Wire != fresh.Writer.Wire ||
+ 		(previous.Writer.Completed == nil) != (fresh.Writer.Completed == nil) ||
+ 		(previous.Writer.Completed != nil && *previous.Writer.Completed != *fresh.Writer.Completed) {
+-		return
++		return false
+ 	}
+ 	old, next := previous.Snapshot, fresh.Snapshot
+-	if old.Schema != "podconnect.native_queue.v1" || old.Schema != next.Schema ||
+-		old.TargetID != next.TargetID || old.RoomID != next.RoomID || old.AccountUserID != next.AccountUserID ||
+-		old.ConnectionID != next.ConnectionID || old.SessionID != next.SessionID ||
+-		old.AliasIncarnation != next.AliasIncarnation || old.QueueRevision != next.QueueRevision ||
+-		old.Truncated != next.Truncated || len(old.Items) != len(next.Items) ||
+-		!queueIDPattern.MatchString(next.ObservationID) || old.ObservationID == next.ObservationID {
+-		return
++	return old.Schema == "podconnect.native_queue.v1" && old.Schema == next.Schema &&
++		old.TargetID == next.TargetID && old.RoomID == next.RoomID && old.AccountUserID == next.AccountUserID &&
++		old.ConnectionID == next.ConnectionID && old.SessionID == next.SessionID &&
++		old.AliasIncarnation == next.AliasIncarnation && old.QueueRevision == next.QueueRevision &&
++		queueIDPattern.MatchString(next.ObservationID) && old.ObservationID != next.ObservationID
++}
++
++func copyQueuePresentationPrefix(old, fresh []nativeQueueItem) bool {
++	if len(old) > len(fresh) {
++		return false
+ 	}
+-	seen := make(map[string]bool, len(old.Items))
+-	for index, row := range old.Items {
+-		current := next.Items[index]
++	seen := make(map[string]bool, len(fresh))
++	for _, row := range fresh[len(old):] {
++		seen[row.ID] = true
++	}
++	for index, row := range old {
++		current := fresh[index]
+ 		if !queueOccurrenceIDPattern.MatchString(row.ID) || seen[row.ID] ||
+ 			row.Position != index || current.Position != index || row.URI != current.URI || row.Queued != current.Queued {
+-			return
++			return false
+ 		}
+ 		seen[row.ID] = true
+ 	}
+ 	// Only presentation IDs survive. The fresh observation, deadline and private
+ 	// admission proof stay detached; neither an old lease nor a consumed offer returns.
+-	for index := range fresh.Snapshot.Items {
+-		fresh.Snapshot.Items[index].ID = old.Items[index].ID
++	for index := range old {
++		fresh[index].ID = old[index].ID
+ 	}
++	return true
+ }
+ 
+ func randomQueueID(bytes int) (string, error) {
+diff --git a/daemon/room_queue.go b/daemon/room_queue.go
+index dfabd82..d7b0062 100644
+--- a/daemon/room_queue.go
++++ b/daemon/room_queue.go
+@@ -273,7 +273,9 @@ func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTranspo
+ 	if remaining < 1 {
+ 		return nil, ErrAliasConflict
+ 	}
+-	retainQueuePresentation(previous, offer)
++	if !p.retainQueueContinuation(offer) {
++		retainQueuePresentation(previous, offer)
++	}
+ 	p.queueOccurrenceOffer = offer
+ 	var metadata map[string]queueMetadata
+ 	if client := p.sess.Spclient(); client != nil {
+@@ -281,6 +283,54 @@ func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTranspo
+ 	}
+ 	return queueStateResponse{Schema: "podconnect.native_room_queue_state.v1", Ready: true, Purpose: queuePurpose, Owner: identity, ObservationID: offer.Snapshot.ObservationID, Revision: offer.Snapshot.QueueRevision, Expires: min(remaining, 10000), Items: offer.Snapshot.Items, Truncated: offer.Snapshot.Truncated, Writer: writer.Wire, Physical: false, Metadata: metadata}, nil
+ }
++
++// A successful exact queue selection removes the upcoming prefix through the
++// selected row. Retain its known survivors only for the actual published list.
++func (p *AppPlayer) recordQueueContinuation(offer *nativeTransportOffer) {
++	p.queuePresentationContinuation = nil
++	queue := offer.Queue
++	if queue == nil || queue.Owner != p || !offer.Published || !queue.EffectEnqueued || !queue.EffectJoined ||
++		queue.Observation == nil || queue.Observation.BoundOwner == nil || offer.Writer == nil ||
++		p.state == nil || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player ||
++		p.primaryStream == nil || p.primaryStream != offer.PreparedStream ||
++		p.state.player == nil || p.state.player != offer.PreparedState ||
++		p.state.tracks == nil || p.state.tracks != offer.PreparedTracks ||
++		p.state.tracks.TransportRevision() != queue.Selection.QueueRevision+1 {
++		return
++	}
++	previous := queue.Observation
++	owner := offer.Snapshot.roomTransportIdentity
++	if *previous.BoundOwner != owner || previous.Snapshot.ObservationID != queue.Selection.ObservationID ||
++		previous.Snapshot.QueueRevision != queue.Selection.QueueRevision ||
++		queue.Position < 0 || queue.Position >= len(previous.Snapshot.Items)-1 ||
++		previous.Snapshot.Items[queue.Position].ID != queue.Selection.OccurrenceID {
++		return
++	}
++	snapshot := previous.Snapshot
++	snapshot.QueueRevision = p.state.tracks.TransportRevision()
++	snapshot.Items = append([]nativeQueueItem(nil), previous.Snapshot.Items[queue.Position+1:]...)
++	for index := range snapshot.Items {
++		snapshot.Items[index].Position = index
++	}
++	writer := *offer.Writer
++	if writer.Completed != nil {
++		completed := *writer.Completed
++		writer.Completed = &completed
++	}
++	p.queuePresentationContinuation = &nativeQueueOffer{
++		Snapshot: snapshot, State: p.state, Tracks: p.state.tracks, Alias: previous.Alias,
++		Expires: time.Now().Add(queueOfferLifetime), BoundOwner: &owner, PlayerState: p.state.player,
++		Session: p.sess, Player: p.player, Primary: p.primaryStream,
++		Generation: p.roomTransportGeneration, Writer: &writer,
++	}
++}
++
++func (p *AppPlayer) retainQueueContinuation(fresh *nativeQueueOffer) bool {
++	previous := p.queuePresentationContinuation
++	p.queuePresentationContinuation = nil
++	return sameQueuePresentationScope(previous, fresh) && time.Now().Before(previous.Expires) &&
++		copyQueuePresentationPrefix(previous.Snapshot.Items, fresh.Snapshot.Items)
++}
+ func validRoomQueueObservation(offer *nativeQueueOffer) bool {
+ 	if offer == nil || offer.Snapshot.QueueRevision >= 1<<53 || len(offer.Snapshot.Items) > 20 {
+ 		return false
+diff --git a/daemon/room_queue_test.go b/daemon/room_queue_test.go
+index 8c0bb71..c225d9a 100644
+--- a/daemon/room_queue_test.go
++++ b/daemon/room_queue_test.go
+@@ -3,6 +3,8 @@ package daemon
+ import (
+ 	"context"
+ 	"encoding/json"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+@@ -210,6 +212,126 @@ func TestQueuePresentationIDsSurviveOnlySameBoundQueue(t *testing.T) {
+ 	}
+ }
+ 
++func TestQueuePresentationRetainsExactSurvivorOfPublishedSelection(t *testing.T) {
++	for _, kind := range []string{"manual", "context"} {
++		t.Run(kind, func(t *testing.T) {
++			p, operation, fresh := queueSurvivorFixture(t, kind)
++			old := operation.Queue.Observation.Snapshot
++			observation, expiry := fresh.Snapshot.ObservationID, fresh.Expires
++			originalTailID := fresh.Snapshot.Items[len(fresh.Snapshot.Items)-1].ID
++			p.recordQueueContinuation(operation)
++			if p.queueOccurrenceOffer != nil || !p.retainQueueContinuation(fresh) ||
++				fresh.Snapshot.Items[0].ID != old.Items[operation.Queue.Position+1].ID {
++				t.Fatal("first fresh read lost the exact surviving duplicate")
++			}
++			if fresh.Snapshot.Items[0].ID == old.Items[operation.Queue.Position].ID || fresh.Snapshot.ObservationID != observation || fresh.Expires != expiry ||
++				fresh.Snapshot.Items[len(fresh.Snapshot.Items)-1].ID != originalTailID {
++				t.Fatal("fresh read restored the consumed occurrence or old authority")
++			}
++			if p.retainQueueContinuation(fresh) {
++				t.Fatal("presentation continuation was reusable")
++			}
++		})
++	}
++}
++
++func TestQueuePresentationContinuationFailsClosedOnInterveningChange(t *testing.T) {
++	for _, change := range []string{"unpublished", "unjoined", "writer", "generation", "revision", "list", "state", "primary", "owner", "expired", "tail-collision"} {
++		t.Run(change, func(t *testing.T) {
++			p, operation, fresh := queueSurvivorFixture(t, "context")
++			switch change {
++			case "unpublished":
++				operation.Published = false
++			case "unjoined":
++				operation.Queue.EffectJoined = false
++			}
++			p.recordQueueContinuation(operation)
++			switch change {
++			case "writer":
++				fresh.Writer.Wire.Generation = "2"
++			case "generation":
++				fresh.Generation++
++			case "revision":
++				fresh.Snapshot.QueueRevision++
++			case "list":
++				fresh.Tracks = &tracks.List{}
++			case "state":
++				fresh.PlayerState = &connectpb.PlayerState{}
++			case "primary":
++				fresh.Primary = &player.Stream{}
++			case "owner":
++				fresh.BoundOwner.AliasRevision++
++			case "expired":
++				p.queuePresentationContinuation.Expires = time.Now().Add(-time.Second)
++			case "tail-collision":
++				old := operation.Queue.Observation.Snapshot.Items[operation.Queue.Position+1]
++				fresh.Snapshot.Items[len(fresh.Snapshot.Items)-1].ID = old.ID
++			}
++			original := fresh.Snapshot.Items[0].ID
++			if p.retainQueueContinuation(fresh) || fresh.Snapshot.Items[0].ID != original || p.queuePresentationContinuation != nil {
++				t.Fatal("stale or unsupported transition reused a prior occurrence")
++			}
++		})
++	}
++}
++
++func queueSurvivorFixture(t *testing.T, kind string) (*AppPlayer, *nativeTransportOffer, *nativeQueueOffer) {
++	t.Helper()
++	ctx := context.Background()
++	p, operation := queueAdmittedFixture(t)
++	owner := operation.Snapshot.roomTransportIdentity
++	track := func(value string) *connectpb.ContextTrack {
++		return &connectpb.ContextTrack{Uri: "spotify:track:" + strings.Repeat(value, 22), Uid: "duplicate"}
++	}
++	rows := []*connectpb.ContextTrack{track("0"), track("1"), track("1"), track("1"), track("2")}
++	for range 20 {
++		rows = append(rows, track("3"))
++	}
++	list, err := tracks.NewTrackListFromContext(ctx, &librespot.NullLogger{}, nil, &connectpb.Context{
++		Uri: "spotify:playlist:" + strings.Repeat("0", 22), Pages: []*connectpb.ContextPage{{Tracks: rows}},
++	})
++	if err != nil || !list.GoStart(ctx) {
++		t.Fatal("fixture context unavailable", err)
++	}
++	if kind == "manual" {
++		for range 3 {
++			list.AddToQueue(track("1"))
++		}
++	}
++	snapshot := func(list *tracks.List, observation string, idBase int) nativeQueueSnapshot {
++		t.Helper()
++		upcoming, err := list.ObserveUpcoming(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		items := make([]nativeQueueItem, 0, len(upcoming.Items))
++		for _, row := range upcoming.Items {
++			items = append(items, nativeQueueItem{ID: fmt.Sprintf("%024x", idBase+row.Position), Position: row.Position, URI: row.URI, Queued: row.Queued})
++		}
++		return nativeQueueSnapshot{Schema: "podconnect.native_queue.v1", TargetID: owner.TargetID, RoomID: owner.RoomID, AccountUserID: owner.AccountUserID, ConnectionID: owner.ConnectionID, SessionID: owner.SessionID, AliasIncarnation: owner.AliasIncarnation, ObservationID: observation, QueueRevision: upcoming.Revision, Items: items, Truncated: upcoming.Truncated}
++	}
++	bound := func(list *tracks.List, observed nativeQueueSnapshot) *nativeQueueOffer {
++		return &nativeQueueOffer{Snapshot: observed, State: p.state, Tracks: list, Alias: *p.aliasBinding(), Expires: time.Now().Add(time.Second), BoundOwner: &owner, PlayerState: p.state.player, Session: p.sess, Player: p.player, Primary: p.primaryStream, Generation: p.roomTransportGeneration, Writer: operation.Writer}
++	}
++	p.state.tracks = list
++	before := snapshot(list, strings.Repeat("a", 32), 1)
++	operation.Queue.Observation = bound(list, before)
++	position := operation.Queue.Position
++	operation.Queue.Selection = queueSelection{before.ObservationID, owner.SessionID, before.QueueRevision, before.Items[position].ID}
++	operation.QueueRevision = before.QueueRevision
++	staged, err := list.PrepareQueueOccurrence(ctx, before.QueueRevision, position)
++	if err != nil {
++		t.Fatal(err)
++	}
++	operation.PreparedTracks, operation.PreparedState = staged, &connectpb.PlayerState{SessionId: owner.SessionID}
++	operation.PreparedStream = &player.Stream{Source: &contentInertSource{}}
++	operation.Published, operation.Queue.EffectEnqueued, operation.Queue.EffectJoined = true, true, true
++	p.state.tracks, p.state.player, p.primaryStream = operation.PreparedTracks, operation.PreparedState, operation.PreparedStream
++	p.advanceRoomTransportGenerationLocked()
++	fresh := bound(staged, snapshot(staged, strings.Repeat("b", 32), 100))
++	return p, operation, fresh
++}
++
+ func TestQueuePresentationIDsNeverBridgeChangedOwnerOrDuplicateReplacement(t *testing.T) {
+ 	for _, change := range []string{"nil", "consumed", "list", "state", "player-state", "session", "player", "primary", "generation", "bound-owner", "alias", "writer", "account", "connection", "session-id", "revision", "position", "uri", "queued", "count", "truncated", "old-id", "duplicate-id", "unbound"} {
+ 		t.Run(change, func(t *testing.T) {
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+index 4170121..e521b4a 100644
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -655,6 +655,7 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
+ 		p.handlePlayerEvent(parent, &player.Event{Type: event})
+ 	}
+ 	if offer.Queue != nil {
++		p.recordQueueContinuation(offer)
+ 		return queueAccepted(offer), nil
+ 	}
+ 	p.recordRoomEffect(offer)

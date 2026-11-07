@@ -1,3 +1,7 @@
+## Speakers 0.26.68 — retain exact surviving queue occurrences
+
+- Preserve the identities of the exact queue rows that survive a successful native queue selection, including identical song duplicates. Every later selection still requires a fresh observation and current owner, output and admission checks.
+
 ## Control 0.10.37 — opt-in native room seeking
 
 - Clients can request seek capability through the existing playback and room-control reads with `include_seek`. The default response remains unchanged for older clients.
