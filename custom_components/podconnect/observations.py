@@ -289,6 +289,7 @@ def register_observation_services(hass):
             entry_id,
             result,
             include_controls=True,
+            include_seek=call.data["include_seek"],
         )
         try:
             current(hass, entry_id, data)
@@ -335,6 +336,8 @@ def register_observation_services(hass):
     def playback_options(value):
         if value["include_controls"] and not value["include_output"]:
             raise vol.Invalid("include_controls requires include_output")
+        if value["include_seek"] and not value["include_controls"]:
+            raise vol.Invalid("include_seek requires include_controls")
         if ("request_id" in value) != ("command_sequence" in value):
             raise vol.Invalid("request_id and command_sequence must be paired")
         if "request_id" in value and not value["include_controls"]:
@@ -346,6 +349,7 @@ def register_observation_services(hass):
             **account,
             vol.Optional("include_output", default=False): bool,
             vol.Optional("include_controls", default=False): bool,
+            vol.Optional("include_seek", default=False): bool,
             vol.Optional("request_id"): vol.All(str, vol.Length(min=1, max=145)),
             vol.Optional("command_sequence"): vol.All(
                 _limit, vol.Range(min=1, max=2**53 - 1)

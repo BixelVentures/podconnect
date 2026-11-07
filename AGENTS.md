@@ -21,12 +21,15 @@ Brugere og PodView (`BixelVentures/podvoice`) mærker alt, hvad der sker her.
 
 ## Krav til oplevelsen
 
-- Pause, afspil, næste, forrige, spol, shuffle, repeat og lydstyrke er idempotente
-  intents. De må ikke vente på en ny Spotify-poll og må ikke afvises, fordi en poll landede
-  imens. Konto, ejer, mål og Speakers-rute tjekkes stadig ved afsendelse.
+- Almindelig betjening må ikke vente på en ny Spotify-poll eller afvises alene, fordi
+  en poll landede imens. Næste/forrige er særskilte brugertryk, aldrig automatisk replay.
+  Absolutte værdier (fx spoleposition og lydstyrke) følger seneste eksplicitte ønske.
+  Konto, ejer, mål, aktuelt indhold og Speakers-rute tjekkes stadig ved afsendelse.
 - Kun start af nyt indhold og flytning mellem rum bekræftes mod aktuel observation.
 - Efter en kommando skal tilstanden være opdateret inden for få sekunder (ikke 10 s-poll).
 - Ingen tokens, persondata eller rå payloads i logs.
+- Ingen lydprøver kl. 18–08 Europe/Copenhagen; ingen installation/genstart, der kan genoptage lyd.
+  Softwareprøver bruger isolerede adaptere. Fysisk accept rapporteres særskilt.
 
 ## Det gør du ikke
 

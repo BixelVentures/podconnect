@@ -1061,6 +1061,9 @@ class PlaybackCommands:
 
 
 def register_command_services(hass):
+    from .room_transport import ACTIONS as room_transport_actions
+    from .room_transport import OBSERVED_ACTIONS
+
     text = vol.All(str, vol.Length(min=1, max=128))
     target = vol.All(str, vol.Length(min=1, max=1024))
     identity = {
@@ -1115,12 +1118,14 @@ def register_command_services(hass):
                 call.data["room_id"],
                 call.data["homepod_id"],
             )
-            # The external v1 offer is the existing four-button contract.
-            # Internal native readers retain seek/shuffle/repeat capabilities.
+            # Internal shuffle/repeat capabilities are not public room offers.
             return {
                 **controls,
                 "actions": [
-                    action for action in _DISALLOWED if action in controls["actions"]
+                    action
+                    for action in OBSERVED_ACTIONS
+                    if action in controls["actions"]
+                    and (action != "seek" or call.data["include_seek"])
                 ],
             }
         except CommandRejected as exc:
@@ -1288,9 +1293,7 @@ def register_command_services(hass):
     room_command_schema = {
         **command_schema,
         **room_identity,
-        vol.Required("action"): vol.In(
-            ("pause", "resume", "next", "previous", "shuffle", "repeat")
-        ),
+        vol.Required("action"): vol.In(room_transport_actions),
         vol.Required("native"): dict,
         vol.Required("route"): dict,
     }
@@ -1351,7 +1354,11 @@ def register_command_services(hass):
         ("cancel_room_content_preparation", content_cancel, content_cancel_schema),
         ("get_room_volume_controls", volume_controls, room_identity),
         ("control_room_volume", volume_command, volume_command_schema),
-        ("get_room_playback_controls", room_controls, room_identity),
+        (
+            "get_room_playback_controls",
+            room_controls,
+            {**room_identity, vol.Optional("include_seek", default=False): bool},
+        ),
         ("control_room_playback", room_command, room_command_schema),
         (
             "get_track_play_controls",

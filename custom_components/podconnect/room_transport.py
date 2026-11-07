@@ -15,8 +15,8 @@ from homeassistant.exceptions import HomeAssistantError
 from .observations import PLAYBACK_MAX_AGE_S, _bounded, current
 from .speakers import ROOM_READ_REASONS, SpeakersError
 
-_OBSERVED_ACTIONS = ("pause", "resume", "next", "previous")
-ACTIONS = (*_OBSERVED_ACTIONS, "seek", "shuffle", "repeat")
+OBSERVED_ACTIONS = ("pause", "resume", "next", "previous", "seek")
+ACTIONS = (*OBSERVED_ACTIONS, "shuffle", "repeat")
 _NATIVE = {
     "account_user_id",
     "target_id",
@@ -223,7 +223,9 @@ class RoomTransport:
             raise CommandRejected("room_transport_unavailable")
         return state
 
-    async def playback_output(self, hass, entry, observed, *, include_controls=False):
+    async def playback_output(
+        self, hass, entry, observed, *, include_controls=False, include_seek=False
+    ):
         """One read-only resolver; the deadline is an observation, never a lease."""
         from .commands import CommandRejected
 
@@ -328,8 +330,10 @@ class RoomTransport:
                     )
                     actions = [
                         action
-                        for action in _OBSERVED_ACTIONS
-                        if action in state["actions"] and action in allowed["actions"]
+                        for action in OBSERVED_ACTIONS
+                        if action in state["actions"]
+                        and action in allowed["actions"]
+                        and (action != "seek" or include_seek)
                     ]
                     volume, reason = None, None
                     try:

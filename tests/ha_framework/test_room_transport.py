@@ -376,6 +376,71 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         self.assertEqual(self._writes(), [])
         self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
 
+    async def test_seek_is_exposed_and_settled_by_the_exact_room_owner(self):
+        self.output_observation = True
+        self.volume_probe_unavailable = True
+
+        async def playback(**selectors):
+            return await self.hass.services.async_call(
+                "podconnect",
+                "get_playback_snapshot",
+                {
+                    "config_entry_id": "account-alpha",
+                    "include_output": True,
+                    "include_controls": True,
+                    **selectors,
+                },
+                blocking=True,
+                return_response=True,
+            )
+
+        offer = await self.room_offer()
+        projection = await playback()
+        self.assertNotIn("seek", offer["actions"])
+        self.assertNotIn("seek", projection["controls"]["supported_actions"])
+        opted_offer = await self.room_offer(include_seek=True)
+        opted_projection = await playback(include_seek=True)
+        self.assertEqual(set(opted_offer), set(offer))
+        self.assertEqual(set(opted_projection), set(projection))
+        self.assertEqual(set(opted_projection["controls"]), set(projection["controls"]))
+        self.assertIn("seek", opted_offer["actions"])
+        actions = opted_projection["controls"]["supported_actions"]
+        self.assertIn("seek", actions)
+        self.assertFalse({"shuffle", "repeat"}.intersection(actions))
+
+        self.state_corrupt = lambda state: state["actions"].remove("seek")
+        self.assertNotIn("seek", (await self.room_offer(include_seek=True))["actions"])
+        self.assertNotIn("seek", (await playback(include_seek=True))["controls"]["supported_actions"])
+        self.state_corrupt = None
+
+        with self.assertRaises(vol.Invalid):
+            await playback(include_seek=True, include_controls=False)
+
+        request = self.room_request("seek", args={"position_ms": 8000})
+        result = await self.room_invoke(request)
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertFalse(result["physical_result_verified"])
+        self.assertEqual(await self.room_invoke(request), result)
+        self.assertEqual(len(self.room_posts), 2)
+        self.assertEqual(self.room_posts[0][1]["position_ms"], 8000)
+        self.assertEqual(self.room_posts[1][1], {"prepare_id": "a" * 32})
+        self.assertEqual(self._writes(), [])
+
+        self.room_effect = {
+            "prepare_id": "a" * 32,
+            "action": "seek",
+            "effect_revision": "1",
+            "native_revision": "1",
+            "native_owner": self.native(),
+        }
+        observed = await playback(
+            include_seek=True,
+            request_id=request["request_id"],
+            command_sequence=request["command_sequence"],
+        )
+        self.assertEqual(observed["settlement"]["status"], "confirmed")
+        self.assertEqual(observed["settlement"]["observation"]["source"], "native_bound_state")
+
     async def test_room_services_are_closed_and_volume_is_unavailable(self):
         for body in (
             self.room_request("volume", args={"percent": 27}),
@@ -615,8 +680,14 @@ class RoomTransportFrameworkTests(CommandFrameworkTests):
         )
         self.assertEqual(
             set(services["get_room_playback_controls"]["fields"]),
-            {"config_entry_id", "kind", "target_id", "room_id", "homepod_id"},
+            {"config_entry_id", "kind", "target_id", "room_id", "homepod_id", "include_seek"},
         )
+        for service in ("get_playback_snapshot", "get_room_playback_controls"):
+            with self.subTest(service=service):
+                field = services[service]["fields"]["include_seek"]
+                self.assertIs(field["required"], False)
+                self.assertIs(field["default"], False)
+                self.assertIn("boolean", field["selector"])
         status, _body = await self._service(
             "control_room_playback", self.room_request(), response=False
         )

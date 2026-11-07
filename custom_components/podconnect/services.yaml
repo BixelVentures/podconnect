@@ -171,6 +171,13 @@ get_playback_snapshot:
       default: false
       selector:
         boolean:
+    include_seek:
+      name: Include observed seek support
+      description: Include seek among observed actions when supported by the current native output. Requires include_controls.
+      required: false
+      default: false
+      selector:
+        boolean:
 
 get_queue:
   name: Get observed queue
@@ -365,7 +372,7 @@ get_queue_controls:
 
 get_room_playback_controls:
   name: Read exact-room native audio controls
-  description: Same-session pause/resume/next/previous through native and OwnTone exact-room capabilities. No route selection, volume, generic fallback or physical proof.
+  description: Same-session pause, resume, next, previous and seek through native and OwnTone exact-room capabilities. No route selection, volume, generic fallback or physical proof.
   fields:
     config_entry_id:
       required: true
@@ -389,6 +396,13 @@ get_room_playback_controls:
       required: true
       selector:
         text:
+    include_seek:
+      name: Include seek support
+      description: Include seek when the current owner and native output support it.
+      required: false
+      default: false
+      selector:
+        boolean:
 
 control_room_playback:
   name: Control exact-room native audio
@@ -450,9 +464,9 @@ control_room_playback:
       required: true
       selector:
         select:
-          options: [pause, resume, next, previous]
+          options: [pause, resume, next, previous, seek]
     args:
-      description: Must be an empty object for the four same-session audio actions.
+      description: Use an object containing the absolute integer position_ms for seek. Use an empty object for pause, resume, next and previous.
       required: true
       selector:
         object:
