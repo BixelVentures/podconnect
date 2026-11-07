@@ -28,8 +28,6 @@ The new room queue path uses `get_room_queue_controls`, `prepare_room_queue` and
 reader; preparation stages one chosen occurrence without audio publication, so the caller
 can recheck its grant before the one-use commit. The older queue service remains separate.
 
-These versions are an unpublished combined candidate. Source review, immutable images,
-installation and physical acceptance are tracked separately in [STATUS](docs/STATUS.md).
 
 ## What works today
 
@@ -130,8 +128,7 @@ they pause whoever is playing, regardless of which Spotify account owns the spea
   not-yet-built feature (OwnTone multi-output is the likely path).
 - Picker visual polish.
 
-See [`docs/TODO.md`](docs/TODO.md) (living roadmap), [`docs/PLAN.md`](docs/PLAN.md) (architecture)
-and [`docs/control-plan.md`](docs/control-plan.md) (integration spec).
+Developers and agents: see [AGENTS.md](AGENTS.md).
 
 ## Repository layout
 
