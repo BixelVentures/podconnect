@@ -1,0 +1,256 @@
+diff --git a/src/outputs_release.inc.c b/src/outputs_release.inc.c
+index d263898..28b2719 100644
+--- a/src/outputs_release.inc.c
++++ b/src/outputs_release.inc.c
+@@ -463,7 +463,7 @@ release_commit(const struct output_transport_request *request, struct output_tra
+       op->effect_pending = true;
+       if (!start_journal_payload_valid() || strcmp(release_record.result.command.token, saved->token))
+ 	{
+-	  start_journal_fault = true;
++	  start_journal_fault_latch(START_JOURNAL_FAULT_PAYLOAD);
+ 	  start_gate_set(true);
+ 	  release_observe(out);
+ 	  return 0;
+@@ -480,7 +480,7 @@ release_commit(const struct output_transport_request *request, struct output_tra
+   op->effect_pending = true;
+   if (release_journal_save(&op->record) < 0)
+     {
+-      start_journal_fault = true;
++      start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);
+       start_gate_set(true);
+       release_observe(out);
+       return 0;
+@@ -684,7 +684,7 @@ outputs_transport_release_confirm(uint64_t id, const char *token, const char *pr
+   op->record.retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
+   if (release_journal_save(&op->record) < 0)
+     {
+-      start_journal_fault = true;
++      start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);
+       release_observe(out);
+       return 0;
+     }
+@@ -848,7 +848,7 @@ outputs_transport_release_recover_pending(void)
+   r.retirement = OUTPUT_RETIRE_RETIRED_KNOWN;
+   if (release_journal_save(&r) < 0)
+     {
+-      start_journal_fault = true;
++      start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);
+       return;
+     }
+   start_startup_quarantine = false;
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+index 9d24eb7..17dd2b8 100644
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -534,20 +534,25 @@ bool outputs_start_emission_current(uint64_t id,uint64_t incarnation,uint64_t ep
+     && transport_identity_get(id,&actual)==0 && transport_identity_equal(&actual,&s->result.route_identity)
+     && (!outputs_radio_auto_resume_enabled() || start_reader_pcm_current(s,&actual));
+ }
+-static bool start_journal_admission(const struct output_start_request *r)
++static const char *start_journal_denial(const struct output_start_request *r)
+ {
+-  if(start_journal_fault)return false;
+-  if(!start_startup_quarantine && (outputs_radio_absence_current_start_admissible(r) || outputs_radio_other_start_admissible(r) || outputs_radio_reacquire_start_admissible(r) || outputs_radio_absence_start_admissible(r) || outputs_radio_move_admissible(r) || outputs_radio_parked_bridge_start_admissible(r) || outputs_radio_parked_bridge_move_admissible(r)))return true;
+-  if(!start_journal.token[0] || start_old_process_retired())return true;
++  if(start_journal_fault)return start_journal_fault_reason();
++  if(!start_startup_quarantine && (outputs_radio_absence_current_start_admissible(r) || outputs_radio_other_start_admissible(r) || outputs_radio_reacquire_start_admissible(r) || outputs_radio_absence_start_admissible(r) || outputs_radio_move_admissible(r) || outputs_radio_parked_bridge_start_admissible(r) || outputs_radio_parked_bridge_move_admissible(r)))return NULL;
++  if(!start_journal.token[0] || start_old_process_retired())return NULL;
+   if(start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN
+-      && start_journal_payload_valid() && !start_startup_quarantine)return true;
+-  return !start_startup_quarantine && start_active && !start_active->cancelled
+-    && start_active->result.phase==OUTPUT_START_COMPLETED && !strcmp(start_journal.token,start_active->result.command.token)
+-    && r->native_process.pid==start_journal.pid && r->native_process.proc_start_ticks==start_journal.proc_start_ticks
++      && start_journal_payload_valid() && !start_startup_quarantine)return NULL;
++  if (start_startup_quarantine)
++    return "startup_quarantine";
++  if (!(start_active && !start_active->cancelled
++        && start_active->result.phase==OUTPUT_START_COMPLETED && !strcmp(start_journal.token,start_active->result.command.token)))
++    return "predecessor_unproven";
++  if (!(r->native_process.pid==start_journal.pid && r->native_process.proc_start_ticks==start_journal.proc_start_ticks
+     && !strcmp(r->native_process.boot_id,start_journal.boot_id)
+     && !strcmp(r->native_incarnation,start_active->result.command.native_incarnation)
+     && r->old_owner_present && start_active->result.actual_owner_present
+-    && native_owner_equal(&r->old_native_owner,&start_active->result.command.committed_native_owner);
++    && native_owner_equal(&r->old_native_owner,&start_active->result.command.committed_native_owner)))
++    return "owner_mismatch";
++  return NULL;
+ }
+ static bool start_available_reason(const struct output_start_request *r, bool diagnostic)
+ {
+@@ -585,7 +590,13 @@ static bool start_available_reason(const struct output_start_request *r, bool di
+   START_CHECK(transport_pin,"transport_pin");
+   START_CHECK(room_volume_pin_busy(),"volume_pin");
+   START_CHECK(room_volume_undrained(),"volume_undrained");
+-  START_CHECK(!start_journal_admission(r),"journal");
++  const char *journal_denial = start_journal_denial(r);
++  if (journal_denial)
++    {
++      if (diagnostic)
++        DPRINTF(E_LOG,L_PLAYER,"START state rejected: journal/%s\n",journal_denial);
++      return false;
++    }
+   START_CHECK(!start_process_current(&r->native_process),"native_process");
+   START_CHECK(!transport_hex(r->native_incarnation,32),"native_incarnation");
+   START_CHECK(!start_pipe_registered(r,digest),"fifo_registration");
+diff --git a/src/outputs_start_journal.inc.c b/src/outputs_start_journal.inc.c
+index d0dc010..2fcbcb0 100644
+--- a/src/outputs_start_journal.inc.c
++++ b/src/outputs_start_journal.inc.c
+@@ -2,6 +2,36 @@
+ static struct db_start_guard start_journal;
+ static atomic_bool start_owned_latch=false;
+ static bool start_journal_fault,start_startup_quarantine;
++enum start_journal_fault_origin
++{
++  START_JOURNAL_FAULT_NONE,
++  START_JOURNAL_FAULT_LOAD,
++  START_JOURNAL_FAULT_PAYLOAD,
++  START_JOURNAL_FAULT_PERSIST,
++  START_JOURNAL_FAULT_PID_NAMESPACE,
++};
++static enum start_journal_fault_origin start_journal_fault_origin;
++
++static void
++start_journal_fault_latch(enum start_journal_fault_origin origin)
++{
++  if (!start_journal_fault)
++    start_journal_fault_origin = origin;
++  start_journal_fault = true;
++}
++
++static const char *
++start_journal_fault_reason(void)
++{
++  switch (start_journal_fault_origin)
++    {
++    case START_JOURNAL_FAULT_LOAD: return "fault_load";
++    case START_JOURNAL_FAULT_PAYLOAD: return "fault_payload";
++    case START_JOURNAL_FAULT_PERSIST: return "fault_persist";
++    case START_JOURNAL_FAULT_PID_NAMESPACE: return "fault_pid_namespace";
++    default: return "fault_unclassified";
++    }
++}
+ /* A terminal retirement is old-source closure evidence, never emission authority.
+  * Fresh configured PIPE admission consumes this permission in the player owner. */
+ static bool start_retired_reopen_pending;
+@@ -331,8 +361,14 @@ static void start_journal_startup(void)
+   start_retired_stage_ready=false;
+   start_retired_stage_path[0]=0;
+   int ret=db_start_guard_load(&start_journal);
+-  if(ret==1 && !start_journal_payload_valid())ret=-1;
++  enum start_journal_fault_origin origin = ret < 0 ? START_JOURNAL_FAULT_LOAD : START_JOURNAL_FAULT_NONE;
++  if (ret == 1 && !start_journal_payload_valid())
++    {
++      ret = -1;
++      origin = START_JOURNAL_FAULT_PAYLOAD;
++    }
+   start_journal_fault=ret<0;
++  start_journal_fault_origin=origin;
+   bool terminal=ret==1 && start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN;
+   /* A consumed one-use permission never resurrects the old producer. A later
+    * C restart may still admit a separately proved fresh normal PIPE source. */
+@@ -352,7 +388,7 @@ static json_object *start_journal_owner(const struct output_native_owner *v)
+ static int start_journal_save(struct start_slot *s)
+ {
+   uint64_t ns_device,ns_inode;
+-  if(!start_pid_namespace(&ns_device,&ns_inode)){start_journal_fault=true;atomic_store(&start_owned_latch,true);start_gate_set(true);return -1;}
++  if(!start_pid_namespace(&ns_device,&ns_inode)){start_journal_fault_latch(START_JOURNAL_FAULT_PID_NAMESPACE);atomic_store(&start_owned_latch,true);start_gate_set(true);return -1;}
+   struct db_start_guard r={0};json_object *o=json_object_new_object(),*route;const char *serialized;int ret;
+   if(!o)return -1;
+   memcpy(r.token,s->result.command.token,33);memcpy(r.c_process,outputs_process,37);
+@@ -413,7 +449,7 @@ static int start_journal_save(struct start_slot *s)
+     start_retired_reopen_pending=s->retirement.outcome==OUTPUT_RETIRE_RETIRED_KNOWN;
+     start_retired_stage_ready=false;}}
+   json_object_put(o);
+-  if(ret<0){start_journal_fault=true;atomic_store(&start_owned_latch,true);start_gate_set(true);}
++  if(ret<0){start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);atomic_store(&start_owned_latch,true);start_gate_set(true);}
+   return ret;
+ }
+ 
+@@ -440,7 +476,7 @@ static int start_journal_consume_retired_reopen(void)
+   copy=ret==0 ? strdup(serialized) : NULL;
+   if(ret==0 && copy){free(start_journal.payload);start_journal.payload=copy;
+     start_journal_retirement_reopen_consumed=true;}
+-  else {start_journal_fault=true;atomic_store(&start_owned_latch,true);start_gate_set(true);ret=-1;}
++  else {start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);atomic_store(&start_owned_latch,true);start_gate_set(true);ret=-1;}
+   json_object_put(o);
+   return ret;
+ }
+diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
+index a48ff2f..0f42245 100644
+--- a/tests/start_gate_owner.inc.c
++++ b/tests/start_gate_owner.inc.c
+@@ -17,6 +17,65 @@ static int start_gate_http(struct httpd_request *h,const char *phase,const char
+   evbuffer_drain(h->in_body,evbuffer_get_length(h->in_body));evbuffer_drain(h->out_body,evbuffer_get_length(h->out_body));
+   evbuffer_add(h->in_body,body,strlen(body));return jsonapi_reply_start_write(h);
+ }
++static void start_gate_journal_reason(const struct output_start_request *r,const char *reason)
++{
++  struct output_start_state state;
++  char expected[128];
++  snprintf(expected,sizeof(expected),"START state rejected: journal/%s\n",reason);
++  start_state_diagnostic_capture=true;
++  start_state_diagnostic_count=0;
++  assert(outputs_start_state_get(r,&state)==0 && !state.ready && state.busy);
++  assert(start_state_diagnostic_count==1 && !strcmp(start_state_diagnostic_message,expected));
++  start_state_diagnostic_capture=false;
++}
++static void start_gate_journal_diagnostics(const struct output_start_request *r)
++{
++  const struct db_start_guard original=start_journal;
++  struct start_slot previous={0};
++  uint64_t device=start_journal_pidns_device,inode=start_journal_pidns_inode;
++  bool gate=outputs_start_gate_closed();
++  assert(!start_active && !start_journal_fault && !start_startup_quarantine && !start_journal.payload);
++  assert(attention_sql(sqlite3_mprintf("SAVEPOINT start_journal_diagnostics"))==0);
++  assert(attention_sql(sqlite3_mprintf("ALTER TABLE native_start_guard_v1 RENAME TO start_journal_diagnostics"))==0);
++  start_journal_startup();
++  start_gate_journal_reason(r,"fault_load");
++  start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);
++  start_gate_journal_reason(r,"fault_load"); /* First fault survives later failures. */
++  assert(attention_sql(sqlite3_mprintf("ROLLBACK TO start_journal_diagnostics"))==0);
++  assert(attention_sql(sqlite3_mprintf("INSERT INTO native_start_guard_v1 VALUES(1,%Q,%Q,%Q,'1','1','{}')",
++    "11111111111111111111111111111111",outputs_process,r->native_process.boot_id))==0);
++  start_journal_startup();
++  start_gate_journal_reason(r,"fault_payload");
++  assert(attention_sql(sqlite3_mprintf("ROLLBACK TO start_journal_diagnostics"))==0);
++  assert(attention_sql(sqlite3_mprintf("RELEASE start_journal_diagnostics"))==0);
++  start_journal_startup();
++  assert(!start_journal_fault && start_journal_fault_origin==START_JOURNAL_FAULT_NONE);
++  start_gate_set(gate);
++  start_journal_fault_latch(START_JOURNAL_FAULT_PID_NAMESPACE);
++  start_gate_journal_reason(r,"fault_pid_namespace");
++  start_journal_startup();
++  start_journal_fault_latch(START_JOURNAL_FAULT_PERSIST);
++  start_gate_journal_reason(r,"fault_persist");
++  start_journal_startup();
++  strcpy(start_journal.token,"22222222222222222222222222222222");
++  strcpy(start_journal.boot_id,r->native_process.boot_id);
++  start_journal.pid=r->native_process.pid;
++  start_journal.proc_start_ticks=r->native_process.proc_start_ticks;
++  assert(start_pid_namespace(&start_journal_pidns_device,&start_journal_pidns_inode));
++  start_startup_quarantine=true;
++  start_gate_journal_reason(r,"startup_quarantine");
++  start_startup_quarantine=false;
++  start_gate_journal_reason(r,"predecessor_unproven");
++  previous.result.phase=OUTPUT_START_COMPLETED;
++  strcpy(previous.result.command.token,start_journal.token);
++  strcpy(previous.result.command.native_incarnation,r->native_incarnation);
++  start_active=&previous;
++  start_gate_journal_reason(r,"owner_mismatch");
++  start_active=NULL;
++  start_journal=original;
++  start_journal_pidns_device=device;
++  start_journal_pidns_inode=inode;
++}
+ static void start_gate_strict_http(const struct output_start_request *r)
+ {
+   struct httpd_request h={0};json_object *body=json_object_new_object(),*process=json_object_new_object(),*reply;char *raw,*changed;
+@@ -294,6 +353,7 @@ static void exact_start_durable_gate(void)
+   close(pipes[0]);assert(start_boot_id(process.boot_id) && start_process_ticks(native,&process.proc_start_ticks)==1);process.pid=native;
+   fresh.pid=getpid();assert(start_boot_id(fresh.boot_id) && start_process_ticks(fresh.pid,&fresh.proc_start_ticks)==1);
+   struct output_start_request http_request=start_gate_fixture_request(path,&process);start_gate_strict_http(&http_request);
++  start_gate_journal_diagnostics(&http_request);
+   /* Both pre-open unknown and a post-open/completed record must keep a restarted
+    * C owner shut while the distinct, actually live native process remains. */
+   for(int phase=0;phase<3;phase++){
