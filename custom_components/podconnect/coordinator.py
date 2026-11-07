@@ -15,7 +15,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import SpotifyApi, SpotifyApiError
-from .const import DOMAIN, LOGGER, POLL_INTERVAL_SECONDS
+from .const import (
+    ACTIVE_POLL_INTERVAL_SECONDS,
+    DOMAIN,
+    EVENT_PLAYBACK_CHANGED,
+    LOGGER,
+    POLL_INTERVAL_SECONDS,
+)
 
 
 class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -38,11 +44,48 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._command_refresh_task = None
         self.command_owner_guard = None
         self._failed_poll_ref = None
+        self._playback_key = None
         self._followup_unsubs = []
 
     async def _async_refresh(self, *args, **kwargs):
         async with self._poll_lock:
             await super()._async_refresh(*args, **kwargs)
+            self._publish_playback_change()
+
+    def _publish_playback_change(self) -> None:
+        """Fire one HA event per real playback change, after the data is published.
+
+        Dashboards (PodView) refresh on this event instead of polling. While music is
+        playing, Spotify is read every few seconds so external changes show up fast.
+        """
+        try:
+            data = self.data if isinstance(self.data, dict) else {}
+            playback = data.get("playback") if isinstance(data.get("playback"), dict) else {}
+            item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
+            device = playback.get("device") if isinstance(playback.get("device"), dict) else {}
+            key = (
+                bool(playback.get("is_playing")),
+                item.get("uri"),
+                device.get("id"),
+                device.get("volume_percent"),
+                playback.get("shuffle_state"),
+                playback.get("repeat_state"),
+            )
+            self.update_interval = timedelta(
+                seconds=ACTIVE_POLL_INTERVAL_SECONDS
+                if playback.get("is_playing")
+                else POLL_INTERVAL_SECONDS
+            )
+            if key == self._playback_key:
+                return
+            previous, self._playback_key = self._playback_key, key
+            if previous is not None and self.config_entry is not None:
+                self.hass.bus.async_fire(
+                    EVENT_PLAYBACK_CHANGED,
+                    {"config_entry_id": self.config_entry.entry_id},
+                )
+        except Exception:  # noqa: BLE001
+            return  # Notification only; never affects the observation itself.
 
     def _check_command_owner(self):
         if self.command_owner_guard is not None and not self.command_owner_guard():
