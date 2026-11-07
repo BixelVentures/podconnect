@@ -1,3 +1,8 @@
+## Control 0.10.36 — changes from other apps show up fast
+
+- Fire a `podconnect_playback_changed` Home Assistant event once per real playback change (play/pause, track, device, volume, shuffle, repeat), after the new state is published. Dashboards such as PodView refresh on it instead of polling.
+- Read Spotify every 3 s while music is playing (10 s otherwise), so changes made in the Spotify app appear within seconds.
+
 ## Control 0.10.35 — snappy room transport and volume
 
 - Pause, resume, next, previous, seek, shuffle, repeat and volume on a native room are idempotent intents. They no longer wait for a newer Spotify Web API poll after a previous command, and a scheduled poll landing mid-command no longer rejects them. Owner epoch, account, target, capability and the exact Speakers route fence are still enforced at commit.

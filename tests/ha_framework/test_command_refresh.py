@@ -130,6 +130,30 @@ class CommandRefreshFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(self.playback_reads, reads + 2)
         self.assertEqual(self._writes(), [])
 
+    async def test_refresh_playback_change_fires_one_event_and_polls_fast_while_playing(self):
+        coordinator = self.entries[0].runtime_data.coordinator
+        coordinator._FOLLOWUP_DELAYS_S = ()
+        events = []
+        remove = self.hass.bus.async_listen(
+            "podconnect_playback_changed", lambda event: events.append(event.data)
+        )
+        self.addCleanup(remove)
+        await coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        playing = bool(coordinator.data["playback"].get("is_playing"))
+        self.assertEqual(coordinator.update_interval.total_seconds(), 3 if playing else 10)
+        baseline = len(events)
+        await coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        self.assertEqual(len(events), baseline, "an unchanged poll fires nothing")
+        result = await self.room_invoke(self.room_request("pause"))
+        self.assertEqual(result["outcome"], "accepted")
+        await self.demand_done()
+        await self.hass.async_block_till_done()
+        self.assertEqual(len(events), baseline + 1)
+        self.assertEqual(events[-1], {"config_entry_id": self.entries[0].entry_id})
+        self.assertEqual(coordinator.update_interval.total_seconds(), 10)
+
     async def test_refresh_scheduled_poll_serializes_before_demand_without_regression(
         self,
     ):
