@@ -234,6 +234,7 @@ class PlaybackCommands:
         for_command=False,
         native_room_phase=False,
         for_observation=False,
+        intent=False,
     ):
         data = self.data
         binding = (
@@ -313,10 +314,16 @@ class PlaybackCommands:
         if device.get("supports_volume") is True and volume is not None:
             actions.append("volume")
         capacity = for_command or self.command_sequence < 2**53 - 1
+        # Room transport and volume are idempotent intents whose exact route is
+        # fenced by Speakers at commit. They never wait for a newer Web API poll.
         ready = (
             capacity
             and (for_command or not self.busy)
-            and observed["poll_sequence"] > self.poll_floor
+            and (
+                native_room_phase
+                or intent
+                or observed["poll_sequence"] > self.poll_floor
+            )
         )
         return {
             "ok": True,
@@ -794,21 +801,16 @@ class PlaybackCommands:
                         native_room_phase=room_transport is not None,
                     )
                 )
-                if (
-                    observed["owner_epoch"] != epoch
-                    or (
-                        observed["poll_sequence"] != sequence
-                        and not (
-                            room_transport is not None
-                            and action == "pause"
-                            and observed["poll_sequence"] > sequence
-                        )
-                    )
+                # Native room transport/volume are idempotent intents: Speakers
+                # fences the exact account/room/output at commit, so a newer Web
+                # API poll or a prior command's floor must not reject them.
+                intent = room_transport is not None or room_volume is not None
+                if observed["owner_epoch"] != epoch or (
+                    not intent
+                    and observed["poll_sequence"] != sequence
                 ):
                     raise CommandRejected("stale_observation")
-                # busy belongs to this exact in-flight request; the prior terminal
-                # command's floor still prevents acting on pre-command observations.
-                if sequence <= self.poll_floor:
+                if not intent and sequence <= self.poll_floor:
                     raise CommandRejected("awaiting_observation")
                 if (
                     room_volume is None

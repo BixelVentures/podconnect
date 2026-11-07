@@ -9,7 +9,8 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -37,6 +38,7 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._command_refresh_task = None
         self.command_owner_guard = None
         self._failed_poll_ref = None
+        self._followup_unsubs = []
 
     async def _async_refresh(self, *args, **kwargs):
         async with self._poll_lock:
@@ -61,11 +63,49 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._command_refresh_task = self.hass.async_create_background_task(
                 refresh(), "podconnect post-command observation", eager_start=False
             )
+            self._schedule_followup_refreshes()
         try:
             async with asyncio.timeout(0.2):
                 await asyncio.shield(self._command_refresh_task)
         except TimeoutError:
             return
+
+    # Spotify's Web API often still reports the pre-command state right after a
+    # command. Two short follow-up reads make the screen settle in ~1-3 s
+    # instead of waiting for the next 10 s scheduled poll.
+    _FOLLOWUP_DELAYS_S = (1.2, 3.0)
+
+    def _schedule_followup_refreshes(self) -> None:
+        for unsub in self._followup_unsubs:
+            unsub()
+        self._followup_unsubs = []
+
+        @callback
+        def fire(_now) -> None:
+            if self.hass.is_stopping:
+                return
+            self.hass.async_create_background_task(
+                self._followup_refresh(),
+                "podconnect post-command follow-up observation",
+                eager_start=False,
+            )
+
+        for delay in self._FOLLOWUP_DELAYS_S:
+            self._followup_unsubs.append(async_call_later(self.hass, delay, fire))
+
+    async def _followup_refresh(self) -> None:
+        try:
+            async with asyncio.timeout(4):
+                self._check_command_owner()
+                await self.async_refresh()
+        except (TimeoutError, UpdateFailed):
+            return
+
+    async def async_shutdown(self) -> None:
+        for unsub in self._followup_unsubs:
+            unsub()
+        self._followup_unsubs = []
+        await super().async_shutdown()
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch playback state + the device list."""

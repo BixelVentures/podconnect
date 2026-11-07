@@ -414,6 +414,18 @@ class RoomTransport:
     async def read(self, hass, entry, target, room, homepod):
         from .commands import CommandRejected
 
+        # A scheduled Web API poll may land during the local route read. That
+        # is not a changed room; read once more instead of hiding all controls.
+        try:
+            return await self._read_once(hass, entry, target, room, homepod)
+        except CommandRejected as exc:
+            if str(exc) != "stale_observation":
+                raise
+        return await self._read_once(hass, entry, target, room, homepod)
+
+    async def _read_once(self, hass, entry, target, room, homepod):
+        from .commands import CommandRejected
+
         before = self.commands.controls(entry, target, native_room_phase=True)
         state = await self.observe(hass, entry, target, room, homepod)
         latest = self.commands.controls(entry, target, native_room_phase=True)

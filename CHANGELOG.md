@@ -1,3 +1,10 @@
+## Control 0.10.35 — snappy room transport and volume
+
+- Pause, resume, next, previous, seek, shuffle, repeat and volume on a native room are idempotent intents. They no longer wait for a newer Spotify Web API poll after a previous command, and a scheduled poll landing mid-command no longer rejects them. Owner epoch, account, target, capability and the exact Speakers route fence are still enforced at commit.
+- Room controls stay offered right after a command, so the screen does not grey out Play/Next while Spotify catches up.
+- A room-control read that races a scheduled poll is read once more instead of reporting the room as unavailable.
+- Two short follow-up observations (≈1.2 s and 3 s) after each command let the shown state settle without waiting for the 10 s poll.
+
 ## Speakers 0.26.67 — distinguish journal denials during music start
 
 - Record the first journal denial category in the existing OwnTone start log. Playback and journal admission stay the same.
