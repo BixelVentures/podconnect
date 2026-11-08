@@ -9,6 +9,7 @@ import ast
 import asyncio
 import copy
 import json
+import re
 import secrets
 import sys
 import unittest
@@ -49,6 +50,7 @@ def load_body(file, namespace=None, names=None):
         copy=copy,
         secrets=secrets,
         json=json,
+        re=re,
         urlsplit=urlsplit,
         urlunsplit=urlunsplit,
         ClientError=ClientError,
@@ -837,6 +839,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             names={"async_unload_entry", "_options_updated", "_configuration_identity"},
         )
         hass, data, entries, reg = services()
+        data.coordinator.async_stop_native_playback = AsyncMock()
+        data.coordinator.set_native_playback_client = AsyncMock()
         hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
         hass.config_entries.async_reload = AsyncMock()
         self.assertFalse(await ns["async_unload_entry"](hass, entries[0]))
@@ -888,7 +892,10 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
             token = SimpleNamespace(
                 token={"scope": "scope-A"}, async_ensure_token_valid=AsyncMock()
             )
-            coord = SimpleNamespace(async_config_entry_first_refresh=AsyncMock())
+            coord = SimpleNamespace(
+                async_config_entry_first_refresh=AsyncMock(),
+                set_native_playback_client=AsyncMock(),
+            )
             ns = load_body(
                 "__init__.py",
                 dict(
