@@ -1,3 +1,14 @@
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -657,7 +657,7 @@
+ 					p.initAliasRegistry()
+ 				}
+ 				if mode == "actual-c-primary-same-target" {
+-					if os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN") != "" {
++					if os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN") != "" || os.Getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != "" {
+ 						p.app.cfg.DeviceAliasHomePodIDs[0] = "2"
+ 					}
+ 					p.initAliasRegistry()
 --- a/daemon/radio_primary_same_composed_test.go
 +++ b/daemon/radio_primary_same_composed_test.go
 @@ -38,9 +38,10 @@
@@ -25,7 +36,7 @@
  		const stopAction = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
  		q.Phase, q.Station, q.Owner = "reserve", "", ""
  		q.Handoff, q.Generation, q.Action = "bdb0c4c5-df0e-4f42-a88e-44a8736ca5b8", "2", stopAction
-@@ -182,7 +185,31 @@
+@@ -182,7 +185,39 @@
  			t.Fatal("missing exact teardown of the observed radio session")
  		}
  		assertSource(true)
@@ -43,6 +54,14 @@
 +		q.Handoff, q.Generation, q.Action = "92e205d7-ec55-4fdb-a38f-19cf1426b960", "3", restartAction
 +		q.Phase, q.Station, q.Owner, q.From, q.Session = "reserve", "", "", "", nil
 +		q.Intent = strconv.FormatUint(app.radio.Intent, 10)
++		wrongRoom := q
++		wrongRoom.Target = "r0"
++		if p.primaryRadioRoom(wrongRoom.Target) != "2" {
++			t.Fatal("wrong-room test requires another configured target")
++		}
++		if _, err := p.radioPrimaryActor(ctx, wrongRoom); err == nil || app.radio.Holds[wrongRoom.Target] != nil {
++			t.Fatal("a different room acquired the same parked Spotify writer's radio admission")
++		}
 +		q.Owner = wait(q, "reserved").Owner
 +		q.Phase, q.Station = "prepare_start", "p1"
 +		wait(q, "prepared")
