@@ -1371,6 +1371,9 @@ func main() {
 	// /api/state — back-compat single-speaker view reflecting room 0, so the existing panel/HA calls
 	// keep working unchanged. Multi-room consumers should use /api/rooms.
 	http.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		if playbackRevisionRequest(w, r) {
+			return
+		}
 		rm := primaryRoom()
 		var (
 			devs []device

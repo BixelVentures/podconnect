@@ -27,7 +27,8 @@ type glLive struct {
 	mu                   sync.Mutex
 	st                   glStatus
 	trackURI             string
-	trackChangeSeq       uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	trackChangeSeq       uint64 // bumped whenever metadata.uri changes
+	playbackRevisionWake chan struct{}
 	aliasRevision        uint64 // observed alias/source intent; unchanged status polls do not bump it
 	transportRevision    uint64 // transport observations, including accepted polling changes
 	routeDispatchSeq     uint64 // mutex-owned command admission, not native acceptance
@@ -125,6 +126,7 @@ func (l *glLive) observeStopLocked() {
 		l.phaseEpoch++
 		l.acceptedRequest = 0
 		l.aliasRevision++
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -178,6 +180,7 @@ func (l *glLive) beginRun(stop <-chan struct{}) glSource {
 	l.aliasRevision++
 	l.sourceStop = stop
 	l.sourceRetired = false
+	l.signalPlaybackRevisionLocked()
 	return glSource{run: l.runEpoch, stop: stop}
 }
 
@@ -191,6 +194,7 @@ func (l *glLive) beginPhase(run glSource) (glSource, bool) {
 	l.aliasRevision++ // A claim captured during retirement cannot cross into this source.
 	l.acceptedRequest = 0
 	l.sourceRetired = false
+	l.signalPlaybackRevisionLocked()
 	return glSource{run: run.run, phase: l.phaseEpoch, stop: run.stop}, true
 }
 
@@ -206,6 +210,7 @@ func (l *glLive) retirePhase(source glSource) {
 		l.aliasRevision++
 		l.phaseEpoch++
 		l.acceptedRequest = 0
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -218,6 +223,7 @@ func (l *glLive) retireRun(run glSource) {
 		l.runEpoch++
 		l.phaseEpoch++
 		l.acceptedRequest = 0
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -260,6 +266,7 @@ func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
 		}
 		if l.st.SelAlias != st.SelAlias || !sameAliasBinding(l.st.AliasBinding, st.AliasBinding) {
 			l.aliasRevision++
+			l.signalPlaybackRevisionLocked()
 		}
 		l.st.SelAlias = st.SelAlias
 		l.st.AliasBinding = st.AliasBinding
@@ -379,6 +386,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 				}
 				l.wireRevision[2]++
 				l.aliasRevision++
+				l.signalPlaybackRevisionLocked()
 				return
 			}
 			l.st.AliasBinding = incoming
@@ -388,6 +396,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 			l.st.AliasBinding = &copy
 			l.wireRevision[2]++
 			l.aliasRevision++
+			l.signalPlaybackRevisionLocked()
 			return
 		}
 	}
@@ -396,6 +405,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 	l.trackURI = nextURI
 	if changed {
 		l.trackChangeSeq++
+		l.signalPlaybackRevisionLocked()
 	}
 	switch typ {
 	case "playing", "paused", "stopped", "not_playing", "active", "inactive":
@@ -409,6 +419,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 		if _, ok := numField(data, "id"); ok {
 			l.wireRevision[2]++
 			l.aliasRevision++ // Valid equal-value observations also fence ABA.
+			l.signalPlaybackRevisionLocked()
 		}
 	}
 }
