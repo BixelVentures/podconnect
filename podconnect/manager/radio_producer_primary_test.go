@@ -259,7 +259,7 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 }
 
 func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
-	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown", "rejected-preflight-first", "rejected-decode-first"} {
+	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown", "rejected-preflight-first", "rejected-decode-first", "lost-rejected-preflight-first", "lost-rejected-decode-first"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -303,25 +303,33 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 			q := radioCommand{ActionID: attentionUUID(), Action: "start", StationID: "p3", TargetID: target,
 				ExpectedRevision: current.Revision, ExpectedProcessID: current.ProcessID,
 				ExpectedGeneration: current.Generation, ExpectedOwnerGeneration: current.OwnerGeneration}
-			if variant == "rejected-preflight-first" || variant == "rejected-decode-first" {
+			if strings.Contains(variant, "rejected-") {
+				lost := strings.HasPrefix(variant, "lost-")
 				f.rejectFirst = "start"
 				want := []string{"reserve", "prepare_start", "start"}
-				if variant == "rejected-preflight-first" {
+				if strings.Contains(variant, "preflight") {
 					f.rejectFirst, want = "prepare_start", want[:2]
 				}
+				wantSource := "spotify"
+				if lost {
+					f.lose, wantSource = f.rejectFirst, "unknown"
+				}
 				state, err := c.execute(ctx, q)
-				if err == nil || state.SourceKind != "spotify" || !reflect.DeepEqual(f.calls, want) || p.active != "" {
+				if err == nil || state.SourceKind != wantSource || !reflect.DeepEqual(f.calls, want) || p.active != "" {
 					t.Fatalf("receiver-free rejection changed Spotify or emitted another operation: %v %v", state, err)
 				}
 				c.refresh(ctx)
-				if !reflect.DeepEqual(f.calls, want) {
-					t.Fatal("passive observation replayed the rejected action")
+				if lost {
+					want = append(want, "result")
+				}
+				if got := c.snapshot(); got.SourceKind != "spotify" || !reflect.DeepEqual(f.calls, want) {
+					t.Fatalf("passive observation lost Spotify or replayed the rejected action: %v %v", got, f.calls)
 				}
 				current := c.snapshot()
 				q.ActionID, q.StationID = attentionUUID(), "p1"
 				q.ExpectedRevision, q.ExpectedGeneration = current.Revision, current.Generation
 				q.ExpectedOwnerGeneration = current.OwnerGeneration
-				f.rejectFirst, f.calls = "", nil
+				f.rejectFirst, f.lose, f.calls = "", "", nil
 				state, err = c.execute(ctx, q)
 				if err != nil || state.StationID != "p1" || state.SourceKind != "radio" ||
 					!reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {

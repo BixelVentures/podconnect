@@ -716,12 +716,14 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 		// A replacement may have refused STOP before any receiver effect.
 		// Recover only that exact terminal refusal, never a positive STOP
 		// followed by a speculative successor.
-		if r.Primary.IncumbentSession != nil && (command.Phase == "prepare_replace" || command.Phase == "stop") {
+		replacement := r.Primary.IncumbentSession != nil && (command.Phase == "prepare_replace" || command.Phase == "stop")
+		first := r.Primary.Incumbent == "" && command.Phase == "prepare_start"
+		if replacement || first {
 			query := command
 			query.Phase, query.ForPhase = "result", command.Phase
 			receipt, err := p.primary.PrimaryCommand(ctx, query)
-			if err == nil && ctx.Err() == nil && query.matches(receipt) && receipt.Phase == "replacement_rejected" &&
-				receipt.Observation == nil && receipt.TeardownCSeq == 0 {
+			if err == nil && ctx.Err() == nil && query.matches(receipt) && receipt.Observation == nil && receipt.TeardownCSeq == 0 &&
+				(replacement && receipt.Phase == "replacement_rejected" || first && receipt.Phase == "rejected" && receipt.Session == nil) {
 				return p.primaryReconcileNoEffects(ctx, r, receipt)
 			}
 		}
@@ -737,7 +739,14 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 			query := command
 			query.Phase, query.ForPhase = "result", command.Phase
 			receipt, err := p.primary.PrimaryCommand(ctx, query)
-			if err != nil || ctx.Err() != nil || !query.matches(receipt) || !primaryTerminalReceipt(command, receipt, r.Primary.Device) {
+			if err != nil || ctx.Err() != nil || !query.matches(receipt) {
+				return radioReconciliation{}, errRadioUnknown
+			}
+			if command.Phase == "start" && r.Primary.Incumbent == "" && receipt.Phase == "rejected" &&
+				receipt.Session == nil && receipt.Observation == nil && receipt.TeardownCSeq == 0 {
+				return p.primaryReconcileNoEffects(ctx, r, receipt)
+			}
+			if !primaryTerminalReceipt(command, receipt, r.Primary.Device) {
 				return radioReconciliation{}, errRadioUnknown
 			}
 			if err = p.primaryRecordEffect(r, stage, receipt); err != nil {
@@ -759,7 +768,9 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 
 func (p *radioProducer) primaryReconcileNoEffects(ctx context.Context, r radioProducerRecord, receipt radioPrimaryReceipt) (radioReconciliation, error) {
 	observation, err := p.primaryObserve(ctx)
-	if err != nil || observation.SourceKind != "radio" || observation.State != "playing" {
+	wantRadio := r.Primary.Incumbent != ""
+	if err != nil || wantRadio && (observation.SourceKind != "radio" || observation.State != "playing") ||
+		!wantRadio && !primaryKnownNonradio(observation) {
 		return radioReconciliation{}, errRadioUnknown
 	}
 	if !r.Terminal {

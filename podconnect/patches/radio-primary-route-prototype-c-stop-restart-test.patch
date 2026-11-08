@@ -1,0 +1,34 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1429,7 +1429,7 @@
+     atomic_fetch_add(&wire->audio_packets,1);
+     if (primary_fixture)
+       atomic_fetch_add(&wire->primary_packets[primary_source], 1);
+-    if (primary_source == 1 && getenv("PC_PRIMARY_MANAGER_TEST_BIN"))
++    if (primary_source == 1 && (getenv("PC_PRIMARY_MANAGER_TEST_BIN") || getenv("PC_NATIVE_PRIMARY_STOP_RESTART")))
+       {
+         if (wire->primary_radio_epoch != wire->primary_session_epoch)
+           {
+@@ -1681,13 +1681,21 @@
+     {
+       bool returned = getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME") != NULL;
+       bool manager = getenv("PC_PRIMARY_MANAGER_TEST_BIN") != NULL;
++      bool restart = getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != NULL;
+       int before = atomic_load(&wire->primary_packets[0]);
+       int radio = atomic_load(&wire->primary_packets[1]);
+       int after = atomic_load(&wire->primary_packets[2]);
+       if (before < 1 || radio < 1 || (returned ? after < 1 : after != 0)
+-          || f->pc70_peer_sessions != (manager ? 5 : returned ? 3 : 2) || f->teardowns != (manager ? 4 : 2))
++          || f->pc70_peer_sessions != (manager ? 5 : restart ? 4 : returned ? 3 : 2)
++          || f->teardowns != (manager ? 4 : restart ? 3 : 2))
+         {
+           recovery_wire_fail(f, "same-target sessions or authenticated RTP windows differ");
++          return;
++        }
++      if (restart && (!returned || atomic_load(&wire->primary_radio_packets[0]) < 1
++          || atomic_load(&wire->primary_radio_packets[1]) < 1 || atomic_load(&wire->primary_radio_packets[2]) != 0))
++        {
++          recovery_wire_fail(f, "explicit Stop and restart require distinct authenticated radio windows");
+           return;
+         }
+       if (manager)
