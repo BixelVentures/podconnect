@@ -225,16 +225,46 @@
        if (!session->primary_radio_custody || !primary_radio_sequence_current(seq_ctx))
          goto error;
      }
-@@ -5189,7 +5200,7 @@
+@@ -5182,24 +5193,33 @@
+ 
+ /* These entry points remain local to the primary output owner. The isolated
+  * fixture calls them on its player thread; no Manager/Native path is enabled. */
+-static int
+-airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
++static struct airplay_session *
++airplay_primary_radio_make(struct output_device *device, struct airplay_primary_radio_route *route)
+ {
+   struct airplay_session *session;
  
    if (!device || !route || device->type != OUTPUT_TYPE_AIRPLAY || !device->advertised
        || device->selected || device->session || device->route_revision == UINT64_MAX
 -      || outputs_transport_busy() || outputs_radio_handoff_blocked(device->id)
 +      || !outputs_primary_radio_transport_available(device->id) || outputs_radio_handoff_blocked(device->id)
        || outputs_radio_sender_role())
-     return -1;
+-    return -1;
++    return NULL;
  
-@@ -5237,11 +5248,24 @@
+   session = session_make_for_source(device, -1, true);
+   if (!session)
+-    return -1;
++    return NULL;
+ 
+   *route = (struct airplay_primary_radio_route) {
+     device->id, session->device_incarnation, session->session_epoch, device->route_revision,
+   };
++  return session;
++}
++
++static int
++airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
++{
++  struct airplay_session *session = airplay_primary_radio_make(device, route);
++  if (!session)
++    return -1;
+   sequence_start(AIRPLAY_SEQ_START, session, NULL, "primary_radio_start");
+   return 0;
+ }
+@@ -5237,11 +5257,24 @@
  #define PRIMARY_RADIO_PACKET_BYTES (AIRPLAY_SAMPLES_PER_PACKET * 4)
  #define PRIMARY_RADIO_QUEUE_PACKETS 8
  #define PRIMARY_RADIO_PACKET_US 7982
@@ -259,7 +289,7 @@
    const char *url; /* immutable station registry storage */
    struct event *tick;
    pthread_mutex_t mutex;
-@@ -5281,16 +5305,38 @@
+@@ -5281,16 +5314,38 @@
  }
  
  static void
@@ -306,7 +336,7 @@
  }
  
  static void *
-@@ -5337,6 +5383,140 @@
+@@ -5337,6 +5392,148 @@
    return NULL;
  }
  
@@ -420,15 +450,23 @@
 +
 +  /* No receiver wire precedes one full decoded PCM packet and the final
 +   * exact idle-target check. Only the player loop runs this constructor. */
-+  struct output_device *device = outputs_device_get(current.device_id);
-+  if (airplay_primary_radio_start(device, &decoder->route) < 0)
++  struct airplay_session *session = airplay_primary_radio_make(outputs_device_get(current.device_id), &decoder->route);
++  if (!session)
 +    {
 +      primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
 +      primary_radio_decode_cancel(decoder);
 +      return false;
 +    }
-+  decoder->session = device->session;
-+  decoder->session->primary_radio_decoder = decoder;
++  decoder->session = session;
++  session->primary_radio_decoder = decoder;
++  if (!primary_radio_station_before_deadline(operation))
++    {
++      primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
++      primary_radio_decode_cancel(decoder);
++      deferred_session_failure(session);
++    }
++  else
++    sequence_start(AIRPLAY_SEQ_START, session, NULL, "primary_radio_station_start");
 +  return true;
 +}
 +
@@ -447,7 +485,7 @@
  static void
  primary_radio_decoder_tick(int fd, short events, void *arg)
  {
-@@ -5347,6 +5527,39 @@
+@@ -5347,6 +5544,39 @@
    struct timeval next = { 0, PRIMARY_RADIO_PACKET_US };
    (void)fd;
    (void)events;
@@ -487,7 +525,7 @@
  
    pthread_mutex_lock(&decoder->mutex);
    done = decoder->done;
-@@ -5393,39 +5606,30 @@
+@@ -5393,39 +5623,30 @@
      session_failure(session);
  }
  
@@ -533,7 +571,7 @@
    if (!decoder->tick || evtimer_add(decoder->tick, &first) || pthread_attr_init(&attr))
      goto fail;
    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED))
-@@ -5437,12 +5641,127 @@
+@@ -5437,12 +5658,127 @@
    int status = pthread_create(&thread, &attr, primary_radio_decode_thread, decoder);
    pthread_attr_destroy(&attr);
    if (!status)
@@ -898,3 +936,91 @@
      {
        event_free(keep_alive_timer);
        service_stop(&airplay_timing_svc);
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1619,7 +1619,7 @@
+ 
+ enum primary_radio_wire_mode {
+   PRIMARY_WIRE, PRIMARY_INGRESS_RED, PRIMARY_PREEMPT_RED, PRIMARY_PREEMPT, PRIMARY_UNKNOWN, PRIMARY_REMOVE,
+-  PRIMARY_CUSTODY_RED, PRIMARY_CUSTODY, PRIMARY_DECODE
++  PRIMARY_CUSTODY_RED, PRIMARY_CUSTODY, PRIMARY_DECODE, PRIMARY_STATION_START
+ };
+ static int primary_spotify_callbacks;
+ static enum output_device_state primary_spotify_state;
+@@ -1732,6 +1732,68 @@
+   assert(music.requested_control_port == airplay_control_svc.port);
+   assert(primary_radio_wire_resend(&music, music.requested_control_port, music_seq) == 1);
+   assert(primary_radio_wire_mapped_resend(&music, music_seq) == 1);
++
++  if (mode == PRIMARY_STATION_START)
++    {
++      struct output_primary_radio_start_request request, changed;
++      struct output_primary_radio_start_result status;
++      assert(outputs_airplay_primary_station_target(music.device->id, &request) < 0);
++      assert(outputs_airplay_primary_station_target(radio.device->id, &request) == 0);
++      outputs_attention_uuid(request.action);
++      snprintf(request.station, sizeof(request.station), "%s", "p3");
++      changed = request;
++      changed.route++;
++      assert(outputs_airplay_primary_station_start(&changed, &status) < 0);
++      changed = request;
++      snprintf(changed.station, sizeof(changed.station), "%s", "https://outside.invalid/audio");
++      assert(outputs_airplay_primary_station_start(&changed, &status) < 0);
++      assert(outputs_airplay_primary_station_start(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_PENDING);
++      assert(!radio.device->session && !radio.wire);
++      assert(outputs_airplay_primary_station_cancel(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_REJECTED);
++      for (int i = 0; i < 1500 && primary_radio_station_find(&request)->decoder; i++)
++        {
++          event_base_loop(base, EVLOOP_NONBLOCK);
++          usleep(1000);
++        }
++      assert(!primary_radio_station_find(&request)->decoder);
++      assert(outputs_airplay_primary_station_start(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_REJECTED);
++      assert(!radio.device->session && !radio.wire);
++
++      outputs_attention_uuid(request.action);
++      active_recovery_wire = &radio;
++      assert(outputs_airplay_primary_station_start(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_PENDING);
++      assert(!radio.device->session && !radio.wire);
++      int received = 0;
++      for (int i = 0; i < 2500 && status.phase == OUTPUT_PRIMARY_RADIO_START_PENDING; i++)
++        {
++          event_base_loop(base, EVLOOP_NONBLOCK);
++          received += primary_radio_wire_packets(&radio, &radio_seq);
++          assert(outputs_airplay_primary_station_result(&request, &status) == 0);
++          usleep(1000);
++        }
++      assert(status.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && received > 0);
++      assert(!strcmp(status.custody.operation, request.action) && !strcmp(status.custody.process, request.process)
++          && status.custody.device_id == request.device_id && status.custody.incarnation == request.incarnation
++          && status.custody.epoch == request.epoch + 1 && status.custody.route == request.route);
++      assert(radio.cipher && radio.pc70_peer_sessions == 1 && !primary_radio_wire_packets(&music, &music_seq));
++      assert(outputs_airplay_primary_station_start(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && radio.pc70_peer_sessions == 1);
++
++      radio.require_decoder_drain = true;
++      assert(outputs_airplay_primary_station_cancel(&request, &status) == 0
++          && status.phase == OUTPUT_PRIMARY_RADIO_START_UNKNOWN);
++      primary_radio_wire_wait(&radio, false);
++      assert(radio.teardowns == 1 && !primary_radio_wire_packets(&radio, &radio_seq));
++      clock_gettime(CLOCK_MONOTONIC, &music_pcm.pts);
++      airplay_write(&music_pcm);
++      assert(primary_radio_wire_packets(&music, &music_seq) == 1 && music_seq == (uint16_t)(first_music_seq + 1));
++      puts("PASS exact station preflight/cancel and first real radio RTP with Spotify continuity");
++      goto cleanup;
++    }
+ 
+   assert(airplay_primary_radio_start(radio.device, &route) == 0);
+ #ifdef RADIO_PRIMARY_SESSION_PROOF
+@@ -1975,6 +2037,7 @@
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-custody-red")) return primary_radio_wire_case(PRIMARY_CUSTODY_RED);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-custody")) return primary_radio_wire_case(PRIMARY_CUSTODY);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-decode")) return primary_radio_wire_case(PRIMARY_DECODE);
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-station-start")) return primary_radio_wire_case(PRIMARY_STATION_START);
+   if (argc == 3 && !strcmp(argv[1], "--radio-primary-custody-restart")) return primary_radio_wire_custody_restart(argv[2]);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-route")) return radio_primary_output_route_case();
+   if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();

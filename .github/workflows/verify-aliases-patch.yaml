@@ -61,10 +61,13 @@ jobs:
           git apply "$patch_dir/queue-occurrence-continuity-native.patch"
           if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
             git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-station-native.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
-        run: cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadio(DrainBindsActionAndNeverReplays|ConnectTransferDoesNotClaimStop)$'
+        run: |
+          (cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadio')
+          (cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer)' -count=1)
       - name: Test Native queue, transport, output and retained packages
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
@@ -198,6 +201,7 @@ jobs:
           make -C src -j"$(nproc)" airplay_callback_owner
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
           src/airplay_callback_owner --radio-primary-decode
+          src/airplay_callback_owner --radio-primary-station-start
           sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_RADIO_STATION=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
