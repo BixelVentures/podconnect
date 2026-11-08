@@ -66,6 +66,7 @@ jobs:
             git apply "$patch_dir/radio-primary-route-prototype-native-park-fences.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-return.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-generation.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-native-replacement.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-readiness.patch"
             git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
           fi
@@ -196,7 +197,7 @@ jobs:
           done
           # Earlier branch runs keep the causal before/after proofs for the
           # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test c-readiness; do
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test c-readiness; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
@@ -212,6 +213,8 @@ jobs:
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |

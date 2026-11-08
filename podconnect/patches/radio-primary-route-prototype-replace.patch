@@ -1,0 +1,951 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -351,6 +351,7 @@
+ {
+   char process[37], action[37], station[32];
+   uint64_t device_id, incarnation, epoch, route, generation;
++  struct output_primary_radio_custody predecessor;
+ };
+ struct output_primary_radio_start_result
+ {
+@@ -360,11 +361,20 @@
+ int outputs_airplay_primary_station_target(uint64_t, struct output_primary_radio_start_request *);
+ int outputs_airplay_primary_station_preflight_target(uint64_t, struct output_primary_radio_start_request *);
+ int outputs_airplay_primary_station_preflight(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
++int outputs_airplay_primary_station_replace_target(uint64_t, const struct output_primary_radio_custody *,
++    struct output_primary_radio_start_request *);
++int outputs_airplay_primary_station_replace_preflight(const struct output_primary_radio_start_request *,
++    struct output_primary_radio_start_result *);
++int outputs_airplay_primary_station_replace_activate(const struct output_primary_radio_start_request *,
++    const struct output_primary_radio_custody *, const char *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_start(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_result(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_cancel(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ bool outputs_primary_radio_transport_available(uint64_t);
+-int outputs_device_session_add_primary_radio(uint64_t, void *, const char *);
++int outputs_device_session_add_primary_radio(uint64_t, void *, const char *,
++    const struct output_primary_radio_start_request *, const struct output_primary_radio_custody *);
++bool outputs_primary_spotify_park_replace_current(const struct output_primary_radio_start_request *,
++    const struct output_primary_radio_custody *, const char *);
+ bool outputs_primary_spotify_park_attach_current(const struct output_primary_radio_start_request *, const char *);
+ bool outputs_primary_spotify_park_session_current(uint64_t, const void *, uint64_t, bool);
+ bool outputs_primary_spotify_park_wire_current(uint64_t, const void *, uint64_t);
+@@ -378,7 +388,10 @@
+ char *outputs_primary_radio_custody_claim(uint64_t, const char *, const char *);
+ int outputs_airplay_primary_radio_claim_stop(const struct output_primary_radio_custody *, const char *);
+ const char *outputs_radio_station_url(const char *);
+-char *outputs_primary_radio_custody_begin(uint64_t, uint64_t, uint64_t, uint64_t, const char *);
++bool outputs_primary_radio_session_equal(const struct output_primary_radio_custody *, const struct output_primary_radio_custody *);
++bool outputs_primary_radio_release_current(const struct output_primary_radio_custody *);
++char *outputs_primary_radio_custody_begin(uint64_t, uint64_t, uint64_t, uint64_t, const char *,
++    const struct output_primary_radio_custody *);
+ int outputs_primary_radio_custody_release(uint64_t, const char *, int);
+ bool outputs_callback_is_primary_radio_restart(int);
+ void outputs_airplay_primary_radio_remove(struct output_device *);
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -515,6 +515,8 @@
+ #include "radio_drain_ticket.inc.c"
+ #include "radio_absence_ticket.inc.c"
+ #include "radio_parked_absence_ticket.inc.c"
++static bool primary_radio_receipt_equal(const struct output_primary_radio_custody *,
++    const struct output_primary_radio_custody *);
+ #include "outputs_radio_handoff.inc.c"
+ #include "outputs_radio_reacquire.inc.c"
+ #include "outputs_radio_other_target.inc.c"
+@@ -1858,7 +1860,8 @@
+ }
+ 
+ static int
+-device_session_add(uint64_t device_id, void *session, bool primary_radio, const char *park_token)
++device_session_add(uint64_t device_id, void *session, bool primary_radio, const char *park_token,
++    const struct output_primary_radio_start_request *replacement, const struct output_primary_radio_custody *released)
+ {
+   struct output_device *device;
+ 
+@@ -1867,7 +1870,8 @@
+     return -1;
+ 
+   struct radio_handoff_slot *park = park_token ? radio_handoff_find(device_id) : NULL;
+-  if (park_token && !primary_spotify_park_attach_allowed(park, device, park_token))
++  if (park_token && !(replacement ? outputs_primary_spotify_park_replace_current(replacement, released, park_token)
++                                : primary_spotify_park_attach_allowed(park, device, park_token)))
+     return -1;
+   if (primary_radio && (device->type != OUTPUT_TYPE_AIRPLAY || !device->advertised
+       || device->selected || device->session || (!park && !outputs_primary_radio_transport_available(device_id))))
+@@ -1879,7 +1883,16 @@
+   device->session_epoch++;
+   device->session = session;
+   if (park)
+-    park->primary_session = session;
++    {
++      park->primary_session = session;
++      park->primary_route = (struct output_primary_radio_custody) {
++        .device_id = device_id, .incarnation = device->incarnation,
++        .epoch = device->session_epoch, .route = device->route_revision,
++      };
++      memcpy(park->primary_route.process, outputs_process, sizeof(park->primary_route.process));
++      memcpy(park->primary_route.operation, replacement ? replacement->action : park->result.command.handoff_id,
++          sizeof(park->primary_route.operation));
++    }
+   if (!primary_radio)
+     outputs_start_session_attached(device_id,session);
+   return 0;
+@@ -1888,13 +1901,14 @@
+ int
+ outputs_device_session_add(uint64_t device_id, void *session)
+ {
+-  return device_session_add(device_id, session, false, NULL);
++  return device_session_add(device_id, session, false, NULL, NULL, NULL);
+ }
+ 
+ int
+-outputs_device_session_add_primary_radio(uint64_t device_id, void *session, const char *park_token)
++outputs_device_session_add_primary_radio(uint64_t device_id, void *session, const char *park_token,
++    const struct output_primary_radio_start_request *replacement, const struct output_primary_radio_custody *released)
+ {
+-  return device_session_add(device_id, session, true, park_token);
++  return device_session_add(device_id, session, true, park_token, replacement, released);
+ }
+ 
+ void
+@@ -2435,10 +2449,49 @@
+   bool available = found == 0 || (found == 1 && raw && primary_radio_custody_valid(raw, id, true));
+   free(raw);
+   return available;
++}
++
++bool
++outputs_primary_radio_session_equal(const struct output_primary_radio_custody *a,
++    const struct output_primary_radio_custody *b)
++{
++  return a && b && a->device_id == b->device_id && a->incarnation == b->incarnation
++      && a->epoch == b->epoch && a->route == b->route && !strcmp(a->process, b->process)
++      && !strcmp(a->operation, b->operation);
++}
++
++static bool
++primary_radio_receipt_equal(const struct output_primary_radio_custody *a, const struct output_primary_radio_custody *b)
++{
++  return outputs_primary_radio_session_equal(a, b)
++      && a->teardown_cseq == b->teardown_cseq && !strcmp(a->stop_action, b->stop_action);
++}
++
++static bool
++primary_radio_custody_decode(const char *raw, uint64_t id, struct output_primary_radio_custody *custody)
++{
++  if (!raw || (!primary_radio_custody_valid(raw, id, false) && !primary_radio_custody_valid(raw, id, true)))
++    return false;
++  json_object *row = json_tokener_parse(raw);
++  if (!row)
++    return false;
++  *custody = (struct output_primary_radio_custody) {
++    .device_id = id,
++    .incarnation = json_object_get_uint64(json_object_object_get(row, "incarnation")),
++    .epoch = json_object_get_uint64(json_object_object_get(row, "epoch")),
++    .route = json_object_get_uint64(json_object_object_get(row, "route")),
++    .teardown_cseq = json_object_get_int(json_object_object_get(row, "teardown_cseq")),
++  };
++  snprintf(custody->process, sizeof(custody->process), "%s", json_object_get_string(json_object_object_get(row, "process")));
++  snprintf(custody->operation, sizeof(custody->operation), "%s", json_object_get_string(json_object_object_get(row, "operation")));
++  snprintf(custody->stop_action, sizeof(custody->stop_action), "%s", json_object_get_string(json_object_object_get(row, "stop_action")));
++  json_object_put(row);
++  return true;
+ }
+ 
+ char *
+-outputs_primary_radio_custody_begin(uint64_t id, uint64_t incarnation, uint64_t epoch, uint64_t route, const char *action)
++outputs_primary_radio_custody_begin(uint64_t id, uint64_t incarnation, uint64_t epoch, uint64_t route,
++    const char *action, const struct output_primary_radio_custody *predecessor)
+ {
+   char key[64], operation[37], *previous = NULL, *pending = NULL;
+   json_object *row;
+@@ -2449,6 +2502,13 @@
+   int found = db_radio_handoff_load_key(key, &previous);
+   if (found < 0 || (found && (!previous || !primary_radio_custody_valid(previous, id, true))))
+     goto done;
++  if (predecessor)
++    {
++      struct output_primary_radio_custody released;
++      if (found != 1 || predecessor->teardown_cseq <= 0 || !primary_radio_custody_decode(previous, id, &released)
++          || !primary_radio_receipt_equal(predecessor, &released))
++        goto done;
++    }
+   row = json_object_new_object();
+   if (!row)
+     goto done;
+@@ -2484,33 +2544,19 @@
+   char key[64], *raw = NULL;
+   primary_radio_custody_key(key, id);
+   int found = db_radio_handoff_load_key(key, &raw);
+-  if (found == 1 && raw)
+-    {
+-      if (!primary_radio_custody_valid(raw, id, false) && !primary_radio_custody_valid(raw, id, true))
+-        found = -1;
+-      else
+-        {
+-          json_object *row = json_tokener_parse(raw);
+-          if (!row)
+-            found = -1;
+-          else
+-            {
+-              *custody = (struct output_primary_radio_custody) {
+-                .device_id = id,
+-                .incarnation = json_object_get_uint64(json_object_object_get(row, "incarnation")),
+-                .epoch = json_object_get_uint64(json_object_object_get(row, "epoch")),
+-                .route = json_object_get_uint64(json_object_object_get(row, "route")),
+-                .teardown_cseq = json_object_get_int(json_object_object_get(row, "teardown_cseq")),
+-              };
+-              snprintf(custody->process, sizeof(custody->process), "%s", json_object_get_string(json_object_object_get(row, "process")));
+-              snprintf(custody->operation, sizeof(custody->operation), "%s", json_object_get_string(json_object_object_get(row, "operation")));
+-              snprintf(custody->stop_action, sizeof(custody->stop_action), "%s", json_object_get_string(json_object_object_get(row, "stop_action")));
+-              json_object_put(row);
+-            }
+-        }
+-    }
++  if (found == 1 && !primary_radio_custody_decode(raw, id, custody))
++    found = -1;
+   free(raw);
+   return found;
++}
++
++bool
++outputs_primary_radio_release_current(const struct output_primary_radio_custody *expected)
++{
++  struct output_primary_radio_custody released;
++  return expected && expected->teardown_cseq > 0
++      && outputs_primary_radio_custody_read(expected->device_id, &released) == 1
++      && primary_radio_receipt_equal(expected, &released);
+ }
+ 
+ char *
+--- a/src/outputs_radio_handoff.inc.c
++++ b/src/outputs_radio_handoff.inc.c
+@@ -8,7 +8,8 @@
+ struct radio_handoff_slot {
+   struct output_radio_handoff_result result;
+   const void *session,*resume_session,*previous_session;
+-  const void *primary_session; /* Live successor, never restored from the journal. */
++  const void *primary_session; /* Latest successor, never restored from the journal. */
++  struct output_primary_radio_custody primary_route;
+   struct output_radio_reacquire_result previous_source;
+   struct output_primary_spotify_return_request primary_return; /* Runtime exact STOP receipt. */
+   uint64_t resume_pcm_generation,previous_pcm_generation; /* Runtime only. */
+@@ -671,6 +672,27 @@
+   return !strcmp(request->process, old->process) && !strcmp(request->action, park->handoff_id)
+       && request->incarnation == old->device_incarnation && request->epoch == old->session_epoch
+       && request->route == old->route_revision && primary_spotify_park_writer_closed(slot);
++}
++
++bool
++outputs_primary_spotify_park_replace_current(const struct output_primary_radio_start_request *request,
++    const struct output_primary_radio_custody *released, const char *token)
++{
++  struct output_device *d = outputs_device_get(request->device_id);
++  struct radio_handoff_slot *slot = radio_handoff_find(request->device_id);
++  if (!token || !primary_spotify_park_scope_current(slot, d) || !slot->primary_session
++      || !outputs_primary_radio_session_equal(released, &slot->primary_route)
++      || !outputs_primary_radio_session_equal(released, &request->predecessor))
++    return false;
++  const struct output_transport_identity *old = &slot->result.command.identity;
++  return !strcmp(token, slot->result.command.token) && !strcmp(request->process, old->process)
++      && request->device_id == released->device_id && request->incarnation == released->incarnation
++      && request->epoch == released->epoch && request->route == released->route
++      && d->advertised && !d->selected && !d->session && released->epoch < UINT64_MAX - 2
++      && d->session_epoch == released->epoch + 1 && d->route_revision == old->route_revision + 1
++      && transport_selection_revision == old->selection_revision + 2
++      && slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_NONE
++      && primary_spotify_park_writer_closed(slot) && outputs_primary_radio_release_current(released);
+ }
+ 
+ bool
+@@ -682,7 +704,7 @@
+       || d->session != session || slot->result.effect_generation != generation)
+     return false;
+   const struct output_transport_identity *old = &slot->result.command.identity;
+-  return d->session_epoch == old->session_epoch + 2
++  return d->session_epoch == slot->primary_route.epoch
+       && (teardown || (d->advertised && !d->selected && d->route_revision == old->route_revision + 1
+           && transport_selection_revision == old->selection_revision + 2));
+ }
+--- a/src/outputs_radio_reacquire.inc.c
++++ b/src/outputs_radio_reacquire.inc.c
+@@ -312,28 +312,18 @@
+ outputs_primary_spotify_return_constructor_current(uint64_t id)
+ {
+   return id && primary_spotify_return_scope == id;
+-}
+-
+-static bool
+-primary_spotify_return_receipt_equal(const struct output_primary_radio_custody *a,
+-    const struct output_primary_radio_custody *b)
+-{
+-  return a->device_id == b->device_id && a->incarnation == b->incarnation && a->epoch == b->epoch
+-      && a->route == b->route && a->teardown_cseq == b->teardown_cseq
+-      && !strcmp(a->process, b->process) && !strcmp(a->operation, b->operation)
+-      && !strcmp(a->stop_action, b->stop_action);
+ }
+ 
+ static bool
+ primary_spotify_return_release_current(const struct output_primary_radio_custody *radio,
+-    const struct output_transport_identity *old, const char *operation)
++    const struct radio_handoff_slot *slot)
+ {
+-  struct output_primary_radio_custody released;
++  const struct output_transport_identity *old = &slot->result.command.identity;
+   return radio->device_id == old->device_id && radio->incarnation == old->device_incarnation
+-      && radio->epoch == old->session_epoch + 2 && radio->route == old->route_revision + 1
+-      && radio->teardown_cseq > 0 && !strcmp(radio->process, old->process)
+-      && !strcmp(radio->operation, operation) && outputs_primary_radio_custody_read(radio->device_id, &released) == 1
+-      && primary_spotify_return_receipt_equal(radio, &released);
++      && radio->epoch >= old->session_epoch + 2 && (radio->epoch - old->session_epoch) % 2 == 0
++      && radio->route == old->route_revision + 1 && !strcmp(radio->process, old->process)
++      && (!slot->primary_session || outputs_primary_radio_session_equal(radio, &slot->primary_route))
++      && outputs_primary_radio_release_current(radio);
+ }
+ 
+ static bool
+@@ -357,9 +347,9 @@
+       || d->attention_lease || d->attention_retiring_session || d->attention_restart_pending)
+     return false;
+   const struct output_transport_identity *old = &slot->result.command.identity;
+-  return old->session_epoch < UINT64_MAX - 4 && old->route_revision < UINT64_MAX - 2
++  return request->radio.epoch < UINT64_MAX - 2 && old->route_revision < UINT64_MAX - 2
+       && old->selection_revision < UINT64_MAX - 3
+-      && primary_spotify_return_release_current(&request->radio, old, slot->result.command.handoff_id)
++      && primary_spotify_return_release_current(&request->radio, slot)
+       && radio_transport_identity_get(d->id, &source, false) == 0 && radio_reacquire_source_equal(old, &source)
+       && d->base_revision && db_attention_base_get(d->id, &base_volume) == 0
+       && base_volume == d->volume && base_volume == slot->result.command.initial_volume_percent
+@@ -381,7 +371,7 @@
+       || !radio_primary_park_sole_selected(d))
+     return false;
+   const struct output_transport_identity *old = &slot->result.command.identity;
+-  return d->session_epoch == old->session_epoch + 4 && d->route_revision == old->route_revision + 2
++  return d->session_epoch == slot->primary_return.radio.epoch + 2 && d->route_revision == old->route_revision + 2
+       && transport_selection_revision == old->selection_revision + 3
+       && primary_spotify_return_source_current(slot, d, &slot->primary_return,
+           slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_CONNECTING);
+@@ -469,14 +459,14 @@
+       if (action == OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT && slot->result.phase == OUTPUT_RADIO_UNKNOWN
+           && resume->command.native_revision == request->native_revision
+           && !strcmp(resume->command.intent_id, request->intent)
+-          && primary_spotify_return_release_current(&request->radio, old, slot->result.command.handoff_id))
++          && primary_spotify_return_release_current(&request->radio, slot))
+         {
+           out->phase = OUTPUT_RADIO_REACQUIRE_UNKNOWN;
+           return 0;
+         }
+       if (action != OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME || resume->phase != OUTPUT_RADIO_REACQUIRE_NONE
+           || !primary_spotify_return_source_current(slot, d, request, true) || d->selected || d->session
+-          || d->session_epoch != old->session_epoch + 3 || d->route_revision != old->route_revision + 1
++          || d->session_epoch != request->radio.epoch + 1 || d->route_revision != old->route_revision + 1
+           || transport_selection_revision != old->selection_revision + 2 || primary_spotify_return_scope)
+         return -1;
+       if (!start_retirement_reader(start_active, old)
+@@ -519,7 +509,7 @@
+     }
+   else if (request->native_revision != slot->primary_return.native_revision
+       || strcmp(request->intent, slot->primary_return.intent)
+-      || !primary_spotify_return_receipt_equal(&request->radio, &slot->primary_return.radio))
++      || !primary_radio_receipt_equal(&request->radio, &slot->primary_return.radio))
+     return -1;
+ 
+   if (action == OUTPUT_PRIMARY_SPOTIFY_RETURN_BARRIER || action == OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN)
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -573,6 +573,7 @@
+ static void primary_radio_decoder_detach(struct airplay_session *);
+ static bool primary_radio_station_current(const struct airplay_session *);
+ static const char *primary_radio_station_action(const struct airplay_session *);
++static const struct output_primary_radio_custody *primary_radio_station_release(const struct airplay_session *);
+ static void primary_radio_station_packet_sent(struct airplay_session *);
+ 
+ bool
+@@ -1925,7 +1926,8 @@
+ }
+ 
+ static struct airplay_session *
+-session_make_for_source(struct output_device *device, int callback_id, bool primary_radio, const char *park_token)
++session_make_for_source(struct output_device *device, int callback_id, bool primary_radio, const char *park_token,
++    const struct output_primary_radio_start_request *replacement, const struct output_primary_radio_custody *released)
+ {
+   if (outputs_airplay_primary_radio_owns(device) || !outputs_primary_radio_custody_available(device->id))
+     return NULL;
+@@ -1995,7 +1997,7 @@
+   const char *start_token = primary_radio || session->primary_spotify_return ? NULL : outputs_start_session_token(device->id);
+   if(start_token)memcpy(session->start_token,start_token,33);
+   // rs is now the official device session
+-  if ((primary_radio ? outputs_device_session_add_primary_radio(device->id, session, park_token)
++  if ((primary_radio ? outputs_device_session_add_primary_radio(device->id, session, park_token, replacement, released)
+                      : outputs_device_session_add(device->id, session)) < 0)
+     {
+       session_cleanup(session);
+@@ -2022,7 +2024,7 @@
+ static struct airplay_session *
+ session_make(struct output_device *device, int callback_id)
+ {
+-  return session_make_for_source(device, callback_id, false, NULL);
++  return session_make_for_source(device, callback_id, false, NULL, NULL, NULL);
+ }
+ 
+ /* ----------------------------- Metadata handling -------------------------- */
+@@ -4706,9 +4708,10 @@
+           || (session->primary_spotify_park_generation && !outputs_primary_spotify_park_wire_current(
+               session->device_id, session, seq_ctx->radio_generation)))
+         goto error;
++      const struct output_primary_radio_custody *released = primary_radio_station_release(session);
+       session->primary_radio_custody = outputs_primary_radio_custody_begin(session->device_id,
+           session->device_incarnation, session->session_epoch, session->primary_radio_route_revision,
+-          primary_radio_station_action(session));
++          primary_radio_station_action(session), released && released->device_id == session->device_id ? released : NULL);
+       if (!session->primary_radio_custody || !primary_radio_sequence_current(seq_ctx))
+         goto error;
+     }
+@@ -5247,7 +5250,8 @@
+ /* These entry points remain local to the primary output owner. The isolated
+  * fixture calls them on its player thread; no Manager/Native path is enabled. */
+ static struct airplay_session *
+-airplay_primary_radio_make(struct output_device *device, struct airplay_primary_radio_route *route, const char *park_token)
++airplay_primary_radio_make(struct output_device *device, struct airplay_primary_radio_route *route, const char *park_token,
++    const struct output_primary_radio_start_request *replacement, const struct output_primary_radio_custody *released)
+ {
+   struct airplay_session *session;
+ 
+@@ -5257,7 +5261,7 @@
+       || outputs_radio_sender_role())
+     return NULL;
+ 
+-  session = session_make_for_source(device, -1, true, park_token);
++  session = session_make_for_source(device, -1, true, park_token, replacement, released);
+   if (!session)
+     return NULL;
+ 
+@@ -5270,7 +5274,7 @@
+ static int
+ airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
+ {
+-  struct airplay_session *session = airplay_primary_radio_make(device, route, NULL);
++  struct airplay_session *session = airplay_primary_radio_make(device, route, NULL, NULL, NULL);
+   if (!session)
+     return -1;
+   sequence_start(AIRPLAY_SEQ_START, session, NULL, "primary_radio_start");
+@@ -5322,6 +5326,7 @@
+   struct timespec deadline;
+   struct primary_radio_decode *decoder;
+   struct airplay_primary_radio_route admitted_route;
++  struct output_primary_radio_custody predecessor_release;
+   bool decode_only, released;
+   char park_token[33];
+ };
+@@ -5467,7 +5472,9 @@
+   const struct primary_radio_station_operation *operation = decoder ? decoder->operation : NULL;
+   return !operation || operation->result.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED
+       || (operation->result.phase == OUTPUT_PRIMARY_RADIO_START_PENDING
+-          && primary_radio_station_before_deadline(operation));
++          && primary_radio_station_before_deadline(operation)
++          && (!operation->request.predecessor.device_id || session->primary_radio_custody
++              || outputs_primary_radio_release_current(&operation->predecessor_release)));
+ }
+ 
+ static const char *
+@@ -5477,6 +5484,14 @@
+   return decoder && decoder->operation ? decoder->operation->request.action : NULL;
+ }
+ 
++static const struct output_primary_radio_custody *
++primary_radio_station_release(const struct airplay_session *session)
++{
++  const struct primary_radio_decode *decoder = session->primary_radio_decoder;
++  const struct primary_radio_station_operation *operation = decoder ? decoder->operation : NULL;
++  return operation && operation->predecessor_release.device_id ? &operation->predecessor_release : NULL;
++}
++
+ static void
+ primary_radio_station_packet_sent(struct airplay_session *session)
+ {
+@@ -5529,9 +5544,93 @@
+ {
+   return a->device_id == b->device_id && a->incarnation == b->incarnation
+       && a->epoch == b->epoch && a->route == b->route && !strcmp(a->process, b->process);
++}
++
++static struct airplay_session *
++primary_radio_station_predecessor(const struct output_primary_radio_custody *predecessor)
++{
++  if (!predecessor->device_id || predecessor->teardown_cseq || predecessor->stop_action[0]
++      || strnlen(predecessor->process, sizeof(predecessor->process)) != 36
++      || strnlen(predecessor->operation, sizeof(predecessor->operation)) != 36
++      || strcmp(predecessor->process, outputs_primary_radio_process()))
++    return NULL;
++  struct airplay_primary_radio_route route = {
++    predecessor->device_id, predecessor->incarnation, predecessor->epoch, predecessor->route,
++  };
++  struct airplay_session *session = airplay_primary_radio_session(&route);
++  if (!primary_radio_live(session) || !session->primary_radio_decoder)
++    return NULL;
++  const struct primary_radio_station_operation *operation = session->primary_radio_decoder->operation;
++  struct output_primary_radio_custody actual;
++  if (!operation || operation->result.phase != OUTPUT_PRIMARY_RADIO_START_OBSERVED
++      || !outputs_primary_radio_session_equal(predecessor, &operation->result.custody)
++      || outputs_primary_radio_custody_read(predecessor->device_id, &actual) != 1
++      || actual.teardown_cseq || actual.stop_action[0] || !outputs_primary_radio_session_equal(predecessor, &actual))
++    return NULL;
++  return session;
++}
++
++int
++outputs_airplay_primary_station_replace_target(uint64_t id, const struct output_primary_radio_custody *predecessor,
++    struct output_primary_radio_start_request *out)
++{
++  if (!out || !predecessor || !id || outputs_start_gate_closed())
++    return -1;
++  struct airplay_session *session = primary_radio_station_predecessor(predecessor);
++  if (!session)
++    return -1;
++  struct output_primary_radio_custody prior = *predecessor;
++  if (id != prior.device_id)
++    {
++      /* A parked Spotify owner has one exact same-target radio chain. */
++      if (session->primary_spotify_park_generation || outputs_airplay_primary_station_target(id, out) < 0)
++        return -1;
++    }
++  else
++    {
++      if (prior.epoch >= UINT64_MAX - 2)
++        return -1;
++      *out = (struct output_primary_radio_start_request) {
++        .device_id = id, .incarnation = prior.incarnation, .epoch = prior.epoch, .route = prior.route,
++      };
++      memcpy(out->process, prior.process, sizeof(out->process));
++    }
++  out->predecessor = prior;
++  return 0;
+ }
+ 
+ static bool
++primary_radio_station_replace_ready(const struct output_primary_radio_start_request *request,
++    const struct output_primary_radio_custody *released, const char *park_token)
++{
++  if (released->epoch >= UINT64_MAX - 2 || outputs_start_gate_closed()
++      || !outputs_primary_radio_session_equal(&request->predecessor, released)
++      || !outputs_primary_radio_release_current(released))
++    return false;
++  struct output_device *previous = outputs_device_get(released->device_id);
++  if (!previous || !previous->advertised || previous->selected || previous->session
++      || previous->incarnation != released->incarnation || previous->session_epoch != released->epoch + 1
++      || previous->route_revision != released->route)
++    return false;
++  for (const struct airplay_session *session = airplay_sessions; session; session = session->next)
++    if (session->primary_radio)
++      return false;
++
++  if (park_token)
++    return request->device_id == previous->id && outputs_primary_spotify_park_replace_current(request, released, park_token);
++  struct output_primary_radio_start_request current, expected = *request;
++  if (request->device_id == previous->id)
++    {
++      if (request->epoch != released->epoch || request->route != released->route
++          || request->incarnation != released->incarnation)
++        return false;
++      expected.epoch++;
++    }
++  return outputs_airplay_primary_station_target(request->device_id, &current) == 0
++      && primary_radio_station_same_target(&expected, &current);
++}
++
++static bool
+ primary_radio_station_attach_ready(struct primary_radio_decode *decoder)
+ {
+   struct primary_radio_station_operation *operation = decoder->operation;
+@@ -5555,8 +5654,11 @@
+     {
+       if (operation->result.phase == OUTPUT_PRIMARY_RADIO_START_PENDING)
+         {
+-          if (outputs_airplay_primary_station_preflight_target(operation->request.device_id, &current) < 0
+-              || !primary_radio_station_same_target(&operation->request, &current))
++          const struct output_primary_radio_start_request *request = &operation->request;
++          int ready = request->predecessor.device_id
++            ? outputs_airplay_primary_station_replace_target(request->device_id, &request->predecessor, &current)
++            : outputs_airplay_primary_station_preflight_target(request->device_id, &current);
++          if (ready < 0 || !primary_radio_station_same_target(request, &current))
+             {
+               primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
+               primary_radio_decode_cancel(decoder);
+@@ -5567,8 +5669,10 @@
+       return false; /* Keep decoded PCM private until a later exact park admission. */
+     }
+   const char *park_token = operation->park_token[0] ? operation->park_token : NULL;
+-  bool target_current = park_token
+-      ? outputs_primary_spotify_park_attach_current(&operation->request, park_token)
++  bool replacement = operation->request.predecessor.device_id != 0;
++  bool target_current = replacement
++      ? primary_radio_station_replace_ready(&operation->request, &operation->predecessor_release, park_token)
++      : park_token ? outputs_primary_spotify_park_attach_current(&operation->request, park_token)
+       : outputs_airplay_primary_station_target(operation->request.device_id, &current) == 0
+           && primary_radio_station_same_target(&operation->request, &current);
+   if (!target_current || !primary_radio_station_before_deadline(operation))
+@@ -5581,7 +5685,8 @@
+   /* No receiver wire precedes one full decoded PCM packet and the final
+    * exact idle-target check. Only the player loop runs this constructor. */
+   struct airplay_session *session = airplay_primary_radio_make(
+-      outputs_device_get(operation->request.device_id), &decoder->route, park_token);
++      outputs_device_get(operation->request.device_id), &decoder->route, park_token,
++      replacement ? &operation->request : NULL, replacement ? &operation->predecessor_release : NULL);
+   if (!session)
+     {
+       primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
+@@ -5775,21 +5880,43 @@
+     if ((i == 8 || i == 13 || i == 18 || i == 23) ? request->action[i] != '-'
+         : !strchr("0123456789abcdef", request->action[i]))
+       return false;
+-  return outputs_radio_station_url(request->station) != NULL;
++  const struct output_primary_radio_custody *prior = &request->predecessor;
++  return (!prior->device_id || (!prior->teardown_cseq && !prior->stop_action[0]
++          && strnlen(prior->process, sizeof(prior->process)) == 36
++          && strnlen(prior->operation, sizeof(prior->operation)) == 36
++          && !strcmp(prior->process, request->process)))
++      && outputs_radio_station_url(request->station) != NULL;
+ }
+ 
+ static struct primary_radio_station_operation *
+-primary_radio_station_find(const struct output_primary_radio_start_request *request)
++primary_radio_station_find_action(const char *action)
+ {
+   for (size_t i = 0; i < ARRAY_SIZE(primary_radio_station_operations); i++)
+     {
+       struct primary_radio_station_operation *operation = &primary_radio_station_operations[i];
+-      if (!strcmp(operation->request.action, request->action))
++      if (!strcmp(operation->request.action, action))
+         return operation;
+     }
+   return NULL;
+ }
+ 
++static struct primary_radio_station_operation *
++primary_radio_station_find(const struct output_primary_radio_start_request *request)
++{
++  return primary_radio_station_find_action(request->action);
++}
++
++static bool
++primary_radio_station_binding_equal(const struct primary_radio_station_operation *operation,
++    const struct output_primary_radio_start_request *request)
++{
++  const struct output_primary_radio_start_request *retained = &operation->request;
++  return primary_radio_station_same_target(retained, request) && retained->generation == request->generation
++      && !strcmp(retained->station, request->station)
++      && ((!retained->predecessor.device_id && !request->predecessor.device_id)
++          || outputs_primary_radio_session_equal(&retained->predecessor, &request->predecessor));
++}
++
+ int
+ outputs_airplay_primary_station_result(const struct output_primary_radio_start_request *request,
+     struct output_primary_radio_start_result *out)
+@@ -5797,16 +5924,16 @@
+   if (!out || !primary_radio_station_request_valid(request))
+     return -1;
+   struct primary_radio_station_operation *operation = primary_radio_station_find(request);
+-  if (!operation || !primary_radio_station_same_target(&operation->request, request)
+-      || operation->request.generation != request->generation || strcmp(operation->request.station, request->station))
++  if (!operation || !primary_radio_station_binding_equal(operation, request))
+     return -1;
+   *out = operation->result;
+   if (out->phase == OUTPUT_PRIMARY_RADIO_START_DECODED)
+     {
+       struct output_primary_radio_start_request current;
+       if (!primary_radio_station_before_deadline(operation)
+-          || outputs_airplay_primary_station_preflight_target(request->device_id, &current) < 0
+-          || !primary_radio_station_same_target(request, &current))
++          || (!request->predecessor.device_id
++              && (outputs_airplay_primary_station_preflight_target(request->device_id, &current) < 0
++                  || !primary_radio_station_same_target(request, &current))))
+         *out = (struct output_primary_radio_start_result) { .phase = OUTPUT_PRIMARY_RADIO_START_REJECTED };
+     }
+   if (out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED
+@@ -5866,20 +5993,23 @@
+   if (request->generation <= primary_radio_station_generation)
+     return -1;
+   struct output_primary_radio_start_request current;
+-  int ready = decode_only ? outputs_airplay_primary_station_preflight_target(request->device_id, &current)
+-                          : outputs_airplay_primary_station_target(request->device_id, &current);
+-  if (ready < 0
+-      || !primary_radio_station_same_target(request, &current))
++  const struct output_primary_radio_custody *prior = &request->predecessor;
++  int ready = prior->device_id ? outputs_airplay_primary_station_replace_target(request->device_id, prior, &current)
++      : decode_only ? outputs_airplay_primary_station_preflight_target(request->device_id, &current)
++                    : outputs_airplay_primary_station_target(request->device_id, &current);
++  if (ready < 0 || !primary_radio_station_same_target(request, &current))
+     return -1;
+-
++  struct airplay_session *predecessor = prior->device_id ? primary_radio_station_predecessor(prior) : NULL;
++  if (prior->device_id && !predecessor)
++    return -1;
+   for (struct airplay_session *session = airplay_sessions; session; session = session->next)
+-    if (session->primary_radio)
++    if (session->primary_radio && session != predecessor)
+       return -1;
+   struct primary_radio_station_operation *empty = NULL, *oldest = NULL;
+   for (size_t i = 0; i < ARRAY_SIZE(primary_radio_station_operations); i++)
+     {
+       struct primary_radio_station_operation *operation = &primary_radio_station_operations[i];
+-      if (operation->decoder)
++      if (operation->decoder && (!predecessor || operation->decoder->session != predecessor))
+         return -1;
+       if (!operation->request.action[0])
+         {
+@@ -5915,25 +6045,25 @@
+ outputs_airplay_primary_station_start(const struct output_primary_radio_start_request *request,
+     struct output_primary_radio_start_result *out)
+ {
+-  return primary_radio_station_begin(request, out, false);
++  return request && !request->predecessor.device_id ? primary_radio_station_begin(request, out, false) : -1;
+ }
+ 
+ int
+ outputs_airplay_primary_station_preflight(const struct output_primary_radio_start_request *request,
+     struct output_primary_radio_start_result *out)
+ {
+-  return primary_radio_station_begin(request, out, true);
++  return request && !request->predecessor.device_id ? primary_radio_station_begin(request, out, true) : -1;
+ }
+ 
+ int
+ outputs_airplay_primary_station_activate(const struct output_primary_radio_start_request *request, const char *park_token,
+     struct output_primary_radio_start_result *out)
+ {
+-  if (!out || !park_token || strlen(park_token) != 32 || !primary_radio_station_request_valid(request))
++  if (!out || !park_token || strlen(park_token) != 32 || !primary_radio_station_request_valid(request)
++      || request->predecessor.device_id)
+     return -1;
+   struct primary_radio_station_operation *operation = primary_radio_station_find(request);
+-  if (!operation || !primary_radio_station_same_target(request, &operation->request)
+-      || request->generation != operation->request.generation || strcmp(request->station, operation->request.station))
++  if (!operation || !primary_radio_station_binding_equal(operation, request))
+     return -1;
+   if (operation->park_token[0])
+     return strcmp(operation->park_token, park_token) ? -1 : outputs_airplay_primary_station_result(request, out);
+@@ -5942,6 +6072,52 @@
+     return -1;
+ 
+   memcpy(operation->park_token, park_token, sizeof(operation->park_token));
++  operation->decode_only = false;
++  operation->result.phase = OUTPUT_PRIMARY_RADIO_START_PENDING;
++  *out = operation->result;
++  return 0;
++}
++
++int
++outputs_airplay_primary_station_replace_preflight(const struct output_primary_radio_start_request *request,
++    struct output_primary_radio_start_result *out)
++{
++  return request && request->predecessor.device_id ? primary_radio_station_begin(request, out, true) : -1;
++}
++
++int
++outputs_airplay_primary_station_replace_activate(const struct output_primary_radio_start_request *request,
++    const struct output_primary_radio_custody *released, const char *park_token,
++    struct output_primary_radio_start_result *out)
++{
++  if (!out || !released || !primary_radio_station_request_valid(request) || !request->predecessor.device_id
++      || released->teardown_cseq <= 0 || strnlen(released->stop_action, sizeof(released->stop_action)) != 36
++      || strnlen(released->process, sizeof(released->process)) != 36
++      || strnlen(released->operation, sizeof(released->operation)) != 36
++      || !outputs_primary_radio_session_equal(&request->predecessor, released)
++      || (park_token && strlen(park_token) != 32))
++    return -1;
++  struct primary_radio_station_operation *operation = primary_radio_station_find(request);
++  if (!operation || !primary_radio_station_binding_equal(operation, request))
++    return -1;
++  const char *token = park_token ? park_token : "";
++  if (operation->predecessor_release.device_id)
++    return released->teardown_cseq == operation->predecessor_release.teardown_cseq
++        && !strcmp(released->stop_action, operation->predecessor_release.stop_action)
++        && !strcmp(token, operation->park_token) ? outputs_airplay_primary_station_result(request, out) : -1;
++  if (!operation->decode_only || !operation->decoder || operation->result.phase != OUTPUT_PRIMARY_RADIO_START_DECODED
++      || !primary_radio_station_before_deadline(operation)
++      || !primary_radio_station_replace_ready(request, released, park_token))
++    return -1;
++
++  /* Save the settled predecessor before the successor can overwrite its
++   * per-device receipt. Otherwise repeated replacements pin its old slot. */
++  struct primary_radio_station_operation *predecessor = primary_radio_station_find_action(released->operation);
++  if (!predecessor || !primary_radio_station_reusable(predecessor))
++    return -1;
++  operation->predecessor_release = *released;
++  if (park_token)
++    memcpy(operation->park_token, park_token, sizeof(operation->park_token));
+   operation->decode_only = false;
+   operation->result.phase = OUTPUT_PRIMARY_RADIO_START_PENDING;
+   *out = operation->result;
+--- a/src/player.c
++++ b/src/player.c
+@@ -3412,6 +3412,7 @@
+   struct output_primary_radio_start_request *request;
+   struct output_primary_radio_start_result *result;
+   const char *park_token;
++  const struct output_primary_radio_custody *released;
+ };
+ 
+ static enum command_state
+@@ -3440,7 +3441,16 @@
+         break;
+       case 6:
+         *retval = outputs_airplay_primary_station_activate(c->request, c->park_token, c->result);
++        break;
++      case 7:
++        *retval = outputs_airplay_primary_station_replace_target(c->request->device_id, &c->request->predecessor, c->request);
++        break;
++      case 8:
++        *retval = outputs_airplay_primary_station_replace_preflight(c->request, c->result);
+         break;
++      case 9:
++        *retval = outputs_airplay_primary_station_replace_activate(c->request, c->released, c->park_token, c->result);
++        break;
+       default:
+         *retval = -1;
+         break;
+@@ -3450,9 +3460,10 @@
+ 
+ int
+ player_radio_primary_station(int phase, struct output_primary_radio_start_request *request,
+-    struct output_primary_radio_start_result *result, const char *park_token)
++    struct output_primary_radio_start_result *result, const char *park_token,
++    const struct output_primary_radio_custody *released)
+ {
+-  struct player_radio_primary_station_command c = { phase, request, result, park_token };
++  struct player_radio_primary_station_command c = { phase, request, result, park_token, released };
+   return commands_exec_sync(cmdbase, radio_primary_station_command, NULL, &c);
+ }
+ 
+--- a/src/player.h
++++ b/src/player.h
+@@ -282,7 +282,7 @@
+ int player_radio_primary_stop(bool, const struct output_primary_radio_custody *, const char *,
+     struct output_primary_radio_custody *);
+ int player_radio_primary_station(int, struct output_primary_radio_start_request *,
+-    struct output_primary_radio_start_result *, const char *);
++    struct output_primary_radio_start_result *, const char *, const struct output_primary_radio_custody *);
+ int player_primary_spotify_park(enum output_primary_spotify_park_action,
+     const struct output_primary_spotify_park_request *, struct output_primary_spotify_park_result *);
+ 
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -68,12 +68,57 @@
+ }
+ 
+ static int
++primary_radio_station_custody_parse(json_object *body, const char *name,
++    struct output_primary_radio_custody *custody, bool released)
++{
++  json_object *object, *cseq;
++  if (!json_object_object_get_ex(body, name, &object) || !json_object_is_type(object, json_type_object)
++      || json_object_object_length(object) != (released ? 8 : 6)
++      || !transport_json_string(object, "process", custody->process, sizeof(custody->process))
++      || !transport_json_string(object, "operation", custody->operation, sizeof(custody->operation))
++      || transport_native_counter(object, "device_id", &custody->device_id) < 0 || !custody->device_id
++      || transport_native_counter(object, "incarnation", &custody->incarnation) < 0 || !custody->incarnation
++      || transport_native_counter(object, "session_epoch", &custody->epoch) < 0 || !custody->epoch
++      || transport_native_counter(object, "route_revision", &custody->route) < 0)
++    return -1;
++  if (released)
++    {
++      if (!transport_json_string(object, "action", custody->stop_action, sizeof(custody->stop_action))
++          || !json_object_object_get_ex(object, "teardown_cseq", &cseq) || !json_object_is_type(cseq, json_type_int)
++          || json_object_get_int64(cseq) <= 0 || json_object_get_int64(cseq) > INT_MAX)
++        return -1;
++      custody->teardown_cseq = json_object_get_int(cseq);
++    }
++  return 0;
++}
++
++static int
++primary_radio_station_custody_reply(json_object *reply, const char *name, const struct output_primary_radio_custody *custody)
++{
++  json_object *object = json_object_new_object();
++  if (!object)
++    return -1;
++  json_object_object_add(object, "process", json_object_new_string(custody->process));
++  json_object_object_add(object, "operation", json_object_new_string(custody->operation));
++  attention_json_u64(object, "device_id", custody->device_id);
++  attention_json_u64(object, "incarnation", custody->incarnation);
++  attention_json_u64(object, "session_epoch", custody->epoch);
++  attention_json_u64(object, "route_revision", custody->route);
++  json_object_object_add(reply, name, object);
++  return 0;
++}
++
++static int
+ jsonapi_reply_primary_radio_start(struct httpd_request *hreq, json_object *body)
+ {
+-  static const char *const names[] = { "target", "start", "result", "cancel", "preflight_target", "preflight", "activate" };
++  static const char *const names[] = {
++    "target", "start", "result", "cancel", "preflight_target", "preflight", "activate",
++    "preflight_replace_target", "preflight_replace", "activate_replace",
++  };
+   struct output_primary_radio_start_request request = { 0 };
+   struct output_primary_radio_start_result result = { 0 };
+-  char phase[17], park_token[33];
++  struct output_primary_radio_custody released = { 0 };
++  char phase[32], park_token[33];
+   uint64_t path_device;
+   int action = -1;
+ 
+@@ -85,10 +130,18 @@
+   for (size_t i = 0; i < ARRAY_SIZE(names); i++)
+     if (!strcmp(phase, names[i]))
+       action = (int)i;
+-  bool read_target = action == 0 || action == 4;
+-  bool activate = action == 6;
+-  if (action < 0 || json_object_object_length(body) != (read_target ? 3 : activate ? 11 : 10)
+-      || (activate && !transport_json_string(body, "park_token", park_token, sizeof(park_token))))
++  bool read_target = action == 0 || action == 4 || action == 7;
++  bool replace = action >= 7;
++  json_object *field;
++  bool has_predecessor = json_object_object_get_ex(body, "predecessor", &field);
++  bool has_token = json_object_object_get_ex(body, "park_token", &field);
++  if (action < 0 || (replace && !has_predecessor)
++      || (has_predecessor && !replace && action != 2 && action != 3)
++      || (action == 6 && !has_token) || (has_token && action != 6 && action != 9)
++      || json_object_object_length(body) != (read_target ? 3 : 10) + has_predecessor + has_token + (action == 9)
++      || (has_token && !transport_json_string(body, "park_token", park_token, sizeof(park_token)))
++      || (has_predecessor && primary_radio_station_custody_parse(body, "predecessor", &request.predecessor, false) < 0)
++      || (action == 9 && primary_radio_station_custody_parse(body, "predecessor_release", &released, true) < 0))
+     return HTTP_BADREQUEST;
+   if (!read_target && (!transport_json_string(body, "process", request.process, sizeof(request.process))
+       || !transport_json_string(body, "action", request.action, sizeof(request.action))
+@@ -99,7 +152,8 @@
+       || transport_native_counter(body, "generation", &request.generation) < 0
+       || !request.generation || request.generation == UINT64_MAX))
+     return HTTP_BADREQUEST;
+-  if (player_radio_primary_station(action, &request, &result, activate ? park_token : NULL) < 0)
++  if (player_radio_primary_station(action, &request, &result, has_token ? park_token : NULL,
++      action == 9 ? &released : NULL) < 0)
+     return 409;
+ 
+   const char *result_phase = "unknown";
+@@ -130,19 +184,12 @@
+       json_object_object_add(reply, "station_id", json_object_new_string(request.station));
+       attention_json_u64(reply, "generation", request.generation);
+     }
+-  if (result.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && !read_target)
++  if ((has_predecessor && primary_radio_station_custody_reply(reply, "predecessor", &request.predecessor) < 0)
++      || (result.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && !read_target
++          && primary_radio_station_custody_reply(reply, "target_session", &result.custody) < 0))
+     {
+-      const struct output_primary_radio_custody *c = &result.custody;
+-      json_object *session = json_object_new_object();
+-      if (!session)
+-        { json_object_put(reply); return HTTP_SERVUNAVAIL; }
+-      json_object_object_add(session, "process", json_object_new_string(c->process));
+-      json_object_object_add(session, "operation", json_object_new_string(c->operation));
+-      attention_json_u64(session, "device_id", c->device_id);
+-      attention_json_u64(session, "incarnation", c->incarnation);
+-      attention_json_u64(session, "session_epoch", c->epoch);
+-      attention_json_u64(session, "route_revision", c->route);
+-      json_object_object_add(reply, "target_session", session);
++      json_object_put(reply);
++      return HTTP_SERVUNAVAIL;
+     }
+   return transport_json_reply(hreq, reply);
+ }

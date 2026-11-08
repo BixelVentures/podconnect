@@ -1,0 +1,193 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1746,6 +1746,76 @@
+   event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
+   evhttp_free(wire.http);event_base_free(wire.http_base);
+   commands_base_free(cmdbase);cmdbase=NULL;
++}
++
++static void
++primary_radio_station_replace_wire(struct recovery_wire_fixture *previous, struct recovery_wire_fixture *destination,
++    const struct output_primary_radio_custody *prior, uint64_t generation, const char *station, const char *park_token,
++    struct output_primary_radio_start_result *out, struct output_primary_radio_custody *released)
++{
++  const void *previous_session = previous->device->session;
++  int previous_peers = previous->pc70_peer_sessions, destination_peers = destination->pc70_peer_sessions;
++  int teardowns = previous->teardowns;
++  struct output_primary_radio_start_request candidate;
++  uint16_t sequence;
++  assert(outputs_airplay_primary_station_replace_target(destination->device->id, prior, &candidate) == 0);
++  assert(candidate.epoch == destination->device->session_epoch && candidate.route == destination->device->route_revision);
++  candidate.generation = generation;
++  outputs_attention_uuid(candidate.action);
++  snprintf(candidate.station, sizeof(candidate.station), "%s", station);
++  (void)primary_radio_wire_packets(previous, &sequence);
++  assert(outputs_airplay_primary_station_replace_preflight(&candidate, out) == 0);
++  for (int i = 0; i < 1500 && out->phase == OUTPUT_PRIMARY_RADIO_START_PENDING; i++)
++    {
++      event_base_loop(previous->base, EVLOOP_NONBLOCK);
++      assert(outputs_airplay_primary_station_result(&candidate, out) == 0);
++      usleep(1000);
++    }
++  assert(out->phase == OUTPUT_PRIMARY_RADIO_START_DECODED && previous->device->session == previous_session
++      && previous->teardowns == teardowns && destination->pc70_peer_sessions == destination_peers);
++  int prior_packets = 0;
++  for (int i = 0; i < 100 && !prior_packets; i++)
++    {
++      event_base_loop(previous->base, EVLOOP_NONBLOCK);
++      prior_packets += primary_radio_wire_packets(previous, &sequence);
++      usleep(1000);
++    }
++  assert(prior_packets > 0);
++  struct primary_radio_decode *worker = primary_radio_station_find(&candidate)->decoder;
++  struct output_primary_radio_custody forged = *prior;
++  outputs_attention_uuid(forged.stop_action);
++  forged.teardown_cseq = 1;
++  assert(outputs_airplay_primary_station_replace_activate(&candidate, &forged, park_token, out) < 0);
++  previous->require_decoder_drain = true;
++  assert(outputs_airplay_primary_radio_claim_stop(prior, forged.stop_action) == 0);
++  primary_radio_wire_wait(previous, false);
++  assert(previous->teardowns == teardowns + 1 && !previous->device->session
++      && outputs_primary_radio_custody_read(prior->device_id, released) == 1
++      && released->teardown_cseq > 0 && !strcmp(released->stop_action, forged.stop_action));
++  forged = *released;
++  forged.teardown_cseq++;
++  assert(outputs_airplay_primary_station_replace_activate(&candidate, &forged, park_token, out) < 0);
++  assert(destination->pc70_peer_sessions == destination_peers && !destination->device->session);
++  if (park_token)
++    assert(outputs_airplay_primary_station_replace_activate(&candidate, released, NULL, out) < 0);
++  (void)primary_radio_wire_packets(destination, &sequence);
++  assert(outputs_airplay_primary_station_replace_activate(&candidate, released, park_token, out) == 0);
++  for (int i = 0; i < 1500 && out->phase == OUTPUT_PRIMARY_RADIO_START_PENDING; i++)
++    {
++      event_base_loop(previous->base, EVLOOP_NONBLOCK);
++      assert(outputs_airplay_primary_station_result(&candidate, out) == 0);
++      usleep(1000);
++    }
++  assert(out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && destination->pc70_peer_sessions == destination_peers + 1
++      && out->custody.epoch == candidate.epoch + (previous == destination ? 2 : 1)
++      && out->custody.route == candidate.route && !strcmp(out->custody.operation, candidate.action)
++      && destination->device->session
++      && ((struct airplay_session *)destination->device->session)->primary_radio_decoder == worker
++      && primary_radio_wire_packets(destination, &sequence) > 0);
++  if (previous != destination)
++    assert(!previous->device->session && previous->pc70_peer_sessions == previous_peers);
++  assert(outputs_airplay_primary_station_replace_activate(&candidate, released, park_token, out) == 0
++      && out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && destination->pc70_peer_sessions == destination_peers + 1);
+ }
+ 
+ static int start35_wire_case(int mode)
+@@ -2995,14 +3065,32 @@
+       assert(f.device->session && decoded == ((struct airplay_session *)f.device->session)->primary_radio_decoder
+           && !strcmp(station.custody.operation, start.action) && station.custody.epoch == start.epoch + 2);
+       assert(primary_radio_wire_packets(&f, &radio_seq) >= 1);
++      bool replace_station = getenv("PC_PRIMARY_SPOTIFY_REPLACE") != NULL;
++      int radio_sessions = 2; /* Original Spotify and the first radio session. */
++      struct output_primary_radio_custody previous_stop;
++      if (replace_station)
++        {
++          const char *stations[] = { "p1", "p4-ostjylland" };
++          for (size_t i = 0; i < ARRAY_SIZE(stations); i++)
++            {
++              struct output_primary_radio_custody prior = station.custody;
++              primary_radio_station_replace_wire(&f, &f, &prior, start.generation + i + 1,
++                  stations[i], exact.token, &station, &previous_stop);
++              radio_sessions++;
++              assert(primary_spotify_park_writer_closed(retained)
++                  && outputs_primary_radio_session_equal(&retained->primary_route, &station.custody));
++            }
++          puts("PASS three encrypted station sessions share the exact parked Spotify output through two drained replacements");
++        }
+       const char *stop = "43a14ca1-b7d4-4a6a-b8db-f01c218f9f72";
+       f.require_decoder_drain = true;
+       assert(outputs_airplay_primary_radio_claim_stop(&station.custody, stop) == 0);
+       primary_radio_wire_wait(&f, false);
+-      assert(f.teardowns == 2 && !f.device->selected);
+-      assert(outputs_airplay_primary_station_activate(&start, exact.token, &station) == 0
+-          && station.phase == OUTPUT_PRIMARY_RADIO_START_UNKNOWN);
+-      assert(f.pc70_peer_sessions == 2 && f.teardowns == 2);
++      assert(f.teardowns == radio_sessions && !f.device->selected);
++      struct output_primary_radio_start_result historical;
++      assert(outputs_airplay_primary_station_activate(&start, exact.token, &historical) == 0
++          && historical.phase == OUTPUT_PRIMARY_RADIO_START_UNKNOWN);
++      assert(f.pc70_peer_sessions == radio_sessions && f.teardowns == radio_sessions);
+       struct output_primary_spotify_return_request back = { 0 };
+       struct output_primary_spotify_return_result returned;
+       bool return_route = getenv("PC_PRIMARY_SPOTIFY_RETURN") != NULL;
+@@ -3015,9 +3103,15 @@
+               && back.radio.teardown_cseq > 0 && !strcmp(back.radio.stop_action, stop));
+           assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT, &back, &returned) < 0);
+           struct output_primary_spotify_return_request wrong = back;
++          if (replace_station)
++            {
++              wrong.radio = previous_stop;
++              assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME, &wrong, &returned) < 0);
++            }
++          wrong.radio = back.radio;
+           wrong.radio.teardown_cseq++;
+           assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME, &wrong, &returned) < 0);
+-          assert(f.pc70_peer_sessions == 2 && f.teardowns == 2 && !f.device->session);
++          assert(f.pc70_peer_sessions == radio_sessions && f.teardowns == radio_sessions && !f.device->session);
+           assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME, &back, &returned) == 0
+               && returned.phase == OUTPUT_RADIO_REACQUIRE_CONNECTING);
+           for (int i = 0; i < 1500 && returned.phase == OUTPUT_RADIO_REACQUIRE_CONNECTING; i++)
+@@ -3026,8 +3120,8 @@
+               assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT, &back, &returned) == 0);
+               usleep(1000);
+             }
+-          assert(returned.phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY && f.pc70_peer_sessions == 3 && f.teardowns == 2
+-              && returned.route.session_epoch == exact.route.session_epoch + 4
++          assert(returned.phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY && f.pc70_peer_sessions == radio_sessions + 1
++              && f.teardowns == radio_sessions && returned.route.session_epoch == back.radio.epoch + 2
+               && returned.route.route_revision == exact.route.route_revision + 2
+               && radio_reacquire_source_equal(&returned.route, &exact.route)
+               && outputs_airplay_primary_spotify_session_current(f.device, f.device->session)
+@@ -3042,7 +3136,7 @@
+           wrong.radio = back.radio;
+           assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME, &wrong, &returned) < 0);
+           assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME, &back, &returned) == 0
+-              && returned.phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY && f.pc70_peer_sessions == 3);
++              && returned.phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY && f.pc70_peer_sessions == radio_sessions + 1);
+           if (getenv("PC_PRIMARY_SPOTIFY_RETURN_WRITER"))
+             {
+               const struct output_transport_identity ready_route = returned.route;
+@@ -3076,7 +3170,7 @@
+               assert(primary_radio_wire_packets(&f, &music_seq) == 1);
+               assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN, &back, &returned) == 0
+                   && returned.phase == OUTPUT_RADIO_REACQUIRE_OPENED && !returned.newly_opened
+-                  && f.pc70_peer_sessions == 3);
++                  && f.pc70_peer_sessions == radio_sessions + 1);
+               assert(!close(writer));
+               writer = -1;
+               assert(!attention_emission_current(f.device->session, NULL));
+@@ -3143,6 +3237,30 @@
+       assert(!strcmp(result.custody.operation, request.action) && result.custody.device_id == 2);
+       assert(primary_radio_wire_packets(&radio, &radio_seq) >= 1);
+       assert(f.device->session == music_owner && f.device->selected && !f.teardowns);
++      if (getenv("PC_PRIMARY_RADIO_REPLACE_DISJOINT"))
++        {
++          struct recovery_wire_fixture destination = { .udp_fd = -1 };
++          primary_radio_wire_receiver(&destination, f.base, 3, "127.0.0.3");
++          struct output_primary_radio_custody prior = result.custody, released;
++          struct output_primary_radio_start_request busy_destination;
++          assert(outputs_airplay_primary_station_replace_target(f.device->id, &prior, &busy_destination) < 0);
++          primary_radio_station_replace_wire(&radio, &destination, &prior, request.generation + 1,
++              "p1", NULL, &result, &released);
++          assert(f.device->session == music_owner && f.device->selected && !f.teardowns);
++          char stop_destination[37];
++          outputs_attention_uuid(stop_destination);
++          destination.require_decoder_drain = true;
++          assert(outputs_airplay_primary_radio_claim_stop(&result.custody, stop_destination) == 0);
++          primary_radio_wire_wait(&destination, false);
++          assert(destination.teardowns == 1 && radio.teardowns == 1 && f.device->session == music_owner && !f.teardowns);
++          outputs_device_remove(destination.device);
++          primary_radio_wire_receiver_reset(&destination);
++          evconnlistener_free(destination.listener);
++          evbuffer_free(destination.plain);
++          close(destination.udp_fd);
++          puts("PASS radio moves from B to idle C after exact STOP while Spotify A keeps its original session");
++          goto cleanup;
++        }
+       const char *stop = "b3919fea-955b-4d4c-a581-c71cb92712b2";
+       radio.require_decoder_drain = true;
+       assert(outputs_airplay_primary_radio_claim_stop(&result.custody, stop) == 0);
