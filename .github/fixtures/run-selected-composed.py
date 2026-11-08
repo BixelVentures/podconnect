@@ -87,6 +87,9 @@ if sys.argv[1] == "primary-radio-http":
 
 
 mode = sys.argv[1]
+manager_primary = mode == "actual-c-primary-manager"
+native_mode = "actual-c-primary-same-target" if manager_primary else mode
+primary_same_target = native_mode == "actual-c-primary-same-target"
 prefix = "pc52-selected-"
 if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME"):
     prefix += "resume-"
@@ -94,7 +97,14 @@ root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)
 env = dict(os.environ, PC_NATIVE_START_READY_FILE=str(ready))
-if mode == "actual-c-primary-same-target":
+if manager_primary:
+    manager_bin = pathlib.Path(env.get("PC_PRIMARY_MANAGER_TEST_BIN", ""))
+    if not manager_bin.is_absolute() or not manager_bin.is_file():
+        raise SystemExit("missing configured Manager test binary")
+    env["PC_NATIVE_PRIMARY_EXPECT_RESUME"] = "1"
+else:
+    env.pop("PC_PRIMARY_MANAGER_TEST_BIN", None)
+if primary_same_target:
     # Real OwnTone HTTP and the START35 harness share the C process and output.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -129,7 +139,7 @@ with (
         c.wait()
         raise SystemExit("C ready missing")
     info = json.loads(ready.read_text())
-    if mode == "actual-c-primary-same-target":
+    if primary_same_target:
         endpoint = f"http://127.0.0.1:{primary_port}"
         if info.get("primary_url") != endpoint:
             raise SystemExit("missing same-process production radio HTTP")
@@ -148,7 +158,7 @@ with (
     env.update(
         PC_NATIVE_START_URL=info["url"],
         PC_NATIVE_START_PIPE=info["pipe"],
-        PC_NATIVE_START_MODE=mode,
+        PC_NATIVE_START_MODE=native_mode,
     )
     n = subprocess.run(
         [
@@ -156,7 +166,7 @@ with (
             "-test.v",
             "-test.timeout=20s",
             "-test.run",
-            "^TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer/" + mode + "$",
+            "^TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer/" + native_mode + "$",
         ],
         env=env,
         stdout=n_log,
@@ -201,13 +211,17 @@ with (
             }
         )
     )
-    if (n.returncode or c_status) and mode == "actual-c-primary-same-target":
-        markers = re.compile(r"FAIL|Resume|park|barrier|RTP|teardown|unknown|error", re.IGNORECASE)
+    if (n.returncode or c_status) and primary_same_target:
+        markers = re.compile(r"FAIL|Manager|Resume|park|barrier|RTP|teardown|unknown|error", re.IGNORECASE)
         for kind in ("native", "c"):
             log = root / (prefix + mode + f"-{kind}.log")
             lines = [line for line in log.read_text(errors="replace").splitlines() if markers.search(line)]
             for line in lines[-60:]:
                 print(re.sub(r"[0-9a-fA-F]{32,}", "[redacted]", line), file=sys.stderr)
+    if manager_primary and not n.returncode and not c_status:
+        for line in (root / (prefix + mode + "-c.log")).read_text().splitlines():
+            if line.startswith(("PASS configured Manager receiver windows", "PASS same-target authenticated RTP")):
+                print(line)
     raise SystemExit(
         n.returncode
         or c_status
