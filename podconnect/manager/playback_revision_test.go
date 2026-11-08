@@ -465,3 +465,48 @@ func TestPlaybackRevisionHTTPPauseSupersedesHeldSameOwnerProbe(t *testing.T) {
 		t.Fatalf("same-owner pause did not survive held read: %+v", reply)
 	}
 }
+
+type playbackRevisionProbeContext struct {
+	context.Context
+	onErr func()
+}
+
+func (ctx *playbackRevisionProbeContext) Err() error {
+	if hook := ctx.onErr; hook != nil {
+		ctx.onErr = nil
+		hook()
+	}
+	return ctx.Context.Err()
+}
+
+func TestPlaybackRevisionRetiresBetweenOwnerProbes(t *testing.T) {
+	f := newRevisionHTTPFixture(t, playbackRevisionWait)
+	ctx := &playbackRevisionProbeContext{Context: context.Background()}
+	f.mu.Lock()
+	f.holdRoute = func(context.Context) {
+		f.mu.Lock()
+		f.holdRoute = nil
+		f.mu.Unlock()
+		f.transportEvent("paused")
+		// The owner check calls Err after it captures the first after-snapshot.
+		// Replace the phase before the retry can acquire its next before-snapshot.
+		ctx.onErr = func() {
+			old := f.source()
+			f.live.retirePhase(old)
+			if _, ok := f.live.beginPhase(glSource{run: old.run, stop: old.stop}); !ok {
+				t.Fatal("could not replace source phase")
+			}
+		}
+	}
+	f.mu.Unlock()
+
+	if _, _, _, ok := currentPlaybackRevision(ctx, f.scope.Target, f.scope.Account); ok || f.reads.Load() != 1 {
+		t.Fatalf("retired request crossed into a new phase: valid=%t route reads=%d", ok, f.reads.Load())
+	}
+	if code, baseline, err := f.request(context.Background(), http.MethodGet, "seed", nil); err != nil || code != 200 || baseline.Changed {
+		t.Fatalf("new request could not establish a clean baseline: %d %+v %v", code, baseline, err)
+	}
+	if f.writes.Load() != 0 {
+		t.Fatal("revision probes dispatched an effect")
+	}
+}

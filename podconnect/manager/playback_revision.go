@@ -151,10 +151,14 @@ func currentPlaybackRevision(ctx context.Context, target, account string) (playb
 	if runtime == nil {
 		return playbackRevisionCursor{}, nil, nil, false
 	}
-	for range 2 {
+	var source glTransportIntent
+	for attempt := range 2 {
 		before, ok := runtime.live.playbackRevisionSnapshot()
-		if !ok {
+		if !ok || attempt > 0 && !samePlaybackRevisionSource(source, before.intent) {
 			return playbackRevisionCursor{}, nil, nil, false
+		}
+		if attempt == 0 {
+			source = before.intent
 		}
 		selected := roomByID(before.status.AliasBinding.RoomID)
 		if selected == nil || selected.HomepodID == "" {
