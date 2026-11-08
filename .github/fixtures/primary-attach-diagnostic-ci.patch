@@ -1,0 +1,196 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -23,6 +23,10 @@
+ #define db_speaker_save fixture_speaker_save
+ #include "../src/conffile.c"
+ #define RADIO_SENDER_FIXTURE_SOURCE
++#define PRIMARY_ATTACH_FIXTURE_TRACE(...) do { \
++  if (getenv("PC_NATIVE_PRIMARY_HTTP_PORT")) \
++    fprintf(stderr, "Primary owner diagnostic: " __VA_ARGS__); \
++} while (0)
+ #include "../src/outputs.c"
+ #include "../src/evrtsp/evrtsp.h"
+ static struct evrtsp_request *fixture_request_new(void (*)(struct evrtsp_request *,void *),void *);
+--- a/src/outputs_radio_handoff.inc.c
++++ b/src/outputs_radio_handoff.inc.c
+@@ -655,8 +655,19 @@
+ primary_spotify_park_writer_closed(const struct radio_handoff_slot *slot)
+ {
+   const struct output_queue_writer *writer = &slot->result.command.writer;
+-  return primary_spotify_park_source_retained(slot)
+-      && start_all_writers_closed(&writer->native_process, writer->pipe_device, writer->pipe_inode) == 1;
++  if (!primary_spotify_park_source_retained(slot))
++    {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("attach_guard=retained_source\n");
++#endif
++      return false;
++    }
++  int proof = start_all_writers_closed(&writer->native_process, writer->pipe_device, writer->pipe_inode);
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++  if (proof != 1)
++    PRIMARY_ATTACH_FIXTURE_TRACE("attach_guard=closed_writer writer_proof=%d\n", proof);
++#endif
++  return proof == 1;
+ }
+ 
+ bool
+@@ -666,12 +677,24 @@
+   struct output_device *d = outputs_device_get(request->device_id);
+   struct radio_handoff_slot *slot = radio_handoff_find(request->device_id);
+   if (!primary_spotify_park_attach_allowed(slot, d, token))
+-    return false;
++    {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("attach_guard=park_scope\n");
++#endif
++      return false;
++    }
+   const struct output_radio_handoff_request *park = &slot->result.command;
+   const struct output_transport_identity *old = &park->identity;
+-  return !strcmp(request->process, old->process) && !strcmp(request->action, park->handoff_id)
++  if (!(!strcmp(request->process, old->process) && !strcmp(request->action, park->handoff_id)
+       && request->incarnation == old->device_incarnation && request->epoch == old->session_epoch
+-      && request->route == old->route_revision && primary_spotify_park_writer_closed(slot);
++      && request->route == old->route_revision))
++    {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("attach_guard=park_identity\n");
++#endif
++      return false;
++    }
++  return primary_spotify_park_writer_closed(slot);
+ }
+ 
+ static bool
+--- a/src/outputs_start_journal.inc.c
++++ b/src/outputs_start_journal.inc.c
+@@ -171,30 +171,73 @@
+   DIR *dir;struct dirent *entry;char directory[80],path[96],line[256],*end;
+   struct stat st;FILE *info;unsigned long flags;int result=1;
+   if(!process || !device || !inode)return -1;
+-  if(!start_process_current(process))return start_old_process_retired() ? 1 : -1;
++  if(!start_process_current(process)){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=initial_process\n");
++#endif
++    return start_old_process_retired() ? 1 : -1;
++  }
+   if(snprintf(directory,sizeof(directory),"/proc/%" PRIu64 "/fd",process->pid)>=(int)sizeof(directory)
+-      || !(dir=opendir(directory)))return -1;
++      || !(dir=opendir(directory))){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=fd_directory\n");
++#endif
++    return -1;
++  }
+   for(;;){
+     unsigned long long fd;bool found=false;
+-    errno=0;entry=readdir(dir);if(!entry){if(errno)result=-1;break;}
++    errno=0;entry=readdir(dir);if(!entry){
++      if(errno){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=readdir\n");
++#endif
++        result=-1;
++      }
++      break;
++    }
+     if(entry->d_name[0]=='.')continue;
+     errno=0;fd=strtoull(entry->d_name,&end,10);
+-    if(errno || end==entry->d_name || *end || fd>INT_MAX){result=-1;break;}
+-    if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fd/%llu",process->pid,fd)>=(int)sizeof(path)
+-        || stat(path,&st)<0){result=-1;break;}
++    if(errno || end==entry->d_name || *end || fd>INT_MAX){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=fd_entry\n");
++#endif
++      result=-1;break;
++    }
++    if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fd/%llu",process->pid,fd)>=(int)sizeof(path)){result=-1;break;}
++    if(stat(path,&st)<0){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=fd_stat vanished=%d\n", errno==ENOENT);
++#endif
++      result=-1;break;
++    }
+     if(!S_ISFIFO(st.st_mode) || (uint64_t)st.st_dev!=device || (uint64_t)st.st_ino!=inode)continue;
+     if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fdinfo/%llu",process->pid,fd)>=(int)sizeof(path)
+-        || !(info=fopen(path,"r"))){result=-1;break;}
++        || !(info=fopen(path,"r"))){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=fdinfo_open vanished=%d\n", errno==ENOENT);
++#endif
++      result=-1;break;
++    }
+     while(fgets(line,sizeof(line),info))if(!strncmp(line,"flags:",6)){
+       errno=0;flags=strtoul(line+6,&end,8);
+       found=!errno && end!=line+6 && (*end=='\n' || *end=='\0');break;
+     }
+     fclose(info);
+-    if(!found || (flags&O_ACCMODE)==3){result=-1;break;}
++    if(!found || (flags&O_ACCMODE)==3){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=fdinfo_flags\n");
++#endif
++      result=-1;break;
++    }
+     if((flags&O_ACCMODE)!=O_RDONLY){result=0;break;}
+   }
+   closedir(dir);
+-  if(!start_process_current(process) && !start_old_process_retired())return -1;
++  if(!start_process_current(process) && !start_old_process_retired()){
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("writer_scan=final_process\n");
++#endif
++    return -1;
++  }
+   return result;
+ }
+ static int start_all_writers_closed(const struct output_native_process *process,uint64_t device,uint64_t inode)
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -5727,6 +5727,9 @@
+     return false;
+   if (!primary_radio_station_before_deadline(operation))
+     {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("station_attach=deadline\n");
++#endif
+       primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
+       primary_radio_decode_cancel(decoder);
+       return false;
+@@ -5759,6 +5762,9 @@
+           && primary_radio_station_same_target(&operation->request, &current);
+   if (!target_current || !primary_radio_station_before_deadline(operation))
+     {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("station_attach=%s\n", target_current ? "deadline" : "target_guard");
++#endif
+       primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
+       primary_radio_decode_cancel(decoder);
+       return false;
+@@ -5771,6 +5777,9 @@
+       replacement ? &operation->request : NULL, replacement ? &operation->predecessor_release : NULL);
+   if (!session)
+     {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++      PRIMARY_ATTACH_FIXTURE_TRACE("station_attach=constructor\n");
++#endif
+       primary_radio_station_finish(operation, OUTPUT_PRIMARY_RADIO_START_REJECTED);
+       primary_radio_decode_cancel(decoder);
+       return false;
+@@ -5830,7 +5839,12 @@
+       bool has_frame = decoder->count > 0;
+       pthread_mutex_unlock(&decoder->mutex);
+       if ((done && !has_frame) || evtimer_add(decoder->tick, &next) < 0)
+-        primary_radio_decoder_drop(decoder);
++        {
++#ifdef PRIMARY_ATTACH_FIXTURE_TRACE
++          PRIMARY_ATTACH_FIXTURE_TRACE("station_attach=%s\n", done && !has_frame ? "decoder_empty" : "timer");
++#endif
++          primary_radio_decoder_drop(decoder);
++        }
+       return;
+     }
+ 

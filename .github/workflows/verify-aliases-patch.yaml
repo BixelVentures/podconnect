@@ -188,7 +188,7 @@ jobs:
             git apply "$patch_dir/$patch.patch"
           done
           # CI-only fixture overlays are applied after the immutable production stack.
-          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c; do
+          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-attach-diagnostic-ci; do
             patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
             git apply --check "$patch"
             git apply "$patch"
