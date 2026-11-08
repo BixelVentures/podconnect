@@ -1,3 +1,8 @@
+## Speakers 0.26.75 — enable primary radio in the standard worker profile
+
+- Enable radio controls when the standard Home Assistant worker profile confirms the same live Native owner on both startup reads. The previous primary startup gate rejected the worker profile even with valid owner proof.
+- Keep radio idle until an explicit choice. Missing, stale or mismatched owner proof still blocks startup. Physical acceptance remains a separate result.
+
 ## Speakers 0.26.74 — preserve radio attachment during descriptor churn
 
 - Prevent an unrelated disappearing Native file descriptor from rejecting a radio attachment after Spotify has parked. Discard the incomplete writer scan and perform one fresh complete scan of the same live owner.

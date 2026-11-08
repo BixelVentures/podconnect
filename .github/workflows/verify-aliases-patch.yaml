@@ -5,12 +5,14 @@ on:
   push:
     branches: [main]
     paths:
+      - "podconnect/manager/**"
       - "podconnect/patches/**"
       - "podconnect/Dockerfile"
       - ".github/fixtures/**"
       - ".github/workflows/verify-aliases-patch.yaml"
   pull_request:
     paths:
+      - "podconnect/manager/**"
       - "podconnect/patches/**"
       - "podconnect/Dockerfile"
       - ".github/fixtures/**"

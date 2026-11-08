@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,13 +108,22 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 		t.Fatal(err)
 	}
 	options, err := json.Marshal(map[string]any{
-		"radio_enabled": true, "radio_owner_mode": "builtin", "radio_physical_accepted": true,
-		"radio_native_url": nativeURL, "radio_native_token": token, "radio_transport_token": token,
+		"radio_enabled": true, "radio_owner_mode": "builtin", "radio_containment": "worker",
+		"radio_physical_accepted": false, "radio_native_url": nativeURL, "radio_transport_token": token,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dataDir, "options.json"), options, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture Native is already configured with this private worker identity.
+	settings, err := json.Marshal(radioWorkerSettings{Schema: radioWorkerSettingsSchema,
+		Token: token, Secret: strings.Repeat("a", 64), Admin: strings.Repeat("b", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(radioWorkerSettingsPath(), settings, 0600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
