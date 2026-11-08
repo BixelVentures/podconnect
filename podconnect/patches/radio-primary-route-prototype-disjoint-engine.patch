@@ -107,7 +107,15 @@
    struct output_device *d=outputs_device_get(id);struct airplay_session *s=d?d->session:NULL;
 --- a/src/outputs_start.inc.c
 +++ b/src/outputs_start.inc.c
-@@ -53,15 +53,52 @@
+@@ -22,6 +22,7 @@
+   uint64_t move_proven_input_generation;
+   uint64_t pcm_reader_generation; /* Runtime OPEN admission only. */
+   bool used,cancelled,writer_pending,volume_pending,volume_admitted;
++  bool standalone_spotify;
+   struct event *deadline_ev;
+ };
+ static struct start_slot start_slots[START_SLOTS],*start_active,*start_scope;
+@@ -53,15 +54,52 @@
  }
  bool outputs_start_busy(void)
  { return outputs_start_gate_closed() || (start_active && start_active->writer_pending); }
@@ -137,7 +145,7 @@
 +start_spotify_scope_current(const struct start_slot *s)
 +{
 +  return s && s == start_active && !s->cancelled && s->result.possible_effect
-+      && !s->result.command.move_existing_session && start_window(s)
++      && s->standalone_spotify && start_window(s)
 +      && !start_journal_fault && !start_startup_quarantine
 +      && s->result.command.native_reservation_id[0] && s->result.command.token[0]
 +      && !strcmp(start_journal.token, s->result.command.token)
@@ -167,7 +175,7 @@
  
  static bool start_move_route_current(struct start_slot *,struct output_transport_identity *,bool);
  static bool start_move_reader_current(struct start_slot *,const struct output_transport_identity *,bool);
-@@ -243,7 +280,7 @@
+@@ -243,7 +281,7 @@
  {
    s->result.deadline_retired=!start_window(s);
    s->result.gate_closed=outputs_start_gate_closed();
@@ -176,7 +184,7 @@
    s->result.pin_remaining_ms=s->used ? transport_remaining(&s->pin_expiry) : 0;
    *out=s->result;
  }
-@@ -563,6 +600,10 @@
+@@ -563,6 +601,10 @@
      return false; /* An unproved radio drain never opens a START reservation. */
    struct output_device *old=NULL;struct output_transport_identity old_identity;
    (void)outputs_transport_busy();
@@ -187,7 +195,7 @@
    if(r->move_existing_session){
      if(!d || !d->advertised || d->type!=OUTPUT_TYPE_AIRPLAY || d->selected || d->session
          || outputs[d->type]->disabled || !outputs_streaming_exclusive_available()
-@@ -690,17 +731,25 @@
+@@ -690,17 +732,25 @@
      }
    out->ready=start_available_reason(r,true) || outputs_radio_absence_current_start_observable(r) || outputs_radio_start_observable(r) || outputs_radio_absence_start_observable(r) || outputs_radio_move_observable(r) || outputs_radio_parked_bridge_start_observable(r);out->busy=!out->ready;return 0;
  }
@@ -215,7 +223,23 @@
  static void start_fail(struct start_slot *s)
  {
    if (!s || s!=start_active || s->cancelled || s->result.phase==OUTPUT_START_OPENED || s->result.phase==OUTPUT_START_COMPLETED) return;
-@@ -807,7 +856,7 @@
+@@ -778,6 +828,15 @@
+     start_observe(s,out);return 0;
+   }
+   if(re_start_capture(&s->result.command,&evolution)<0){start_observe(s,out);return 0;}
++  const struct output_start_request *command = &s->result.command;
++  s->standalone_spotify = !command->move_existing_session
++    && !outputs_radio_absence_current_start_admissible(command)
++    && !outputs_radio_other_start_admissible(command)
++    && !outputs_radio_reacquire_start_admissible(command)
++    && !outputs_radio_absence_start_admissible(command)
++    && !outputs_radio_move_admissible(command)
++    && !outputs_radio_parked_bridge_start_admissible(command)
++    && !outputs_radio_parked_bridge_move_admissible(command);
+   memcpy(s->result.command.native_reservation_id,r->native_reservation_id,33);
+   if(clock_gettime(CLOCK_MONOTONIC,&s->pin_expiry)<0){start_observe(s,out);return 0;}s->pin_expiry.tv_sec+=15;
+   if(start_startup_quarantine && !start_old_process_retired()){start_observe(s,out);return 0;}
+@@ -807,7 +866,7 @@
    s->result.possible_effect=true; /* Before the first irreversible gate/source effect. */
    transport_pause_retained=false;
    start_active=s;s->writer_pending=true;s->result.phase=OUTPUT_START_GATE_DRAINING;start_gate_set(true);transport_generation_advance();
@@ -224,7 +248,7 @@
    s->deadline_ev=evtimer_new(evbase_player,start_expire,s);
    unsigned remaining=transport_remaining(&s->deadline);ttl.tv_sec=remaining/1000;ttl.tv_usec=(remaining%1000)*1000;
    if(!s->deadline_ev || evtimer_add(s->deadline_ev,&ttl)<0)start_fail(s);
-@@ -887,8 +936,8 @@
+@@ -887,8 +946,8 @@
          || old->attention_revision!=s->result.old_attention_revision || !old->selected
          || !outputs[old->type]->device_start_retire){start_fail(s);return -1;}
      outputs[old->type]->device_start_retire(old);
@@ -235,7 +259,7 @@
    start_scope=s;
    for(d=outputs_device_list;d;d=d->next)outputs_device_deselect(d);
    d=outputs_device_get(s->result.command.device_id);
-@@ -952,7 +1001,7 @@
+@@ -952,7 +1011,7 @@
        || r->move_existing_session!=s->result.command.move_existing_session
        || strcmp(r->native_reservation_id,s->result.command.native_reservation_id) || r->writer_source_epoch!=s->result.writer_source_epoch
        || !native_owner_equal(&r->committed_native_owner,&s->result.command.intended_native_owner)
@@ -244,7 +268,7 @@
        || !transport_identity_equal(&actual,&s->result.route_identity) || outputs_start_metadata_generation()==UINT64_MAX)return -1;
    d=outputs_device_get(s->result.command.device_id);
    if(d->base_revision!=s->target_base_revision || d->attention_revision!=s->target_attention_revision)return -1;
-@@ -1005,7 +1054,7 @@
+@@ -1005,7 +1064,7 @@
        || start_journal_fault || strcmp(start_journal.token,r->token) || strcmp(start_journal.c_process,outputs_process)
        || strcmp(r->native_reservation_id,s->result.command.native_reservation_id) || r->writer_source_epoch!=s->result.writer_source_epoch
        || !native_owner_equal(&r->committed_native_owner,&s->result.command.committed_native_owner)
