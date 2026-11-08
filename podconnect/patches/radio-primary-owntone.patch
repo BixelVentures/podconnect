@@ -6635,3 +6635,22 @@ diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
  int outputs_airplay_radio_emission_floor(uint64_t id,const void *session){(void)id;(void)session;return -1;}
  int outputs_airplay_radio_pairing_key_digest(uint64_t id,char out[65]){(void)id;(void)out;return -1;}
  int outputs_airplay_radio_controller_id(char out[17]){(void)out;return -1;}
+@@ -827,6 +839,7 @@
+   output_airplay.device_probe = inert_start;
+   output_airplay.device_stop = inert_stop;
+   restart_calls = completions = 0;
++  assert(outputs_primary_radio_custody_available(a->id));
+   assert(outputs_device_start(a, completed_start, false) == 1);
+   owned = a->attention_restart_callback;
+   assert(outputs_device_start(a, completed_start, false) == -1);
+@@ -1964,6 +1977,10 @@
+     int fd=mkstemp(owner_database_path);
+     assert(fd>=0); close(fd);
+     assert(sqlite3_open(owner_database_path,&hdl) == SQLITE_OK);
++    /* Primary custody reads the same admin table as normal OwnTone startup.
++     * An empty table proves no prior radio custody; a missing table is UNKNOWN. */
++    assert(sqlite3_exec(hdl, "CREATE TABLE IF NOT EXISTS admin ("
++      "key VARCHAR(32) PRIMARY KEY NOT NULL, value VARCHAR(255) NOT NULL)", NULL, NULL, NULL) == SQLITE_OK);
+     assert(db_attention_schema_init() == 0);
+     assert(outputs_attention_startup() == 0);
+ 
