@@ -67,7 +67,7 @@
  	ask := func(q radioPrimaryCommand) radioPrimaryReply {
  		t.Helper()
  		reply, err := p.radioPrimaryActor(ctx, q)
-@@ -191,3 +212,86 @@
+@@ -191,3 +212,90 @@
  	}
  	poll(func(c counts) bool { return c.After > 0 })
  }
@@ -90,7 +90,11 @@
 +	events, _ := (evtimpl.Impl{}).NewEventManager(app.log, nil, nil, nil, "")
 +	nextSessionField(p.sess, "events", events)
 +	nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
-+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++		status := http.StatusNoContent
++		if r.Method == http.MethodPut && r.URL.Path == "/connect-state/v1/devices/fixture-device" {
++			status = http.StatusOK // Connect state publication requires 200.
++		}
++		return &http.Response{StatusCode: status, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
 +	})))
 +	actorContext, cancel := context.WithCancel(ctx)
 +	actorRequests := make(chan ApiRequest)
