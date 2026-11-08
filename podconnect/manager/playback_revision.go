@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -51,6 +52,61 @@ func parsePlaybackRevisionCursor(value string) (playbackRevisionCursor, bool) {
 	return playbackRevisionCursor{scope, seq}, err == nil
 }
 
+type playbackRevisionItem struct {
+	uri          string
+	paused       bool
+	seekPosition float64
+	seekDuration float64
+	seekAt       time.Time
+}
+
+func validPlaybackRevisionURI(uri string) bool {
+	return contentTrackURI.MatchString(uri) || contentEpisodeURI.MatchString(uri)
+}
+
+// Called after the established wire-source and transport admission. These facts
+// are hints to read Spotify again; they never publish metadata or change routing.
+func (l *glLive) observePlaybackRevisionEventLocked(typ string, data map[string]any) {
+	uri, _ := data["uri"].(string)
+	item := &l.playbackItem
+	switch typ {
+	case "metadata":
+		if !validPlaybackRevisionURI(uri) || uri == item.uri {
+			return
+		}
+		*item = playbackRevisionItem{uri: uri, paused: l.st.Paused}
+	case "playing", "paused":
+		if _, validResume := data["resume"].(bool); typ == "playing" && !validResume {
+			return
+		}
+		paused := typ == "paused"
+		if uri == "" || uri != item.uri || !l.st.Active || l.st.Stopped || paused == item.paused {
+			return
+		}
+		item.paused = paused
+		item.seekAt = time.Time{}
+	case "seek":
+		position, hasPosition := numField(data, "position")
+		duration, hasDuration := numField(data, "duration")
+		if uri == "" || uri != item.uri || !l.st.Active || l.st.Stopped ||
+			!hasPosition || !hasDuration || !(0 <= position && position <= duration && duration > 0 && duration < 1<<53) ||
+			position != math.Trunc(position) || duration != math.Trunc(duration) {
+			return
+		}
+		if position == item.seekPosition && duration == item.seekDuration && time.Since(item.seekAt) < 250*time.Millisecond {
+			return // A duplicate frame is quiet; a later explicit seek may use the same target.
+		}
+		item.seekPosition, item.seekDuration, item.seekAt = position, duration, time.Now()
+	case "stopped", "inactive":
+		*item = playbackRevisionItem{}
+		return
+	default:
+		return
+	}
+	l.playbackRevision++
+	l.signalPlaybackRevisionLocked()
+}
+
 func (l *glLive) signalPlaybackRevisionLocked() {
 	if l.playbackRevisionWake != nil {
 		close(l.playbackRevisionWake)
@@ -58,20 +114,29 @@ func (l *glLive) signalPlaybackRevisionLocked() {
 	}
 }
 
-func (l *glLive) playbackRevisionSnapshot(intent glTransportIntent) (uint64, <-chan struct{}, bool) {
+type playbackRevisionSnapshot struct {
+	status glStatus
+	intent glTransportIntent
+	seq    uint64
+	wake   <-chan struct{}
+}
+
+func (l *glLive) playbackRevisionSnapshot() (playbackRevisionSnapshot, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.observeStopLocked()
-	if l.sourceRetired || intent.run == 0 || intent.phase == 0 || intent.run != l.runEpoch ||
-		intent.phase != l.phaseEpoch || intent.aliasRevision != l.aliasRevision ||
-		intent.transportRevision != l.transportRevision || intent.alias != l.st.SelAlias ||
-		!l.st.AliasBinding.valid() {
-		return 0, nil, false
+	if l.sourceRetired || l.runEpoch == 0 || l.phaseEpoch == 0 || !l.st.AliasBinding.valid() {
+		return playbackRevisionSnapshot{}, false
 	}
 	if l.playbackRevisionWake == nil {
 		l.playbackRevisionWake = make(chan struct{})
 	}
-	return l.trackChangeSeq, l.playbackRevisionWake, true
+	intent := glTransportIntent{l.runEpoch, l.phaseEpoch, l.aliasRevision, l.transportRevision, l.st.SelAlias}
+	return playbackRevisionSnapshot{l.st, intent, l.playbackRevision, l.playbackRevisionWake}, true
+}
+
+func samePlaybackRevisionSource(a, b glTransportIntent) bool {
+	return a.run == b.run && a.phase == b.phase && a.aliasRevision == b.aliasRevision && a.alias == b.alias
 }
 
 func currentPlaybackRevision(ctx context.Context, target, account string) (playbackRevisionCursor, <-chan struct{}, <-chan struct{}, bool) {
@@ -86,29 +151,27 @@ func currentPlaybackRevision(ctx context.Context, target, account string) (playb
 	if runtime == nil {
 		return playbackRevisionCursor{}, nil, nil, false
 	}
-	status, intent := runtime.live.transportSnapshot()
-	if !status.AliasBinding.valid() {
-		return playbackRevisionCursor{}, nil, nil, false
-	}
-	selected := roomByID(status.AliasBinding.RoomID)
-	if selected == nil || selected.HomepodID == "" {
-		return playbackRevisionCursor{}, nil, nil, false
-	}
 	for range 2 {
-		seq, wake, ok := runtime.live.playbackRevisionSnapshot(intent)
+		before, ok := runtime.live.playbackRevisionSnapshot()
 		if !ok {
+			return playbackRevisionCursor{}, nil, nil, false
+		}
+		selected := roomByID(before.status.AliasBinding.RoomID)
+		if selected == nil || selected.HomepodID == "" {
 			return playbackRevisionCursor{}, nil, nil, false
 		}
 		claim, native, output, err := readRoomTransport(ctx, roomTransportScope{target, selected.ID, selected.HomepodID, account})
-		if err != nil || claim.RT != runtime || claim.Intent != intent || ctx.Err() != nil {
+		after, ok := runtime.live.playbackRevisionSnapshot()
+		if !ok || ctx.Err() != nil || !samePlaybackRevisionSource(before.intent, after.intent) {
 			return playbackRevisionCursor{}, nil, nil, false
 		}
-		currentSeq, _, ok := runtime.live.playbackRevisionSnapshot(intent)
-		if !ok {
-			return playbackRevisionCursor{}, nil, nil, false
+		if after.seq != before.seq {
+			// A native event can supersede a held probe. Only this same source may
+			// receive one fresh owner/route check; a different owner retires it.
+			continue
 		}
-		if currentSeq != seq {
-			continue // A newer metadata revision needs a new exact owner read.
+		if err != nil || claim.RT != runtime || claim.Intent != before.intent || after.intent != before.intent {
+			return playbackRevisionCursor{}, nil, nil, false
 		}
 		key, err := playbackRevisionKey()
 		if err != nil {
@@ -119,13 +182,13 @@ func currentPlaybackRevision(ctx context.Context, target, account string) (playb
 		// session, so only stable route custody belongs in the cursor scope.
 		route := output.Identity
 		material, _ := json.Marshal([]any{
-			intent.run, intent.phase, intent.aliasRevision, native.Identity,
+			before.intent.run, before.intent.phase, before.intent.aliasRevision, native.Identity,
 			route.Process, route.Device, route.Incarnation, route.Session, route.Selection, route.InputDigest,
 		})
 		digest := hmac.New(sha256.New, key[:])
 		_, _ = digest.Write(material)
 		scope := hex.EncodeToString(digest.Sum(nil)[:16])
-		return playbackRevisionCursor{scope, seq}, wake, runtime.stop, true
+		return playbackRevisionCursor{scope, before.seq}, before.wake, runtime.stop, true
 	}
 	return playbackRevisionCursor{}, nil, nil, false
 }
