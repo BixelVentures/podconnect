@@ -95,10 +95,17 @@ if os.getenv("PC_NATIVE_CANCEL_STAGED_SELECTION"):
     prefix += "cancel-staged-"
 if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME"):
     prefix += "resume-"
+if os.getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"):
+    prefix += "held-teardown-"
 root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)
 env = dict(os.environ, PC_NATIVE_START_READY_FILE=str(ready))
+release = None
+if env.get("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"):
+    release = ready.with_name(ready.stem + "-release")
+    release.unlink(missing_ok=True)
+    env["PC_NATIVE_PRIMARY_HOLD_TEARDOWN"] = str(release)
 if manager_primary:
     manager_bin = pathlib.Path(env.get("PC_PRIMARY_MANAGER_TEST_BIN", ""))
     if not manager_bin.is_absolute() or not manager_bin.is_file():
@@ -195,6 +202,8 @@ with (
             unknown = subprocess.run(["src/airplay_callback_owner", "--native-start-wire"], env=unknown_env, stdout=unknown_log, stderr=subprocess.STDOUT, check=False)
         if unknown.returncode:
             raise SystemExit("C UNKNOWN journal reload failed; see shutdown-unknown.log")
+    if release is not None:
+        release.unlink(missing_ok=True)
     skew_ms = None
     if not n.returncode and not c_status and os.getenv("PC_REQUIRE_FIRST_SYNC_CLOCK"):
         match = re.search(
@@ -214,7 +223,12 @@ with (
         )
     )
     if (n.returncode or c_status) and primary_same_target:
-        markers = re.compile(r"FAIL|Manager|Resume|park|barrier|RTP|teardown|unknown|error", re.IGNORECASE)
+        markers = re.compile(
+            r"FAIL|Manager|Resume|park|barrier|RTP|teardown|unknown|error|"
+            r"Primary owner diagnostic:|Radio handoff closed:|"
+            r"JSON API request '/api/outputs/[0-9]+/radio-handoff/reacquire'",
+            re.IGNORECASE,
+        )
         for kind in ("native", "c"):
             log = root / (prefix + mode + f"-{kind}.log")
             lines = [line for line in log.read_text(errors="replace").splitlines() if markers.search(line)]
@@ -224,6 +238,11 @@ with (
         for line in (root / (prefix + mode + "-native.log")).read_text().splitlines():
             if "PASS exact staged decoder cancellation" in line or "actual selected PCM reached C output" in line:
                 print(line)
+    if os.getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN") and not n.returncode and not c_status:
+        log = (root / (prefix + mode + "-c.log")).read_text()
+        for marker in ("PASS pending park poll preceded exact Spotify TEARDOWN acknowledgment",
+                       "PASS same-target authenticated RTP"):
+            print(next(line for line in log.splitlines() if line.startswith(marker)))
     if manager_primary and not n.returncode and not c_status:
         for line in (root / (prefix + mode + "-c.log")).read_text().splitlines():
             if line.startswith(("PASS configured Manager receiver windows", "PASS same-target authenticated RTP")):

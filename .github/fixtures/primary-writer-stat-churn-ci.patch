@@ -1,0 +1,150 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 19bed7c..fd02f65 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -8,6 +8,7 @@
+  * before discovery. User-Agent is checked on actual loopback RTSP requests. */
+ #include <assert.h>
+ #include <sys/wait.h>
++#include <sys/stat.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -23,7 +24,10 @@
+ #define db_speaker_save fixture_speaker_save
+ #include "../src/conffile.c"
+ #define RADIO_SENDER_FIXTURE_SOURCE
++static int fixture_primary_writer_stat(const char *path, struct stat *result);
++#define stat(path, result) fixture_primary_writer_stat(path, result)
+ #include "../src/outputs.c"
++#undef stat
+ #include "../src/evrtsp/evrtsp.h"
+ static struct evrtsp_request *fixture_request_new(void (*)(struct evrtsp_request *,void *),void *);
+ static void *fixture_calloc(size_t n, size_t size);
+@@ -57,6 +61,94 @@ fixture_primary_decoder_before_done(void)
+ #define PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE() fixture_primary_decoder_before_done()
+ #include "../src/outputs/airplay.c"
+ #undef PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE
++
++static int fixture_primary_churn_fd = -1;
++static unsigned int fixture_primary_churn_count;
++static unsigned int fixture_primary_scan_errors;
++static int fixture_primary_scan_errno;
++static char fixture_primary_churn_path[96];
++
++static void
++fixture_primary_writer_churn_arm(void)
++{
++  int descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
++  assert(descriptor >= 0 && fixture_primary_churn_fd < 0 && !fixture_primary_churn_count);
++  fixture_primary_churn_fd = fcntl(descriptor, F_DUPFD_CLOEXEC, 128);
++  assert(fixture_primary_churn_fd >= 128 && close(descriptor) == 0);
++  int length = snprintf(fixture_primary_churn_path, sizeof(fixture_primary_churn_path),
++      "/proc/%ld/fd/%d", (long)getpid(), fixture_primary_churn_fd);
++  assert(length > 0 && (size_t)length < sizeof(fixture_primary_churn_path));
++}
++
++static void
++fixture_primary_writer_scan_fail_closed(const struct output_queue_writer *writer, const char *fifo)
++{
++  const struct output_native_process *process = &writer->native_process;
++  uint64_t device = writer->pipe_device, inode = writer->pipe_inode;
++  fixture_primary_writer_churn_arm();
++
++  fixture_primary_scan_errno = EACCES;
++  fixture_primary_scan_errors = 2;
++  assert(start_all_writers_closed_scan(process, device, inode, true) == -1
++      && fixture_primary_scan_errors == 1);
++
++  fixture_primary_scan_errno = ENOENT;
++  fixture_primary_scan_errors = 2;
++  assert(start_all_writers_closed_scan(process, device, inode, true) == -1
++      && !fixture_primary_scan_errors);
++
++  /* The retry must census the same FIFO and see a real writable descriptor.
++   * Linux enumerates numeric fd entries in order. Put the writer after the fault. */
++  int opened = open(fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++  assert(opened >= 0);
++  int fifo_writer = fcntl(opened, F_DUPFD_CLOEXEC, fixture_primary_churn_fd + 1);
++  assert(fifo_writer > fixture_primary_churn_fd && close(opened) == 0);
++  fixture_primary_scan_errors = 1;
++  assert(start_all_writers_closed_scan(process, device, inode, true) == 0
++      && !fixture_primary_scan_errors && close(fifo_writer) == 0);
++
++  struct output_native_process stale = *process;
++  stale.proc_start_ticks++;
++  fixture_primary_scan_errors = 1;
++  assert(start_all_writers_closed_scan(&stale, device, inode, true) == -1
++      && fixture_primary_scan_errors == 1);
++
++  fixture_primary_scan_errors = 0;
++  fixture_primary_scan_errno = 0;
++  assert(close(fixture_primary_churn_fd) == 0);
++  fixture_primary_churn_fd = -1;
++  puts("PASS parked writer rescan refuses permission, repeated disappearance, real FIFO writer and stale Native incarnation");
++}
++
++static int
++fixture_primary_writer_stat(const char *path, struct stat *result)
++{
++  if (fixture_primary_churn_fd >= 0 && fixture_primary_scan_errno
++      && !strcmp(path, fixture_primary_churn_path))
++    {
++      if (!fixture_primary_scan_errors)
++        return stat(path, result);
++      fixture_primary_scan_errors--;
++      errno = fixture_primary_scan_errno;
++      return -1;
++    }
++  if (fixture_primary_churn_fd >= 0 && !strcmp(path, fixture_primary_churn_path)
++      && airplay_sessions && airplay_sessions->primary_radio)
++    {
++      struct output_device *device = outputs_device_get(airplay_sessions->device_id);
++      /* Constructor has linked its local session but has not attached or emitted. */
++      assert(device && !device->session);
++      assert(close(fixture_primary_churn_fd) == 0);
++      fixture_primary_churn_fd = -1;
++      int status = stat(path, result);
++      assert(status < 0 && errno == ENOENT);
++      fixture_primary_churn_count++;
++      fputs("FORCED primary constructor writer scan saw a vanished unrelated FD\n", stderr);
++      errno = ENOENT;
++      return status;
++    }
++  return stat(path, result);
++}
+ #undef net_bind
+ #undef evrtsp_request_new
+ #undef calloc
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index 924a4e3..eb4d924 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2022,12 +2022,18 @@ primary_radio_station_replace_wire(struct recovery_wire_fixture *previous, struc
+     assert(outputs_airplay_primary_station_replace_activate(&candidate, released, NULL, out) < 0);
+   (void)primary_radio_wire_packets(destination, &sequence);
+   assert(outputs_airplay_primary_station_replace_activate(&candidate, released, park_token, out) == 0);
++  bool force_churn = park_token && previous == destination && !fixture_primary_churn_count
++      && getenv("PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN");
++  if (force_churn)
++    fixture_primary_writer_churn_arm();
+   for (int i = 0; i < 1500 && out->phase == OUTPUT_PRIMARY_RADIO_START_PENDING; i++)
+     {
+       event_base_loop(previous->base, EVLOOP_NONBLOCK);
+       assert(outputs_airplay_primary_station_result(&candidate, out) == 0);
+       usleep(1000);
+     }
++  if (force_churn)
++    assert(fixture_primary_churn_count == 1 && fixture_primary_churn_fd == -1);
+   assert(out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && destination->pc70_peer_sessions == destination_peers + 1
+       && out->custody.epoch == candidate.epoch + (previous == destination ? 2 : 1)
+       && out->custody.route == candidate.route && !strcmp(out->custody.operation, candidate.action)
+@@ -3319,6 +3325,8 @@ static int start35_wire_case(int mode)
+           && f.device->route_revision == exact.route.route_revision + 1
+           && !outputs_radio_handoff_emission_current(f.device->id));
+       struct radio_handoff_slot *retained = radio_handoff_find(f.device->id);
++      if (getenv("PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN"))
++        fixture_primary_writer_scan_fail_closed(&exact.writer, fifo);
+       assert(outputs_primary_radio_spotify_owner(f.device->id, &exact.owner, &exact.writer, &observed_owner) < 0);
+       struct output_radio_handoff_result v1;
+       assert(retained && !retained->result.suspended_signature[0]

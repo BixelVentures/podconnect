@@ -62,6 +62,9 @@ jobs:
           git apply "$patch_dir/queue-occurrence-continuity-native.patch"
           git apply --check "$patch_dir/radio-primary-native.patch"
           git apply "$patch_dir/radio-primary-native.patch"
+          fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
+          git apply --check "$fixture"
+          git apply "$fixture"
       - name: Test Manager radio and playback revision contracts
         run: cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1
       - name: Test Native queue, transport, output and retained packages
@@ -184,10 +187,12 @@ jobs:
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"
           done
-          # Retired Connect fixture bypasses player_init when wiring the real playback clock.
-          fixture="$GITHUB_WORKSPACE/.github/fixtures/connect-retired-playback-clock-ci.patch"
-          git apply --check "$fixture"
-          git apply "$fixture"
+          # CI-only fixture overlays are applied after the immutable production stack.
+          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-writer-stat-churn-ci; do
+            patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
+            git apply --check "$patch"
+            git apply "$patch"
+          done
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -250,7 +255,7 @@ jobs:
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - uses: actions/upload-artifact@v4
@@ -299,6 +304,7 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_HOLD_TEARDOWN=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_STOP_RESTART=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           status=0
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target || status=1

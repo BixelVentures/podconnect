@@ -3160,7 +3160,7 @@ index dae3206db01217fed6a2efc9a784dba644826e82..0c3162530a52e34453fa416e0e214b1b
    d=outputs_device_get(id);
    if(d && (d->selected || d->session))return 1;
 diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
-index bcf702fb9c3564e749d05b94ecbeab1543816078..9f9f460dfa84bcf5af696b01762b6985adafa5a1 100644
+index bcf702fb9c3564e749d05b94ecbeab1543816078..6a542cdf7b66887d2a1536eba2b4ad25c232493b 100644
 --- a/src/outputs_radio_handoff.inc.c
 +++ b/src/outputs_radio_handoff.inc.c
 @@ -4,17 +4,23 @@
@@ -3583,7 +3583,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..9f9f460dfa84bcf5af696b01762b6985
 +{
 +  const struct output_queue_writer *writer = &slot->result.command.writer;
 +  return primary_spotify_park_source_retained(slot)
-+      && start_all_writers_closed(&writer->native_process, writer->pipe_device, writer->pipe_inode) == 1;
++      && start_all_writers_closed_scan(&writer->native_process, writer->pipe_device, writer->pipe_inode, true) == 1;
 +}
 +
 +bool
@@ -3656,6 +3656,58 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..9f9f460dfa84bcf5af696b01762b6985
 +  return outputs_primary_spotify_park_session_current(id, session, generation, false)
 +      && primary_spotify_park_writer_closed(radio_handoff_find(id));
 +}
+diff --git a/src/outputs_start_journal.inc.c b/src/outputs_start_journal.inc.c
+index 2fcbcb0187b091918cf1911f37a2f606b8154b15..99ad8c35ad42ed84922943fd09dd801f046fc575 100644
+--- a/src/outputs_start_journal.inc.c
++++ b/src/outputs_start_journal.inc.c
+@@ -164,6 +164,7 @@ static bool start_unique_writer_fd(const struct output_native_process *process,u
+   return result && start_process_current(process);
+ }
+ static bool start_old_process_retired(void);
++enum { START_WRITER_SCAN_FD_VANISHED = -2 };
+ /* 1: all writable descriptors for this exact FIFO are absent; 0: one remains;
+  * -1: /proc evidence is ambiguous. A vanished single FD is insufficient. */
+ static int start_all_writers_closed_raw(const struct output_native_process *process,uint64_t device,uint64_t inode)
+@@ -180,8 +181,11 @@ static int start_all_writers_closed_raw(const struct output_native_process *proc
+     if(entry->d_name[0]=='.')continue;
+     errno=0;fd=strtoull(entry->d_name,&end,10);
+     if(errno || end==entry->d_name || *end || fd>INT_MAX){result=-1;break;}
+-    if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fd/%llu",process->pid,fd)>=(int)sizeof(path)
+-        || stat(path,&st)<0){result=-1;break;}
++    if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fd/%llu",process->pid,fd)>=(int)sizeof(path)){result=-1;break;}
++    if(stat(path,&st)<0){
++      result=errno==ENOENT ? START_WRITER_SCAN_FD_VANISHED : -1;
++      break;
++    }
+     if(!S_ISFIFO(st.st_mode) || (uint64_t)st.st_dev!=device || (uint64_t)st.st_ino!=inode)continue;
+     if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fdinfo/%llu",process->pid,fd)>=(int)sizeof(path)
+         || !(info=fopen(path,"r"))){result=-1;break;}
+@@ -197,13 +201,23 @@ static int start_all_writers_closed_raw(const struct output_native_process *proc
+   if(!start_process_current(process) && !start_old_process_retired())return -1;
+   return result;
+ }
+-static int start_all_writers_closed(const struct output_native_process *process,uint64_t device,uint64_t inode)
++static int start_all_writers_closed_scan(const struct output_native_process *process,uint64_t device,uint64_t inode,
++    bool rescan_vanished_fd)
+ {
+   struct proc_native_scope scope={0};int result;
+   if(!process || !process->pid || process->pid>INT_MAX || !proc_native_scope_enter(&scope))return -1;
+   result=start_all_writers_closed_raw(process,device,inode);
++  bool rescan=rescan_vanished_fd && result==START_WRITER_SCAN_FD_VANISHED;
++  /* Discard the incomplete enumeration. Only a fresh full scan of the same
++   * live Native process can renew a parked-source attachment proof. */
++  if(rescan)
++    result=start_process_current(process) ? start_all_writers_closed_raw(process,device,inode) : -1;
+   proc_native_scope_leave(&scope);
+-  return result>=0 && (start_process_current(process) || start_old_process_retired()) ? result : -1;
++  return result>=0 && (start_process_current(process) || (!rescan && start_old_process_retired())) ? result : -1;
++}
++static int start_all_writers_closed(const struct output_native_process *process,uint64_t device,uint64_t inode)
++{
++  return start_all_writers_closed_scan(process,device,inode,false);
+ }
+ static bool start_old_process_retired(void)
+ {
 diff --git a/src/outputs_radio_reacquire.inc.c b/src/outputs_radio_reacquire.inc.c
 index 6565928f8c3b7882f0fe04fdd2393c151114520b..fee05b24eca96a9dd726fc9392d6330310342876 100644
 --- a/src/outputs_radio_reacquire.inc.c

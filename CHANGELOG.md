@@ -1,3 +1,9 @@
+## Speakers 0.26.74 — preserve radio attachment during descriptor churn
+
+- Prevent an unrelated disappearing Native file descriptor from rejecting a radio attachment after Spotify has parked. Discard the incomplete writer scan and perform one fresh complete scan of the same live owner.
+- Keep real writer conflicts, permission errors, repeated disappearance and changed process identity closed. No playback command is repeated.
+- Verified with the actual C motor and authenticated simulated receivers; installation and physical audio acceptance remain separate.
+
 ## Speakers 0.26.73 — radio through the existing speaker owner
 
 - Play radio through the existing primary speaker route, preserving the Spotify session and queue. Change stations, stop and start radio again, or explicitly return to Spotify with Resume or a new selection.

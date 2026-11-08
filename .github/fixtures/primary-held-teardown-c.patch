@@ -1,0 +1,55 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1314,6 +1314,7 @@
+   struct evhttp *http;
+   atomic_bool done,completed,retired;
+   atomic_bool reset_audio;
++  bool primary_teardown_released;
+   atomic_int audio_packets;
+   atomic_int primary_selected_packets;
+   struct start_slot *primary_initial_start;
+@@ -1678,6 +1679,23 @@
+ {
+   struct native_start_wire *wire=arg;struct recovery_wire_fixture *f=wire->fixture;
+   struct timeval soon={0,1000};(void)fd;(void)events;
++  const char *release = getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN");
++  if (release && f->primary_held_cseq > 0 && access(release, F_OK) == 0)
++    {
++      const struct radio_handoff_slot *park = radio_handoff_find(f->device->id);
++      if (wire->primary_teardown_released || !f->primary_hold_teardown || f->teardowns != 1
++          || f->pc70_peer_sessions != 1 || !park || park->result.phase != OUTPUT_RADIO_STOPPING
++          || park->stop_accepted || park->drained
++          || recovery_wire_reply(f, 200, f->primary_held_cseq, NULL, 0) < 0)
++        {
++          recovery_wire_fail(f, "could not release the exact pending Spotify TEARDOWN");
++          return;
++        }
++      wire->primary_teardown_released = true;
++      f->primary_hold_teardown = false;
++      f->primary_held_cseq = 0;
++      fprintf(stderr, "PASS pending park poll preceded exact Spotify TEARDOWN acknowledgment\n");
++    }
+   if (atomic_exchange(&wire->reset_audio, false))
+     {
+       unsigned char old[4096];
+@@ -1710,6 +1728,11 @@
+   if (getenv("PC_NATIVE_PRIMARY_HTTP_PORT"))
+     {
+       bool returned = getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME") != NULL;
++      if (release && !wire->primary_teardown_released)
++        {
++          recovery_wire_fail(f, "controlled pending park did not release its exact TEARDOWN");
++          return;
++        }
+       bool manager = getenv("PC_PRIMARY_MANAGER_TEST_BIN") != NULL;
+       bool restart = getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != NULL;
+       int before = atomic_load(&wire->primary_packets[0]);
+@@ -1879,6 +1902,8 @@
+   const char *primary_port = getenv("PC_NATIVE_PRIMARY_HTTP_PORT");
+   if (primary_port)
+     assert(httpd_init("/tmp") == 0); /* Same C owner and production JSON authorization. */
++  if (primary_port && getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"))
++    f->primary_hold_teardown = true;
+   FILE *ready=fopen(ready_path,"w");assert(ready);
+   fprintf(ready,"{\"url\":\"http://127.0.0.1:%u\",\"pipe\":\"%s\",\"homepod_id\":\"1\"",ntohs(address.sin_port),fifo);
+   if (primary_port)
