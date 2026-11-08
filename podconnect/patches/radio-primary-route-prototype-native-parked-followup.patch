@@ -77,17 +77,27 @@
  			epochDelta = 2
  		} else if sameTarget {
  			epochDelta, routeDelta = 2, 1
-@@ -262,6 +267,9 @@
+@@ -254,6 +259,9 @@
+ 			if hold == nil || hold.PrimaryPending == nil {
+ 				return nil, ErrAliasConflict // A legacy hold still owns its source or receiver.
+ 			}
++			if hold != h && hold.WriterParked && primaryRadioReleased(hold) {
++				return nil, ErrAliasConflict // The parked writer pins the advertised room.
++			}
+ 		}
+ 		if r.Session != nil {
+ 			return p.reservePrimaryRadioReplacement(r, h)
+@@ -261,6 +269,9 @@
+ 		generation, err := strconv.ParseUint(r.Generation, 10, 64)
  		if err != nil || generation <= app.radio.Generation || r.Owner != "" || r.ForPhase != "" || r.Session != nil || r.Station != "" {
  			return nil, ErrAliasConflict
- 		}
++		}
 +		if release, ok := primaryParkedStopReceipt(h); ok {
 +			return p.reservePrimaryParkedRestart(r, h, release, generation)
-+		}
+ 		}
  		if h == nil || primaryRadioRetired(h) && !h.WriterParked && !h.PauseUncertain {
  			h = &radioHold{owner: p, Phase: "primary_reserved", Actions: map[string]bool{},
- 				Request: radioRequest{Schema: "podconnect.native_radio_primary_hold.v1", ProcessID: r.Process,
-@@ -283,6 +291,9 @@
+@@ -283,6 +294,9 @@
  		return nil, ErrAliasConflict
  	}
  	operation := h.PrimaryPending
