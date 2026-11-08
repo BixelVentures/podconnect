@@ -309,6 +309,12 @@ func prepareConfiguredRadioProducer(ctx context.Context, o radioProducerBootstra
 		return nil, err
 	}
 	for _, record := range records {
+		if record.Primary != nil {
+			if !producerPrimaryHistoryTerminal(records, record) {
+				return nil, errRadioUnknown
+			}
+			continue
+		}
 		if !record.Terminal || record.Observation.SourceKind == "radio" && record.Observation.State == "playing" && !producerHistoryReleased(records, record) {
 			return nil, errRadioUnknown
 		}

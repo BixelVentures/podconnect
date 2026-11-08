@@ -89,6 +89,7 @@ type radioPrimaryRecord struct {
 	Session          *radioPrimarySession `json:"target_session,omitempty"`
 	LastCommand      *radioPrimaryCommand `json:"last_command,omitempty"`
 	LastReceipt      *radioPrimaryReceipt `json:"last_receipt,omitempty"`
+	StopReceipt      *radioPrimaryReceipt `json:"positive_stop_receipt,omitempty"`
 }
 
 // Bootstrap continues to construct the v1 producer. The primary port is only
@@ -135,6 +136,9 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for token, record := range p.records {
+		if record.Primary == nil && producerLegacyHistoryTerminal(p.records, record) {
+			continue
+		}
 		if record.Primary == nil || !record.Terminal || record.Observation.SourceKind == "radio" &&
 			record.Observation.State == "playing" && !record.SourceDrained && !p.live[token] {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
@@ -534,7 +538,9 @@ func (p *radioProducer) primaryRecordEffect(r radioProducerRecord, stage string,
 		if old.Primary == nil || old.Primary.Session == nil || receipt.Session == nil || *old.Primary.Session != *receipt.Session {
 			return errRadioUnknown
 		}
-		old.SourceDrained = true
+		retired := *old.Primary
+		retired.StopReceipt = &receipt
+		old.Primary, old.SourceDrained = &retired, true
 		if err := p.storeLocked(old); err != nil {
 			return err
 		}

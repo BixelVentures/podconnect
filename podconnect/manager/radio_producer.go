@@ -148,7 +148,7 @@ func newRadioProducer(native radioProducerNativePort, sender radioProducerSender
 		return nil, e
 	}
 	for _, record := range records {
-		if record.Primary != nil {
+		if record.Primary != nil && !producerPrimaryHistoryTerminal(records, record) {
 			return nil, errRadioUnavailable
 		}
 	}
@@ -181,6 +181,9 @@ func (p *radioProducer) Ready(ctx context.Context) ([]radioTarget, []string, err
 	// Startup never adopts an old hold or starts/replays a radio effect. Unsettled
 	// durable records are an explicit enable blocker until passive recovery.
 	for key, r := range p.records {
+		if r.Primary != nil && producerPrimaryHistoryTerminal(p.records, r) {
+			continue
+		}
 		if !r.Terminal || r.Observation.SourceKind == "radio" && r.Observation.State == "playing" && !p.live[key] && !retired[key] {
 			missing = append(missing, "durable_unknown_effect_custody")
 			break
@@ -209,6 +212,9 @@ func (p *radioProducer) completedNativeCustody(ctx context.Context, evidence rad
 	retired := map[string]bool{}
 	latest := map[string]radioProducerRecord{}
 	for _, record := range records {
+		if record.Primary != nil {
+			continue
+		}
 		key := record.Native.Process + "/" + record.Native.Handoff + "/" + record.Native.Token
 		if previous, ok := latest[key]; !ok || record.Fence.Generation > previous.Fence.Generation {
 			latest[key] = record
