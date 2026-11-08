@@ -1,0 +1,64 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1316,6 +1316,7 @@
+   atomic_bool reset_audio;
+   atomic_int audio_packets;
+   atomic_int primary_selected_packets;
++  struct start_slot *primary_initial_start;
+   atomic_int primary_packets[3]; /* Spotify before, radio, Spotify after. */
+   atomic_int primary_radio_packets[3];
+   uint64_t primary_radio_epoch;
+@@ -1436,8 +1437,24 @@
+             recovery_wire_fail(f, "parked Spotify emitted audio before the new content START");
+             return;
+           }
+-        if (selection && primary_source == 0 && atomic_load(&wire->primary_packets[1]) > 0)
+-          atomic_fetch_add(&wire->primary_selected_packets, 1);
++        if (selection && primary_source == 0)
++          {
++            if (!wire->primary_initial_start)
++              wire->primary_initial_start = start_active;
++            if (atomic_load(&wire->primary_packets[1]) > 0)
++              {
++                if (!start_active || start_active == wire->primary_initial_start
++                    || start_active->session != session || !session->start_route_managed
++                    || session->radio_custody_managed || f->device->auth_key)
++                  {
++                    recovery_wire_fail(f, "selected Spotify RTP has no exact transient successor START");
++                    return;
++                  }
++                atomic_fetch_add(&wire->primary_selected_packets, 1);
++              }
++            else
++              atomic_fetch_add(&wire->primary_packets[0], 1);
++          }
+         else
+           atomic_fetch_add(&wire->primary_packets[primary_source], 1);
+       }
+@@ -1702,11 +1719,25 @@
+         {
+           int selected = atomic_load(&wire->primary_selected_packets);
+           if (before < 1 || radio < 1 || after != 0 || selected < 1 || !start_active
+-              || start_active->result.phase != OUTPUT_START_COMPLETED || f->pc70_peer_sessions != 4 || f->teardowns != 3)
++              || start_active->result.phase != OUTPUT_START_COMPLETED || f->pc70_peer_sessions != 4 || f->teardowns != 2)
+             {
+               recovery_wire_fail(f, "new explicit Spotify START did not replace radio without resuming old PCM");
+               return;
+             }
++          struct radio_handoff_slot *slot = radio_handoff_find(f->device->id);
++          const char *token = start_active->result.command.token;
++          char different[sizeof(start_active->result.command.token)];
++          memcpy(different, token, sizeof(different));
++          different[0] = different[0] == '0' ? '1' : '0';
++          assert(slot && outputs_primary_spotify_start_owner(f->device->id, token) == 1
++              && outputs_primary_spotify_start_owner(f->device->id, different) == -1);
++          char peer[sizeof(slot->result.command.sender_peer)];
++          memcpy(peer, slot->result.command.sender_peer, sizeof(peer));
++          memset(slot->result.command.sender_peer, 0, sizeof(slot->result.command.sender_peer));
++          assert(outputs_primary_spotify_start_owner(f->device->id, token) == 0);
++          memcpy(slot->result.command.sender_peer, peer, sizeof(peer));
++          /* START's canonical local retirement closes the muted return socket.
++           * Only the initial park and positive radio STOP use wire TEARDOWN. */
+           fprintf(stderr, "PASS same-target explicit new Spotify START RTP old=%d radio=%d selected=%d\n", before, radio, selected);
+           event_base_loopbreak(f->base);
+           return;

@@ -1,0 +1,61 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -300,6 +300,7 @@
+ bool outputs_radio_handoff_blocked(uint64_t);
+ bool outputs_radio_handoff_any(void);
+ bool outputs_radio_custody_constructor_current(uint64_t);
++int outputs_primary_spotify_start_owner(uint64_t, const char *);
+ bool outputs_radio_handoff_source_reserved(void);
+ bool outputs_radio_handoff_emission_current(uint64_t);
+ uint64_t outputs_radio_handoff_generation(uint64_t);
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -558,6 +558,19 @@
+ /* Capture credential policy when a real constructor is admitted. The session
+  * keeps this provenance after scopes/generations advance; a later error must
+  * not erase the primary pairing used by a radio-caused reconnect. */
++/* A primary return delegates to the existing Spotify START owner. Its
++ * exact token must never borrow the legacy radio sender's durable pairing. */
++int
++outputs_primary_spotify_start_owner(uint64_t id, const char *token)
++{
++  struct radio_handoff_slot *source = token ? radio_handoff_find(id) : NULL;
++  if (!source || source->result.phase != OUTPUT_RADIO_REACQUIRED
++      || source->result.resume.phase != OUTPUT_RADIO_REACQUIRE_DELEGATED
++      || !radio_primary_park_command(&source->result.command))
++    return 0;
++  return !strcmp(token, source->result.resume.delegated_token) ? 1 : -1;
++}
++
+ bool outputs_radio_custody_constructor_current(uint64_t id)
+ {
+   struct radio_handoff_slot *source=radio_handoff_find(id);
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -1937,12 +1937,15 @@
+   int ret;
+ 
+   extra = device->extra_device_info;
+-  if (outputs_primary_spotify_return_constructor_current(device->id) && !extra->supports_encryption)
++  bool primary_return = outputs_primary_spotify_return_constructor_current(device->id);
++  const char *start_token = primary_radio || primary_return ? NULL : outputs_start_session_token(device->id);
++  int primary_start = outputs_primary_spotify_start_owner(device->id, start_token);
++  if (primary_start < 0 || (primary_return && !extra->supports_encryption))
+     return NULL;
+ 
+   CHECK_NULL(L_AIRPLAY, session = calloc(1, sizeof(struct airplay_session)));
+-  session->primary_spotify_return = outputs_primary_spotify_return_constructor_current(device->id);
+-  session->radio_custody_managed = !session->primary_spotify_return
++  session->primary_spotify_return = primary_return;
++  session->radio_custody_managed = !primary_return && !primary_start
+       && outputs_radio_custody_constructor_current(device->id);
+   session->primary_radio = primary_radio;
+   if (park_token)
+@@ -1994,7 +1997,6 @@
+   session->next = airplay_sessions;
+   airplay_sessions = session;
+ 
+-  const char *start_token = primary_radio || session->primary_spotify_return ? NULL : outputs_start_session_token(device->id);
+   if(start_token)memcpy(session->start_token,start_token,33);
+   // rs is now the official device session
+   if ((primary_radio ? outputs_device_session_add_primary_radio(device->id, session, park_token, replacement, released)

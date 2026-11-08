@@ -75,6 +75,7 @@ jobs:
             git apply "$patch_dir/radio-primary-route-prototype-manager-composed-native-test.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-stop-restart-test.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-new-selection-test.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-native-test.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
@@ -219,6 +220,8 @@ jobs:
           git apply "$patch_dir/radio-primary-route-prototype-manager-composed-c-test.patch"
           git apply "$patch_dir/radio-primary-route-prototype-c-stop-restart-test.patch"
           git apply "$patch_dir/radio-primary-route-prototype-c-new-selection-test.patch"
+          git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-auth.patch"
+          git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-auth-test.patch"
           autoreconf -fi
           ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
           make -j"$(nproc)"
@@ -345,8 +348,10 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_STOP_RESTART=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-manager
+          status=0
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target || status=1
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-manager || status=1
+          exit "$status"
       - name: Verify held fresh START and explicit late paused Resume against actual C
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone

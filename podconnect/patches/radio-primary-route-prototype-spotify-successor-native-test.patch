@@ -1,0 +1,28 @@
+--- a/daemon/radio_primary_same_composed_test.go
++++ b/daemon/radio_primary_same_composed_test.go
+@@ -11,6 +11,7 @@
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -439,7 +440,16 @@
+ 		server.handleContentCommit)
+ 	var receipt contentReceipt
+ 	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || !receipt.Accepted || receipt.OperationID != control.Offer.OfferID {
+-		t.Fatalf("new Spotify content did not receive exact START acceptance: %+v %v", receipt, err)
++		if log, ok := app.log.(*contentFailureLog); ok {
++			log.mu.Lock()
++			for _, line := range log.lines {
++				if strings.HasPrefix(line, "content_start_failed stage=") {
++					t.Log(line)
++				}
++			}
++			log.mu.Unlock()
++		}
++		t.Fatalf("new Spotify content did not receive exact START acceptance: state=%s accepted=%t err=%v", receipt.State, receipt.Accepted, err)
+ 	}
+ 	// Join the production actor's commit before reading worker and session state.
+ 	_, _ = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
