@@ -20,7 +20,6 @@ on:
 # ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
-    if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -50,23 +49,40 @@ jobs:
           done
           # These are the same final Native suffix slots used by Docker.
           # The unified tests already include the selected-content clock fixture.
-          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch dealer-roomchange-native.patch dealer-roomchange-native-tests.patch private-diagnostics-native.patch private-diagnostics-native-tests.patch blocked-decoder-controls-native.patch blocked-decoder-controls-native-tests.patch queue-metadata-background-native.patch queue-occurrence-continuity-native.patch; do
+          for patch in room-release-native.patch room-release-native-tests.patch move-quiesce-native.patch move-quiesce-native-tests.patch room-owner-parity-native.patch room-owner-parity-native-tests.patch dealer-roomchange-native.patch dealer-roomchange-native-tests.patch private-diagnostics-native.patch private-diagnostics-native-tests.patch blocked-decoder-controls-native.patch blocked-decoder-controls-native-tests.patch queue-metadata-background-native.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
+          if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
+            git apply "$patch_dir/dealer-fieldcodes-native.patch"
+            sed "s@ /patches/@ $patch_dir/@" "$patch_dir/radio-handoff-native.sha256" | sha256sum -c -
+            git apply "$patch_dir/radio-handoff-native.patch"
+          fi
+          git apply "$patch_dir/queue-occurrence-continuity-native.patch"
+          if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
+            git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
+          fi
+      - name: Test exact primary radio Native preempt action and receipt
+        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
+        run: cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadioDrainBindsActionAndNeverReplays$'
       - name: Test Native queue, transport, output and retained packages
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
       - name: Reuse tested Native package cache for composed fixture binary
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race -c -o /tmp/native-tests ./daemon
       - uses: actions/upload-artifact@v4
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         with:
           name: selected-native-tests
           path: /tmp/native-tests
           if-no-files-found: error
           retention-days: 3
       - name: Build patched fork
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
       - name: Smoke-check binary
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
@@ -196,6 +212,10 @@ jobs:
           make -C src -j"$(nproc)" airplay_callback_owner
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
           src/airplay_callback_owner --radio-primary-decode
+          git apply "$patch_dir/radio-primary-route-prototype-private-c.patch"
+          make -j"$(nproc)"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
@@ -256,6 +276,7 @@ jobs:
           retention-days: 3
 
   selected-start-clock:
+    if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
     needs: [build-fork, build-owntone]
     runs-on: ubuntu-24.04
     timeout-minutes: 10

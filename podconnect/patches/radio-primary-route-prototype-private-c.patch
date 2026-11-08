@@ -1,0 +1,116 @@
+--- a/src/player.h
++++ b/src/player.h
+@@ -279,6 +279,8 @@
+ int player_radio_handoff(int,const struct output_radio_handoff_request *,struct output_radio_handoff_result *);
+ 
+ int player_radio_reacquire(int,const struct output_radio_reacquire_request *,struct output_radio_reacquire_result *);
++int player_radio_primary_stop(bool, const struct output_primary_radio_custody *, const char *,
++    struct output_primary_radio_custody *);
+ 
+ int player_radio_other_target(int,const struct output_radio_other_target_request *,struct output_radio_other_target_result *);
+ 
+--- a/src/player.c
++++ b/src/player.c
+@@ -3372,6 +3372,40 @@
+ {
+   struct player_radio_reacquire_command c={action,r,out};return commands_exec_sync(cmdbase,radio_reacquire_command,NULL,&c);
+ }
++struct player_radio_primary_stop_command
++{
++  bool claim;
++  const struct output_primary_radio_custody *expected;
++  const char *action;
++  struct output_primary_radio_custody *out;
++};
++
++static enum command_state
++radio_primary_stop_command(void *arg, int *retval)
++{
++  struct player_radio_primary_stop_command *c = arg;
++  const struct output_primary_radio_custody *expected = c->expected;
++  struct output_primary_radio_custody *actual = c->out;
++
++  *retval = -1;
++  if (c->claim && outputs_airplay_primary_radio_claim_stop(expected, c->action) < 0)
++    return COMMAND_END;
++  if (outputs_primary_radio_custody_read(expected->device_id, actual) == 1
++      && !strcmp(expected->process, actual->process) && !strcmp(expected->operation, actual->operation)
++      && expected->incarnation == actual->incarnation && expected->epoch == actual->epoch && expected->route == actual->route
++      && !strcmp(c->action, actual->stop_action))
++    *retval = 0;
++  return COMMAND_END;
++}
++
++int
++player_radio_primary_stop(bool claim, const struct output_primary_radio_custody *expected, const char *action,
++    struct output_primary_radio_custody *out)
++{
++  struct player_radio_primary_stop_command command = { claim, expected, action, out };
++  return commands_exec_sync(cmdbase, radio_primary_stop_command, NULL, &command);
++}
++
+ struct player_radio_other_command {int action;const struct output_radio_other_target_request *r;struct output_radio_other_target_result *out;};
+ static enum command_state radio_other_command(void *arg,int *retval)
+ {
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -29,13 +29,57 @@
+     default:return "unknown";
+   }
+ }
++static int
++jsonapi_reply_primary_radio_stop(struct httpd_request *hreq, json_object *body)
++{
++  struct output_primary_radio_custody expected = { 0 }, actual;
++  char phase[16], action[37];
++  uint64_t path_device;
++  json_object *reply;
++
++  if (outputs_radio_sender_role() || json_object_object_length(body) != 9
++      || !transport_json_string(body, "phase", phase, sizeof(phase))
++      || (strcmp(phase, "claim_stop") && strcmp(phase, "result"))
++      || !transport_json_string(body, "process", expected.process, sizeof(expected.process))
++      || !transport_json_string(body, "operation", expected.operation, sizeof(expected.operation))
++      || !transport_json_string(body, "action", action, sizeof(action))
++      || transport_native_counter(body, "device_id", &expected.device_id) < 0
++      || transport_native_counter(body, "incarnation", &expected.incarnation) < 0
++      || transport_native_counter(body, "session_epoch", &expected.epoch) < 0
++      || transport_native_counter(body, "route_revision", &expected.route) < 0
++      || safe_atou64(hreq->path_parts[2], &path_device) < 0 || path_device != expected.device_id)
++    return HTTP_BADREQUEST;
++  if (player_radio_primary_stop(!strcmp(phase, "claim_stop"), &expected, action, &actual) < 0)
++    return 409;
++  reply = json_object_new_object();
++  if (!reply)
++    return HTTP_SERVUNAVAIL;
++  json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_radio_primary_stop.v1"));
++  json_object_object_add(reply, "phase", json_object_new_string(actual.teardown_cseq > 0 ? "released" : "pending"));
++  json_object_object_add(reply, "process", json_object_new_string(actual.process));
++  json_object_object_add(reply, "operation", json_object_new_string(actual.operation));
++  json_object_object_add(reply, "action", json_object_new_string(actual.stop_action));
++  attention_json_u64(reply, "device_id", actual.device_id);
++  attention_json_u64(reply, "incarnation", actual.incarnation);
++  attention_json_u64(reply, "session_epoch", actual.epoch);
++  attention_json_u64(reply, "route_revision", actual.route);
++  json_object_object_add(reply, "teardown_cseq", json_object_new_int(actual.teardown_cseq));
++  return transport_json_reply(hreq, reply);
++}
++
+ static int jsonapi_reply_radio_reacquire(struct httpd_request *hreq)
+ {
+   struct output_radio_reacquire_request r={0};struct output_radio_reacquire_result result={0};
+   json_object *body=transport_parse_body_limit(hreq->in_body,24576),*hold,*reply;char schema[64],phase[16];uint64_t id;int ret=HTTP_BADREQUEST,action=-1;size_t i;
+   const char *names[]={"challenge","commit","barrier","open","state","bind_start"};
+-  if(!body || !transport_json_string(body,"schema",schema,sizeof(schema)) || strcmp(schema,"podconnect.output_radio_reacquire.v1")
+-      || !transport_json_string(body,"phase",phase,sizeof(phase)))goto done;
++  if (!body || !transport_json_string(body, "schema", schema, sizeof(schema))) goto done;
++  if (!strcmp(schema, "podconnect.output_radio_primary_stop.v1"))
++    {
++      ret = jsonapi_reply_primary_radio_stop(hreq, body);
++      goto done;
++    }
++  if (strcmp(schema, "podconnect.output_radio_reacquire.v1")
++      || !transport_json_string(body, "phase", phase, sizeof(phase))) goto done;
+   for(i=0;i<ARRAY_SIZE(names);i++)if(!strcmp(phase,names[i]))action=i;
+   if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
+       || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
