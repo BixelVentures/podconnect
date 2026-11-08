@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,70 @@ func TestConfiguredRadioBootstrapNegotiatesWithoutEffects(t *testing.T) {
 			})
 			if (err == nil) != tc.wantReady || (selected != nil) != tc.wantReady || primary != tc.wantPrimary || v1 != tc.wantV1 {
 				t.Fatalf("unexpected selection ready=%t primary=%t v1=%d err=%v", selected != nil, primary, v1, err)
+			}
+		})
+	}
+}
+
+func TestPrimaryRadioProducerRequiresFreshBootstrapOwnerOnSecondRead(t *testing.T) {
+	for _, name := range []string{"unknown source", "no selectable receiver", "changed process", "missing proof list", "same owner"} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().Unix()
+			pinned := strings.Repeat("a", 64)
+			good := radioPrimaryState{
+				Schema: primaryRadioSchema, Protocol: primaryRadioProtocol, Process: pinned, Revision: "5",
+				Missing: []string{}, Targets: []radioProducerTarget{{radioTarget: radioTarget{
+					ID: "room-A", Availability: "available", Selectable: true,
+				}, HomePodID: "123"}},
+				Observation: &radioNativeObservation{State: "idle", SourceKind: "none", ObservedAt: now, ValidUntil: now + 5},
+			}
+			next := good
+			switch name {
+			case "unknown source":
+				next.Observation = &radioNativeObservation{State: "unknown", SourceKind: "unknown", ObservedAt: now, ValidUntil: now + 5}
+			case "no selectable receiver":
+				next.Targets = []radioProducerTarget{{radioTarget: radioTarget{ID: "room-A", Availability: "unavailable"}, HomePodID: "123"}}
+			case "changed process":
+				next.Process = strings.Repeat("b", 64)
+			case "missing proof list":
+				next.Missing = nil
+			}
+			reads := 0
+			previous := http.DefaultTransport
+			defer func() { http.DefaultTransport = previous }()
+			http.DefaultTransport = startTransport(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || req.URL.Path != "/radio/primary" {
+					t.Fatal("bootstrap must only read the primary owner")
+				}
+				state := good
+				if reads > 0 {
+					state = next
+				}
+				reads++
+				raw, err := json.Marshal(state)
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(raw)))}, err
+			})
+			ctx := context.Background()
+			n, primary, err := awaitConfiguredRadioBootstrap(ctx, radioProducerBootstrapOptions{
+				NativeURL: "http://127.0.0.1:4001", NativeToken: "control", Physical: true,
+			}, func(context.Context, time.Duration) error { return errors.New("unexpected bootstrap retry") })
+			if err != nil || !primary {
+				t.Fatalf("initial read did not select the exact primary owner: %v", err)
+			}
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := newPrimaryRadioProducer(n, filepath.Join(dir, "private-journal"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.evidence.NativeProcess = n.primaryBootstrapProcess
+			c := newRadioCoordinator(p)
+			err = c.enable(ctx)
+			wantEnabled := name == "same owner"
+			if reads != 2 || (err == nil) != wantEnabled || c.snapshot().Enabled != wantEnabled {
+				t.Fatalf("second bootstrap read: enabled=%t reads=%d err=%v", c.snapshot().Enabled, reads, err)
 			}
 		})
 	}

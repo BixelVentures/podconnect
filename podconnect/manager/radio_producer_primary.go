@@ -152,7 +152,10 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	if len(state.Missing) != 0 {
 		return nil, state.Missing, errRadioUnavailable
 	}
-	if n, ok := p.primary.(*radioProducerNativeClient); ok && n.primaryBootstrapProcess != "" && !primaryBootstrapStateReady(state) {
+	backend := p.primary.(*radioPrimaryBackend)
+	native, configured := backend.radioPrimaryPort.(*radioProducerNativeClient)
+	if configured && native.primaryBootstrapProcess != "" &&
+		(state.Process != native.primaryBootstrapProcess || !primaryBootstrapStateReady(state)) {
 		return nil, nil, errRadioUnavailable
 	}
 	if state.Observation == nil || !validRadioObservation(*state.Observation) {
@@ -195,7 +198,7 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	}
 	p.evidence.NativeProcess = state.Process
 	p.evidence.Targets = append([]radioTarget(nil), targets...)
-	p.primary.(*radioPrimaryBackend).replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
+	backend.replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
 	return targets, nil, nil
 }
 
