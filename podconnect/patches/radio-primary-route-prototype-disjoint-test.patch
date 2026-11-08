@@ -1,16 +1,17 @@
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
-@@ -1390,6 +1390,9 @@
+@@ -1390,6 +1390,10 @@
  static void rss_unlock_notify_observe(void);
  #include "player_startup_owner.inc.c"
  #include "rss_probe_transaction_owner.inc.c"
 +static void primary_radio_wire_receiver(struct recovery_wire_fixture *, struct event_base *, uint64_t, const char *);
 +static void primary_radio_wire_wait(struct recovery_wire_fixture *, bool);
 +static int primary_radio_wire_packets(struct recovery_wire_fixture *, uint16_t *);
++static void radio_wire_private_service(struct airplay_service *, event_callback_fn, struct event_base *);
  #include "start35_wire_owner.inc.c"
  #include "radio_sender_wire_owner.inc.c"
  #include "radio_handoff_wire_owner.inc.c"
-@@ -1996,6 +1999,7 @@
+@@ -1996,6 +2000,7 @@
      puts("PASS fixed first-difference classification matches route rejection"); return 0;
    }
    if (argc == 2 && !strcmp(argv[1], "--native-start-wire")) return start35_wire_case(29);
@@ -35,7 +36,7 @@
    struct recovery_wire_fixture f={.mode=mode,.udp_fd=-1};struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
    socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};struct airplay_extra *extra;
    char database[PATH_MAX] = "/tmp/start35-wire-db-XXXXXX", fifo[PATH_MAX] = "/tmp/start35-wire-pipe-XXXXXX";
-@@ -1827,6 +1835,23 @@
+@@ -1827,6 +1835,27 @@
    f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);f.device->extra_device_info=extra;extra->mdns_name=strdup(f.device->name);
    if(mode==29 && getenv("PC_REQUIRE_RTP_AUDIO"))extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
    f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
@@ -55,11 +56,15 @@
 +      assert(!clock_gettime(CLOCK_MONOTONIC, &radio_pcm.pts));
 +      assert(airplay_primary_radio_write(&radio_route, &radio_pcm) == 0);
 +      assert(primary_radio_wire_packets(&radio, &first_radio_seq) == 1);
++      start_gate_set(true);
++      assert(airplay_primary_radio_write(&radio_route, &radio_pcm) < 0);
++      assert(primary_radio_wire_packets(&radio, &radio_seq) == 0);
++      start_gate_set(false);
 +    }
    /* Seed the real library database without invoking an unrelated scanner command consumer. */
    sqlite3 *seed = NULL;
    assert(sqlite3_open(database, &seed) == SQLITE_OK);
-@@ -2381,6 +2406,20 @@
+@@ -2381,6 +2410,20 @@
    assert(errno==EAGAIN);assert(!fcntl(writer,F_SETFL,fcntl(writer,F_GETFL)&~O_NONBLOCK));
    pending.fd=writer;assert(pthread_create(&writer_thread,NULL,start_fifo_finish,&pending)==0);
    assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
@@ -80,7 +85,7 @@
    outputs_write(NULL,0,0,NULL,NULL); /* Actual ALL-backend gate precedes buffer dereference. */
    assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
    if(mode==18 || mode==26 || mode==27 || mode==28){
-@@ -2786,7 +2825,20 @@
+@@ -2786,7 +2829,20 @@
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -102,7 +107,7 @@
   cleanup:
    if(mode==29){
      event_free(keep_alive_timer);keep_alive_timer=NULL;
-@@ -2794,6 +2846,17 @@
+@@ -2794,6 +2850,17 @@
    }
    if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
    while(airplay_sessions)session_cleanup(airplay_sessions);
