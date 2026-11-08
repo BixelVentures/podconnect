@@ -472,30 +472,90 @@
  			continue
  		}
  		if h != nil && h.Primary != nil {
-@@ -530,7 +536,8 @@
- 			return nil, err
+@@ -531,35 +537,7 @@
  		}
  		if h.RequiresPause {
--			if err := p.pauseAndParkRadioWriter(ctx, h); err != nil {
-+			generation, _ := strconv.ParseUint(h.Proof.Generation, 10, 64)
+ 			generation, _ := strconv.ParseUint(h.Proof.Generation, 10, 64)
+-			b := output.RadioPipeBinding{Token: h.Proof.Token, Generation: generation, Writer: output.MovePipeIdentity{PipeIdentity: h.Proof.Writer.Pipe, FD: h.Proof.Writer.FD}}
+-			guard := func() error {
+-				if ctx.Err() != nil {
+-					return ctx.Err()
+-				}
+-				app.moveCustodyMu.Lock()
+-				defer app.moveCustodyMu.Unlock()
+-				if app.openedWriterOwner != p || app.openedWriter != b.Writer {
+-					return ErrAliasConflict
+-				}
+-				return nil
+-			}
+-			paused, err := p.player.PauseRadio(ctx, b, guard)
+-			if err != nil {
+-				return nil, err
+-			}
+-			if paused.PositionMS == nil {
+-				return nil, ErrAliasConflict
+-			}
+-			p.state.player.PositionAsOfTimestamp = *paused.PositionMS
+-			p.state.player.Timestamp = time.Now().UnixMilli()
+-			p.state.setPaused(true)
+-			state, err := p.player.SuspendRadio(ctx, b, guard)
+-			if err != nil || !state.Suspended || !state.WriterClosed {
+-				return nil, ErrAliasConflict
+-			}
+-			h.WriterParked = true
+-			h.PauseUncertain = false
+-			if err = app.persistRadioLocked(); err != nil {
 +			if err := p.pauseAndParkRadioWriter(ctx, h, h.Proof.Token, generation, h.Proof.Writer); err != nil {
  				return nil, err
  			}
  		}
-@@ -574,10 +581,9 @@
- 
- // The caller holds app.radio.mu and has already persisted pause uncertainty.
- // Writer identity is rechecked by the existing audio owner at the effect.
--func (p *AppPlayer) pauseAndParkRadioWriter(ctx context.Context, h *radioHold) error {
+@@ -600,6 +578,45 @@
+ 	}
+ 	return false
+ }
++
++// The caller holds app.radio.mu and has already persisted pause uncertainty.
++// Writer identity is rechecked by the existing audio owner at the effect.
 +func (p *AppPlayer) pauseAndParkRadioWriter(ctx context.Context, h *radioHold, token string, generation uint64, writer queueWriterWire) error {
- 	app := p.app
--	generation, _ := strconv.ParseUint(h.Proof.Generation, 10, 64)
--	b := output.RadioPipeBinding{Token: h.Proof.Token, Generation: generation, Writer: output.MovePipeIdentity{PipeIdentity: h.Proof.Writer.Pipe, FD: h.Proof.Writer.FD}}
++	app := p.app
 +	b := output.RadioPipeBinding{Token: token, Generation: generation, Writer: output.MovePipeIdentity{PipeIdentity: writer.Pipe, FD: writer.FD}}
- 	guard := func() error {
- 		if ctx.Err() != nil {
- 			return ctx.Err()
-@@ -731,6 +737,9 @@
++	guard := func() error {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		app.moveCustodyMu.Lock()
++		defer app.moveCustodyMu.Unlock()
++		if app.openedWriterOwner != p || app.openedWriter != b.Writer {
++			return ErrAliasConflict
++		}
++		return nil
++	}
++	paused, err := p.player.PauseRadio(ctx, b, guard)
++	if err != nil {
++		return err
++	}
++	if paused.PositionMS == nil {
++		return ErrAliasConflict
++	}
++	p.state.player.PositionAsOfTimestamp = *paused.PositionMS
++	p.state.player.Timestamp = time.Now().UnixMilli()
++	p.state.setPaused(true)
++	state, err := p.player.SuspendRadio(ctx, b, guard)
++	if err != nil || !state.Suspended || !state.WriterClosed {
++		return ErrAliasConflict
++	}
++	h.WriterParked = true
++	h.PauseUncertain = false
++	if err = app.persistRadioLocked(); err != nil {
++		return err
++	}
++	return nil
++}
++
+ func (p *AppPlayer) radioOwnerCall(ctx context.Context, h *radioHold, action string) (*radioCReply, error) {
+ 	var ack radioCReply
+ 	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + h.Proof.Output.DeviceID + "/radio-handoff/" + action
+@@ -720,6 +737,9 @@
  func (app *App) refreshRadioOutputFenceLocked() {
  	held := app.radio.failed
  	for _, h := range app.radio.Holds {
