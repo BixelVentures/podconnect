@@ -1,0 +1,11 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2607,6 +2607,8 @@
+       pair_setup_free(f.pair);f.pair=NULL;evbuffer_drain(f.plain,evbuffer_get_length(f.plain));
+       f.phase=4;f.volumes=0;f.teardowns=0;
+       player_tick_interval.tv_nsec=50000000;
++      /* Match player_init when wiring the production playback callback directly. */
++      pb_write_deficit_max = PLAYER_WRITE_BEHIND_MAX * 1000000 / player_tick_interval.tv_nsec;
+       pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
+       assert(pb_timer_fd>=0);
+       pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);

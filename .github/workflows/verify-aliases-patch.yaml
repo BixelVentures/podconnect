@@ -184,6 +184,10 @@ jobs:
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"
           done
+          # Retired Connect fixture bypasses player_init when wiring the real playback clock.
+          fixture="$GITHUB_WORKSPACE/.github/fixtures/connect-retired-playback-clock-ci.patch"
+          git apply --check "$fixture"
+          git apply "$fixture"
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
