@@ -62,6 +62,7 @@ jobs:
           if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
             git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
             git apply "$patch_dir/radio-primary-route-prototype-station-native.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-native-park.patch"
             git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
