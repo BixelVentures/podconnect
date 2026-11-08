@@ -192,6 +192,10 @@ jobs:
           make -C src -j"$(nproc)" airplay_callback_owner
           sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
           src/airplay_callback_owner --radio-primary-custody
+          git apply "$patch_dir/radio-primary-route-prototype-decoder.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
+          src/airplay_callback_owner --radio-primary-decode
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
