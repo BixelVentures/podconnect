@@ -1,0 +1,3775 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index 3efecfba08570963bfe2a5cedfc75ffaa5a72240..f0cd26f1cd0464183157dfa4ff2af32c865a8cc5 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -568,6 +568,7 @@ func (s *ConcreteApiServer) serve() {
+ 	})
+ 	m.HandleFunc("/player/aliases", s.handleAliases)
+ 	m.HandleFunc("/radio/handoff/", s.handleRadioHTTP)
++	m.HandleFunc("/radio/primary", s.handleRadioPrimaryHTTP)
+ 	m.HandleFunc("/player/play", func(w http.ResponseWriter, r *http.Request) {
+ 		if r.Method != "POST" {
+ 			w.WriteHeader(http.StatusMethodNotAllowed)
+diff --git a/daemon/app.go b/daemon/app.go
+index 16ce679b06baf7cb35780a2d284f5e1942ddc412..bdea7205d73ed2305c9a06eadcdc19f2ba36f27e 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -567,6 +567,10 @@ func (app *App) forwardAPI(ctx context.Context) {
+ 				go app.handleRadioAPI(ctx, req)
+ 				continue
+ 			}
++			if req.Type == apiRadioPrimaryHTTP {
++				go app.handleRadioPrimaryAPI(ctx, req)
++				continue
++			}
+ 			app.ownerMu.Lock()
+ 			apiCh, done := app.currentAPI, app.currentDone
+ 			app.ownerMu.Unlock()
+diff --git a/daemon/player.go b/daemon/player.go
+index 5d5e80ea4867fcff7ed22fd5fe385927cd0a10fb..4261414b9bd6eee826897b7793fd71f42bf1d5b1 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -759,6 +759,12 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 	if req.Type == apiRadioHandoff {
+ 		return p.radioHandoffActor(ctx, req.Data.(radioActorRequest))
+ 	}
++	if req.Type == apiRadioPrimaryActor {
++		return p.radioPrimaryActor(ctx, req.Data.(radioPrimaryCommand))
++	}
++	if req.Type == apiRadioPrimaryActorState {
++		return p.radioPrimaryActorState(ctx, req.Data.(radioPrimaryActorStateRequest))
++	}
+ 	// Reject released busy commands before radio intent, preemption or drain.
+ 	if p.roomVolumeBusy() {
+ 		switch req.Type {
+diff --git a/daemon/radio_admission.go b/daemon/radio_admission.go
+index 54674edb4e6e6a860fb1fe9a49803dc026856370..9b3597fbb7526213429ebbb5ffd7ec822e5ec3f0 100644
+--- a/daemon/radio_admission.go
++++ b/daemon/radio_admission.go
+@@ -41,7 +41,7 @@ func (p *AppPlayer) radioAdmitExplicit(ctx context.Context, target, cause string
+ 	if failed || target == "" {
+ 		return ErrAliasConflict
+ 	}
+-	if h != nil {
++	if h != nil && !primaryRadioRetired(h) {
+ 		if h.Parked != nil {
+ 			return p.preemptParkedRadio(ctx, target, cause)
+ 		}
+@@ -58,7 +58,7 @@ func (p *AppPlayer) radioMutationAllowed(target string) bool {
+ 	}
+ 	p.app.radio.mu.Lock()
+ 	defer p.app.radio.mu.Unlock()
+-	if p.app.radio.failed || p.app.radio.Holds[target] != nil {
++	if h := p.app.radio.Holds[target]; p.app.radio.failed || (h != nil && !primaryRadioRetired(h)) {
+ 		return false
+ 	}
+ 	for _, h := range p.app.radio.Holds {
+@@ -72,6 +72,9 @@ func (p *AppPlayer) radioMutationAllowed(target string) bool {
+ // A proven target-only absence leaves the actual live source on other rooms
+ // untouched. Restart/unknown receipts still require a fresh admission proof.
+ func radioGlobalCustodyRequired(h *radioHold) bool {
++	if h.Primary != nil || h.PrimaryPending != nil {
++		return h.WriterParked || h.PauseUncertain // Only a same-target park retains the writer.
++	}
+ 	if h.Parked != nil || radioAbsenceEvolved(h) {
+ 		return false // Receiver-only custody never owns the retained global FIFO.
+ 	}
+diff --git a/daemon/radio_content_staging.go b/daemon/radio_content_staging.go
+index 6f1716a11833ae95d28a3594f01556df49ca7d83..fba2ad3d9c4a91f65e4e8538174d5b83e8285249 100644
+--- a/daemon/radio_content_staging.go
++++ b/daemon/radio_content_staging.go
+@@ -11,16 +11,18 @@ const apiRadioContentRefresh ApiRequestType = "radio_content_refresh"
+ // This binds a deferred C observation to real, durable radio custody. It is not
+ // a C readiness receipt. No radio transition runs while browsing or staging URI.
+ type radioContentStage struct {
+-	HandoffID      string
+-	Generation     string
+-	Token          string
+-	HoldTarget     string
+-	ClaimIntent    uint64
+-	CurrentAbsence bool
+-	Absence        bool
+-	Parked         bool
+-	hold           *radioHold
+-	controlToken   string
++	HandoffID       string
++	Generation      string
++	Token           string
++	HoldTarget      string
++	ClaimIntent     uint64
++	CurrentAbsence  bool
++	Absence         bool
++	Parked          bool
++	Primary         bool
++	PrimaryReleased bool
++	hold            *radioHold
++	controlToken    string
+ }
+ 
+ func (p *AppPlayer) radioContentSnapshot(scope roomVolumeScope) (*radioContentStage, error) {
+@@ -34,6 +36,9 @@ func (p *AppPlayer) radioContentSnapshot(scope roomVolumeScope) (*radioContentSt
+ 		return nil, ErrAliasConflict
+ 	}
+ 	h := app.radio.Holds[scope.RoomID]
++	if primaryRadioRetired(h) {
++		h = nil
++	}
+ 	if h == nil {
+ 		for _, candidate := range app.radio.Holds {
+ 			if candidate.WriterParked {
+@@ -44,9 +49,15 @@ func (p *AppPlayer) radioContentSnapshot(scope roomVolumeScope) (*radioContentSt
+ 			}
+ 		}
+ 	}
+-	if h == nil {
++	if h == nil || primaryRadioRetired(h) {
+ 		return nil, nil
+ 	}
++	if h.Primary != nil {
++		if !p.primaryContentOwns(h) || h.PrimaryPark != nil && h.Request.TargetID != scope.RoomID {
++			return nil, ErrAliasConflict
++		}
++		return &radioContentStage{HandoffID: h.Request.HandoffID, Generation: h.Request.Generation, HoldTarget: h.Request.TargetID, Primary: true, hold: h}, nil
++	}
+ 	if (h.owner != p && h.Absence == nil && h.Parked == nil) || (h.Latest == nil && h.Absence == nil && h.Parked == nil) || (h.Phase != "prepared" && h.Phase != "suspended" && h.Phase != "content_ready" && h.Phase != "content_bound" && !(h.Phase == "source_evolved" && radioAbsenceEvolved(h))) || !volumeHex32.MatchString(radioHoldToken(h)) {
+ 		return nil, ErrAliasConflict
+ 	}
+@@ -60,9 +71,18 @@ func (p *AppPlayer) radioContentCurrent(stage *radioContentStage) bool {
+ 	app.radio.mu.Lock()
+ 	defer app.radio.mu.Unlock()
+ 	h := app.radio.Holds[stage.HoldTarget]
++	if stage.Primary {
++		return !app.radio.failed && h != nil && h == stage.hold && p.primaryContentOwns(h) &&
++			h.Request.HandoffID == stage.HandoffID && h.Request.Generation == stage.Generation
++	}
+ 	return !app.radio.failed && h != nil && h == stage.hold && (h.owner == p || h.Absence != nil || h.Parked != nil) && h.Request.HandoffID == stage.HandoffID && h.Request.Generation == stage.Generation && radioHoldToken(h) == stage.Token && (h.Phase == "prepared" || h.Phase == "suspended" || stage.CurrentAbsence && h.Phase == "source_evolved" && radioAbsenceEvolved(h))
+ }
+ 
++func (p *AppPlayer) primaryContentOwns(h *radioHold) bool {
++	return h.owner == p && validPrimaryRadioHold(h) && !primaryReplacementPending(h) &&
++		(h.Phase == "primary_active" && h.PrimaryAction == "" || h.PrimaryPark != nil && h.WriterParked && primaryRadioReleased(h))
++}
++
+ // refreshRadioContent runs only after the original opaque command has been
+ // consumed by commit. It never broadens the accepted URI, scope or lifetime.
+ func (p *AppPlayer) refreshRadioContent(ctx context.Context, request contentActorRequest) (any, error) {
+@@ -150,6 +170,32 @@ func (p *AppPlayer) radioPrepareContentTransition(ctx context.Context, op *conte
+ 	if op.Radio == nil {
+ 		return ErrAliasConflict
+ 	}
++	if op.Radio.Primary {
++		h, target := op.Radio.hold, op.Capture.Scope.RoomID
++		var err error
++		if h.PrimaryPark != nil {
++			// Reopen the exact parked writer still paused; the already
++			// admitted new Spotify content command owns any later PCM.
++			err = p.returnPrimarySpotify(ctx, target, h, false)
++		} else {
++			err = p.preemptPrimaryRadio(ctx, target, h)
++		}
++		if err != nil {
++			return err
++		}
++		op.mu.Lock()
++		defer op.mu.Unlock()
++		if op.Cancelled || op.Terminal {
++			return ErrAliasConflict
++		}
++		p.app.radio.mu.Lock()
++		defer p.app.radio.mu.Unlock()
++		if p.app.radio.failed || p.app.radio.Intent != op.Radio.ClaimIntent || p.app.radio.Holds[op.Radio.HoldTarget] != op.Radio.hold || !primaryRadioReleased(op.Radio.hold) {
++			return ErrAliasConflict
++		}
++		op.Radio.PrimaryReleased = true
++		return nil
++	}
+ 	if op.Radio.Parked {
+ 		return p.bindRadioParkedStart(ctx, op.Radio.hold, op)
+ 	}
+@@ -169,7 +215,7 @@ func (p *AppPlayer) bindRadioContentStart(ctx context.Context, op *contentOperat
+ 	if stage == nil {
+ 		return nil
+ 	}
+-	if stage.Absence || stage.Parked {
++	if stage.Primary || stage.Absence || stage.Parked {
+ 		return nil
+ 	}
+ 	if stage.HoldTarget != op.Capture.Scope.RoomID {
+@@ -221,6 +267,12 @@ func (p *AppPlayer) completeRadioContent(op *contentOperation) error {
+ 	app.radio.mu.Lock()
+ 	defer app.radio.mu.Unlock()
+ 	h := app.radio.Holds[op.Radio.HoldTarget]
++	if op.Radio.Primary {
++		if !op.Radio.PrimaryReleased || h != op.Radio.hold || !primaryRadioReleased(h) || app.radio.Intent != op.Radio.ClaimIntent {
++			return ErrAliasConflict
++		}
++		return nil
++	}
+ 	if h == nil || h != op.Radio.hold || h.Phase != "content_bound" {
+ 		return ErrAliasConflict
+ 	}
+@@ -245,6 +297,9 @@ func (p *AppPlayer) radioContentIntentCurrent(op *contentOperation) bool {
+ 	p.app.radio.mu.Lock()
+ 	defer p.app.radio.mu.Unlock()
+ 	h := p.app.radio.Holds[op.Radio.HoldTarget]
++	if op.Radio.Primary {
++		return !p.app.radio.failed && op.Radio.PrimaryReleased && h == op.Radio.hold && primaryRadioReleased(h) && p.app.radio.Intent == op.Radio.ClaimIntent
++	}
+ 	if p.app.radio.failed || h == nil || h != op.Radio.hold || p.app.radio.Intent != op.Radio.ClaimIntent {
+ 		return false
+ 	}
+@@ -261,6 +316,9 @@ func (p *AppPlayer) unknownRadioContent(op *contentOperation) {
+ 	p.app.radio.mu.Lock()
+ 	defer p.app.radio.mu.Unlock()
+ 	if h := p.app.radio.Holds[op.Radio.HoldTarget]; h != nil && h == op.Radio.hold {
++		if op.Radio.Primary && primaryRadioReleased(h) {
++			return // A later Spotify START failure cannot erase the exact radio release.
++		}
+ 		h.Phase = "unknown"
+ 		_ = p.app.persistRadioLocked()
+ 	}
+diff --git a/daemon/radio_global_content_admission.go b/daemon/radio_global_content_admission.go
+index d2dc25a33f6a5eaec086f0ae6825db74802af862..6dcb3190515592a0e7528e14f80c4d3408bf0fb0 100644
+--- a/daemon/radio_global_content_admission.go
++++ b/daemon/radio_global_content_admission.go
+@@ -37,11 +37,15 @@ func (p *AppPlayer) radioGlobalContentAdmission(request contentActorRequest) boo
+ 	app := p.app
+ 	app.radio.mu.Lock()
+ 	defer app.radio.mu.Unlock()
+-	if app.radio.failed || len(app.radio.Holds) == 0 || app.radio.Holds[c.Scope.RoomID] != nil {
++	own := app.radio.Holds[c.Scope.RoomID]
++	if app.radio.failed || !app.hasActiveRadioHoldLocked() || own != nil && !primaryRadioRetired(own) {
+ 		return false
+ 	}
+ 	devices, digests := map[string]bool{}, map[string]bool{}
+ 	for room, h := range app.radio.Holds {
++		if primaryRadioRetired(h) {
++			continue
++		}
+ 		if h == nil || !validRadioRequest(h.Request) || h.Request.ProcessID != radioProcessID(c.Process) || h.Request.TargetID != room || room == c.Scope.RoomID || h.owner != nil || h.primary != nil || h.Parked != nil || h.Absence == nil || h.WriterParked || h.RequiresPause || h.PauseUncertain || h.Phase != "suspended" || radioAbsenceEvolved(h) || !radioGlobalCustodyRequired(h) || h.Absence.Custody != nil || h.evolutionActive || !volumeHex64.MatchString(h.Absence.Signature) {
+ 			return false
+ 		}
+diff --git a/daemon/radio_handoff.go b/daemon/radio_handoff.go
+index 2787ffb0a8738d4647172dac2f519724e2c0c58d..afdfd61d520f8ab696f92ef884069a3b8f062980 100644
+--- a/daemon/radio_handoff.go
++++ b/daemon/radio_handoff.go
+@@ -69,6 +69,12 @@ type radioCReply struct {
+ 	Signature     string   `json:"suspended_signature,omitempty"`
+ }
+ type radioHold struct {
++	PrimaryStatus      *radioPrimaryActive     `json:"primary_status,omitempty"`
++	PrimaryReturn      *radioPrimaryReturnWire `json:"primary_spotify_return,omitempty"`
++	PrimaryPark        *radioPrimaryParkWire   `json:"primary_spotify_park,omitempty"`
++	PrimaryPending     *radioPrimaryPending    `json:"primary_pending,omitempty"`
++	Primary            *radioPrimaryBinding    `json:"primary_session,omitempty"`
++	PrimaryAction      string                  `json:"primary_stop_action,omitempty"`
+ 	evolutionActive    bool
+ 	Request            radioRequest              `json:"request"`
+ 	Proof              radioCBinding             `json:"proof"`
+@@ -168,6 +174,30 @@ func (app *App) initRadio() error {
+ 		return fmt.Errorf("invalid radio handoff journal")
+ 	}
+ 	for key, h := range disk.Holds {
++		if h != nil && h.PrimaryPending != nil {
++			r := h.PrimaryPending.Reserve
++			if key != h.Request.TargetID || key != r.Target || !validPrimaryCommandIdentity(r) ||
++				r.Owner != r.Generation || r.Phase != "reserve" || h.Request.Schema != "podconnect.native_radio_primary_hold.v1" {
++				return fmt.Errorf("invalid primary radio reservation")
++			}
++			if h.Primary != nil && !validPrimaryRadioHold(h) {
++				return fmt.Errorf("invalid primary radio hold")
++			}
++			if !primaryRadioReleased(h) {
++				h.Phase = "unknown"
++			}
++			if h.WriterParked || h.PauseUncertain {
++				app.radioOutputFence.Store(true)
++			}
++			continue
++		}
++		if h != nil && h.Primary != nil {
++			if key != h.Request.TargetID || !validPrimaryRadioHold(h) {
++				return fmt.Errorf("invalid primary radio hold")
++			}
++			h.Phase = "unknown" // A restarted actor never inherits an explicit intent.
++			continue
++		}
+ 		if h == nil || key != h.Request.TargetID || !validRadioRequest(h.Request) || h.Actions == nil {
+ 			return fmt.Errorf("invalid radio hold")
+ 		}
+@@ -349,6 +379,21 @@ func (app *App) handleRadioAPI(ctx context.Context, req ApiRequest) {
+ 		}
+ 		app.radio.mu.Unlock()
+ 	}
++	if c.Action != "result" && c.Action != "observe" {
++		app.radio.mu.Lock()
++		conflict := false
++		for _, hold := range app.radio.Holds {
++			if hold != nil && hold.PrimaryPending != nil && !primaryRadioRetired(hold) {
++				conflict = true
++				break
++			}
++		}
++		app.radio.mu.Unlock()
++		if conflict {
++			req.Reply(nil, ErrAliasConflict)
++			return
++		}
++	}
+ 	// A released56 manual-release transaction owns the source until its
+ 	// exact terminal cleanup. Read-only radio results remain available.
+ 	if c.Action != "result" && c.Action != "observe" && app.manualReleasePending() {
+@@ -392,7 +437,16 @@ func (p *AppPlayer) radioHeld() bool {
+ 	}
+ 	p.app.radio.mu.Lock()
+ 	defer p.app.radio.mu.Unlock()
+-	return p.app.radio.failed || len(p.app.radio.Holds) > 0
++	return p.app.radio.failed || p.app.hasActiveRadioHoldLocked()
++}
++
++func (app *App) hasActiveRadioHoldLocked() bool {
++	for _, h := range app.radio.Holds {
++		if !primaryRadioRetired(h) {
++			return true
++		}
++	}
++	return false
+ }
+ 
+ func (p *AppPlayer) radioHandoffActor(ctx context.Context, a radioActorRequest) (any, error) {
+@@ -511,35 +565,7 @@ func (p *AppPlayer) radioHandoffActor(ctx context.Context, a radioActorRequest)
+ 		}
+ 		if h.RequiresPause {
+ 			generation, _ := strconv.ParseUint(h.Proof.Generation, 10, 64)
+-			b := output.RadioPipeBinding{Token: h.Proof.Token, Generation: generation, Writer: output.MovePipeIdentity{PipeIdentity: h.Proof.Writer.Pipe, FD: h.Proof.Writer.FD}}
+-			guard := func() error {
+-				if ctx.Err() != nil {
+-					return ctx.Err()
+-				}
+-				app.moveCustodyMu.Lock()
+-				defer app.moveCustodyMu.Unlock()
+-				if app.openedWriterOwner != p || app.openedWriter != b.Writer {
+-					return ErrAliasConflict
+-				}
+-				return nil
+-			}
+-			paused, err := p.player.PauseRadio(ctx, b, guard)
+-			if err != nil {
+-				return nil, err
+-			}
+-			if paused.PositionMS == nil {
+-				return nil, ErrAliasConflict
+-			}
+-			p.state.player.PositionAsOfTimestamp = *paused.PositionMS
+-			p.state.player.Timestamp = time.Now().UnixMilli()
+-			p.state.setPaused(true)
+-			state, err := p.player.SuspendRadio(ctx, b, guard)
+-			if err != nil || !state.Suspended || !state.WriterClosed {
+-				return nil, ErrAliasConflict
+-			}
+-			h.WriterParked = true
+-			h.PauseUncertain = false
+-			if err = app.persistRadioLocked(); err != nil {
++			if err := p.pauseAndParkRadioWriter(ctx, h, h.Proof.Token, generation, h.Proof.Writer); err != nil {
+ 				return nil, err
+ 			}
+ 		}
+@@ -580,6 +606,49 @@ func (p *AppPlayer) radioHasExclusiveLocked() bool {
+ 	}
+ 	return false
+ }
++
++// The caller holds app.radio.mu and has already persisted pause uncertainty.
++// Writer identity is rechecked by the existing audio owner at the effect.
++func (p *AppPlayer) pauseAndParkRadioWriter(ctx context.Context, h *radioHold, token string, generation uint64, writer queueWriterWire) error {
++	app := p.app
++	writerGeneration, err := strconv.ParseUint(writer.Generation, 10, 64)
++	if err != nil || writerGeneration == 0 {
++		return ErrAliasConflict
++	}
++	b := output.RadioPipeBinding{Token: token, Generation: generation, Writer: output.MovePipeIdentity{PipeIdentity: writer.Pipe, FD: writer.FD}}
++	guard := func() error {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		app.moveCustodyMu.Lock()
++		defer app.moveCustodyMu.Unlock()
++		if app.openedWriterOwner != p || app.openedWriter != b.Writer || app.openedWriterGeneration != writerGeneration {
++			return ErrAliasConflict
++		}
++		return nil
++	}
++	paused, err := p.player.PauseRadio(ctx, b, guard)
++	if err != nil {
++		return err
++	}
++	if paused.PositionMS == nil {
++		return ErrAliasConflict
++	}
++	p.state.player.PositionAsOfTimestamp = *paused.PositionMS
++	p.state.player.Timestamp = time.Now().UnixMilli()
++	p.state.setPaused(true)
++	state, err := p.player.SuspendRadio(ctx, b, guard)
++	if err != nil || !state.Suspended || !state.WriterClosed {
++		return ErrAliasConflict
++	}
++	h.WriterParked = true
++	h.PauseUncertain = false
++	if err = app.persistRadioLocked(); err != nil {
++		return err
++	}
++	return nil
++}
++
+ func (p *AppPlayer) radioOwnerCall(ctx context.Context, h *radioHold, action string) (*radioCReply, error) {
+ 	var ack radioCReply
+ 	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + h.Proof.Output.DeviceID + "/radio-handoff/" + action
+@@ -700,6 +769,9 @@ func (p *AppPlayer) takeRadioDeferredEOF() []*player.Event {
+ func (app *App) refreshRadioOutputFenceLocked() {
+ 	held := app.radio.failed
+ 	for _, h := range app.radio.Holds {
++		if h.PrimaryPending != nil && !h.WriterParked && !h.PauseUncertain {
++			continue
++		}
+ 		if h.Absence == nil && h.Parked == nil {
+ 			held = true
+ 		}
+diff --git a/daemon/radio_move_staging.go b/daemon/radio_move_staging.go
+index 82fa6c4f18de9cda080b11936d2cc3867ae6eb96..f0e0bd8878de54c3c4bd01e6d48e014d0e59a9f7 100644
+--- a/daemon/radio_move_staging.go
++++ b/daemon/radio_move_staging.go
+@@ -52,6 +52,9 @@ func (c *moveCapture) radioReadCState(ctx context.Context) (moveCState, error) {
+ 	if c.Radio == nil {
+ 		return c.readCState(ctx)
+ 	}
++	if c.Radio.Primary {
++		return moveCState{}, ErrAliasConflict
++	}
+ 	var reply struct {
+ 		Schema   string          `json:"schema"`
+ 		Purpose  string          `json:"purpose"`
+diff --git a/daemon/radio_primary.go b/daemon/radio_primary.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..93c314e94699235ca005c8d85d32b2bfbbdbcbe5
+--- /dev/null
++++ b/daemon/radio_primary.go
+@@ -0,0 +1,423 @@
++package daemon
++
++import (
++	"context"
++	"crypto/subtle"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	apiRadioPrimaryHTTP  ApiRequestType = "radio_primary_http"
++	apiRadioPrimaryActor ApiRequestType = "radio_primary_actor"
++	nativePrimarySchema                 = "podconnect.native_radio_primary.v1"
++	cPrimaryStartSchema                 = "podconnect.output_radio_primary_start.v1"
++)
++
++type radioPrimaryCommand struct {
++	Schema     string               `json:"schema"`
++	Phase      string               `json:"phase"`
++	ForPhase   string               `json:"for_phase,omitempty"`
++	Process    string               `json:"process_id"`
++	Handoff    string               `json:"handoff_id"`
++	Generation string               `json:"generation"`
++	Action     string               `json:"action_id"`
++	Target     string               `json:"target_id"`
++	Intent     string               `json:"expected_native_revision"`
++	Owner      string               `json:"owner_generation,omitempty"`
++	From       string               `json:"from_target_id,omitempty"`
++	Station    string               `json:"station_id,omitempty"`
++	Session    *radioPrimaryBinding `json:"target_session,omitempty"`
++}
++
++type radioPrimaryObservation struct {
++	State           string `json:"state"`
++	Station         string `json:"station_id"`
++	Target          string `json:"target_id"`
++	Source          string `json:"source_kind"`
++	OwnerGeneration uint64 `json:"owner_generation"`
++	ObservedAt      int64  `json:"observed_at"`
++	ValidUntil      int64  `json:"valid_until"`
++	Volume          *int   `json:"volume_percent"`
++}
++
++type radioPrimaryReply struct {
++	radioPrimaryCommand
++	CSeq        int                      `json:"teardown_cseq,omitempty"`
++	Observation *radioPrimaryObservation `json:"observation,omitempty"`
++}
++
++type radioPrimaryTarget struct {
++	Process     string `json:"process,omitempty"`
++	Device      string `json:"device_id"`
++	Incarnation string `json:"incarnation,omitempty"`
++	Epoch       string `json:"session_epoch,omitempty"`
++	Route       string `json:"route_revision,omitempty"`
++}
++
++type radioPrimaryStartWire struct {
++	Schema       string                       `json:"schema"`
++	Phase        string                       `json:"phase"`
++	Action       string                       `json:"action,omitempty"`
++	Station      string                       `json:"station_id,omitempty"`
++	Generation   string                       `json:"generation,omitempty"`
++	ParkToken    string                       `json:"park_token,omitempty"`
++	Predecessor  *radioPrimaryBinding         `json:"predecessor,omitempty"`
++	PriorRelease *radioPrimaryPreviousRelease `json:"predecessor_release,omitempty"`
++	radioPrimaryTarget
++}
++
++type radioPrimaryStartReceipt struct {
++	radioPrimaryStartWire
++	Session *radioPrimaryBinding `json:"target_session,omitempty"`
++}
++
++type radioPrimaryActive struct {
++	Request         radioPrimaryStartWire `json:"request"`
++	OwnerGeneration string                `json:"owner_generation"`
++	SameTarget      bool                  `json:"same_target,omitempty"`
++}
++
++func primaryRadioActiveRead(wire radioPrimaryStartWire, ownerGeneration string, sameTarget bool) *radioPrimaryActive {
++	wire.Phase, wire.ParkToken = "result", ""
++	if wire.PriorRelease != nil && wire.PriorRelease.Action == wire.Action {
++		wire.PriorRelease = nil
++	}
++	return &radioPrimaryActive{wire, ownerGeneration, sameTarget}
++}
++
++type radioPrimaryPending struct {
++	Station             string                   `json:"station_id,omitempty"`
++	Reserve             radioPrimaryCommand      `json:"reserve"`
++	Target              *radioPrimaryTarget      `json:"c_target,omitempty"`
++	Started             *radioPrimaryCommand     `json:"started,omitempty"`
++	Stopped             *radioPrimaryCommand     `json:"stopped,omitempty"`
++	Released            int                      `json:"teardown_cseq,omitempty"`
++	SameTarget          bool                     `json:"same_target,omitempty"`
++	Decoded             bool                     `json:"decoded,omitempty"`
++	PriorRelease        *radioPrimaryStopReceipt `json:"predecessor_release,omitempty"`
++	ActivationSent      bool                     `json:"activation_sent,omitempty"`
++	ReplacementDone     bool                     `json:"replacement_done,omitempty"`
++	ReplacementRejected bool                     `json:"replacement_rejected,omitempty"`
++	ParkedRestart       bool                     `json:"parked_restart,omitempty"`
++}
++
++type radioPrimaryHTTPCall struct {
++	Token   string
++	Query   bool
++	Request radioPrimaryCommand
++	Context context.Context
++}
++
++func (s *ConcreteApiServer) handleRadioPrimaryHTTP(w http.ResponseWriter, r *http.Request) {
++	call := radioPrimaryHTTPCall{Token: r.Header.Get("X-PodConnect-Token"), Query: r.Method == http.MethodGet, Context: r.Context()}
++	if r.URL.RawQuery != "" {
++		w.WriteHeader(http.StatusBadRequest)
++		return
++	}
++	if !call.Query && !roomTransportBody(w, r, &call.Request) {
++		return
++	}
++	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
++	defer cancel()
++	data, err := s.roomTransportAsk(ctx, apiRadioPrimaryHTTP, call)
++	if err == ErrForbidden {
++		w.WriteHeader(http.StatusForbidden)
++		return
++	}
++	roomTransportResponse(w, data, err)
++}
++
++func (app *App) handleRadioPrimaryAPI(ctx context.Context, req ApiRequest) {
++	c, ok := req.Data.(radioPrimaryHTTPCall)
++	if !ok || app.cfg == nil || app.cfg.RadioHandoffControlToken == "" ||
++		subtle.ConstantTimeCompare([]byte(c.Token), []byte(app.cfg.RadioHandoffControlToken)) != 1 {
++		req.Reply(nil, ErrForbidden)
++		return
++	}
++	process, processOK := nativeContentProcess()
++	if !processOK {
++		req.Reply(nil, ErrAliasConflict)
++		return
++	}
++	if c.Query {
++		req.Reply(app.radioPrimaryReadiness(ctx, process), nil)
++		return
++	}
++	if !app.radioEnabled() || c.Request.Process != radioProcessID(process) ||
++		!validPrimaryCommandIdentity(c.Request) || c.Request.Phase != "result" && app.manualReleasePending() {
++		req.Reply(nil, ErrAliasConflict)
++		return
++	}
++	actionCtx, cancel := queueOperationContext(ctx, c.Context)
++	defer cancel()
++	data, err := app.primaryRadioActorAsk(actionCtx, apiRadioPrimaryActor, c.Request)
++	req.Reply(data, err)
++}
++
++func (t radioPrimaryTarget) valid() bool {
++	return volumeUUID.MatchString(t.Process) && volumeCounter(t.Device) && t.Device != "0" &&
++		volumeCounter(t.Incarnation) && t.Incarnation != "0" && volumeCounter(t.Epoch) && volumeCounter(t.Route)
++}
++
++func (p *AppPlayer) primaryRadioCStart(ctx context.Context, r radioPrimaryStartWire, sameTarget bool) (radioPrimaryStartReceipt, error) {
++	var ack radioPrimaryStartReceipt
++	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + r.Device + "/radio-handoff/reacquire"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, p.app.cfg.RadioHandoffControlToken, r, &ack); err != nil {
++		return ack, err
++	}
++	if ack.Schema != r.Schema || !ack.radioPrimaryTarget.valid() || ack.Device != r.Device {
++		return ack, ErrAliasConflict
++	}
++	if (ack.Predecessor == nil) != (r.Predecessor == nil) || r.Predecessor != nil && *ack.Predecessor != *r.Predecessor ||
++		ack.PriorRelease != nil || ack.ParkToken != "" {
++		return ack, ErrAliasConflict
++	}
++	if r.Phase == "target" || r.Phase == "preflight_target" || r.Phase == "preflight_replace_target" {
++		if ack.Phase != "target_ready" || ack.Action != "" || ack.Station != "" || ack.Generation != "" || ack.Session != nil {
++			return ack, ErrAliasConflict
++		}
++	} else if ack.radioPrimaryTarget != r.radioPrimaryTarget || ack.Action != r.Action || ack.Station != r.Station ||
++		!volumeCounter(r.Generation) || r.Generation == "0" || ack.Generation != r.Generation ||
++		(ack.Phase == "playing" && (ack.Session == nil || !ack.Session.valid() || ack.Session.DeviceID != r.Device ||
++			ack.Session.Process != r.Process || ack.Session.Operation != r.Action ||
++			ack.Session.Incarnation != r.Incarnation)) ||
++		(ack.Phase != "playing" && ack.Session != nil) {
++		return ack, ErrAliasConflict
++	}
++	if ack.Phase == "playing" {
++		before, err := strconv.ParseUint(r.Epoch, 10, 64)
++		route, routeErr := strconv.ParseUint(r.Route, 10, 64)
++		epochDelta, routeDelta := uint64(1), uint64(0)
++		if r.Predecessor != nil && r.Predecessor.DeviceID == r.Device &&
++			(r.PriorRelease == nil || r.PriorRelease.Action == r.Action) {
++			epochDelta = 2
++		} else if sameTarget {
++			epochDelta, routeDelta = 2, 1
++		}
++		if err != nil || routeErr != nil || before > ^uint64(0)-epochDelta || route > ^uint64(0)-routeDelta ||
++			ack.Session.Epoch != strconv.FormatUint(before+epochDelta, 10) ||
++			ack.Session.Route != strconv.FormatUint(route+routeDelta, 10) {
++			return ack, ErrAliasConflict
++		}
++	}
++	return ack, nil
++}
++
++func validPrimaryCommandIdentity(r radioPrimaryCommand) bool {
++	return r.Schema == nativePrimarySchema && volumeHex64.MatchString(r.Process) &&
++		volumeUUID.MatchString(r.Handoff) && volumeUUID.MatchString(r.Action) &&
++		volumeCounter(r.Generation) && r.Generation != "0" &&
++		volumeCounter(r.Intent) && nativeOwnerASCII(r.Target, 255) &&
++		(r.From == "" || nativeOwnerASCII(r.From, 255))
++}
++
++func primaryCommandMatches(r, reserve radioPrimaryCommand) bool {
++	return r.Schema == reserve.Schema && r.Process == reserve.Process && r.Handoff == reserve.Handoff &&
++		r.Generation == reserve.Generation && r.Action == reserve.Action && r.Target == reserve.Target &&
++		r.Intent == reserve.Intent && r.Owner == reserve.Owner && r.From == reserve.From
++}
++
++func primaryObservation(r radioPrimaryCommand, state, source string) *radioPrimaryObservation {
++	generation, _ := strconv.ParseUint(r.Owner, 10, 64)
++	now := time.Now().Unix()
++	return &radioPrimaryObservation{State: state, Station: r.Station, Target: r.Target, Source: source,
++		OwnerGeneration: generation, ObservedAt: now, ValidUntil: now + 3}
++}
++
++func (p *AppPlayer) primaryRadioRoom(target string) string {
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	if p.aliasRetired || !p.transportMappingCurrentLocked() {
++		return ""
++	}
++	for _, alias := range p.aliasRegistry {
++		if alias.RoomID == target && volumeCounter(alias.HomePodID) && alias.HomePodID != "0" {
++			return alias.HomePodID
++		}
++	}
++	return ""
++}
++
++func (p *AppPlayer) radioPrimaryActor(ctx context.Context, r radioPrimaryCommand) (any, error) {
++	app := p.app
++	process, ok := nativeContentProcess()
++	device := p.primaryRadioRoom(r.Target)
++	if !ok || device == "" || r.Process != radioProcessID(process) || !validPrimaryCommandIdentity(r) || ctx.Err() != nil {
++		return nil, ErrAliasConflict
++	}
++	app.radio.mu.Lock()
++	defer app.radio.mu.Unlock()
++	if app.radio.failed || strconv.FormatUint(app.radio.Intent, 10) != r.Intent {
++		return nil, ErrAliasConflict
++	}
++	h := app.radio.Holds[r.Target]
++	if r.Phase == "reserve" {
++		for _, hold := range app.radio.Holds {
++			if hold == nil || hold.PrimaryPending == nil {
++				return nil, ErrAliasConflict // A legacy hold still owns its source or receiver.
++			}
++			if hold != h && hold.WriterParked && primaryRadioReleased(hold) {
++				return nil, ErrAliasConflict // The parked writer pins the advertised room.
++			}
++		}
++		if r.Session != nil {
++			return p.reservePrimaryRadioReplacement(r, h)
++		}
++		generation, err := strconv.ParseUint(r.Generation, 10, 64)
++		if err != nil || generation <= app.radio.Generation || r.Owner != "" || r.ForPhase != "" || r.Session != nil || r.Station != "" {
++			return nil, ErrAliasConflict
++		}
++		if release, ok := primaryParkedStopReceipt(h); ok {
++			return p.reservePrimaryParkedRestart(r, h, release, generation)
++		}
++		if h == nil || primaryRadioRetired(h) && !h.WriterParked && !h.PauseUncertain {
++			h = &radioHold{owner: p, Phase: "primary_reserved", Actions: map[string]bool{},
++				Request: radioRequest{Schema: "podconnect.native_radio_primary_hold.v1", ProcessID: r.Process,
++					TargetID: r.Target, HandoffID: r.Handoff, Generation: r.Generation, ActionID: r.Action, ExpectedRevision: r.Intent}}
++		} else if h.owner != p || h.Primary == nil || h.Phase != "primary_active" || r.From != r.Target || primaryReplacementPending(h) {
++			return nil, ErrAliasConflict
++		}
++		r.Owner = r.Generation
++		h.PrimaryPending = &radioPrimaryPending{Reserve: r}
++		app.radio.Generation = generation
++		app.radio.Holds[r.Target] = h
++		if err = app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		r.Phase = "reserved"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if h == nil || h.owner != p || h.PrimaryPending == nil || !primaryCommandMatches(r, h.PrimaryPending.Reserve) {
++		return nil, ErrAliasConflict
++	}
++	operation := h.PrimaryPending
++	if operation.ParkedRestart {
++		return p.primaryRadioParkedRestartActor(ctx, r, h, device)
++	}
++	if operation.Reserve.Session != nil {
++		return p.primaryRadioReplacementActor(ctx, r, h, device)
++	}
++	if r.Phase == "prepare_start" || r.Phase == "result" && r.ForPhase == "prepare_start" {
++		return p.primaryRadioPrepareStation(ctx, r, h, device)
++	}
++	start := r.Phase == "start"
++	if start || (r.Phase == "result" && r.ForPhase == "start") {
++		if operation.Target == nil || operation.Target.Device != device || operation.Station != r.Station || r.Session != nil {
++			return nil, ErrAliasConflict
++		}
++		wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Action: r.Action, Station: r.Station, Generation: r.Generation, radioPrimaryTarget: *operation.Target}
++		if start {
++			if h.Phase != "primary_reserved" || operation.Started != nil || r.ForPhase != "" ||
++				operation.SameTarget && !operation.Decoded {
++				return nil, ErrAliasConflict
++			}
++			admitted := r
++			operation.Started, h.Phase = &admitted, "primary_start_pending"
++			if err := app.persistRadioLocked(); err != nil {
++				return nil, err
++			}
++			wire.Phase = "start"
++		} else if operation.Started == nil {
++			return nil, ErrAliasConflict
++		}
++		var ack radioPrimaryStartReceipt
++		var err error
++		if operation.SameTarget {
++			ack, err = p.primaryRadioAdvancePark(ctx, h, r, wire, start)
++		} else {
++			ack, err = p.primaryRadioCStart(ctx, wire, false)
++		}
++		if err != nil {
++			return nil, err
++		}
++		switch ack.Phase {
++		case "pending":
++			r.Phase = "pending"
++		case "playing":
++			h.Primary, h.Phase = ack.Session, "primary_active"
++			h.PrimaryStatus = primaryRadioActiveRead(wire, r.Owner, operation.SameTarget)
++			r.Session, r.Phase = ack.Session, "playing"
++		case "rejected":
++			if operation.SameTarget {
++				h.Phase = "unknown"
++				_ = app.persistRadioLocked()
++				return nil, ErrAliasConflict
++			}
++			h.Phase, r.Phase = "primary_rejected", "rejected"
++		default:
++			h.Phase = "unknown"
++			_ = app.persistRadioLocked()
++			return nil, ErrAliasConflict
++		}
++		if err = app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		reply := radioPrimaryReply{radioPrimaryCommand: r}
++		if r.Phase == "playing" {
++			reply.Observation = primaryObservation(r, "playing", "radio")
++		}
++		return reply, nil
++	}
++	return p.radioPrimaryActorStop(ctx, r, h)
++}
++
++func (p *AppPlayer) radioPrimaryActorStop(ctx context.Context, r radioPrimaryCommand, h *radioHold) (any, error) {
++	app, operation := p.app, h.PrimaryPending
++	stop := r.Phase == "stop"
++	if (!stop && !(r.Phase == "result" && r.ForPhase == "stop")) ||
++		h.Primary == nil || r.Session == nil || *r.Session != *h.Primary || r.Station != "" {
++		return nil, ErrAliasConflict
++	}
++	phase := "result"
++	if stop {
++		if operation.Stopped != nil || h.Phase != "primary_active" || r.ForPhase != "" {
++			return nil, ErrAliasConflict
++		}
++		admitted := r
++		operation.Stopped, h.Phase = &admitted, "primary_stop_pending"
++		if err := app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		phase = "claim_stop"
++	} else if operation.Stopped == nil {
++		return nil, ErrAliasConflict
++	}
++	binding := *h.Primary
++	wire := radioPrimaryStopRequest{Schema: primaryRadioStopSchema, Phase: phase, Action: r.Action, radioPrimaryBinding: binding}
++	var ack radioPrimaryStopReceipt
++	endpoint := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + binding.DeviceID + "/radio-handoff/reacquire"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, app.cfg.RadioHandoffControlToken, wire, &ack); err != nil {
++		return nil, err
++	}
++	if ack.Schema != wire.Schema || ack.Action != wire.Action || ack.radioPrimaryBinding != binding {
++		return nil, ErrAliasConflict
++	}
++	r.Phase = "pending"
++	if ack.Phase == "pending" && ack.TeardownCSeq == 0 {
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if ack.Phase != "released" || ack.TeardownCSeq <= 0 {
++		return nil, ErrAliasConflict
++	}
++	h.Phase, operation.Released = "primary_released", ack.TeardownCSeq
++	if err := app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	r.Phase = "released"
++	return radioPrimaryReply{radioPrimaryCommand: r, CSeq: ack.TeardownCSeq, Observation: primaryObservation(r, "stopped", "none")}, nil
++}
++
++func primaryRadioReleased(h *radioHold) bool {
++	return h != nil && h.PrimaryPending != nil && h.Primary != nil && h.Primary.valid() &&
++		h.Phase == "primary_released" && h.PrimaryPending.Released > 0 &&
++		(volumeUUID.MatchString(h.PrimaryAction) || h.PrimaryPending.Stopped != nil &&
++			volumeUUID.MatchString(h.PrimaryPending.Stopped.Action) && h.PrimaryPending.Stopped.Session != nil &&
++			*h.PrimaryPending.Stopped.Session == *h.Primary)
++}
++
++func primaryRadioRetired(h *radioHold) bool {
++	return h != nil && !h.WriterParked && !h.PauseUncertain && (primaryRadioReleased(h) || h.PrimaryPending != nil && h.Phase == "primary_rejected")
++}
+diff --git a/daemon/radio_primary_composed_test.go b/daemon/radio_primary_composed_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..04c6df65bc82cc3b3e9108e9e851125544af327e
+--- /dev/null
++++ b/daemon/radio_primary_composed_test.go
+@@ -0,0 +1,114 @@
++package daemon
++
++import (
++	"context"
++	"net/http"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestPrimaryRadioActorOwnToneHTTP(t *testing.T) {
++	endpoint, token := os.Getenv("PC_PRIMARY_HTTP_URL"), os.Getenv("PC_PRIMARY_HTTP_TOKEN")
++	if endpoint == "" || token == "" {
++		t.Skip("requires the isolated production OwnTone HTTP fixture")
++	}
++	p, op := contentFixture(t)
++	p.app.radio.Holds = map[string]*radioHold{}
++	p.app.cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "radio.json")
++	p.app.cfg.RadioHandoffControlToken = token
++	p.app.cfg.RoomTransportOwnToneURL = endpoint
++
++	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++	defer cancel()
++	unauthorized, err := http.NewRequestWithContext(ctx, http.MethodPost,
++		endpoint+"/api/outputs/202/radio-handoff/reacquire", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response, err := http.DefaultClient.Do(unauthorized)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != http.StatusForbidden {
++		t.Fatalf("production OwnTone token gate returned %d", response.StatusCode)
++	}
++
++	ask := func(q radioPrimaryCommand) radioPrimaryReply {
++		t.Helper()
++		reply, err := p.radioPrimaryActor(ctx, q)
++		if err != nil {
++			t.Fatalf("%s/%s: %v", q.Phase, q.ForPhase, err)
++		}
++		ack, ok := reply.(radioPrimaryReply)
++		if !ok {
++			t.Fatalf("%s returned %T", q.Phase, reply)
++		}
++		return ack
++	}
++	wait := func(q radioPrimaryCommand, ack radioPrimaryReply, phase string) radioPrimaryReply {
++		t.Helper()
++		q.ForPhase, q.Phase = q.Phase, "result"
++		tick := time.NewTicker(25 * time.Millisecond)
++		defer tick.Stop()
++		for ack.Phase == "pending" {
++			select {
++			case <-ctx.Done():
++				t.Fatalf("timed out observing %s", q.ForPhase)
++			case <-tick.C:
++				ack = ask(q)
++			}
++		}
++		if ack.Phase != phase {
++			t.Fatalf("want %s, got %s", phase, ack.Phase)
++		}
++		return ack
++	}
++
++	const startAction = "b3919fea-955b-4d4c-a581-c71cb92712b2"
++	const stopAction = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
++	q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(op.Capture.Process),
++		Handoff: "a411aa42-8b70-4bf4-a37d-81b0519db7df", Generation: "1", Action: startAction, Target: "r1", Intent: "0", From: "r0"}
++	if ack := ask(q); ack.Phase == "reserved" && ack.Owner != "" {
++		q.Owner = ack.Owner
++	} else {
++		t.Fatal("native actor did not reserve exact start")
++	}
++	q.Phase, q.Station = "prepare_start", "p3"
++	if ack := ask(q); ack.Phase != "prepared" {
++		t.Fatalf("production C target did not prepare: %s", ack.Phase)
++	}
++	q.Phase = "start"
++	started := ask(q)
++	if _, err := p.radioPrimaryActor(ctx, q); err == nil {
++		t.Fatal("duplicate station effect accepted")
++	}
++	playing := wait(q, started, "playing")
++	if playing.Session == nil || !playing.Session.valid() || playing.Session.DeviceID != "202" ||
++		playing.Session.Operation != startAction || playing.Observation == nil || playing.Observation.Source != "radio" {
++		t.Fatal("missing exact observed production C radio session")
++	}
++
++	q.Phase, q.Station, q.Owner = "reserve", "", ""
++	q.Handoff, q.Generation, q.Action, q.From = "bdb0c4c5-df0e-4f42-a88e-44a8736ca5b8", "2", stopAction, q.Target
++	if ack := ask(q); ack.Phase == "reserved" && ack.Owner != "" {
++		q.Owner = ack.Owner
++	} else {
++		t.Fatal("native actor did not reserve exact stop")
++	}
++	q.Phase, q.Session = "stop", playing.Session
++	stopped := ask(q)
++	if _, err := p.radioPrimaryActor(ctx, q); err == nil {
++		t.Fatal("duplicate stop effect accepted")
++	}
++	released := wait(q, stopped, "released")
++	if released.Session == nil || *released.Session != *playing.Session || released.Action != stopAction ||
++		released.CSeq <= 0 || released.Observation == nil || released.Observation.Source != "none" {
++		t.Fatal("missing exact positive C teardown receipt")
++	}
++	if p.primaryStream != op.Capture.Primary || p.state.player != op.Capture.PlayerState {
++		t.Fatal("radio actor changed the disjoint Native Spotify owner")
++	}
++}
+diff --git a/daemon/radio_primary_observation.go b/daemon/radio_primary_observation.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e64ae1627b3c1cd4f0eff2d10147367f9284be8
+--- /dev/null
++++ b/daemon/radio_primary_observation.go
+@@ -0,0 +1,245 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	apiRadioPrimaryActorState ApiRequestType = "radio_primary_actor_state"
++	cPrimaryOwnerSchema                      = "podconnect.output_primary_radio_owner_observation.v1"
++)
++
++type radioPrimaryOwnerRequest struct {
++	Schema  string                 `json:"schema"`
++	Source  string                 `json:"source_kind"`
++	Owner   *roomTransportIdentity `json:"native_owner,omitempty"`
++	Writer  *queueWriterWire       `json:"writer_proof,omitempty"`
++	Absence *radioAbsenceSource    `json:"source_absence,omitempty"`
++}
++
++type radioPrimaryOwnerReceipt struct {
++	radioPrimaryOwnerRequest
++	Output   *roomVolumeRoute    `json:"output_identity,omitempty"`
++	Target   *radioPrimaryTarget `json:"target_identity,omitempty"`
++	Physical *bool               `json:"physical_result_verified"`
++}
++
++type radioPrimaryActorStateRequest struct {
++	State     radioPrimaryReadinessState
++	CProcess  string
++	Receivers map[string]string
++}
++
++func (app *App) primaryRadioActorAsk(ctx context.Context, kind ApiRequestType, call any) (any, error) {
++	app.ownerMu.Lock()
++	ch, done := app.currentAPI, app.currentDone
++	app.ownerMu.Unlock()
++	if ch == nil || done == nil {
++		return nil, ErrAliasConflict
++	}
++	request, wait := NewApiRequest(kind, call)
++	select {
++	case ch <- request:
++		return wait(ctx)
++	case <-done:
++		return nil, ErrAliasConflict
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++}
++
++func (p *AppPlayer) primaryRadioReadOwner(ctx context.Context, device string, query radioPrimaryOwnerRequest) (radioPrimaryOwnerReceipt, error) {
++	var ack radioPrimaryOwnerReceipt
++	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + device + "/radio-handoff/primary-owner"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, p.app.cfg.RadioHandoffControlToken, query, &ack); err != nil {
++		return ack, err
++	}
++	if ack.Schema != query.Schema || ack.Source != query.Source || ack.Physical == nil || *ack.Physical {
++		return ack, ErrAliasConflict
++	}
++	switch query.Source {
++	case "spotify":
++		if ack.Owner == nil || ack.Writer == nil || ack.Absence != nil || ack.Target != nil || ack.Output == nil ||
++			!ack.Output.valid() || ack.Output.DeviceID != device || *ack.Owner != *query.Owner || *ack.Writer != *query.Writer ||
++			ack.Output.InputPathDigest != query.Writer.InputDigest {
++			return ack, ErrAliasConflict
++		}
++	case "none":
++		if ack.Owner != nil || ack.Writer != nil || ack.Absence == nil || ack.Absence.Live != nil || ack.Output != nil ||
++			ack.Target == nil || !ack.Target.valid() || ack.Target.Device != device || *ack.Absence != *query.Absence {
++			return ack, ErrAliasConflict
++		}
++	default:
++		return ack, ErrAliasConflict
++	}
++	return ack, nil
++}
++
++// The same Native actor owns source observation and effects. No persisted hold
++// becomes a new authority after restart, and a paused writer remains Spotify.
++func (p *AppPlayer) radioPrimaryActorState(ctx context.Context, request radioPrimaryActorStateRequest) (any, error) {
++	app, state := p.app, request.State
++	if ctx.Err() != nil || p.state == nil || p.state.player == nil || app.manualReleasePending() {
++		return nil, ErrAliasConflict
++	}
++	app.radio.mu.Lock()
++	generation := app.radio.Generation
++	if app.radio.failed || state.Revision != strconv.FormatUint(app.radio.Intent, 10) {
++		app.radio.mu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	var held *radioHold
++	var parked *radioHold
++	var parkedRelease radioPrimaryStopReceipt
++	var releaseBinding *radioPrimaryBinding
++	var releaseAction string
++	var releaseCSeq int
++	var releaseGeneration uint64
++	for _, h := range app.radio.Holds {
++		if primaryRadioReleased(h) {
++			if h.WriterParked {
++				release, ok := primaryParkedStopReceipt(h)
++				if !ok || parked != nil || h.owner != p || h.primary == nil || p.primaryStream != h.primary {
++					app.radio.mu.Unlock()
++					return nil, ErrAliasConflict
++				}
++				parked, parkedRelease = h, release
++			}
++			if h.Request.ProcessID != state.Process {
++				continue
++			}
++			candidateGeneration, _ := strconv.ParseUint(h.Request.Generation, 10, 64)
++			if candidateGeneration > releaseGeneration {
++				releaseGeneration = candidateGeneration
++				binding := *h.Primary
++				releaseBinding, releaseCSeq = &binding, h.PrimaryPending.Released
++				releaseAction = h.PrimaryAction
++				if releaseAction == "" && h.PrimaryPending.Stopped != nil {
++					releaseAction = h.PrimaryPending.Stopped.Action
++				}
++			}
++			continue
++		}
++		if primaryRadioRetired(h) {
++			continue
++		}
++		if h == nil || h.owner != p || h.PrimaryStatus == nil || h.Primary == nil || h.Phase != "primary_active" || held != nil {
++			app.radio.mu.Unlock()
++			return nil, ErrAliasConflict
++		}
++		held = h
++	}
++	app.radio.mu.Unlock()
++
++	source, playbackState, sourceRoom := "none", "idle", ""
++	var session *radioPrimaryBinding
++	if held != nil {
++		proof := held.PrimaryStatus
++		query := proof.Request
++		query.Phase = "readiness"
++		ack, err := p.primaryRadioCStart(ctx, query, proof.SameTarget)
++		if err != nil || ack.Phase != "playing" || ack.Session == nil || *ack.Session != *held.Primary ||
++			ack.Session.Process != request.CProcess || request.Receivers[ack.Session.DeviceID] != ack.Session.Incarnation {
++			return nil, ErrAliasConflict
++		}
++		source, playbackState, sourceRoom, session = "radio", "playing", held.Request.TargetID, ack.Session
++		generation, _ = strconv.ParseUint(proof.OwnerGeneration, 10, 64)
++	} else if parked != nil {
++		device := parkedRelease.DeviceID
++		ack, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{
++			Schema: cPrimaryStartSchema, Phase: "preflight_replace_target", radioPrimaryTarget: radioPrimaryTarget{Device: device},
++			Predecessor: &parkedRelease.radioPrimaryBinding, PriorRelease: primaryPreviousRelease(&parkedRelease),
++		}, false)
++		if err != nil || ack.Process != request.CProcess || request.Receivers[device] != ack.Incarnation {
++			return nil, ErrAliasConflict
++		}
++		source, playbackState, sourceRoom = "none", "stopped", parked.Request.TargetID
++	} else if p.primaryStream != nil {
++		owner, err := p.radioSourceOwner()
++		if err != nil {
++			return nil, err
++		}
++		writer, err := p.captureQueueWriter(ctx, owner, nil)
++		if err != nil {
++			return nil, err
++		}
++		ack, err := p.primaryRadioReadOwner(ctx, owner.HomePodID, radioPrimaryOwnerRequest{
++			Schema: cPrimaryOwnerSchema, Source: "spotify", Owner: &owner, Writer: &writer.Wire,
++		})
++		if err != nil || ack.Output.Process != request.CProcess || request.Receivers[ack.Output.DeviceID] != ack.Output.DeviceIncarnation {
++			return nil, ErrAliasConflict
++		}
++		source, playbackState, sourceRoom = "spotify", "playing", owner.RoomID
++		if p.state.player.IsPaused {
++			playbackState = "stopped"
++		}
++	} else {
++		proof, err := app.radioAbsenceSource()
++		if err != nil {
++			return nil, err
++		}
++		valid := false
++		for _, target := range state.Targets {
++			if request.Receivers[target.HomePodID] == "" {
++				continue
++			}
++			ack, err := p.primaryRadioReadOwner(ctx, target.HomePodID, radioPrimaryOwnerRequest{Schema: cPrimaryOwnerSchema, Source: "none", Absence: &proof})
++			if err == nil && ack.Target.Process == request.CProcess && request.Receivers[target.HomePodID] == ack.Target.Incarnation {
++				valid = true
++				break
++			}
++		}
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	}
++	for i, target := range state.Targets {
++		// A verified roster must distinguish unavailable outputs from the
++		// unverified protocol envelope. One refused receiver must not close
++		// other proven targets in the Manager's same-roster refresh.
++		state.Targets[i].Availability, state.Targets[i].Selectable = "unavailable", false
++		incarnation := request.Receivers[target.HomePodID]
++		if incarnation == "" || p.primaryRadioRoom(target.ID) != target.HomePodID {
++			continue
++		}
++		if parked != nil && held == nil {
++			if target.ID == sourceRoom && target.HomePodID == parkedRelease.DeviceID {
++				state.Targets[i].Availability, state.Targets[i].Selectable = "available", true
++			}
++			continue
++		}
++		query := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "target", radioPrimaryTarget: radioPrimaryTarget{Device: target.HomePodID}}
++		if session != nil {
++			query.Phase, query.Predecessor = "preflight_replace_target", session
++		} else if source == "spotify" && target.ID == sourceRoom {
++			query.Phase = "preflight_target"
++		}
++		ack, err := p.primaryRadioCStart(ctx, query, false)
++		if err == nil && ack.Process == request.CProcess && ack.Incarnation == incarnation {
++			state.Targets[i].Availability, state.Targets[i].Selectable = "available", true
++		}
++	}
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	app.radio.mu.Lock()
++	stable := !app.radio.failed && state.Revision == strconv.FormatUint(app.radio.Intent, 10) &&
++		(held == nil || app.radio.Holds[sourceRoom] == held && held.Phase == "primary_active" && held.Primary != nil && *held.Primary == *session)
++	app.radio.mu.Unlock()
++	if !stable {
++		return nil, ErrAliasConflict
++	}
++	now := time.Now().Unix()
++	state.Session = session
++	state.Observation = &radioPrimaryObservation{State: playbackState, Source: source, Target: sourceRoom, OwnerGeneration: generation, ObservedAt: now, ValidUntil: now + 3}
++	if held != nil {
++		state.Observation.Station = held.PrimaryStatus.Request.Station
++	}
++	if releaseBinding != nil && source != "radio" && volumeUUID.MatchString(releaseAction) && releaseCSeq > 0 {
++		state.ReleasedSession, state.ReleaseActionID, state.TeardownCSeq = releaseBinding, &releaseAction, &releaseCSeq
++	}
++	return state, nil
++}
+diff --git a/daemon/radio_primary_park.go b/daemon/radio_primary_park.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d05ad7201a0a5dbb1dfdb18ed4cbd06288f80ac
+--- /dev/null
++++ b/daemon/radio_primary_park.go
+@@ -0,0 +1,183 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++)
++
++const cPrimaryParkSchema = "podconnect.output_primary_spotify_park.v1"
++
++type radioPrimaryParkWire struct {
++	Schema   string                `json:"schema"`
++	Phase    string                `json:"phase"`
++	Action   string                `json:"action"`
++	Revision string                `json:"native_revision"`
++	Owner    roomTransportIdentity `json:"native_owner"`
++	Writer   queueWriterWire       `json:"writer_proof"`
++	Route    *roomVolumeRoute      `json:"output_identity,omitempty"`
++	Token    string                `json:"token,omitempty"`
++}
++
++type radioPrimaryParkReceipt struct {
++	radioPrimaryParkWire
++	RequiresPause bool `json:"requires_native_pause"`
++	StopCSeq      int  `json:"stop_cseq,omitempty"`
++}
++
++func (p *AppPlayer) primaryRadioParkCall(ctx context.Context, wire radioPrimaryParkWire, target radioPrimaryTarget) (radioPrimaryParkReceipt, error) {
++	var ack radioPrimaryParkReceipt
++	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + target.Device + "/radio-handoff/reacquire"
++	err := radioAuthenticatedHTTP(ctx, endpoint, p.app.cfg.RadioHandoffControlToken, wire, &ack)
++	if err != nil {
++		return ack, err
++	}
++	if ack.Schema != wire.Schema || ack.Action != wire.Action || ack.Revision != wire.Revision ||
++		ack.Owner != wire.Owner || ack.Writer != wire.Writer || !ack.RequiresPause || !volumeHex32.MatchString(ack.Token) ||
++		ack.Route == nil || !ack.Route.valid() || ack.Route.Process != target.Process || ack.Route.DeviceID != target.Device ||
++		ack.Route.DeviceIncarnation != target.Incarnation || ack.Route.SessionEpoch != target.Epoch ||
++		ack.Route.RouteRevision != target.Route || ack.Route.InputPathDigest != wire.Writer.InputDigest {
++		return ack, ErrAliasConflict
++	}
++	if wire.Phase == "prepare" {
++		if ack.Phase != "prepared" || ack.StopCSeq != 0 {
++			return ack, ErrAliasConflict
++		}
++	} else if wire.Route == nil || *wire.Route != *ack.Route || wire.Token != ack.Token ||
++		(ack.Phase != "pending" || ack.StopCSeq != 0) && (ack.Phase != "parked" || ack.StopCSeq <= 0) {
++		return ack, ErrAliasConflict
++	}
++	return ack, nil
++}
++
++func (p *AppPlayer) primaryRadioPrepareStation(ctx context.Context, r radioPrimaryCommand, h *radioHold, device string) (any, error) {
++	op := h.PrimaryPending
++	if h.Phase == "primary_rejected" && r.Phase == "result" && r.ForPhase == "prepare_start" &&
++		op.Started == nil && r.Session == nil && op.Station == r.Station {
++		r.Phase = "rejected"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if h.Phase != "primary_reserved" || r.Session != nil || !nativeOwnerASCII(r.Station, 31) {
++		return nil, ErrAliasConflict
++	}
++	if r.Phase == "prepare_start" {
++		if r.ForPhase != "" || op.Target != nil {
++			return nil, ErrAliasConflict
++		}
++		phase := "target"
++		if room, err := p.radioIntentTarget(nil); p.primaryStream != nil && err == nil && room == r.Target {
++			phase, op.SameTarget = "preflight_target", true
++		}
++		ack, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: phase, radioPrimaryTarget: radioPrimaryTarget{Device: device}}, op.SameTarget)
++		if err != nil {
++			return nil, err
++		}
++		op.Target, op.Station = &ack.radioPrimaryTarget, r.Station
++		if err = p.app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++	}
++	if op.Target == nil || op.Station != r.Station || op.Target.Device != device {
++		return nil, ErrAliasConflict
++	}
++	r.Phase, op.Decoded = "prepared", !op.SameTarget
++	if !op.SameTarget {
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++
++	phase := "result"
++	if r.ForPhase == "" {
++		phase = "preflight"
++	}
++	ack, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{
++		Schema: cPrimaryStartSchema, Phase: phase, Action: r.Action, Station: r.Station, Generation: r.Generation, radioPrimaryTarget: *op.Target,
++	}, true)
++	if err != nil {
++		return nil, err
++	}
++	switch ack.Phase {
++	case "pending":
++		r.Phase = "pending"
++	case "decoded":
++		op.Decoded = true
++		if err = p.app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++	case "rejected":
++		r.Phase, h.Phase = "rejected", "primary_rejected"
++		if err = p.app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++	default:
++		return nil, ErrAliasConflict
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++// Existing Native reservation owns exactly one preflight, park confirm and
++// decoder activation. Reads can settle a pending step, but never resend it.
++func (p *AppPlayer) primaryRadioAdvancePark(ctx context.Context, h *radioHold, r radioPrimaryCommand, wire radioPrimaryStartWire, begin bool) (radioPrimaryStartReceipt, error) {
++	op, app := h.PrimaryPending, p.app
++	if op.ActivationSent {
++		wire.Phase = "result"
++		return p.primaryRadioCStart(ctx, wire, true)
++	}
++
++	if begin {
++		owner, err := p.radioSourceOwner()
++		if err != nil || owner.RoomID != r.Target || owner.HomePodID != wire.Device || p.primaryStream == nil {
++			return radioPrimaryStartReceipt{}, ErrAliasConflict
++		}
++		writer, err := p.captureQueueWriter(ctx, owner, nil)
++		if err != nil {
++			return radioPrimaryStartReceipt{}, err
++		}
++		revision, err := p.nextNativeIntent()
++		if err != nil {
++			return radioPrimaryStartReceipt{}, err
++		}
++		ack, err := p.primaryRadioParkCall(ctx, radioPrimaryParkWire{
++			Schema: cPrimaryParkSchema, Phase: "prepare", Action: r.Action, Revision: revision, Owner: owner, Writer: writer.Wire,
++		}, *op.Target)
++		if err != nil {
++			return radioPrimaryStartReceipt{}, err
++		}
++		h.PrimaryPark, h.primary, h.RequiresPause, h.PauseUncertain = &ack.radioPrimaryParkWire, p.primaryStream, true, true
++		paused := p.state.player.IsPaused
++		h.PausedBefore = &paused
++		app.radioOutputFence.Store(true)
++		if err = app.persistRadioLocked(); err != nil {
++			return radioPrimaryStartReceipt{}, err
++		}
++		generation, _ := strconv.ParseUint(revision, 10, 64)
++		if err = p.pauseAndParkRadioWriter(ctx, h, ack.Token, generation, writer.Wire); err != nil {
++			return radioPrimaryStartReceipt{}, err
++		}
++	}
++	park := h.PrimaryPark
++	if park == nil || !h.WriterParked || h.PauseUncertain || h.primary == nil || p.primaryStream != h.primary {
++		return radioPrimaryStartReceipt{}, ErrAliasConflict
++	}
++	if owner, err := p.radioSourceOwner(); err != nil || owner != park.Owner {
++		return radioPrimaryStartReceipt{}, ErrAliasConflict
++	}
++	query := *park
++	query.Phase = "result"
++	if begin {
++		query.Phase = "confirm"
++	}
++	ack, err := p.primaryRadioParkCall(ctx, query, *op.Target)
++	if err != nil {
++		return radioPrimaryStartReceipt{}, err
++	}
++	if ack.Phase == "pending" {
++		return radioPrimaryStartReceipt{radioPrimaryStartWire: radioPrimaryStartWire{Phase: "pending"}}, nil
++	}
++
++	op.ActivationSent = true
++	if err = app.persistRadioLocked(); err != nil {
++		return radioPrimaryStartReceipt{}, err
++	}
++	wire.Phase, wire.ParkToken = "activate", park.Token
++	return p.primaryRadioCStart(ctx, wire, true)
++}
+diff --git a/daemon/radio_primary_park_test.go b/daemon/radio_primary_park_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd70c649592c674065284c833c16497e15ed8644
+--- /dev/null
++++ b/daemon/radio_primary_park_test.go
+@@ -0,0 +1,109 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++)
++
++func TestPrimaryRadioSameTargetRejectsStartUntilExactDecodedProof(t *testing.T) {
++	p, op := contentFixture(t)
++	p.app.radio.Holds = map[string]*radioHold{}
++	p.app.cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "radio.json")
++	p.app.cfg.RadioHandoffControlToken = "inert-test-token"
++	const cProcess = "a411aa42-8b70-4bf4-a37d-81b0519db7df"
++	const action = "b3919fea-955b-4d4c-a581-c71cb92712b2"
++	target := radioPrimaryTarget{Process: cProcess, Device: op.Capture.OldOwner.HomePodID, Incarnation: "4", Epoch: "7", Route: "8"}
++	var prepare, results atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		var wire radioPrimaryStartWire
++		if req.Header.Get("X-PodConnect-Token") != "inert-test-token" ||
++			json.NewDecoder(req.Body).Decode(&wire) != nil || wire.Schema != cPrimaryStartSchema || wire.Device != target.Device {
++			t.Error("unexpected private C request")
++			w.WriteHeader(http.StatusBadRequest)
++			return
++		}
++		ack := radioPrimaryStartReceipt{radioPrimaryStartWire: wire}
++		switch wire.Phase {
++		case "preflight_target":
++			ack.Phase, ack.radioPrimaryTarget = "target_ready", target
++		case "preflight", "result":
++			if wire.radioPrimaryTarget != target || wire.Action != action || wire.Station != "p3" {
++				t.Error("decoder lost the exact captured Spotify target")
++				w.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			if wire.Phase == "preflight" {
++				prepare.Add(1)
++				ack.Phase = "pending"
++			} else {
++				results.Add(1)
++				ack.Phase = "decoded"
++			}
++		default:
++			t.Errorf("unexpected effect before decoded proof: %s", wire.Phase)
++			w.WriteHeader(http.StatusConflict)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(ack)
++	}))
++	defer server.Close()
++	p.app.cfg.RoomTransportOwnToneURL = server.URL
++
++	ctx := context.Background()
++	ask := func(r radioPrimaryCommand, phase string) radioPrimaryReply {
++		t.Helper()
++		reply, err := p.radioPrimaryActor(ctx, r)
++		ack, ok := reply.(radioPrimaryReply)
++		if err != nil || !ok || ack.Phase != phase {
++			t.Fatalf("want %s, got %#v (%v)", phase, reply, err)
++		}
++		return ack
++	}
++	r := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(op.Capture.Process),
++		Handoff: cProcess, Generation: "1", Action: action, Target: op.Capture.OldOwner.RoomID, Intent: "0", From: op.Capture.OldOwner.RoomID}
++	r.Owner = ask(r, "reserved").Owner
++	r.Phase, r.Station = "prepare_start", "p3"
++	ask(r, "pending")
++	if _, err := p.radioPrimaryActor(ctx, r); err == nil {
++		t.Fatal("decoder preflight replayed")
++	}
++	r.Phase = "start"
++	if _, err := p.radioPrimaryActor(ctx, r); err == nil {
++		t.Fatal("undecoded station was allowed to park Spotify")
++	}
++	r.Phase, r.ForPhase = "result", "prepare_start"
++	ask(r, "prepared")
++	h := p.app.radio.Holds[r.Target]
++	if prepare.Load() != 1 || results.Load() != 1 || !h.PrimaryPending.Decoded || h.PrimaryPending.Started != nil ||
++		h.WriterParked || h.PauseUncertain || p.app.radioOutputFence.Load() || p.primaryStream != op.Capture.Primary {
++		t.Fatal("decode-only preflight changed Spotify custody")
++	}
++}
++
++func TestPrimaryRadioReleaseDoesNotBlockLaterContentSelection(t *testing.T) {
++	p, op := contentFixture(t)
++	binding := &radioPrimaryBinding{
++		Process: "a411aa42-8b70-4bf4-a37d-81b0519db7df", DeviceID: "202",
++		Operation: "b3919fea-955b-4d4c-a581-c71cb92712b2", Incarnation: "1", Epoch: "3", Route: "4",
++	}
++	h := &radioHold{
++		Primary: binding, Phase: "primary_released",
++		PrimaryAction:  "87f6f7dd-2a03-4d75-9a62-6a7a2e089705",
++		PrimaryPending: &radioPrimaryPending{Released: 5},
++	}
++	p.app.radio.Holds = map[string]*radioHold{op.Capture.Scope.RoomID: h}
++	for attempt := 0; attempt < 2; attempt++ {
++		if stage, err := p.radioContentSnapshot(op.Capture.Scope); stage != nil || err != nil || p.radioHeld() {
++			t.Fatalf("released receiver incorrectly triggered radio content admission: stage %v, err %v", stage, err)
++		}
++	}
++	h.WriterParked = true
++	if !p.radioHeld() {
++		t.Fatal("a receiver release incorrectly dropped parked writer custody")
++	}
++}
+diff --git a/daemon/radio_primary_parked_restart.go b/daemon/radio_primary_parked_restart.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbff63a251ffa64f797cbac594eb9a28df9dd443
+--- /dev/null
++++ b/daemon/radio_primary_parked_restart.go
+@@ -0,0 +1,117 @@
++package daemon
++
++import "context"
++
++func primaryParkedStopReceipt(h *radioHold) (radioPrimaryStopReceipt, bool) {
++	if !primaryRadioReleased(h) || h.PrimaryPark == nil || !h.WriterParked || h.PauseUncertain || !validPrimaryRadioHold(h) {
++		return radioPrimaryStopReceipt{}, false
++	}
++	action := h.PrimaryAction
++	if action == "" && h.PrimaryPending.Stopped != nil {
++		action = h.PrimaryPending.Stopped.Action
++	}
++	receipt := radioPrimaryStopReceipt{radioPrimaryStopRequest: radioPrimaryStopRequest{
++		Schema: primaryRadioStopSchema, Phase: "released", Action: action, radioPrimaryBinding: *h.Primary,
++	}, TeardownCSeq: h.PrimaryPending.Released}
++	return receipt, volumeUUID.MatchString(action) && receipt.TeardownCSeq > 0
++}
++
++func primaryPreviousRelease(receipt *radioPrimaryStopReceipt) *radioPrimaryPreviousRelease {
++	return &radioPrimaryPreviousRelease{receipt.radioPrimaryBinding, receipt.Action, receipt.TeardownCSeq}
++}
++
++func (p *AppPlayer) reservePrimaryParkedRestart(r radioPrimaryCommand, h *radioHold, release radioPrimaryStopReceipt, generation uint64) (any, error) {
++	if h.owner != p || h.primary == nil || p.primaryStream != h.primary || h.PrimaryReturn != nil ||
++		r.Target != h.Request.TargetID || r.From != "" && r.From != r.Target || primaryReplacementPending(h) ||
++		p.state == nil || p.state.player == nil || !p.state.player.IsPaused {
++		return nil, ErrAliasConflict
++	}
++	r.Owner = r.Generation
++	h.Phase, h.PrimaryAction = "primary_reserved", release.Action
++	h.PrimaryPending = &radioPrimaryPending{Reserve: r, ParkedRestart: true, PriorRelease: &release, Released: release.TeardownCSeq}
++	p.app.radio.Generation = generation
++	if err := p.app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	r.Phase = "reserved"
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) primaryRadioParkedRestartActor(ctx context.Context, r radioPrimaryCommand, h *radioHold, device string) (any, error) {
++	op := h.PrimaryPending
++	if r.Session != nil || op.PriorRelease == nil || h.PrimaryPark == nil || !h.WriterParked {
++		return nil, ErrAliasConflict
++	}
++	if r.Phase == "start" || r.Phase == "result" && r.ForPhase == "start" {
++		if !op.Decoded || r.Station != op.Station {
++			return nil, ErrAliasConflict
++		}
++		return p.primaryRadioReplacementStart(ctx, r, h)
++	}
++	if r.Phase != "prepare_start" && !(r.Phase == "result" && r.ForPhase == "prepare_start") {
++		return nil, ErrAliasConflict
++	}
++	if !nativeOwnerASCII(r.Station, 31) || op.Station != "" && r.Station != op.Station {
++		return nil, ErrAliasConflict
++	}
++	if op.ReplacementRejected && r.Phase == "result" {
++		r.Phase = "rejected"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if h.Phase != "primary_reserved" && !(h.Phase == "primary_replacement_released" && r.Phase == "result") || op.Started != nil {
++		return nil, ErrAliasConflict
++	}
++
++	wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Action: r.Action,
++		Station: r.Station, Generation: r.Generation, Predecessor: &op.PriorRelease.radioPrimaryBinding,
++		PriorRelease: primaryPreviousRelease(op.PriorRelease)}
++	if r.Phase == "prepare_start" {
++		if r.ForPhase != "" || op.Target != nil {
++			return nil, ErrAliasConflict
++		}
++		target, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{
++			Schema: cPrimaryStartSchema, Phase: "preflight_replace_target",
++			radioPrimaryTarget: radioPrimaryTarget{Device: device}, Predecessor: wire.Predecessor, PriorRelease: wire.PriorRelease,
++		}, false)
++		op.Station = r.Station
++		if err != nil {
++			return p.rejectPrimaryParkedRestart(r, h) // Only a read was attempted.
++		}
++		op.Target = &target.radioPrimaryTarget
++		if err = p.app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		wire.Phase = "preflight_replace"
++	}
++	if op.Target == nil || op.Target.Device != device || op.Station != r.Station {
++		return nil, ErrAliasConflict
++	}
++	wire.radioPrimaryTarget = *op.Target
++	ack, err := p.primaryRadioCStart(ctx, wire, false)
++	if err != nil {
++		return nil, err
++	}
++	switch ack.Phase {
++	case "pending":
++		r.Phase = "pending"
++	case "decoded":
++		op.Decoded, h.Phase, r.Phase = true, "primary_replacement_released", "prepared"
++	case "rejected":
++		return p.rejectPrimaryParkedRestart(r, h)
++	default:
++		return nil, ErrAliasConflict
++	}
++	if err = p.app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) rejectPrimaryParkedRestart(r radioPrimaryCommand, h *radioHold) (any, error) {
++	h.PrimaryPending.ReplacementRejected, h.PrimaryPending.ReplacementDone = true, true
++	h.Phase, r.Phase = "primary_released", "rejected"
++	if err := p.app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
+diff --git a/daemon/radio_primary_readiness.go b/daemon/radio_primary_readiness.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d05fe05f01ce23f36d76067c9ef746dd0683e0ba
+--- /dev/null
++++ b/daemon/radio_primary_readiness.go
+@@ -0,0 +1,122 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"strconv"
++	"strings"
++)
++
++const primaryRadioCapabilitySchema = "podconnect.output_primary_radio_readiness.v1"
++
++var errPrimaryCapabilityUnsupported = errors.New("primary radio capability endpoint unsupported")
++
++type radioPrimaryCapability struct {
++	Schema      string `json:"schema"`
++	Effects     string `json:"effect_protocol"`
++	Process     string `json:"process_id"`
++	Device      string `json:"device_id"`
++	Incarnation string `json:"device_incarnation"`
++	LegacyOpen  *bool  `json:"legacy_admission_open"`
++	Physical    *bool  `json:"physical_result_verified"`
++}
++
++func (c radioPrimaryCapability) valid(device string) bool {
++	return c.Schema == primaryRadioCapabilitySchema && c.Effects == "primary_route_v1" && c.Device == device &&
++		volumeUUID.MatchString(c.Process) && volumeCounter(c.Incarnation) && c.Incarnation != "0" &&
++		c.LegacyOpen != nil && c.Physical != nil && !*c.Physical
++}
++
++type radioPrimaryReadinessState struct {
++	Schema          string                   `json:"schema"`
++	Protocol        string                   `json:"protocol,omitempty"`
++	Process         string                   `json:"process_id"`
++	Revision        string                   `json:"native_revision"`
++	Targets         []radioTarget            `json:"configured_targets"`
++	Missing         []string                 `json:"missing_proofs"`
++	Observation     *radioPrimaryObservation `json:"observation"`
++	Session         *radioPrimaryBinding     `json:"target_session,omitempty"`
++	Capabilities    []string                 `json:"capabilities,omitempty"`
++	ReleasedSession *radioPrimaryBinding     `json:"released_session,omitempty"`
++	ReleaseActionID *string                  `json:"release_action_id,omitempty"`
++	TeardownCSeq    *int                     `json:"teardown_cseq,omitempty"`
++}
++
++// Only the exact composed C build publishes the authenticated capability.
++// Capability and inventory alone are never a source observation. Until the
++// actor reports its matching current owner this path remains visibly closed.
++func (app *App) radioPrimaryReadiness(ctx context.Context, process contentProcess) radioPrimaryReadinessState {
++	app.radio.mu.Lock()
++	intent, failed := app.radio.Intent, app.radio.failed
++	app.radio.mu.Unlock()
++	s := radioPrimaryReadinessState{
++		Schema: nativePrimarySchema, Process: radioProcessID(process), Revision: strconv.FormatUint(intent, 10),
++		Targets: []radioTarget{}, Missing: []string{"primary_c_capability_unverified"},
++	}
++	if failed || !app.radioEnabled() || !roomTransportURL(app.cfg.RoomTransportOwnToneURL) ||
++		len(app.cfg.DeviceAliasRoomIDs) != len(app.cfg.DeviceAliases) || len(app.cfg.DeviceAliasHomePodIDs) != len(app.cfg.DeviceAliases) {
++		return s
++	}
++	rooms, devices := map[string]bool{}, map[string]bool{}
++	for i, id := range app.cfg.DeviceAliasRoomIDs {
++		device := app.cfg.DeviceAliasHomePodIDs[i]
++		if !nativeOwnerASCII(id, 255) || !homePodIDPattern.MatchString(device) || !volumeCounter(device) || device == "0" || rooms[id] || devices[device] {
++			return s
++		}
++		rooms[id], devices[device] = true, true
++		s.Targets = append(s.Targets, radioTarget{id, app.cfg.DeviceAliases[i], device, "unknown", false, i == 0, ""})
++	}
++	unsupported := 0
++	receivers := make(map[string]string, len(s.Targets))
++	cProcess := ""
++	base := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/")
++	for _, target := range s.Targets {
++		var c radioPrimaryCapability
++		endpoint := base + "/api/outputs/" + target.HomePodID + "/radio-handoff/primary-readiness"
++		err := radioControlHTTP(ctx, http.MethodGet, endpoint, app.cfg.RadioHandoffControlToken, nil, &c)
++		if errors.Is(err, errPrimaryCapabilityUnsupported) {
++			// Released C maps an unrecognized JSON path to 400. Neither
++			// 400 nor 404 alone establishes an older working owner.
++			var legacy radioAvailabilityAdmission
++			legacyEndpoint := base + "/api/outputs/" + target.HomePodID + "/radio-admission"
++			if radioControlHTTP(ctx, http.MethodGet, legacyEndpoint, app.cfg.RadioHandoffControlToken, nil, &legacy) != nil ||
++				legacy.Schema != "podconnect.output_radio_admission.v1" || legacy.Physical || !legacy.Open ||
++				legacy.DeviceID != target.HomePodID || !volumeUUID.MatchString(legacy.Process) ||
++				!volumeCounter(legacy.Incarnation) || legacy.Incarnation == "0" || (cProcess != "" && legacy.Process != cProcess) {
++				return s
++			}
++			cProcess = legacy.Process
++			unsupported++
++			continue
++		}
++		if err != nil {
++			continue // This configured output remains unavailable.
++		}
++		if !c.valid(target.HomePodID) || (cProcess != "" && c.Process != cProcess) {
++			return s
++		}
++		receivers[target.HomePodID] = c.Incarnation
++		cProcess = c.Process
++	}
++	app.radio.mu.Lock()
++	stable := app.radio.Intent == intent && !app.radio.failed
++	app.radio.mu.Unlock()
++	if !stable || ctx.Err() != nil || len(s.Targets) == 0 {
++		return s
++	}
++	if unsupported == len(s.Targets) {
++		s.Protocol = "v1" // Manager still requires fresh v1 evidence from this Native process.
++	} else if unsupported == 0 && len(receivers) > 0 && cProcess != "" {
++		s.Missing = []string{"primary_current_owner_unverified"}
++		observed, err := app.primaryRadioActorAsk(ctx, apiRadioPrimaryActorState, radioPrimaryActorStateRequest{
++			State: s, CProcess: cProcess, Receivers: receivers,
++		})
++		if verified, ok := observed.(radioPrimaryReadinessState); err == nil && ok && verified.Observation != nil {
++			s = verified
++			s.Protocol, s.Missing = "primary", []string{}
++			s.Capabilities = []string{"replacement_decoder_preflight"}
++		}
++	}
++	return s
++}
+diff --git a/daemon/radio_primary_readiness_test.go b/daemon/radio_primary_readiness_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..28e0b33d4eab6827d1dcba1f34bd85a5d999916f
+--- /dev/null
++++ b/daemon/radio_primary_readiness_test.go
+@@ -0,0 +1,63 @@
++package daemon
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestPrimaryRadioReadinessSeparatesCapabilityFromCurrentOwner(t *testing.T) {
++	const token = "0123456789abcdef0123456789abcdef"
++	process := contentProcess{BootID: "boot", PID: "31", StartTicks: "20"}
++	app := &App{cfg: &Config{
++		DeviceAliases: []string{"Kitchen"}, DeviceAliasRoomIDs: []string{"kitchen"}, DeviceAliasHomePodIDs: []string{"42"},
++		RadioHandoffControlToken: token, RadioHandoffOwnerURL: "http://127.0.0.1:4010",
++		RadioHandoffStatePath: filepath.Join(t.TempDir(), "radio.json"), RoomTransportOwnToneURL: "http://127.0.0.1:3689",
++	}}
++	const legacy = `{"schema":"podconnect.output_radio_admission.v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","admission_open":true,"physical_result_verified":false}`
++	const capability = `{"schema":"podconnect.output_primary_radio_readiness.v1","effect_protocol":"primary_route_v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","legacy_admission_open":true,"physical_result_verified":false}`
++	for _, tc := range []struct {
++		name, body, legacy, protocol, missing string
++		status                                int
++	}{
++		{"old C released route-miss and exact legacy owner", "", legacy, "v1", "primary_c_capability_unverified", http.StatusBadRequest},
++		{"old C route 404 and exact legacy owner", "", legacy, "v1", "primary_c_capability_unverified", http.StatusNotFound},
++		{"route miss alone is not old C", "", "", "", "primary_c_capability_unverified", http.StatusBadRequest},
++		{"new C alone is not owner proof", capability, "", "", "primary_current_owner_unverified", http.StatusOK},
++		{"different receiver", strings.Replace(capability, `"42"`, `"43"`, 1), "", "", "primary_c_capability_unverified", http.StatusOK},
++		{"truncated response", capability[:25], "", "", "primary_c_capability_unverified", http.StatusOK},
++		{"unavailable C is not old C", "", "", "", "primary_c_capability_unverified", http.StatusServiceUnavailable},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			old := http.DefaultTransport
++			defer func() { http.DefaultTransport = old }()
++			reads := 0
++			http.DefaultTransport = pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				reads++
++				if r.Method != http.MethodGet || r.Header.Get("X-PodConnect-Token") != token {
++					t.Fatalf("unexpected capability request %s %s", r.Method, r.URL.Path)
++				}
++				if r.URL.Path == "/api/outputs/42/radio-admission" && reads == 2 {
++					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.legacy))}, nil
++				}
++				if r.URL.Path != "/api/outputs/42/radio-handoff/primary-readiness" || reads != 1 {
++					t.Fatalf("unexpected capability path %s", r.URL.Path)
++				}
++				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
++			})
++			got := app.radioPrimaryReadiness(context.Background(), process)
++			wantReads := 1
++			if tc.status == http.StatusBadRequest || tc.status == http.StatusNotFound {
++				wantReads++
++			}
++			if reads != wantReads || got.Process != radioProcessID(process) || got.Protocol != tc.protocol || got.Observation != nil ||
++				len(got.Missing) != 1 || got.Missing[0] != tc.missing || len(got.Targets) != 1 ||
++				got.Targets[0].Selectable || got.Targets[0].ReceiverDigest != "" {
++				t.Fatalf("unexpected readiness %v", got)
++			}
++		})
++	}
++}
+diff --git a/daemon/radio_primary_replacement.go b/daemon/radio_primary_replacement.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..14b1b46c9401dfb7d67d90fe5f03f30e4a8efd84
+--- /dev/null
++++ b/daemon/radio_primary_replacement.go
+@@ -0,0 +1,287 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++)
++
++type radioPrimaryPreviousRelease struct {
++	radioPrimaryBinding
++	Action       string `json:"action"`
++	TeardownCSeq int    `json:"teardown_cseq"`
++}
++
++func primaryReplacementPending(h *radioHold) bool {
++	return h != nil && h.PrimaryPending != nil && h.PrimaryPending.Reserve.Session != nil && !h.PrimaryPending.ReplacementDone
++}
++
++func (p *AppPlayer) reservePrimaryRadioReplacement(r radioPrimaryCommand, h *radioHold) (any, error) {
++	app := p.app
++	generation, err := strconv.ParseUint(r.Generation, 10, 64)
++	if err != nil || generation <= app.radio.Generation || r.Owner != "" || r.ForPhase != "" || r.Station != "" ||
++		r.From == "" || r.Session == nil || !r.Session.valid() {
++		return nil, ErrAliasConflict
++	}
++	old := app.radio.Holds[r.From]
++	if old == nil || old.owner != p || old.Phase != "primary_active" || old.Primary == nil || *old.Primary != *r.Session ||
++		p.primaryRadioRoom(r.From) != r.Session.DeviceID || old.PrimaryAction != "" {
++		return nil, ErrAliasConflict
++	}
++	for _, candidate := range app.radio.Holds {
++		if primaryReplacementPending(candidate) {
++			return nil, ErrAliasConflict
++		}
++	}
++	if h != old {
++		if h != nil && !primaryRadioRetired(h) {
++			return nil, ErrAliasConflict
++		}
++		h = &radioHold{owner: p, Phase: "primary_reserved", Actions: map[string]bool{},
++			Request: radioRequest{Schema: "podconnect.native_radio_primary_hold.v1", ProcessID: r.Process,
++				TargetID: r.Target, HandoffID: r.Handoff, Generation: r.Generation, ActionID: r.Action, ExpectedRevision: r.Intent}}
++	}
++	incumbent := *old.Primary
++	r.Session = &incumbent
++	r.Owner = r.Generation
++	h.PrimaryPending = &radioPrimaryPending{Reserve: r}
++	app.radio.Holds[r.Target], app.radio.Generation = h, generation
++	if err = app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	r.Phase = "reserved"
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) primaryRadioReplacementActor(ctx context.Context, r radioPrimaryCommand, h *radioHold, device string) (any, error) {
++	op := h.PrimaryPending
++	old := p.app.radio.Holds[op.Reserve.From]
++	if old == nil || old.owner != p {
++		return nil, ErrAliasConflict
++	}
++	if r.Phase == "prepare_replace" || r.Phase == "result" && r.ForPhase == "prepare_replace" {
++		return p.primaryRadioPrepareReplacement(ctx, r, h, old, device)
++	}
++	if r.Phase == "stop" || r.Phase == "result" && r.ForPhase == "stop" {
++		if op.ReplacementRejected && op.Stopped != nil && r.Phase == "result" && r.Session != nil && *r.Session == *op.Reserve.Session && r.Station == "" {
++			r.Phase = "replacement_rejected"
++			return radioPrimaryReply{radioPrimaryCommand: r}, nil
++		}
++		if op.Decoded && !op.ReplacementRejected {
++			return p.primaryRadioReplacementStop(ctx, r, h, old)
++		}
++		return nil, ErrAliasConflict
++	}
++	if !op.Decoded || op.ReplacementRejected {
++		return nil, ErrAliasConflict
++	}
++	if op.PriorRelease == nil || r.Station != op.Station || r.Session != nil {
++		return nil, ErrAliasConflict
++	}
++	if r.Phase == "prepare_start" || r.Phase == "result" && r.ForPhase == "prepare_start" {
++		r.Phase = "prepared"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if r.Phase != "start" && !(r.Phase == "result" && r.ForPhase == "start") {
++		return nil, ErrAliasConflict
++	}
++	return p.primaryRadioReplacementStart(ctx, r, h)
++}
++
++func (p *AppPlayer) primaryRadioPrepareReplacement(ctx context.Context, r radioPrimaryCommand, h, old *radioHold, device string) (any, error) {
++	op, app := h.PrimaryPending, p.app
++	if r.Session == nil || *r.Session != *op.Reserve.Session || !nativeOwnerASCII(r.Station, 31) ||
++		(op.Station != "" && op.Station != r.Station) {
++		return nil, ErrAliasConflict
++	}
++	if op.ReplacementRejected && r.Phase == "result" {
++		r.Phase = "replacement_rejected"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if op.ReplacementDone || old.Phase != "primary_active" || old.Primary == nil || *old.Primary != *r.Session {
++		return nil, ErrAliasConflict
++	}
++	wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Predecessor: r.Session,
++		Action: r.Action, Station: r.Station, Generation: r.Generation}
++	if r.Phase == "prepare_replace" {
++		if r.ForPhase != "" || op.Target != nil {
++			return nil, ErrAliasConflict
++		}
++		target, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{
++			Schema: cPrimaryStartSchema, Phase: "preflight_replace_target", Predecessor: r.Session,
++			radioPrimaryTarget: radioPrimaryTarget{Device: device},
++		}, false)
++		if err != nil {
++			// This was a read-only target lookup. Retire our unstarted
++			// candidate without touching the predecessor or receiver.
++			op.Station = r.Station
++			return p.rejectPrimaryRadioReplacement(r, h, old)
++		}
++		op.Target, op.Station = &target.radioPrimaryTarget, r.Station
++		if err = app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		wire.Phase = "preflight_replace"
++	}
++	if op.Target == nil || op.Station != r.Station || op.Target.Device != device {
++		return nil, ErrAliasConflict
++	}
++	wire.radioPrimaryTarget = *op.Target
++	ack, err := p.primaryRadioCStart(ctx, wire, false)
++	if err != nil {
++		return nil, err
++	}
++	switch ack.Phase {
++	case "pending":
++		r.Phase = "pending"
++	case "decoded":
++		op.Decoded, r.Phase = true, "replacement_prepared"
++	case "rejected":
++		return p.rejectPrimaryRadioReplacement(r, h, old)
++	default:
++		return nil, ErrAliasConflict
++	}
++	if err = app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) rejectPrimaryRadioReplacement(r radioPrimaryCommand, h, old *radioHold) (any, error) {
++	op := h.PrimaryPending
++	op.ReplacementDone, op.ReplacementRejected, r.Phase = true, true, "replacement_rejected"
++	if h != old {
++		h.Phase = "primary_rejected"
++	}
++	if err := p.app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) primaryRadioReplacementStop(ctx context.Context, r radioPrimaryCommand, h, old *radioHold) (any, error) {
++	app, op := p.app, h.PrimaryPending
++	if r.Session == nil || *r.Session != *op.Reserve.Session || r.Station != "" || op.ReplacementDone ||
++		old.Primary == nil || *old.Primary != *r.Session || op.ActivationSent || old.PrimaryPending == nil {
++		return nil, ErrAliasConflict
++	}
++	if op.PriorRelease != nil {
++		if r.Phase != "result" {
++			return nil, ErrAliasConflict
++		}
++		return primaryRadioReplacementStopReply(r, *op.PriorRelease), nil
++	}
++	wire := radioPrimaryStopRequest{Schema: primaryRadioStopSchema, Phase: "result_stop_replace", Action: r.Action, radioPrimaryBinding: *r.Session}
++	if r.Phase == "stop" {
++		if r.ForPhase != "" || op.Stopped != nil || old.Phase != "primary_active" || old.PrimaryAction != "" {
++			return nil, ErrAliasConflict
++		}
++		admitted := r
++		op.Stopped, old.Phase, old.PrimaryAction = &admitted, "primary_stop_pending", r.Action
++		if err := app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		wire.Phase = "claim_stop_replace"
++	} else if op.Stopped == nil || old.Phase != "primary_stop_pending" || old.PrimaryAction != r.Action {
++		return nil, ErrAliasConflict
++	}
++	var ack radioPrimaryStopReceipt
++	endpoint := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + wire.DeviceID + "/radio-handoff/reacquire"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, app.cfg.RadioHandoffControlToken, wire, &ack); err != nil {
++		return nil, err
++	}
++	if ack.Schema != wire.Schema || ack.Action != wire.Action || ack.radioPrimaryBinding != wire.radioPrimaryBinding {
++		return nil, ErrAliasConflict
++	}
++	if ack.Phase == "pending" && ack.TeardownCSeq == 0 {
++		r.Phase = "pending"
++		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if ack.Phase == "replacement_rejected" && ack.TeardownCSeq == 0 {
++		old.Phase, old.PrimaryAction = "primary_active", ""
++		return p.rejectPrimaryRadioReplacement(r, h, old)
++	}
++	if ack.Phase != "released" || ack.TeardownCSeq <= 0 {
++		return nil, ErrAliasConflict
++	}
++	op.PriorRelease = &ack
++	if old != h {
++		old.Phase, old.PrimaryPending.Released = "primary_released", ack.TeardownCSeq
++	}
++	h.Phase = "primary_replacement_released"
++	if err := app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return primaryRadioReplacementStopReply(r, ack), nil
++}
++
++func primaryRadioReplacementStopReply(r radioPrimaryCommand, ack radioPrimaryStopReceipt) radioPrimaryReply {
++	r.Phase = "released"
++	source := r
++	source.Target = r.From
++	return radioPrimaryReply{radioPrimaryCommand: r, CSeq: ack.TeardownCSeq, Observation: primaryObservation(source, "stopped", "none")}
++}
++
++func (p *AppPlayer) primaryRadioReplacementStart(ctx context.Context, r radioPrimaryCommand, h *radioHold) (any, error) {
++	app, op := p.app, h.PrimaryPending
++	if op.Target == nil || op.PriorRelease == nil {
++		return nil, ErrAliasConflict
++	}
++	wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Action: r.Action,
++		Station: r.Station, Generation: r.Generation, radioPrimaryTarget: *op.Target, Predecessor: op.Reserve.Session}
++	if op.ParkedRestart {
++		wire.Predecessor, wire.PriorRelease = &op.PriorRelease.radioPrimaryBinding, primaryPreviousRelease(op.PriorRelease)
++	}
++	if r.Phase == "start" {
++		if r.ForPhase != "" || h.Phase != "primary_replacement_released" || op.Started != nil || op.ReplacementDone {
++			return nil, ErrAliasConflict
++		}
++		admitted := r
++		op.Started, op.ActivationSent, h.Phase = &admitted, true, "primary_start_pending"
++		if err := app.persistRadioLocked(); err != nil {
++			return nil, err
++		}
++		wire.PriorRelease = primaryPreviousRelease(op.PriorRelease)
++		wire.Phase = "activate_replace"
++		if h.PrimaryPark != nil {
++			wire.ParkToken = h.PrimaryPark.Token
++		}
++	} else if op.Started == nil || h.Phase != "primary_start_pending" && h.Phase != "primary_active" {
++		return nil, ErrAliasConflict
++	}
++	alreadyObserved := h.Phase == "primary_active" && op.ReplacementDone
++	ack, err := p.primaryRadioCStart(ctx, wire, false)
++	if err != nil {
++		return nil, err
++	}
++	if alreadyObserved {
++		if ack.Phase != "playing" || ack.Session == nil || h.Primary == nil || *ack.Session != *h.Primary {
++			return nil, ErrAliasConflict
++		}
++		r.Session, r.Phase = ack.Session, "playing"
++		return radioPrimaryReply{radioPrimaryCommand: r, Observation: primaryObservation(r, "playing", "radio")}, nil
++	}
++	switch ack.Phase {
++	case "pending":
++		r.Phase = "pending"
++	case "playing":
++		h.Primary, h.PrimaryAction, h.Phase = ack.Session, "", "primary_active"
++		h.PrimaryStatus = primaryRadioActiveRead(wire, r.Owner, false)
++		h.Request = radioRequest{Schema: "podconnect.native_radio_primary_hold.v1", ProcessID: r.Process,
++			TargetID: r.Target, HandoffID: r.Handoff, Generation: r.Generation, ActionID: r.Action, ExpectedRevision: r.Intent}
++		op.ReplacementDone = true
++		r.Session, r.Phase = ack.Session, "playing"
++	default:
++		h.Phase = "unknown"
++		_ = app.persistRadioLocked()
++		return nil, ErrAliasConflict
++	}
++	if err = app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	reply := radioPrimaryReply{radioPrimaryCommand: r}
++	if r.Phase == "playing" {
++		reply.Observation = primaryObservation(r, "playing", "radio")
++	}
++	return reply, nil
++}
+diff --git a/daemon/radio_primary_return.go b/daemon/radio_primary_return.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..fed06a5216585dc052f7fe35af99cf0da134fad4
+--- /dev/null
++++ b/daemon/radio_primary_return.go
+@@ -0,0 +1,324 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/devgianlu/go-librespot/output"
++)
++
++const cPrimaryReturnSchema = "podconnect.output_primary_spotify_return.v1"
++
++type radioPrimaryReturnWire struct {
++	Schema   string                  `json:"schema"`
++	Phase    string                  `json:"phase"`
++	Intent   string                  `json:"intent"`
++	Revision string                  `json:"native_revision"`
++	Park     radioPrimaryParkWire    `json:"park"`
++	Release  radioPrimaryStopReceipt `json:"radio_release"`
++	Writer   *queueWriterWire        `json:"current_writer_proof,omitempty"`
++}
++
++type radioPrimaryReturnReceipt struct {
++	radioPrimaryReturnWire
++	Route *roomVolumeRoute `json:"route,omitempty"`
++}
++
++func (p *AppPlayer) primaryRadioReturnCall(ctx context.Context, wire radioPrimaryReturnWire) (radioPrimaryReturnReceipt, error) {
++	var ack radioPrimaryReturnReceipt
++	device := wire.Release.DeviceID
++	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + device + "/radio-handoff/reacquire"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, p.app.cfg.RadioHandoffControlToken, wire, &ack); err != nil {
++		return ack, err
++	}
++	old := wire.Park.Route
++	if old == nil || ack.Park.Route == nil || ack.Schema != wire.Schema || ack.Intent != wire.Intent ||
++		ack.Revision != wire.Revision || ack.Release != wire.Release ||
++		ack.Park.Schema != wire.Park.Schema || ack.Park.Phase != wire.Park.Phase || ack.Park.Action != wire.Park.Action ||
++		ack.Park.Revision != wire.Park.Revision || ack.Park.Owner != wire.Park.Owner || ack.Park.Writer != wire.Park.Writer ||
++		ack.Park.Token != wire.Park.Token || *ack.Park.Route != *old ||
++		(wire.Writer == nil) != (ack.Writer == nil) || wire.Writer != nil && *wire.Writer != *ack.Writer {
++		return ack, ErrAliasConflict
++	}
++	switch ack.Phase {
++	case "consumed", "connecting":
++		if ack.Route != nil {
++			return ack, ErrAliasConflict
++		}
++	case "route_ready", "barrier_ready", "opened":
++		if ack.Route == nil || !ack.Route.valid() || ack.Route.Process != old.Process || ack.Route.DeviceID != old.DeviceID ||
++			ack.Route.DeviceIncarnation != old.DeviceIncarnation || ack.Route.InputPathDigest != old.InputPathDigest ||
++			!primaryReturnCounter(ack.Route.SessionEpoch, wire.Release.Epoch, 2) ||
++			!primaryReturnCounter(ack.Route.RouteRevision, old.RouteRevision, 2) ||
++			!primaryReturnCounter(ack.Route.SelectionRevision, old.SelectionRevision, 3) {
++			return ack, ErrAliasConflict
++		}
++	default:
++		return ack, ErrAliasConflict
++	}
++	return ack, nil
++}
++
++func primaryReturnCounter(actual, old string, delta uint64) bool {
++	parsed, err := strconv.ParseUint(old, 10, 64)
++	return err == nil && parsed <= ^uint64(0)-delta && actual == strconv.FormatUint(parsed+delta, 10)
++}
++
++// Reopen the retained writer only after consuming one explicit Resume and
++// reading the exact new ordinary AirPlay route. A failure leaves custody closed.
++func (p *AppPlayer) returnPrimarySpotify(parent context.Context, target string, h *radioHold, resume bool) error {
++	app := p.app
++	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
++	defer cancel()
++
++	app.radio.mu.Lock()
++	if app.radio.failed || app.radio.Holds[target] != h || h.owner != p || !validPrimaryRadioHold(h) ||
++		!h.WriterParked || h.PauseUncertain || primaryReplacementPending(h) || h.PrimaryPark == nil || h.PrimaryReturn != nil ||
++		h.primary == nil || p.primaryStream != h.primary || h.Phase != "primary_active" && !primaryRadioReleased(h) {
++		app.radio.mu.Unlock()
++		return ErrAliasConflict
++	}
++	park, binding, primary, globalIntent := *h.PrimaryPark, *h.Primary, h.primary, app.radio.Intent
++	stopped := primaryRadioReleased(h)
++	var release radioPrimaryStopReceipt
++	if stopped {
++		action := h.PrimaryAction
++		if action == "" && h.PrimaryPending.Stopped != nil {
++			action = h.PrimaryPending.Stopped.Action
++		}
++		release = radioPrimaryStopReceipt{radioPrimaryStopRequest: radioPrimaryStopRequest{
++			Schema: primaryRadioStopSchema, Phase: "released", Action: action, radioPrimaryBinding: binding,
++		}, TeardownCSeq: h.PrimaryPending.Released}
++	}
++	app.radio.mu.Unlock()
++
++	owner, err := p.radioSourceOwner()
++	if err != nil || owner != park.Owner || owner.RoomID != target || owner.HomePodID != binding.DeviceID ||
++		primary.Source == nil || p.state == nil || p.state.player == nil || !p.state.player.IsPaused {
++		return ErrAliasConflict
++	}
++	actualSource, err := p.player.Start35CurrentSource(ctx)
++	if err != nil || actualSource != primary.Source {
++		return ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return err
++	}
++	rawID, err := randomQueueID(16)
++	if err != nil {
++		return err
++	}
++	intent := rawID[:8] + "-" + rawID[8:12] + "-" + rawID[12:16] + "-" + rawID[16:20] + "-" + rawID[20:]
++	wire := radioPrimaryReturnWire{Schema: cPrimaryReturnSchema, Phase: "consume", Intent: intent, Revision: revision, Park: park, Release: release}
++
++	app.radio.mu.Lock()
++	if ctx.Err() != nil || app.radio.failed || app.radio.Intent != globalIntent || app.radio.Holds[target] != h || h.owner != p ||
++		h.PrimaryReturn != nil || h.Primary == nil || *h.Primary != binding || h.primary != primary || p.primaryStream != primary ||
++		stopped != primaryRadioReleased(h) || !stopped && (h.Phase != "primary_active" || h.PrimaryAction != "") {
++		app.radio.mu.Unlock()
++		return ErrAliasConflict
++	}
++	saved := wire
++	h.Phase, h.ReacquirePhase, h.PrimaryReturn = "reacquiring", "primary_return_attempted", &saved
++	if !stopped {
++		h.PrimaryAction = intent
++	}
++	err = app.persistRadioLocked()
++	app.radio.mu.Unlock()
++	if err != nil {
++		return err
++	}
++
++	succeeded := false
++	defer func() {
++		if !succeeded {
++			app.radio.mu.Lock()
++			if app.radio.Holds[target] == h && h.PrimaryReturn != nil && h.PrimaryReturn.Intent == intent {
++				h.Phase = "unknown"
++				_ = app.persistRadioLocked()
++			}
++			app.radio.mu.Unlock()
++		}
++	}()
++
++	currentLocked := func() bool {
++		return ctx.Err() == nil && !app.radio.failed && app.radio.Intent == globalIntent && app.radio.Holds[target] == h &&
++			h.owner == p && h.Phase == "reacquiring" && h.PrimaryReturn != nil && h.PrimaryReturn.Intent == intent &&
++			h.primary == primary && p.primaryStream == primary && p.state != nil && p.state.player != nil && p.state.player.IsPaused &&
++			p.state.player.SessionId == owner.SessionID && p.spotConnId == owner.ConnectionID &&
++			p.aliasRevision == owner.AliasRevision && p.aliasIncarnation == owner.AliasIncarnation && p.aliasFingerprint == owner.AliasRegistry &&
++			p.radioReacquiredAliasCurrentLocked(owner) && strconv.FormatUint(p.roomNativeIntent, 10) == revision
++	}
++	withCurrent := func(effect func() error) error {
++		observed, err := p.radioSourceOwner()
++		if err != nil || observed != owner {
++			return ErrAliasConflict
++		}
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		app.radio.mu.Lock()
++		defer app.radio.mu.Unlock()
++		if !currentLocked() {
++			return ErrAliasConflict
++		}
++		if effect != nil {
++			return effect()
++		}
++		return nil
++	}
++	current := func() bool { return withCurrent(nil) == nil }
++	if !stopped {
++		endpoint := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + binding.DeviceID + "/radio-handoff/reacquire"
++		release, err = radioPrimaryDrain(ctx, endpoint, app.cfg.RadioHandoffControlToken, binding, intent, current)
++		if err != nil {
++			return err
++		}
++	}
++	wire.Release = release
++	checkpoint := func(phase string) error {
++		return withCurrent(func() error {
++			saved := wire
++			h.PrimaryReturn, h.ReacquirePhase = &saved, phase
++			h.PrimaryPending.Released = release.TeardownCSeq
++			return app.persistRadioLocked()
++		})
++	}
++	if err = checkpoint("primary_return_consume_attempted"); err != nil {
++		return err
++	}
++	receipt, err := p.primaryRadioReturnCall(ctx, wire)
++	ticker := time.NewTicker(30 * time.Millisecond)
++	defer ticker.Stop()
++	for err == nil && (receipt.Phase == "consumed" || receipt.Phase == "connecting") {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case <-ticker.C:
++		}
++		if !current() {
++			return ErrAliasConflict
++		}
++		wire.Phase = "result"
++		receipt, err = p.primaryRadioReturnCall(ctx, wire)
++	}
++	if err != nil || receipt.Phase != "route_ready" || !current() {
++		return ErrAliasConflict
++	}
++	route := *receipt.Route
++
++	parkGeneration, err := strconv.ParseUint(park.Revision, 10, 64)
++	if err != nil || parkGeneration == 0 || checkpoint("primary_return_writer_open_attempted") != nil {
++		return ErrAliasConflict
++	}
++	oldWriter := output.MovePipeIdentity{PipeIdentity: park.Writer.Pipe, FD: park.Writer.FD}
++	pipe := output.RadioPipeBinding{Token: park.Token, Generation: parkGeneration, Writer: oldWriter}
++	guard := func() error {
++		if !current() {
++			return ErrAliasConflict
++		}
++		return nil
++	}
++	reopened, err := p.player.ReacquireRadio(ctx, pipe, guard, func(create func() (output.Output, error)) (output.Output, error) {
++		app.moveCustodyMu.Lock()
++		defer app.moveCustodyMu.Unlock()
++		if app.openedWriterOwner != p || app.openedWriter != oldWriter || strconv.FormatUint(app.openedWriterGeneration, 10) != park.Writer.Generation {
++			return nil, ErrAliasConflict
++		}
++		return app.openRegisteredOutputLocked(p, create)
++	})
++	if err != nil || !reopened.Suspended || reopened.WriterClosed || reopened.Binding != pipe {
++		return ErrAliasConflict
++	}
++	app.moveCustodyMu.Lock()
++	writer, generation, writerOwner := app.openedWriter, app.openedWriterGeneration, app.openedWriterOwner
++	app.moveCustodyMu.Unlock()
++	process, ok := nativeContentProcess()
++	oldGeneration, err := strconv.ParseUint(park.Writer.Generation, 10, 64)
++	if !ok || err != nil || process != park.Writer.Process || writerOwner != p || writer.PipeIdentity != park.Writer.Pipe || generation <= oldGeneration {
++		return ErrAliasConflict
++	}
++	fresh := queueWriterWire{process, writer.FD, writer.PipeIdentity, park.Writer.Epoch, strconv.FormatUint(generation, 10), park.Writer.InputDigest}
++	wire.Writer = &fresh
++	wire.Phase = "barrier"
++	if err = checkpoint("primary_return_barrier_attempted"); err != nil {
++		return err
++	}
++	barrier, err := p.primaryRadioReturnCall(ctx, wire)
++	if err != nil || barrier.Phase != "barrier_ready" || *barrier.Route != route || !current() {
++		return ErrAliasConflict
++	}
++	wire.Phase = "open"
++	if err = checkpoint("primary_return_open_attempted"); err != nil {
++		return err
++	}
++	opened, err := p.primaryRadioReturnCall(ctx, wire)
++	if err != nil || opened.Phase != "opened" || *opened.Route != route || !current() {
++		return ErrAliasConflict
++	}
++	if _, err = p.player.CompleteRadioReacquire(ctx, pipe, guard); err != nil || !current() {
++		return ErrAliasConflict
++	}
++	if err = p.commitPrimaryRadioReturn(ctx, h, opened, owner, globalIntent, generation, writer, resume); err != nil {
++		return err
++	}
++	succeeded = true
++	return nil
++}
++
++func (p *AppPlayer) commitPrimaryRadioReturn(ctx context.Context, h *radioHold, opened radioPrimaryReturnReceipt,
++	owner roomTransportIdentity, globalIntent, generation uint64, writer output.MovePipeIdentity, resume bool) error {
++	if ctx.Err() != nil || opened.Phase != "opened" || opened.Writer == nil || opened.Route == nil ||
++		p.primaryStream == nil || p.primaryStream != h.primary || p.primaryStream.Source == nil {
++		return ErrAliasConflict
++	}
++	wire, primary, source, app := *opened.Writer, p.primaryStream, p.primaryStream.Source, p.app
++	_, _, err := p.player.RoomMove(ctx, "verify", source, writer, wire.Epoch, false, func(mutate func()) error {
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		account, bound := p.sess.BoundUsername()
++		alias := p.aliasBindingLocked()
++		if ctx.Err() != nil || !bound || account != owner.AccountUserID || alias == nil || !alias.Ready || alias.RoomID != owner.RoomID ||
++			!p.radioReacquiredAliasCurrentLocked(owner) || p.aliasRevision != owner.AliasRevision || p.aliasIncarnation != owner.AliasIncarnation ||
++			p.aliasFingerprint != owner.AliasRegistry || p.spotConnId != owner.ConnectionID || p.state == nil || p.state.player == nil ||
++			p.state.player.SessionId != owner.SessionID || !p.state.player.IsPaused || p.primaryStream != primary || primary.Source != source ||
++			strconv.FormatUint(p.roomNativeIntent, 10) != opened.Revision {
++			return ErrAliasConflict
++		}
++		app.radio.mu.Lock()
++		defer app.radio.mu.Unlock()
++		if app.radio.failed || app.radio.Intent != globalIntent || app.radio.Holds[owner.RoomID] != h || h.owner != p ||
++			h.Phase != "reacquiring" || h.ReacquirePhase != "primary_return_open_attempted" || h.PrimaryReturn == nil ||
++			h.PrimaryReturn.Intent != opened.Intent || h.PrimaryReturn.Release != opened.Release || h.PrimaryReturn.Writer == nil ||
++			*h.PrimaryReturn.Writer != wire || h.Primary == nil || opened.Release.radioPrimaryBinding != *h.Primary {
++			return ErrAliasConflict
++		}
++		app.moveCustodyMu.Lock()
++		defer app.moveCustodyMu.Unlock()
++		if app.openedWriterOwner != p || app.openedWriter != writer || app.openedWriterGeneration != generation {
++			return ErrAliasConflict
++		}
++		mutate()
++		h.Phase, h.ReacquirePhase = "primary_released", "primary_return_opened"
++		h.WriterParked, h.RequiresPause = false, false
++		if err := app.persistRadioLocked(); err != nil {
++			h.Phase, h.WriterParked, h.RequiresPause = "unknown", true, true
++			return err
++		}
++		intent, _ := strconv.ParseUint(opened.Revision, 10, 64)
++		app.radioReacquiredWriter = &radioReacquiredWriter{
++			Intent: intent, GlobalIntent: globalIntent, Owner: p, Player: p.player, Session: p.sess,
++			Primary: primary, Source: source, Identity: owner, Wire: wire, Writer: writer, Process: wire.Process,
++			Generation: generation, StartAt: app.startCustody, MoveAt: app.moveCustody, PrimaryReturn: &opened,
++		}
++		app.radioParkedWriter, app.radioOtherWriter = nil, nil
++		if resume {
++			p.radioResume = &radioResumeMarker{Primary: primary, Source: source, Player: p.player, Session: p.sess, Owner: owner, Writer: wire}
++		}
++		app.refreshRadioOutputFenceLocked()
++		return nil
++	})
++	return err
++}
+diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a054eed9d78db490c225f8832bbe8d089505d092
+--- /dev/null
++++ b/daemon/radio_primary_same_composed_test.go
+@@ -0,0 +1,462 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	evtimpl "github.com/devgianlu/go-librespot/events/impl"
++	"github.com/devgianlu/go-librespot/mpris"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++)
++
++func testPrimarySameTargetWithActualSTART(t *testing.T, p *AppPlayer, worker *player.Player, stream *player.Stream) {
++	t.Helper()
++	endpoint, token := os.Getenv("PC_NATIVE_PRIMARY_HTTP_URL"), os.Getenv("PC_PRIMARY_HTTP_TOKEN")
++	if !radioWireLoopbackURL(endpoint) || !volumeHex64.MatchString(token) {
++		t.Fatal("missing isolated production OwnTone radio HTTP")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 13*time.Second)
++	defer cancel()
++	unauthorized, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/api/outputs/1/radio-handoff/reacquire", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response, err := http.DefaultClient.Do(unauthorized)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != http.StatusForbidden {
++		t.Fatalf("production primary route token gate returned HTTP %d", response.StatusCode)
++	}
++	type counts struct {
++		Before   int    `json:"primary_before"`
++		Radio    int    `json:"primary_radio"`
++		After    int    `json:"primary_after"`
++		Selected int    `json:"primary_selected"`
++		Windows  [3]int `json:"primary_radio_windows"`
++	}
++	poll := func(check func(counts) bool) counts {
++		t.Helper()
++		client := &http.Client{Timeout: time.Second}
++		tick := time.NewTicker(20 * time.Millisecond)
++		defer tick.Stop()
++		for {
++			request, err := http.NewRequestWithContext(ctx, http.MethodGet, os.Getenv("PC_NATIVE_START_URL")+"/fixture/rtp", nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			response, err := client.Do(request)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var observed counts
++			err = json.NewDecoder(response.Body).Decode(&observed)
++			response.Body.Close()
++			if err != nil || response.StatusCode != http.StatusOK {
++				t.Fatalf("RTP observation returned HTTP %d (%v)", response.StatusCode, err)
++			}
++			if check(observed) {
++				return observed
++			}
++			select {
++			case <-ctx.Done():
++				t.Fatalf("RTP window never observed: %#v", observed)
++			case <-tick.C:
++			}
++		}
++	}
++	poll(func(c counts) bool { return c.Before > 0 && c.Radio == 0 && c.After == 0 })
++
++	app := p.app
++	app.cfg.RoomTransportOwnToneURL = endpoint
++	app.cfg.RadioHandoffOwnerURL = endpoint
++	app.cfg.RadioHandoffControlToken = token
++	app.cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "primary-radio.json")
++	if err := app.initRadio(); err != nil {
++		t.Fatal(err)
++	}
++	owner, err := p.radioSourceOwner()
++	process, ok := nativeContentProcess()
++	if err != nil || !ok || owner.HomePodID != "1" {
++		t.Fatal("initial START35 did not retain the expected bound receiver", err)
++	}
++	originalTracks, originalSession, originalClient := p.state.tracks, p.state.player.SessionId, p.sess
++	originalGeneration := app.openedWriterGeneration
++	assertSource := func(paused bool) {
++		t.Helper()
++		source, err := worker.Start35CurrentSource(ctx)
++		if err != nil || source != stream.Source || p.primaryStream != stream ||
++			p.state.tracks != originalTracks || p.state.player.SessionId != originalSession || p.sess != originalClient ||
++			p.state.player.IsPaused != paused {
++			t.Fatalf("retained Native source, queue, session or pause state changed (want paused=%t): %v", paused, err)
++		}
++	}
++	if manager := os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN"); manager != "" {
++		if originalTracks == nil || originalSession == "" {
++			t.Fatal("configured Manager scenario requires a real retained queue and Spotify session")
++		}
++		const nextURI = "spotify:track:0000000000000000000004"
++		queueRevision := originalTracks.TransportRevision()
++		if originalTracks.PeekNext(ctx).GetUri() != nextURI {
++			t.Fatal("configured Manager scenario requires an actual upcoming Spotify item")
++		}
++		testConfiguredManagerPrimaryResume(t, ctx, p, worker, manager)
++		assertSource(false)
++		if originalTracks.TransportRevision() != queueRevision || originalTracks.PeekNext(ctx).GetUri() != nextURI {
++			t.Fatal("configured Manager handback changed the original queue occurrence")
++		}
++		if app.openedWriterOwner != p || app.openedWriterGeneration != originalGeneration+1 || app.radioOutputFence.Load() {
++			t.Fatal("configured Manager handback did not reopen the original Spotify writer exactly once")
++		}
++		poll(func(c counts) bool { return c.After > 0 })
++		return
++	}
++	ask := func(q radioPrimaryCommand) radioPrimaryReply {
++		t.Helper()
++		reply, err := p.radioPrimaryActor(ctx, q)
++		ack, ok := reply.(radioPrimaryReply)
++		if err != nil || !ok {
++			t.Fatalf("Native %s/%s failed: %v", q.Phase, q.ForPhase, err)
++		}
++		return ack
++	}
++	wait := func(q radioPrimaryCommand, expected string) radioPrimaryReply {
++		t.Helper()
++		ack := ask(q)
++		q.ForPhase, q.Phase = q.Phase, "result"
++		tick := time.NewTicker(20 * time.Millisecond)
++		defer tick.Stop()
++		for ack.Phase == "pending" {
++			select {
++			case <-ctx.Done():
++				t.Fatalf("Native %s did not settle", q.ForPhase)
++			case <-tick.C:
++				ack = ask(q)
++			}
++		}
++		if ack.Phase != expected {
++			t.Fatalf("Native %s expected %s, got %s", q.ForPhase, expected, ack.Phase)
++		}
++		return ack
++	}
++	const startAction = "b3919fea-955b-4d4c-a581-c71cb92712b2"
++	q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(process),
++		Handoff: "a411aa42-8b70-4bf4-a37d-81b0519db7df", Generation: "1", Action: startAction,
++		Target: owner.RoomID, Intent: strconv.FormatUint(app.radio.Intent, 10), From: owner.RoomID}
++	q.Owner = wait(q, "reserved").Owner
++	q.Phase, q.Station = "prepare_start", "p3"
++	wait(q, "prepared")
++	assertSource(false)
++
++	q.Phase = "start"
++	playing := wait(q, "playing")
++	if playing.Session == nil || !playing.Session.valid() || playing.Session.Operation != startAction ||
++		playing.Session.DeviceID != owner.HomePodID {
++		t.Fatal("missing exact same-target C radio session")
++	}
++	if _, err = p.radioPrimaryActor(ctx, q); err == nil {
++		t.Fatal("duplicate start crossed the parked-writer fence")
++	}
++	assertSource(true)
++	parked, err := worker.InspectRadio(ctx)
++	if err != nil || !parked.Suspended || !parked.WriterClosed || !app.radioOutputFence.Load() {
++		t.Fatalf("same-target radio played without exact Native writer closure: %v", err)
++	}
++	poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 })
++
++	if os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
++		before := poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 && c.Selected == 0 })
++		testPrimaryNewSpotifySelection(t, ctx, p, worker, stream, owner, func() {
++			assertSource(true)
++			poll(func(c counts) bool { return c.Radio > before.Radio && c.After == 0 && c.Selected == 0 })
++		})
++		poll(func(c counts) bool { return c.After == 0 && c.Selected > 0 })
++		return
++	}
++
++	restart := os.Getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != ""
++	resume := os.Getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME") != ""
++	if !resume || restart {
++		const stopAction = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
++		q.Phase, q.Station, q.Owner = "reserve", "", ""
++		q.Handoff, q.Generation, q.Action = "bdb0c4c5-df0e-4f42-a88e-44a8736ca5b8", "2", stopAction
++		q.Owner = wait(q, "reserved").Owner
++		q.Phase, q.Session = "stop", playing.Session
++		stopped := wait(q, "released")
++		if stopped.CSeq <= 0 || stopped.Session == nil || *stopped.Session != *playing.Session {
++			t.Fatal("missing exact teardown of the observed radio session")
++		}
++		assertSource(true)
++		if !restart {
++			return
++		}
++		parked, err = worker.InspectRadio(ctx)
++		if err != nil || !parked.Suspended || !parked.WriterClosed || !app.radioOutputFence.Load() {
++			t.Fatalf("explicit Stop implicitly resumed Spotify: %v", err)
++		}
++		poll(func(c counts) bool { return c.After == 0 && c.Windows[0] > 0 && c.Windows[1] == 0 })
++
++		const restartAction = "9cc46ec0-bef7-4d06-80d3-7781017b28d3"
++		q.Handoff, q.Generation, q.Action = "92e205d7-ec55-4fdb-a38f-19cf1426b960", "3", restartAction
++		q.Phase, q.Station, q.Owner, q.From, q.Session = "reserve", "", "", "", nil
++		q.Intent = strconv.FormatUint(app.radio.Intent, 10)
++		wrongRoom := q
++		wrongRoom.Target = "r0"
++		if p.primaryRadioRoom(wrongRoom.Target) != "2" {
++			t.Fatal("wrong-room test requires another configured target")
++		}
++		if _, err := p.radioPrimaryActor(ctx, wrongRoom); err == nil || app.radio.Holds[wrongRoom.Target] != nil {
++			t.Fatal("a different room acquired the same parked Spotify writer's radio admission")
++		}
++		q.Owner = wait(q, "reserved").Owner
++		q.Phase, q.Station = "prepare_start", "p1"
++		wait(q, "prepared")
++		assertSource(true)
++		q.Phase = "start"
++		again := wait(q, "playing")
++		if again.Session == nil || !again.Session.valid() || again.Session.Operation != restartAction ||
++			again.Session.DeviceID != playing.Session.DeviceID || *again.Session == *playing.Session {
++			t.Fatal("fresh explicit selection did not establish distinct same-output radio custody")
++		}
++		poll(func(c counts) bool { return c.After == 0 && c.Windows[1] > 0 })
++		assertSource(true)
++	}
++
++	app.mpris = mpris.DummyServer{}
++	server, err := NewApiServer(app.log, "127.0.0.1", 0, "", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer server.Close()
++	app.server = server
++	p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++	p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++	p.state.player.Options = &connectpb.ContextPlayerOptions{}
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	events, _ := (evtimpl.Impl{}).NewEventManager(app.log, nil, nil, nil, "")
++	nextSessionField(p.sess, "events", events)
++	nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++
++	if _, err = p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypeResume}); err != nil {
++		t.Fatal("explicit Native Resume failed", err)
++	}
++	assertSource(false)
++	if app.openedWriterOwner != p || app.openedWriterGeneration != originalGeneration+1 || app.radioOutputFence.Load() {
++		t.Fatal("explicit Resume did not reopen exact retained writer custody")
++	}
++	poll(func(c counts) bool { return c.After > 0 })
++}
++
++func testConfiguredManagerPrimaryResume(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player, manager string) {
++	t.Helper()
++	app := p.app
++	api, err := NewApiServer(app.log, "127.0.0.1", 0, "", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := api.(*ConcreteApiServer)
++	defer server.Close()
++	app.server, app.mpris = server, mpris.DummyServer{}
++	p.state.player.Track = &connectpb.ProvidedTrack{Uri: "spotify:track:0000000000000000000003"}
++	p.state.player.PlayOrigin = &connectpb.PlayOrigin{}
++	p.state.player.Options = &connectpb.ContextPlayerOptions{}
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	events, _ := (evtimpl.Impl{}).NewEventManager(app.log, nil, nil, nil, "")
++	nextSessionField(p.sess, "events", events)
++	nextSessionField(p.sess, "sp", pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		status := http.StatusNoContent
++		if r.Method == http.MethodPut && r.URL.Path == "/connect-state/v1/devices/fixture-device" {
++			status = http.StatusOK // Connect state publication requires 200.
++		}
++		return &http.Response{StatusCode: status, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
++	})))
++	actorContext, cancel := context.WithCancel(ctx)
++	actorRequests := make(chan ApiRequest)
++	actorDone, dispatchDone := make(chan struct{}), make(chan struct{})
++	app.ownerMu.Lock()
++	app.currentPlayer, app.currentAPI, app.currentDone = p, actorRequests, actorDone
++	app.ownerMu.Unlock()
++	go func() {
++		defer close(actorDone)
++		for {
++			select {
++			case <-actorContext.Done():
++				return
++			case req := <-actorRequests:
++				if !p.dispatchAPIAndPark(actorContext, req) {
++					return
++				}
++			case event, open := <-worker.Receive():
++				if !open {
++					return
++				}
++				p.handlePlayerEvent(actorContext, &event)
++			}
++		}
++	}()
++	go func() {
++		defer close(dispatchDone)
++		app.forwardAPI(actorContext)
++	}()
++	defer func() {
++		cancel()
++		<-dispatchDone
++		<-actorDone
++		app.ownerMu.Lock()
++		app.currentPlayer, app.currentAPI, app.currentDone = nil, nil, nil
++		app.ownerMu.Unlock()
++	}()
++
++	endpoint := "http://" + server.listener.Addr().String()
++	cmd := exec.CommandContext(ctx, manager, "-test.v", "-test.timeout=18s", "-test.run", "^TestConfiguredPrimaryRadioComposed$")
++	cmd.Env = append(os.Environ(), "PC_PRIMARY_MANAGER_NATIVE_URL="+endpoint)
++	output, err := cmd.CombinedOutput()
++	t.Logf("configured Manager result:\n%s", output)
++	if err != nil {
++		t.Fatal("configured Manager did not complete the three observed stations", err)
++	}
++	parked, err := worker.InspectRadio(ctx)
++	if err != nil || !parked.Suspended || !parked.WriterClosed || !app.radioOutputFence.Load() {
++		t.Fatal("Manager radio did not retain the parked Spotify writer", err)
++	}
++	resume, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/player/resume", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response, err := http.DefaultClient.Do(resume)
++	if err != nil {
++		t.Fatal("explicit Native Resume failed", err)
++	}
++	response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		t.Fatalf("explicit Native Resume returned HTTP %d", response.StatusCode)
++	}
++}
++
++// Use the ordinary public content offer/prepare/commit handlers with the real
++// actor, guarded C START and existing inert provider decoder fixtures.
++func testPrimaryNewSpotifySelection(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player,
++	incumbent *player.Stream, owner roomTransportIdentity, whileStaged func()) {
++	t.Helper()
++	app := p.app
++	app.mpris = mpris.DummyServer{}
++	server := &ConcreteApiServer{log: app.log, requests: make(chan ApiRequest)}
++	app.server = server
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for req := range server.requests {
++			if !p.dispatchAPIAndPark(ctx, req) {
++				return
++			}
++		}
++	}()
++	defer func() {
++		close(server.requests)
++		<-done
++	}()
++
++	scope := roomVolumeScope{owner.AccountUserID, owner.TargetID, owner.RoomID, owner.HomePodID}
++	query := url.Values{
++		"account_user_id": {scope.AccountUserID}, "target_id": {scope.TargetID},
++		"room_id": {scope.RoomID}, "homepod_id": {scope.HomePodID},
++	}
++	rec := httptest.NewRecorder()
++	server.handleContentControls(rec, httptest.NewRequestWithContext(ctx, http.MethodGet,
++		"/player/room_content/controls?"+query.Encode(), nil))
++	var control struct {
++		Ready bool         `json:"ready"`
++		Offer contentOffer `json:"start_offer"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &control); err != nil || rec.Code != http.StatusOK || !control.Ready {
++		t.Fatalf("new Spotify content offer while radio plays returned HTTP %d: %v", rec.Code, err)
++	}
++	op := server.roomContents.get(control.Offer.OfferID, control.Offer.BindingID)
++	if op == nil || op.Radio == nil || !op.Radio.Primary {
++		t.Fatal("new Spotify offer lost the incumbent primary radio custody")
++	}
++
++	const selectedURI = "spotify:track:0000000000000000000004"
++	post := func(path string, body any, handler http.HandlerFunc) *httptest.ResponseRecorder {
++		t.Helper()
++		raw, err := json.Marshal(body)
++		if err != nil {
++			t.Fatal(err)
++		}
++		w := httptest.NewRecorder()
++		handler(w, httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(raw)))
++		if w.Code != http.StatusOK {
++			t.Fatalf("new Spotify content %s returned HTTP %d", path, w.Code)
++		}
++		return w
++	}
++	post("/player/room_content/prepare", contentPrepareRequest{scope, control.Offer, "play_track",
++		contentArgs{TrackURI: selectedURI, MaxVolume: 35}}, server.handleContentPrepare)
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++	var fresh *player.Stream
++	for fresh == nil {
++		op.mu.Lock()
++		phase, selected := op.State, op.Stream
++		op.mu.Unlock()
++		if phase == "staged" && selected != nil {
++			fresh = selected
++			break
++		}
++		if phase != "staging" {
++			t.Fatalf("new Spotify media did not stage: %s", phase)
++		}
++		select {
++		case <-ctx.Done():
++			t.Fatal("new Spotify media did not stage before the existing fixture deadline")
++		case <-tick.C:
++		}
++	}
++	if fresh == incumbent || fresh.Source == incumbent.Source || fresh.Media == nil || fresh.Media.Id().Uri() != selectedURI {
++		t.Fatal("prepared Spotify media is not the explicitly selected new track")
++	}
++	whileStaged()
++
++	rec = post("/player/room_content/commit", contentIDRequest{control.Offer.OfferID, control.Offer.BindingID},
++		server.handleContentCommit)
++	var receipt contentReceipt
++	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || !receipt.Accepted || receipt.OperationID != control.Offer.OfferID {
++		if log, ok := app.log.(*contentFailureLog); ok {
++			log.mu.Lock()
++			for _, line := range log.lines {
++				if strings.HasPrefix(line, "content_start_failed stage=") {
++					t.Log(line)
++				}
++			}
++			log.mu.Unlock()
++		}
++		t.Fatalf("new Spotify content did not receive exact START acceptance: state=%s accepted=%t err=%v", receipt.State, receipt.Accepted, err)
++	}
++	// Join the production actor's commit before reading worker and session state.
++	_, _ = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
++	source, err := worker.Start35CurrentSource(ctx)
++	if err != nil || source != fresh.Source || p.primaryStream != fresh || p.state.player.IsPaused ||
++		!p.state.player.IsPlaying || p.state.player.Track.GetUri() != selectedURI || p.state.player.SessionId == owner.SessionID ||
++		app.startCustody != op || app.radioOutputFence.Load() {
++		t.Fatalf("new Spotify media did not replace the original source under its own START: %v", err)
++	}
++}
+diff --git a/daemon/radio_primary_stop.go b/daemon/radio_primary_stop.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..15bdbf26a6b917d1bf2cf46b641f0e325836d122
+--- /dev/null
++++ b/daemon/radio_primary_stop.go
+@@ -0,0 +1,174 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const primaryRadioStopSchema = "podconnect.output_radio_primary_stop.v1"
++
++type radioPrimaryBinding struct {
++	Process     string `json:"process"`
++	Operation   string `json:"operation"`
++	DeviceID    string `json:"device_id"`
++	Incarnation string `json:"incarnation"`
++	Epoch       string `json:"session_epoch"`
++	Route       string `json:"route_revision"`
++}
++
++func (b radioPrimaryBinding) valid() bool {
++	return volumeUUID.MatchString(b.Process) && volumeUUID.MatchString(b.Operation) &&
++		volumeCounter(b.DeviceID) && b.DeviceID != "0" &&
++		volumeCounter(b.Incarnation) && b.Incarnation != "0" &&
++		volumeCounter(b.Epoch) && b.Epoch != "0" && volumeCounter(b.Route)
++}
++
++type radioPrimaryStopRequest struct {
++	Schema string `json:"schema"`
++	Phase  string `json:"phase"`
++	Action string `json:"action"`
++	radioPrimaryBinding
++}
++
++type radioPrimaryStopReceipt struct {
++	radioPrimaryStopRequest
++	TeardownCSeq int `json:"teardown_cseq"`
++}
++
++func validPrimaryRadioHold(h *radioHold) bool {
++	r := h.Request
++	return h.Primary != nil && h.Primary.valid() && r.Schema == "podconnect.native_radio_primary_hold.v1" &&
++		nativeOwnerASCII(r.TargetID, 255) && volumeHex64.MatchString(r.ProcessID) &&
++		volumeUUID.MatchString(r.ActionID) && volumeCounter(r.ExpectedRevision) &&
++		volumeUUID.MatchString(r.HandoffID) && volumeCounter(r.Generation) && r.Generation != "0" &&
++		r.ActionID == h.Primary.Operation &&
++		r.Peer == (radioPeer{}) && r.Token == "" && h.Actions != nil &&
++		(h.PrimaryAction == "" || volumeUUID.MatchString(h.PrimaryAction)) &&
++		h.Absence == nil && h.Parked == nil &&
++		(!h.WriterParked && !h.PauseUncertain && !h.RequiresPause ||
++			h.PrimaryPark != nil && h.WriterParked && !h.PauseUncertain && h.RequiresPause)
++}
++
++// Exactly one effectful claim is permitted. A pending result can be read
++// within the original action deadline. A lost reply is never sent again.
++func radioPrimaryDrain(ctx context.Context, endpoint, token string, binding radioPrimaryBinding, action string, current func() bool) (radioPrimaryStopReceipt, error) {
++	if !binding.valid() || !volumeUUID.MatchString(action) {
++		return radioPrimaryStopReceipt{}, ErrAliasConflict
++	}
++	r := radioPrimaryStopRequest{Schema: primaryRadioStopSchema, Phase: "claim_stop", Action: action, radioPrimaryBinding: binding}
++	tick := time.NewTicker(30 * time.Millisecond)
++	defer tick.Stop()
++	for {
++		if ctx.Err() != nil || !current() {
++			return radioPrimaryStopReceipt{}, ErrAliasConflict
++		}
++		var ack radioPrimaryStopReceipt
++		if err := radioAuthenticatedHTTP(ctx, endpoint, token, r, &ack); err != nil {
++			return radioPrimaryStopReceipt{}, err
++		}
++		if ctx.Err() != nil || !current() || ack.Schema != r.Schema || ack.Action != action || ack.radioPrimaryBinding != binding {
++			return radioPrimaryStopReceipt{}, ErrAliasConflict
++		}
++		if ack.Phase == "released" && ack.TeardownCSeq > 0 {
++			return ack, nil
++		}
++		if ack.Phase != "pending" || ack.TeardownCSeq != 0 {
++			return radioPrimaryStopReceipt{}, ErrAliasConflict
++		}
++		r.Phase = "result"
++		select {
++		case <-ctx.Done():
++			return radioPrimaryStopReceipt{}, ctx.Err()
++		case <-tick.C:
++		}
++	}
++}
++
++func (p *AppPlayer) preemptPrimaryRadio(parent context.Context, target string, h *radioHold) error {
++	app := p.app
++	app.radio.mu.Lock()
++	if app.radio.failed || app.radio.Holds[target] != h || h.owner != p || h.Phase != "primary_active" || h.PrimaryAction != "" || h.PrimaryPark != nil || !validPrimaryRadioHold(h) {
++		app.radio.mu.Unlock()
++		return ErrAliasConflict
++	}
++	binding, intent := *h.Primary, app.radio.Intent
++	app.radio.mu.Unlock()
++	owner, intended, err := p.radioOwnersForIntent(target)
++	if err != nil || intended.HomePodID != binding.DeviceID {
++		return ErrAliasConflict
++	}
++	revision, err := p.nextNativeIntent()
++	if err != nil {
++		return err
++	}
++	id, err := randomQueueID(16)
++	if err != nil {
++		return err
++	}
++	action := id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
++	app.radio.mu.Lock()
++	if app.radio.failed || app.radio.Intent != intent || app.radio.Holds[target] != h || h.owner != p ||
++		h.Phase != "primary_active" || h.PrimaryAction != "" || h.Primary == nil || *h.Primary != binding {
++		app.radio.mu.Unlock()
++		return ErrAliasConflict
++	}
++	h.Phase, h.PrimaryAction = "reacquiring", action
++	err = app.persistRadioLocked()
++	app.radio.mu.Unlock()
++	if err != nil {
++		return err
++	}
++	succeeded := false
++	defer func() {
++		if !succeeded {
++			app.radio.mu.Lock()
++			if app.radio.Holds[target] == h && h.PrimaryAction == action {
++				h.Phase = "unknown"
++				_ = app.persistRadioLocked()
++			}
++			app.radio.mu.Unlock()
++		}
++	}()
++	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
++	defer cancel()
++	intentCurrentLocked := func() bool {
++		return !app.radio.failed && !p.aliasRetired && strconv.FormatUint(p.roomNativeIntent, 10) == revision &&
++			p.aliasRevision == owner.AliasRevision && p.aliasIncarnation == owner.AliasIncarnation &&
++			p.aliasFingerprint == owner.AliasRegistry && p.spotConnId == owner.ConnectionID &&
++			p.state != nil && p.state.player != nil && p.state.player.SessionId == owner.SessionID &&
++			app.radio.Intent == intent && app.radio.Holds[target] == h && h.Primary != nil && *h.Primary == binding &&
++			h.Phase == "reacquiring" && h.PrimaryAction == action
++	}
++	current := func() bool {
++		nowOwner, nowIntended, err := p.radioOwnersForIntent(target)
++		if err != nil || nowOwner != owner || nowIntended != intended {
++			return false
++		}
++		p.aliasMu.Lock()
++		defer p.aliasMu.Unlock()
++		app.radio.mu.Lock()
++		defer app.radio.mu.Unlock()
++		return intentCurrentLocked()
++	}
++	endpoint := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + binding.DeviceID + "/radio-handoff/reacquire"
++	ack, err := radioPrimaryDrain(ctx, endpoint, app.cfg.RadioHandoffControlToken, binding, action, current)
++	if err != nil {
++		return err
++	}
++	p.aliasMu.Lock()
++	defer p.aliasMu.Unlock()
++	app.radio.mu.Lock()
++	defer app.radio.mu.Unlock()
++	if ctx.Err() != nil || !intentCurrentLocked() {
++		return ErrAliasConflict
++	}
++	h.Phase, h.PrimaryPending.Released = "primary_released", ack.TeardownCSeq
++	if err = app.persistRadioLocked(); err != nil {
++		h.Phase, h.PrimaryPending.Released = "reacquiring", 0
++		return err
++	}
++	succeeded = true
++	return nil
++}
+diff --git a/daemon/radio_primary_stop_test.go b/daemon/radio_primary_stop_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..033d44955db72c065fea84b42130a457a7afedd8
+--- /dev/null
++++ b/daemon/radio_primary_stop_test.go
+@@ -0,0 +1,78 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestPrimaryRadioDrainBindsActionAndNeverReplays(t *testing.T) {
++	binding := radioPrimaryBinding{
++		Process: "a411aa42-8b70-4bf4-a37d-81b0519db7df", Operation: "b3919fea-955b-4d4c-a581-c71cb92712b2",
++		DeviceID: "2", Incarnation: "4", Epoch: "5", Route: "0",
++	}
++	const action = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
++	for _, variant := range []string{"exact", "stale", "wrong_action", "lost_reply"} {
++		t.Run(variant, func(t *testing.T) {
++			var claims, observations atomic.Int32
++			var current atomic.Bool
++			current.Store(true)
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var request radioPrimaryStopRequest
++				if json.NewDecoder(r.Body).Decode(&request) != nil || request.Schema != primaryRadioStopSchema ||
++					request.Action != action || request.radioPrimaryBinding != binding || r.Header.Get("X-PodConnect-Token") != "inert-test-token" {
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				ack := radioPrimaryStopReceipt{radioPrimaryStopRequest: request}
++				switch request.Phase {
++				case "claim_stop":
++					claims.Add(1)
++					if variant == "lost_reply" {
++						w.WriteHeader(http.StatusServiceUnavailable)
++						return
++					}
++					ack.Phase = "pending"
++				case "result":
++					observations.Add(1)
++					ack.Phase, ack.TeardownCSeq = "released", 7
++					if variant == "stale" {
++						current.Store(false)
++					}
++					if variant == "wrong_action" {
++						ack.Action = binding.Operation
++					}
++				default:
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				_ = json.NewEncoder(w).Encode(ack)
++			}))
++			defer server.Close()
++
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			_, err := radioPrimaryDrain(ctx, server.URL, "inert-test-token", binding, action, current.Load)
++			if (err == nil) != (variant == "exact") || claims.Load() != 1 {
++				t.Fatalf("exact-action result err=%v, claims=%d", err, claims.Load())
++			}
++			if variant == "lost_reply" && observations.Load() != 0 || variant != "lost_reply" && observations.Load() != 1 {
++				t.Fatalf("unexpected status reads: %d", observations.Load())
++			}
++		})
++	}
++}
++
++func TestPrimaryRadioConnectTransferDoesNotClaimStop(t *testing.T) {
++	app := &App{}
++	p := &AppPlayer{app: app}
++	h := &radioHold{Primary: &radioPrimaryBinding{}, Phase: "primary_active", owner: p}
++	app.radio.Holds = map[string]*radioHold{"target": h}
++	if err := p.preemptRadioPolicy(context.Background(), "target", "transfer", false, false); err == nil || h.PrimaryAction != "" || h.Phase != "primary_active" {
++		t.Fatal("unproven transfer changed the primary radio hold")
++	}
++}
+diff --git a/daemon/radio_primary_test.go b/daemon/radio_primary_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6d59b0af957321320d27c9ff1d0433d2a07d3dc
+--- /dev/null
++++ b/daemon/radio_primary_test.go
+@@ -0,0 +1,116 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++)
++
++func TestPrimaryRadioActorUsesSameReservationAcrossStartAndStop(t *testing.T) {
++	p, op := contentFixture(t)
++	p.app.radio.Holds = map[string]*radioHold{}
++	p.app.cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "radio.json")
++	p.app.cfg.RadioHandoffControlToken = "inert-test-token"
++	const process = "a411aa42-8b70-4bf4-a37d-81b0519db7df"
++	const startAction = "b3919fea-955b-4d4c-a581-c71cb92712b2"
++	const stopAction = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
++	target := radioPrimaryTarget{Process: process, Device: "202", Incarnation: "4", Epoch: "0", Route: "0"}
++	binding := radioPrimaryBinding{Process: process, DeviceID: "202", Operation: startAction, Incarnation: "4", Epoch: "1", Route: "0"}
++	var starts, stops atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		if req.URL.Path != "/api/outputs/202/radio-handoff/reacquire" || req.Header.Get("X-PodConnect-Token") != "inert-test-token" {
++			w.WriteHeader(http.StatusForbidden)
++			return
++		}
++		var raw json.RawMessage
++		if json.NewDecoder(req.Body).Decode(&raw) != nil {
++			w.WriteHeader(http.StatusBadRequest)
++			return
++		}
++		var discriminator struct{ Schema string }
++		_ = json.Unmarshal(raw, &discriminator)
++		switch discriminator.Schema {
++		case cPrimaryStartSchema:
++			var r radioPrimaryStartWire
++			if strictVolumeJSON(raw, &r) != nil || r.Device != target.Device {
++				w.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			ack := radioPrimaryStartReceipt{radioPrimaryStartWire: r}
++			switch r.Phase {
++			case "target":
++				ack.Phase, ack.radioPrimaryTarget = "target_ready", target
++			case "start":
++				starts.Add(1)
++				ack.Phase = "pending"
++			case "result":
++				ack.Phase, ack.Session = "playing", &binding
++			default:
++				w.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			_ = json.NewEncoder(w).Encode(ack)
++		case primaryRadioStopSchema:
++			var r radioPrimaryStopRequest
++			if strictVolumeJSON(raw, &r) != nil || r.Action != stopAction || r.radioPrimaryBinding != binding {
++				w.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			ack := radioPrimaryStopReceipt{radioPrimaryStopRequest: r}
++			if r.Phase == "claim_stop" {
++				stops.Add(1)
++				ack.Phase = "pending"
++			} else {
++				ack.Phase, ack.TeardownCSeq = "released", 8
++			}
++			_ = json.NewEncoder(w).Encode(ack)
++		default:
++			w.WriteHeader(http.StatusBadRequest)
++		}
++	}))
++	defer server.Close()
++	p.app.cfg.RoomTransportOwnToneURL = server.URL
++	ctx := context.Background()
++	ask := func(r radioPrimaryCommand, phase string) radioPrimaryReply {
++		t.Helper()
++		reply, err := p.radioPrimaryActor(ctx, r)
++		if err != nil {
++			t.Fatal(err)
++		}
++		ack, ok := reply.(radioPrimaryReply)
++		if !ok || ack.Phase != phase {
++			t.Fatalf("want %s, got %v", phase, reply)
++		}
++		return ack
++	}
++	request := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(op.Capture.Process),
++		Handoff: process, Generation: "1", Action: startAction, Target: "r1", Intent: "0", From: "r0"}
++	request.Owner = ask(request, "reserved").Owner
++	request.Phase, request.Station = "prepare_start", "p3"
++	ask(request, "prepared")
++	request.Phase = "start"
++	ask(request, "pending")
++	if _, err := p.radioPrimaryActor(ctx, request); err == nil {
++		t.Fatal("duplicate station action replayed")
++	}
++	request.Phase, request.ForPhase = "result", "start"
++	if ack := ask(request, "playing"); ack.Session == nil || *ack.Session != binding || ack.Observation.Source != "radio" {
++		t.Fatal("wrong live primary receipt")
++	}
++	request.Phase, request.ForPhase, request.Station, request.Owner = "reserve", "", "", ""
++	request.Action, request.Generation, request.From = stopAction, "2", request.Target
++	request.Owner = ask(request, "reserved").Owner
++	request.Phase, request.Session = "stop", &binding
++	ask(request, "pending")
++	request.Phase, request.ForPhase = "result", "stop"
++	if ack := ask(request, "released"); ack.CSeq != 8 || ack.Observation.Source != "none" {
++		t.Fatal("wrong exact release receipt")
++	}
++	if starts.Load() != 1 || stops.Load() != 1 || p.primaryStream != op.Capture.Primary || p.state.player != op.Capture.PlayerState {
++		t.Fatal("actor replayed effects or changed the disjoint Spotify source")
++	}
++}
+diff --git a/daemon/radio_reacquire.go b/daemon/radio_reacquire.go
+index 7f0e842c92c5dcf31a52f31331cbdc75764575ac..5d129e3d80667c1e9f561aefa4f1bca9559f5a5b 100644
+--- a/daemon/radio_reacquire.go
++++ b/daemon/radio_reacquire.go
+@@ -150,6 +150,20 @@ func (p *AppPlayer) preemptRadioPolicy(ctx context.Context, target, cause string
+ 		app.radio.mu.Unlock()
+ 		return nil
+ 	}
++	if h.Primary != nil {
++		parkedPrimary := h.PrimaryPark != nil
++		app.radio.mu.Unlock()
++		if parkedPrimary {
++			if cause != "resume" && cause != "play" || keepMuted && cause != "play" {
++				return ErrAliasConflict
++			}
++			return p.returnPrimarySpotify(ctx, target, h, cause == "resume")
++		}
++		if cause != "play" && cause != "resume" {
++			return ErrAliasConflict
++		}
++		return p.preemptPrimaryRadio(ctx, target, h)
++	}
+ 	if h.owner != p || (h.Phase != "suspended" && h.Phase != "prepared") || h.Latest == nil || (h.Latest.Phase != "suspended" && h.Latest.Phase != "prepared") || !volumeHex32.MatchString(h.Proof.Token) {
+ 		app.radio.mu.Unlock()
+ 		return ErrAliasConflict
+@@ -384,6 +398,9 @@ func radioControlHTTPProbe(ctx context.Context, method, endpoint, token string,
+ 		return err
+ 	}
+ 	defer response.Body.Close()
++	if _, ok := out.(*radioPrimaryCapability); ok && method == http.MethodGet && (response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusBadRequest) {
++		return errPrimaryCapabilityUnsupported
++	}
+ 	raw, err = io.ReadAll(io.LimitReader(response.Body, 16385))
+ 	if err != nil || len(raw) > 16384 || response.StatusCode != http.StatusOK {
+ 		return ErrAliasConflict
+diff --git a/daemon/radio_reacquired_writer.go b/daemon/radio_reacquired_writer.go
+index 674d052980e2576688031db0a734ada0dd8007c6..8017165dc3dc1ed6895baaea7564a47692cdd2f6 100644
+--- a/daemon/radio_reacquired_writer.go
++++ b/daemon/radio_reacquired_writer.go
+@@ -27,23 +27,24 @@ type radioReacquiredSource struct {
+ // subsequent authenticated source-state observation, never from an old START
+ // or an invented OTHER grant. The immutable hold remains in terminal history.
+ type radioReacquiredWriter struct {
+-	Intent       uint64
+-	GlobalIntent uint64
+-	Owner        *AppPlayer
+-	Player       *player.Player
+-	Session      *session.Session
+-	Primary      *player.Stream
+-	Source       librespot.AudioSource
+-	Identity     roomTransportIdentity
+-	Wire         queueWriterWire
+-	Writer       output.MovePipeIdentity
+-	Process      contentProcess
+-	Generation   uint64
+-	Hold         radioCBinding
+-	Receipt      radioReacquireReply
+-	Observed     radioReacquiredSource
+-	StartAt      *contentOperation
+-	MoveAt       *moveOperation
++	Intent        uint64
++	GlobalIntent  uint64
++	Owner         *AppPlayer
++	Player        *player.Player
++	Session       *session.Session
++	Primary       *player.Stream
++	Source        librespot.AudioSource
++	Identity      roomTransportIdentity
++	Wire          queueWriterWire
++	Writer        output.MovePipeIdentity
++	Process       contentProcess
++	Generation    uint64
++	Hold          radioCBinding
++	Receipt       radioReacquireReply
++	Observed      radioReacquiredSource
++	StartAt       *contentOperation
++	MoveAt        *moveOperation
++	PrimaryReturn *radioPrimaryReturnReceipt
+ }
+ 
+ func (p *AppPlayer) captureRadioReacquiredWriter(ctx context.Context, h *radioHold, r radioReacquire, ack *radioReacquireReply, writer queueWriterWire, intended roomTransportIdentity, globalIntent uint64) (*radioReacquiredWriter, error) {
+@@ -105,7 +106,12 @@ func (p *AppPlayer) captureRadioReacquiredWriter(ctx context.Context, h *radioHo
+ 	if !valid || process != writer.Process || app.openedWriterOwner != p || app.openedWriter != actual || app.openedWriterGeneration != generation {
+ 		return nil, ErrAliasConflict
+ 	}
+-	return &radioReacquiredWriter{intent, globalIntent, p, p.player, p.sess, primary, source, intended, writer, actual, process, generation, h.Proof, *ack, observed, app.startCustody, app.moveCustody}, nil
++	return &radioReacquiredWriter{
++		Intent: intent, GlobalIntent: globalIntent, Owner: p, Player: p.player, Session: p.sess,
++		Primary: primary, Source: source, Identity: intended, Wire: writer, Writer: actual, Process: process,
++		Generation: generation, Hold: h.Proof, Receipt: *ack, Observed: observed,
++		StartAt: app.startCustody, MoveAt: app.moveCustody,
++	}, nil
+ }
+ 
+ func (app *App) completedRadioReacquiredWriterCurrentLocked(owner *AppPlayer, identity roomTransportIdentity) (*completedWriter, bool, error) {
+@@ -133,12 +139,22 @@ func (app *App) completedRadioReacquiredWriterCurrentLocked(owner *AppPlayer, id
+ 		return nil, true, ErrAliasConflict
+ 	}
+ 	process, valid := nativeContentProcess()
+-	if !valid || process != proof.Process || owner == nil || owner.player == nil || owner.sess == nil || owner.state == nil || owner.state.player == nil || proof.Owner != owner || proof.Player != owner.player || proof.Session != owner.sess || proof.Primary != owner.primaryStream || owner.primaryStream == nil || proof.Source != owner.primaryStream.Source || proof.Identity != identity || owner.state.player.SessionId != identity.SessionID || owner.spotConnId != identity.ConnectionID || app.openedWriterOwner != owner || app.openedWriter != proof.Writer || app.openedWriterGeneration != proof.Generation || proof.Receipt.Phase != "opened" || !proof.Receipt.Barrier || proof.Receipt.Writer == nil || *proof.Receipt.Writer != proof.Wire || proof.Observed.Writer != proof.Wire || proof.Observed.Owner != identity {
++	if !valid || process != proof.Process || owner == nil || owner.player == nil || owner.sess == nil || owner.state == nil || owner.state.player == nil || proof.Owner != owner || proof.Player != owner.player || proof.Session != owner.sess || proof.Primary != owner.primaryStream || owner.primaryStream == nil || proof.Source != owner.primaryStream.Source || proof.Identity != identity || owner.state.player.SessionId != identity.SessionID || owner.spotConnId != identity.ConnectionID || app.openedWriterOwner != owner || app.openedWriter != proof.Writer || app.openedWriterGeneration != proof.Generation || !proof.openedCurrent(identity) {
+ 		return nil, true, ErrAliasConflict
+ 	}
+ 	return &completedWriter{reacquired: proof, custodyStart: proof.StartAt, custodyMove: proof.MoveAt, writer: proof.Writer, epoch: proof.Wire.Epoch}, true, nil
+ }
+ 
++func (proof *radioReacquiredWriter) openedCurrent(identity roomTransportIdentity) bool {
++	if primary := proof.PrimaryReturn; primary != nil {
++		return primary.Schema == cPrimaryReturnSchema && primary.Phase == "opened" && primary.Writer != nil &&
++			*primary.Writer == proof.Wire && primary.Park.Owner == identity && primary.Route != nil &&
++			primary.Route.valid() && primary.Route.DeviceID == identity.HomePodID
++	}
++	return proof.Receipt.Phase == "opened" && proof.Receipt.Barrier && proof.Receipt.Writer != nil &&
++		*proof.Receipt.Writer == proof.Wire && proof.Observed.Writer == proof.Wire && proof.Observed.Owner == identity
++}
++
+ // Credit completion inside the actual source/output verification boundary.
+ // A late EOF, reused FD with a new epoch, or a replacement owner cannot publish
+ // authority between the C observation and durable Native terminal receipt.
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index d00748fa345933c24eb73c6542b810fcbf4ee6f2..6d61f4972cf957808e5c489aaf0b5845e5103a44 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -566,10 +566,6 @@ func (op *contentOperation) stage() {
+ 		terminalState = "cancelled"
+ 		return
+ 	}
+-	// Ownership remains with the staged operation until guarded publication.
+-	op.mu.Lock()
+-	op.Stream = stream
+-	op.mu.Unlock()
+ 	keepStaged = true
+ 	time.AfterFunc(5*time.Second, func() {
+ 		op.mu.Lock()
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..629aae74cb00751aa443e293b2a8482a33bd0e88 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -50,6 +50,17 @@ import (
+ 	"unsafe"
+ )
+ 
++type stagedSourceCloseWitness struct {
++	librespot.AudioSource
++	closer io.Closer
++	calls  atomic.Int32
++}
++
++func (s *stagedSourceCloseWitness) Close() error {
++	s.calls.Add(1)
++	return s.closer.Close()
++}
++
+ type contentInertSource struct {
+ 	closes    atomic.Int32
+ 	finite    bool
+@@ -605,7 +616,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 	modes := []string{"absence-evolution-admission-failed", "absence-evolution-admission-unknown", "absence-evolution-fifo", "absence-evolution-pending-completion", "absence-evolution-save-fails", "absence-evolution-current-start", "absence-evolution-current-stale", "sourceful-reacquired-writer", "playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation", "direct-pause-current", "direct-pause-unknown-state", "direct-pause-route", "direct-pause-foreign-prepare", "direct-pause-late-generation", "direct-pause-late-intent", "direct-pause-unknown-commit", "direct-pause-unknown-confirm", "episode-stage", "episode-metadata404", "episode-decode404", "episode-wrongmetadata", "episode-owner-stale", "episode-owner-late", "episode-wronggid", "episode-commit", "episode-invalid-overflow", "episode-invalid-maxplus", "episode-invalid-malformed", "episode-resolved-overflow", "episode-missinggid", "episode-malformedgid"}
+ 	if mode := os.Getenv("PC_NATIVE_START_MODE"); mode != "" {
+-		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" && mode != "actual-c-selected" && mode != "actual-c-selected-stage" && mode != "actual-c-selected-successor" && mode != "actual-c-selected-rtp" && mode != "selected-sustained" && mode != "actual-c-native-pause" && mode != "actual-c-radio-http" {
++		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" && mode != "actual-c-selected" && mode != "actual-c-selected-stage" && mode != "actual-c-selected-successor" && mode != "actual-c-selected-rtp" && mode != "selected-sustained" && mode != "actual-c-native-pause" && mode != "actual-c-radio-http" && mode != "actual-c-primary-same-target" {
+ 			t.Fatal("invalid C compose mode")
+ 		}
+ 		modes = []string{mode}
+@@ -656,6 +667,12 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					// before any source/alias/owner is published to real C.
+ 					p.initAliasRegistry()
+ 				}
++				if mode == "actual-c-primary-same-target" {
++					if os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN") != "" || os.Getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != "" {
++						p.app.cfg.DeviceAliasHomePodIDs[0] = "2"
++					}
++					p.initAliasRegistry()
++				}
+ 			}
+ 
+ 			p.app.cfg.AudioOutputPipe = path
+@@ -703,7 +720,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 				}
+ 				return out, e
+ 			}}
+-			if strings.HasPrefix(mode, "actual-c-selected-") || mode == "selected-sustained" || mode == "actual-c-native-pause" || strings.HasPrefix(mode, "episode-") || mode == "actual-c-radio-http" && os.Getenv("PC_NATIVE_RADIO_HTTP_SELECTED_PROVIDER") == "1" {
++			if strings.HasPrefix(mode, "actual-c-selected-") || mode == "selected-sustained" || mode == "actual-c-native-pause" || strings.HasPrefix(mode, "episode-") || mode == "actual-c-radio-http" && os.Getenv("PC_NATIVE_RADIO_HTTP_SELECTED_PROVIDER") == "1" || mode == "actual-c-primary-same-target" && os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
+ 				if strings.HasPrefix(mode, "episode-") {
+ 					configureSelectedStage(t, p, options, mode)
+ 				} else {
+@@ -755,12 +772,17 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					source.eofFile = os.Getenv("PC_NATIVE_START_EOF_FILE")
+ 				}
+ 			}
+-			if strings.HasPrefix(mode, "direct-pause-") {
++			managerPrimary := mode == "actual-c-primary-same-target" && os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN") != ""
++			if strings.HasPrefix(mode, "direct-pause-") || managerPrimary {
+ 				sp := pc13Spclient(t, pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
+ 					return &http.Response{StatusCode: 204, Body: http.NoBody, Header: make(http.Header), Request: r}, nil
+ 				}))
+ 				current := &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000003"}
+-				list, e := tracks.NewTrackListFromContext(context.Background(), p.app.log, sp, &connectpb.Context{Uri: current.Uri, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{current}}}})
++				queue := []*connectpb.ContextTrack{current}
++				if managerPrimary {
++					queue = append(queue, &connectpb.ContextTrack{Uri: "spotify:track:0000000000000000000004"})
++				}
++				list, e := tracks.NewTrackListFromContext(context.Background(), p.app.log, sp, &connectpb.Context{Uri: current.Uri, Pages: []*connectpb.ContextPage{{Tracks: queue}}})
+ 				if e != nil {
+ 					t.Fatal(e)
+ 				}
+@@ -1040,7 +1062,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			} else {
+ 				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
+ 			}
+-			good := strings.HasPrefix(mode, "absence-evolution-") && !strings.HasPrefix(mode, "absence-evolution-admission-") || mode == "sourceful-reacquired-writer" || strings.HasPrefix(mode, "direct-pause-") || mode == "actual-c-paused" || mode == "actual-c-playing" || mode == "actual-c-radio-http" || mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
++			good := strings.HasPrefix(mode, "absence-evolution-") && !strings.HasPrefix(mode, "absence-evolution-admission-") || mode == "sourceful-reacquired-writer" || strings.HasPrefix(mode, "direct-pause-") || mode == "actual-c-paused" || mode == "actual-c-playing" || mode == "actual-c-radio-http" || mode == "actual-c-primary-same-target" || mode == "playing" || mode == "paused" || strings.HasPrefix(mode, "dealer-")
+ 			if good {
+ 				if err != nil {
+ 					if external && actualOutput != nil {
+@@ -1241,6 +1263,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			if mode == "actual-c-radio-http" {
+ 				testServeActualRadioHTTP(t, p, worker, stream)
+ 			}
++			if mode == "actual-c-primary-same-target" {
++				testPrimarySameTargetWithActualSTART(t, p, worker, stream)
++			}
+ 			if external && mode != "actual-c-radio-http" {
+ 				reply, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
+ 				if e != nil {
+@@ -1380,41 +1405,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 	if mode == "episode-commit" {
+ 		selectedHomePod = "202"
+ 	}
+-	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r1", selectedHomePod})
+-	if err != nil {
+-		t.Fatal("capture", err)
+-	}
+-	state, err := capture.readCState(ctx)
+-	if err != nil {
+-		t.Fatal("actual C state", err)
+-	}
+-	offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
+-	if err != nil {
+-		t.Fatal("offer", err)
+-	}
+-	op := offered.(*contentOperation)
+-	if !server.roomContents.put(op) {
+-		t.Fatal("store")
+-	}
+-	request := contentPrepareRequest{capture.Scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
+-	if mode == "episode-commit" {
+-		request.Action = "play_episode"
+-		request.Args = contentArgs{EpisodeURI: "spotify:episode:0000000000000000000004", MaxVolume: 35}
+-	}
+-	if mode == "actual-c-selected" {
+-		_, err = server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
++	scope := roomVolumeScope{"account", "engine", "r1", selectedHomePod}
++	offer := func() *contentOperation {
++		t.Helper()
++		capture, err := p.captureContent(scope)
+ 		if err != nil {
+-			t.Fatal("claim", err)
++			t.Fatal("capture", err)
+ 		}
+-		op.mu.Lock()
+-		op.Stream, op.Tracks = stream, p.state.tracks
+-		op.Prepared.SessionId = op.Intended.SessionID
+-		op.Prepared.IsPlaying, op.Prepared.IsPaused = true, true
+-		op.ContentDigest = strings.Repeat("d", 64)
+-		op.State = "staged"
+-		op.StagedUntil = time.Now().Add(5 * time.Second)
+-		op.mu.Unlock()
+-	} else {
++		state, err := capture.readCState(ctx)
++		if err != nil {
++			t.Fatal("actual C state", err)
++		}
++		offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++		if err != nil {
++			t.Fatal("offer", err)
++		}
++		op := offered.(*contentOperation)
++		if !server.roomContents.put(op) {
++			t.Fatal("store")
++		}
++		return op
++	}
++	stage := func(op *contentOperation, request contentPrepareRequest) *player.Stream {
++		t.Helper()
+ 		raw, _ := json.Marshal(request)
+ 		rec := httptest.NewRecorder()
+ 		server.handleContentPrepare(rec, httptest.NewRequest("POST", "/player/room_content/prepare", bytes.NewReader(raw)))
+@@ -1427,28 +1440,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 			phase, stagedStream := op.State, op.Stream
+ 			op.mu.Unlock()
+ 			if phase == "staged" && stagedStream != nil {
+-				stream = stagedStream
+-				break
++				return stagedStream
+ 			}
+ 			if (phase != "staging" && phase != "staged") || time.Now().After(until) {
+ 				t.Fatal("actual stage did not produce stream", phase)
+ 			}
+ 			time.Sleep(time.Millisecond)
+ 		}
++	}
++	var cancelled *contentOperation
++	replayCancelled := func(handler http.HandlerFunc, path string) {
++		t.Helper()
++		body, _ := json.Marshal(contentIDRequest{cancelled.Offer.OfferID, cancelled.Offer.BindingID})
++		rec := httptest.NewRecorder()
++		handler(rec, httptest.NewRequest("POST", path, bytes.NewReader(body)))
++		var receipt contentReceipt
++		if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || rec.Code != http.StatusOK ||
++			receipt.Accepted || receipt.State != "cancelled" || receipt.OperationID != cancelled.Offer.OfferID {
++			t.Fatalf("exact cancelled offer did not stay terminal: status=%d state=%s accepted=%t err=%v", rec.Code, receipt.State, receipt.Accepted, err)
++		}
++	}
++	if os.Getenv("PC_NATIVE_CANCEL_STAGED_SELECTION") != "" {
++		if mode != "actual-c-selected-rtp" {
++			t.Fatal("cancelled selection requires the actual C RTP fixture")
++		}
++		cancelled = offer()
++		const cancelledURI = "spotify:track:0000000000000000000003"
++		shuffle := false
++		discarded := stage(cancelled, contentPrepareRequest{scope, cancelled.Offer, "play_tracks",
++			contentArgs{TrackURIs: []string{cancelledURI}, Shuffle: &shuffle, LibrarySource: "liked", MaxVolume: 35}})
++		closer, ok := discarded.Source.(io.Closer)
++		if !ok || discarded.File == nil || discarded.File.GetFormat() != metadatapb.AudioFile_FLAC_FLAC ||
++			discarded.Media.Id().Uri() != cancelledURI {
++			t.Fatal("first selection did not stage the exact decoded track")
++		}
++		// Observe the Close on the actual staged decoder and its storage reader.
++		closed := &stagedSourceCloseWitness{AudioSource: discarded.Source, closer: closer}
++		cancelled.mu.Lock()
++		discarded.Source = closed
++		cancelled.mu.Unlock()
++		replayCancelled(server.handleContentCancel, "/player/room_content/cancel")
++		replayCancelled(server.handleContentCommit, "/player/room_content/commit")
++		cancelled.mu.Lock()
++		cleared := cancelled.Terminal && cancelled.Cancelled && cancelled.Stream == nil &&
++			cancelled.CReceipt == nil && !cancelled.CommitClaimed && !cancelled.Published
++		cancelled.mu.Unlock()
++		current, err := worker.Start35CurrentSource(ctx)
++		if err != nil || !cleared || closed.calls.Load() != 1 || current != nil || p.primaryStream != nil || p.app.startCustody != nil {
++			t.Fatalf("cancelled stage reached the live source or C START: %v", err)
++		}
++	}
++	op := offer()
++	if cancelled != nil && (op.Offer.OfferID == cancelled.Offer.OfferID || op.Offer.BindingID == cancelled.Offer.BindingID) {
++		t.Fatal("fresh selection reused the cancelled offer")
++	}
++	request := contentPrepareRequest{scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
++	if mode == "episode-commit" {
++		request.Action = "play_episode"
++		request.Args = contentArgs{EpisodeURI: "spotify:episode:0000000000000000000004", MaxVolume: 35}
++	}
++	if mode == "actual-c-selected" {
++		_, err := server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
++		if err != nil {
++			t.Fatal("claim", err)
++		}
++		op.mu.Lock()
++		op.Stream, op.Tracks = stream, p.state.tracks
++		op.Prepared.SessionId = op.Intended.SessionID
++		op.Prepared.IsPlaying, op.Prepared.IsPaused = true, true
++		op.ContentDigest = strings.Repeat("d", 64)
++		op.State = "staged"
++		op.StagedUntil = time.Now().Add(5 * time.Second)
++		op.mu.Unlock()
++	} else {
++		stream = stage(op, request)
+ 		t.Log("public prepare -> actual ContextResolve/metadata/key/storage/AES/FLAC/NewStream staged")
+ 	}
+ 	body, _ := json.Marshal(contentIDRequest{op.Offer.OfferID, op.Offer.BindingID})
+ 	rec := httptest.NewRecorder()
+ 	server.handleContentCommit(rec, httptest.NewRequest("POST", "/player/room_content/commit", strings.NewReader(string(body))))
+ 	var receipt contentReceipt
+-	if err = json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
++	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
+ 		t.Fatal(err, rec.Code, rec.Body.String())
+ 	}
+ 	if !receipt.Accepted {
+ 		t.Fatal("selected-content actual commit rejected", rec.Code, receipt)
+ 	}
+ 	// Join the existing actor's terminal publication before observing state.
+-	_, err = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
++	_, err := server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
+ 	if err == nil {
+ 		t.Fatal("expected unsupported noop")
+ 	}
+@@ -1456,6 +1535,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
+ 		t.Fatal("selected state not observed", err)
+ 	}
++	if cancelled != nil {
++		if stream.Media.Id().Uri() != request.Args.TrackURI || receipt.OperationID != op.Offer.OfferID ||
++			p.state.player.Track.GetUri() != request.Args.TrackURI || p.app.startCustody != op {
++			t.Fatal("fresh explicit START did not own the requested track")
++		}
++		replayCancelled(server.handleContentCommit, "/player/room_content/commit")
++		if current, err := worker.Start35CurrentSource(ctx); err != nil || current != stream.Source {
++			t.Fatalf("late cancelled commit changed the fresh writer source: %v", err)
++		}
++	}
+ 	if mode == "actual-c-selected-rtp" {
+ 		until := time.Now().Add(7 * time.Second)
+ 		client := &http.Client{Timeout: time.Second}
+@@ -1477,6 +1566,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 			}
+ 			if observed.AudioPackets > 0 {
+ 				t.Logf("actual selected PCM reached C output and private peer as %d audio RTP packet(s)", observed.AudioPackets)
++				if cancelled != nil {
++					t.Log("PASS exact staged decoder cancellation and stale commit refusal before and after fresh actual START35")
++				}
+ 				break
+ 			}
+ 			if time.Now().After(until) {
+@@ -1711,7 +1803,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+ 	if len(episode) > 0 && episode[0] == "episode-commit" {
+ 		mediaBytes = selectedSustainedFLAC
+ 	}
+-	if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" || os.Getenv("PC_NATIVE_START_MODE") == "actual-c-selected-rtp" {
++	if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" || os.Getenv("PC_NATIVE_START_MODE") == "actual-c-selected-rtp" || os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
+ 		mediaBytes = selectedSustainedFLAC
+ 		if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" {
+ 			selectedPCMProof = &selectedPCMState{gate: make(chan struct{}), ranges: map[int]int{}}

@@ -45,6 +45,25 @@ func (s *radioProducerSenderClient) radioTargetPairings(ctx context.Context) (ra
 // CurrentTargets never calls Ready, launches a process, imports credentials or
 // acquires a receiver. Every command still performs its normal fresh preflight.
 func (p *radioProducer) CurrentTargets(ctx context.Context) ([]radioTarget, error) {
+	if p.primary != nil {
+		state, err := p.primaryState(ctx)
+		if err != nil || len(state.Missing) > 0 {
+			return nil, errRadioUnavailable
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if state.Process != p.evidence.NativeProcess {
+			return nil, errRadioUnknown
+		}
+		fresh := make([]radioTarget, 0, len(state.Targets))
+		for _, target := range state.Targets {
+			fresh = append(fresh, target.radioTarget)
+		}
+		if !sameRadioTargetIDs(p.evidence.Targets, fresh) {
+			return nil, errRadioUnknown
+		}
+		return fresh, nil
+	}
 	n, nativeOK := p.native.(interface {
 		radioTargetInventory(context.Context) (radioTargetInventory, error)
 	})
