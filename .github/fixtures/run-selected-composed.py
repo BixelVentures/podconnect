@@ -2,13 +2,13 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import time
 
 def run_primary_radio_http():
     import pwd
-    import socket
     import tempfile
 
     root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
@@ -88,10 +88,23 @@ if sys.argv[1] == "primary-radio-http":
 
 mode = sys.argv[1]
 prefix = "pc52-selected-"
+if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME"):
+    prefix += "resume-"
 root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)
 env = dict(os.environ, PC_NATIVE_START_READY_FILE=str(ready))
+if mode == "actual-c-primary-same-target":
+    # Real OwnTone HTTP and the START35 harness share the C process and output.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        primary_port = sock.getsockname()[1]
+    env.pop("PODCONNECT_RADIO_SENDER", None)
+    env.update(
+        PC_NATIVE_PRIMARY_HTTP_PORT=str(primary_port),
+        PC_PRIMARY_HTTP_TOKEN="2" * 64,
+        PC_REQUIRE_RTP_AUDIO="1",
+    )
 if env.get("PC_SHUTDOWN_JOURNAL"):
     for item in (root / "shutdown-songs.db", root / "shutdown-music.fifo"):
         item.unlink(missing_ok=True)
@@ -116,6 +129,22 @@ with (
         c.wait()
         raise SystemExit("C ready missing")
     info = json.loads(ready.read_text())
+    if mode == "actual-c-primary-same-target":
+        endpoint = f"http://127.0.0.1:{primary_port}"
+        if info.get("primary_url") != endpoint:
+            raise SystemExit("missing same-process production radio HTTP")
+        env["PC_NATIVE_PRIMARY_HTTP_URL"] = endpoint
+        until = time.monotonic() + 2
+        while c.poll() is None and time.monotonic() < until:
+            try:
+                with socket.create_connection(("127.0.0.1", primary_port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.025)
+        else:
+            c.terminate()
+            c.wait()
+            raise SystemExit("same-process production radio HTTP listener unavailable")
     env.update(
         PC_NATIVE_START_URL=info["url"],
         PC_NATIVE_START_PIPE=info["pipe"],

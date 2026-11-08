@@ -69,6 +69,7 @@ jobs:
             git apply "$patch_dir/radio-primary-route-prototype-native-replacement.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-readiness.patch"
             git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-same-composed-native-test.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
@@ -197,7 +198,7 @@ jobs:
           done
           # Earlier branch runs keep the causal before/after proofs for the
           # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test c-readiness; do
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test c-readiness same-composed-c-test; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
@@ -316,6 +317,8 @@ jobs:
           chmod +x src/airplay_callback_owner native-tests
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
       - name: Verify held fresh START and explicit late paused Resume against actual C
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone
