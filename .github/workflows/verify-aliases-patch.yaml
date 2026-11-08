@@ -62,6 +62,9 @@ jobs:
           git apply "$patch_dir/queue-occurrence-continuity-native.patch"
           git apply --check "$patch_dir/radio-primary-native.patch"
           git apply "$patch_dir/radio-primary-native.patch"
+          fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
+          git apply --check "$fixture"
+          git apply "$fixture"
       - name: Test Manager radio and playback revision contracts
         run: cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1
       - name: Test Native queue, transport, output and retained packages
@@ -185,7 +188,7 @@ jobs:
             git apply "$patch_dir/$patch.patch"
           done
           # CI-only fixture overlays are applied after the immutable production stack.
-          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci; do
+          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c; do
             patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -301,6 +304,12 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_HOLD_TEARDOWN=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          # Reuse the compiled pair to seek the original initial-start race. Stop at the first failure.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            printf 'Primary initial-start reproduction attempt %s of 8\n' "$attempt"
+            sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_REPRO_ATTEMPT="$attempt" python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          done
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_STOP_RESTART=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           status=0
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target || status=1
