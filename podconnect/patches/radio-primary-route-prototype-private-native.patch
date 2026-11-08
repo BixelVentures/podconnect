@@ -160,12 +160,15 @@
  		Purpose  string          `json:"purpose"`
 --- a/daemon/radio_reacquire.go
 +++ b/daemon/radio_reacquire.go
-@@ -150,6 +150,10 @@
+@@ -150,6 +150,13 @@
  		app.radio.mu.Unlock()
  		return nil
  	}
 +	if h.Primary != nil {
 +		app.radio.mu.Unlock()
++		if cause != "play" && cause != "resume" {
++			return ErrAliasConflict
++		}
 +		return p.preemptPrimaryRadio(ctx, target, h)
 +	}
  	if h.owner != p || (h.Phase != "suspended" && h.Phase != "prepared") || h.Latest == nil || (h.Latest.Phase != "suspended" && h.Latest.Phase != "prepared") || !volumeHex32.MatchString(h.Proof.Token) {
@@ -346,7 +349,7 @@
 +}
 --- /dev/null
 +++ b/daemon/radio_primary_stop_test.go
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,78 @@
 +package daemon
 +
 +import (
@@ -413,5 +416,15 @@
 +				t.Fatalf("unexpected status reads: %d", observations.Load())
 +			}
 +		})
++	}
++}
++
++func TestPrimaryRadioConnectTransferDoesNotClaimStop(t *testing.T) {
++	app := &App{}
++	p := &AppPlayer{app: app}
++	h := &radioHold{Primary: &radioPrimaryBinding{}, Phase: "primary_active", owner: p}
++	app.radio.Holds = map[string]*radioHold{"target": h}
++	if err := p.preemptRadioPolicy(context.Background(), "target", "transfer", false, false); err == nil || h.PrimaryAction != "" || h.Phase != "primary_active" {
++		t.Fatal("unproven transfer changed the primary radio hold")
 +	}
 +}

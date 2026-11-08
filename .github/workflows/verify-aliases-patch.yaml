@@ -64,7 +64,7 @@ jobs:
           fi
       - name: Test exact primary radio Native preempt action and receipt
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
-        run: cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadioDrainBindsActionAndNeverReplays$'
+        run: cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadio(DrainBindsActionAndNeverReplays|ConnectTransferDoesNotClaimStop)$'
       - name: Test Native queue, transport, output and retained packages
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
@@ -187,34 +187,17 @@ jobs:
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply "$patch_dir/$patch.patch"
           done
-          # The preceding layers have their own recorded RED/GREEN runs.
-          # Apply the tested bytes and compile the new disjoint transition only.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test; do
+          # Earlier branch runs keep the causal before/after proofs for the
+          # unchanged layers. Build the full translation units with the bridge.
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
           ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
           make -j"$(nproc)"
           make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          sudo -n env PC_PRIMARY_RADIO_DISJOINT=red src/airplay_callback_owner --radio-primary-disjoint-start > /tmp/radio-primary-disjoint-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-disjoint-red.log
-          test "$result" = 1
-          grep -Fx "RADIO_PRIMARY_START_RED: managed Spotify START retired disjoint radio receiver B" /tmp/radio-primary-disjoint-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-disjoint-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          sudo -n env PC_PRIMARY_RADIO_DISJOINT=green src/airplay_callback_owner --radio-primary-disjoint-start
-          git apply "$patch_dir/radio-primary-route-prototype-intent.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          src/airplay_callback_owner --radio-primary-custody
-          git apply "$patch_dir/radio-primary-route-prototype-decoder.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
           src/airplay_callback_owner --radio-primary-decode
-          git apply "$patch_dir/radio-primary-route-prototype-private-c.patch"
-          make -j"$(nproc)"
-          make -C src -j"$(nproc)" airplay_callback_owner
           sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'

@@ -1,3 +1,39 @@
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -2361,6 +2361,12 @@
+   return valid;
+ }
+ 
++const char *
++outputs_primary_radio_process(void)
++{
++  return outputs_process;
++}
++
+ bool
+ outputs_primary_radio_custody_available(uint64_t id)
+ {
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -279,6 +279,7 @@
+   uint64_t device_id, incarnation, epoch, route;
+   int teardown_cseq;
+ };
++const char *outputs_primary_radio_process(void);
+ bool outputs_primary_radio_custody_available(uint64_t);
+ int outputs_primary_radio_custody_read(uint64_t, struct output_primary_radio_custody *);
+ char *outputs_primary_radio_custody_claim(uint64_t, const char *, const char *);
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -5480,7 +5480,7 @@
+     return -1;
+   if (actual.stop_action[0])
+     return strcmp(actual.stop_action, action) ? -1 : 0;
+-  if (strcmp(actual.process, outputs_process))
++  if (strcmp(actual.process, outputs_primary_radio_process()))
+     return -1;
+ 
+   struct airplay_primary_radio_route route = { actual.device_id, actual.incarnation, actual.epoch, actual.route };
 --- a/src/player.h
 +++ b/src/player.h
 @@ -279,6 +279,8 @@
