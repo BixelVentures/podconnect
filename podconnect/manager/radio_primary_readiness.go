@@ -42,7 +42,9 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 			return false, true, err
 		}
 		advertised = true
-		if !o.Physical {
+		// Standard worker activation proves runtime readiness only. Keep
+		// physical acceptance separate, as for the legacy worker backend.
+		if !radioWorkerConfigured(o) && !o.Physical {
 			return false, false, errRadioUnavailable
 		}
 		if !primaryBootstrapStateReady(state) {

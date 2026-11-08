@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -108,8 +109,17 @@ func TestConfiguredRadioBootstrapNegotiatesWithoutEffects(t *testing.T) {
 }
 
 func TestPrimaryRadioProducerRequiresFreshBootstrapOwnerOnSecondRead(t *testing.T) {
-	for _, name := range []string{"unknown source", "no selectable receiver", "changed process", "missing proof list", "same owner"} {
+	for _, name := range []string{"unknown source", "no selectable receiver", "changed process", "missing proof list", "expired observation", "same owner"} {
 		t.Run(name, func(t *testing.T) {
+			radioSettingsTestOptions(t, true)
+			if err := ensureRadioWorkerSettings(); err != nil {
+				t.Fatal(err)
+			}
+			options, err := readRadioProducerBootstrapOptions()
+			if err != nil || !radioWorkerConfigured(options) || options.Physical {
+				t.Fatalf("expected the standard worker with physical acceptance unset: %v", err)
+			}
+			options.NativeURL = "http://127.0.0.1:4001"
 			now := time.Now().Unix()
 			pinned := strings.Repeat("a", 64)
 			good := radioPrimaryState{
@@ -129,13 +139,16 @@ func TestPrimaryRadioProducerRequiresFreshBootstrapOwnerOnSecondRead(t *testing.
 				next.Process = strings.Repeat("b", 64)
 			case "missing proof list":
 				next.Missing = nil
+			case "expired observation":
+				next.Observation = &radioNativeObservation{State: "idle", SourceKind: "none", ObservedAt: now - 5, ValidUntil: now - 1}
 			}
 			reads := 0
 			previous := http.DefaultTransport
 			defer func() { http.DefaultTransport = previous }()
 			http.DefaultTransport = startTransport(func(req *http.Request) (*http.Response, error) {
-				if req.Method != http.MethodGet || req.URL.Path != "/radio/primary" {
-					t.Fatal("bootstrap must only read the primary owner")
+				if req.Method != http.MethodGet || req.URL.Path != "/radio/primary" ||
+					req.Header.Get("X-PodConnect-Token") != options.NativeToken {
+					t.Fatal("bootstrap must only read the authenticated primary owner")
 				}
 				state := good
 				if reads > 0 {
@@ -146,9 +159,8 @@ func TestPrimaryRadioProducerRequiresFreshBootstrapOwnerOnSecondRead(t *testing.
 				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(raw)))}, err
 			})
 			ctx := context.Background()
-			n, primary, err := awaitConfiguredRadioBootstrap(ctx, radioProducerBootstrapOptions{
-				NativeURL: "http://127.0.0.1:4001", NativeToken: "control", Physical: true,
-			}, func(context.Context, time.Duration) error { return errors.New("unexpected bootstrap retry") })
+			n, primary, err := awaitConfiguredRadioBootstrap(ctx, options,
+				func(context.Context, time.Duration) error { return errors.New("unexpected bootstrap retry") })
 			if err != nil || !primary {
 				t.Fatalf("initial read did not select the exact primary owner: %v", err)
 			}
@@ -164,9 +176,23 @@ func TestPrimaryRadioProducerRequiresFreshBootstrapOwnerOnSecondRead(t *testing.
 			c := newRadioCoordinator(p)
 			err = c.enable(ctx)
 			wantEnabled := name == "same owner"
-			if reads != 2 || (err == nil) != wantEnabled || c.snapshot().Enabled != wantEnabled {
-				t.Fatalf("second bootstrap read: enabled=%t reads=%d err=%v", c.snapshot().Enabled, reads, err)
+			state := c.snapshot()
+			if reads != 2 || (err == nil) != wantEnabled || state.Enabled != wantEnabled || state.PhysicalVerified {
+				t.Fatalf("second bootstrap read: enabled=%t physical=%t reads=%d err=%v", state.Enabled, state.PhysicalVerified, reads, err)
 			}
 		})
+	}
+}
+
+func TestPrimaryRadioWorkerBootstrapRejectsUnsafePrivateSettings(t *testing.T) {
+	radioSettingsTestOptions(t, true)
+	if err := ensureRadioWorkerSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(radioWorkerSettingsPath(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRadioProducerBootstrapOptions(); err == nil {
+		t.Fatal("bootstrap admitted unsafe worker credentials")
 	}
 }
