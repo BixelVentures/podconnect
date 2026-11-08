@@ -188,6 +188,10 @@ jobs:
           git apply "$patch_dir/radio-primary-route-prototype-disjoint-engine.patch"
           make -C src -j"$(nproc)" airplay_callback_owner
           sudo -n env PC_PRIMARY_RADIO_DISJOINT=green src/airplay_callback_owner --radio-primary-disjoint-start
+          git apply "$patch_dir/radio-primary-route-prototype-intent.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          src/airplay_callback_owner --radio-primary-custody
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
