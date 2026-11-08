@@ -240,6 +240,17 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 			current.TargetID != target || current.PhysicalVerified {
 			t.Fatalf("Manager did not observe %s on the configured target", station)
 		}
+		currentSelectable, otherUnavailable := false, false
+		for _, output := range current.Targets {
+			if output.ID == target {
+				currentSelectable = output.Selectable && output.Availability == "available"
+			} else {
+				otherUnavailable = !output.Selectable && output.Availability == "unavailable"
+			}
+		}
+		if len(current.Targets) != 2 || !currentSelectable || !otherUnavailable || !slices.Contains(current.Actions, "start") {
+			t.Fatalf("parked %s should retain current station selection when the other receiver is unavailable", station)
+		}
 		wait(func() bool {
 			observed := windows()
 			if observed.Return != 0 {

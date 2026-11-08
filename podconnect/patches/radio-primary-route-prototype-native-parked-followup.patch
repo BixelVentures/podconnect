@@ -149,8 +149,14 @@
  	} else if p.primaryStream != nil {
  		owner, err := p.radioSourceOwner()
  		if err != nil {
-@@ -179,6 +199,12 @@
+@@ -177,8 +197,18 @@
+ 		}
+ 	}
  	for i, target := range state.Targets {
++		// A verified roster must distinguish unavailable outputs from the
++		// unverified protocol envelope. One refused receiver must not close
++		// other proven targets in the Manager's same-roster refresh.
++		state.Targets[i].Availability, state.Targets[i].Selectable = "unavailable", false
  		incarnation := request.Receivers[target.HomePodID]
  		if incarnation == "" || p.primaryRadioRoom(target.ID) != target.HomePodID {
 +			continue
