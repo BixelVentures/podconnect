@@ -9,6 +9,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientError, ClientTimeout
 
+PLAYBACK_CURSOR = re.compile(r"^[0-9a-f]{32}:(0|[1-9][0-9]{0,19})$")
 ROOM_READ_REASONS = frozenset(
     {
         "claim_unavailable",
@@ -71,8 +72,12 @@ class SpeakersClient:
         budget: int = 5,
         room_read_reason: bool = False,
         queue_metadata: bool = False,
+        playback_cursor: str | None = None,
     ):
         headers = {"Accept": "application/json"}
+        if playback_cursor is not None:
+            headers["X-Podconnect-Playback-Revision"] = playback_cursor
+            headers["Cache-Control"] = "no-store"
         if queue_metadata:
             headers["X-Podconnect-Queue-Metadata"] = "1"
         try:
@@ -85,6 +90,8 @@ class SpeakersClient:
                     allow_redirects=False,
                     timeout=ClientTimeout(total=budget - 1),
                 ) as response:
+                    if playback_cursor is not None and response.status == 204:
+                        return None
                     diagnostic = (
                         room_read_reason
                         and method == "GET"
@@ -94,9 +101,10 @@ class SpeakersClient:
                     if response.status != 200 and not diagnostic:
                         raise SpeakersError(f"Speakers returned HTTP {response.status}")
                     raw = bytearray()
+                    max_bytes = 512 if playback_cursor is not None else 65536
                     async for chunk in response.content.iter_chunked(8192):
                         raw.extend(chunk)
-                        if len(raw) > 65536:
+                        if len(raw) > max_bytes:
                             raise SpeakersError("Speakers response exceeds budget")
 
                     def pairs(items):
@@ -324,6 +332,26 @@ class SpeakersClient:
                 raise SpeakersError("Ambiguous observed outputs")
             seen.add(row["id"])
         return data
+
+    async def wait_playback_revision(self, account, target, cursor):
+        """Wait on the existing state read for a bounded, content-free hint."""
+        path = "/api/state?" + urlencode(
+            {"account_user_id": account, "target_id": target}
+        )
+        reply = await self._request("GET", path, budget=23, playback_cursor=cursor)
+        if reply is None:
+            return None
+        if (
+            not isinstance(reply, dict)
+            or set(reply) != {"schema", "cursor", "changed"}
+            or reply["schema"] != "podconnect.playback_revision.v1"
+            or type(reply["changed"]) is not bool
+            or not isinstance(reply["cursor"], str)
+            or (match := PLAYBACK_CURSOR.fullmatch(reply["cursor"])) is None
+            or int(match[1]) > 2**64 - 1
+        ):
+            raise SpeakersError("Playback revision unavailable")
+        return reply["cursor"], reply["changed"]
 
     async def start_readiness(self, room_id: str, target_id: str) -> dict:
         """Read the native owner's exact engine, room, output and start policy."""

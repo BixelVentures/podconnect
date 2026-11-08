@@ -146,11 +146,11 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
                     minor_version=1,
                     source="user",
                     title=title,
-                    unique_id=ident,
+                    unique_id=getattr(self, "account_overrides", {}).get(ident, ident),
                     discovery_keys=MappingProxyType({}),
                     subentries_data=None,
-                    pref_disable_polling=True,
-                    options={"speakers_url": self.base},
+                    pref_disable_polling=not getattr(self, "enable_polling", False),
+                    options={"speakers_url": getattr(self, "speakers_base", self.base)},
                     data={
                         "auth_implementation": DOMAIN,
                         "token": {

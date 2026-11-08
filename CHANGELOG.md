@@ -1,3 +1,11 @@
+## Speakers 0.26.72 — report current native playback revisions
+
+- Let Control wait for track changes, pause, resume and seek on the current native output through the existing Speakers state read. The hint carries only a revision.
+
+## Control 0.10.38 — refresh local playback on native changes
+
+- Advance the shared Spotify read when the current native output reports a change. PodView receives the confirmed Spotify observation, with ordinary polling available during disconnects and on external outputs.
+
 ## Speakers 0.26.70 — distinguish Native radio capability failures
 
 - When Native checks the existing radio capability of configured speakers, log only changed aggregate counts for failed custody, unavailable or rejected HTTP probes, invalid identity, missing signing or pairing, and accepted capability replies. This locates the remaining startup blocker without changing readiness, playback, or authority.

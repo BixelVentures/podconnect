@@ -323,6 +323,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     entry.async_on_unload(entry.add_update_listener(_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.runtime_data.active = True
+    coordinator.set_native_playback_client(speakers)
     return True
 
 
@@ -331,15 +332,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) 
     data = entry.runtime_data
     previously_active = data.active
     data.active = False  # Retire new admission before the platform unload can yield.
+    await data.coordinator.async_stop_native_playback()
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unloaded:
         data.active = previously_active
+        data.coordinator.set_native_playback_client(data.speakers, restore_poll=True)
     return unloaded
 
 
 async def _options_updated(hass: HomeAssistant, entry: PodConnectConfigEntry) -> None:
     """Replace owners for configuration changes, never routine OAuth token renewal."""
     data = getattr(entry, "runtime_data", None)
-    if data is None or data.configuration_identity == _configuration_identity(entry):
+    if data is None:
+        return
+    if data.configuration_identity == _configuration_identity(entry):
+        if data.active:
+            data.coordinator.set_native_playback_client(data.speakers)
         return
     await hass.config_entries.async_reload(entry.entry_id)

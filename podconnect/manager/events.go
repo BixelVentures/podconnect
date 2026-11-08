@@ -27,7 +27,10 @@ type glLive struct {
 	mu                   sync.Mutex
 	st                   glStatus
 	trackURI             string
-	trackChangeSeq       uint64 // bumped whenever metadata.uri changes (future buffer-flush hook)
+	trackChangeSeq       uint64 // bumped whenever metadata.uri changes
+	playbackRevisionWake chan struct{}
+	playbackRevision     uint64
+	playbackItem         playbackRevisionItem
 	aliasRevision        uint64 // observed alias/source intent; unchanged status polls do not bump it
 	transportRevision    uint64 // transport observations, including accepted polling changes
 	routeDispatchSeq     uint64 // mutex-owned command admission, not native acceptance
@@ -125,6 +128,7 @@ func (l *glLive) observeStopLocked() {
 		l.phaseEpoch++
 		l.acceptedRequest = 0
 		l.aliasRevision++
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -155,9 +159,10 @@ type glSource struct {
 }
 
 type glStatusRequest struct {
-	source   glSource
-	sequence uint64
-	wire     [3]uint64
+	source           glSource
+	sequence         uint64
+	wire             [3]uint64
+	playbackRevision uint64
 }
 
 func sourceStopped(stop <-chan struct{}) bool {
@@ -178,6 +183,8 @@ func (l *glLive) beginRun(stop <-chan struct{}) glSource {
 	l.aliasRevision++
 	l.sourceStop = stop
 	l.sourceRetired = false
+	l.playbackItem = playbackRevisionItem{}
+	l.signalPlaybackRevisionLocked()
 	return glSource{run: l.runEpoch, stop: stop}
 }
 
@@ -191,6 +198,8 @@ func (l *glLive) beginPhase(run glSource) (glSource, bool) {
 	l.aliasRevision++ // A claim captured during retirement cannot cross into this source.
 	l.acceptedRequest = 0
 	l.sourceRetired = false
+	l.playbackItem = playbackRevisionItem{}
+	l.signalPlaybackRevisionLocked()
 	return glSource{run: run.run, phase: l.phaseEpoch, stop: run.stop}, true
 }
 
@@ -206,6 +215,7 @@ func (l *glLive) retirePhase(source glSource) {
 		l.aliasRevision++
 		l.phaseEpoch++
 		l.acceptedRequest = 0
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -218,6 +228,7 @@ func (l *glLive) retireRun(run glSource) {
 		l.runEpoch++
 		l.phaseEpoch++
 		l.acceptedRequest = 0
+		l.signalPlaybackRevisionLocked()
 	}
 }
 
@@ -228,7 +239,7 @@ func (l *glLive) beginStatus(source glSource) (glStatusRequest, bool) {
 		return glStatusRequest{}, false
 	}
 	l.nextRequest++
-	return glStatusRequest{source: source, sequence: l.nextRequest, wire: l.wireRevision}, true
+	return glStatusRequest{source: source, sequence: l.nextRequest, wire: l.wireRevision, playbackRevision: l.playbackRevision}, true
 }
 
 // acceptStatus publishes only groups not superseded by wire input since request
@@ -260,6 +271,8 @@ func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
 		}
 		if l.st.SelAlias != st.SelAlias || !sameAliasBinding(l.st.AliasBinding, st.AliasBinding) {
 			l.aliasRevision++
+			l.playbackItem = playbackRevisionItem{}
+			l.signalPlaybackRevisionLocked()
 		}
 		l.st.SelAlias = st.SelAlias
 		l.st.AliasBinding = st.AliasBinding
@@ -267,6 +280,14 @@ func (l *glLive) acceptStatus(request glStatusRequest, st glStatus) bool {
 	}
 	if accepted {
 		l.acceptedRequest = request.sequence
+		if request.playbackRevision == l.playbackRevision && request.wire[0] == l.wireRevision[0] && request.wire[2] == l.wireRevision[2] {
+			if !st.Active || st.Stopped {
+				l.playbackItem = playbackRevisionItem{}
+			} else if l.playbackItem.uri == "" && validPlaybackRevisionURI(st.trackURI) {
+				// Reconnect can seed item identity but does not publish a revision.
+				l.playbackItem = playbackRevisionItem{uri: st.trackURI, paused: st.Paused}
+			}
+		}
 	}
 	return accepted
 }
@@ -379,6 +400,8 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 				}
 				l.wireRevision[2]++
 				l.aliasRevision++
+				l.playbackItem = playbackRevisionItem{}
+				l.signalPlaybackRevisionLocked()
 				return
 			}
 			l.st.AliasBinding = incoming
@@ -388,6 +411,8 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 			l.st.AliasBinding = &copy
 			l.wireRevision[2]++
 			l.aliasRevision++
+			l.playbackItem = playbackRevisionItem{}
+			l.signalPlaybackRevisionLocked()
 			return
 		}
 	}
@@ -397,6 +422,7 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 	if changed {
 		l.trackChangeSeq++
 	}
+	l.observePlaybackRevisionEventLocked(typ, data)
 	switch typ {
 	case "playing", "paused", "stopped", "not_playing", "active", "inactive":
 		l.wireRevision[0]++
@@ -409,6 +435,8 @@ func (l *glLive) applyEventLocked(typ string, data map[string]any) {
 		if _, ok := numField(data, "id"); ok {
 			l.wireRevision[2]++
 			l.aliasRevision++ // Valid equal-value observations also fence ABA.
+			l.playbackItem = playbackRevisionItem{}
+			l.signalPlaybackRevisionLocked()
 		}
 	}
 }
