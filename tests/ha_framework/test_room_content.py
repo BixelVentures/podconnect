@@ -524,7 +524,7 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(self.content_commits(), [])
         await self.content_cleanup()
 
-    async def test_content_cancelled_prepare_never_auto_commits_on_late_response(self):
+    async def test_content_cancelled_prepare_allows_fresh_explicit_start(self):
         request = self.content_request()
         self.content_hold = True
         task = self._task(self.content_invoke("prepare_room_selected_content", request))
@@ -538,6 +538,67 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
         self.assertEqual(replay["state"], "cancelled")
         self.assertEqual(self.content_commits(), [])
         await self.content_cleanup()
+        offer_keys = ("offer_id", "binding_id")
+        self.assertEqual(
+            [body for path, body in self.content_posts if path.endswith("cancel")],
+            [{key: request["start_offer"][key] for key in offer_keys}],
+        )
+
+        self.content_hold = False
+        self.content_offer_id = "f" * 32
+        controls = await self.content_invoke(
+            "get_room_content_controls",
+            {
+                key: request[key]
+                for key in (
+                    "config_entry_id",
+                    "kind",
+                    "target_id",
+                    "room_id",
+                    "homepod_id",
+                )
+            },
+        )
+        self.assertEqual(controls["status"], "ready")
+        self.assertEqual(controls["owner_epoch"], request["owner_epoch"])
+        self.assertEqual(
+            controls["next_command_sequence"], request["command_sequence"] + 1
+        )
+        fresh = self.content_request(
+            command_sequence=controls["next_command_sequence"],
+            expected_poll_sequence=controls["poll_sequence"],
+            start_offer=controls["start_offer"],
+            args={"track_uri": "spotify:track:" + "Z" * 22, "max_volume": 35},
+        )
+        self.assertEqual(
+            (await self.content_invoke("prepare_room_selected_content", fresh))[
+                "state"
+            ],
+            "staged",
+        )
+        self.assertEqual(
+            (await self.content_invoke("start_room_selected_content", request))[
+                "outcome"
+            ],
+            "rejected",
+        )
+        self.assertEqual(self.content_commits(), [])
+        receipt = await self.content_invoke("start_room_selected_content", fresh)
+        self.assertEqual(receipt["outcome"], "accepted")
+        self.assertEqual(
+            receipt["start_operation_id"], fresh["start_offer"]["offer_id"]
+        )
+        self.assertFalse(receipt["physical_result_verified"])
+        self.assertEqual(
+            await self.content_invoke("start_room_selected_content", fresh), receipt
+        )
+        self.assertEqual(
+            [body["args"] for body in self.prepares()], [request["args"], fresh["args"]]
+        )
+        self.assertEqual(
+            self.content_commits(),
+            [{key: fresh["start_offer"][key] for key in offer_keys}],
+        )
 
     async def test_content_missing_or_intermediate_ack_is_consumed_unknown_never_complete(
         self,
