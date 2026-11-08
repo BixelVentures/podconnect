@@ -1,3 +1,8 @@
+## Speakers 0.26.76 — diagnose primary radio startup refusals
+
+- Log the first failed check when OwnTone cannot prove an idle radio source. The reason distinguishes receiver availability, START or journal custody, and a present FIFO writer from an incomplete FIFO proof.
+- Startup admission and playback behavior are unchanged.
+
 ## Speakers 0.26.75 — enable primary radio in the standard worker profile
 
 - Enable radio controls when the standard Home Assistant worker profile confirms the same live Native owner on both startup reads. The previous primary startup gate rejected the worker profile even with valid owner proof.
