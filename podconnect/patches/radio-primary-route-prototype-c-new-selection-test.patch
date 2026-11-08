@@ -1,0 +1,62 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1315,6 +1315,7 @@
+   atomic_bool done,completed,retired;
+   atomic_bool reset_audio;
+   atomic_int audio_packets;
++  atomic_int primary_selected_packets;
+   atomic_int primary_packets[3]; /* Spotify before, radio, Spotify after. */
+   atomic_int primary_radio_packets[3];
+   uint64_t primary_radio_epoch;
+@@ -1428,7 +1429,18 @@
+     wire->decoded_audio_packet=true;wire->last_audio_seq=seq;wire->last_audio_timestamp=timestamp;
+     atomic_fetch_add(&wire->audio_packets,1);
+     if (primary_fixture)
+-      atomic_fetch_add(&wire->primary_packets[primary_source], 1);
++      {
++        bool selection = getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != NULL;
++        if (selection && primary_source == 2)
++          {
++            recovery_wire_fail(f, "parked Spotify emitted audio before the new content START");
++            return;
++          }
++        if (selection && primary_source == 0 && atomic_load(&wire->primary_packets[1]) > 0)
++          atomic_fetch_add(&wire->primary_selected_packets, 1);
++        else
++          atomic_fetch_add(&wire->primary_packets[primary_source], 1);
++      }
+     if (primary_source == 1 && (getenv("PC_PRIMARY_MANAGER_TEST_BIN") || getenv("PC_NATIVE_PRIMARY_STOP_RESTART")))
+       {
+         if (wire->primary_radio_epoch != wire->primary_session_epoch)
+@@ -1506,9 +1518,10 @@
+     evbuffer_free(response);return;
+   }
+   if(!strcmp(uri,"/fixture/rtp") && wire->fixture->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
+-    evbuffer_add_printf(response, "{\"audio_packets\":%d,\"primary_before\":%d,\"primary_radio\":%d,\"primary_after\":%d,\"primary_radio_windows\":[%d,%d,%d]}",
++    evbuffer_add_printf(response, "{\"audio_packets\":%d,\"primary_before\":%d,\"primary_radio\":%d,\"primary_after\":%d,\"primary_selected\":%d,\"primary_radio_windows\":[%d,%d,%d]}",
+         atomic_load(&wire->audio_packets), atomic_load(&wire->primary_packets[0]),
+         atomic_load(&wire->primary_packets[1]), atomic_load(&wire->primary_packets[2]),
++        atomic_load(&wire->primary_selected_packets),
+         atomic_load(&wire->primary_radio_packets[0]), atomic_load(&wire->primary_radio_packets[1]),
+         atomic_load(&wire->primary_radio_packets[2]));
+     evhttp_send_reply(request,200,"OK",response);
+@@ -1685,6 +1698,19 @@
+       int before = atomic_load(&wire->primary_packets[0]);
+       int radio = atomic_load(&wire->primary_packets[1]);
+       int after = atomic_load(&wire->primary_packets[2]);
++      if (getenv("PC_NATIVE_PRIMARY_NEW_SELECTION"))
++        {
++          int selected = atomic_load(&wire->primary_selected_packets);
++          if (before < 1 || radio < 1 || after != 0 || selected < 1 || !start_active
++              || start_active->result.phase != OUTPUT_START_COMPLETED || f->pc70_peer_sessions != 4 || f->teardowns != 3)
++            {
++              recovery_wire_fail(f, "new explicit Spotify START did not replace radio without resuming old PCM");
++              return;
++            }
++          fprintf(stderr, "PASS same-target explicit new Spotify START RTP old=%d radio=%d selected=%d\n", before, radio, selected);
++          event_base_loopbreak(f->base);
++          return;
++        }
+       if (before < 1 || radio < 1 || (returned ? after < 1 : after != 0)
+           || f->pc70_peer_sessions != (manager ? 5 : restart ? 4 : returned ? 3 : 2)
+           || f->teardowns != (manager ? 4 : restart ? 3 : 2))

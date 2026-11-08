@@ -1,0 +1,174 @@
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -709,7 +709,7 @@
+ 				}
+ 				return out, e
+ 			}}
+-			if strings.HasPrefix(mode, "actual-c-selected-") || mode == "selected-sustained" || mode == "actual-c-native-pause" || strings.HasPrefix(mode, "episode-") || mode == "actual-c-radio-http" && os.Getenv("PC_NATIVE_RADIO_HTTP_SELECTED_PROVIDER") == "1" {
++			if strings.HasPrefix(mode, "actual-c-selected-") || mode == "selected-sustained" || mode == "actual-c-native-pause" || strings.HasPrefix(mode, "episode-") || mode == "actual-c-radio-http" && os.Getenv("PC_NATIVE_RADIO_HTTP_SELECTED_PROVIDER") == "1" || mode == "actual-c-primary-same-target" && os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
+ 				if strings.HasPrefix(mode, "episode-") {
+ 					configureSelectedStage(t, p, options, mode)
+ 				} else {
+@@ -1725,7 +1725,7 @@
+ 	if len(episode) > 0 && episode[0] == "episode-commit" {
+ 		mediaBytes = selectedSustainedFLAC
+ 	}
+-	if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" || os.Getenv("PC_NATIVE_START_MODE") == "actual-c-selected-rtp" {
++	if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" || os.Getenv("PC_NATIVE_START_MODE") == "actual-c-selected-rtp" || os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
+ 		mediaBytes = selectedSustainedFLAC
+ 		if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" {
+ 			selectedPCMProof = &selectedPCMState{gate: make(chan struct{}), ranges: map[int]int{}}
+--- a/daemon/radio_primary_same_composed_test.go
++++ b/daemon/radio_primary_same_composed_test.go
+@@ -1,9 +1,12 @@
+ package daemon
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"net/http"
++	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -38,10 +41,11 @@
+ 		t.Fatalf("production primary route token gate returned HTTP %d", response.StatusCode)
+ 	}
+ 	type counts struct {
+-		Before  int    `json:"primary_before"`
+-		Radio   int    `json:"primary_radio"`
+-		After   int    `json:"primary_after"`
+-		Windows [3]int `json:"primary_radio_windows"`
++		Before   int    `json:"primary_before"`
++		Radio    int    `json:"primary_radio"`
++		After    int    `json:"primary_after"`
++		Selected int    `json:"primary_selected"`
++		Windows  [3]int `json:"primary_radio_windows"`
+ 	}
+ 	poll := func(check func(counts) bool) counts {
+ 		t.Helper()
+@@ -171,6 +175,16 @@
+ 		t.Fatalf("same-target radio played without exact Native writer closure: %v", err)
+ 	}
+ 	poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 })
++
++	if os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
++		before := poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 && c.Selected == 0 })
++		testPrimaryNewSpotifySelection(t, ctx, p, worker, stream, owner, func() {
++			assertSource(true)
++			poll(func(c counts) bool { return c.Radio > before.Radio && c.After == 0 && c.Selected == 0 })
++		})
++		poll(func(c counts) bool { return c.After == 0 && c.Selected > 0 })
++		return
++	}
+ 
+ 	restart := os.Getenv("PC_NATIVE_PRIMARY_STOP_RESTART") != ""
+ 	resume := os.Getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME") != ""
+@@ -330,3 +344,105 @@
+ 		t.Fatalf("explicit Native Resume returned HTTP %d", response.StatusCode)
+ 	}
+ }
++
++// Use the ordinary public content offer/prepare/commit handlers with the real
++// actor, guarded C START and existing inert provider decoder fixtures.
++func testPrimaryNewSpotifySelection(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player,
++	incumbent *player.Stream, owner roomTransportIdentity, whileStaged func()) {
++	t.Helper()
++	app := p.app
++	app.mpris = mpris.DummyServer{}
++	server := &ConcreteApiServer{log: app.log, requests: make(chan ApiRequest)}
++	app.server = server
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		for req := range server.requests {
++			if !p.dispatchAPIAndPark(ctx, req) {
++				return
++			}
++		}
++	}()
++	defer func() {
++		close(server.requests)
++		<-done
++	}()
++
++	scope := roomVolumeScope{owner.AccountUserID, owner.TargetID, owner.RoomID, owner.HomePodID}
++	query := url.Values{
++		"account_user_id": {scope.AccountUserID}, "target_id": {scope.TargetID},
++		"room_id": {scope.RoomID}, "homepod_id": {scope.HomePodID},
++	}
++	rec := httptest.NewRecorder()
++	server.handleContentControls(rec, httptest.NewRequestWithContext(ctx, http.MethodGet,
++		"/player/room_content/controls?"+query.Encode(), nil))
++	var control struct {
++		Ready bool         `json:"ready"`
++		Offer contentOffer `json:"start_offer"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &control); err != nil || rec.Code != http.StatusOK || !control.Ready {
++		t.Fatalf("new Spotify content offer while radio plays returned HTTP %d: %v", rec.Code, err)
++	}
++	op := server.roomContents.get(control.Offer.OfferID, control.Offer.BindingID)
++	if op == nil || op.Radio == nil || !op.Radio.Primary {
++		t.Fatal("new Spotify offer lost the incumbent primary radio custody")
++	}
++
++	const selectedURI = "spotify:track:0000000000000000000004"
++	post := func(path string, body any, handler http.HandlerFunc) *httptest.ResponseRecorder {
++		t.Helper()
++		raw, err := json.Marshal(body)
++		if err != nil {
++			t.Fatal(err)
++		}
++		w := httptest.NewRecorder()
++		handler(w, httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(raw)))
++		if w.Code != http.StatusOK {
++			t.Fatalf("new Spotify content %s returned HTTP %d", path, w.Code)
++		}
++		return w
++	}
++	post("/player/room_content/prepare", contentPrepareRequest{scope, control.Offer, "play_track",
++		contentArgs{TrackURI: selectedURI, MaxVolume: 35}}, server.handleContentPrepare)
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++	var fresh *player.Stream
++	for fresh == nil {
++		op.mu.Lock()
++		phase, selected := op.State, op.Stream
++		op.mu.Unlock()
++		if phase == "staged" && selected != nil {
++			fresh = selected
++			break
++		}
++		if phase != "staging" {
++			t.Fatalf("new Spotify media did not stage: %s", phase)
++		}
++		select {
++		case <-ctx.Done():
++			t.Fatal("new Spotify media did not stage before the existing fixture deadline")
++		case <-tick.C:
++		}
++	}
++	if fresh == incumbent || fresh.Source == incumbent.Source || fresh.Media == nil || fresh.Media.Id().Uri() != selectedURI {
++		t.Fatal("prepared Spotify media is not the explicitly selected new track")
++	}
++	whileStaged()
++
++	rec = post("/player/room_content/commit", contentIDRequest{control.Offer.OfferID, control.Offer.BindingID},
++		server.handleContentCommit)
++	var receipt contentReceipt
++	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || !receipt.Accepted || receipt.OperationID != control.Offer.OfferID {
++		t.Fatalf("new Spotify content did not receive exact START acceptance: %+v %v", receipt, err)
++	}
++	// Join the production actor's commit before reading worker and session state.
++	_, _ = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
++	source, err := worker.Start35CurrentSource(ctx)
++	if err != nil || source != fresh.Source || p.primaryStream != fresh || p.state.player.IsPaused ||
++		!p.state.player.IsPlaying || p.state.player.Track.GetUri() != selectedURI || p.state.player.SessionId == owner.SessionID ||
++		app.startCustody != op || app.radioOutputFence.Load() {
++		t.Fatalf("new Spotify media did not replace the original source under its own START: %v", err)
++	}
++}
