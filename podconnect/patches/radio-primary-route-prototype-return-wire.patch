@@ -1,0 +1,134 @@
+--- a/src/player.h
++++ b/src/player.h
+@@ -286,6 +286,9 @@
+ int player_primary_spotify_park(enum output_primary_spotify_park_action,
+     const struct output_primary_spotify_park_request *, struct output_primary_spotify_park_result *);
+ 
++int player_primary_spotify_return(enum output_primary_spotify_return_action,
++    const struct output_primary_spotify_return_request *, struct output_primary_spotify_return_result *);
++
+ int player_radio_other_target(int,const struct output_radio_other_target_request *,struct output_radio_other_target_result *);
+ 
+ int player_radio_source_state(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_radio_source_state *);
+--- a/src/player.c
++++ b/src/player.c
+@@ -3479,6 +3479,30 @@
+   return commands_exec_sync(cmdbase, primary_spotify_park_command, NULL, &c);
+ }
+ 
++struct player_primary_spotify_return_command
++{
++  enum output_primary_spotify_return_action action;
++  const struct output_primary_spotify_return_request *request;
++  struct output_primary_spotify_return_result *result;
++};
++
++static enum command_state
++primary_spotify_return_command(void *arg, int *retval)
++{
++  struct player_primary_spotify_return_command *c = arg;
++  *retval = outputs_primary_spotify_return(c->action, c->request, c->result);
++  return COMMAND_END;
++}
++
++int
++player_primary_spotify_return(enum output_primary_spotify_return_action action,
++    const struct output_primary_spotify_return_request *request, struct output_primary_spotify_return_result *result)
++{
++  struct player_primary_spotify_return_command c = { action, request, result };
++  return commands_exec_sync(cmdbase, primary_spotify_return_command, NULL, &c);
++}
++
++
+ struct player_radio_other_command {int action;const struct output_radio_other_target_request *r;struct output_radio_other_target_result *out;};
+ static enum command_state radio_other_command(void *arg,int *retval)
+ {
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -202,6 +202,74 @@
+   return transport_json_reply(hreq, reply);
+ }
+ 
++static int
++jsonapi_reply_primary_spotify_return(struct httpd_request *hreq, json_object *body)
++{
++  struct output_primary_spotify_return_request request = { 0 };
++  struct output_primary_spotify_return_result result = { 0 };
++  struct output_primary_spotify_park_request *park = &request.park;
++  struct output_primary_radio_custody *radio = &request.radio;
++  json_object *park_json, *release, *cseq;
++  char phase[16], schema[64];
++  uint64_t path_device;
++
++  if (outputs_radio_sender_role() || json_object_object_length(body) != 6
++      || !transport_json_string(body, "phase", phase, sizeof(phase))
++      || (strcmp(phase, "consume") && strcmp(phase, "result"))
++      || !transport_json_string(body, "intent", request.intent, sizeof(request.intent))
++      || transport_native_counter(body, "native_revision", &request.native_revision) < 0
++      || !json_object_object_get_ex(body, "park", &park_json) || !json_object_is_type(park_json, json_type_object)
++      || json_object_object_length(park_json) != 8
++      || !transport_json_string(park_json, "schema", schema, sizeof(schema))
++      || strcmp(schema, "podconnect.output_primary_spotify_park.v1")
++      || !transport_json_string(park_json, "action", park->action, sizeof(park->action))
++      || !transport_json_string(park_json, "token", park->token, sizeof(park->token))
++      || transport_native_counter(park_json, "native_revision", &park->native_revision) < 0
++      || radio_named_owner_parse(park_json, "native_owner", &park->owner) < 0
++      || radio_named_writer_parse(park_json, "writer_proof", &park->writer) < 0
++      || radio_named_identity_parse(park_json, "output_identity", &park->route) < 0
++      || !json_object_object_get_ex(body, "radio_release", &release) || !json_object_is_type(release, json_type_object)
++      || json_object_object_length(release) != 10
++      || !transport_json_string(release, "schema", schema, sizeof(schema))
++      || strcmp(schema, "podconnect.output_radio_primary_stop.v1")
++      || !transport_json_string(release, "process", radio->process, sizeof(radio->process))
++      || !transport_json_string(release, "operation", radio->operation, sizeof(radio->operation))
++      || !transport_json_string(release, "action", radio->stop_action, sizeof(radio->stop_action))
++      || transport_native_counter(release, "device_id", &radio->device_id) < 0
++      || transport_native_counter(release, "incarnation", &radio->incarnation) < 0
++      || transport_native_counter(release, "session_epoch", &radio->epoch) < 0
++      || transport_native_counter(release, "route_revision", &radio->route) < 0
++      || !json_object_object_get_ex(release, "teardown_cseq", &cseq) || !json_object_is_type(cseq, json_type_int)
++      || json_object_get_int64(cseq) <= 0 || json_object_get_int64(cseq) > INT_MAX
++      || safe_atou64(hreq->path_parts[2], &path_device) < 0 || path_device != park->route.device_id
++      || path_device != radio->device_id)
++    return HTTP_BADREQUEST;
++
++  char nested_phase[16];
++  if (!transport_json_string(park_json, "phase", nested_phase, sizeof(nested_phase)) || strcmp(nested_phase, "prepared")
++      || !transport_json_string(release, "phase", nested_phase, sizeof(nested_phase)) || strcmp(nested_phase, "released"))
++    return HTTP_BADREQUEST;
++  radio->teardown_cseq = json_object_get_int(cseq);
++
++  enum output_primary_spotify_return_action action = !strcmp(phase, "consume")
++      ? OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME : OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT;
++  if (player_primary_spotify_return(action, &request, &result) < 0)
++    return 409;
++
++  json_object *reply = json_object_new_object();
++  if (!reply)
++    return HTTP_SERVUNAVAIL;
++  json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_primary_spotify_return.v1"));
++  json_object_object_add(reply, "phase", json_object_new_string(radio_reacquire_phase_name(result.phase)));
++  json_object_object_add(reply, "intent", json_object_new_string(request.intent));
++  attention_json_u64(reply, "native_revision", request.native_revision);
++  json_object_object_add(reply, "park", json_object_get(park_json));
++  json_object_object_add(reply, "radio_release", json_object_get(release));
++  if (result.phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY)
++    json_object_object_add(reply, "route", transport_identity_json(&result.route));
++  return transport_json_reply(hreq, reply);
++}
++
+ static int jsonapi_reply_radio_reacquire(struct httpd_request *hreq)
+ {
+   struct output_radio_reacquire_request r={0};struct output_radio_reacquire_result result={0};
+@@ -221,6 +289,11 @@
+   if (!strcmp(schema, "podconnect.output_primary_spotify_park.v1"))
+     {
+       ret = jsonapi_reply_primary_spotify_park(hreq, body);
++      goto done;
++    }
++  if (!strcmp(schema, "podconnect.output_primary_spotify_return.v1"))
++    {
++      ret = jsonapi_reply_primary_spotify_return(hreq, body);
+       goto done;
+     }
+   if (strcmp(schema, "podconnect.output_radio_reacquire.v1")
