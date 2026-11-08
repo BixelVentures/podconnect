@@ -21,7 +21,7 @@
  bool outputs_start_gate_closed(void);
 --- a/src/outputs.c
 +++ b/src/outputs.c
-@@ -528,6 +528,27 @@
+@@ -528,6 +528,31 @@
  #include "outputs_radio_absence_evolution.inc.c"
  #include "outputs_radio_absence_current_start.inc.c"
  #include "outputs_radio_sender.inc.c"
@@ -36,14 +36,18 @@
 +  struct radio_handoff_slot *handoff = radio_handoff_find(id);
 +  struct radio_absence_slot *absence = radio_absence_find(id);
 +  struct radio_move_slot *move = radio_move_find(id);
-+  struct radio_parked_bridge_slot *bridge = radio_parked_bridge_for_start(request);
++  /* The dispatcher may prefer an old OPENED slot after the target changed
++   * phase. Match the exact committed token against the retained slots. */
++  for (size_t i = 0; i < ARRAY_SIZE(radio_parked_bridges); i++)
++    if (radio_parked_bridges[i].used
++        && !strcmp(token, radio_parked_bridges[i].result.delegated_token))
++      return true;
 +
 +  return (current && !strcmp(token, current->result.delegated_token))
 +      || (other && !strcmp(token, other->result.delegated_token))
 +      || (handoff && !strcmp(token, handoff->result.resume.delegated_token))
 +      || (absence && !strcmp(token, absence->result.start.delegated_token))
-+      || (move && !strcmp(token, move->result.delegated_token))
-+      || (bridge && !strcmp(token, bridge->result.delegated_token));
++      || (move && !strcmp(token, move->result.delegated_token));
 +}
 +
  /* Capture credential policy when a real constructor is admitted. The session
