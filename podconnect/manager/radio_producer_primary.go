@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"time"
 )
 
 const primaryRadioSchema = "podconnect.native_radio_primary.v1"
+const primaryReplacementCapability = "replacement_decoder_preflight"
 
 // This is a primary C session identity. It cannot stand in for a v1 sender
 // pairing digest or be reconstructed from the configured receiver ID.
@@ -47,18 +49,24 @@ type radioPrimaryReceipt struct {
 }
 
 type radioPrimaryState struct {
-	Schema      string                  `json:"schema"`
-	Process     string                  `json:"process_id"`
-	Revision    string                  `json:"native_revision"`
-	Targets     []radioProducerTarget   `json:"configured_targets"`
-	Missing     []string                `json:"missing_proofs"`
-	Observation *radioNativeObservation `json:"observation,omitempty"`
-	Session     *radioPrimarySession    `json:"target_session,omitempty"`
+	Schema       string                  `json:"schema"`
+	Process      string                  `json:"process_id"`
+	Revision     string                  `json:"native_revision"`
+	Targets      []radioProducerTarget   `json:"configured_targets"`
+	Missing      []string                `json:"missing_proofs"`
+	Capabilities []string                `json:"capabilities,omitempty"`
+	Observation  *radioNativeObservation `json:"observation,omitempty"`
+	Session      *radioPrimarySession    `json:"target_session,omitempty"`
 }
 
 type radioPrimaryPort interface {
 	PrimaryState(context.Context) (radioPrimaryState, error)
 	PrimaryCommand(context.Context, radioPrimaryCommand) (radioPrimaryReceipt, error)
+}
+
+type radioPrimaryBackend struct {
+	radioPrimaryPort
+	replacement bool // Negotiated by Ready and protected by radioProducer.mu.
 }
 
 func (n *radioProducerNativeClient) PrimaryState(ctx context.Context) (radioPrimaryState, error) {
@@ -74,12 +82,13 @@ func (n *radioProducerNativeClient) PrimaryCommand(ctx context.Context, q radioP
 }
 
 type radioPrimaryRecord struct {
-	Device      string               `json:"device_id"`
-	Station     string               `json:"station_id,omitempty"`
-	Incumbent   string               `json:"incumbent,omitempty"`
-	Session     *radioPrimarySession `json:"target_session,omitempty"`
-	LastCommand *radioPrimaryCommand `json:"last_command,omitempty"`
-	LastReceipt *radioPrimaryReceipt `json:"last_receipt,omitempty"`
+	Device           string               `json:"device_id"`
+	Station          string               `json:"station_id,omitempty"`
+	Incumbent        string               `json:"incumbent,omitempty"`
+	IncumbentSession *radioPrimarySession `json:"incumbent_session,omitempty"`
+	Session          *radioPrimarySession `json:"target_session,omitempty"`
+	LastCommand      *radioPrimaryCommand `json:"last_command,omitempty"`
+	LastReceipt      *radioPrimaryReceipt `json:"last_receipt,omitempty"`
 }
 
 // Bootstrap continues to construct the v1 producer. The primary port is only
@@ -92,7 +101,7 @@ func newPrimaryRadioProducer(port radioPrimaryPort, directory string) (*radioPro
 	if err != nil {
 		return nil, err
 	}
-	return &radioProducer{primary: port, journal: journal, records: records, live: make(map[string]bool)}, nil
+	return &radioProducer{primary: &radioPrimaryBackend{radioPrimaryPort: port}, journal: journal, records: records, live: make(map[string]bool)}, nil
 }
 
 func (p *radioProducer) primaryState(ctx context.Context) (radioPrimaryState, error) {
@@ -136,15 +145,24 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	}
 	if state.Observation.SourceKind == "radio" {
 		active := p.records[p.active]
-		if active.Primary == nil || active.Primary.Session == nil || state.Session == nil ||
-			*active.Primary.Session != *state.Session || state.Observation.OwnerGeneration != active.Fence.OwnerGeneration {
+		if !primaryOwnsPlaying(state, active) {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
 		}
 	} else if state.Session != nil || p.active != "" {
 		return nil, nil, errRadioUnknown
 	}
 	p.evidence.NativeProcess = state.Process
+	p.primary.(*radioPrimaryBackend).replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
 	return targets, nil, nil
+}
+
+func primaryOwnsPlaying(state radioPrimaryState, incumbent radioProducerRecord) bool {
+	return incumbent.Primary != nil && incumbent.Primary.Session != nil && incumbent.Primary.Session.valid() &&
+		state.Session != nil && *state.Session == *incumbent.Primary.Session &&
+		state.Observation != nil && validRadioObservation(*state.Observation) &&
+		state.Observation.State == "playing" && state.Observation.SourceKind == "radio" &&
+		state.Observation.OwnerGeneration == incumbent.Fence.OwnerGeneration &&
+		state.Observation.TargetID == incumbent.Request.Target && state.Observation.StationID == incumbent.Primary.Station
 }
 
 func (p *radioProducer) primaryPrepare(ctx context.Context, station, target, action string, generation uint64) error {
@@ -166,8 +184,24 @@ func (p *radioProducer) primaryPrepare(ctx context.Context, station, target, act
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if device == "" || state.Process != p.evidence.NativeProcess || len(state.Missing) != 0 || p.active != "" {
+	if device == "" || state.Process != p.evidence.NativeProcess || len(state.Missing) != 0 {
 		return errRadioUnavailable
+	}
+	candidate := &radioPrimaryRecord{Device: device, Station: station}
+	if p.active != "" {
+		incumbent := p.records[p.active]
+		if !p.primary.(*radioPrimaryBackend).replacement || !slices.Contains(state.Capabilities, primaryReplacementCapability) {
+			return errRadioUnavailable
+		}
+		if !p.live[p.active] || !incumbent.Terminal || incumbent.SourceDrained ||
+			!primaryOwnsPlaying(state, incumbent) {
+			return errRadioUnknown
+		}
+		candidate.Incumbent = p.active
+		session := *state.Session
+		candidate.IncumbentSession = &session
+	} else if state.Session != nil || state.Observation != nil && state.Observation.SourceKind == "radio" {
+		return errRadioUnknown
 	}
 	for _, record := range p.records {
 		if !record.Terminal || record.Fence.ActionID == action {
@@ -181,7 +215,7 @@ func (p *radioProducer) primaryPrepare(ctx context.Context, station, target, act
 			radioProducerIdentity: radioProducerIdentity{Process: state.Process, Handoff: id, ActionID: action, Generation: generation, Target: target},
 			ExpectedIntent:        radioProducerIntent{Process: state.Process, Revision: state.Revision},
 		},
-		Stage: "preflight-prepared", Primary: &radioPrimaryRecord{Device: device, Station: station},
+		Stage: "preflight-prepared", Primary: candidate,
 	}
 	if err := p.storeLocked(r); err != nil {
 		return err
@@ -200,7 +234,7 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 		}
 	}
 	p.mu.Lock()
-	if action == "" || generation == 0 || p.evidence.NativeProcess == "" || to != "" && p.active != "" {
+	if action == "" || generation == 0 || p.evidence.NativeProcess == "" {
 		p.mu.Unlock()
 		return radioFence{}, errRadioUnavailable
 	}
@@ -238,6 +272,12 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 		}
 	}
 	state := *r.Primary
+	if to != "" && (state.Incumbent != p.active || p.active != "" &&
+		(state.IncumbentSession == nil || *state.IncumbentSession != *incumbent.Primary.Session ||
+			incumbent.SourceDrained || !p.primary.(*radioPrimaryBackend).replacement)) {
+		p.mu.Unlock()
+		return r.Fence, errRadioUnknown
+	}
 	if p.active != "" {
 		state.Incumbent = incumbent.Fence.Token
 	}
@@ -250,6 +290,7 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 	}
 	p.live[r.Fence.Token] = true
 	q := r.primaryCommand("reserve")
+	q.Session = state.IncumbentSession
 	p.mu.Unlock()
 
 	if ctx.Err() != nil {
@@ -257,19 +298,28 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 	}
 	receipt, err := p.primary.PrimaryCommand(ctx, q)
 	if err != nil || ctx.Err() != nil || !q.matches(receipt) || receipt.Phase != "reserved" ||
-		!producerCounter(receipt.OwnerGeneration, false) || receipt.Session != nil || receipt.Observation != nil || receipt.TeardownCSeq != 0 {
+		!producerCounter(receipt.OwnerGeneration, false) || (receipt.Session == nil) != (q.Session == nil) ||
+		receipt.Observation != nil || receipt.TeardownCSeq != 0 {
 		return r.Fence, errRadioUnknown
 	}
 	owner, _ := strconv.ParseUint(receipt.OwnerGeneration, 10, 64)
+	if state.IncumbentSession != nil && owner <= incumbent.Fence.OwnerGeneration {
+		return r.Fence, errRadioUnknown
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	current := p.records[r.Fence.Token]
 	if current.Fence != r.Fence || current.Stage != r.Stage || current.Preempted || p.evidence.NativeProcess != q.Process {
+		p.mu.Unlock()
 		return r.Fence, errRadioUnknown
 	}
 	current.Fence.OwnerGeneration = owner
 	current.Stage = "reserved"
-	return current.Fence, p.storeLocked(current)
+	err = p.storeLocked(current)
+	p.mu.Unlock()
+	if err == nil && state.IncumbentSession != nil {
+		err = p.primaryPrepareReplacement(ctx, current.Fence)
+	}
+	return current.Fence, err
 }
 
 func (r radioProducerRecord) primaryCommand(phase string) radioPrimaryCommand {
@@ -281,10 +331,67 @@ func (r radioProducerRecord) primaryCommand(phase string) radioPrimaryCommand {
 	if r.Fence.OwnerGeneration != 0 {
 		q.OwnerGeneration = strconv.FormatUint(r.Fence.OwnerGeneration, 10)
 	}
-	if phase == "start" || phase == "prepare_start" {
+	if phase == "start" || phase == "prepare_start" || phase == "prepare_replace" {
 		q.Station = r.Primary.Station
 	}
 	return q
+}
+
+// Reserve returns to the coordinator only after the destination decoder has
+// been proved under the same fence, before the first possible receiver effect.
+func (p *radioProducer) primaryPrepareReplacement(ctx context.Context, f radioFence) error {
+	p.mu.Lock()
+	r := p.records[f.Token]
+	if r.Fence != f || r.Primary == nil || r.Primary.IncumbentSession == nil ||
+		r.Stage != "reserved" || r.Preempted || p.active != r.Primary.Incumbent ||
+		p.evidence.NativeProcess != r.Request.Process {
+		p.mu.Unlock()
+		return errRadioUnknown
+	}
+	q := r.primaryCommand("prepare_replace")
+	q.Session = r.Primary.IncumbentSession
+	state := *r.Primary
+	state.LastCommand = &q
+	r.Primary = &state
+	r.Stage = "replacement-preflight-attempted"
+	err := p.storeLocked(r)
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return errRadioUnknown
+	}
+	receipt, err := p.primary.PrimaryCommand(ctx, q)
+	if err != nil {
+		return errRadioUnknown
+	}
+	receipt, err = p.primaryWait(ctx, q, receipt)
+	if err != nil || receipt.Observation != nil || receipt.TeardownCSeq != 0 {
+		return errRadioUnknown
+	}
+	if receipt.Phase == "replacement_prepared" {
+		return p.primaryRecordEffect(r, "reserved", receipt)
+	}
+	if receipt.Phase != "replacement_rejected" {
+		return errRadioUnknown
+	}
+	// This exact terminal owner receipt attests cancellation of the candidate
+	// and reservation with the incumbent unchanged. A timeout cannot do that.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.records[f.Token]
+	if current.Fence != f || current.Stage != r.Stage || current.Preempted ||
+		p.active != state.Incumbent || p.evidence.NativeProcess != q.Process {
+		return errRadioUnknown
+	}
+	state.LastReceipt = &receipt
+	current.Primary = &state
+	current.Terminal, current.Outcome, current.Stage = true, "rejected", "no-effects-rejected"
+	if err = p.storeLocked(current); err != nil {
+		return err
+	}
+	return &radioProducerNoReceiverEffects{}
 }
 
 func (q radioPrimaryCommand) matches(r radioPrimaryReceipt) bool {
@@ -322,6 +429,12 @@ func (p *radioProducer) primaryEffect(ctx context.Context, f radioFence, phase, 
 	if phase == "stop" {
 		old := p.records[r.Primary.Incumbent]
 		if old.Primary == nil || old.Primary.Session == nil || old.Request.Target != target || old.SourceDrained || p.active != r.Primary.Incumbent {
+			p.mu.Unlock()
+			return errRadioUnknown
+		}
+		if pinned := r.Primary.IncumbentSession; pinned != nil &&
+			(*pinned != *old.Primary.Session || r.Primary.LastReceipt == nil ||
+				r.Primary.LastReceipt.Phase != "replacement_prepared") {
 			p.mu.Unlock()
 			return errRadioUnknown
 		}
@@ -411,6 +524,9 @@ func (p *radioProducer) primaryRecordEffect(r radioProducerRecord, stage string,
 	state := *current.Primary
 	state.LastReceipt = &receipt
 	if stage == "started" {
+		if state.IncumbentSession != nil && receipt.Session != nil && *receipt.Session == *state.IncumbentSession {
+			return errRadioUnknown
+		}
 		state.Session = receipt.Session
 	}
 	if stage == "stopped" {
@@ -438,6 +554,7 @@ func (p *radioProducer) primaryFinish(f radioFence) (radioNativeObservation, err
 	if r.Fence != f || r.Primary == nil || r.Primary.LastReceipt == nil || r.Primary.LastReceipt.Observation == nil ||
 		r.Preempted || r.Terminal || !p.live[f.Token] || r.Request.Process != p.evidence.NativeProcess ||
 		(r.Stage != "started" && r.Stage != "stopped") ||
+		(r.Stage == "stopped" && r.Primary.Station != "") ||
 		!validRadioObservation(*r.Primary.LastReceipt.Observation) {
 		return radioNativeObservation{}, errRadioUnknown
 	}
@@ -464,9 +581,7 @@ func (p *radioProducer) primaryObserve(ctx context.Context) (radioNativeObservat
 	}
 	if state.Observation.SourceKind == "radio" {
 		incumbent := p.records[p.active]
-		if incumbent.Primary == nil || incumbent.Primary.Session == nil || state.Session == nil ||
-			*state.Session != *incumbent.Primary.Session || state.Observation.OwnerGeneration != incumbent.Fence.OwnerGeneration ||
-			state.Observation.TargetID != incumbent.Request.Target || state.Observation.StationID != incumbent.Primary.Station {
+		if !primaryOwnsPlaying(state, incumbent) {
 			return radioNativeObservation{}, errRadioUnknown
 		}
 	} else if p.active != "" || state.Session != nil {
@@ -536,6 +651,11 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 // exact receiver acknowledgement for it.
 func (p *radioProducer) RadioCapabilities() []string {
 	if p.primary != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.primary.(*radioPrimaryBackend).replacement {
+			return []string{"start", "stop", "move"}
+		}
 		return []string{"start", "stop"}
 	}
 	return []string{"start", "stop", "move", "volume"}

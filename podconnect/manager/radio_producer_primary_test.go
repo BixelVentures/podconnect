@@ -12,13 +12,15 @@ import (
 )
 
 type primaryRadioFixture struct {
-	t       *testing.T
-	p       *radioProducer
-	state   radioPrimaryState
-	session radioPrimarySession
-	calls   []string
-	lose    string
-	badStop bool
+	t            *testing.T
+	p            *radioProducer
+	state        radioPrimaryState
+	session      radioPrimarySession
+	calls        []string
+	lose         string
+	badStop      bool
+	replaceReply string
+	waitReplace  bool
 }
 
 func (f *primaryRadioFixture) PrimaryState(context.Context) (radioPrimaryState, error) {
@@ -51,11 +53,41 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 	case "reserve":
 		result.Phase = "reserved"
 		result.OwnerGeneration = strconv.FormatUint(generation+10, 10)
+		if q.ExpectedRevision != f.state.Revision {
+			f.t.Fatalf("reserve did not use the captured Native revision: %+v", q)
+		}
+		if r.Primary.IncumbentSession != nil && (q.Session == nil || *q.Session != f.session ||
+			*r.Primary.IncumbentSession != f.session || q.From != f.state.Observation.TargetID) {
+			f.t.Fatalf("replacement reserve lost the exact incumbent: %+v", q)
+		}
+	case "prepare_replace":
+		if q.Session == nil || *q.Session != f.session || q.From != f.state.Observation.TargetID ||
+			q.Station != r.Primary.Station || q.OwnerGeneration != strconv.FormatUint(generation+10, 10) ||
+			r.Stage != "replacement-preflight-attempted" {
+			f.t.Fatalf("replacement preflight lost its pinned reservation: %+v", q)
+		}
+		if f.waitReplace && q.Phase != "result" {
+			result.Phase = "pending"
+			return result, nil
+		}
+		result.Phase = "replacement_prepared"
+		if f.replaceReply != "" {
+			result.Phase = f.replaceReply
+		}
 	case "prepare_start":
 		result.Phase = "prepared"
 	case "start":
 		result.Phase = "playing"
-		result.Session = &f.session
+		session := f.session
+		if r.Primary.IncumbentSession != nil {
+			session.Operation = attentionUUID()
+			session.DeviceID = r.Primary.Device
+			session.Epoch = strconv.FormatUint(generation+10, 10)
+		}
+		f.session = session
+		result.Session = &session
+		revision, _ := strconv.ParseUint(f.state.Revision, 10, 64)
+		f.state.Revision = strconv.FormatUint(revision+1, 10)
 		result.Observation = &radioNativeObservation{
 			State: "playing", SourceKind: "radio", TargetID: q.Target, StationID: q.Station,
 			OwnerGeneration: generation + 10, ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
@@ -85,6 +117,112 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 		f.t.Fatalf("unexpected primary phase: %s", phase)
 	}
 	return result, nil
+}
+
+func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
+	for _, variant := range []string{"station", "move", "no-capability", "stale-incumbent", "rejected-preflight", "lost-preflight", "lost-stop"} {
+		t.Run(variant, func(t *testing.T) {
+			ctx := context.Background()
+			f := &primaryRadioFixture{t: t,
+				state: radioPrimaryState{
+					Schema: primaryRadioSchema, Process: strings.Repeat("a", 64), Revision: "7",
+					Capabilities: []string{primaryReplacementCapability},
+					Targets: []radioProducerTarget{
+						{radioTarget: radioTarget{ID: "r1", Selectable: true, Availability: "available"}, HomePodID: "1"},
+						{radioTarget: radioTarget{ID: "r2", Selectable: true, Availability: "available"}, HomePodID: "2"},
+					},
+					Observation: &radioNativeObservation{State: "idle", SourceKind: "none",
+						ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20},
+				},
+				session: radioPrimarySession{Process: attentionUUID(), Operation: attentionUUID(), DeviceID: "1", Incarnation: "3", Epoch: "4", Route: "0"},
+			}
+			if variant == "no-capability" {
+				f.state.Capabilities = nil
+			}
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := newPrimaryRadioProducer(f, filepath.Join(directory, "private-journal"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.p = p
+			c := newRadioCoordinator(p)
+			if err = c.enable(ctx); err != nil {
+				t.Fatal(err)
+			}
+			command := func(action, station, target string) radioCommand {
+				s := c.snapshot()
+				return radioCommand{ActionID: attentionUUID(), Action: action, StationID: station, TargetID: target,
+					ExpectedRevision: s.Revision, ExpectedProcessID: s.ProcessID,
+					ExpectedGeneration: s.Generation, ExpectedOwnerGeneration: s.OwnerGeneration}
+			}
+			started, err := c.execute(ctx, command("start", "p3", "r1"))
+			if err != nil || started.State != "playing" {
+				t.Fatalf("incumbent did not start: %+v %v", started, err)
+			}
+			incumbent, session := p.active, f.session
+			f.calls = nil
+			q := command("start", "p1", "r1")
+			wantTarget, wantStation := "r1", "p1"
+			wantCalls := []string{"reserve", "prepare_replace", "stop", "result", "prepare_start", "start"}
+			switch variant {
+			case "station":
+				f.waitReplace = true
+				wantCalls = []string{"reserve", "prepare_replace", "result", "stop", "result", "prepare_start", "start"}
+			case "move":
+				q = command("move", "", "r2")
+				wantTarget, wantStation = "r2", "p3"
+			case "no-capability":
+				wantCalls = nil
+			case "stale-incumbent":
+				wrong := f.session
+				wrong.Epoch = "9"
+				f.state.Session = &wrong
+				wantCalls = nil
+			case "rejected-preflight":
+				f.replaceReply = "replacement_rejected"
+				wantCalls = []string{"reserve", "prepare_replace"}
+			case "lost-preflight":
+				f.lose = "prepare_replace"
+				wantCalls = []string{"reserve", "prepare_replace"}
+			case "lost-stop":
+				f.lose = "stop"
+				wantCalls = []string{"reserve", "prepare_replace", "stop"}
+			}
+			next, err := c.execute(ctx, q)
+			if !reflect.DeepEqual(f.calls, wantCalls) {
+				t.Fatalf("replacement phases %v, want %v", f.calls, wantCalls)
+			}
+			switch variant {
+			case "station", "move":
+				if err != nil || next.State != "playing" || next.StationID != wantStation || next.TargetID != wantTarget ||
+					p.active == incumbent || !p.records[incumbent].SourceDrained || f.session == session {
+					t.Fatalf("successor did not replace exact incumbent: %+v %v", next, err)
+				}
+			case "lost-preflight", "lost-stop":
+				if err == nil || next.State != "unknown" || p.active != incumbent || p.records[incumbent].SourceDrained {
+					t.Fatalf("lost reply did not retain unknown custody: %+v %v", next, err)
+				}
+				c.refresh(ctx)
+				if _, err = c.execute(ctx, q); err == nil || !reflect.DeepEqual(f.calls, wantCalls) {
+					t.Fatalf("unknown replacement replayed: %v", f.calls)
+				}
+				if _, err = c.execute(ctx, command("start", "p1", "r1")); err == nil || !reflect.DeepEqual(f.calls, wantCalls) {
+					t.Fatalf("fresh action bypassed unknown replacement: %v", f.calls)
+				}
+			default:
+				if err == nil || next.State != "playing" || next.StationID != "p3" || next.TargetID != "r1" ||
+					p.active != incumbent || p.records[incumbent].SourceDrained {
+					t.Fatalf("denied replacement changed incumbent: %+v %v", next, err)
+				}
+				if variant == "rejected-preflight" && (!p.records[c.fence.Token].Terminal || p.records[c.fence.Token].Outcome != "rejected") {
+					t.Fatal("exact no-effects rejection did not retire candidate")
+				}
+			}
+		})
+	}
 }
 
 func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
