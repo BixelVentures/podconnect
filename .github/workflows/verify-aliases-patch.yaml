@@ -191,7 +191,7 @@ jobs:
           dump_owner_logs() {
             status=$?
             if [ "$status" -ne 0 ]; then
-              for log in src/test-suite.log src/outputs_attention_owner.log src/airplay_callback_owner.log; do
+              for log in src/test-suite.log src/outputs_attention_owner.log src/airplay_callback_owner.log /tmp/retire-diagnostics.log; do
                 if [ -f "$log" ]; then
                   printf '\n=== %s ===\n' "$log"
                   sudo -n cat "$log" || true
@@ -210,13 +210,14 @@ jobs:
           sudo -n src/outputs_attention_owner --deployed-uid-proc
           sudo -n src/airplay_callback_owner --queue-wire
           sudo -n env PC_RETIRE_DIAGNOSTIC_TEST=1 timeout 25 src/airplay_callback_owner --start-retire-wire > /tmp/retire-diagnostics.log 2>&1
-          test "$(grep -c 'START retirement rejected:' /tmp/retire-diagnostics.log)" = 7
-          for reason in request_missing result_missing session_changed writer_epoch input_epoch pipe_inode writer_fd; do
+          # The fixture always rejects a changed route before the seven diagnostic injections.
+          test "$(grep -c 'START retirement rejected:' /tmp/retire-diagnostics.log)" = 8
+          for reason in 'route_changed field=route' request_missing result_missing session_changed writer_epoch input_epoch pipe_inode writer_fd; do
             test "$(grep -c "START retirement rejected: $reason$" /tmp/retire-diagnostics.log)" = 1
           done
           grep -q 'RETIRE_DIAGNOSTIC_NEGATIVES_DONE' /tmp/retire-diagnostics.log
           grep -q 'PASS actual START35 full fresh successor' /tmp/retire-diagnostics.log
-          ! sed -n '/RETIRE_DIAGNOSTIC_NEGATIVES_DONE/,$p' /tmp/retire-diagnostics.log | grep -q 'START retirement rejected:'
+          awk '/RETIRE_DIAGNOSTIC_NEGATIVES_DONE/ { done = 1 } done && /START retirement rejected:/ { exit 1 }' /tmp/retire-diagnostics.log
           sudo -n env PC_ATTENTION_RESTORE_CASE=1 src/airplay_callback_owner --start-retire-wire
           sudo -n env PC_ATTENTION_RECOVER_BUSY=1 src/airplay_callback_owner --attention-recovery-wire
           sudo -n src/airplay_callback_owner --metadata-pipe-owner
