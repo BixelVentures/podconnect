@@ -484,7 +484,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..7adeda5cd24504555b5f688fd36b49f5
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..c4fd49feae03e17f2e8045bb5936ae75831c488b 100644
+index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..44683473eba4244ff81e682daad196e36b1ae653 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -107,6 +107,7 @@ struct outputs_callback_register
@@ -947,7 +947,7 @@ index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..c4fd49feae03e17f2e8045bb5936ae75
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3069,69 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3069,92 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -996,28 +996,51 @@ index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..c4fd49feae03e17f2e8045bb5936ae75
 +outputs_primary_radio_absent_owner(uint64_t id, const struct radio_absence_source *source,
 +    struct output_primary_radio_start_request *target)
 +{
-+  if (!radio_protocols_initialized || !source || !target || source->target_absence || source->route_count
-+      || source->writer_fd || source->input_generation || source->input_item_id || source->input_epoch
-+      || radio_absence_fault || radio_handoff_fault || radio_other_fault || start_journal_fault
-+      || start_startup_quarantine || transport_pin || room_volume_pin_busy() || room_volume_undrained()
-+      || outputs_start_busy() || !start_contexts_drained() || outputs_start_source_owned()
-+      || (start_journal.token[0] && (start_journal_retirement_outcome != OUTPUT_RETIRE_RETIRED_KNOWN
-+          || !start_journal_payload_valid()))
-+      || radio_absence_fifo_writers(source) != 1
-+      || outputs_airplay_primary_station_target(id, target) < 0)
-+    return -1;
++  int writers;
++  /* Log the first refusal on the existing read-only owner path. Predicates
++   * that inspect changing custody must run only once at their original point. */
++#define PRIMARY_ABSENCE_DENY(condition, reason) do { \
++  if (condition) { \
++    DPRINTF(E_LOG, L_PLAYER, "Primary radio absent owner denied: %s\n", reason); \
++    return -1; \
++  } \
++} while (0)
++  PRIMARY_ABSENCE_DENY(!radio_protocols_initialized, "protocol_uninitialized");
++  PRIMARY_ABSENCE_DENY(!source || !target || source->target_absence || source->route_count
++      || source->writer_fd || source->input_generation || source->input_item_id || source->input_epoch, "invalid_source_shape");
++  PRIMARY_ABSENCE_DENY(radio_absence_fault, "radio_absence_fault");
++  PRIMARY_ABSENCE_DENY(radio_handoff_fault, "radio_handoff_fault");
++  PRIMARY_ABSENCE_DENY(radio_other_fault, "radio_other_fault");
++  PRIMARY_ABSENCE_DENY(start_journal_fault, start_journal_fault_reason());
++  PRIMARY_ABSENCE_DENY(start_startup_quarantine, "startup_quarantine");
++  PRIMARY_ABSENCE_DENY(transport_pin, "transport_pin");
++  PRIMARY_ABSENCE_DENY(room_volume_pin_busy(), "volume_pin");
++  PRIMARY_ABSENCE_DENY(room_volume_undrained(), "volume_undrained");
++  PRIMARY_ABSENCE_DENY(outputs_start_busy(), "start_busy");
++  PRIMARY_ABSENCE_DENY(!start_contexts_drained(), "contexts_undrained");
++  PRIMARY_ABSENCE_DENY(outputs_start_source_owned(), "start_source_owned");
++  if (start_journal.token[0])
++    {
++      PRIMARY_ABSENCE_DENY(start_journal_retirement_outcome != OUTPUT_RETIRE_RETIRED_KNOWN, "retirement_unproven");
++      PRIMARY_ABSENCE_DENY(!start_journal_payload_valid(), "retirement_payload_invalid");
++    }
++  writers = radio_absence_fifo_writers(source);
++  PRIMARY_ABSENCE_DENY(writers != 1, writers == 0 ? "fifo_writer_present" : "fifo_proof_incomplete");
++  PRIMARY_ABSENCE_DENY(outputs_airplay_primary_station_target(id, target) < 0, "idle_target_unavailable");
 +  for (struct output_device *d = outputs_device_list; d; d = d->next)
-+    if (d->selected || d->session)
-+      return -1;
++    PRIMARY_ABSENCE_DENY(d->selected || d->session, "another_output_selected_or_live");
 +  /* A writer may change outside this owner thread; recheck the same process
 +   * and FIFO after taking the exact receiver snapshot. */
-+  return radio_absence_fifo_writers(source) == 1 ? 0 : -1;
++  writers = radio_absence_fifo_writers(source);
++  PRIMARY_ABSENCE_DENY(writers != 1, writers == 0 ? "fifo_writer_present_on_recheck" : "fifo_proof_incomplete_on_recheck");
++#undef PRIMARY_ABSENCE_DENY
++  return 0;
 +}
 +
  int
  outputs_init(void)
  {
-@@ -2785,6 +3208,7 @@ outputs_init(void)
+@@ -2785,6 +3231,7 @@ outputs_init(void)
    return 0;
  }
  
@@ -5676,7 +5699,7 @@ index aec54e58c3a3f3ac7af17936924dd368453ac7e3..19bed7c8c3f368886f1895dfc5da3d42
    if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
      { completed_move_real_resume=true; return start35_wire_case(24); }
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa8123238cf1da09 100644
+index 40ebe09716eb4c4b19b08356268f8447f913088c..a2426b607ff761678284ceab1501d14b14bbddaf 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -1315,6 +1315,13 @@ struct native_start_wire {
@@ -6135,7 +6158,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
        {
  	struct output_device *target = calloc(1, sizeof(*target));
  	struct airplay_extra *target_extra = calloc(1, sizeof(*target_extra));
-@@ -2373,6 +2702,74 @@ static int start35_wire_case(int mode)
+@@ -2373,6 +2702,82 @@ static int start35_wire_case(int mode)
    strcpy(r->policy_revision,OUTPUT_START_POLICY);strcpy(r->expected_input_path,fifo);unsigned char hash[32];gcry_md_hash_buffer(GCRY_MD_SHA256,hash,fifo,strlen(fifo));
    for(size_t i=0;i<32;i++)sprintf(r->expected_input_path_digest+2*i,"%02x",hash[i]);
    assert(start_boot_id(r->native_process.boot_id));r->native_process.pid=getpid();assert(start_process_ticks(getpid(),&r->native_process.proc_start_ticks)==1);
@@ -6199,6 +6222,14 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
 +      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) == 0
 +          && target.device_id == f.device->id && !strcmp(target.process, outputs_process)
 +          && target.incarnation == f.device->incarnation && !f.device->session && !start_active);
++      start_startup_quarantine = true;
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) < 0);
++      start_startup_quarantine = false;
++      f.device->busy = true;
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) < 0);
++      f.device->busy = false;
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) == 0
++          && target.incarnation == f.device->incarnation && !f.device->session && !start_active);
 +      int extra_writer = open(fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 +      assert(extra_writer >= 0);
 +      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) < 0);
@@ -6210,7 +6241,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
    struct output_start_state state;assert(outputs_start_state_get(r,&state)==0 && state.ready);
    assert(outputs_start_prepare(r,&f.start_result)==0);*r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
    /* Fill a genuine FIFO and block a genuine old writer before C opens its reader. */
-@@ -2381,6 +2778,20 @@ static int start35_wire_case(int mode)
+@@ -2381,6 +2786,20 @@ static int start35_wire_case(int mode)
    assert(errno==EAGAIN);assert(!fcntl(writer,F_SETFL,fcntl(writer,F_GETFL)&~O_NONBLOCK));
    pending.fd=writer;assert(pthread_create(&writer_thread,NULL,start_fifo_finish,&pending)==0);
    assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
@@ -6231,7 +6262,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
    outputs_write(NULL,0,0,NULL,NULL); /* Actual ALL-backend gate precedes buffer dereference. */
    assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
    if(mode==18 || mode==26 || mode==27 || mode==28){
-@@ -2786,7 +3197,411 @@ static int start35_wire_case(int mode)
+@@ -2786,7 +3205,411 @@ static int start35_wire_case(int mode)
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -6644,7 +6675,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
   cleanup:
    if(mode==29){
      event_free(keep_alive_timer);keep_alive_timer=NULL;
-@@ -2794,6 +3609,20 @@ static int start35_wire_case(int mode)
+@@ -2794,6 +3617,20 @@ static int start35_wire_case(int mode)
    }
    if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
    while(airplay_sessions)session_cleanup(airplay_sessions);
