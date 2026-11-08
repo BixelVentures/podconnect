@@ -184,6 +184,16 @@ jobs:
           git apply "$patch_dir/radio-primary-route-prototype-engine.patch"
           make -C src -j"$(nproc)" airplay_callback_owner
           src/airplay_callback_owner --radio-primary-output-route
+          git apply "$patch_dir/radio-primary-route-prototype-wire-test.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          result=0
+          src/airplay_callback_owner --radio-primary-output-wire >/tmp/radio-primary-output-wire-red.log 2>&1 || result=$?
+          cat /tmp/radio-primary-output-wire-red.log
+          test "$result" = 1
+          grep -Fx "RADIO_PRIMARY_WIRE_RED: actual B receiver got A's audio on the same-format fan-out" /tmp/radio-primary-output-wire-red.log
+          git apply "$patch_dir/radio-primary-route-prototype-wire-engine.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          src/airplay_callback_owner --radio-primary-output-wire
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |

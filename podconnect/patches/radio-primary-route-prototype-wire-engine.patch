@@ -1,0 +1,298 @@
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -246,8 +246,18 @@
+ struct airplay_room_volume_request;
+ struct airplay_seq_ctx;
+ 
++/* Process-local proof of the existing primary transport. No receiver key
++ * claim survives teardown or a fresh session. */
++struct airplay_primary_radio_route
++{
++  uint64_t device_id, incarnation, epoch, revision;
++};
++
+ struct airplay_session
+ {
++  bool primary_radio;
++  bool primary_radio_revoked;
++  uint64_t primary_radio_route_revision;
+   char radio_receiver_key_digest[65];
+   bool radio_custody_managed;
+   uint64_t device_id;
+@@ -549,6 +559,28 @@
+ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
+ static bool sequence_callback_current(const struct airplay_seq_ctx *context);
+ 
++static bool
++primary_radio_binding_current(const struct airplay_session *session)
++{
++  struct output_device *device = outputs_device_get(session->device_id);
++
++  return device && device->session == session && device->advertised && !device->selected
++      && device->incarnation == session->device_incarnation
++      && device->session_epoch == session->session_epoch
++      && device->route_revision == session->primary_radio_route_revision;
++}
++
++static bool
++primary_radio_sequence_current(const struct airplay_seq_ctx *context)
++{
++  const struct airplay_session *session = context->session;
++  if (!session->primary_radio)
++    return true;
++
++  bool teardown = context->cur_request->seq_type == AIRPLAY_SEQ_STOP;
++  return primary_radio_binding_current(session) && session->primary_radio_revoked == teardown;
++}
++
+ static int
+ recovery_sequence_current(void *arg)
+ {
+@@ -560,6 +592,7 @@
+ static int radio_sequence_guard(void *arg)
+ {
+   struct airplay_seq_ctx *c=arg;
++  if (!primary_radio_sequence_current(c)) return false;
+   if(!outputs_radio_handoff_effect_current(c->session->device_id,c->radio_generation,c->radio_stop)
+       || !outputs_radio_other_effect_current(c->session->device_id,c->radio_other_generation)
+       || !outputs_radio_absence_effect_current(c->session->device_id,c->radio_absence_generation)
+@@ -1752,7 +1785,7 @@
+ }
+ 
+ static struct airplay_session *
+-session_make(struct output_device *device, int callback_id)
++session_make_for_source(struct output_device *device, int callback_id, bool primary_radio)
+ {
+   if((outputs_radio_handoff_blocked(device->id) && !outputs_radio_reacquire_constructor_current(device->id) && !outputs_radio_other_constructor_current(device->id) && !outputs_radio_parked_bridge_constructor_current(device->id)) || !outputs_radio_sender_constructor_allowed(device->id))return NULL;
+   struct airplay_session *session;
+@@ -1763,6 +1796,8 @@
+ 
+   CHECK_NULL(L_AIRPLAY, session = calloc(1, sizeof(struct airplay_session)));
+   session->radio_custody_managed=outputs_radio_custody_constructor_current(device->id);
++  session->primary_radio = primary_radio;
++  session->primary_radio_route_revision = device->route_revision;
+   CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
+ 
+   session->devname = strdup(device->name);
+@@ -1797,7 +1832,7 @@
+ 	goto error;
+     }
+ 
+-  session->master_session = master_session_make(&device->quality, extra->use_ptp, NULL);
++  session->master_session = master_session_make(&device->quality, extra->use_ptp, primary_radio ? session : NULL);
+   if (!session->master_session)
+     {
+       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", device->name);
+@@ -1834,6 +1869,12 @@
+ }
+ 
+ 
++static struct airplay_session *
++session_make(struct output_device *device, int callback_id)
++{
++  return session_make_for_source(device, callback_id, false);
++}
++
+ /* ----------------------------- Metadata handling -------------------------- */
+ 
+ static void
+@@ -1909,6 +1950,9 @@
+ airplay_metadata_send_generic(struct airplay_session *session, struct output_metadata *metadata, bool only_progress)
+ {
+   struct airplay_metadata *rmd = metadata->priv;
++
++  if (session->primary_radio)
++    return 0; /* The ordinary player's track metadata does not own radio. */
+ 
+   if (session->wanted_metadata & AIRPLAY_MD_WANTS_PROGRESS)
+     sequence_start(AIRPLAY_SEQ_SEND_PROGRESS, session, metadata, "SET_PARAMETER (progress)");
+@@ -2332,6 +2376,10 @@
+ 
+   if (!outputs_radio_absence_emission_allowed(session->device_id) || !outputs_radio_parked_absence_emission_allowed(session->device_id) || !outputs_radio_parked_bridge_emission_allowed(session->device_id,session->device_incarnation,session->session_epoch,session) || !outputs_radio_other_emission_allowed(session->device_id,session->device_incarnation,session->session_epoch,session) || !outputs_radio_sender_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) || !outputs_radio_handoff_emission_current(session->device_id) || outputs_start_gate_closed() || session->attention_retiring || session->recovery_only)
+     return false;
++  if (session->primary_radio)
++    return !session->primary_radio_revoked && primary_radio_binding_current(session)
++      && session->control_cipher_ctx && session->packet_cipher_hd
++      && (session->state & AIRPLAY_STATE_F_CONNECTED);
+   if(outputs_start_source_owned() && !outputs_radio_parked_bridge_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_other_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_reacquired_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_start_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session))return false;
+   if (!session->attention_managed && !session->start_route_managed)
+     return true; // Ordinary legacy sessions retain their original contract.
+@@ -3436,7 +3484,7 @@
+ static void
+ start_failure(struct airplay_session *session)
+ {
+-  if (outputs_radio_sender_role() || session->radio_custody_managed || session->recovery_only || session->start_token[0]) { session_failure(session); return; }
++  if (outputs_radio_sender_role() || session->radio_custody_managed || session->primary_radio || session->recovery_only || session->start_token[0]) { session_failure(session); return; }
+   struct output_device *device;
+ 
+   device = outputs_device_get(session->device_id);
+@@ -3463,7 +3511,7 @@
+ static void
+ start_retry(struct airplay_session *session)
+ {
+-  if (session->recovery_only || session->start_token[0]) { session_failure(session); return; }
++  if (session->primary_radio || session->recovery_only || session->start_token[0]) { session_failure(session); return; }
+   struct output_device *device;
+   int callback_id = session->callback_id;
+ 
+@@ -3789,6 +3837,13 @@
+     session->pair_type=PAIR_CLIENT_HOMEKIT_NORMAL;session->state=AIRPLAY_STATE_INFO;
+     return AIRPLAY_SEQ_PAIR_VERIFY;
+   }
++  /* A radio selection can use the existing registered PairVerify or
++   * transient policy, but does not start enrollment or clear a credential. */
++  if (session->primary_radio && ((session->statusflags & AIRPLAY_FLAG_PIN_REQUIRED)
++      || (!device->auth_key && (session->statusflags
++          & (AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED | AIRPLAY_FLAG_PASSWORD_REQUIRED)))))
++    return AIRPLAY_SEQ_ABORT;
++
+   // Identify next sequence based on response
+   if (session->statusflags & AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED)
+     {
+@@ -3919,6 +3974,7 @@
+ 
+   if (session->pair_type == PAIR_CLIENT_HOMEKIT_TRANSIENT && req->response_code == RTSP_CONNECTION_AUTH_REQUIRED)
+     {
++      if (session->primary_radio) return AIRPLAY_SEQ_ABORT;
+       device = outputs_device_get(session->device_id);
+       if (!device)
+ 	return AIRPLAY_SEQ_ABORT;
+@@ -4021,7 +4077,7 @@
+ 	return AIRPLAY_SEQ_ABORT;
+ 
+       // The dedicated role keeps its configured credential on failure.
+-      if(!outputs_radio_sender_role() && !session->radio_custody_managed){free(device->auth_key);device->auth_key=NULL;}
++      if(!outputs_radio_sender_role() && !session->radio_custody_managed && !session->primary_radio){free(device->auth_key);device->auth_key=NULL;}
+ 
+       return AIRPLAY_SEQ_ABORT;
+     }
+@@ -4136,7 +4192,7 @@
+     return AIRPLAY_SEQ_ABORT;
+ 
+   // A failed radio verification cannot mutate the imported identity.
+-  if(!outputs_radio_sender_role() && !session->radio_custody_managed){free(device->auth_key);device->auth_key=NULL;}
++  if(!outputs_radio_sender_role() && !session->radio_custody_managed && !session->primary_radio){free(device->auth_key);device->auth_key=NULL;}
+ 
+   session->state = AIRPLAY_STATE_AUTH;
+ 
+@@ -4276,6 +4332,7 @@
+ {
+   const struct airplay_session *session = context->session;
+   struct output_device *device;
++  if (!primary_radio_sequence_current(context)) return false;
+   if (!outputs_radio_handoff_effect_current(session->device_id,context->radio_generation,context->radio_stop)
+       || !outputs_radio_other_effect_current(session->device_id,context->radio_other_generation)
+       || !outputs_radio_absence_effect_current(session->device_id,context->radio_absence_generation)
+@@ -4345,7 +4402,8 @@
+       return;
+     }
+ 
+-  if(session->start_token[0] || seq_ctx->radio_generation || seq_ctx->radio_sender_generation || seq_ctx->radio_other_generation || seq_ctx->radio_absence_generation || seq_ctx->radio_parked_generation || seq_ctx->radio_bridge_generation) {
++  if (session->primary_radio && req->response_code != RTSP_OK) goto error;
++  if(session->primary_radio || session->start_token[0] || seq_ctx->radio_generation || seq_ctx->radio_sender_generation || seq_ctx->radio_other_generation || seq_ctx->radio_absence_generation || seq_ctx->radio_parked_generation || seq_ctx->radio_bridge_generation) {
+     const char *header=evrtsp_find_header(req->input_headers,"CSeq");int cseq;
+     if(!header || safe_atoi32(header,&cseq)<0 || cseq!=seq_ctx->start_request_cseq)goto error;
+   }
+@@ -4999,6 +5057,70 @@
+ airplay_write(struct output_buffer *obuf)
+ {
+   airplay_write_source(obuf, NULL);
++}
++
++/* These entry points remain local to the primary output owner. The isolated
++ * fixture calls them on its player thread; no Manager/Native path is enabled. */
++static int
++airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
++{
++  struct airplay_session *session;
++
++  if (!device || !route || device->type != OUTPUT_TYPE_AIRPLAY || !device->advertised
++      || device->selected || device->session || device->route_revision == UINT64_MAX
++      || outputs_transport_busy() || outputs_radio_handoff_blocked(device->id)
++      || outputs_radio_sender_role())
++    return -1;
++
++  session = session_make_for_source(device, -1, true);
++  if (!session)
++    return -1;
++
++  *route = (struct airplay_primary_radio_route) {
++    device->id, session->device_incarnation, session->session_epoch, device->route_revision,
++  };
++  sequence_start(AIRPLAY_SEQ_START, session, NULL, "primary_radio_start");
++  return 0;
++}
++
++static struct airplay_session *
++airplay_primary_radio_session(const struct airplay_primary_radio_route *route)
++{
++  struct output_device *device = outputs_device_get(route->device_id);
++  struct airplay_session *session = device && device->type == OUTPUT_TYPE_AIRPLAY ? device->session : NULL;
++
++  if (!session || !session->primary_radio || !primary_radio_binding_current(session)
++      || route->incarnation != session->device_incarnation || route->epoch != session->session_epoch
++      || route->revision != session->primary_radio_route_revision)
++    return NULL;
++
++  return session;
++}
++
++static int
++airplay_primary_radio_write(const struct airplay_primary_radio_route *route, struct output_buffer *obuf)
++{
++  struct airplay_session *session = airplay_primary_radio_session(route);
++
++  if (!session || !attention_emission_current(session, NULL))
++    return -1;
++
++  airplay_write_source(obuf, session);
++  return 0;
++}
++
++static int
++airplay_primary_radio_revoke(const struct airplay_primary_radio_route *route)
++{
++  struct airplay_session *session = airplay_primary_radio_session(route);
++
++  if (!session || session->primary_radio_revoked || !session->control_cipher_ctx
++      || !(session->state & AIRPLAY_STATE_F_CONNECTED))
++    return -1;
++
++  session->primary_radio_revoked = true;
++  sequence_start(AIRPLAY_SEQ_STOP, session, NULL, "primary_radio_revoke");
++  return 0;
+ }
+ 
+ static int
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1446,28 +1446,7 @@
+   return 0;
+ }
+ 
+-/* RED uses the installed primary session constructor for both outputs. */
+-struct airplay_primary_radio_route { uint64_t device_id, epoch; };
+-static int
+-airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
+-{
+-  int ret = outputs_device_start(device, NULL, false);
+-  if (ret != 1) return -1;
+-  *route = (struct airplay_primary_radio_route){ device->id, device->session_epoch };
+-  return 0;
+-}
+-static int
+-airplay_primary_radio_write(const struct airplay_primary_radio_route *route, struct output_buffer *obuf)
+-{
+-  (void)route;
+-  airplay_write(obuf);
+-  return 0;
+-}
+-static int
+-airplay_primary_radio_revoke(const struct airplay_primary_radio_route *route)
+-{
+-  return airplay_device_stop(outputs_device_get(route->device_id), -1);
+-}
++#define RADIO_PRIMARY_SESSION_PROOF 1
+ 
+ /* Two real transient receiver sessions in one primary player process. */
+ static void
