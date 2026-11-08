@@ -226,7 +226,7 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 }
 
 func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
-	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop"} {
+	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -298,6 +298,10 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 				!reflect.DeepEqual(started.Actions, []string{"stop"}) {
 				t.Fatalf("exact start failed: %+v %v", started, err)
 			}
+			if strings.HasPrefix(variant, "passive-") {
+				testPassivePrimaryRelease(t, ctx, p, c, f, variant)
+				return
+			}
 			q = radioCommand{ActionID: attentionUUID(), Action: "stop", ExpectedRevision: started.Revision,
 				ExpectedProcessID: started.ProcessID, ExpectedGeneration: started.Generation, ExpectedOwnerGeneration: started.OwnerGeneration}
 			stopped, err := c.execute(ctx, q)
@@ -314,5 +318,69 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 				t.Fatalf("exact stop failed: %+v %v", stopped, err)
 			}
 		})
+	}
+}
+
+func testPassivePrimaryRelease(t *testing.T, ctx context.Context, p *radioProducer, c *radioCoordinator, f *primaryRadioFixture, variant string) {
+	t.Helper()
+	token := p.active
+	record := p.records[token]
+	session := f.session
+	if variant == "passive-old" {
+		newer := *f.state.Observation
+		newer.ObservedAt = radioTestNow()
+		f.state.Observation = &newer
+		c.refresh(ctx)
+	}
+	observed := &radioNativeObservation{State: "playing", SourceKind: "spotify", TargetID: record.Request.Target,
+		OwnerGeneration: record.Fence.OwnerGeneration, ObservedAt: radioTestNow(), ValidUntil: radioTestNow() + 20}
+	f.state.Session, f.state.Observation, f.state.ReleasedSession = nil, observed, &session
+	releaseAction, teardown := attentionUUID(), 42
+	f.state.ReleaseActionID, f.state.TeardownCSeq = &releaseAction, &teardown
+	restarted, err := newPrimaryRadioProducer(f, p.journal.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := restarted.Ready(ctx); err == nil {
+		t.Fatal("restart adopted an unresolved active primary session")
+	}
+	switch variant {
+	case "passive-wrong-session":
+		session.Epoch = "99"
+	case "passive-incomplete":
+		f.state.ReleaseActionID = nil
+	case "passive-old":
+		observed.ObservedAt = p.primaryObservedAt
+	case "passive-unknown":
+		observed.State, observed.SourceKind = "unknown", "unknown"
+	}
+	c.refresh(ctx)
+	if variant != "passive-exact" {
+		if c.snapshot().State != "unknown" || p.active != token || p.records[token].SourceDrained {
+			t.Fatal("invalid passive observation retired the active radio")
+		}
+		// An unknown presentation must not resurrect the historical START.
+		c.refresh(ctx)
+		if c.snapshot().State != "unknown" {
+			t.Fatal("historical radio START became current again")
+		}
+		session = f.session
+		f.state.ReleaseActionID = &releaseAction
+		observed.State, observed.SourceKind = "playing", "spotify"
+		observed.ObservedAt = radioTestNow()
+		observed.OwnerGeneration++
+		c.refresh(ctx)
+	}
+	if state := c.snapshot(); state.SourceKind != "spotify" || state.State != "playing" || p.active != "" {
+		t.Fatalf("exact passive release did not update the coordinator: %+v", state)
+	}
+	var stored radioProducerRecord
+	raw, err := os.ReadFile(filepath.Join(p.journal.directory, producerRecordName(token)))
+	if err != nil || json.Unmarshal(raw, &stored) != nil || !stored.SourceDrained ||
+		stored.Primary.ReleaseActionID != releaseAction || stored.Primary.TeardownCSeq != 42 {
+		t.Fatalf("exact passive release was not retained: %+v %v", stored, err)
+	}
+	if !reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {
+		t.Fatalf("passive release replayed a command: %v", f.calls)
 	}
 }

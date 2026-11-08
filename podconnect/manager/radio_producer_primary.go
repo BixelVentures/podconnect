@@ -49,14 +49,17 @@ type radioPrimaryReceipt struct {
 }
 
 type radioPrimaryState struct {
-	Schema       string                  `json:"schema"`
-	Process      string                  `json:"process_id"`
-	Revision     string                  `json:"native_revision"`
-	Targets      []radioProducerTarget   `json:"configured_targets"`
-	Missing      []string                `json:"missing_proofs"`
-	Capabilities []string                `json:"capabilities,omitempty"`
-	Observation  *radioNativeObservation `json:"observation,omitempty"`
-	Session      *radioPrimarySession    `json:"target_session,omitempty"`
+	Schema          string                  `json:"schema"`
+	Process         string                  `json:"process_id"`
+	Revision        string                  `json:"native_revision"`
+	Targets         []radioProducerTarget   `json:"configured_targets"`
+	Missing         []string                `json:"missing_proofs"`
+	Capabilities    []string                `json:"capabilities,omitempty"`
+	Observation     *radioNativeObservation `json:"observation,omitempty"`
+	Session         *radioPrimarySession    `json:"target_session,omitempty"`
+	ReleasedSession *radioPrimarySession    `json:"released_session,omitempty"`
+	ReleaseActionID *string                 `json:"release_action_id,omitempty"`
+	TeardownCSeq    *int                    `json:"teardown_cseq,omitempty"`
 }
 
 type radioPrimaryPort interface {
@@ -90,6 +93,8 @@ type radioPrimaryRecord struct {
 	LastCommand      *radioPrimaryCommand `json:"last_command,omitempty"`
 	LastReceipt      *radioPrimaryReceipt `json:"last_receipt,omitempty"`
 	StopReceipt      *radioPrimaryReceipt `json:"positive_stop_receipt,omitempty"`
+	ReleaseActionID  string               `json:"release_action_id,omitempty"`
+	TeardownCSeq     int                  `json:"teardown_cseq,omitempty"`
 }
 
 // Bootstrap continues to construct the v1 producer. The primary port is only
@@ -110,7 +115,20 @@ func (p *radioProducer) primaryState(ctx context.Context) (radioPrimaryState, er
 	if err != nil || ctx.Err() != nil || state.Schema != primaryRadioSchema || !producerHex(state.Process, 64) || !producerCounter(state.Revision, true) {
 		return radioPrimaryState{}, errRadioUnavailable
 	}
+	if state.ReleasedSession != nil || state.ReleaseActionID != nil || state.TeardownCSeq != nil {
+		if state.ReleasedSession == nil || !state.ReleasedSession.valid() ||
+			state.ReleaseActionID == nil || !producerUUID(*state.ReleaseActionID) || state.TeardownCSeq == nil ||
+			*state.TeardownCSeq <= 0 || state.Session != nil || state.Observation == nil ||
+			!validRadioObservation(*state.Observation) || !primaryKnownNonradio(*state.Observation) {
+			return radioPrimaryState{}, errRadioUnknown
+		}
+	}
 	return state, nil
+}
+
+func primaryKnownNonradio(o radioNativeObservation) bool {
+	return o.SourceKind == "spotify" && (o.State == "playing" || o.State == "stopped") ||
+		o.SourceKind == "none" && (o.State == "stopped" || o.State == "idle")
 }
 
 func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []string, error) {
@@ -152,8 +170,12 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 		if !primaryOwnsPlaying(state, active) {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
 		}
-	} else if state.Session != nil || p.active != "" {
+	} else if state.Session != nil {
 		return nil, nil, errRadioUnknown
+	} else if p.active != "" {
+		if err := p.retireObservedPrimaryLocked(state); err != nil {
+			return nil, nil, err
+		}
 	}
 	p.evidence.NativeProcess = state.Process
 	p.primary.(*radioPrimaryBackend).replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
@@ -546,6 +568,7 @@ func (p *radioProducer) primaryRecordEffect(r radioProducerRecord, stage string,
 		}
 		if p.active == state.Incumbent {
 			p.active = ""
+			p.primaryObservedAt = 0
 		}
 	}
 	current.Primary = &state
@@ -571,6 +594,7 @@ func (p *radioProducer) primaryFinish(f radioFence) (radioNativeObservation, err
 	}
 	if r.Observation.SourceKind == "radio" {
 		p.active = f.Token
+		p.primaryObservedAt = r.Observation.ObservedAt
 	}
 	return r.Observation, nil
 }
@@ -587,13 +611,45 @@ func (p *radioProducer) primaryObserve(ctx context.Context) (radioNativeObservat
 	}
 	if state.Observation.SourceKind == "radio" {
 		incumbent := p.records[p.active]
-		if !primaryOwnsPlaying(state, incumbent) {
+		if !primaryOwnsPlaying(state, incumbent) || state.Observation.ObservedAt < p.primaryObservedAt {
 			return radioNativeObservation{}, errRadioUnknown
 		}
-	} else if p.active != "" || state.Session != nil {
+		p.primaryObservedAt = max(p.primaryObservedAt, state.Observation.ObservedAt)
+	} else if state.Session != nil {
 		return radioNativeObservation{}, errRadioUnknown
+	} else if p.active != "" {
+		if err := p.retireObservedPrimaryLocked(state); err != nil {
+			return radioNativeObservation{}, err
+		}
 	}
 	return *state.Observation, nil
+}
+
+func (p *radioProducer) retireObservedPrimaryLocked(state radioPrimaryState) error {
+	record := p.records[p.active]
+	observation := *state.Observation
+	if !p.live[p.active] || !record.Terminal || record.Preempted || record.SourceDrained ||
+		record.Request.Process != state.Process || record.Primary == nil || record.Primary.Session == nil ||
+		state.ReleasedSession == nil || *record.Primary.Session != *state.ReleasedSession ||
+		observation.OwnerGeneration < record.Fence.OwnerGeneration ||
+		observation.OwnerGeneration == record.Fence.OwnerGeneration && observation.ObservedAt <= p.primaryObservedAt {
+		return errRadioUnknown
+	}
+	for _, pending := range p.records {
+		if !pending.Terminal {
+			return errRadioUnknown
+		}
+	}
+	custody := *record.Primary
+	custody.ReleaseActionID, custody.TeardownCSeq = *state.ReleaseActionID, *state.TeardownCSeq
+	record.Primary = &custody
+	record.SourceDrained = true
+	if err := p.storeLocked(record); err != nil {
+		return err
+	}
+	p.active = ""
+	p.primaryObservedAt = 0
+	return nil
 }
 
 // Reconciliation can observe the exact pending effect. It never sends its
@@ -628,6 +684,11 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 	if stage == "" {
 		return radioReconciliation{}, errRadioUnknown
 	}
+	if r.Terminal && r.Primary.Session != nil {
+		// A prior successful START is historical. After an observation failure,
+		// read the current owner again instead of reviving its old playing receipt.
+		return p.primaryReconcileStarted(ctx, r)
+	}
 	if !r.Terminal {
 		if r.Stage != stage {
 			query := command
@@ -651,6 +712,32 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 	}
 	return radioReconciliation{ActionID: f.ActionID, Generation: f.Generation, Token: r.Fence.Token,
 		Terminal: true, Outcome: "committed", Observation: r.Observation}, nil
+}
+
+func (p *radioProducer) primaryReconcileStarted(ctx context.Context, r radioProducerRecord) (radioReconciliation, error) {
+	observation, err := p.primaryObserve(ctx)
+	if err != nil {
+		return radioReconciliation{}, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := p.records[r.Fence.Token]
+	if current.Fence != r.Fence || !p.live[r.Fence.Token] || current.Primary == nil {
+		return radioReconciliation{}, errRadioUnknown
+	}
+	outcome := "committed"
+	if observation.SourceKind == "radio" {
+		if p.active != r.Fence.Token || current.SourceDrained {
+			return radioReconciliation{}, errRadioUnknown
+		}
+	} else {
+		if !primaryKnownNonradio(observation) || !current.SourceDrained || current.Primary.ReleaseActionID == "" || p.active != "" {
+			return radioReconciliation{}, errRadioUnknown
+		}
+		outcome = "preempted"
+	}
+	return radioReconciliation{ActionID: r.Fence.ActionID, Generation: r.Fence.Generation, Token: r.Fence.Token,
+		Terminal: true, Outcome: outcome, Observation: observation}, nil
 }
 
 // Primary volume remains unavailable until the same C owner can return an
