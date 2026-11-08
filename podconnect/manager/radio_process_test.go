@@ -114,7 +114,12 @@ func TestRadioInertChild(t *testing.T) {
 		os.Exit(0)
 	}
 	if os.Getenv("RADIO_TEST_GROUP_ROLE") == "grandchild" {
-		_ = os.WriteFile(os.Getenv("RADIO_TEST_PIDFILE"), []byte(strconv.Itoa(os.Getpid())), 0600)
+		path := os.Getenv("RADIO_TEST_PIDFILE")
+		// Both fixture readers treat existence as publication of a complete PID.
+		if path == "" || os.WriteFile(path+".tmp", []byte(strconv.Itoa(os.Getpid())), 0600) != nil ||
+			os.Rename(path+".tmp", path) != nil {
+			os.Exit(3)
+		}
 		time.Sleep(30 * time.Second)
 		os.Exit(0)
 	}
