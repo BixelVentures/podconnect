@@ -15,11 +15,17 @@ on:
       - "podconnect/Dockerfile"
       - ".github/fixtures/**"
   workflow_dispatch:
+    inputs:
+      retained_primary_resume:
+        description: Reuse the exact d987c5b fixture binaries for Resume failure diagnostics
+        type: boolean
+        default: false
 
 # Keep producers and the composed-fixture consumer on one supported ABI.
 # ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
+    if: github.ref_name != 'codex/radio-primary-output-routing-20261108' || !inputs.retained_primary_resume
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -95,6 +101,7 @@ jobs:
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
+    if: github.ref_name != 'codex/radio-primary-output-routing-20261108' || !inputs.retained_primary_resume
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -289,6 +296,10 @@ jobs:
 
   selected-start-clock:
     needs: [build-fork, build-owntone]
+    if: always() && ((github.ref_name == 'codex/radio-primary-output-routing-20261108' && inputs.retained_primary_resume) || (needs.build-fork.result == 'success' && needs.build-owntone.result == 'success'))
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -305,10 +316,14 @@ jobs:
         with:
           name: selected-c-callback
           path: /tmp/owntone
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.retained_primary_resume && 42482437578 || github.run_id }}
       - uses: actions/download-artifact@v4
         with:
           name: selected-native-tests
           path: /tmp/owntone
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.retained_primary_resume && 42482437578 || github.run_id }}
       - name: Verify exact primary Native actor through production OwnTone HTTP
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone
@@ -316,8 +331,11 @@ jobs:
           set -Eeuo pipefail
           chmod +x src/airplay_callback_owner native-tests
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          trap 'status=$?; if [ "$status" -ne 0 ]; then python3 "$GITHUB_WORKSPACE/.github/fixtures/print-primary-resume-failure.py"; fi; exit "$status"' EXIT
+          if [ "${{ inputs.retained_primary_resume }}" != true ]; then
+            sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
+            sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
+          fi
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
       - name: Verify held fresh START and explicit late paused Resume against actual C
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
