@@ -1,0 +1,158 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -369,6 +369,7 @@
+     const struct output_primary_radio_custody *, const char *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_start(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_result(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
++int outputs_airplay_primary_station_readiness(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ int outputs_airplay_primary_station_cancel(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
+ bool outputs_primary_radio_transport_available(uint64_t);
+ int outputs_device_session_add_primary_radio(uint64_t, void *, const char *,
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -2660,8 +2660,6 @@
+       return -1;
+     }
+ 
+-  if (session->primary_radio)
+-    primary_radio_station_packet_sent(session);
+   outputs_radio_sender_packet(session->device_id,session->device_incarnation,session->session_epoch,session);
+ 
+ /*
+@@ -2753,6 +2751,13 @@
+       session->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
+ }
+ 
++static void
++packet_send_fresh(struct airplay_session *session, struct rtp_packet *packet)
++{
++  if (packet_send(session, packet) == 0 && session->primary_radio)
++    primary_radio_station_packet_sent(session);
++}
++
+ static int
+ packets_send(struct airplay_master_session *ams)
+ {
+@@ -2780,12 +2785,12 @@
+       if (session->state == AIRPLAY_STATE_CONNECTED)
+ 	{
+ 	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
+-	  packet_send(session, pkt);
++	  packet_send_fresh(session, pkt);
+ 	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
+ 	}
+       else if (session->state == AIRPLAY_STATE_STREAMING)
+ 	{
+-	  packet_send(session, pkt);
++	  packet_send_fresh(session, pkt);
+ 	}
+     }
+ 
+@@ -5316,6 +5321,7 @@
+ #define PRIMARY_RADIO_PACKET_US 7982
+ #define PRIMARY_RADIO_START_LIMIT 32
+ #define PRIMARY_RADIO_START_SECONDS 8
++#define PRIMARY_RADIO_READY_SECONDS 2
+ 
+ /* This table and its reservation watermark belong to one primary C process
+  * and only the player loop. The watermark survives eviction, not restart. */
+@@ -5323,7 +5329,7 @@
+ {
+   struct output_primary_radio_start_request request;
+   struct output_primary_radio_start_result result;
+-  struct timespec deadline;
++  struct timespec deadline, last_fresh_rtp;
+   struct primary_radio_decode *decoder;
+   struct airplay_primary_radio_route admitted_route;
+   struct output_primary_radio_custody predecessor_release;
+@@ -5498,8 +5504,18 @@
+   struct primary_radio_decode *decoder = session->primary_radio_decoder;
+   struct primary_radio_station_operation *operation = decoder ? decoder->operation : NULL;
+   struct output_primary_radio_custody custody;
+-  if (!operation || operation->result.phase != OUTPUT_PRIMARY_RADIO_START_PENDING)
++  struct timespec sent;
++  if (!operation)
+     return;
++  bool timed = clock_gettime(CLOCK_MONOTONIC, &sent) == 0;
++  if (operation->result.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED)
++    {
++      if (timed)
++        operation->last_fresh_rtp = sent;
++      return;
++    }
++  if (operation->result.phase != OUTPUT_PRIMARY_RADIO_START_PENDING)
++    return;
+   if (!primary_radio_station_before_deadline(operation)
+       || outputs_primary_radio_custody_read(session->device_id, &custody) != 1
+       || strcmp(custody.process, operation->request.process)
+@@ -5513,6 +5529,8 @@
+     }
+   operation->result.phase = OUTPUT_PRIMARY_RADIO_START_OBSERVED;
+   operation->result.custody = custody;
++  if (timed)
++    operation->last_fresh_rtp = sent;
+ }
+ 
+ int
+@@ -5943,6 +5961,23 @@
+ }
+ 
+ int
++outputs_airplay_primary_station_readiness(const struct output_primary_radio_start_request *request,
++    struct output_primary_radio_start_result *out)
++{
++  if (outputs_airplay_primary_station_result(request, out) < 0
++      || out->phase != OUTPUT_PRIMARY_RADIO_START_OBSERVED
++      || !primary_radio_station_predecessor(&out->custody))
++    return -1;
++  const struct primary_radio_station_operation *operation = primary_radio_station_find(request);
++  struct timespec now, zero = { 0 }, max_age = { .tv_sec = PRIMARY_RADIO_READY_SECONDS };
++  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0 || timespec_cmp(operation->last_fresh_rtp, zero) <= 0
++      || timespec_cmp(now, operation->last_fresh_rtp) < 0
++      || timespec_cmp(timespec_sub(now, operation->last_fresh_rtp), max_age) > 0)
++    return -1;
++  return 0;
++}
++
++int
+ outputs_airplay_primary_station_preflight_target(uint64_t id, struct output_primary_radio_start_request *out)
+ {
+   struct output_device *device = outputs_device_get(id);
+--- a/src/player.c
++++ b/src/player.c
+@@ -3451,6 +3451,9 @@
+       case 9:
+         *retval = outputs_airplay_primary_station_replace_activate(c->request, c->released, c->park_token, c->result);
+         break;
++      case 10:
++        *retval = outputs_airplay_primary_station_readiness(c->request, c->result);
++        break;
+       default:
+         *retval = -1;
+         break;
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -113,7 +113,7 @@
+ {
+   static const char *const names[] = {
+     "target", "start", "result", "cancel", "preflight_target", "preflight", "activate",
+-    "preflight_replace_target", "preflight_replace", "activate_replace",
++    "preflight_replace_target", "preflight_replace", "activate_replace", "readiness",
+   };
+   struct output_primary_radio_start_request request = { 0 };
+   struct output_primary_radio_start_result result = { 0 };
+@@ -131,12 +131,12 @@
+     if (!strcmp(phase, names[i]))
+       action = (int)i;
+   bool read_target = action == 0 || action == 4 || action == 7;
+-  bool replace = action >= 7;
++  bool replace = action >= 7 && action <= 9;
+   json_object *field;
+   bool has_predecessor = json_object_object_get_ex(body, "predecessor", &field);
+   bool has_token = json_object_object_get_ex(body, "park_token", &field);
+   if (action < 0 || (replace && !has_predecessor)
+-      || (has_predecessor && !replace && action != 2 && action != 3)
++      || (has_predecessor && !replace && action != 2 && action != 3 && action != 10)
+       || (action == 6 && !has_token) || (has_token && action != 6 && action != 9)
+       || json_object_object_length(body) != (read_target ? 3 : 10) + has_predecessor + has_token + (action == 9)
+       || (has_token && !transport_json_string(body, "park_token", park_token, sizeof(park_token)))

@@ -1,0 +1,387 @@
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1969,6 +1969,7 @@
+   if (!reply)
+     return HTTP_SERVUNAVAIL;
+   json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_primary_radio_readiness.v1"));
++  json_object_object_add(reply, "effect_protocol", json_object_new_string("primary_route_v1"));
+   json_object_object_add(reply, "process_id", json_object_new_string(admission.process_id));
+   attention_json_u64(reply, "device_id", admission.device_id);
+   attention_json_u64(reply, "device_incarnation", admission.device_incarnation);
+@@ -5237,6 +5238,7 @@
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/source-state$", jsonapi_reply_radio_source_state },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/reacquire$", jsonapi_reply_radio_reacquire },
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/radio-handoff/primary-readiness$", jsonapi_reply_primary_radio_readiness },
++    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/primary-owner$", jsonapi_reply_primary_radio_owner },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/(move|move-state)$", jsonapi_reply_radio_move },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/(source-move|source-move-state)$", jsonapi_reply_radio_source_move },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/other-target$", jsonapi_reply_radio_other_target },
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -17,6 +17,77 @@
+   wrapper=json_object_new_object();if(!wrapper)return -1;
+   json_object_object_add(wrapper,"output_identity",json_object_get(field));int ret=radio_handoff_identity_parse(wrapper,identity);json_object_put(wrapper);return ret;
+ }
++/* Authenticated by the existing /radio-handoff route guard. POST carries
++ * structured exact proof only; this entry cannot dispatch an effect. */
++static int
++jsonapi_reply_primary_radio_owner(struct httpd_request *hreq)
++{
++  static const char schema[] = "podconnect.output_primary_radio_owner_observation.v1";
++  char supplied[sizeof(schema)], kind[8];
++  uint64_t id;
++  int ret = HTTP_BADREQUEST;
++  json_object *body = transport_parse_body_limit(hreq->in_body, 4096), *identity = NULL, *reply = NULL;
++  if (!body || outputs_radio_sender_role() || safe_atou64(hreq->path_parts[2], &id) < 0 || !id || id == UINT64_MAX
++      || !transport_json_string(body, "schema", supplied, sizeof(supplied)) || strcmp(supplied, schema)
++      || !transport_json_string(body, "source_kind", kind, sizeof(kind)))
++    goto done;
++  if (!strcmp(kind, "spotify"))
++    {
++      struct output_native_owner owner = { 0 };
++      struct output_queue_writer writer = { 0 };
++      struct output_transport_identity route = { 0 };
++      if (json_object_object_length(body) != 4 || radio_named_owner_parse(body, "native_owner", &owner) < 0
++          || radio_named_writer_parse(body, "writer_proof", &writer) < 0)
++        goto done;
++      ret = 409;
++      if (player_primary_radio_spotify_owner(id, &owner, &writer, &route) < 0)
++        goto done;
++      ret = HTTP_SERVUNAVAIL;
++      identity = transport_identity_json(&route);
++      reply = json_object_new_object();
++      if (!identity || !reply)
++        goto done;
++      json_object_object_add(reply, "native_owner", transport_native_json(&owner));
++      json_object_object_add(reply, "writer_proof", queue_writer_json(&writer));
++      json_object_object_add(reply, "output_identity", identity);
++    }
++  else if (!strcmp(kind, "none"))
++    {
++      struct radio_absence_source source = { 0 };
++      struct output_primary_radio_start_request target = { 0 };
++      if (json_object_object_length(body) != 3 || radio_absence_source_parse(body, &source) < 0 || source.target_absence)
++        goto done;
++      ret = 409;
++      if (player_primary_radio_absent_owner(id, &source, &target) < 0)
++        goto done;
++      ret = HTTP_SERVUNAVAIL;
++      identity = json_object_new_object();
++      reply = json_object_new_object();
++      if (!identity || !reply)
++        goto done;
++      json_object_object_add(identity, "process", json_object_new_string(target.process));
++      attention_json_u64(identity, "device_id", target.device_id);
++      attention_json_u64(identity, "incarnation", target.incarnation);
++      attention_json_u64(identity, "session_epoch", target.epoch);
++      attention_json_u64(identity, "route_revision", target.route);
++      json_object_object_add(reply, "source_absence", radio_absence_source_json(&source));
++      json_object_object_add(reply, "target_identity", identity);
++    }
++  else
++    goto done;
++  identity = NULL; /* Owned by reply. */
++  json_object_object_add(reply, "schema", json_object_new_string(schema));
++  json_object_object_add(reply, "source_kind", json_object_new_string(kind));
++  json_object_object_add(reply, "physical_result_verified", json_object_new_boolean(false));
++  ret = transport_json_reply(hreq, reply);
++  reply = NULL; /* transport_json_reply consumed it. */
++done:
++  if (identity) json_object_put(identity);
++  if (reply) json_object_put(reply);
++  if (body) json_object_put(body);
++  return ret;
++}
++
+ static const char *radio_reacquire_phase_name(enum output_radio_reacquire_phase phase)
+ {
+   switch(phase){
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -3056,6 +3056,69 @@
+   return 0;
+ }
+ 
++/* Read-only owner-thread observations. Selection alone is not Spotify proof;
++ * the exact live FIFO writer and ordinary encrypted route must agree. */
++int
++outputs_primary_radio_spotify_owner(uint64_t id, const struct output_native_owner *owner,
++    const struct output_queue_writer *writer, struct output_transport_identity *route)
++{
++  struct output_device *d = outputs_device_get(id);
++  struct radio_handoff_slot *slot = radio_handoff_find(id);
++  if (!radio_protocols_initialized || outputs_radio_sender_role() || radio_handoff_fault
++      || start_journal_fault || start_startup_quarantine || !owner || !writer || !route
++      || !d || !native_owner_valid(owner, id) || outputs_radio_handoff_blocked(id)
++      || !outputs_airplay_primary_spotify_session_current(d, d->session)
++      || radio_transport_identity_get(id, route, true) < 0
++      || !radio_queue_writer_current(writer, route, NULL))
++    return -1;
++
++  /* A parked/returning writer cannot fall through to the old START proof. */
++  if (slot && slot->primary_return.intent[0])
++    {
++      const struct output_radio_reacquire_result *v = &slot->result.resume;
++      return slot->result.phase == OUTPUT_RADIO_REACQUIRED
++        && v->phase == OUTPUT_RADIO_REACQUIRE_OPENED
++        && native_owner_equal(owner, &v->command.intended_native_owner)
++        && queue_writer_equal(writer, &v->command.current_writer)
++        && transport_identity_equal(route, &v->route_identity)
++        && radio_reacquired_current(id, d->incarnation, d->session_epoch, d->session, false) ? 0 : -1;
++    }
++  const struct start_slot *spotify = start_active;
++  if (!spotify || spotify->cancelled || spotify->result.phase != OUTPUT_START_COMPLETED
++      || !spotify->result.actual_owner_present
++      || !native_owner_equal(owner, &spotify->result.command.committed_native_owner)
++      || writer->source_epoch != spotify->result.writer_source_epoch
++      || writer->writer_fd != spotify->result.command.writer_fd
++      || writer->pipe_device != spotify->result.pipe_device || writer->pipe_inode != spotify->result.pipe_inode
++      || strcmp(writer->native_process.boot_id, spotify->result.command.native_process.boot_id)
++      || writer->native_process.pid != spotify->result.command.native_process.pid
++      || writer->native_process.proc_start_ticks != spotify->result.command.native_process.proc_start_ticks)
++    return -1;
++  return outputs_start_bound_owner_current(owner, route, false) ? 0 : -1;
++}
++
++int
++outputs_primary_radio_absent_owner(uint64_t id, const struct radio_absence_source *source,
++    struct output_primary_radio_start_request *target)
++{
++  if (!radio_protocols_initialized || !source || !target || source->target_absence || source->route_count
++      || source->writer_fd || source->input_generation || source->input_item_id || source->input_epoch
++      || radio_absence_fault || radio_handoff_fault || radio_other_fault || start_journal_fault
++      || start_startup_quarantine || transport_pin || room_volume_pin_busy() || room_volume_undrained()
++      || outputs_start_busy() || !start_contexts_drained() || outputs_start_source_owned()
++      || (start_journal.token[0] && (start_journal_retirement_outcome != OUTPUT_RETIRE_RETIRED_KNOWN
++          || !start_journal_payload_valid()))
++      || radio_absence_fifo_writers(source) != 1
++      || outputs_airplay_primary_station_target(id, target) < 0)
++    return -1;
++  for (struct output_device *d = outputs_device_list; d; d = d->next)
++    if (d->selected || d->session)
++      return -1;
++  /* A writer may change outside this owner thread; recheck the same process
++   * and FIFO after taking the exact receiver snapshot. */
++  return radio_absence_fifo_writers(source) == 1 ? 0 : -1;
++}
++
+ int
+ outputs_init(void)
+ {
+@@ -3132,6 +3195,7 @@
+   return 0;
+ }
+ 
++
+ void
+ outputs_deinit(void)
+ {
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -169,6 +169,13 @@
+   bool admission_open;
+ };
+ int outputs_radio_admission_get(uint64_t,struct output_radio_admission *);
++struct output_primary_radio_start_request;
++struct radio_absence_source;
++int outputs_primary_radio_spotify_owner(uint64_t, const struct output_native_owner *,
++    const struct output_queue_writer *, struct output_transport_identity *);
++int outputs_primary_radio_absent_owner(uint64_t, const struct radio_absence_source *,
++    struct output_primary_radio_start_request *);
++
+ int outputs_radio_capability_get(uint64_t,struct output_radio_capability *);
+ int outputs_radio_source_state(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_radio_source_state *);
+ struct output_radio_handoff_request {
+--- a/src/outputs_radio_absence.inc.c
++++ b/src/outputs_radio_absence.inc.c
+@@ -99,19 +99,30 @@
+ {return !strcmp(a->process,b->process) && a->device_id==b->device_id && a->device_incarnation==b->device_incarnation && a->session_epoch==b->session_epoch && a->route_revision==b->route_revision && a->base_revision==b->base_revision && a->attention_revision==b->attention_revision;}
+ static bool radio_absence_equal(const struct output_radio_absence_request *a,const struct output_radio_absence_request *b,bool token)
+ {return radio_absence_source_equal(&a->source,&b->source) && radio_absence_identity_equal(&a->identity,&b->identity) && !strcmp(a->handoff_id,b->handoff_id) && (!token || !strcmp(a->token,b->token)) && a->generation==b->generation && a->native_revision==b->native_revision && a->radio_owner_epoch==b->radio_owner_epoch && a->initial_volume_percent==b->initial_volume_percent && !strcmp(a->sender_peer,b->sender_peer) && !strcmp(a->radio_process,b->radio_process) && !strcmp(a->receiver_key_digest,b->receiver_key_digest);}
+-/* 0 proven clean source + receiver + persisted manual base; 1 concrete Spotify
+- * source present; -1 ambiguous/unknown or incomplete prerequisite. No effects. */
+-int outputs_radio_absence_observe(const struct radio_absence_source *source,uint64_t id,struct output_radio_absence_result *out)
+-{
+-  struct output_device *d,*scan;struct stat st;struct output_start_request path={0};char digest[65],peer[65];int base;
+-  if(!source || !out || radio_absence_fault || !outputs_process[0] || !transport_hex(source->registry_digest,64)
++/* Common local FIFO proof. This never opens a writer or updates custody. */
++static int
++radio_absence_fifo_writers(const struct radio_absence_source *source)
++{
++  struct stat st;
++  struct output_start_request path = { 0 };
++  char digest[65];
++  if(!source || !transport_hex(source->registry_digest,64)
+       || !start_process_current(&source->native_process) || source->input_path[0]!='/' || !transport_hex(source->input_path_digest,64)
+       || !source->pipe_device || !source->pipe_inode)return -1;
+   snprintf(path.expected_input_path,sizeof(path.expected_input_path),"%s",source->input_path);
+   snprintf(path.expected_input_path_digest,sizeof(path.expected_input_path_digest),"%s",source->input_path_digest);
+   if(!start_pipe_registered(&path,digest) || stat(source->input_path,&st)<0 || !S_ISFIFO(st.st_mode)
+       || (uint64_t)st.st_dev!=source->pipe_device || (uint64_t)st.st_ino!=source->pipe_inode)return -1;
+-  int writers=start_all_writers_closed(&source->native_process,source->pipe_device,source->pipe_inode);
++  return start_all_writers_closed(&source->native_process,source->pipe_device,source->pipe_inode);
++}
++
++/* 0 proven clean source + receiver + persisted manual base; 1 concrete Spotify
++ * source present; -1 ambiguous/unknown or incomplete prerequisite. No effects. */
++int outputs_radio_absence_observe(const struct radio_absence_source *source,uint64_t id,struct output_radio_absence_result *out)
++{
++  struct output_device *d,*scan;char peer[65];int base;
++  if(!out || radio_absence_fault || !outputs_process[0])return -1;
++  int writers=radio_absence_fifo_writers(source);
+   if(writers<0)return -1;
+   d=outputs_device_get(id);
+   if(d && (d->selected || d->session))return 1;
+--- a/src/player.c
++++ b/src/player.c
+@@ -3191,6 +3191,41 @@
+ {struct player_radio_admission_command *c=arg;*retval=outputs_radio_admission_get(c->id,c->out);return COMMAND_END;}
+ int player_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+ {struct player_radio_admission_command c={id,out};return commands_exec_sync(cmdbase,radio_admission_command,NULL,&c);}
++
++struct player_primary_radio_owner_command
++{
++  uint64_t id;
++  const struct output_native_owner *owner;
++  const struct output_queue_writer *writer;
++  const struct radio_absence_source *absence;
++  struct output_transport_identity *route;
++  struct output_primary_radio_start_request *target;
++};
++
++static enum command_state
++primary_radio_owner_command(void *arg, int *retval)
++{
++  const struct player_primary_radio_owner_command *c = arg;
++  *retval = c->absence ? outputs_primary_radio_absent_owner(c->id, c->absence, c->target)
++    : outputs_primary_radio_spotify_owner(c->id, c->owner, c->writer, c->route);
++  return COMMAND_END;
++}
++
++int
++player_primary_radio_spotify_owner(uint64_t id, const struct output_native_owner *owner,
++    const struct output_queue_writer *writer, struct output_transport_identity *route)
++{
++  struct player_primary_radio_owner_command c = { .id = id, .owner = owner, .writer = writer, .route = route };
++  return commands_exec_sync(cmdbase, primary_radio_owner_command, NULL, &c);
++}
++
++int
++player_primary_radio_absent_owner(uint64_t id, const struct radio_absence_source *absence,
++    struct output_primary_radio_start_request *target)
++{
++  struct player_primary_radio_owner_command c = { .id = id, .absence = absence, .target = target };
++  return commands_exec_sync(cmdbase, primary_radio_owner_command, NULL, &c);
++}
+ 
+ struct player_radio_capability_command {uint64_t id;struct output_radio_capability *out;};
+ static enum command_state radio_capability_command(void *arg,int *retval)
+--- a/src/player.h
++++ b/src/player.h
+@@ -294,3 +294,9 @@
+ int player_radio_source_state(uint64_t,const struct output_native_owner *,const struct output_queue_writer *,struct output_radio_source_state *);
+ int player_radio_capability_get(uint64_t,struct output_radio_capability *);
+ int player_radio_admission_get(uint64_t,struct output_radio_admission *);
++struct output_primary_radio_start_request;
++struct radio_absence_source;
++int player_primary_radio_spotify_owner(uint64_t, const struct output_native_owner *,
++    const struct output_queue_writer *, struct output_transport_identity *);
++int player_primary_radio_absent_owner(uint64_t, const struct radio_absence_source *,
++    struct output_primary_radio_start_request *);
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1991,7 +1991,10 @@
+     assert(changed.payload && db_start_guard_save(&saved,&changed)==0);
+     json_object_put(record);free(saved.payload);free(changed.payload);
+   }
+-  start_journal_startup();
++  if (primary_park)
++    outputs_radio_protocols_startup();
++  else
++    start_journal_startup();
+   if (cold_restart && !getenv("PC_JOURNAL_INJECT_UNKNOWN"))
+     rollback53_probe("new-version-retained-release", false);
+   if (cold_restart)
+@@ -2630,6 +2633,43 @@
+       f.primary_hold_teardown = false;
+       f.volumes = 0;
+     }
++  if (primary_park)
++    {
++      struct stat fifo_stat;
++      assert(!stat(fifo, &fifo_stat) && S_ISFIFO(fifo_stat.st_mode));
++      struct radio_absence_source absence = {
++        .native_process = r->native_process, .pipe_device = fifo_stat.st_dev, .pipe_inode = fifo_stat.st_ino,
++      };
++      json_object *registry = json_object_new_object(), *aliases = json_object_new_array();
++      json_object *rooms = json_object_new_array(), *targets = json_object_new_array();
++      json_object_array_add(aliases, json_object_new_string(f.device->name));
++      json_object_array_add(rooms, json_object_new_string(r->intended_native_owner.room_id));
++      json_object_array_add(targets, json_object_new_string(r->intended_native_owner.homepod_id));
++      json_object_object_add(registry, "Aliases", aliases);
++      json_object_object_add(registry, "Rooms", rooms);
++      json_object_object_add(registry, "Homepods", targets);
++      json_object_object_add(registry, "Pipe", json_object_new_string(fifo));
++      json_object_object_add(registry, "Format", json_object_new_string("s16le"));
++      const char *serialized = json_object_to_json_string_ext(registry, JSON_C_TO_STRING_PLAIN);
++      unsigned char digest[32];
++      gcry_md_hash_buffer(GCRY_MD_SHA256, digest, serialized, strlen(serialized));
++      for (size_t i = 0; i < sizeof(digest); i++)
++        sprintf(absence.registry_digest + i * 2, "%02x", digest[i]);
++      json_object_put(registry);
++      snprintf(absence.input_path, sizeof(absence.input_path), "%s", fifo);
++      memcpy(absence.input_path_digest, r->expected_input_path_digest, sizeof(absence.input_path_digest));
++      struct output_primary_radio_start_request target;
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) == 0
++          && target.device_id == f.device->id && !strcmp(target.process, outputs_process)
++          && target.incarnation == f.device->incarnation && !f.device->session && !start_active);
++      int extra_writer = open(fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++      assert(extra_writer >= 0);
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) < 0);
++      assert(!close(extra_writer));
++      absence.pipe_inode++;
++      assert(outputs_primary_radio_absent_owner(f.device->id, &absence, &target) < 0);
++      puts("PASS primary absence requires exact registered FIFO and no writer; no pairing or start needed");
++    }
+   struct output_start_state state;assert(outputs_start_state_get(r,&state)==0 && state.ready);
+   assert(outputs_start_prepare(r,&f.start_result)==0);*r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
+   /* Fill a genuine FIFO and block a genuine old writer before C opens its reader. */
+@@ -3084,6 +3124,13 @@
+       };
+       memcpy(request.writer.input_path_digest, f.start_result.command.expected_input_path_digest,
+           sizeof(request.writer.input_path_digest));
++      struct output_transport_identity observed_owner;
++      struct output_queue_writer stale_writer = request.writer;
++      stale_writer.source_epoch++;
++      assert(outputs_primary_radio_spotify_owner(f.device->id, &request.owner, &stale_writer, &observed_owner) < 0);
++      assert(outputs_primary_radio_spotify_owner(f.device->id, &request.owner, &request.writer, &observed_owner) == 0
++          && transport_identity_equal(&observed_owner, &f.start_result.route_identity)
++          && f.pc70_peer_sessions == 1 && !f.teardowns);
+       outputs_attention_uuid(request.action);
+       struct output_primary_radio_start_request start;
+       struct output_primary_radio_start_result station;
+@@ -3130,6 +3177,7 @@
+           && f.device->route_revision == exact.route.route_revision + 1
+           && !outputs_radio_handoff_emission_current(f.device->id));
+       struct radio_handoff_slot *retained = radio_handoff_find(f.device->id);
++      assert(outputs_primary_radio_spotify_owner(f.device->id, &exact.owner, &exact.writer, &observed_owner) < 0);
+       struct output_radio_handoff_result v1;
+       assert(retained && !retained->result.suspended_signature[0]
+           && !retained->result.command.receiver_key_digest[0]
+@@ -3275,6 +3323,8 @@
+                   && returned.phase == OUTPUT_RADIO_REACQUIRE_OPENED && returned.newly_opened
+                   && transport_identity_equal(&returned.route, &ready_route)
+                   && outputs_radio_reacquire_resume_current(&returned.resume_arm));
++              assert(outputs_primary_radio_spotify_owner(f.device->id, &exact.owner, &back.current_writer, &observed_owner) == 0
++                  && transport_identity_equal(&observed_owner, &ready_route));
+               assert(clock_gettime(CLOCK_MONOTONIC, &radio_pcm.pts) == 0);
+               airplay_write(&radio_pcm); /* Real encoder and encrypted loopback UDP; fixture-provided PCM. */
+               assert(primary_radio_wire_packets(&f, &music_seq) == 1);
+@@ -3283,6 +3333,7 @@
+                   && f.pc70_peer_sessions == radio_sessions + 1);
+               assert(!close(writer));
+               writer = -1;
++              assert(outputs_primary_radio_spotify_owner(f.device->id, &exact.owner, &back.current_writer, &observed_owner) < 0);
+               assert(!attention_emission_current(f.device->session, NULL));
+               assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT, &back, &returned) == 0
+                   && returned.phase == OUTPUT_RADIO_REACQUIRE_UNKNOWN && !returned.route.device_id);

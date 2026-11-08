@@ -1,0 +1,382 @@
+--- a/daemon/radio_primary.go
++++ b/daemon/radio_primary.go
+@@ -142,9 +142,15 @@
+ 		req.Reply(app.radioPrimaryReadiness(ctx, process), nil)
+ 		return
+ 	}
+-	// Keep the private prototype dormant until the same-target park/handback
+-	// and decoder lifecycle compose through the existing producer.
+-	req.Reply(nil, ErrAliasConflict)
++	if !app.radioEnabled() || c.Request.Process != radioProcessID(process) ||
++		!validPrimaryCommandIdentity(c.Request) || c.Request.Phase != "result" && app.manualReleasePending() {
++		req.Reply(nil, ErrAliasConflict)
++		return
++	}
++	actionCtx, cancel := queueOperationContext(ctx, c.Context)
++	defer cancel()
++	data, err := app.primaryRadioActorAsk(actionCtx, apiRadioPrimaryActor, c.Request)
++	req.Reply(data, err)
+ }
+ 
+ func (t radioPrimaryTarget) valid() bool {
+@@ -244,6 +250,11 @@
+ 	}
+ 	h := app.radio.Holds[r.Target]
+ 	if r.Phase == "reserve" {
++		for _, hold := range app.radio.Holds {
++			if hold == nil || hold.PrimaryPending == nil {
++				return nil, ErrAliasConflict // A legacy hold still owns its source or receiver.
++			}
++		}
+ 		if r.Session != nil {
+ 			return p.reservePrimaryRadioReplacement(r, h)
+ 		}
+--- a/daemon/radio_handoff.go
++++ b/daemon/radio_handoff.go
+@@ -377,6 +377,21 @@
+ 		}
+ 		app.radio.mu.Unlock()
+ 	}
++	if c.Action != "result" && c.Action != "observe" {
++		app.radio.mu.Lock()
++		conflict := false
++		for _, hold := range app.radio.Holds {
++			if hold != nil && hold.PrimaryPending != nil && !primaryRadioRetired(hold) {
++				conflict = true
++				break
++			}
++		}
++		app.radio.mu.Unlock()
++		if conflict {
++			req.Reply(nil, ErrAliasConflict)
++			return
++		}
++	}
+ 	// A released56 manual-release transaction owns the source until its
+ 	// exact terminal cleanup. Read-only radio results remain available.
+ 	if c.Action != "result" && c.Action != "observe" && app.manualReleasePending() {
+--- a/daemon/radio_primary_readiness.go
++++ b/daemon/radio_primary_readiness.go
+@@ -14,6 +14,7 @@
+ 
+ type radioPrimaryCapability struct {
+ 	Schema      string `json:"schema"`
++	Effects     string `json:"effect_protocol"`
+ 	Process     string `json:"process_id"`
+ 	Device      string `json:"device_id"`
+ 	Incarnation string `json:"device_incarnation"`
+@@ -22,19 +23,24 @@
+ }
+ 
+ func (c radioPrimaryCapability) valid(device string) bool {
+-	return c.Schema == primaryRadioCapabilitySchema && c.Device == device &&
++	return c.Schema == primaryRadioCapabilitySchema && c.Effects == "primary_route_v1" && c.Device == device &&
+ 		volumeUUID.MatchString(c.Process) && volumeCounter(c.Incarnation) && c.Incarnation != "0" &&
+ 		c.LegacyOpen != nil && c.Physical != nil && !*c.Physical
+ }
+ 
+ type radioPrimaryReadinessState struct {
+-	Schema      string                   `json:"schema"`
+-	Protocol    string                   `json:"protocol,omitempty"`
+-	Process     string                   `json:"process_id"`
+-	Revision    string                   `json:"native_revision"`
+-	Targets     []radioTarget            `json:"configured_targets"`
+-	Missing     []string                 `json:"missing_proofs"`
+-	Observation *radioPrimaryObservation `json:"observation"`
++	Schema          string                   `json:"schema"`
++	Protocol        string                   `json:"protocol,omitempty"`
++	Process         string                   `json:"process_id"`
++	Revision        string                   `json:"native_revision"`
++	Targets         []radioTarget            `json:"configured_targets"`
++	Missing         []string                 `json:"missing_proofs"`
++	Observation     *radioPrimaryObservation `json:"observation"`
++	Session         *radioPrimaryBinding     `json:"target_session,omitempty"`
++	Capabilities    []string                 `json:"capabilities,omitempty"`
++	ReleasedSession *radioPrimaryBinding     `json:"released_session,omitempty"`
++	ReleaseActionID *string                  `json:"release_action_id,omitempty"`
++	TeardownCSeq    *int                     `json:"teardown_cseq,omitempty"`
+ }
+ 
+ // Only the exact composed C build publishes the authenticated capability.
+@@ -62,6 +68,7 @@
+ 		s.Targets = append(s.Targets, radioTarget{id, app.cfg.DeviceAliases[i], device, "unknown", false, i == 0, ""})
+ 	}
+ 	unsupported := 0
++	receivers := make(map[string]string, len(s.Targets))
+ 	cProcess := ""
+ 	base := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/")
+ 	for _, target := range s.Targets {
+@@ -83,9 +90,13 @@
+ 			unsupported++
+ 			continue
+ 		}
+-		if err != nil || !c.valid(target.HomePodID) || (cProcess != "" && c.Process != cProcess) {
++		if err != nil {
++			continue // This configured output remains unavailable.
++		}
++		if !c.valid(target.HomePodID) || (cProcess != "" && c.Process != cProcess) {
+ 			return s
+ 		}
++		receivers[target.HomePodID] = c.Incarnation
+ 		cProcess = c.Process
+ 	}
+ 	app.radio.mu.Lock()
+@@ -96,8 +107,16 @@
+ 	}
+ 	if unsupported == len(s.Targets) {
+ 		s.Protocol = "v1" // Manager still requires fresh v1 evidence from this Native process.
+-	} else if unsupported == 0 && cProcess != "" {
++	} else if unsupported == 0 && len(receivers) > 0 && cProcess != "" {
+ 		s.Missing = []string{"primary_current_owner_unverified"}
++		observed, err := app.primaryRadioActorAsk(ctx, apiRadioPrimaryActorState, radioPrimaryActorStateRequest{
++			State: s, CProcess: cProcess, Receivers: receivers,
++		})
++		if verified, ok := observed.(radioPrimaryReadinessState); err == nil && ok && verified.Observation != nil {
++			s = verified
++			s.Protocol, s.Missing = "primary", []string{}
++			s.Capabilities = []string{"replacement_decoder_preflight"}
++		}
+ 	}
+ 	return s
+ }
+--- a/daemon/radio_primary_readiness_test.go
++++ b/daemon/radio_primary_readiness_test.go
+@@ -18,7 +18,7 @@
+ 		RadioHandoffStatePath: filepath.Join(t.TempDir(), "radio.json"), RoomTransportOwnToneURL: "http://127.0.0.1:3689",
+ 	}}
+ 	const legacy = `{"schema":"podconnect.output_radio_admission.v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","admission_open":true,"physical_result_verified":false}`
+-	const capability = `{"schema":"podconnect.output_primary_radio_readiness.v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","legacy_admission_open":true,"physical_result_verified":false}`
++	const capability = `{"schema":"podconnect.output_primary_radio_readiness.v1","effect_protocol":"primary_route_v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","legacy_admission_open":true,"physical_result_verified":false}`
+ 	for _, tc := range []struct {
+ 		name, body, legacy, protocol, missing string
+ 		status                                int
+--- /dev/null
++++ b/daemon/radio_primary_observation.go
+@@ -0,0 +1,215 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	apiRadioPrimaryActorState ApiRequestType = "radio_primary_actor_state"
++	cPrimaryOwnerSchema                      = "podconnect.output_primary_radio_owner_observation.v1"
++)
++
++type radioPrimaryOwnerRequest struct {
++	Schema  string                 `json:"schema"`
++	Source  string                 `json:"source_kind"`
++	Owner   *roomTransportIdentity `json:"native_owner,omitempty"`
++	Writer  *queueWriterWire       `json:"writer_proof,omitempty"`
++	Absence *radioAbsenceSource    `json:"source_absence,omitempty"`
++}
++
++type radioPrimaryOwnerReceipt struct {
++	radioPrimaryOwnerRequest
++	Output   *roomVolumeRoute    `json:"output_identity,omitempty"`
++	Target   *radioPrimaryTarget `json:"target_identity,omitempty"`
++	Physical *bool               `json:"physical_result_verified"`
++}
++
++type radioPrimaryActorStateRequest struct {
++	State     radioPrimaryReadinessState
++	CProcess  string
++	Receivers map[string]string
++}
++
++func (app *App) primaryRadioActorAsk(ctx context.Context, kind ApiRequestType, call any) (any, error) {
++	app.ownerMu.Lock()
++	ch, done := app.currentAPI, app.currentDone
++	app.ownerMu.Unlock()
++	if ch == nil || done == nil {
++		return nil, ErrAliasConflict
++	}
++	request, wait := NewApiRequest(kind, call)
++	select {
++	case ch <- request:
++		return wait(ctx)
++	case <-done:
++		return nil, ErrAliasConflict
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++}
++
++func (p *AppPlayer) primaryRadioReadOwner(ctx context.Context, device string, query radioPrimaryOwnerRequest) (radioPrimaryOwnerReceipt, error) {
++	var ack radioPrimaryOwnerReceipt
++	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + device + "/radio-handoff/primary-owner"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, p.app.cfg.RadioHandoffControlToken, query, &ack); err != nil {
++		return ack, err
++	}
++	if ack.Schema != query.Schema || ack.Source != query.Source || ack.Physical == nil || *ack.Physical {
++		return ack, ErrAliasConflict
++	}
++	switch query.Source {
++	case "spotify":
++		if ack.Owner == nil || ack.Writer == nil || ack.Absence != nil || ack.Target != nil || ack.Output == nil ||
++			!ack.Output.valid() || ack.Output.DeviceID != device || *ack.Owner != *query.Owner || *ack.Writer != *query.Writer ||
++			ack.Output.InputPathDigest != query.Writer.InputDigest {
++			return ack, ErrAliasConflict
++		}
++	case "none":
++		if ack.Owner != nil || ack.Writer != nil || ack.Absence == nil || ack.Absence.Live != nil || ack.Output != nil ||
++			ack.Target == nil || !ack.Target.valid() || ack.Target.Device != device || *ack.Absence != *query.Absence {
++			return ack, ErrAliasConflict
++		}
++	default:
++		return ack, ErrAliasConflict
++	}
++	return ack, nil
++}
++
++// The same Native actor owns source observation and effects. No persisted hold
++// becomes a new authority after restart, and a paused writer remains Spotify.
++func (p *AppPlayer) radioPrimaryActorState(ctx context.Context, request radioPrimaryActorStateRequest) (any, error) {
++	app, state := p.app, request.State
++	if ctx.Err() != nil || p.state == nil || p.state.player == nil || app.manualReleasePending() {
++		return nil, ErrAliasConflict
++	}
++	app.radio.mu.Lock()
++	generation := app.radio.Generation
++	if app.radio.failed || state.Revision != strconv.FormatUint(app.radio.Intent, 10) {
++		app.radio.mu.Unlock()
++		return nil, ErrAliasConflict
++	}
++	var held *radioHold
++	var releaseBinding *radioPrimaryBinding
++	var releaseAction string
++	var releaseCSeq int
++	var releaseGeneration uint64
++	for _, h := range app.radio.Holds {
++		if primaryRadioReleased(h) {
++			if h.Request.ProcessID != state.Process {
++				continue
++			}
++			candidateGeneration, _ := strconv.ParseUint(h.Request.Generation, 10, 64)
++			if candidateGeneration > releaseGeneration {
++				releaseGeneration = candidateGeneration
++				binding := *h.Primary
++				releaseBinding, releaseCSeq = &binding, h.PrimaryPending.Released
++				releaseAction = h.PrimaryAction
++				if releaseAction == "" && h.PrimaryPending.Stopped != nil {
++					releaseAction = h.PrimaryPending.Stopped.Action
++				}
++			}
++			continue
++		}
++		if primaryRadioRetired(h) {
++			continue
++		}
++		if h == nil || h.owner != p || h.PrimaryStatus == nil || h.Primary == nil || h.Phase != "primary_active" || held != nil {
++			app.radio.mu.Unlock()
++			return nil, ErrAliasConflict
++		}
++		held = h
++	}
++	app.radio.mu.Unlock()
++
++	source, playbackState, sourceRoom := "none", "idle", ""
++	var session *radioPrimaryBinding
++	if held != nil {
++		proof := held.PrimaryStatus
++		query := proof.Request
++		query.Phase = "readiness"
++		ack, err := p.primaryRadioCStart(ctx, query, proof.SameTarget)
++		if err != nil || ack.Phase != "playing" || ack.Session == nil || *ack.Session != *held.Primary ||
++			ack.Session.Process != request.CProcess || request.Receivers[ack.Session.DeviceID] != ack.Session.Incarnation {
++			return nil, ErrAliasConflict
++		}
++		source, playbackState, sourceRoom, session = "radio", "playing", held.Request.TargetID, ack.Session
++		generation, _ = strconv.ParseUint(proof.OwnerGeneration, 10, 64)
++	} else if p.primaryStream != nil {
++		owner, err := p.radioSourceOwner()
++		if err != nil {
++			return nil, err
++		}
++		writer, err := p.captureQueueWriter(ctx, owner, nil)
++		if err != nil {
++			return nil, err
++		}
++		ack, err := p.primaryRadioReadOwner(ctx, owner.HomePodID, radioPrimaryOwnerRequest{
++			Schema: cPrimaryOwnerSchema, Source: "spotify", Owner: &owner, Writer: &writer.Wire,
++		})
++		if err != nil || ack.Output.Process != request.CProcess || request.Receivers[ack.Output.DeviceID] != ack.Output.DeviceIncarnation {
++			return nil, ErrAliasConflict
++		}
++		source, playbackState, sourceRoom = "spotify", "playing", owner.RoomID
++		if p.state.player.IsPaused {
++			playbackState = "stopped"
++		}
++	} else {
++		proof, err := app.radioAbsenceSource()
++		if err != nil {
++			return nil, err
++		}
++		valid := false
++		for _, target := range state.Targets {
++			if request.Receivers[target.HomePodID] == "" {
++				continue
++			}
++			ack, err := p.primaryRadioReadOwner(ctx, target.HomePodID, radioPrimaryOwnerRequest{Schema: cPrimaryOwnerSchema, Source: "none", Absence: &proof})
++			if err == nil && ack.Target.Process == request.CProcess && request.Receivers[target.HomePodID] == ack.Target.Incarnation {
++				valid = true
++				break
++			}
++		}
++		if !valid {
++			return nil, ErrAliasConflict
++		}
++	}
++	for i, target := range state.Targets {
++		incarnation := request.Receivers[target.HomePodID]
++		if incarnation == "" || p.primaryRadioRoom(target.ID) != target.HomePodID {
++			continue
++		}
++		query := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "target", radioPrimaryTarget: radioPrimaryTarget{Device: target.HomePodID}}
++		if session != nil {
++			query.Phase, query.Predecessor = "preflight_replace_target", session
++		} else if source == "spotify" && target.ID == sourceRoom {
++			query.Phase = "preflight_target"
++		}
++		ack, err := p.primaryRadioCStart(ctx, query, false)
++		if err == nil && ack.Process == request.CProcess && ack.Incarnation == incarnation {
++			state.Targets[i].Availability, state.Targets[i].Selectable = "available", true
++		}
++	}
++	if ctx.Err() != nil {
++		return nil, ctx.Err()
++	}
++	app.radio.mu.Lock()
++	stable := !app.radio.failed && state.Revision == strconv.FormatUint(app.radio.Intent, 10) &&
++		(held == nil || app.radio.Holds[sourceRoom] == held && held.Phase == "primary_active" && held.Primary != nil && *held.Primary == *session)
++	app.radio.mu.Unlock()
++	if !stable {
++		return nil, ErrAliasConflict
++	}
++	now := time.Now().Unix()
++	state.Session = session
++	state.Observation = &radioPrimaryObservation{State: playbackState, Source: source, Target: sourceRoom, OwnerGeneration: generation, ObservedAt: now, ValidUntil: now + 3}
++	if held != nil {
++		state.Observation.Station = held.PrimaryStatus.Request.Station
++	}
++	if releaseBinding != nil && source != "radio" && volumeUUID.MatchString(releaseAction) && releaseCSeq > 0 {
++		state.ReleasedSession, state.ReleaseActionID, state.TeardownCSeq = releaseBinding, &releaseAction, &releaseCSeq
++	}
++	return state, nil
++}
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -761,6 +761,9 @@
+ 	}
+ 	if req.Type == apiRadioPrimaryActor {
+ 		return p.radioPrimaryActor(ctx, req.Data.(radioPrimaryCommand))
++	}
++	if req.Type == apiRadioPrimaryActorState {
++		return p.radioPrimaryActorState(ctx, req.Data.(radioPrimaryActorStateRequest))
+ 	}
+ 	// Reject released busy commands before radio intent, preemption or drain.
+ 	if p.roomVolumeBusy() {
