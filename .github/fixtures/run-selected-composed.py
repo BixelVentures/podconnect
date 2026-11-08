@@ -214,7 +214,12 @@ with (
         )
     )
     if (n.returncode or c_status) and primary_same_target:
-        markers = re.compile(r"FAIL|Manager|Resume|park|barrier|RTP|teardown|unknown|error", re.IGNORECASE)
+        markers = re.compile(
+            r"FAIL|Manager|Resume|park|barrier|RTP|teardown|unknown|error|"
+            r"Primary owner diagnostic:|Radio handoff closed:|"
+            r"JSON API request '/api/outputs/[0-9]+/radio-handoff/reacquire'",
+            re.IGNORECASE,
+        )
         for kind in ("native", "c"):
             log = root / (prefix + mode + f"-{kind}.log")
             lines = [line for line in log.read_text(errors="replace").splitlines() if markers.search(line)]

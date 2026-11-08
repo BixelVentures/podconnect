@@ -1,0 +1,24 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1889,6 +1889,21 @@
+   f->deadline=evtimer_new(f->base,recovery_wire_deadline,f);
+   assert(f->poll && f->deadline && !evtimer_add(f->poll,&soon) && !evtimer_add(f->deadline,&bound));
+   event_base_dispatch(f->base);
++  if (primary_port && f->failed)
++    {
++      const struct radio_handoff_slot *park = radio_handoff_find(f->device->id);
++      fprintf(stderr, "Primary owner diagnostic: park_phase=%d stop_accepted=%d drained=%d selected=%d receiver_present=%d\n",
++          park ? (int)park->result.phase : -1, park && park->stop_accepted, park && park->drained,
++          !!f->device->selected, !!f->device->session);
++      for (size_t i = 0; i < ARRAY_SIZE(primary_radio_station_operations); i++)
++        {
++          const struct primary_radio_station_operation *operation = &primary_radio_station_operations[i];
++          if (operation->request.device_id == f->device->id)
++            fprintf(stderr, "Primary owner diagnostic: station_phase=%d decode_only=%d activated=%d receiver_admitted=%d\n",
++                (int)operation->result.phase, operation->decode_only, !!operation->park_token[0],
++                !!operation->admitted_route.device_id);
++        }
++    }
+   event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
+   evhttp_free(wire.http);event_base_free(wire.http_base);
+   if (primary_port)
