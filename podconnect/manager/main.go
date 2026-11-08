@@ -327,6 +327,7 @@ type glStatus struct {
 	Stopped      bool
 	SelAlias     int           // device-aliases: currently selected alias id (0 = none), from the fork's /status
 	AliasBinding *aliasBinding // nil preserves the old engine protocol; nonnil must be current
+	trackURI     string        // private item anchor for revision hints
 }
 
 // librespotStatus reads go-librespot's /status once (volume + transport). With external_volume:true
@@ -342,18 +343,25 @@ func librespotStatus(base string) glStatus {
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
 	var st struct {
-		Username      string        `json:"username"`
-		Volume        *json.Number  `json:"volume"`
-		VolumeSteps   *json.Number  `json:"volume_steps"`
-		Paused        bool          `json:"paused"`
-		Stopped       bool          `json:"stopped"`
-		SelectedAlias *json.Number  `json:"selected_alias_id"`
-		AliasBinding  *aliasBinding `json:"alias_binding"`
+		Username      string          `json:"username"`
+		Volume        *json.Number    `json:"volume"`
+		VolumeSteps   *json.Number    `json:"volume_steps"`
+		Paused        bool            `json:"paused"`
+		Stopped       bool            `json:"stopped"`
+		SelectedAlias *json.Number    `json:"selected_alias_id"`
+		AliasBinding  *aliasBinding   `json:"alias_binding"`
+		Track         json.RawMessage `json:"track"`
 	}
 	if err := dec.Decode(&st); err != nil {
 		return glStatus{} // empty body / no session
 	}
 	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped, AliasBinding: st.AliasBinding}
+	var track struct {
+		URI string `json:"uri"`
+	}
+	if json.Unmarshal(st.Track, &track) == nil {
+		out.trackURI = track.URI
+	}
 	if st.SelectedAlias != nil {
 		if n, e := st.SelectedAlias.Int64(); e == nil {
 			out.SelAlias = int(n)
@@ -1371,6 +1379,9 @@ func main() {
 	// /api/state — back-compat single-speaker view reflecting room 0, so the existing panel/HA calls
 	// keep working unchanged. Multi-room consumers should use /api/rooms.
 	http.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		if playbackRevisionRequest(w, r) {
+			return
+		}
 		rm := primaryRoom()
 		var (
 			devs []device

@@ -22,10 +22,13 @@ from .const import (
     LOGGER,
     POLL_INTERVAL_SECONDS,
 )
+from .speakers import SpeakersError
 
 
 class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls /me/player and /me/player/devices once per cycle for all entities."""
+
+    _NATIVE_ENGINE_RECHECK_SECONDS = 60
 
     def __init__(self, hass: HomeAssistant, entry, api: SpotifyApi) -> None:
         """Initialise the coordinator."""
@@ -46,11 +49,171 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._failed_poll_ref = None
         self._playback_key = None
         self._followup_unsubs = []
+        self._native_client = None
+        self._native_watch_scope = None
+        self._native_watch_task = None
+        self._native_refresh_task = None
+        self._native_pending = None
+        self._native_last_started = 0.0
+        self._native_last_completed = 0.0
 
-    async def _async_refresh(self, *args, **kwargs):
+    async def _async_refresh(self, *args, native_scope=None, **kwargs):
+        completed_before = self._native_last_completed
         async with self._poll_lock:
+            if (
+                kwargs.get("scheduled")
+                and completed_before != self._native_last_completed
+            ):
+                return  # The demand read already advanced and rescheduled this poll.
+            if native_scope is not None:
+                if (
+                    native_scope != self._native_watch_scope
+                    or native_scope != self._native_pending
+                    or self._native_refresh_task is not asyncio.current_task()
+                ):
+                    return
+                if (
+                    self.command_owner_guard is not None
+                    and not self.command_owner_guard()
+                ):
+                    self._native_pending = None
+                    return
+                self._native_last_started = self.hass.loop.time()
+            # Any read beginning now covers hints received before this point. A hint
+            # during collection can request one successor behind the same lock.
+            self._native_pending = None
             await super()._async_refresh(*args, **kwargs)
+            if native_scope is not None:
+                self._native_last_completed = self._native_last_started
             self._publish_playback_change()
+            self._sync_native_watch()
+
+    def set_native_playback_client(self, client, *, restore_poll=False):
+        self._native_client = client
+        self._sync_native_watch()
+        # A failed platform unload can resume after cancellation of a demand read
+        # whose HA coordinator had already cleared the old fallback timer.
+        if (
+            restore_poll
+            and self._listeners
+            and self._unsub_refresh is None
+            and not self._poll_lock.locked()
+        ):
+            self._schedule_refresh()
+
+    async def async_stop_native_playback(self):
+        tasks = tuple(
+            task
+            for task in (self._native_watch_task, self._native_refresh_task)
+            if task
+        )
+        self.set_native_playback_client(None)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _sync_native_watch(self):
+        scope = None
+        entry = self.config_entry
+        if (
+            self._native_client is not None
+            and entry is not None
+            and not entry.pref_disable_polling
+            and not self.hass.is_stopping
+            and self.last_update_success
+            and isinstance(self.data, dict)
+        ):
+            playback = self.data.get("playback")
+            if (
+                isinstance(playback, dict)
+                and type(playback.get("is_playing")) is bool
+                and isinstance(playback.get("item"), dict)
+            ):
+                device = playback.get("device")
+                target = device.get("id") if isinstance(device, dict) else None
+                account = entry.unique_id
+                if (
+                    isinstance(account, str)
+                    and 1 <= len(account) <= 160
+                    and isinstance(target, str)
+                    and len(target) == 40
+                    and all(char in "0123456789abcdef" for char in target)
+                ):
+                    scope = (account, target)
+        if scope == self._native_watch_scope:
+            return
+        self._native_watch_scope = scope
+        self._native_pending = None
+        for task in (self._native_watch_task, self._native_refresh_task):
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+        self._native_watch_task = self._native_refresh_task = None
+        if scope is not None:
+            self._native_watch_task = self.hass.async_create_background_task(
+                self._watch_native_playback(self._native_client, scope),
+                "podconnect native playback revision",
+                eager_start=False,
+            )
+
+    async def _watch_native_playback(self, client, scope):
+        account, target = scope
+        cursor = "seed"
+        delay = 1
+        engine_checked = False
+        while self._native_watch_task is asyncio.current_task():
+            try:
+                if not engine_checked:
+                    if await client.start_identity() != target:
+                        await asyncio.sleep(self._NATIVE_ENGINE_RECHECK_SECONDS)
+                        continue
+                    engine_checked = True
+                reply = await client.wait_playback_revision(account, target, cursor)
+            except SpeakersError:
+                # Older/unavailable Speakers keep normal Spotify polling in charge.
+                engine_checked = False
+                await asyncio.sleep(delay)
+                delay = min(60, delay * 2)
+                continue
+            delay = 1
+            if reply is None:
+                # Real quiet responses take 20s; cap retries for a broken fast server.
+                await asyncio.sleep(0.25)
+                continue
+            next_cursor, changed = reply
+            if self._native_watch_task is not asyncio.current_task():
+                return
+            generation, _, revision = cursor.partition(":")
+            next_generation, next_revision = next_cursor.split(":")
+            if not changed:
+                if next_generation != generation:
+                    if cursor != "seed":
+                        await asyncio.sleep(0.25)
+                    cursor = next_cursor
+                else:
+                    await asyncio.sleep(0.25)
+                continue
+            if next_generation != generation or int(next_revision) <= int(revision):
+                await asyncio.sleep(0.25)
+                continue
+            cursor = next_cursor
+            self._native_pending = scope
+            if self._native_refresh_task is None or self._native_refresh_task.done():
+                self._native_refresh_task = self.hass.async_create_background_task(
+                    self._refresh_native_playback(scope),
+                    "podconnect native playback observation",
+                    eager_start=False,
+                )
+            # A fast stream can coalesce later changes without a hot request loop.
+            await asyncio.sleep(0.25)
+
+    async def _refresh_native_playback(self, scope):
+        while (
+            self._native_pending == scope
+            and self._native_refresh_task is asyncio.current_task()
+        ):
+            delay = self._native_last_started + 0.75 - self.hass.loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            await self._async_refresh(native_scope=scope)
 
     def _publish_playback_change(self) -> None:
         """Fire one HA event per real playback change, after the data is published.
@@ -60,9 +223,20 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         try:
             data = self.data if isinstance(self.data, dict) else {}
-            playback = data.get("playback") if isinstance(data.get("playback"), dict) else {}
-            item = playback.get("item") if isinstance(playback.get("item"), dict) else {}
-            device = playback.get("device") if isinstance(playback.get("device"), dict) else {}
+            playback = (
+                data.get("playback") if isinstance(data.get("playback"), dict) else {}
+            )
+            item = (
+                playback.get("item") if isinstance(playback.get("item"), dict) else {}
+            )
+            device = (
+                playback.get("device")
+                if isinstance(playback.get("device"), dict)
+                else {}
+            )
+            # Spotify's state-change timestamp also changes for a same-item seek.
+            # Routine progress updates alone must never fire an invalidation.
+            changed_at = playback.get("timestamp")
             key = (
                 bool(playback.get("is_playing")),
                 item.get("uri"),
@@ -70,6 +244,7 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 device.get("volume_percent"),
                 playback.get("shuffle_state"),
                 playback.get("repeat_state"),
+                changed_at if type(changed_at) is int and changed_at > 0 else None,
             )
             self.update_interval = timedelta(
                 seconds=ACTIVE_POLL_INTERVAL_SECONDS
@@ -145,6 +320,7 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
     async def async_shutdown(self) -> None:
+        await self.async_stop_native_playback()
         for unsub in self._followup_unsubs:
             unsub()
         self._followup_unsubs = []
