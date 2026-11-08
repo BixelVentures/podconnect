@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +15,75 @@ import (
 	"testing"
 	"time"
 )
+
+type primaryComposedTransport struct {
+	next  http.RoundTripper
+	trace []string
+}
+
+type primaryComposedBody struct {
+	io.Reader
+	close func() error
+}
+
+func (b primaryComposedBody) Close() error { return b.close() }
+
+func primaryComposedPhase(phase string) string {
+	switch phase {
+	case "reserve", "reserved", "prepare_replacement", "replacement_prepared", "replacement_rejected",
+		"prepare_start", "prepared", "start", "playing", "stop", "released", "finish",
+		"result", "pending", "rejected", "unknown":
+		return phase
+	default:
+		return "unrecognized"
+	}
+}
+
+func (tr *primaryComposedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodPost || req.URL.Path != "/radio/primary" {
+		return tr.next.RoundTrip(req)
+	}
+	var command radioPrimaryCommand
+	if req.GetBody != nil {
+		if body, err := req.GetBody(); err == nil {
+			_ = json.NewDecoder(body).Decode(&command)
+			body.Close()
+		}
+	}
+	report := func(result string) {
+		phase := primaryComposedPhase(command.Phase)
+		if command.Phase == "result" {
+			phase += "/" + primaryComposedPhase(command.ForPhase)
+		}
+		line := phase + " " + result
+		if len(tr.trace) == 0 || tr.trace[len(tr.trace)-1] != line {
+			tr.trace = append(tr.trace, line)
+		}
+	}
+	resp, err := tr.next.RoundTrip(req)
+	if err != nil {
+		report("transport_error")
+		return resp, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		report(fmt.Sprintf("HTTP=%d", resp.StatusCode))
+		return resp, nil
+	}
+	body := resp.Body
+	var observed bytes.Buffer
+	resp.Body = primaryComposedBody{Reader: io.TeeReader(body, &observed), close: func() error {
+		var receipt radioPrimaryReceipt
+		if json.Unmarshal(observed.Bytes(), &receipt) != nil {
+			report("HTTP=200 unreadable_receipt")
+		} else {
+			report(fmt.Sprintf("HTTP=200 reply=%s matches=%t observation=%t session=%t teardown=%t",
+				primaryComposedPhase(receipt.Phase), command.matches(receipt), receipt.Observation != nil,
+				receipt.Session != nil, receipt.TeardownCSeq > 0))
+		}
+		return body.Close()
+	}}
+	return resp, nil
+}
 
 func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 	nativeURL := os.Getenv("PC_PRIMARY_MANAGER_NATIVE_URL")
@@ -109,6 +180,24 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 	if initial := windows(); initial.Spotify < 1 || initial.Radio != [3]int{} || initial.Return != 0 {
 		t.Fatalf("passive Manager readiness touched receiver output: %+v", initial)
 	}
+	// The configured bootstrap has published Enabled and has no further client
+	// work. Tap this fixture's existing client only during the synchronous actions.
+	radioOwner.mu.Lock()
+	producer, ok := radioOwner.backend.(*radioProducer)
+	radioOwner.mu.Unlock()
+	if !ok {
+		t.Fatal("configured Manager did not select the builtin producer")
+	}
+	backend, ok := producer.primary.(*radioPrimaryBackend)
+	if !ok {
+		t.Fatal("configured Manager did not negotiate the Native primary protocol")
+	}
+	client, ok := backend.radioPrimaryPort.(*radioProducerNativeClient)
+	if !ok || client.http.client.Transport != nil {
+		t.Fatal("configured Manager did not use the default Native HTTP transport")
+	}
+	trace := &primaryComposedTransport{next: http.DefaultTransport}
+	client.http.client.Transport = trace
 	for i, station := range []string{"p3", "p1", "p6-beat"} {
 		q := radioCommand{ActionID: attentionUUID(), Action: "start", StationID: station, TargetID: target,
 			ExpectedRevision: current.Revision, ExpectedProcessID: current.ProcessID,
@@ -122,7 +211,27 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 			Status string `json:"status"`
 			Retry  bool   `json:"retry_allowed"`
 		}
-		call(http.MethodPost, "/api/radio/action", body, radioActionHandler, &receipt)
+		trace.trace = nil
+		request := httptest.NewRequest(http.MethodPost, "/api/radio/action", bytes.NewReader(body)).WithContext(ctx)
+		request.Header.Set("X-PodConnect-Token", token)
+		response := httptest.NewRecorder()
+		radioActionHandler(response, request)
+		if err := json.NewDecoder(response.Body).Decode(&receipt); err != nil || response.Code != http.StatusOK {
+			for _, step := range trace.trace {
+				t.Logf("Manager %s Native %s", station, step)
+			}
+			stage := "no_record"
+			producer.mu.Lock()
+			for _, record := range producer.records {
+				if record.Fence.ActionID == q.ActionID {
+					stage = record.Stage
+					break
+				}
+			}
+			producer.mu.Unlock()
+			t.Fatalf("Manager %s action failed: HTTP=%d unknown=%t rejected=%t journal_stage=%s",
+				station, response.Code, receipt.Status == "unknown", receipt.Status == "rejected", stage)
+		}
 		if receipt.Action != q.ActionID || receipt.Status != "accepted" || receipt.Retry {
 			t.Fatalf("Manager did not accept the exact %s action", station)
 		}
