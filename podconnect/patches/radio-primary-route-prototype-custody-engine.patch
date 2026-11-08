@@ -39,7 +39,7 @@
    if (device->session && device->attention_retiring_session == device->session)
      {
        // The first command waits for exact native destruction, never claims running.
-@@ -2298,6 +2298,105 @@
+@@ -2298,6 +2298,107 @@
      }
  }
  
@@ -57,18 +57,20 @@
 +    && !strcmp(json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN), value)
 +    && json_object_object_length(row) == 8
 +    && json_object_object_get_ex(row, "schema", &field) && json_object_is_type(field, json_type_string)
++    && json_object_get_string_len(field) == sizeof("podconnect.radio-primary-custody.v1") - 1
 +    && !strcmp(json_object_get_string(field), "podconnect.radio-primary-custody.v1")
 +    && json_object_object_get_ex(row, "device", &field) && json_object_is_type(field, json_type_int)
 +    && json_object_get_uint64(field) == id
 +    && json_object_object_get_ex(row, "process", &field) && json_object_is_type(field, json_type_string)
-+    && json_object_get_string_len(field) == 36
++    && json_object_get_string_len(field) == 36 && radio_handoff_uuid(json_object_get_string(field))
 +    && json_object_object_get_ex(row, "operation", &field) && json_object_is_type(field, json_type_string)
-+    && json_object_get_string_len(field) == 36
++    && json_object_get_string_len(field) == 36 && radio_handoff_uuid(json_object_get_string(field))
 +    && json_object_object_get_ex(row, "incarnation", &field) && json_object_is_type(field, json_type_int)
-+    && json_object_get_uint64(field) > 0
++    && json_object_get_int64(field) > 0 && json_object_get_uint64(field) < UINT64_MAX
 +    && json_object_object_get_ex(row, "epoch", &field) && json_object_is_type(field, json_type_int)
-+    && json_object_get_uint64(field) > 0
++    && json_object_get_int64(field) > 0 && json_object_get_uint64(field) < UINT64_MAX
 +    && json_object_object_get_ex(row, "route", &field) && json_object_is_type(field, json_type_int)
++    && json_object_get_int64(field) >= 0 && json_object_get_uint64(field) < UINT64_MAX
 +    && json_object_object_get_ex(row, "teardown_cseq", &field) && json_object_is_type(field, json_type_int)
 +    && (released ? json_object_get_int64(field) > 0 && json_object_get_int64(field) <= INT_MAX
 +                 : json_object_get_int64(field) == 0);
@@ -145,7 +147,7 @@
  void
  outputs_primary_radio_drain_complete(uint64_t id, uint64_t incarnation, uint64_t epoch, bool confirmed)
  {
-@@ -2307,10 +2406,7 @@
+@@ -2307,10 +2408,7 @@
        || epoch == UINT64_MAX || device->session_epoch != epoch + 1)
      return;
    if (!confirmed)
@@ -252,3 +254,13 @@
    struct output_device *old=NULL;struct output_transport_identity old_identity;
    (void)outputs_transport_busy();
    if(r->move_existing_session){
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1485,6 +1485,7 @@
+ }
+ 
+ #define RADIO_PRIMARY_SESSION_PROOF 1
++#define RADIO_PRIMARY_DURABLE_CUSTODY 1
+ 
+ /* Two real transient receiver sessions in one primary player process. */
+ static void

@@ -43,7 +43,7 @@
  static int primary_spotify_callbacks;
  static enum output_device_state primary_spotify_state;
  
-@@ -1609,6 +1620,38 @@
+@@ -1609,6 +1620,55 @@
    assert(!device || device->id == 2);
    primary_spotify_callbacks++;
    primary_spotify_state = state;
@@ -65,11 +65,28 @@
 +  outputs_attention_uuid(outputs_process);
 +  assert(outputs_attention_startup() == 0);
 +  primary_radio_wire_receiver(&radio, base, 2, "127.0.0.2");
++#ifdef RADIO_PRIMARY_DURABLE_CUSTODY
++  assert(!outputs_primary_radio_custody_available(2));
++#endif
 +  assert(airplay_primary_radio_start(radio.device, &route) < 0);
 +  outputs_device_select(radio.device, -1);
 +  assert(outputs_device_start(radio.device, primary_spotify_connected, false) < 0);
 +  assert(!radio.device->session && !radio.pc70_peer_sessions && !primary_spotify_callbacks);
 +  puts("PASS fresh process reads unknown primary-radio custody and sends no same-target command");
++#ifdef RADIO_PRIMARY_DURABLE_CUSTODY
++  char *raw = NULL;
++  const char *key = "podconnect.radio-primary-custody.v1.2";
++  assert(db_radio_handoff_load_key(key, &raw) == 1 && raw);
++  json_object *row = json_tokener_parse(raw);
++  assert(row);
++  json_object_object_add(row, "teardown_cseq", json_object_new_int(100));
++  json_object_object_add(row, "route", json_object_new_int(-1));
++  assert(!db_radio_handoff_save_key(key, raw, json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN)));
++  json_object_put(row);
++  free(raw);
++  assert(!outputs_primary_radio_custody_available(2));
++  puts("PASS malformed release row leaves primary-radio custody closed");
++#endif
 +  outputs_device_remove(radio.device);
 +  evconnlistener_free(radio.listener);
 +  evbuffer_free(radio.plain);
@@ -82,7 +99,7 @@
  }
  
  static int
-@@ -1641,6 +1684,7 @@
+@@ -1641,6 +1701,7 @@
    outputs_buffer_duration_ms = cfg_getint(cfg_getsec(cfg, "general"), "start_buffer_ms");
    primary_radio_wire_receiver(&music, base, 1, "127.0.0.1");
    primary_radio_wire_receiver(&radio, base, 2, "127.0.0.2");
@@ -90,7 +107,7 @@
    active_recovery_wire = &music;
  
    outputs_device_select(music.device, -1);
-@@ -1724,7 +1768,8 @@
+@@ -1724,7 +1785,8 @@
    assert(primary_radio_wire_packets(&radio, &radio_seq) == 1);
    assert(primary_radio_wire_resend(&radio, old_radio_control_port, radio_seq) == 0);
  
@@ -100,7 +117,7 @@
      {
        struct airplay_session *old_radio = radio.device->session;
        unsigned short retiring_control_port = radio.requested_control_port;
-@@ -1748,19 +1793,43 @@
+@@ -1748,19 +1810,43 @@
          }
        assert(radio.primary_held_cseq > 0 && radio.teardowns == 2 && radio.pc70_peer_sessions == 2);
        assert(!primary_spotify_callbacks && radio.device->session == old_radio && !music.teardowns);
@@ -146,7 +163,7 @@
          }
        else
          {
-@@ -1816,6 +1885,19 @@
+@@ -1816,6 +1902,19 @@
    db_deinit();
    cfg_free(cfg);
    event_base_free(base);
@@ -166,7 +183,7 @@
    unlink(database);
    return result;
  }
-@@ -1834,6 +1916,9 @@
+@@ -1834,6 +1933,9 @@
    if (argc == 2 && !strcmp(argv[1], "--radio-primary-preempt")) return primary_radio_wire_case(PRIMARY_PREEMPT);
    if (argc == 2 && !strcmp(argv[1], "--radio-primary-preempt-unknown")) return primary_radio_wire_case(PRIMARY_UNKNOWN);
    if (argc == 2 && !strcmp(argv[1], "--radio-primary-remove")) return primary_radio_wire_case(PRIMARY_REMOVE);
