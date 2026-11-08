@@ -97,8 +97,6 @@ if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPEC
     prefix += "resume-"
 if os.getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"):
     prefix += "held-teardown-"
-if attempt := os.getenv("PC_NATIVE_PRIMARY_REPRO_ATTEMPT"):
-    prefix += f"repro-{int(attempt)}-"
 root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)

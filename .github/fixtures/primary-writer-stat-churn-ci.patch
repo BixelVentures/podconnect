@@ -8,10 +8,10 @@
  #include <stdarg.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -27,7 +28,10 @@
-   if (getenv("PC_NATIVE_PRIMARY_HTTP_PORT")) \
-     fprintf(stderr, "Primary owner diagnostic: " __VA_ARGS__); \
- } while (0)
+@@ -23,7 +24,10 @@
+ #define db_speaker_save fixture_speaker_save
+ #include "../src/conffile.c"
+ #define RADIO_SENDER_FIXTURE_SOURCE
 +static int fixture_primary_writer_stat(const char *path, struct stat *result);
 +#define stat(path, result) fixture_primary_writer_stat(path, result)
  #include "../src/outputs.c"
