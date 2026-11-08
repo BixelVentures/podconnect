@@ -315,6 +315,10 @@ func (c *radioCoordinator) execute(ctx context.Context, q radioCommand) (radioSt
 	// Stop the original source before acquiring a new destination. No rollback.
 	if old.State == "playing" && old.SourceKind == "radio" && (q.Action == "stop" || q.Action == "move" || q.Action == "start") {
 		err = c.backend.Stop(effect, f, old.TargetID)
+		var noEffects *radioProducerNoReceiverEffects
+		if errors.As(err, &noEffects) {
+			return c.complete(generation, old, f, err, false)
+		}
 	}
 	if err == nil && (q.Action == "start" || q.Action == "move") {
 		err = c.backend.PauseAndRelease(effect, f, q.TargetID)

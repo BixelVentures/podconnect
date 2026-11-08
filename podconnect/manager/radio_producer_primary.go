@@ -402,19 +402,24 @@ func (p *radioProducer) primaryPrepareReplacement(ctx context.Context, f radioFe
 	if receipt.Phase != "replacement_rejected" {
 		return errRadioUnknown
 	}
-	// This exact terminal owner receipt attests cancellation of the candidate
-	// and reservation with the incumbent unchanged. A timeout cannot do that.
+	return p.primaryRejectReplacement(r, receipt)
+}
+
+// Only an exact terminal owner receipt can retire the candidate before any
+// receiver STOP. A timeout or malformed reply still holds the operation.
+func (p *radioProducer) primaryRejectReplacement(r radioProducerRecord, receipt radioPrimaryReceipt) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	current := p.records[f.Token]
-	if current.Fence != f || current.Stage != r.Stage || current.Preempted ||
-		p.active != state.Incumbent || p.evidence.NativeProcess != q.Process {
+	current := p.records[r.Fence.Token]
+	if current.Fence != r.Fence || current.Stage != r.Stage || current.Preempted || current.Terminal || current.Primary == nil ||
+		current.Primary.IncumbentSession == nil || p.active != current.Primary.Incumbent || p.evidence.NativeProcess != receipt.Process {
 		return errRadioUnknown
 	}
+	state := *current.Primary
 	state.LastReceipt = &receipt
 	current.Primary = &state
 	current.Terminal, current.Outcome, current.Stage = true, "rejected", "no-effects-rejected"
-	if err = p.storeLocked(current); err != nil {
+	if err := p.storeLocked(current); err != nil {
 		return err
 	}
 	return &radioProducerNoReceiverEffects{}
@@ -486,6 +491,10 @@ func (p *radioProducer) primaryEffect(ctx context.Context, f radioFence, phase, 
 		return errRadioUnknown
 	}
 	receipt, err = p.primaryWait(ctx, q, receipt)
+	if err == nil && phase == "stop" && r.Primary.IncumbentSession != nil &&
+		receipt.Phase == "replacement_rejected" && receipt.Observation == nil && receipt.TeardownCSeq == 0 {
+		return p.primaryRejectReplacement(r, receipt)
+	}
 	if err != nil || !primaryTerminalReceipt(q, receipt, r.Primary.Device) {
 		return errRadioUnknown
 	}

@@ -1,0 +1,217 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -387,6 +387,8 @@
+ int outputs_primary_radio_custody_read(uint64_t, struct output_primary_radio_custody *);
+ char *outputs_primary_radio_custody_claim(uint64_t, const char *, const char *);
+ int outputs_airplay_primary_radio_claim_stop(const struct output_primary_radio_custody *, const char *);
++int outputs_airplay_primary_radio_claim_replace_stop(const struct output_primary_radio_custody *, const char *);
++bool outputs_airplay_primary_radio_replace_stop_rejected(const struct output_primary_radio_custody *, const char *);
+ const char *outputs_radio_station_url(const char *);
+ bool outputs_primary_radio_session_equal(const struct output_primary_radio_custody *, const struct output_primary_radio_custody *);
+ bool outputs_primary_radio_release_current(const struct output_primary_radio_custody *);
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -5327,7 +5327,7 @@
+   struct primary_radio_decode *decoder;
+   struct airplay_primary_radio_route admitted_route;
+   struct output_primary_radio_custody predecessor_release;
+-  bool decode_only, released;
++  bool decode_only, released, replacement_stop_rejected;
+   char park_token[33];
+ };
+ static struct primary_radio_station_operation primary_radio_station_operations[PRIMARY_RADIO_START_LIMIT];
+@@ -5628,6 +5628,15 @@
+     }
+   return outputs_airplay_primary_station_target(request->device_id, &current) == 0
+       && primary_radio_station_same_target(&expected, &current);
++}
++
++static bool
++primary_radio_decode_frame_ready(struct primary_radio_decode *decoder)
++{
++  pthread_mutex_lock(&decoder->mutex);
++  bool ready = decoder->count > 0 && !primary_radio_decode_cancelled(decoder);
++  pthread_mutex_unlock(&decoder->mutex);
++  return ready;
+ }
+ 
+ static bool
+@@ -5645,10 +5654,7 @@
+       return false;
+     }
+ 
+-  pthread_mutex_lock(&decoder->mutex);
+-  bool frame_ready = decoder->count > 0 && !primary_radio_decode_cancelled(decoder);
+-  pthread_mutex_unlock(&decoder->mutex);
+-  if (!frame_ready)
++  if (!primary_radio_decode_frame_ready(decoder))
+     return false;
+   if (operation->decode_only)
+     {
+@@ -6185,7 +6191,66 @@
+   return 0;
+ }
+ 
++static struct primary_radio_station_operation *
++primary_radio_replacement_stop_candidate(const struct output_primary_radio_custody *expected, const char *action)
++{
++  if (!expected || !action || strlen(action) != 36 || !expected->device_id)
++    return NULL;
++  struct primary_radio_station_operation *candidate = primary_radio_station_find_action(action);
++  if (!candidate || !candidate->request.predecessor.device_id
++      || !outputs_primary_radio_session_equal(expected, &candidate->request.predecessor))
++    return NULL;
++  return candidate;
++}
++
++bool
++outputs_airplay_primary_radio_replace_stop_rejected(const struct output_primary_radio_custody *expected, const char *action)
++{
++  const struct primary_radio_station_operation *candidate = primary_radio_replacement_stop_candidate(expected, action);
++  return candidate && candidate->replacement_stop_rejected;
++}
++
++/* Check the retained decoder and claim its predecessor on the same player
++ * turn. Only an exact, receiver-free candidate can be retired as no-effect. */
+ int
++outputs_airplay_primary_radio_claim_replace_stop(const struct output_primary_radio_custody *expected, const char *action)
++{
++  struct primary_radio_station_operation *candidate = primary_radio_replacement_stop_candidate(expected, action);
++  struct output_primary_radio_custody actual;
++  if (!candidate || outputs_primary_radio_custody_read(expected->device_id, &actual) != 1
++      || !outputs_primary_radio_session_equal(expected, &actual))
++    return -1;
++  if (actual.stop_action[0])
++    return strcmp(actual.stop_action, action) ? -1 : 0;
++  if (candidate->replacement_stop_rejected)
++    return 1;
++  if (!candidate->decode_only || candidate->admitted_route.device_id
++      || (candidate->decoder && candidate->decoder->session))
++    return -1;
++
++  struct airplay_session *session = primary_radio_station_predecessor(expected);
++  if (!session)
++    return -1;
++  const struct output_primary_radio_start_request *request = &candidate->request;
++  struct output_primary_radio_start_request current;
++  if (candidate->result.phase != OUTPUT_PRIMARY_RADIO_START_DECODED || !candidate->decoder
++      || outputs_airplay_primary_station_replace_target(request->device_id, expected, &current) < 0
++      || !primary_radio_station_same_target(request, &current)
++      || !primary_radio_decode_frame_ready(candidate->decoder) || !primary_radio_station_before_deadline(candidate))
++    {
++      candidate->replacement_stop_rejected = true;
++      primary_radio_station_finish(candidate, OUTPUT_PRIMARY_RADIO_START_REJECTED);
++      if (candidate->decoder)
++        primary_radio_decoder_drop(candidate->decoder);
++      return 1;
++    }
++  if (primary_radio_claim_stop(session, action) < 0)
++    return -1;
++  primary_radio_stop_after_decoder(session, "primary_radio_replace_revoke");
++  return 0;
++}
++
++int
+ outputs_airplay_primary_radio_preempt(struct output_device *device)
+ {
+   struct airplay_session *session = device->session;
+--- a/src/player.h
++++ b/src/player.h
+@@ -279,7 +279,7 @@
+ int player_radio_handoff(int,const struct output_radio_handoff_request *,struct output_radio_handoff_result *);
+ 
+ int player_radio_reacquire(int,const struct output_radio_reacquire_request *,struct output_radio_reacquire_result *);
+-int player_radio_primary_stop(bool, const struct output_primary_radio_custody *, const char *,
++int player_radio_primary_stop(bool, bool, const struct output_primary_radio_custody *, const char *,
+     struct output_primary_radio_custody *);
+ int player_radio_primary_station(int, struct output_primary_radio_start_request *,
+     struct output_primary_radio_start_result *, const char *, const struct output_primary_radio_custody *);
+--- a/src/player.c
++++ b/src/player.c
+@@ -3374,7 +3374,7 @@
+ }
+ struct player_radio_primary_stop_command
+ {
+-  bool claim;
++  bool claim, replace;
+   const struct output_primary_radio_custody *expected;
+   const char *action;
+   struct output_primary_radio_custody *out;
+@@ -3388,21 +3388,32 @@
+   struct output_primary_radio_custody *actual = c->out;
+ 
+   *retval = -1;
+-  if (c->claim && outputs_airplay_primary_radio_claim_stop(expected, c->action) < 0)
+-    return COMMAND_END;
++  if (c->claim)
++    {
++      int outcome = c->replace ? outputs_airplay_primary_radio_claim_replace_stop(expected, c->action)
++                               : outputs_airplay_primary_radio_claim_stop(expected, c->action);
++      if (outcome < 0)
++        return COMMAND_END;
++    }
+   if (outputs_primary_radio_custody_read(expected->device_id, actual) == 1
+-      && !strcmp(expected->process, actual->process) && !strcmp(expected->operation, actual->operation)
+-      && expected->incarnation == actual->incarnation && expected->epoch == actual->epoch && expected->route == actual->route
++      && outputs_primary_radio_session_equal(expected, actual)
+       && !strcmp(c->action, actual->stop_action))
+     *retval = 0;
++  else if (c->replace && outputs_airplay_primary_radio_replace_stop_rejected(expected, c->action))
++    {
++      *actual = *expected;
++      memcpy(actual->stop_action, c->action, sizeof(actual->stop_action));
++      actual->teardown_cseq = 0;
++      *retval = 1;
++    }
+   return COMMAND_END;
+ }
+ 
+ int
+-player_radio_primary_stop(bool claim, const struct output_primary_radio_custody *expected, const char *action,
++player_radio_primary_stop(bool claim, bool replace, const struct output_primary_radio_custody *expected, const char *action,
+     struct output_primary_radio_custody *out)
+ {
+-  struct player_radio_primary_stop_command command = { claim, expected, action, out };
++  struct player_radio_primary_stop_command command = { claim, replace, expected, action, out };
+   return commands_exec_sync(cmdbase, radio_primary_stop_command, NULL, &command);
+ }
+ 
+--- a/src/httpd_jsonapi_radio_reacquire.inc.c
++++ b/src/httpd_jsonapi_radio_reacquire.inc.c
+@@ -33,13 +33,14 @@
+ jsonapi_reply_primary_radio_stop(struct httpd_request *hreq, json_object *body)
+ {
+   struct output_primary_radio_custody expected = { 0 }, actual;
+-  char phase[16], action[37];
++  char phase[24], action[37];
+   uint64_t path_device;
+   json_object *reply;
+ 
+   if (outputs_radio_sender_role() || json_object_object_length(body) != 9
+       || !transport_json_string(body, "phase", phase, sizeof(phase))
+-      || (strcmp(phase, "claim_stop") && strcmp(phase, "result"))
++      || (strcmp(phase, "claim_stop") && strcmp(phase, "result")
++          && strcmp(phase, "claim_stop_replace") && strcmp(phase, "result_stop_replace"))
+       || !transport_json_string(body, "process", expected.process, sizeof(expected.process))
+       || !transport_json_string(body, "operation", expected.operation, sizeof(expected.operation))
+       || !transport_json_string(body, "action", action, sizeof(action))
+@@ -49,13 +50,17 @@
+       || transport_native_counter(body, "route_revision", &expected.route) < 0
+       || safe_atou64(hreq->path_parts[2], &path_device) < 0 || path_device != expected.device_id)
+     return HTTP_BADREQUEST;
+-  if (player_radio_primary_stop(!strcmp(phase, "claim_stop"), &expected, action, &actual) < 0)
++  bool claim = !strcmp(phase, "claim_stop") || !strcmp(phase, "claim_stop_replace");
++  bool replace = !strcmp(phase, "claim_stop_replace") || !strcmp(phase, "result_stop_replace");
++  int outcome = player_radio_primary_stop(claim, replace, &expected, action, &actual);
++  if (outcome < 0)
+     return 409;
+   reply = json_object_new_object();
+   if (!reply)
+     return HTTP_SERVUNAVAIL;
+   json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_radio_primary_stop.v1"));
+-  json_object_object_add(reply, "phase", json_object_new_string(actual.teardown_cseq > 0 ? "released" : "pending"));
++  const char *result_phase = outcome > 0 ? "replacement_rejected" : actual.teardown_cseq > 0 ? "released" : "pending";
++  json_object_object_add(reply, "phase", json_object_new_string(result_phase));
+   json_object_object_add(reply, "process", json_object_new_string(actual.process));
+   json_object_object_add(reply, "operation", json_object_new_string(actual.operation));
+   json_object_object_add(reply, "action", json_object_new_string(actual.stop_action));

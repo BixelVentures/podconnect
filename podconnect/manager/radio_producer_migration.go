@@ -40,13 +40,13 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	}
 	if record.Outcome == "rejected" && record.Stage == "no-effects-rejected" {
 		command, receipt := primary.LastCommand, primary.LastReceipt
-		if command == nil || receipt == nil || command.Phase != "prepare_replace" || primary.Session != nil ||
+		if command == nil || receipt == nil || (command.Phase != "prepare_replace" && command.Phase != "stop") || primary.Session != nil ||
 			receipt.Phase != "replacement_rejected" || receipt.TeardownCSeq != 0 || receipt.Observation != nil {
 			return false
 		}
 		q := *command
 		q.ForPhase = receipt.ForPhase
-		return (q.ForPhase == "" || q.ForPhase == "prepare_replace") && q.matches(*receipt)
+		return (q.ForPhase == "" || q.ForPhase == command.Phase) && q.matches(*receipt)
 	}
 	if record.Outcome != "committed" || record.Stage != "terminal" {
 		return false
@@ -56,6 +56,11 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	}
 	if !record.SourceDrained {
 		return false
+	}
+	if producerUUID(primary.ReleaseActionID) && primary.ReleaseActionID != record.Fence.ActionID && primary.TeardownCSeq > 0 {
+		// The passive same-owner release path has no separate Manager
+		// command. Its exact old session was checked before this fsync.
+		return primary.Session.valid()
 	}
 	if primary.StopReceipt != nil {
 		receipt := *primary.StopReceipt

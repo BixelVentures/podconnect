@@ -21,6 +21,7 @@ type primaryRadioFixture struct {
 	badStop      bool
 	replaceReply string
 	waitReplace  bool
+	expiredStop  bool
 }
 
 func (f *primaryRadioFixture) PrimaryState(context.Context) (radioPrimaryState, error) {
@@ -94,6 +95,10 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 		}
 		f.state.Session, f.state.Observation = result.Session, result.Observation
 	case "stop":
+		if f.expiredStop {
+			result.Phase = "replacement_rejected"
+			return result, nil
+		}
 		if q.Session == nil || *q.Session != f.session {
 			f.t.Fatalf("stop did not retain the exact prior C route: %+v", q)
 		}
@@ -120,7 +125,7 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 }
 
 func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
-	for _, variant := range []string{"station", "move", "no-capability", "stale-incumbent", "rejected-preflight", "lost-preflight", "lost-stop"} {
+	for _, variant := range []string{"station", "move", "no-capability", "stale-incumbent", "rejected-preflight", "lost-preflight", "lost-stop", "expired-stop"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -190,6 +195,9 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 			case "lost-stop":
 				f.lose = "stop"
 				wantCalls = []string{"reserve", "prepare_replace", "stop"}
+			case "expired-stop":
+				f.expiredStop = true
+				wantCalls = []string{"reserve", "prepare_replace", "stop"}
 			}
 			next, err := c.execute(ctx, q)
 			if !reflect.DeepEqual(f.calls, wantCalls) {
@@ -217,7 +225,7 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 					p.active != incumbent || p.records[incumbent].SourceDrained {
 					t.Fatalf("denied replacement changed incumbent: %+v %v", next, err)
 				}
-				if variant == "rejected-preflight" && (!p.records[c.fence.Token].Terminal || p.records[c.fence.Token].Outcome != "rejected") {
+				if (variant == "rejected-preflight" || variant == "expired-stop") && (!p.records[c.fence.Token].Terminal || p.records[c.fence.Token].Outcome != "rejected") {
 					t.Fatal("exact no-effects rejection did not retire candidate")
 				}
 			}

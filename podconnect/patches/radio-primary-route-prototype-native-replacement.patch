@@ -154,7 +154,7 @@
  		return ErrAliasConflict
 --- /dev/null
 +++ b/daemon/radio_primary_replacement.go
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,285 @@
 +package daemon
 +
 +import (
@@ -219,11 +219,18 @@
 +	if r.Phase == "prepare_replace" || r.Phase == "result" && r.ForPhase == "prepare_replace" {
 +		return p.primaryRadioPrepareReplacement(ctx, r, h, old, device)
 +	}
-+	if !op.Decoded || op.ReplacementRejected {
++	if r.Phase == "stop" || r.Phase == "result" && r.ForPhase == "stop" {
++		if op.ReplacementRejected && op.Stopped != nil && r.Phase == "result" && r.Session != nil && *r.Session == *op.Reserve.Session && r.Station == "" {
++			r.Phase = "replacement_rejected"
++			return radioPrimaryReply{radioPrimaryCommand: r}, nil
++		}
++		if op.Decoded && !op.ReplacementRejected {
++			return p.primaryRadioReplacementStop(ctx, r, h, old)
++		}
 +		return nil, ErrAliasConflict
 +	}
-+	if r.Phase == "stop" || r.Phase == "result" && r.ForPhase == "stop" {
-+		return p.primaryRadioReplacementStop(ctx, r, h, old)
++	if !op.Decoded || op.ReplacementRejected {
++		return nil, ErrAliasConflict
 +	}
 +	if op.PriorRelease == nil || r.Station != op.Station || r.Session != nil {
 +		return nil, ErrAliasConflict
@@ -262,7 +269,10 @@
 +			radioPrimaryTarget: radioPrimaryTarget{Device: device},
 +		}, false)
 +		if err != nil {
-+			return nil, err
++			// This was a read-only target lookup. Retire our unstarted
++			// candidate without touching the predecessor or receiver.
++			op.Station = r.Station
++			return p.rejectPrimaryRadioReplacement(r, h, old)
 +		}
 +		op.Target, op.Station = &target.radioPrimaryTarget, r.Station
 +		if err = app.persistRadioLocked(); err != nil {
@@ -284,14 +294,23 @@
 +	case "decoded":
 +		op.Decoded, r.Phase = true, "replacement_prepared"
 +	case "rejected":
-+		op.ReplacementDone, op.ReplacementRejected, r.Phase = true, true, "replacement_rejected"
-+		if h != old {
-+			h.Phase = "primary_rejected"
-+		}
++		return p.rejectPrimaryRadioReplacement(r, h, old)
 +	default:
 +		return nil, ErrAliasConflict
 +	}
 +	if err = app.persistRadioLocked(); err != nil {
++		return nil, err
++	}
++	return radioPrimaryReply{radioPrimaryCommand: r}, nil
++}
++
++func (p *AppPlayer) rejectPrimaryRadioReplacement(r radioPrimaryCommand, h, old *radioHold) (any, error) {
++	op := h.PrimaryPending
++	op.ReplacementDone, op.ReplacementRejected, r.Phase = true, true, "replacement_rejected"
++	if h != old {
++		h.Phase = "primary_rejected"
++	}
++	if err := p.app.persistRadioLocked(); err != nil {
 +		return nil, err
 +	}
 +	return radioPrimaryReply{radioPrimaryCommand: r}, nil
@@ -309,7 +328,7 @@
 +		}
 +		return primaryRadioReplacementStopReply(r, *op.PriorRelease), nil
 +	}
-+	wire := radioPrimaryStopRequest{Schema: primaryRadioStopSchema, Phase: "result", Action: r.Action, radioPrimaryBinding: *r.Session}
++	wire := radioPrimaryStopRequest{Schema: primaryRadioStopSchema, Phase: "result_stop_replace", Action: r.Action, radioPrimaryBinding: *r.Session}
 +	if r.Phase == "stop" {
 +		if r.ForPhase != "" || op.Stopped != nil || old.Phase != "primary_active" || old.PrimaryAction != "" {
 +			return nil, ErrAliasConflict
@@ -319,7 +338,7 @@
 +		if err := app.persistRadioLocked(); err != nil {
 +			return nil, err
 +		}
-+		wire.Phase = "claim_stop"
++		wire.Phase = "claim_stop_replace"
 +	} else if op.Stopped == nil || old.Phase != "primary_stop_pending" || old.PrimaryAction != r.Action {
 +		return nil, ErrAliasConflict
 +	}
@@ -334,6 +353,10 @@
 +	if ack.Phase == "pending" && ack.TeardownCSeq == 0 {
 +		r.Phase = "pending"
 +		return radioPrimaryReply{radioPrimaryCommand: r}, nil
++	}
++	if ack.Phase == "replacement_rejected" && ack.TeardownCSeq == 0 {
++		old.Phase, old.PrimaryAction = "primary_active", ""
++		return p.rejectPrimaryRadioReplacement(r, h, old)
 +	}
 +	if ack.Phase != "released" || ack.TeardownCSeq <= 0 {
 +		return nil, ErrAliasConflict
@@ -378,12 +401,20 @@
 +		if h.PrimaryPark != nil {
 +			wire.ParkToken = h.PrimaryPark.Token
 +		}
-+	} else if op.Started == nil || h.Phase != "primary_start_pending" {
++	} else if op.Started == nil || h.Phase != "primary_start_pending" && h.Phase != "primary_active" {
 +		return nil, ErrAliasConflict
 +	}
++	alreadyObserved := h.Phase == "primary_active" && op.ReplacementDone
 +	ack, err := p.primaryRadioCStart(ctx, wire, false)
 +	if err != nil {
 +		return nil, err
++	}
++	if alreadyObserved {
++		if ack.Phase != "playing" || ack.Session == nil || h.Primary == nil || *ack.Session != *h.Primary {
++			return nil, ErrAliasConflict
++		}
++		r.Session, r.Phase = ack.Session, "playing"
++		return radioPrimaryReply{radioPrimaryCommand: r, Observation: primaryObservation(r, "playing", "radio")}, nil
 +	}
 +	switch ack.Phase {
 +	case "pending":
