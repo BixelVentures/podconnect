@@ -2675,10 +2675,10 @@ index 0000000..54674ed
 +}
 diff --git a/daemon/radio_availability.go b/daemon/radio_availability.go
 new file mode 100644
-index 0000000..5fcbf78
+index 0000000..856d341
 --- /dev/null
 +++ b/daemon/radio_availability.go
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,305 @@
 +package daemon
 +
 +import (
@@ -2729,6 +2729,37 @@ index 0000000..5fcbf78
 +		}
 +	}
 +	return true
++}
++
++func (c radioAvailabilityCapability) identityValid(homepod string) bool {
++	return c.Schema == "podconnect.output_radio_capability.v1" && c.Purpose == "radio_handoff_v1" &&
++		volumeUUID.MatchString(c.Process) && c.DeviceID == homepod && volumeCounter(c.Incarnation) &&
++		c.Incarnation != "0" && radioControllerIDValid(c.ControllerID) && !c.Physical
++}
++
++type radioCapabilityProbe struct {
++	status   int
++	unpaired *radioAvailabilityCapability
++}
++
++func radioUnpairedCapability(raw []byte) *radioAvailabilityCapability {
++	// OwnTone deliberately returns a null digest for an unpaired receiver. The
++	// shared admission decoder rejects all nulls. Recognize just that closed
++	// shape for diagnostics, and keep the original rejected probe result.
++	var fields map[string]json.RawMessage
++	if strictVolumeJSON(raw, &fields) != nil || string(fields["receiver_key_digest"]) != "null" {
++		return nil
++	}
++	fields["receiver_key_digest"] = json.RawMessage(`""`)
++	normalized, err := json.Marshal(fields)
++	if err != nil {
++		return nil
++	}
++	var capability radioAvailabilityCapability
++	if strictVolumeJSON(normalized, &capability) != nil || capability.Pairing {
++		return nil
++	}
++	return &capability
 +}
 +
 +type radioCapabilityDiagnostics struct {
@@ -2805,12 +2836,16 @@ index 0000000..5fcbf78
 +		}
 +		base := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + target.HomePodID
 +		var capability radioAvailabilityCapability
-+		var status int
++		var probe radioCapabilityProbe
 +		switch {
-+		case radioControlHTTPStatus(ctx, http.MethodGet, base+"/radio-handoff/capabilities", app.cfg.RadioHandoffControlToken, nil, &capability, &status) != nil:
-+			diagnostic.failedProbe(status)
++		case radioControlHTTPProbe(ctx, http.MethodGet, base+"/radio-handoff/capabilities", app.cfg.RadioHandoffControlToken, nil, &capability, &probe) != nil:
++			if unpaired := probe.unpaired; unpaired != nil && unpaired.identityValid(target.HomePodID) && unpaired.Protocol && unpaired.Signing {
++				diagnostic.pairingUnavailable++
++			} else {
++				diagnostic.failedProbe(probe.status)
++			}
 +			continue
-+		case capability.Schema != "podconnect.output_radio_capability.v1" || capability.Purpose != "radio_handoff_v1" || !volumeUUID.MatchString(capability.Process) || capability.DeviceID != target.HomePodID || !volumeCounter(capability.Incarnation) || capability.Incarnation == "0" || !radioControllerIDValid(capability.ControllerID) || capability.Physical:
++		case !capability.identityValid(target.HomePodID):
 +			diagnostic.identityInvalid++
 +			continue
 +		case !capability.Protocol:
@@ -4728,10 +4763,10 @@ index 0000000..934038a
 +}
 diff --git a/daemon/radio_idle_availability_test.go b/daemon/radio_idle_availability_test.go
 new file mode 100644
-index 0000000..8907c43
+index 0000000..9b60196
 --- /dev/null
 +++ b/daemon/radio_idle_availability_test.go
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,324 @@
 +package daemon
 +
 +import (
@@ -4741,6 +4776,7 @@ index 0000000..8907c43
 +	"net/http"
 +	"net/http/httptest"
 +	"path/filepath"
++	"regexp"
 +	"strings"
 +	"sync/atomic"
 +	"syscall"
@@ -4967,9 +5003,9 @@ index 0000000..8907c43
 +	app := radioTestApp(t)
 +	logger := &radioCapabilityLog{}
 +	app.log = logger
-+	app.cfg.DeviceAliases = []string{"private-alpha", "private-beta", "private-gamma", "private-delta", "private-epsilon", "private-zeta", "private-eta"}
-+	app.cfg.DeviceAliasRoomIDs = []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"}
-+	app.cfg.DeviceAliasHomePodIDs = []string{"101", "102", "103", "104", "105", "106", "107"}
++	app.cfg.DeviceAliases = []string{"private-alpha", "private-beta", "private-gamma", "private-delta", "private-epsilon", "private-zeta", "private-eta", "private-theta"}
++	app.cfg.DeviceAliasRoomIDs = []string{"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"}
++	app.cfg.DeviceAliasHomePodIDs = []string{"101", "102", "103", "104", "105", "106", "107", "108"}
 +	app.cfg.AudioBackend = "pipe"
 +	app.cfg.ExternalVolume = true
 +	app.cfg.AudioOutputPipeFormat = "s16le"
@@ -5002,6 +5038,8 @@ index 0000000..8907c43
 +			case "107":
 +				http.Redirect(w, r, "/private-target", http.StatusFound)
 +				return
++			case "108":
++				capability.Digest = nil // Invalid: claims pairing with no digest.
 +			}
 +			_ = json.NewEncoder(w).Encode(capability)
 +		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/radio-admission"):
@@ -5022,7 +5060,7 @@ index 0000000..8907c43
 +			Targets []radioTarget `json:"configured_targets"`
 +			Missing []string      `json:"missing_proofs"`
 +		}
-+		if err := json.Unmarshal(raw, &state); err != nil || len(state.Targets) != 7 || len(state.Missing) != 1 || state.Missing[0] != "fresh_receiver_source_proof" {
++		if err := json.Unmarshal(raw, &state); err != nil || len(state.Targets) != 8 || len(state.Missing) != 1 || state.Missing[0] != "fresh_receiver_source_proof" {
 +			t.Fatal("diagnostics changed Native availability")
 +		}
 +		for _, target := range state.Targets {
@@ -5031,16 +5069,25 @@ index 0000000..8907c43
 +			}
 +		}
 +	}
-+	if capabilities.Load() != 14 || admissions.Load() != 2 || effects.Load() != 0 || len(logger.lines) != 1 {
++	if capabilities.Load() != 16 || admissions.Load() != 2 || effects.Load() != 0 || len(logger.lines) != 1 {
 +		t.Fatal("unexpected probe, effect or duplicate log count")
 +	}
-+	want := "radio: native_capability targets=7 journal_failed=0 probe_failed=3 probe_no_response=0 probe_auth=1 probe_503=1 probe_invalid_reply=0 probe_other_http=1 identity_invalid=1 protocol_unsupported=0 signing_unconfigured=1 pairing_unavailable=1 passed=1"
++	want := "radio: native_capability targets=8 journal_failed=0 probe_failed=4 probe_no_response=0 probe_auth=1 probe_503=1 probe_invalid_reply=1 probe_other_http=1 identity_invalid=1 protocol_unsupported=0 signing_unconfigured=1 pairing_unavailable=1 passed=1"
 +	if logger.lines[0] != want {
-+		t.Fatal("capability log contains unexpected or private fields")
++		// Failure output must remain safe even if the log regresses.
++		var got []string
++		for _, field := range strings.Fields(want)[2:] {
++			key, _, _ := strings.Cut(field, "=")
++			count := regexp.MustCompile(`(?:^| )` + key + `=[0-8](?: |$)`).FindString(logger.lines[0])
++			if count != "" {
++				got = append(got, strings.TrimSpace(count))
++			}
++		}
++		t.Fatalf("unexpected diagnostic counts: got %v; want %s", got, want)
 +	}
 +	app.radio.failed = true
 +	app.radioStateObserved(context.Background())
-+	if capabilities.Load() != 14 || len(logger.lines) != 2 || !strings.Contains(logger.lines[1], "journal_failed=7 probe_failed=0") {
++	if capabilities.Load() != 16 || len(logger.lines) != 2 || !strings.Contains(logger.lines[1], "journal_failed=8 probe_failed=0") {
 +		t.Fatal("journal quarantine changed or was not distinguished")
 +	}
 +}
@@ -8444,10 +8491,10 @@ index 0000000..5184d37
 +}
 diff --git a/daemon/radio_reacquire.go b/daemon/radio_reacquire.go
 new file mode 100644
-index 0000000..da13e16
+index 0000000..7f0e842
 --- /dev/null
 +++ b/daemon/radio_reacquire.go
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,440 @@
 +package daemon
 +
 +import (
@@ -8807,10 +8854,10 @@ index 0000000..da13e16
 +	return radioControlHTTP(ctx, http.MethodPost, endpoint, token, payload, out)
 +}
 +func radioControlHTTP(ctx context.Context, method, endpoint, token string, payload, out any) error {
-+	return radioControlHTTPStatus(ctx, method, endpoint, token, payload, out, nil)
++	return radioControlHTTPProbe(ctx, method, endpoint, token, payload, out, nil)
 +}
 +
-+func radioControlHTTPStatus(ctx context.Context, method, endpoint, token string, payload, out any, status *int) error {
++func radioControlHTTPProbe(ctx context.Context, method, endpoint, token string, payload, out any, probe *radioCapabilityProbe) error {
 +	var raw []byte
 +	var err error
 +	if payload != nil {
@@ -8827,8 +8874,8 @@ index 0000000..da13e16
 +	req.Header.Set("X-PodConnect-Token", token)
 +	client := &http.Client{Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAliasConflict }}
 +	response, err := client.Do(req)
-+	if status != nil && response != nil {
-+		*status = response.StatusCode
++	if probe != nil && response != nil {
++		probe.status = response.StatusCode
 +	}
 +	if err != nil {
 +		return err
@@ -8857,7 +8904,11 @@ index 0000000..da13e16
 +	case *radioAbsenceStartReply:
 +		return decodeRadioAbsenceStartReply(raw, typed)
 +	}
-+	return strictVolumeJSON(raw, out)
++	err = strictVolumeJSON(raw, out)
++	if err != nil && probe != nil {
++		probe.unpaired = radioUnpairedCapability(raw)
++	}
++	return err
 +}
 +
 +func (p *AppPlayer) radioReacquireCheckpoint(h *radioHold, r radioReacquire, phase string, ack *radioReacquireReply) error {
