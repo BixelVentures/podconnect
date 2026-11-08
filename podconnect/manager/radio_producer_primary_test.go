@@ -150,6 +150,10 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 				if _, _, err = restarted.Ready(ctx); err == nil || len(f.calls) != 3 {
 					t.Fatal("restart adopted or replayed unknown custody")
 				}
+				old := &producerFixture{}
+				if _, err := newRadioProducer(producerNativeFixture{old}, producerSenderFixture{old}, p.journal.directory, true); err == nil {
+					t.Fatal("v1 producer adopted a primary-session journal")
+				}
 				return
 			}
 			if err != nil || started.State != "playing" || started.TargetID != target || started.StationID != "p3" ||

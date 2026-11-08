@@ -147,6 +147,11 @@ func newRadioProducer(native radioProducerNativePort, sender radioProducerSender
 	if e != nil {
 		return nil, e
 	}
+	for _, record := range records {
+		if record.Primary != nil {
+			return nil, errRadioUnavailable
+		}
+	}
 	return &radioProducer{native: native, sender: sender, journal: journal, records: records, prepared: make(map[string]radioProducerPeer), physicalAccepted: physicalAccepted, live: make(map[string]bool), retained: make(map[string]radioProducerPrior)}, nil
 }
 func (p *radioProducer) Ready(ctx context.Context) ([]radioTarget, []string, error) {
