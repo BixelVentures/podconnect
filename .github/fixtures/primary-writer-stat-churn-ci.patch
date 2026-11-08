@@ -1,0 +1,86 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -8,6 +8,7 @@
+  * before discovery. User-Agent is checked on actual loopback RTSP requests. */
+ #include <assert.h>
+ #include <sys/wait.h>
++#include <sys/stat.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -27,7 +28,10 @@
+   if (getenv("PC_NATIVE_PRIMARY_HTTP_PORT")) \
+     fprintf(stderr, "Primary owner diagnostic: " __VA_ARGS__); \
+ } while (0)
++static int fixture_primary_writer_stat(const char *path, struct stat *result);
++#define stat(path, result) fixture_primary_writer_stat(path, result)
+ #include "../src/outputs.c"
++#undef stat
+ #include "../src/evrtsp/evrtsp.h"
+ static struct evrtsp_request *fixture_request_new(void (*)(struct evrtsp_request *,void *),void *);
+ static void *fixture_calloc(size_t n, size_t size);
+@@ -61,6 +65,43 @@
+ #define PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE() fixture_primary_decoder_before_done()
+ #include "../src/outputs/airplay.c"
+ #undef PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE
++
++static int fixture_primary_churn_fd = -1;
++static unsigned int fixture_primary_churn_count;
++static char fixture_primary_churn_path[96];
++
++static void
++fixture_primary_writer_churn_arm(void)
++{
++  int descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
++  assert(descriptor >= 0 && fixture_primary_churn_fd < 0 && !fixture_primary_churn_count);
++  fixture_primary_churn_fd = fcntl(descriptor, F_DUPFD_CLOEXEC, 128);
++  assert(fixture_primary_churn_fd >= 128 && close(descriptor) == 0);
++  int length = snprintf(fixture_primary_churn_path, sizeof(fixture_primary_churn_path),
++      "/proc/%ld/fd/%d", (long)getpid(), fixture_primary_churn_fd);
++  assert(length > 0 && (size_t)length < sizeof(fixture_primary_churn_path));
++}
++
++static int
++fixture_primary_writer_stat(const char *path, struct stat *result)
++{
++  if (fixture_primary_churn_fd >= 0 && !strcmp(path, fixture_primary_churn_path)
++      && airplay_sessions && airplay_sessions->primary_radio)
++    {
++      struct output_device *device = outputs_device_get(airplay_sessions->device_id);
++      /* Constructor has linked its local session but has not attached or emitted. */
++      assert(device && !device->session);
++      assert(close(fixture_primary_churn_fd) == 0);
++      fixture_primary_churn_fd = -1;
++      int status = stat(path, result);
++      assert(status < 0 && errno == ENOENT);
++      fixture_primary_churn_count++;
++      fputs("FORCED primary constructor writer scan saw a vanished unrelated FD\n", stderr);
++      errno = ENOENT;
++      return status;
++    }
++  return stat(path, result);
++}
+ #undef net_bind
+ #undef evrtsp_request_new
+ #undef calloc
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -2022,12 +2022,18 @@
+     assert(outputs_airplay_primary_station_replace_activate(&candidate, released, NULL, out) < 0);
+   (void)primary_radio_wire_packets(destination, &sequence);
+   assert(outputs_airplay_primary_station_replace_activate(&candidate, released, park_token, out) == 0);
++  bool force_churn = park_token && previous == destination && !fixture_primary_churn_count
++      && getenv("PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN");
++  if (force_churn)
++    fixture_primary_writer_churn_arm();
+   for (int i = 0; i < 1500 && out->phase == OUTPUT_PRIMARY_RADIO_START_PENDING; i++)
+     {
+       event_base_loop(previous->base, EVLOOP_NONBLOCK);
+       assert(outputs_airplay_primary_station_result(&candidate, out) == 0);
+       usleep(1000);
+     }
++  if (force_churn)
++    assert(fixture_primary_churn_count == 1 && fixture_primary_churn_fd == -1);
+   assert(out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && destination->pc70_peer_sessions == destination_peers + 1
+       && out->custody.epoch == candidate.epoch + (previous == destination ? 2 : 1)
+       && out->custody.route == candidate.route && !strcmp(out->custody.operation, candidate.action)

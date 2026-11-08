@@ -188,7 +188,7 @@ jobs:
             git apply "$patch_dir/$patch.patch"
           done
           # CI-only fixture overlays are applied after the immutable production stack.
-          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-attach-diagnostic-ci; do
+          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-attach-diagnostic-ci primary-writer-stat-churn-ci; do
             patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -255,7 +255,7 @@ jobs:
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - uses: actions/upload-artifact@v4
