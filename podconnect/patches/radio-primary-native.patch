@@ -3468,11 +3468,44 @@ index 674d052980e2576688031db0a734ada0dd8007c6..8017165dc3dc1ed6895baaea7564a476
  // Credit completion inside the actual source/output verification boundary.
  // A late EOF, reused FD with a new epoch, or a replacement owner cannot publish
  // authority between the C observation and durable Native terminal receipt.
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index d00748fa345933c24eb73c6542b810fcbf4ee6f2..6d61f4972cf957808e5c489aaf0b5845e5103a44 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -566,10 +566,6 @@ func (op *contentOperation) stage() {
+ 		terminalState = "cancelled"
+ 		return
+ 	}
+-	// Ownership remains with the staged operation until guarded publication.
+-	op.mu.Lock()
+-	op.Stream = stream
+-	op.mu.Unlock()
+ 	keepStaged = true
+ 	time.AfterFunc(5*time.Second, func() {
+ 		op.mu.Lock()
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f48303676143fc0 100644
+index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..629aae74cb00751aa443e293b2a8482a33bd0e88 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -605,7 +605,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+@@ -50,6 +50,17 @@ import (
+ 	"unsafe"
+ )
+ 
++type stagedSourceCloseWitness struct {
++	librespot.AudioSource
++	closer io.Closer
++	calls  atomic.Int32
++}
++
++func (s *stagedSourceCloseWitness) Close() error {
++	s.calls.Add(1)
++	return s.closer.Close()
++}
++
+ type contentInertSource struct {
+ 	closes    atomic.Int32
+ 	finite    bool
+@@ -605,7 +616,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
  func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  	modes := []string{"absence-evolution-admission-failed", "absence-evolution-admission-unknown", "absence-evolution-fifo", "absence-evolution-pending-completion", "absence-evolution-save-fails", "absence-evolution-current-start", "absence-evolution-current-stale", "sourceful-reacquired-writer", "playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation", "direct-pause-current", "direct-pause-unknown-state", "direct-pause-route", "direct-pause-foreign-prepare", "direct-pause-late-generation", "direct-pause-late-intent", "direct-pause-unknown-commit", "direct-pause-unknown-confirm", "episode-stage", "episode-metadata404", "episode-decode404", "episode-wrongmetadata", "episode-owner-stale", "episode-owner-late", "episode-wronggid", "episode-commit", "episode-invalid-overflow", "episode-invalid-maxplus", "episode-invalid-malformed", "episode-resolved-overflow", "episode-missinggid", "episode-malformedgid"}
  	if mode := os.Getenv("PC_NATIVE_START_MODE"); mode != "" {
@@ -3481,7 +3514,7 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  			t.Fatal("invalid C compose mode")
  		}
  		modes = []string{mode}
-@@ -656,6 +656,12 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -656,6 +667,12 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					// before any source/alias/owner is published to real C.
  					p.initAliasRegistry()
  				}
@@ -3494,7 +3527,7 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  			}
  
  			p.app.cfg.AudioOutputPipe = path
-@@ -703,7 +709,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -703,7 +720,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  				}
  				return out, e
  			}}
@@ -3503,7 +3536,7 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  				if strings.HasPrefix(mode, "episode-") {
  					configureSelectedStage(t, p, options, mode)
  				} else {
-@@ -755,12 +761,17 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -755,12 +772,17 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					source.eofFile = os.Getenv("PC_NATIVE_START_EOF_FILE")
  				}
  			}
@@ -3523,7 +3556,7 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  				if e != nil {
  					t.Fatal(e)
  				}
-@@ -1040,7 +1051,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -1040,7 +1062,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			} else {
  				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
  			}
@@ -3532,7 +3565,7 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  			if good {
  				if err != nil {
  					if external && actualOutput != nil {
-@@ -1241,6 +1252,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -1241,6 +1263,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			if mode == "actual-c-radio-http" {
  				testServeActualRadioHTTP(t, p, worker, stream)
  			}
@@ -3542,7 +3575,196 @@ index f4ee0c59427c796ec01aa1de6ee97d1ce50e03bd..ddc0ccf04c752d5bbba45b883f483036
  			if external && mode != "actual-c-radio-http" {
  				reply, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
  				if e != nil {
-@@ -1711,7 +1725,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1380,41 +1405,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 	if mode == "episode-commit" {
+ 		selectedHomePod = "202"
+ 	}
+-	capture, err := p.captureContent(roomVolumeScope{"account", "engine", "r1", selectedHomePod})
+-	if err != nil {
+-		t.Fatal("capture", err)
+-	}
+-	state, err := capture.readCState(ctx)
+-	if err != nil {
+-		t.Fatal("actual C state", err)
+-	}
+-	offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
+-	if err != nil {
+-		t.Fatal("offer", err)
+-	}
+-	op := offered.(*contentOperation)
+-	if !server.roomContents.put(op) {
+-		t.Fatal("store")
+-	}
+-	request := contentPrepareRequest{capture.Scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
+-	if mode == "episode-commit" {
+-		request.Action = "play_episode"
+-		request.Args = contentArgs{EpisodeURI: "spotify:episode:0000000000000000000004", MaxVolume: 35}
+-	}
+-	if mode == "actual-c-selected" {
+-		_, err = server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
++	scope := roomVolumeScope{"account", "engine", "r1", selectedHomePod}
++	offer := func() *contentOperation {
++		t.Helper()
++		capture, err := p.captureContent(scope)
+ 		if err != nil {
+-			t.Fatal("claim", err)
++			t.Fatal("capture", err)
+ 		}
+-		op.mu.Lock()
+-		op.Stream, op.Tracks = stream, p.state.tracks
+-		op.Prepared.SessionId = op.Intended.SessionID
+-		op.Prepared.IsPlaying, op.Prepared.IsPaused = true, true
+-		op.ContentDigest = strings.Repeat("d", 64)
+-		op.State = "staged"
+-		op.StagedUntil = time.Now().Add(5 * time.Second)
+-		op.mu.Unlock()
+-	} else {
++		state, err := capture.readCState(ctx)
++		if err != nil {
++			t.Fatal("actual C state", err)
++		}
++		offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++		if err != nil {
++			t.Fatal("offer", err)
++		}
++		op := offered.(*contentOperation)
++		if !server.roomContents.put(op) {
++			t.Fatal("store")
++		}
++		return op
++	}
++	stage := func(op *contentOperation, request contentPrepareRequest) *player.Stream {
++		t.Helper()
+ 		raw, _ := json.Marshal(request)
+ 		rec := httptest.NewRecorder()
+ 		server.handleContentPrepare(rec, httptest.NewRequest("POST", "/player/room_content/prepare", bytes.NewReader(raw)))
+@@ -1427,28 +1440,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 			phase, stagedStream := op.State, op.Stream
+ 			op.mu.Unlock()
+ 			if phase == "staged" && stagedStream != nil {
+-				stream = stagedStream
+-				break
++				return stagedStream
+ 			}
+ 			if (phase != "staging" && phase != "staged") || time.Now().After(until) {
+ 				t.Fatal("actual stage did not produce stream", phase)
+ 			}
+ 			time.Sleep(time.Millisecond)
+ 		}
++	}
++	var cancelled *contentOperation
++	replayCancelled := func(handler http.HandlerFunc, path string) {
++		t.Helper()
++		body, _ := json.Marshal(contentIDRequest{cancelled.Offer.OfferID, cancelled.Offer.BindingID})
++		rec := httptest.NewRecorder()
++		handler(rec, httptest.NewRequest("POST", path, bytes.NewReader(body)))
++		var receipt contentReceipt
++		if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil || rec.Code != http.StatusOK ||
++			receipt.Accepted || receipt.State != "cancelled" || receipt.OperationID != cancelled.Offer.OfferID {
++			t.Fatalf("exact cancelled offer did not stay terminal: status=%d state=%s accepted=%t err=%v", rec.Code, receipt.State, receipt.Accepted, err)
++		}
++	}
++	if os.Getenv("PC_NATIVE_CANCEL_STAGED_SELECTION") != "" {
++		if mode != "actual-c-selected-rtp" {
++			t.Fatal("cancelled selection requires the actual C RTP fixture")
++		}
++		cancelled = offer()
++		const cancelledURI = "spotify:track:0000000000000000000003"
++		shuffle := false
++		discarded := stage(cancelled, contentPrepareRequest{scope, cancelled.Offer, "play_tracks",
++			contentArgs{TrackURIs: []string{cancelledURI}, Shuffle: &shuffle, LibrarySource: "liked", MaxVolume: 35}})
++		closer, ok := discarded.Source.(io.Closer)
++		if !ok || discarded.File == nil || discarded.File.GetFormat() != metadatapb.AudioFile_FLAC_FLAC ||
++			discarded.Media.Id().Uri() != cancelledURI {
++			t.Fatal("first selection did not stage the exact decoded track")
++		}
++		// Observe the Close on the actual staged decoder and its storage reader.
++		closed := &stagedSourceCloseWitness{AudioSource: discarded.Source, closer: closer}
++		cancelled.mu.Lock()
++		discarded.Source = closed
++		cancelled.mu.Unlock()
++		replayCancelled(server.handleContentCancel, "/player/room_content/cancel")
++		replayCancelled(server.handleContentCommit, "/player/room_content/commit")
++		cancelled.mu.Lock()
++		cleared := cancelled.Terminal && cancelled.Cancelled && cancelled.Stream == nil &&
++			cancelled.CReceipt == nil && !cancelled.CommitClaimed && !cancelled.Published
++		cancelled.mu.Unlock()
++		current, err := worker.Start35CurrentSource(ctx)
++		if err != nil || !cleared || closed.calls.Load() != 1 || current != nil || p.primaryStream != nil || p.app.startCustody != nil {
++			t.Fatalf("cancelled stage reached the live source or C START: %v", err)
++		}
++	}
++	op := offer()
++	if cancelled != nil && (op.Offer.OfferID == cancelled.Offer.OfferID || op.Offer.BindingID == cancelled.Offer.BindingID) {
++		t.Fatal("fresh selection reused the cancelled offer")
++	}
++	request := contentPrepareRequest{scope, op.Offer, "play_track", contentArgs{TrackURI: "spotify:track:0000000000000000000004", MaxVolume: 35}}
++	if mode == "episode-commit" {
++		request.Action = "play_episode"
++		request.Args = contentArgs{EpisodeURI: "spotify:episode:0000000000000000000004", MaxVolume: 35}
++	}
++	if mode == "actual-c-selected" {
++		_, err := server.roomTransportAsk(ctx, apiContentClaim, contentActorRequest{Operation: op, Context: ctx, Request: request})
++		if err != nil {
++			t.Fatal("claim", err)
++		}
++		op.mu.Lock()
++		op.Stream, op.Tracks = stream, p.state.tracks
++		op.Prepared.SessionId = op.Intended.SessionID
++		op.Prepared.IsPlaying, op.Prepared.IsPaused = true, true
++		op.ContentDigest = strings.Repeat("d", 64)
++		op.State = "staged"
++		op.StagedUntil = time.Now().Add(5 * time.Second)
++		op.mu.Unlock()
++	} else {
++		stream = stage(op, request)
+ 		t.Log("public prepare -> actual ContextResolve/metadata/key/storage/AES/FLAC/NewStream staged")
+ 	}
+ 	body, _ := json.Marshal(contentIDRequest{op.Offer.OfferID, op.Offer.BindingID})
+ 	rec := httptest.NewRecorder()
+ 	server.handleContentCommit(rec, httptest.NewRequest("POST", "/player/room_content/commit", strings.NewReader(string(body))))
+ 	var receipt contentReceipt
+-	if err = json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
++	if err := json.Unmarshal(rec.Body.Bytes(), &receipt); err != nil {
+ 		t.Fatal(err, rec.Code, rec.Body.String())
+ 	}
+ 	if !receipt.Accepted {
+ 		t.Fatal("selected-content actual commit rejected", rec.Code, receipt)
+ 	}
+ 	// Join the existing actor's terminal publication before observing state.
+-	_, err = server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
++	_, err := server.roomTransportAsk(ctx, ApiRequestType("fixture_noop"), nil)
+ 	if err == nil {
+ 		t.Fatal("expected unsupported noop")
+ 	}
+@@ -1456,6 +1535,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
+ 		t.Fatal("selected state not observed", err)
+ 	}
++	if cancelled != nil {
++		if stream.Media.Id().Uri() != request.Args.TrackURI || receipt.OperationID != op.Offer.OfferID ||
++			p.state.player.Track.GetUri() != request.Args.TrackURI || p.app.startCustody != op {
++			t.Fatal("fresh explicit START did not own the requested track")
++		}
++		replayCancelled(server.handleContentCommit, "/player/room_content/commit")
++		if current, err := worker.Start35CurrentSource(ctx); err != nil || current != stream.Source {
++			t.Fatalf("late cancelled commit changed the fresh writer source: %v", err)
++		}
++	}
+ 	if mode == "actual-c-selected-rtp" {
+ 		until := time.Now().Add(7 * time.Second)
+ 		client := &http.Client{Timeout: time.Second}
+@@ -1477,6 +1566,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 			}
+ 			if observed.AudioPackets > 0 {
+ 				t.Logf("actual selected PCM reached C output and private peer as %d audio RTP packet(s)", observed.AudioPackets)
++				if cancelled != nil {
++					t.Log("PASS exact staged decoder cancellation and stale commit refusal before and after fresh actual START35")
++				}
+ 				break
+ 			}
+ 			if time.Now().After(until) {
+@@ -1711,7 +1803,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  	if len(episode) > 0 && episode[0] == "episode-commit" {
  		mediaBytes = selectedSustainedFLAC
  	}

@@ -91,6 +91,8 @@ manager_primary = mode == "actual-c-primary-manager"
 native_mode = "actual-c-primary-same-target" if manager_primary else mode
 primary_same_target = native_mode == "actual-c-primary-same-target"
 prefix = "pc52-selected-"
+if os.getenv("PC_NATIVE_CANCEL_STAGED_SELECTION"):
+    prefix += "cancel-staged-"
 if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME"):
     prefix += "resume-"
 root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
@@ -218,6 +220,10 @@ with (
             lines = [line for line in log.read_text(errors="replace").splitlines() if markers.search(line)]
             for line in lines[-60:]:
                 print(re.sub(r"[0-9a-fA-F]{32,}", "[redacted]", line), file=sys.stderr)
+    if os.getenv("PC_NATIVE_CANCEL_STAGED_SELECTION") and not n.returncode and not c_status:
+        for line in (root / (prefix + mode + "-native.log")).read_text().splitlines():
+            if "PASS exact staged decoder cancellation" in line or "actual selected PCM reached C output" in line:
+                print(line)
     if manager_primary and not n.returncode and not c_status:
         for line in (root / (prefix + mode + "-c.log")).read_text().splitlines():
             if line.startswith(("PASS configured Manager receiver windows", "PASS same-target authenticated RTP")):
