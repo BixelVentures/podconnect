@@ -1,0 +1,254 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -272,6 +272,9 @@
+ bool outputs_airplay_primary_radio_owns(const struct output_device *);
+ int outputs_airplay_primary_radio_preempt(struct output_device *);
+ void outputs_primary_radio_drain_complete(uint64_t, uint64_t, uint64_t, bool);
++bool outputs_primary_radio_custody_available(uint64_t);
++char *outputs_primary_radio_custody_begin(uint64_t, uint64_t, uint64_t, uint64_t);
++int outputs_primary_radio_custody_release(uint64_t, const char *, int);
+ bool outputs_callback_is_primary_radio_restart(int);
+ void outputs_airplay_primary_radio_remove(struct output_device *);
+ void outputs_radio_handoff_teardown(uint64_t,uint64_t,uint64_t,const void *,int,int);
+@@ -525,8 +528,6 @@
+  */
+ struct output_device
+ {
+-  bool primary_radio_drain_unknown; /* Process-local; shipping requires durable custody. */
+-
+   // Device id
+   uint64_t id;
+ 
+--- a/src/outputs.c
++++ b/src/outputs.c
+@@ -2222,8 +2222,6 @@
+     return -1;
+ 
+   if (outputs_transport_busy() && !outputs_radio_reacquire_constructor_current(device->id) && !outputs_radio_other_constructor_current(device->id) && !outputs_radio_parked_bridge_constructor_current(device->id) && !outputs_start_transition_current(device->id,1) && (!device->session || device->attention_retiring_session == device->session)) return -1;
+-  if (device->primary_radio_drain_unknown)
+-    return -1;
+   if (device->type == OUTPUT_TYPE_AIRPLAY && outputs_airplay_primary_radio_owns(device))
+     {
+       if (only_probe || !device->selected || device->attention_restart_pending)
+@@ -2239,6 +2237,8 @@
+         attention_restart_cancel(device);
+       return 1;
+     }
++  if (device->type == OUTPUT_TYPE_AIRPLAY && !outputs_primary_radio_custody_available(device->id))
++    return -1;
+   if (device->session && device->attention_retiring_session == device->session)
+     {
+       // The first command waits for exact native destruction, never claims running.
+@@ -2298,6 +2298,105 @@
+     }
+ }
+ 
++static void
++primary_radio_custody_key(char key[64], uint64_t id)
++{
++  snprintf(key, 64, "podconnect.radio-primary-custody.v1.%" PRIu64, id);
++}
++
++static bool
++primary_radio_custody_valid(const char *value, uint64_t id, bool released)
++{
++  json_object *row = json_tokener_parse(value), *field;
++  bool valid = row && json_object_is_type(row, json_type_object)
++    && !strcmp(json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN), value)
++    && json_object_object_length(row) == 8
++    && json_object_object_get_ex(row, "schema", &field) && json_object_is_type(field, json_type_string)
++    && !strcmp(json_object_get_string(field), "podconnect.radio-primary-custody.v1")
++    && json_object_object_get_ex(row, "device", &field) && json_object_is_type(field, json_type_int)
++    && json_object_get_uint64(field) == id
++    && json_object_object_get_ex(row, "process", &field) && json_object_is_type(field, json_type_string)
++    && json_object_get_string_len(field) == 36
++    && json_object_object_get_ex(row, "operation", &field) && json_object_is_type(field, json_type_string)
++    && json_object_get_string_len(field) == 36
++    && json_object_object_get_ex(row, "incarnation", &field) && json_object_is_type(field, json_type_int)
++    && json_object_get_uint64(field) > 0
++    && json_object_object_get_ex(row, "epoch", &field) && json_object_is_type(field, json_type_int)
++    && json_object_get_uint64(field) > 0
++    && json_object_object_get_ex(row, "route", &field) && json_object_is_type(field, json_type_int)
++    && json_object_object_get_ex(row, "teardown_cseq", &field) && json_object_is_type(field, json_type_int)
++    && (released ? json_object_get_int64(field) > 0 && json_object_get_int64(field) <= INT_MAX
++                 : json_object_get_int64(field) == 0);
++  if (row) json_object_put(row);
++  return valid;
++}
++
++bool
++outputs_primary_radio_custody_available(uint64_t id)
++{
++  char key[64], *raw = NULL;
++  primary_radio_custody_key(key, id);
++  int found = db_radio_handoff_load_key(key, &raw);
++  bool available = found == 0 || (found == 1 && raw && primary_radio_custody_valid(raw, id, true));
++  free(raw);
++  return available;
++}
++
++char *
++outputs_primary_radio_custody_begin(uint64_t id, uint64_t incarnation, uint64_t epoch, uint64_t route)
++{
++  char key[64], operation[37], *previous = NULL, *pending = NULL;
++  json_object *row;
++
++  primary_radio_custody_key(key, id);
++  int found = db_radio_handoff_load_key(key, &previous);
++  if (found < 0 || (found && (!previous || !primary_radio_custody_valid(previous, id, true))))
++    goto done;
++  row = json_object_new_object();
++  if (!row)
++    goto done;
++  outputs_attention_uuid(operation);
++  json_object_object_add(row, "schema", json_object_new_string("podconnect.radio-primary-custody.v1"));
++  json_object_object_add(row, "device", json_object_new_uint64(id));
++  json_object_object_add(row, "process", json_object_new_string(outputs_process));
++  json_object_object_add(row, "operation", json_object_new_string(operation));
++  json_object_object_add(row, "incarnation", json_object_new_uint64(incarnation));
++  json_object_object_add(row, "epoch", json_object_new_uint64(epoch));
++  json_object_object_add(row, "route", json_object_new_uint64(route));
++  json_object_object_add(row, "teardown_cseq", json_object_new_int(0));
++  const char *raw = json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN);
++  pending = raw ? strdup(raw) : NULL;
++  json_object_put(row);
++  if (pending && (!primary_radio_custody_valid(pending, id, false)
++      || db_radio_handoff_save_key(key, previous, pending) < 0))
++    {
++      free(pending);
++      pending = NULL;
++    }
++
++ done:
++  free(previous);
++  return pending;
++}
++
++int
++outputs_primary_radio_custody_release(uint64_t id, const char *pending, int teardown_cseq)
++{
++  char key[64];
++  json_object *row = json_tokener_parse(pending);
++  if (!row || teardown_cseq <= 0 || !primary_radio_custody_valid(pending, id, false))
++    {
++      if (row) json_object_put(row);
++      return -1;
++    }
++  primary_radio_custody_key(key, id);
++  json_object_object_add(row, "teardown_cseq", json_object_new_int(teardown_cseq));
++  const char *raw = json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN);
++  int status = raw && primary_radio_custody_valid(raw, id, true) ? db_radio_handoff_save_key(key, pending, raw) : -1;
++  json_object_put(row);
++  return status;
++}
++
+ void
+ outputs_primary_radio_drain_complete(uint64_t id, uint64_t incarnation, uint64_t epoch, bool confirmed)
+ {
+@@ -2307,10 +2406,7 @@
+       || epoch == UINT64_MAX || device->session_epoch != epoch + 1)
+     return;
+   if (!confirmed)
+-    {
+-      device->primary_radio_drain_unknown = true;
+-      attention_restart_cancel(device);
+-    }
++    attention_restart_cancel(device);
+ }
+ 
+ int
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -257,8 +257,8 @@
+ {
+   bool primary_radio;
+   bool primary_radio_revoked;
+-  bool primary_radio_teardown_confirmed;
+-  bool primary_radio_was_connected;
++  int primary_radio_teardown_cseq;
++  char *primary_radio_custody;
+   bool primary_radio_successor;
+   int primary_radio_control_fd;
+   unsigned short primary_radio_control_port;
+@@ -1443,8 +1443,8 @@
+ {
+   struct airplay_session *s;
+   bool retiring = session->attention_retiring;
+-  bool primary_radio_owned = session->primary_radio && (session->primary_radio_revoked || session->primary_radio_was_connected);
+-  bool primary_radio_confirmed = session->primary_radio_teardown_confirmed;
++  char *primary_radio_custody = session->primary_radio_custody;
++  int primary_radio_teardown_cseq = session->primary_radio_teardown_cseq;
+   uint64_t id = session->device_id, incarnation = session->device_incarnation, epoch = session->session_epoch;
+   const void *old_session = session;
+   struct output_attention_result recovery = session->recovery_operation;
+@@ -1476,8 +1476,13 @@
+     outputs_attention_handoff_drained(&recovery);
+   else if (recovery.operation)
+     outputs_attention_complete(&recovery,accepted ? OUTPUT_ATTENTION_PROTOCOL_ACCEPTED : OUTPUT_ATTENTION_UNKNOWN,code,cseq);
+-  if (primary_radio_owned)
+-    outputs_primary_radio_drain_complete(id, incarnation, epoch, primary_radio_confirmed);
++  if (primary_radio_custody)
++    {
++      bool confirmed = primary_radio_teardown_cseq > 0
++        && outputs_primary_radio_custody_release(id, primary_radio_custody, primary_radio_teardown_cseq) == 0;
++      free(primary_radio_custody);
++      outputs_primary_radio_drain_complete(id, incarnation, epoch, confirmed);
++    }
+   if (retiring)
+     outputs_attention_retirement_finished(id, incarnation, epoch, old_session);
+ }
+@@ -1562,7 +1567,6 @@
+ session_connected(struct airplay_session *session)
+ {
+   session->state = AIRPLAY_STATE_CONNECTED;
+-  session->primary_radio_was_connected = session->primary_radio;
+   if (session->recovery_only)
+     {
+       struct output_device *device = outputs_device_get(session->device_id);
+@@ -1854,7 +1858,7 @@
+ static struct airplay_session *
+ session_make_for_source(struct output_device *device, int callback_id, bool primary_radio)
+ {
+-  if (device->primary_radio_drain_unknown || outputs_airplay_primary_radio_owns(device))
++  if (outputs_airplay_primary_radio_owns(device) || !outputs_primary_radio_custody_available(device->id))
+     return NULL;
+   if((outputs_radio_handoff_blocked(device->id) && !outputs_radio_reacquire_constructor_current(device->id) && !outputs_radio_other_constructor_current(device->id) && !outputs_radio_parked_bridge_constructor_current(device->id)) || !outputs_radio_sender_constructor_allowed(device->id))return NULL;
+   struct airplay_session *session;
+@@ -3856,7 +3860,7 @@
+   outputs_radio_handoff_teardown(session->device_id,session->device_incarnation,session->session_epoch,session,req->response_code,cseq);
+   outputs_radio_sender_teardown(session->device_id,session->device_incarnation,session->session_epoch,session,req->response_code,cseq);
+   if (session->primary_radio)
+-    session->primary_radio_teardown_confirmed = true; // Exact scope and 200/CSeq checked before this handler.
++    session->primary_radio_teardown_cseq = cseq; // Exact scope and 200/CSeq checked before this handler.
+   session->state = AIRPLAY_STATE_STOPPED;
+   return AIRPLAY_SEQ_CONTINUE;
+ }
+@@ -4611,6 +4615,17 @@
+ 	goto error;
+     }
+ 
++  if (session->primary_radio && cur_request->seq_type == AIRPLAY_SEQ_START_PLAYBACK
++      && !session->primary_radio_custody)
++    {
++      if (!session->control_cipher_ctx || !primary_radio_sequence_current(seq_ctx))
++        goto error;
++      session->primary_radio_custody = outputs_primary_radio_custody_begin(session->device_id,
++          session->device_incarnation, session->session_epoch, session->primary_radio_route_revision);
++      if (!session->primary_radio_custody || !primary_radio_sequence_current(seq_ctx))
++        goto error;
++    }
++
+   uri = (cur_request->uri) ? cur_request->uri : session->session_url;
+ 
+   DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -559,6 +559,8 @@
+   if(outputs_radio_handoff_source_reserved() && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
+   if(outputs_radio_handoff_blocked(r->device_id) && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_absence_start_admissible(r) && !outputs_radio_move_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
+   struct output_device *d=outputs_device_get(r->device_id),*scan; char digest[65];
++  if (!outputs_primary_radio_custody_available(r->device_id))
++    return false; /* An unproved radio drain never opens a START reservation. */
+   struct output_device *old=NULL;struct output_transport_identity old_identity;
+   (void)outputs_transport_busy();
+   if(r->move_existing_session){

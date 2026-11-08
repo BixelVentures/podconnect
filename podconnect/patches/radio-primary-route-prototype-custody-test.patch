@@ -1,0 +1,178 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -7,6 +7,7 @@
+  * AirPlay config is read by actual airplay_init, with service binding refused
+  * before discovery. User-Agent is checked on actual loopback RTSP requests. */
+ #include <assert.h>
++#include <sys/wait.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -688,7 +689,7 @@
+   bool primary_route_receiver, primary_route_auth_required;
+   char session_uri[256];
+   unsigned short requested_control_port;
+-  bool primary_hold_teardown;
++  bool primary_hold_teardown, require_persisted_primary_custody;
+   int primary_held_cseq;
+   struct output_attention_result handoff;
+   struct output_room_volume_request volume_command;
+@@ -887,6 +888,13 @@
+             || (f->session_uri[0] && strcmp(f->session_uri, uri)))
+           { recovery_wire_fail(f, "primary route SETUP must retain encrypted session URI"); goto done; }
+         snprintf(f->session_uri, sizeof(f->session_uri), "%s", uri);
++        if (f->require_persisted_primary_custody)
++          {
++            char *row = NULL;
++            assert(db_radio_handoff_load_key("podconnect.radio-primary-custody.v1.2", &row) == 1);
++            assert(row && strstr(row, "\"teardown_cseq\":0"));
++            free(row);
++          }
+       }
+     plist=plist_new_dict();
+     plist_t setup = NULL;
+@@ -1599,7 +1607,10 @@
+   return resent;
+ }
+ 
+-enum primary_radio_wire_mode { PRIMARY_WIRE, PRIMARY_INGRESS_RED, PRIMARY_PREEMPT_RED, PRIMARY_PREEMPT, PRIMARY_UNKNOWN, PRIMARY_REMOVE };
++enum primary_radio_wire_mode {
++  PRIMARY_WIRE, PRIMARY_INGRESS_RED, PRIMARY_PREEMPT_RED, PRIMARY_PREEMPT, PRIMARY_UNKNOWN, PRIMARY_REMOVE,
++  PRIMARY_CUSTODY_RED, PRIMARY_CUSTODY
++};
+ static int primary_spotify_callbacks;
+ static enum output_device_state primary_spotify_state;
+ 
+@@ -1609,6 +1620,38 @@
+   assert(!device || device->id == 2);
+   primary_spotify_callbacks++;
+   primary_spotify_state = state;
++}
++
++static int
++primary_radio_wire_custody_restart(const char *database)
++{
++  struct recovery_wire_fixture radio = { .udp_fd = -1 };
++  struct airplay_primary_radio_route route;
++  struct event_base *base = event_base_new();
++
++  assert(base);
++  evbase_player = base;
++  cfg = cfg_init(toplvl_cfg, CFGF_NONE);
++  assert(cfg);
++  cfg_setstr(cfg_getsec(cfg, "general"), "db_path", database);
++  assert(db_init(ATTENTION_TEST_SQLEXT_PATH) == 0 && db_perthread_init() == 0);
++  outputs_attention_uuid(outputs_process);
++  assert(outputs_attention_startup() == 0);
++  primary_radio_wire_receiver(&radio, base, 2, "127.0.0.2");
++  assert(airplay_primary_radio_start(radio.device, &route) < 0);
++  outputs_device_select(radio.device, -1);
++  assert(outputs_device_start(radio.device, primary_spotify_connected, false) < 0);
++  assert(!radio.device->session && !radio.pc70_peer_sessions && !primary_spotify_callbacks);
++  puts("PASS fresh process reads unknown primary-radio custody and sends no same-target command");
++  outputs_device_remove(radio.device);
++  evconnlistener_free(radio.listener);
++  evbuffer_free(radio.plain);
++  close(radio.udp_fd);
++  db_perthread_deinit();
++  db_deinit();
++  cfg_free(cfg);
++  event_base_free(base);
++  return 0;
+ }
+ 
+ static int
+@@ -1641,6 +1684,7 @@
+   outputs_buffer_duration_ms = cfg_getint(cfg_getsec(cfg, "general"), "start_buffer_ms");
+   primary_radio_wire_receiver(&music, base, 1, "127.0.0.1");
+   primary_radio_wire_receiver(&radio, base, 2, "127.0.0.2");
++  radio.require_persisted_primary_custody = mode == PRIMARY_CUSTODY;
+   active_recovery_wire = &music;
+ 
+   outputs_device_select(music.device, -1);
+@@ -1724,7 +1768,8 @@
+   assert(primary_radio_wire_packets(&radio, &radio_seq) == 1);
+   assert(primary_radio_wire_resend(&radio, old_radio_control_port, radio_seq) == 0);
+ 
+-  if (mode == PRIMARY_PREEMPT_RED || mode == PRIMARY_PREEMPT || mode == PRIMARY_UNKNOWN)
++  bool unknown = mode == PRIMARY_UNKNOWN || mode == PRIMARY_CUSTODY_RED || mode == PRIMARY_CUSTODY;
++  if (mode == PRIMARY_PREEMPT_RED || mode == PRIMARY_PREEMPT || unknown)
+     {
+       struct airplay_session *old_radio = radio.device->session;
+       unsigned short retiring_control_port = radio.requested_control_port;
+@@ -1748,19 +1793,43 @@
+         }
+       assert(radio.primary_held_cseq > 0 && radio.teardowns == 2 && radio.pc70_peer_sessions == 2);
+       assert(!primary_spotify_callbacks && radio.device->session == old_radio && !music.teardowns);
+-      assert(recovery_wire_reply(&radio, 200, radio.primary_held_cseq + (mode == PRIMARY_UNKNOWN), NULL, 0) == 0);
++      assert(recovery_wire_reply(&radio, 200, radio.primary_held_cseq + unknown, NULL, 0) == 0);
+       for (int i = 0; i < 1500 && !primary_spotify_callbacks; i++)
+         {
+           event_base_loop(base, EVLOOP_NONBLOCK);
+           usleep(1000);
+         }
+       assert(primary_spotify_callbacks == 1 && radio.teardowns == 2 && !music.teardowns);
+-      if (mode == PRIMARY_UNKNOWN)
++      if (unknown)
+         {
+           assert(primary_spotify_state == OUTPUT_STATE_FAILED);
+           assert(!radio.device->session && radio.pc70_peer_sessions == 2);
+           assert(outputs_device_start(radio.device, primary_spotify_connected, false) < 0);
+           puts("PASS mismatched primary radio TEARDOWN leaves same-target Spotify blocked without replay");
++          if (mode == PRIMARY_CUSTODY_RED || mode == PRIMARY_CUSTODY)
++            {
++              uint64_t incarnation = radio.device->incarnation;
++              outputs_device_remove(radio.device);
++              primary_radio_wire_receiver_reset(&radio);
++              evconnlistener_free(radio.listener);
++              evbuffer_free(radio.plain);
++              close(radio.udp_fd);
++              radio = (struct recovery_wire_fixture){ .udp_fd = -1 };
++              primary_radio_wire_receiver(&radio, base, 2, "127.0.0.2");
++              assert(radio.device->incarnation != incarnation);
++              outputs_device_select(radio.device, -1);
++              int admitted = outputs_device_start(radio.device, primary_spotify_connected, false);
++              if (mode == PRIMARY_CUSTODY_RED && admitted == 1)
++                {
++                  fputs("RADIO_PRIMARY_CUSTODY_RED: rediscovered target admitted Spotify after unknown radio drain\n", stderr);
++                  result = 1;
++                  goto cleanup;
++                }
++              assert(admitted < 0 && !radio.device->session && !radio.pc70_peer_sessions);
++              outputs_device_deselect(radio.device);
++              assert(airplay_primary_radio_start(radio.device, &next) < 0);
++              puts("PASS rediscovered output retains exact unknown primary-radio custody");
++            }
+         }
+       else
+         {
+@@ -1816,6 +1885,19 @@
+   db_deinit();
+   cfg_free(cfg);
+   event_base_free(base);
++  if (!result && mode == PRIMARY_CUSTODY)
++    {
++      fflush(NULL);
++      pid_t child = fork();
++      assert(child >= 0);
++      if (!child)
++        {
++          execl("/proc/self/exe", "airplay_callback_owner", "--radio-primary-custody-restart", database, NULL);
++          _exit(127);
++        }
++      int status;
++      assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    }
+   unlink(database);
+   return result;
+ }
+@@ -1834,6 +1916,9 @@
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-preempt")) return primary_radio_wire_case(PRIMARY_PREEMPT);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-preempt-unknown")) return primary_radio_wire_case(PRIMARY_UNKNOWN);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-remove")) return primary_radio_wire_case(PRIMARY_REMOVE);
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-custody-red")) return primary_radio_wire_case(PRIMARY_CUSTODY_RED);
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-custody")) return primary_radio_wire_case(PRIMARY_CUSTODY);
++  if (argc == 3 && !strcmp(argv[1], "--radio-primary-custody-restart")) return primary_radio_wire_custody_restart(argv[2]);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-route")) return radio_primary_output_route_case();
+   if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
