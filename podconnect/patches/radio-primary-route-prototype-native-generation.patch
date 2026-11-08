@@ -1,0 +1,53 @@
+--- a/daemon/radio_primary.go
++++ b/daemon/radio_primary.go
+@@ -58,11 +58,12 @@
+ }
+ 
+ type radioPrimaryStartWire struct {
+-	Schema    string `json:"schema"`
+-	Phase     string `json:"phase"`
+-	Action    string `json:"action,omitempty"`
+-	Station   string `json:"station_id,omitempty"`
+-	ParkToken string `json:"park_token,omitempty"`
++	Schema     string `json:"schema"`
++	Phase      string `json:"phase"`
++	Action     string `json:"action,omitempty"`
++	Station    string `json:"station_id,omitempty"`
++	Generation string `json:"generation,omitempty"`
++	ParkToken  string `json:"park_token,omitempty"`
+ 	radioPrimaryTarget
+ }
+ 
+@@ -162,10 +163,11 @@
+ 		return ack, ErrAliasConflict
+ 	}
+ 	if r.Phase == "target" || r.Phase == "preflight_target" {
+-		if ack.Phase != "target_ready" || ack.Action != "" || ack.Station != "" || ack.Session != nil {
++		if ack.Phase != "target_ready" || ack.Action != "" || ack.Station != "" || ack.Generation != "" || ack.Session != nil {
+ 			return ack, ErrAliasConflict
+ 		}
+ 	} else if ack.radioPrimaryTarget != r.radioPrimaryTarget || ack.Action != r.Action || ack.Station != r.Station ||
++		!volumeCounter(r.Generation) || r.Generation == "0" || ack.Generation != r.Generation ||
+ 		(ack.Phase == "playing" && (ack.Session == nil || !ack.Session.valid() || ack.Session.DeviceID != r.Device ||
+ 			ack.Session.Process != r.Process || ack.Session.Operation != r.Action ||
+ 			ack.Session.Incarnation != r.Incarnation)) ||
+@@ -270,7 +272,7 @@
+ 		if operation.Target == nil || operation.Target.Device != device || operation.Station != r.Station || r.Session != nil {
+ 			return nil, ErrAliasConflict
+ 		}
+-		wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Action: r.Action, Station: r.Station, radioPrimaryTarget: *operation.Target}
++		wire := radioPrimaryStartWire{Schema: cPrimaryStartSchema, Phase: "result", Action: r.Action, Station: r.Station, Generation: r.Generation, radioPrimaryTarget: *operation.Target}
+ 		if start {
+ 			if h.Phase != "primary_reserved" || operation.Started != nil || r.ForPhase != "" ||
+ 				operation.SameTarget && !operation.Decoded {
+--- a/daemon/radio_primary_park.go
++++ b/daemon/radio_primary_park.go
+@@ -85,7 +85,7 @@
+ 		phase = "preflight"
+ 	}
+ 	ack, err := p.primaryRadioCStart(ctx, radioPrimaryStartWire{
+-		Schema: cPrimaryStartSchema, Phase: phase, Action: r.Action, Station: r.Station, radioPrimaryTarget: *op.Target,
++		Schema: cPrimaryStartSchema, Phase: phase, Action: r.Action, Station: r.Station, Generation: r.Generation, radioPrimaryTarget: *op.Target,
+ 	}, true)
+ 	if err != nil {
+ 		return nil, err
