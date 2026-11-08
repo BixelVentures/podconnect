@@ -133,7 +133,7 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 }
 
 func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
-	for _, variant := range []string{"station", "move", "no-capability", "stale-incumbent", "rejected-preflight", "lost-preflight", "lost-stop", "expired-stop"} {
+	for _, variant := range []string{"station", "move", "no-capability", "stale-incumbent", "rejected-preflight", "lost-preflight", "lost-stop", "expired-stop", "lost-expired-stop"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -203,8 +203,11 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 			case "lost-stop":
 				f.lose = "stop"
 				wantCalls = []string{"reserve", "prepare_replace", "stop"}
-			case "expired-stop":
+			case "expired-stop", "lost-expired-stop":
 				f.expiredStop = true
+				if variant == "lost-expired-stop" {
+					f.lose = "stop"
+				}
 				wantCalls = []string{"reserve", "prepare_replace", "stop"}
 			}
 			next, err := c.execute(ctx, q)
@@ -217,11 +220,25 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 					p.active == incumbent || !p.records[incumbent].SourceDrained || f.session == session {
 					t.Fatalf("successor did not replace exact incumbent: %+v %v", next, err)
 				}
+			case "lost-expired-stop":
+				if err == nil || next.State != "unknown" || p.active != incumbent {
+					t.Fatalf("lost terminal refusal claimed an effect: %+v %v", next, err)
+				}
+				c.refresh(ctx)
+				fresh := c.snapshot()
+				if fresh.State != "playing" || fresh.StationID != "p3" || p.active != incumbent ||
+					!reflect.DeepEqual(f.calls, append(wantCalls, "result")) || !p.records[c.fence.Token].Terminal {
+					t.Fatalf("passive exact refusal did not preserve incumbent: %+v %v", fresh, f.calls)
+				}
 			case "lost-preflight", "lost-stop":
 				if err == nil || next.State != "unknown" || p.active != incumbent || p.records[incumbent].SourceDrained {
 					t.Fatalf("lost reply did not retain unknown custody: %+v %v", next, err)
 				}
 				c.refresh(ctx)
+				wantCalls = append(wantCalls, "result")
+				if c.snapshot().State != "unknown" {
+					t.Fatal("ambiguous replacement adopted a successor without a user action")
+				}
 				if _, err = c.execute(ctx, q); err == nil || !reflect.DeepEqual(f.calls, wantCalls) {
 					t.Fatalf("unknown replacement replayed: %v", f.calls)
 				}

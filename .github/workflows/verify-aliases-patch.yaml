@@ -199,7 +199,7 @@ jobs:
           done
           # Earlier branch runs keep the causal before/after proofs for the
           # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test replace-stop replace-stop-test c-readiness same-composed-c-test c-passive-owner fresh-rtp fresh-rtp-test; do
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test replace-stop replace-stop-test c-readiness same-composed-c-test c-passive-owner fresh-rtp worker-fence worker-fence-test fresh-rtp-test; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
@@ -209,6 +209,7 @@ jobs:
           install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
           src/airplay_callback_owner --radio-primary-decode
           src/airplay_callback_owner --radio-primary-station-start
+          PC_PRIMARY_RADIO_DECODER_STALL=1 src/airplay_callback_owner --radio-primary-station-start
           sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_RADIO_STATION=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 src/airplay_callback_owner --radio-primary-disjoint-start

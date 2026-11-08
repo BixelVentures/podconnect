@@ -1,0 +1,145 @@
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -5318,6 +5318,7 @@
+  * consume or emit. The producer never touches the output registry or FIFO. */
+ #define PRIMARY_RADIO_PACKET_BYTES (AIRPLAY_SAMPLES_PER_PACKET * 4)
+ #define PRIMARY_RADIO_QUEUE_PACKETS 8
++#define PRIMARY_RADIO_MAX_WORKERS 2
+ #define PRIMARY_RADIO_PACKET_US 7982
+ #define PRIMARY_RADIO_START_LIMIT 32
+ #define PRIMARY_RADIO_START_SECONDS 8
+@@ -5338,6 +5339,9 @@
+ };
+ static struct primary_radio_station_operation primary_radio_station_operations[PRIMARY_RADIO_START_LIMIT];
+ static uint64_t primary_radio_station_generation;
++/* Only the player starts workers. A detached worker retains its place
++ * until its own transcode cleanup finishes. */
++static atomic_uint primary_radio_decoder_workers;
+ 
+ struct primary_radio_decode
+ {
+@@ -5348,6 +5352,7 @@
+   struct event *tick;
+   pthread_mutex_t mutex;
+   pthread_cond_t space;
++  struct timespec stop_deadline; /* Player-owned after exact revocation. */
+   atomic_bool cancelled;
+   atomic_uint refs;
+   bool done;
+@@ -5399,6 +5404,7 @@
+     {
+       struct primary_radio_station_operation *operation = decoder->operation;
+       operation->decoder = NULL;
++      decoder->operation = NULL;
+       if (operation->result.phase == OUTPUT_PRIMARY_RADIO_START_PENDING
+           || operation->result.phase == OUTPUT_PRIMARY_RADIO_START_DECODED
+           || operation->result.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED)
+@@ -5455,23 +5461,31 @@
+ 
+   if (stream) transcode_cleanup(&stream);
+   if (buffer) evbuffer_free(buffer);
++#ifdef PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE
++  PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE();
++#endif
+   pthread_mutex_lock(&decoder->mutex);
+   decoder->done = true;
+   pthread_mutex_unlock(&decoder->mutex);
+   primary_radio_decode_unref(decoder);
++  atomic_fetch_sub(&primary_radio_decoder_workers, 1);
+   return NULL;
+ }
+ 
+ static bool
+-primary_radio_station_before_deadline(const struct primary_radio_station_operation *operation)
++primary_radio_before_deadline(struct timespec deadline)
+ {
+   struct timespec now;
+-  return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+-      && (now.tv_sec < operation->deadline.tv_sec
+-          || (now.tv_sec == operation->deadline.tv_sec && now.tv_nsec < operation->deadline.tv_nsec));
++  return clock_gettime(CLOCK_MONOTONIC, &now) == 0 && timespec_cmp(now, deadline) < 0;
+ }
+ 
+ static bool
++primary_radio_station_before_deadline(const struct primary_radio_station_operation *operation)
++{
++  return primary_radio_before_deadline(operation->deadline);
++}
++
++static bool
+ primary_radio_station_current(const struct airplay_session *session)
+ {
+   const struct primary_radio_decode *decoder = session->primary_radio_decoder;
+@@ -5762,6 +5776,11 @@
+             session_failure(decoder->session);
+           return;
+         }
++      if (decoder->operation->result.phase == OUTPUT_PRIMARY_RADIO_START_REJECTED)
++        {
++          primary_radio_decoder_drop(decoder);
++          return;
++        }
+       pthread_mutex_lock(&decoder->mutex);
+       done = decoder->done;
+       bool has_frame = decoder->count > 0;
+@@ -5771,7 +5790,15 @@
+       return;
+     }
+ 
+-  if (decoder->operation && decoder->operation->result.phase == OUTPUT_PRIMARY_RADIO_START_PENDING
++  if (session->primary_radio_revoked && !primary_radio_before_deadline(decoder->stop_deadline))
++    {
++      /* Closing the local route cannot stand in for a drained decoder or
++       * an acknowledged receiver STOP. Keep its claimed SQLite row pending. */
++      session_failure(session);
++      return;
++    }
++  if (!session->primary_radio_revoked && decoder->operation
++      && decoder->operation->result.phase == OUTPUT_PRIMARY_RADIO_START_PENDING
+       && (!primary_radio_station_before_deadline(decoder->operation) || !primary_radio_binding_current(session)))
+     {
+       if (evtimer_add(decoder->tick, &next) < 0)
+@@ -5838,6 +5865,8 @@
+   struct timeval first = { 0, 0 };
+   pthread_attr_t attr;
+   pthread_t thread;
++  if (atomic_load(&primary_radio_decoder_workers) >= PRIMARY_RADIO_MAX_WORKERS)
++    return NULL;
+   struct primary_radio_decode *decoder = calloc(1, sizeof(*decoder));
+   if (!decoder)
+     return NULL;
+@@ -5864,10 +5893,12 @@
+       goto fail;
+     }
+   atomic_fetch_add(&decoder->refs, 1);
++  atomic_fetch_add(&primary_radio_decoder_workers, 1);
+   int status = pthread_create(&thread, &attr, primary_radio_decode_thread, decoder);
+   pthread_attr_destroy(&attr);
+   if (!status)
+     return decoder;
++  atomic_fetch_sub(&primary_radio_decoder_workers, 1);
+   primary_radio_decode_unref(decoder);
+ 
+  fail:
+@@ -6183,10 +6214,17 @@
+ static void
+ primary_radio_stop_after_decoder(struct airplay_session *session, const char *reason)
+ {
+-  if (session->primary_radio_decoder)
+-    primary_radio_decode_cancel(session->primary_radio_decoder);
+-  else
+-    sequence_start(AIRPLAY_SEQ_STOP, session, NULL, reason);
++  struct primary_radio_decode *decoder = session->primary_radio_decoder;
++  if (!decoder)
++    {
++      sequence_start(AIRPLAY_SEQ_STOP, session, NULL, reason);
++      return;
++    }
++  struct timespec deadline = { 0 };
++  if (clock_gettime(CLOCK_MONOTONIC, &deadline) == 0)
++    deadline.tv_sec += PRIMARY_RADIO_START_SECONDS;
++  decoder->stop_deadline = deadline;
++  primary_radio_decode_cancel(decoder);
+ }
+ 
+ static int

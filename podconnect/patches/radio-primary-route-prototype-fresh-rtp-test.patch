@@ -1,6 +1,6 @@
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
-@@ -1791,6 +1791,7 @@
+@@ -1806,6 +1806,7 @@
            usleep(1000);
          }
        assert(status.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && received > 0);
@@ -8,10 +8,11 @@
        assert(!strcmp(status.custody.operation, request.action) && !strcmp(status.custody.process, request.process)
            && status.custody.device_id == request.device_id && status.custody.incarnation == request.incarnation
            && status.custody.epoch == request.epoch + 1 && status.custody.route == request.route);
-@@ -1798,6 +1799,26 @@
-       assert(outputs_airplay_primary_station_start(&request, &status) == 0
-           && status.phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && radio.pc70_peer_sessions == 1);
- 
+@@ -1867,6 +1868,26 @@
+           puts("PASS bounded decoder STOP stays UNKNOWN without receiver TEARDOWN and counts both detached workers");
+           goto cleanup;
+         }
++
 +      /* Keep the live route and age only its observation. Retransmitting an
 +       * actual retained packet cannot replace a fresh producer send. */
 +      struct primary_radio_station_operation *playing = primary_radio_station_find(&request);
@@ -31,7 +32,6 @@
 +        }
 +      assert(fresh_packets > 0 && outputs_airplay_primary_station_readiness(&request, &status) == 0);
 +      puts("PASS passive readiness requires recent producer RTP; replaying an old RTP packet does not refresh it");
-+
+ 
        radio.require_decoder_drain = true;
        assert(outputs_airplay_primary_station_cancel(&request, &status) == 0
-           && status.phase == OUTPUT_PRIMARY_RADIO_START_UNKNOWN);

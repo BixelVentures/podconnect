@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strconv"
 	"time"
@@ -712,6 +713,18 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 		}
 	}
 	if stage == "" {
+		// A replacement may have refused STOP before any receiver effect.
+		// Recover only that exact terminal refusal, never a positive STOP
+		// followed by a speculative successor.
+		if r.Primary.IncumbentSession != nil && (command.Phase == "prepare_replace" || command.Phase == "stop") {
+			query := command
+			query.Phase, query.ForPhase = "result", command.Phase
+			receipt, err := p.primary.PrimaryCommand(ctx, query)
+			if err == nil && ctx.Err() == nil && query.matches(receipt) && receipt.Phase == "replacement_rejected" &&
+				receipt.Observation == nil && receipt.TeardownCSeq == 0 {
+				return p.primaryReconcileNoEffects(ctx, r, receipt)
+			}
+		}
 		return radioReconciliation{}, errRadioUnknown
 	}
 	if r.Terminal && r.Primary.Session != nil {
@@ -742,6 +755,23 @@ func (p *radioProducer) primaryReconcile(ctx context.Context, f radioFence) (rad
 	}
 	return radioReconciliation{ActionID: f.ActionID, Generation: f.Generation, Token: r.Fence.Token,
 		Terminal: true, Outcome: "committed", Observation: r.Observation}, nil
+}
+
+func (p *radioProducer) primaryReconcileNoEffects(ctx context.Context, r radioProducerRecord, receipt radioPrimaryReceipt) (radioReconciliation, error) {
+	observation, err := p.primaryObserve(ctx)
+	if err != nil || observation.SourceKind != "radio" || observation.State != "playing" {
+		return radioReconciliation{}, errRadioUnknown
+	}
+	if !r.Terminal {
+		var rejected *radioProducerNoReceiverEffects
+		if err = p.primaryRejectNoEffects(r, receipt); !errors.As(err, &rejected) {
+			return radioReconciliation{}, errRadioUnknown
+		}
+	} else if r.Outcome != "rejected" {
+		return radioReconciliation{}, errRadioUnknown
+	}
+	return radioReconciliation{ActionID: r.Fence.ActionID, Generation: r.Fence.Generation, Token: r.Fence.Token,
+		Terminal: true, Outcome: "rejected", Observation: observation}, nil
 }
 
 func (p *radioProducer) primaryReconcileStarted(ctx context.Context, r radioProducerRecord) (radioReconciliation, error) {
