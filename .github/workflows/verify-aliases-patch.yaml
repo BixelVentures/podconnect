@@ -233,6 +233,16 @@ jobs:
           src/airplay_callback_owner --radio-primary-output-wire
           src/airplay_callback_owner --radio-primary-preempt
           src/airplay_callback_owner --radio-primary-custody
+          git apply "$patch_dir/radio-primary-route-prototype-disjoint-test.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          result=0
+          PC_PRIMARY_RADIO_DISJOINT=red src/airplay_callback_owner --radio-primary-disjoint-start > /tmp/radio-primary-disjoint-red.log 2>&1 || result=$?
+          cat /tmp/radio-primary-disjoint-red.log
+          test "$result" = 1
+          grep -Fx "RADIO_PRIMARY_START_RED: managed Spotify START retired disjoint radio receiver B" /tmp/radio-primary-disjoint-red.log
+          git apply "$patch_dir/radio-primary-route-prototype-disjoint-engine.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          PC_PRIMARY_RADIO_DISJOINT=green src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
