@@ -53,37 +53,18 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
-            git apply "$patch_dir/dealer-fieldcodes-native.patch"
-            sed "s@ /patches/@ $patch_dir/@" "$patch_dir/radio-handoff-native.sha256" | sha256sum -c -
-            git apply "$patch_dir/radio-handoff-native.patch"
-          fi
+          git apply --check "$patch_dir/dealer-fieldcodes-native.patch"
+          git apply "$patch_dir/dealer-fieldcodes-native.patch"
+          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/radio-handoff-native.sha256" | sha256sum -c -
+          git apply --check "$patch_dir/radio-handoff-native.patch"
+          git apply "$patch_dir/radio-handoff-native.patch"
+          git apply --check "$patch_dir/queue-occurrence-continuity-native.patch"
           git apply "$patch_dir/queue-occurrence-continuity-native.patch"
-          if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
-            git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-station-native.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-park.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-park-fences.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-return.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-generation.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-replacement.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-readiness.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-observation.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-parked-followup.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-same-composed-native-test.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-manager-composed-native-test.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-stop-restart-test.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-native-new-selection-test.patch"
-            git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-native-test.patch"
-          fi
-      - name: Test exact primary radio Native preempt action and receipt
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
-        run: |
-          (cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadio')
-          (cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1)
+          git apply --check "$patch_dir/radio-primary-native.patch"
+          git apply "$patch_dir/radio-primary-native.patch"
+      - name: Test Manager radio and playback revision contracts
+        run: cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1
       - name: Test Native queue, transport, output and retained packages
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
       - name: Build existing daemon-test artifact for composed fixture
         run: cd /tmp/gl && go test -race -c -o /tmp/native-tests ./daemon
@@ -94,20 +75,16 @@ jobs:
           if-no-files-found: error
           retention-days: 3
       - name: Build configured Manager test for the composed radio fixture
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         run: cd podconnect/manager && go test -race -c -o /tmp/primary-manager-tests .
       - uses: actions/upload-artifact@v4
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         with:
           name: primary-manager-tests
           path: /tmp/primary-manager-tests
           if-no-files-found: error
           retention-days: 3
       - name: Build patched fork
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
       - name: Smoke-check binary
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
@@ -202,45 +179,12 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-      - name: Compare same-format radio source routing against the actual OwnTone encoder
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
-        run: |
-          set -Eeuo pipefail
-          cd /tmp/owntone
-          patch_dir="$GITHUB_WORKSPACE/podconnect/patches"
-          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone; do
+          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
+            git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"
           done
-          # Earlier branch runs keep the causal before/after proofs for the
-          # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate activate-fence return-route return-test return-wire return-barrier return-barrier-test return-barrier-wire composed-c-test station-lifecycle station-lifecycle-test replace replace-test replace-stop replace-stop-test c-readiness same-composed-c-test c-passive-owner fresh-rtp worker-fence worker-fence-test fresh-rtp-test stopped-replace stopped-replace-test; do
-            git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
-          done
-          git apply "$patch_dir/radio-primary-route-prototype-manager-composed-c-test.patch"
-          git apply "$patch_dir/radio-primary-route-prototype-c-stop-restart-test.patch"
-          git apply "$patch_dir/radio-primary-route-prototype-c-new-selection-test.patch"
-          git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-auth.patch"
-          git apply "$patch_dir/radio-primary-route-prototype-spotify-successor-auth-test.patch"
-          autoreconf -fi
-          ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
-          make -j"$(nproc)"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
-          src/airplay_callback_owner --radio-primary-decode
-          src/airplay_callback_owner --radio-primary-station-start
-          PC_PRIMARY_RADIO_DECODER_STALL=1 src/airplay_callback_owner --radio-primary-station-start
-          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_RADIO_STATION=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - name: Compile and run actual queue C owner modes
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
           set -Eeuo pipefail
           cd /tmp/owntone
@@ -287,19 +231,24 @@ jobs:
           sudo -n src/airplay_callback_owner --start-retire-closed-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire
+      - name: Verify primary radio using the actual OwnTone owner and encoder
+        working-directory: /tmp/owntone
+        run: |
+          set -Eeuo pipefail
+          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
+          src/airplay_callback_owner --radio-primary-decode
+          src/airplay_callback_owner --radio-primary-station-start
+          PC_PRIMARY_RADIO_DECODER_STALL=1 src/airplay_callback_owner --radio-primary-station-start
+          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_RADIO_STATION=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
+          sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - uses: actions/upload-artifact@v4
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
-        with:
-          name: selected-c-callback
-          path: |
-            /tmp/owntone/src/airplay_callback_owner
-            /tmp/owntone/sqlext/.libs/owntone-sqlext.so
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 3
-
-      - uses: actions/upload-artifact@v4
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         with:
           name: selected-c-callback
           path: |
@@ -333,12 +282,10 @@ jobs:
           name: selected-native-tests
           path: /tmp/owntone
       - uses: actions/download-artifact@v4
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         with:
           name: primary-manager-tests
           path: /tmp/owntone
       - name: Verify exact primary Native actor through production OwnTone HTTP
-        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone
         run: |
           set -Eeuo pipefail
@@ -353,7 +300,6 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-manager || status=1
           exit "$status"
       - name: Verify held fresh START and explicit late paused Resume against actual C
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone
         run: |
           set -Eeuo pipefail

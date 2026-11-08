@@ -48,3 +48,4 @@ e19c26159cf722cc41515e30c950257e3f51bab25c24d7a0cbf4cd7d8ea7d10c  /patches/block
 63996e7c2a3ddcdf4208674b543be4774a42cb29a9adb2a822a1cc881358b55e  /patches/queue-metadata-background-native.patch
 a15b9c18b2e38a617e1cc9af2ec28b62bb818c25d94985cb50bf9729c0d930b0  /patches/dealer-fieldcodes-native.patch
 68769882dd15ebf873cccff3c354baa4062ed762ffd16625d61e018b094cade7  /patches/queue-occurrence-continuity-native.patch
+3d76da61e83addf37c1366344127d630108430165d2ce1106421e693b0cb7be9  /patches/radio-primary-native.patch

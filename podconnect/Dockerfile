@@ -126,6 +126,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/radio-handoff-native.patch \
   && git apply --check /patches/queue-occurrence-continuity-native.patch \
   && git apply /patches/queue-occurrence-continuity-native.patch \
+  && git apply --check /patches/radio-primary-native.patch \
+  && git apply /patches/radio-primary-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -149,6 +151,8 @@ COPY patches/radio-handoff-owntone.patch /patches/radio-handoff-owntone.patch
 COPY patches/radio-handoff-owntone.sha256 /patches/radio-handoff-owntone.sha256
 COPY patches/start-journal-diagnostics-owntone.patch /patches/start-journal-diagnostics-owntone.patch
 COPY patches/start-journal-diagnostics-owntone.sha256 /patches/start-journal-diagnostics-owntone.sha256
+COPY patches/radio-primary-owntone.patch /patches/radio-primary-owntone.patch
+COPY patches/radio-primary-owntone.sha256 /patches/radio-primary-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -310,6 +314,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/start-journal-diagnostics-owntone.sha256 \
   && git apply --check /patches/start-journal-diagnostics-owntone.patch \
   && git apply /patches/start-journal-diagnostics-owntone.patch \
+  && sha256sum -c /patches/radio-primary-owntone.sha256 \
+  && git apply --check /patches/radio-primary-owntone.patch \
+  && git apply /patches/radio-primary-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
