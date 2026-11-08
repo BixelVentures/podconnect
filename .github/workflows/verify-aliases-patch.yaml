@@ -20,6 +20,7 @@ on:
 # ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
+    if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -160,7 +161,31 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
+      - name: Compare same-format radio source routing against the actual OwnTone encoder
+        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
+        run: |
+          set -Eeuo pipefail
+          cd /tmp/owntone
+          patch_dir="$GITHUB_WORKSPACE/podconnect/patches"
+          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone; do
+            sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
+            git apply "$patch_dir/$patch.patch"
+          done
+          git apply "$patch_dir/radio-primary-route-prototype-test.patch"
+          autoreconf -fi
+          ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
+          make -j"$(nproc)"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          result=0
+          src/airplay_callback_owner --radio-primary-output-route >/tmp/radio-primary-output-route-red.log 2>&1 || result=$?
+          cat /tmp/radio-primary-output-route-red.log
+          test "$result" = 1
+          grep -Fx 'RADIO_PRIMARY_ROUTE_RED: same-format radio B shares Spotify A ALAC/RTP master' /tmp/radio-primary-output-route-red.log
+          git apply "$patch_dir/radio-primary-route-prototype-engine.patch"
+          make -C src -j"$(nproc)" airplay_callback_owner
+          src/airplay_callback_owner --radio-primary-output-route
       - name: Compile and run actual queue C owner modes
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: |
           set -Eeuo pipefail
           cd /tmp/owntone
@@ -208,6 +233,7 @@ jobs:
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire
       - uses: actions/upload-artifact@v4
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         with:
           name: selected-c-callback
           path: |

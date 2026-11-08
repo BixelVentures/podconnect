@@ -1,0 +1,97 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -1364,6 +1364,86 @@
+ #include "radio_http_owner.inc.c"
+ #include "start_streaming_owner.inc.c"
+ 
++// Test adapter maps both source requests to the existing quality-only path.
++static struct airplay_master_session *
++radio_primary_test_master(struct media_quality *quality, struct airplay_session *route)
++{
++  (void)route;
++  return master_session_make(quality, false);
++}
++
++static void
++radio_primary_test_write(struct output_buffer *obuf, struct airplay_session *route)
++{
++  (void)route;
++  airplay_write(obuf);
++}
++
++
++static int
++radio_primary_output_route_case(void)
++{
++  struct media_quality quality = { .sample_rate = 44100, .bits_per_sample = 16, .channels = 2 };
++  struct airplay_session radio_route = { 0 };
++  struct airplay_master_session *spotify, *radio;
++  struct output_buffer spotify_pcm = { 0 }, radio_pcm = { 0 };
++  uint8_t spotify_samples[AIRPLAY_SAMPLES_PER_PACKET * 4] = { 0 };
++  uint8_t radio_samples[AIRPLAY_SAMPLES_PER_PACKET * 4];
++  uint16_t spotify_seq, radio_seq;
++  struct rtp_packet *spotify_packet, *radio_packet;
++
++  memset(radio_samples, 0x19, sizeof(radio_samples));
++  outputs_buffer_duration_ms = AIRPLAY_AUDIO_LATENCY_MS + 1000;
++  spotify = master_session_make(&quality, false);
++  assert(spotify);
++  spotify_pcm.data[0] = (struct output_data) {
++    .quality = quality, .buffer = spotify_samples,
++    .bufsize = sizeof(spotify_samples), .samples = AIRPLAY_SAMPLES_PER_PACKET,
++  };
++  radio_pcm.data[0] = (struct output_data) {
++    .quality = quality, .buffer = radio_samples,
++    .bufsize = sizeof(radio_samples), .samples = AIRPLAY_SAMPLES_PER_PACKET,
++  };
++  spotify_seq = spotify->rtp_session->seqnum;
++  airplay_write(&spotify_pcm);
++  assert(spotify->packet_serial == 1);
++
++  // Try to attach radio B while the ordinary Spotify A pipeline is already live.
++  radio = radio_primary_test_master(&quality, &radio_route);
++  assert(radio);
++  if (radio == spotify)
++    {
++      fprintf(stderr, "RADIO_PRIMARY_ROUTE_RED: same-format radio B shares Spotify A ALAC/RTP master\n");
++      master_session_cleanup(spotify);
++      return 1;
++    }
++  assert(radio->packet_serial == 0);
++  radio_seq = radio->rtp_session->seqnum;
++  airplay_write(&spotify_pcm);
++  assert(spotify->packet_serial == 2 && radio->packet_serial == 0);
++
++  radio_primary_test_write(&radio_pcm, &radio_route);
++  assert(spotify->packet_serial == 2 && radio->packet_serial == 1);
++  spotify_packet = rtp_packet_get(spotify->rtp_session, spotify_seq);
++  radio_packet = rtp_packet_get(radio->rtp_session, radio_seq);
++  assert(spotify_packet && radio_packet && spotify_packet != radio_packet);
++  assert(spotify_packet->payload_len != radio_packet->payload_len
++      || memcmp(spotify_packet->payload, radio_packet->payload, spotify_packet->payload_len) != 0);
++
++  // Retire only B's pipeline. The old source key must not encode or fall back to A.
++  master_session_cleanup(radio);
++  radio_primary_test_write(&radio_pcm, &radio_route);
++  assert(spotify->packet_serial == 2);
++  airplay_write(&spotify_pcm);
++  assert(spotify->packet_serial == 3);
++  assert(spotify->rtp_session->seqnum == (uint16_t)(spotify_seq + 3));
++  master_session_cleanup(spotify);
++  assert(!airplay_master_sessions);
++
++  puts("PASS actual same-format ALAC/RTP source partition and exact B master retirement");
++  return 0;
++}
++
+ int main(int argc, char **argv)
+ {
+   int mode;
+@@ -1372,6 +1452,7 @@
+   gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
+   if (argc == 3 && (!strcmp(argv[1], "--pc70-recover-fenced") || !strcmp(argv[1], "--pc70-recover-terminal")))
+     return manual_release_recover_process_case(argv[2], !strcmp(argv[1], "--pc70-recover-fenced"));
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-route")) return radio_primary_output_route_case();
+   if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
+     { for(int mode=0;mode<7;mode++) if(recovery_wire_case(mode))return 1; return 0; }
