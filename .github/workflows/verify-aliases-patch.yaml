@@ -63,6 +63,7 @@ jobs:
             git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
             git apply "$patch_dir/radio-primary-route-prototype-station-native.patch"
             git apply "$patch_dir/radio-primary-route-prototype-native-park.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-native-park-fences.patch"
             git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
