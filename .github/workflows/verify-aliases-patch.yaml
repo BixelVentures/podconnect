@@ -171,69 +171,14 @@ jobs:
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply "$patch_dir/$patch.patch"
           done
-          git apply "$patch_dir/radio-primary-route-prototype-test.patch"
+          # The preceding layers have their own recorded RED/GREEN runs.
+          # Apply the tested bytes and compile the new disjoint transition only.
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test; do
+            git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
+          done
           autoreconf -fi
           ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --disable-install_systemd --disable-install_user
           make -j"$(nproc)"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          src/airplay_callback_owner --radio-primary-output-route >/tmp/radio-primary-output-route-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-output-route-red.log
-          test "$result" = 1
-          grep -Fx 'RADIO_PRIMARY_ROUTE_RED: same-format radio B shares Spotify A ALAC/RTP master' /tmp/radio-primary-output-route-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-output-route
-          git apply "$patch_dir/radio-primary-route-prototype-wire-test.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          src/airplay_callback_owner --radio-primary-output-wire >/tmp/radio-primary-output-wire-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-output-wire-red.log
-          test "$result" = 1
-          grep -Fx "RADIO_PRIMARY_WIRE_RED: actual B receiver got A's audio on the same-format fan-out" /tmp/radio-primary-output-wire-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-wire-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-output-wire
-          git apply "$patch_dir/radio-primary-route-prototype-ingress-test.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          src/airplay_callback_owner --radio-primary-ingress-red > /tmp/radio-primary-ingress-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-ingress-red.log
-          test "$result" = 1
-          grep -Fx "RADIO_PRIMARY_INGRESS_RED: unauthenticated shared datagram reached B's ring" /tmp/radio-primary-ingress-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-ingress-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-output-wire
-          git apply "$patch_dir/radio-primary-route-prototype-preempt-test.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          src/airplay_callback_owner --radio-primary-preempt-red > /tmp/radio-primary-preempt-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-preempt-red.log
-          test "$result" = 1
-          grep -Fx "RADIO_PRIMARY_PREEMPT_RED: ordinary START reported existing radio session as running" /tmp/radio-primary-preempt-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-preempt-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-preempt
-          src/airplay_callback_owner --radio-primary-preempt-unknown
-          git apply "$patch_dir/radio-primary-route-prototype-edge-fences.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-output-wire
-          src/airplay_callback_owner --radio-primary-preempt
-          src/airplay_callback_owner --radio-primary-preempt-unknown
-          src/airplay_callback_owner --radio-primary-remove
-          git apply "$patch_dir/radio-primary-route-prototype-custody-test.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          result=0
-          src/airplay_callback_owner --radio-primary-custody-red > /tmp/radio-primary-custody-red.log 2>&1 || result=$?
-          cat /tmp/radio-primary-custody-red.log
-          test "$result" = 1
-          grep -Fx "RADIO_PRIMARY_CUSTODY_RED: rediscovered target admitted Spotify after unknown radio drain" /tmp/radio-primary-custody-red.log
-          git apply "$patch_dir/radio-primary-route-prototype-custody-engine.patch"
-          make -C src -j"$(nproc)" airplay_callback_owner
-          src/airplay_callback_owner --radio-primary-output-wire
-          src/airplay_callback_owner --radio-primary-preempt
-          src/airplay_callback_owner --radio-primary-custody
-          git apply "$patch_dir/radio-primary-route-prototype-disjoint-test.patch"
           make -C src -j"$(nproc)" airplay_callback_owner
           result=0
           PC_PRIMARY_RADIO_DISJOINT=red src/airplay_callback_owner --radio-primary-disjoint-start > /tmp/radio-primary-disjoint-red.log 2>&1 || result=$?
