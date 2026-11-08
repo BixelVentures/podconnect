@@ -1,3 +1,7 @@
+## Speakers 0.26.69 — explain radio startup readiness
+
+- Log only changed, sanitized native readiness results during radio startup. This diagnoses missing controller or receiver readiness without changing playback, permissions or retry timing; it does not itself fix unavailable radio.
+
 ## Speakers 0.26.68 — retain exact surviving queue occurrences
 
 - Preserve the identities of the exact queue rows that survive a successful native queue selection, including identical song duplicates. Every later selection still requires a fresh observation and current owner, output and admission checks.

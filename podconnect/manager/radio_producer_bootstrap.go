@@ -500,8 +500,37 @@ func waitRadioPassiveReadiness(ctx context.Context, probe func(context.Context) 
 	}
 }
 
+// The Native payload is private. Only protocol-owned codes may reach startup logs.
+func radioBootstrapMissingProofs(proofs []string) []string {
+	seen := make(map[string]bool)
+	for _, proof := range proofs {
+		switch proof {
+		case "actual_registered_radio_controller_binding", "conflicting_c_controller_identity",
+			"fresh_receiver_source_proof", "fresh_explicit_intent_reacquire_ticket",
+			"global_clean_absence_without_spotify_writer", "linux_native_process_identity",
+			"radio_handoff_configuration":
+		default:
+			proof = "other"
+		}
+		seen[proof] = true
+	}
+	codes := make([]string, 0, len(seen))
+	for code := range seen {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
 func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause radioReadinessPause) (*radioProducerNativeClient, error) {
 	var readyClient *radioProducerNativeClient
+	lastReadiness := ""
+	report := func(readiness string) {
+		if readiness != lastReadiness {
+			lastReadiness = readiness
+			log.Printf("radio: bootstrap phase=native_wait %s", readiness)
+		}
+	}
 	err := waitRadioPassiveReadiness(ctx, func(readCtx context.Context) (bool, bool, error) {
 		// Pre-bootstrap reads carry no admitted source/operation. A fresh client
 		// allows a cold Native process to be replaced before the ONE preparation
@@ -511,14 +540,31 @@ func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause ra
 			return false, false, err
 		}
 		evidence, err := n.Evidence(readCtx)
-		available := false
-		for _, target := range evidence.Targets {
-			available = available || target.Selectable && target.Availability == "available"
+		if err != nil {
+			report("result=read_failed")
+			return false, true, err
 		}
+		available := 0
+		for _, target := range evidence.Targets {
+			if target.Selectable && target.Availability == "available" {
+				available++
+			}
+		}
+		ready := len(evidence.Missing) == 0 && available > 0
+		result := "waiting"
+		if ready {
+			result = "ready"
+		}
+		n.mu.Lock()
+		controllerRegistered := producerControllerID(n.state.ControllerID)
+		n.mu.Unlock()
+		report(fmt.Sprintf("result=%s controller_registered=%t configured_targets=%d selectable_available=%d missing_proofs=[%s]",
+			result, controllerRegistered, len(evidence.Targets), available,
+			strings.Join(radioBootstrapMissingProofs(evidence.Missing), ",")))
 		// Held-only/controller metadata is not fresh initial acquisition
 		// readiness. Keep reading until an actual source/absence path is offered
 		// rather than consuming the one preparation attempt prematurely.
-		if err == nil && len(evidence.Missing) == 0 && available {
+		if ready {
 			readyClient = n
 			return true, false, nil
 		}
