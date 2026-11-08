@@ -1,3 +1,7 @@
+## Speakers 0.26.70 — distinguish Native radio capability failures
+
+- When Native checks the existing radio capability of configured speakers, log only changed aggregate counts for failed custody, unavailable or rejected HTTP probes, invalid identity, missing signing or pairing, and accepted capability replies. This locates the remaining startup blocker without changing readiness, playback, or authority.
+
 ## Speakers 0.26.69 — explain radio startup readiness
 
 - Log only changed, sanitized native readiness results during radio startup. This diagnoses missing controller or receiver readiness without changing playback, permissions or retry timing; it does not itself fix unavailable radio.
