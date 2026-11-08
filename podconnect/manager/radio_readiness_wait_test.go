@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -139,5 +142,69 @@ func TestRadioNativeBootstrapWaitsForActualTargetBeyondHeldControllerMetadata(t 
 	client, err := awaitRadioNativeBootstrap(context.Background(), server.URL, "control-token", func(context.Context, time.Duration) error { pauses++; return nil })
 	if err != nil || client == nil || reads.Load() != 5 || pauses != 4 {
 		t.Fatal("held-only metadata consumed initial preparation", err, reads.Load(), pauses)
+	}
+}
+
+func TestRadioNativeBootstrapLogsOnlyChangedClosedReadiness(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	state := producerNativeStateFixture()
+	state.ControllerID = ""
+	state.Targets[0].ID = "fixture-private-target-id"
+	state.Targets[0].Selectable = false
+	state.Targets[0].Availability = "unknown"
+	var reads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/radio/handoff/state" {
+			t.Error("bootstrap made a request other than the passive Native read")
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		reply := state
+		switch reads.Add(1) {
+		case 1, 2:
+			http.Error(w, "fixture-private-upstream-body", http.StatusServiceUnavailable)
+			return
+		case 3:
+			reply.Missing = []string{"fresh_receiver_source_proof", "fixture-private-proof"}
+		case 4:
+			reply.Missing = []string{"different-private-proof", "fresh_receiver_source_proof", "fresh_receiver_source_proof"}
+		default:
+			reply.ControllerID = "AABBCCDDEEFF0011"
+			reply.Targets[0].Selectable = true
+			reply.Targets[0].Availability = "available"
+			reply.Missing = nil
+		}
+		json.NewEncoder(w).Encode(reply)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := awaitRadioNativeBootstrap(ctx, server.URL, "fixture-private-token", func(context.Context, time.Duration) error { return nil })
+	if err != nil || client == nil || reads.Load() != 5 {
+		t.Fatal("diagnostics changed passive bootstrap", err, reads.Load())
+	}
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	expected := []string{
+		"result=read_failed",
+		"result=waiting controller_registered=false configured_targets=1 selectable_available=0 missing_proofs=[actual_registered_radio_controller_binding,fresh_receiver_source_proof,other]",
+		"result=ready controller_registered=true configured_targets=1 selectable_available=1 missing_proofs=[]",
+	}
+	if len(lines) != len(expected) {
+		t.Fatal("unchanged readiness logged again")
+	}
+	for i, want := range expected {
+		if !strings.HasSuffix(lines[i], "radio: bootstrap phase=native_wait "+want) {
+			t.Fatal("unexpected or unbounded readiness fields at entry", i)
+		}
+	}
+	for _, private := range []string{"fixture-private", "different-private", "AABBCCDDEEFF0011", server.URL, state.ProcessID} {
+		if strings.Contains(logs.String(), private) {
+			t.Fatal("private Native data escaped to readiness logs")
+		}
 	}
 }
