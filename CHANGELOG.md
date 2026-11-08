@@ -1,3 +1,10 @@
+## Speakers 0.26.73 — radio through the existing speaker owner
+
+- Play radio through the existing primary speaker route, preserving the Spotify session and queue. Change stations, stop and start radio again, or explicitly return to Spotify with Resume or a new selection.
+- Keep the active speaker selectable when another configured speaker is unavailable. Require a fresh matching owner before enabling radio; recover exact no-effect refusals without resending a playback command.
+- Preserve unknown outcomes across restart and keep legacy sender authorization unchanged. Existing radio configuration and physical-acceptance requirements remain in place.
+- The composed Manager, Native and OwnTone tests use authenticated simulated receivers. Publication does not imply installation or physical audio acceptance.
+
 ## Speakers 0.26.72 — report current native playback revisions
 
 - Let Control wait for track changes, pause, resume and seek on the current native output through the existing Speakers state read. The hint carries only a revision.
