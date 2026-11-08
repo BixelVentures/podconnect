@@ -49,6 +49,7 @@ type radioPrimaryReceipt struct {
 }
 
 type radioPrimaryState struct {
+	Protocol        string                  `json:"protocol,omitempty"`
 	Schema          string                  `json:"schema"`
 	Process         string                  `json:"process_id"`
 	Revision        string                  `json:"native_revision"`
@@ -72,10 +73,21 @@ type radioPrimaryBackend struct {
 	replacement bool // Negotiated by Ready and protected by radioProducer.mu.
 }
 
-func (n *radioProducerNativeClient) PrimaryState(ctx context.Context) (radioPrimaryState, error) {
+func (n *radioProducerNativeClient) primaryProtocolState(ctx context.Context) (radioPrimaryState, error) {
 	var state radioPrimaryState
 	err := n.http.call(ctx, "/radio/primary", nil, &state)
 	return state, err
+}
+
+func (n *radioProducerNativeClient) PrimaryState(ctx context.Context) (radioPrimaryState, error) {
+	state, err := n.primaryProtocolState(ctx)
+	if err != nil {
+		return state, err
+	}
+	if state.Protocol != primaryRadioProtocol {
+		return radioPrimaryState{}, errRadioUnavailable
+	}
+	return state, nil
 }
 
 func (n *radioProducerNativeClient) PrimaryCommand(ctx context.Context, q radioPrimaryCommand) (radioPrimaryReceipt, error) {
@@ -139,6 +151,9 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	if len(state.Missing) != 0 {
 		return nil, state.Missing, errRadioUnavailable
 	}
+	if n, ok := p.primary.(*radioProducerNativeClient); ok && n.primaryBootstrapProcess != "" && !primaryBootstrapStateReady(state) {
+		return nil, nil, errRadioUnavailable
+	}
 	if state.Observation == nil || !validRadioObservation(*state.Observation) {
 		return nil, nil, errRadioUnavailable
 	}
@@ -178,6 +193,7 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 		}
 	}
 	p.evidence.NativeProcess = state.Process
+	p.evidence.Targets = append([]radioTarget(nil), targets...)
 	p.primary.(*radioPrimaryBackend).replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
 	return targets, nil, nil
 }

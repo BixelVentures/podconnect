@@ -76,7 +76,7 @@ jobs:
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
         run: |
           (cd /tmp/gl && go test ./daemon -run '^TestPrimaryRadio')
-          (cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision)' -count=1)
+          (cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1)
       - name: Test Native queue, transport, output and retained packages
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis

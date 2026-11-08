@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -98,27 +99,36 @@ func (p *radioProducerHTTP) call(ctx context.Context, path string, args any, out
 	}
 	defer response.Body.Close()
 	// A peer's explicit conflict is not inferred from network/timeout errors.
+	primaryRead := method == http.MethodGet && path == "/radio/primary"
+	if primaryRead && response.StatusCode == http.StatusNotFound {
+		return errRadioPrimaryUnsupported
+	}
 	if response.StatusCode != 200 {
 		return errRadioUnknown
 	}
+	invalid := errRadioUnknown
+	if primaryRead {
+		invalid = errors.Join(invalid, errRadioPrimaryAdvertised)
+	}
 	raw, e := io.ReadAll(io.LimitReader(response.Body, 65537))
 	if e != nil || len(raw) > 65536 {
-		return errRadioUnknown
+		return invalid
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(out) != nil || decoder.Decode(new(any)) != io.EOF {
-		return errRadioUnknown
+		return invalid
 	}
 	return nil
 }
 
 type radioProducerNativeClient struct {
-	http        *radioProducerHTTP
-	mu          sync.Mutex
-	state       radioProducerNativeState
-	holds       map[string]radioProducerNativeReply
-	established map[string]radioProducerNativeReply
+	http                    *radioProducerHTTP
+	mu                      sync.Mutex
+	state                   radioProducerNativeState
+	holds                   map[string]radioProducerNativeReply
+	established             map[string]radioProducerNativeReply
+	primaryBootstrapProcess string
 }
 
 func newRadioProducerNativeClient(base, token string) (*radioProducerNativeClient, error) {

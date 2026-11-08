@@ -73,7 +73,7 @@ func readRadioProducerBootstrapOptions() (radioProducerBootstrapOptions, error) 
 	if json.Unmarshal(raw, &o) != nil {
 		return o, errRadioUnavailable
 	}
-	if !o.Enabled || o.Mode != "builtin" || !o.Physical || len(o.NativeToken) < 32 || len(o.NativeToken) > 256 || !producerHex(o.NativeToken, len(o.NativeToken)) || !producerHex(o.Secret, 64) || len(o.AdminPassword) < 32 || len(o.AdminPassword) > 256 || !producerHex(o.AdminPassword, len(o.AdminPassword)) || o.Cgroup == "" {
+	if !o.Enabled || o.Mode != "builtin" || !o.Physical || len(o.NativeToken) < 32 || len(o.NativeToken) > 256 || !producerHex(o.NativeToken, len(o.NativeToken)) {
 		return o, errRadioUnavailable
 	}
 	// The radio child's permanent uid must not be able to read the Native
@@ -264,7 +264,9 @@ func runRadioBootstrapCommand(ctx context.Context, parent string, args []string,
 }
 func prepareConfiguredRadioProducer(ctx context.Context, o radioProducerBootstrapOptions, n *radioProducerNativeClient) (*radioProducer, error) {
 	worker := o.Containment == "worker"
-	if !o.Enabled || o.Mode != "builtin" || !o.Physical && !worker {
+	if !o.Enabled || o.Mode != "builtin" || !o.Physical && !worker ||
+		!producerHex(o.Secret, 64) || len(o.AdminPassword) < 32 || len(o.AdminPassword) > 256 ||
+		!producerHex(o.AdminPassword, len(o.AdminPassword)) || !worker && o.Cgroup == "" {
 		return nil, errRadioUnavailable
 	}
 	evidence, e := n.Evidence(ctx)
@@ -435,11 +437,19 @@ func startConfiguredRadioBuiltin(ctx context.Context, c *radioCoordinator) {
 		// Before preparation there is no sender, lease or effect to replay. Slow
 		// startup/offline receivers therefore keep receiving bounded passive
 		// reads instead of requiring a restart of the Spotify manager.
-		n, err := awaitRadioNativeBootstrap(ctx, o.NativeURL, o.NativeToken, radioReadinessSleep)
+		n, primary, err := awaitConfiguredRadioBootstrap(ctx, o, radioReadinessSleep)
 		if err != nil {
 			return
 		}
-		producer, err := prepareConfiguredRadioProducer(ctx, o, n)
+		var producer *radioProducer
+		if primary {
+			producer, err = newPrimaryRadioProducer(n, filepath.Join(dataDir, "radio-owner-journal"))
+			if err == nil {
+				producer.evidence.NativeProcess = n.primaryBootstrapProcess
+			}
+		} else {
+			producer, err = prepareConfiguredRadioProducer(ctx, o, n)
+		}
 		if err != nil {
 			c.mu.Lock()
 			c.state.Error = "Built-in radio bootstrap unavailable"
@@ -528,8 +538,7 @@ func radioBootstrapMissingProofs(proofs []string) []string {
 	return codes
 }
 
-func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause radioReadinessPause) (*radioProducerNativeClient, error) {
-	var readyClient *radioProducerNativeClient
+func radioLegacyBootstrapProbe() func(context.Context, *radioProducerNativeClient, string) (bool, error) {
 	lastReadiness := ""
 	report := func(readiness string) {
 		if readiness != lastReadiness {
@@ -537,18 +546,11 @@ func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause ra
 			log.Printf("radio: bootstrap phase=native_wait %s", readiness)
 		}
 	}
-	err := waitRadioPassiveReadiness(ctx, func(readCtx context.Context) (bool, bool, error) {
-		// Pre-bootstrap reads carry no admitted source/operation. A fresh client
-		// allows a cold Native process to be replaced before the ONE preparation
-		// attempt. Once returned, its normal immutable process checks apply.
-		n, err := newRadioProducerNativeClient(base, token)
-		if err != nil {
-			return false, false, err
-		}
-		evidence, err := n.Evidence(readCtx)
+	return func(ctx context.Context, n *radioProducerNativeClient, expectedProcess string) (bool, error) {
+		evidence, err := n.Evidence(ctx)
 		if err != nil {
 			report("result=read_failed")
-			return false, true, err
+			return false, err
 		}
 		available := 0
 		for _, target := range evidence.Targets {
@@ -556,7 +558,8 @@ func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause ra
 				available++
 			}
 		}
-		ready := len(evidence.Missing) == 0 && available > 0
+		ready := len(evidence.Missing) == 0 && available > 0 &&
+			(expectedProcess == "" || evidence.NativeProcess == expectedProcess)
 		result := "waiting"
 		if ready {
 			result = "ready"
@@ -567,14 +570,23 @@ func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause ra
 		report(fmt.Sprintf("result=%s controller_registered=%t configured_targets=%d selectable_available=%d missing_proofs=[%s]",
 			result, controllerRegistered, len(evidence.Targets), available,
 			strings.Join(radioBootstrapMissingProofs(evidence.Missing), ",")))
-		// Held-only/controller metadata is not fresh initial acquisition
-		// readiness. Keep reading until an actual source/absence path is offered
-		// rather than consuming the one preparation attempt prematurely.
+		return ready, nil
+	}
+}
+
+func awaitRadioNativeBootstrap(ctx context.Context, base, token string, pause radioReadinessPause) (*radioProducerNativeClient, error) {
+	var readyClient *radioProducerNativeClient
+	probe := radioLegacyBootstrapProbe()
+	err := waitRadioPassiveReadiness(ctx, func(readCtx context.Context) (bool, bool, error) {
+		n, err := newRadioProducerNativeClient(base, token)
+		if err != nil {
+			return false, false, err
+		}
+		ready, err := probe(readCtx, n, "")
 		if ready {
 			readyClient = n
-			return true, false, nil
 		}
-		return false, true, err
+		return ready, !ready, err
 	}, pause)
 	return readyClient, err
 }
