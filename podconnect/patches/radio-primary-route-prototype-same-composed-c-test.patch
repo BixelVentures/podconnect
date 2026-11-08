@@ -28,7 +28,7 @@ index b8064f9..50aac9f 100644
 +            wire->decoded_audio_packet = false;
 +            continue; /* Exclude packets queued at the session boundary. */
 +          }
-+        primary_source = session->primary_radio ? 1 : session->primary_spotify_park_generation ? 2 : 0;
++        primary_source = session->primary_radio ? 1 : session->primary_spotify_return_opened ? 2 : 0;
 +      }
      bool ordinary
          = getenv("PC70_RELEASE_COMPOSE")

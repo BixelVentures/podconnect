@@ -201,6 +201,13 @@ with (
             }
         )
     )
+    if (n.returncode or c_status) and mode == "actual-c-primary-same-target":
+        markers = re.compile(r"FAIL|Resume|park|barrier|RTP|teardown|unknown|error", re.IGNORECASE)
+        for kind in ("native", "c"):
+            log = root / (prefix + mode + f"-{kind}.log")
+            lines = [line for line in log.read_text(errors="replace").splitlines() if markers.search(line)]
+            for line in lines[-60:]:
+                print(re.sub(r"[0-9a-fA-F]{32,}", "[redacted]", line), file=sys.stderr)
     raise SystemExit(
         n.returncode
         or c_status
