@@ -1,4 +1,4 @@
-## Speakers 0.26.71 — report current native playback revisions
+## Speakers 0.26.72 — report current native playback revisions
 
 - Let Control wait for track changes, pause, resume and seek on the current native output through the existing Speakers state read. The hint carries only a revision.
 

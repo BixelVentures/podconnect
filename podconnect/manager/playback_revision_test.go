@@ -137,7 +137,18 @@ func newRevisionHTTPFixture(t *testing.T, wait time.Duration) *revisionHTTPFixtu
 	})
 	f.track(true) // A seed watcher starts on an existing current item.
 	f.server = httptest.NewServer(mux)
-	t.Cleanup(f.server.Close)
+	t.Cleanup(func() {
+		f.server.Close()
+		// The HTTP handler can return before its bounded owner probe unwinds.
+		// After closing the only request source, acquire every slot so each
+		// probe has finished before the remaining cleanups restore globals.
+		for range cap(playbackRevisionSlots) {
+			playbackRevisionSlots <- struct{}{}
+		}
+		for range cap(playbackRevisionSlots) {
+			<-playbackRevisionSlots
+		}
+	})
 	return f
 }
 
