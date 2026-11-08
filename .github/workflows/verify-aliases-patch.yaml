@@ -62,6 +62,7 @@ jobs:
           if [ "$GITHUB_REF_NAME" = 'codex/radio-primary-output-routing-20261108' ]; then
             git apply "$patch_dir/radio-primary-route-prototype-private-native.patch"
             git apply "$patch_dir/radio-primary-route-prototype-station-native.patch"
+            git apply "$patch_dir/radio-primary-route-prototype-composed-native-test.patch"
           fi
       - name: Test exact primary radio Native preempt action and receipt
         if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
@@ -71,11 +72,9 @@ jobs:
       - name: Test Native queue, transport, output and retained packages
         if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
-      - name: Reuse tested Native package cache for composed fixture binary
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
+      - name: Build existing daemon-test artifact for composed fixture
         run: cd /tmp/gl && go test -race -c -o /tmp/native-tests ./daemon
       - uses: actions/upload-artifact@v4
-        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         with:
           name: selected-native-tests
           path: /tmp/native-tests
@@ -192,7 +191,7 @@ jobs:
           done
           # Earlier branch runs keep the causal before/after proofs for the
           # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park; do
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park composed-c-test; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
@@ -264,8 +263,19 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - uses: actions/upload-artifact@v4
+        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
+        with:
+          name: selected-c-callback
+          path: |
+            /tmp/owntone/src/airplay_callback_owner
+            /tmp/owntone/sqlext/.libs/owntone-sqlext.so
+            /tmp/owntone/tests/fixtures/radio-sender-fixture.mp3
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
   selected-start-clock:
-    if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
     needs: [build-fork, build-owntone]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -287,7 +297,16 @@ jobs:
         with:
           name: selected-native-tests
           path: /tmp/owntone
+      - name: Verify exact primary Native actor through production OwnTone HTTP
+        if: github.ref_name == 'codex/radio-primary-output-routing-20261108'
+        working-directory: /tmp/owntone
+        run: |
+          set -Eeuo pipefail
+          chmod +x src/airplay_callback_owner native-tests
+          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
+          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
       - name: Verify held fresh START and explicit late paused Resume against actual C
+        if: github.ref_name != 'codex/radio-primary-output-routing-20261108'
         working-directory: /tmp/owntone
         run: |
           set -Eeuo pipefail
