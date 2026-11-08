@@ -1,8 +1,6 @@
-diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index b8064f9..50aac9f 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
-@@ -1315,6 +1315,8 @@ struct native_start_wire {
+@@ -1315,6 +1315,8 @@
    atomic_bool done,completed,retired;
    atomic_bool reset_audio;
    atomic_int audio_packets;
@@ -11,7 +9,7 @@ index b8064f9..50aac9f 100644
    bool decoded_audio_packet, nonzero_pcm_input;
    uint16_t last_audio_seq;
    uint32_t last_audio_timestamp;
-@@ -1353,20 +1355,34 @@ static void native_start_audio_poll(struct native_start_wire *wire)
+@@ -1353,20 +1355,40 @@
    while((length=recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT))>0){
      if(!native_start_audio_rtp(packet,length))continue;
      if(native_start_old_move_audio(wire,packet,length))continue; /* Never target audio evidence. */
@@ -28,7 +26,13 @@ index b8064f9..50aac9f 100644
 +            wire->decoded_audio_packet = false;
 +            continue; /* Exclude packets queued at the session boundary. */
 +          }
-+        primary_source = session->primary_radio ? 1 : session->primary_spotify_return_opened ? 2 : 0;
++        if (session->primary_spotify_return && !session->primary_spotify_return_opened)
++          {
++            recovery_wire_fail(f, "Spotify return emitted RTP before OPEN");
++            return;
++          }
++        primary_source = session->primary_radio ? 1
++            : session->primary_spotify_return && session->primary_spotify_return_opened ? 2 : 0;
 +      }
      bool ordinary
          = getenv("PC70_RELEASE_COMPOSE")
@@ -49,7 +53,7 @@ index b8064f9..50aac9f 100644
      struct airplay_master_session *master=session ? session->master_session : NULL;
      uint16_t seq;uint32_t timestamp;size_t payload_len;
      uint8_t nonce[12]={0},decoded[4096];gcry_cipher_hd_t cipher;
-@@ -1402,6 +1418,8 @@ static void native_start_audio_poll(struct native_start_wire *wire)
+@@ -1402,6 +1424,8 @@
        if(master->rawbuf[i]){wire->nonzero_pcm_input=true;break;}
      wire->decoded_audio_packet=true;wire->last_audio_seq=seq;wire->last_audio_timestamp=timestamp;
      atomic_fetch_add(&wire->audio_packets,1);
@@ -58,7 +62,7 @@ index b8064f9..50aac9f 100644
    }
    if(length<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)
      recovery_wire_fail(f,"private RTP receive failed");
-@@ -1465,7 +1483,9 @@ static void native_start_http(struct evhttp_request *request,void *arg)
+@@ -1465,7 +1489,9 @@
      evbuffer_free(response);return;
    }
    if(!strcmp(uri,"/fixture/rtp") && wire->fixture->mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")){
@@ -69,7 +73,7 @@ index b8064f9..50aac9f 100644
      evhttp_send_reply(request,200,"OK",response);
      }
    else if (!strcmp(uri, "/fixture/ordinary-writer-ready") && getenv("PC70_RELEASE_COMPOSE")
-@@ -1632,6 +1652,23 @@ static void native_start_done_poll(int fd,short events,void *arg)
+@@ -1632,6 +1658,23 @@
  	return;
    }
    if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
@@ -93,7 +97,7 @@ index b8064f9..50aac9f 100644
    if(getenv("PC55_SEEK_MOVE")) {
      if(!atomic_load(&wire->move_terminal_verified)) {
        recovery_wire_fail(f,"Native completed MOVE/paused Seek/Resume did not preserve exact live target route and authenticated PCM before done ACK");return;
-@@ -1736,8 +1773,14 @@ static void native_start_wire_run(struct recovery_wire_fixture *f,const char *fi
+@@ -1736,8 +1779,14 @@
    assert(socket && !getsockname(evhttp_bound_socket_get_fd(socket),(struct sockaddr *)&address,&length));
    cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
    assert(!pthread_create(&thread,NULL,native_start_http_thread,&wire));
@@ -109,7 +113,7 @@ index b8064f9..50aac9f 100644
    assert(!fclose(ready));
    f->poll=evtimer_new(f->base,native_start_done_poll,&wire);
    f->deadline=evtimer_new(f->base,recovery_wire_deadline,f);
-@@ -1745,6 +1788,8 @@ static void native_start_wire_run(struct recovery_wire_fixture *f,const char *fi
+@@ -1745,6 +1794,8 @@
    event_base_dispatch(f->base);
    event_base_loopbreak(wire.http_base);assert(!pthread_join(thread,NULL));
    evhttp_free(wire.http);event_base_free(wire.http_base);
@@ -118,7 +122,7 @@ index b8064f9..50aac9f 100644
    commands_base_free(cmdbase);cmdbase=NULL;
  }
  
-@@ -1767,6 +1812,7 @@ static int start35_wire_case(int mode)
+@@ -1837,6 +1888,7 @@
    socklen_t length=sizeof(address);struct timeval bound={5,0},soon={0,1000};struct airplay_extra *extra;
    char database[PATH_MAX] = "/tmp/start35-wire-db-XXXXXX", fifo[PATH_MAX] = "/tmp/start35-wire-pipe-XXXXXX";
    const char *cold_db = getenv("PC70_COLD_DATABASE"), *cold_fifo = getenv("PC70_COLD_FIFO");
@@ -126,7 +130,7 @@ index b8064f9..50aac9f 100644
    bool cold = mode == 29 && cold_db && cold_fifo, cold_restart = cold && getenv("PC70_COLD_RESTART");
    int file = -1, placeholder = -1, writer = -1, reader = -1, item;
    bool database_ready=false,input_ready=false,worker_ready=false;pthread_t writer_thread;struct start_fifo_writer pending={0};
-@@ -1805,9 +1851,23 @@ static int start35_wire_case(int mode)
+@@ -1875,9 +1927,23 @@
    if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
    cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
    cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
@@ -150,7 +154,7 @@ index b8064f9..50aac9f 100644
    if (getenv("PC_JOURNAL_INJECT_UNKNOWN")) {
      struct db_start_guard saved={0}, changed={0};
      assert(cold_restart && db_start_guard_load(&saved)==1);
-@@ -1840,7 +1900,7 @@ static int start35_wire_case(int mode)
+@@ -1910,7 +1976,7 @@
    f.device->quality=(struct media_quality){44100,16,2};f.device->v4_address=strdup("127.0.0.1");f.device->v4_port=ntohs(address.sin_port);f.device->extra_device_info=extra;extra->mdns_name=strdup(f.device->name);
    if (primary_park || primary_station || (mode==29 && getenv("PC_REQUIRE_RTP_AUDIO")))
      extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
@@ -159,7 +163,7 @@ index b8064f9..50aac9f 100644
      f.primary_route_receiver = true;
    f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
    if (disjoint || primary_intent || primary_station || primary_park)
-@@ -1900,7 +1960,13 @@ static int start35_wire_case(int mode)
+@@ -1970,7 +2036,13 @@
    if(mode==29){
      if(getenv("PC_METADATA_PRESENT")){char metadata[PATH_MAX];snprintf(metadata,sizeof(metadata),"%s.metadata",fifo);assert(mkfifo(metadata,0600)==0);}
      keep_alive_timer=evtimer_new(f.base,airplay_keep_alive_timer_cb,NULL);assert(keep_alive_timer);
