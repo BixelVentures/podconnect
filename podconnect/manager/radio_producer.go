@@ -102,6 +102,7 @@ type radioProducerSenderPort interface {
 	Result(context.Context, radioProducerIdentity) (radioProducerResult, error)
 }
 type radioProducerRecord struct {
+	Primary             *radioPrimaryRecord    `json:"primary_session,omitempty"`
 	Controller          string                 `json:"controller_id,omitempty"`
 	NativeRelease       json.RawMessage        `json:"native_release_receipt,omitempty"`
 	NativeRejection     json.RawMessage        `json:"native_rejection,omitempty"`
@@ -121,6 +122,7 @@ type radioProducerRecord struct {
 	DrainTicket         json.RawMessage        `json:"drain_ticket,omitempty"`
 }
 type radioProducer struct {
+	primary          radioPrimaryPort
 	physicalAccepted bool
 	// A deployed worker proves runtime custody from the actual process. Physical
 	// acceptance remains separately reported; it is not fabricated at activation.
@@ -148,6 +150,9 @@ func newRadioProducer(native radioProducerNativePort, sender radioProducerSender
 	return &radioProducer{native: native, sender: sender, journal: journal, records: records, prepared: make(map[string]radioProducerPeer), physicalAccepted: physicalAccepted, live: make(map[string]bool), retained: make(map[string]radioProducerPrior)}, nil
 }
 func (p *radioProducer) Ready(ctx context.Context) ([]radioTarget, []string, error) {
+	if p.primary != nil {
+		return p.primaryReady(ctx)
+	}
 	p.recoverPassive(ctx)
 	native, e := p.native.Evidence(ctx)
 	if e != nil {
@@ -268,6 +273,9 @@ func producerHistoryReleased(records map[string]radioProducerRecord, old radioPr
 }
 func (p *radioProducer) Preflight(context.Context, string, string) error { return errRadioUnavailable }
 func (p *radioProducer) PreflightOperation(ctx context.Context, station, target, action string, generation uint64) error {
+	if p.primary != nil {
+		return p.primaryPrepare(ctx, station, target, action, generation)
+	}
 	if action == "" || generation == 0 {
 		return errRadioUnavailable
 	}
@@ -340,6 +348,9 @@ func (p *radioProducer) PreflightOperation(ctx context.Context, station, target,
 	return nil
 }
 func (p *radioProducer) Reserve(ctx context.Context, from, to, action string, generation uint64) (radioFence, error) {
+	if p.primary != nil {
+		return p.primaryReserve(ctx, from, to, action, generation)
+	}
 	p.mu.Lock()
 	if action == "" || generation == 0 || p.evidence.NativeProcess == "" || p.evidence.SenderProcess == "" {
 		p.mu.Unlock()
@@ -486,6 +497,9 @@ func (p *radioProducer) admit(f radioFence, stage string) (radioProducerRecord, 
 	return r, p.storeLocked(r)
 }
 func (p *radioProducer) PauseAndRelease(ctx context.Context, f radioFence, target string) error {
+	if p.primary != nil {
+		return p.primaryEffect(ctx, f, "prepare_start", target, "")
+	}
 	r, e := p.admit(f, "pause-suspend-attempted")
 	if e != nil || r.Request.Target != target {
 		return errRadioUnknown
@@ -511,6 +525,9 @@ func (p *radioProducer) PauseAndRelease(ctx context.Context, f radioFence, targe
 	return p.advance(f, "pause-suspend-attempted", "suspended")
 }
 func (p *radioProducer) Start(ctx context.Context, f radioFence, station, target string) error {
+	if p.primary != nil {
+		return p.primaryEffect(ctx, f, "start", target, station)
+	}
 	r, e := p.admit(f, "start-attempted")
 	if e != nil || r.Request.Target != target {
 		return errRadioUnknown
@@ -524,6 +541,9 @@ func (p *radioProducer) Start(ctx context.Context, f radioFence, station, target
 	return p.advance(f, "start-attempted", "started")
 }
 func (p *radioProducer) Stop(ctx context.Context, f radioFence, target string) error {
+	if p.primary != nil {
+		return p.primaryEffect(ctx, f, "stop", target, "")
+	}
 	r, e := p.admit(f, "stop-attempted")
 	if e != nil {
 		return e
@@ -566,6 +586,9 @@ func (p *radioProducer) Stop(ctx context.Context, f radioFence, target string) e
 	return p.storeLocked(current)
 }
 func (p *radioProducer) Volume(ctx context.Context, f radioFence, target string, percent int) error {
+	if p.primary != nil {
+		return errRadioUnavailable
+	}
 	r, e := p.admit(f, "volume-attempted")
 	if e != nil || percent < 0 || percent > 100 {
 		return errRadioUnknown
@@ -576,6 +599,9 @@ func (p *radioProducer) Volume(ctx context.Context, f radioFence, target string,
 	return p.advance(f, "volume-attempted", "volume-observed")
 }
 func (p *radioProducer) Finish(ctx context.Context, f radioFence) (radioNativeObservation, error) {
+	if p.primary != nil {
+		return p.primaryFinish(f)
+	}
 	r, e := p.admit(f, "finish-attempted")
 	if e != nil {
 		return radioNativeObservation{}, e
@@ -608,6 +634,9 @@ func producerResultMatches(result radioProducerResult, hold radioProducerHold, o
 	return result.Identity == operation && result.Observation.OwnerGeneration == hold.SourceGeneration && result.Terminal && (result.Outcome == "committed" || result.Outcome == "rejected" || result.Outcome == "preempted") && validRadioObservation(result.Observation)
 }
 func (p *radioProducer) Observe(ctx context.Context) (radioNativeObservation, error) {
+	if p.primary != nil {
+		return p.primaryObserve(ctx)
+	}
 	p.mu.Lock()
 	evidence := p.evidence
 	p.mu.Unlock()
@@ -615,6 +644,9 @@ func (p *radioProducer) Observe(ctx context.Context) (radioNativeObservation, er
 	return p.sender.Observe(ctx)
 }
 func (p *radioProducer) Reconcile(ctx context.Context, f radioFence) (radioReconciliation, error) {
+	if p.primary != nil {
+		return p.primaryReconcile(ctx, f)
+	}
 	p.mu.Lock()
 	r, ok := p.records[f.Token]
 	if !ok && f.Token == "" {

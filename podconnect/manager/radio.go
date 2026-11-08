@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -133,21 +134,25 @@ func (c *radioCoordinator) actionsLocked() []string {
 			}
 		}
 	}
-	if selectable {
+	playingRadio := c.state.State == "playing" && c.state.SourceKind == "radio"
+	if selectable && slices.Contains(c.state.Capabilities, "start") && (!playingRadio || slices.Contains(c.state.Capabilities, "move")) {
 		actions = append(actions, "start")
 	}
-	if c.state.State != "playing" || c.state.SourceKind != "radio" || !currentRoute {
+	if !playingRadio || !currentRoute {
 		return actions
 	}
 	now := time.Now().Unix()
 	if c.state.ObservedAt == nil || c.state.ValidUntil == nil || *c.state.ObservedAt > now || *c.state.ValidUntil <= now {
 		return actions
 	}
-	actions = append(actions, "stop")
-	if movable {
+	if slices.Contains(c.state.Capabilities, "stop") {
+		actions = append(actions, "stop")
+	}
+	if movable && slices.Contains(c.state.Capabilities, "move") {
 		actions = append(actions, "move")
 	}
-	if c.state.VolumePercent != nil && *c.state.VolumePercent >= 0 && *c.state.VolumePercent <= 100 {
+	if c.state.VolumePercent != nil && *c.state.VolumePercent >= 0 && *c.state.VolumePercent <= 100 &&
+		slices.Contains(c.state.Capabilities, "volume") {
 		actions = append(actions, "volume")
 	}
 	return actions
@@ -186,6 +191,9 @@ func (c *radioCoordinator) enable(ctx context.Context) error {
 	c.state.Targets = targets
 	c.state.BlockedReasons = []string{}
 	c.state.Capabilities = []string{"start", "stop", "move", "volume"}
+	if backend, ok := c.backend.(interface{ RadioCapabilities() []string }); ok {
+		c.state.Capabilities = backend.RadioCapabilities()
+	}
 	return nil
 }
 func (c *radioCoordinator) execute(ctx context.Context, q radioCommand) (radioState, error) {
