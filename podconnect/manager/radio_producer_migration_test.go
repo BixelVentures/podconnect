@@ -84,7 +84,7 @@ func TestRadioProducerMigrationLegacyTerminalHistory(t *testing.T) {
 }
 
 func TestRadioProducerMigrationPrimaryTerminalHistory(t *testing.T) {
-	for _, kind := range []string{"released", "wrong-session", "wrong-action", "unknown", "playing"} {
+	for _, kind := range []string{"released", "wrong-session", "wrong-action", "wrong-observed-owner", "unknown", "playing"} {
 		t.Run(kind, func(t *testing.T) {
 			directory, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
@@ -108,10 +108,11 @@ func TestRadioProducerMigrationPrimaryTerminalHistory(t *testing.T) {
 				Generation: "2", Action: fence.ActionID, Process: nativeProcess, OwnerGeneration: "2",
 				Target: "room", From: "room", ExpectedRevision: "2", Session: &session}
 			receipt := radioPrimaryReceipt{radioPrimaryCommand: command, TeardownCSeq: 7,
-				Observation: &radioNativeObservation{State: "stopped", SourceKind: "none"}}
+				Observation: &radioNativeObservation{State: "stopped", SourceKind: "none", OwnerGeneration: 2}}
 			receipt.Phase, receipt.ForPhase = "released", "stop"
 			stop := radioProducerRecord{Fence: fence,
-				Request:  radioProducerReserve{radioProducerIdentity: radioProducerIdentity{Process: nativeProcess, Target: "room"}, From: "room"},
+				Request: radioProducerReserve{radioProducerIdentity: radioProducerIdentity{Process: nativeProcess, Target: "room"}, From: "room",
+					ExpectedIntent: radioProducerIntent{Process: nativeProcess, Revision: "2"}},
 				Primary:  &radioPrimaryRecord{Device: "1", Incumbent: start.Fence.Token, LastCommand: &command, LastReceipt: &receipt},
 				Terminal: kind != "unknown", Outcome: "committed", Stage: "terminal",
 			}
@@ -122,6 +123,10 @@ func TestRadioProducerMigrationPrimaryTerminalHistory(t *testing.T) {
 				archived.Session = &wrong
 			} else if kind == "wrong-action" {
 				archived.Action = attentionUUID()
+			} else if kind == "wrong-observed-owner" {
+				other := *archived.Observation
+				other.OwnerGeneration++
+				archived.Observation = &other
 			}
 			start.Primary.StopReceipt = &archived
 			if err := journal.write(start); err != nil {
@@ -144,5 +149,80 @@ func TestRadioProducerMigrationPrimaryTerminalHistory(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRadioProducerMigrationRejectionRequiresExactTypedOperation(t *testing.T) {
+	const epoch, generation = "1", "2"
+	native, sender, action := strings.Repeat("a", 64), attentionUUID(), attentionUUID()
+	token, digest := strings.Repeat("b", 32), strings.Repeat("c", 64)
+	legacy := radioProducerRecord{
+		Terminal: true, Outcome: "rejected", Stage: "no-effects-rejected",
+		Request: radioProducerReserve{
+			radioProducerIdentity: radioProducerIdentity{Process: native, Target: "room", Handoff: action, Generation: 2},
+			ExpectedIntent:        radioProducerIntent{Process: native, Revision: "1"},
+			Peer:                  radioProducerPeer{Process: sender, OwnerGeneration: 1, ReceiverDigest: digest},
+		},
+	}
+	legacy.Request.Peer.Proof, _ = json.Marshal(map[string]string{
+		"device_id": "1", "operation_id": action, "operation_generation": generation,
+		"radio_process": sender, "radio_owner_epoch": epoch, "sender_token": token,
+	})
+	nativeWire := nativeProducerWire(legacy.Request)
+	nativeWire.Schema = "podconnect.native_radio_handoff_rejected.v1"
+	noEffect := false
+	legacy.NativeRejection, _ = json.Marshal(struct {
+		radioProducerNativeRequest
+		Rejected bool   `json:"operation_rejected"`
+		Effects  *bool  `json:"effects_started"`
+		Terminal bool   `json:"terminal"`
+		Reason   string `json:"reason"`
+	}{nativeWire, true, &noEffect, true, "stale_intent"})
+	legacy.CancellationReceipt, _ = json.Marshal(radioProducerSenderReply{
+		Schema: "podconnect.radio-sender.v1", OK: true, Process: sender, Device: "1", Epoch: epoch,
+		Generation: generation, Operation: action, Token: token, Digest: digest, Phase: "cancelled", Cancelled: true,
+	})
+	if !producerLegacyHistoryTerminal(nil, legacy) {
+		t.Fatal("exact receiver-free legacy rejection was blocked")
+	}
+	for _, garbage := range []json.RawMessage{json.RawMessage("null"), json.RawMessage(`{"not":"proof"}`)} {
+		other := legacy
+		other.NativeRejection = garbage
+		if producerLegacyHistoryTerminal(nil, other) {
+			t.Fatal("accepted unbound Native rejection")
+		}
+		other = legacy
+		other.CancellationReceipt = garbage
+		if producerLegacyHistoryTerminal(nil, other) {
+			t.Fatal("accepted unbound cancellation receipt")
+		}
+		other.Stage = "rejected-reconciled"
+		if producerLegacyHistoryTerminal(nil, other) {
+			t.Fatal("accepted reconciliation without retained sender proof")
+		}
+	}
+
+	predecessor := radioPrimarySession{Process: attentionUUID(), Operation: attentionUUID(), DeviceID: "1", Incarnation: "2", Epoch: "3", Route: "4"}
+	cmd := radioPrimaryCommand{
+		Schema: primaryRadioSchema, Phase: "prepare_replace", Process: native, Handoff: action, Action: attentionUUID(),
+		Generation: "2", OwnerGeneration: "2", Target: "room", From: "room", ExpectedRevision: "1", Session: &predecessor,
+	}
+	receipt := radioPrimaryReceipt{radioPrimaryCommand: cmd}
+	receipt.Phase = "replacement_rejected"
+	record := radioProducerRecord{
+		Terminal: true, Outcome: "rejected", Stage: "no-effects-rejected",
+		Fence: radioFence{Token: action, ActionID: cmd.Action, Generation: 2, OwnerGeneration: 2},
+		Request: radioProducerReserve{
+			radioProducerIdentity: radioProducerIdentity{Process: native, Target: "room"},
+			From:                  "room", ExpectedIntent: radioProducerIntent{Process: native, Revision: "1"},
+		},
+		Primary: &radioPrimaryRecord{IncumbentSession: &predecessor, LastCommand: &cmd, LastReceipt: &receipt},
+	}
+	if !producerPrimaryHistoryTerminal(nil, record) {
+		t.Fatal("exact primary no-effects rejection was blocked")
+	}
+	record.Fence.ActionID = attentionUUID()
+	if producerPrimaryHistoryTerminal(nil, record) {
+		t.Fatal("accepted copied command and receipt from another journal action")
 	}
 }

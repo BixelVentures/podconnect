@@ -122,24 +122,31 @@ func (s *radioProducerSenderClient) call(ctx context.Context, action string, q m
 		seenKeys[target.Digest] = true
 	}
 	if action != "capabilities" {
-		if !producerUUID(r.Operation) || !producerHex(r.Token, 32) || !producerHex(r.Digest, 64) || !producerCounter(r.Device, false) || !producerCounter(r.Epoch, false) || !producerCounter(r.Generation, false) {
-			return r, errRadioUnknown
-		}
-		if r.Device != q["device_id"] || r.Operation != q["operation_id"] || r.Generation != q["operation_generation"] {
-			return r, errRadioUnknown
-		}
-		if expected, ok := q["radio_process"]; ok && r.Process != expected {
-			return r, errRadioUnknown
-		}
-		if expected, ok := q["radio_owner_epoch"]; ok && r.Epoch != expected {
-			return r, errRadioUnknown
-		}
-		if expected, ok := q["sender_token"]; ok && r.Token != expected {
+		if !producerSenderOperationMatches(r, q) {
 			return r, errRadioUnknown
 		}
 	}
 	return r, nil
 }
+func producerSenderOperationMatches(r radioProducerSenderReply, q map[string]any) bool {
+	if !producerUUID(r.Operation) || !producerHex(r.Token, 32) || !producerHex(r.Digest, 64) || !producerCounter(r.Device, false) || !producerCounter(r.Epoch, false) || !producerCounter(r.Generation, false) {
+		return false
+	}
+	if r.Device != q["device_id"] || r.Operation != q["operation_id"] || r.Generation != q["operation_generation"] {
+		return false
+	}
+	if expected, ok := q["radio_process"]; ok && r.Process != expected {
+		return false
+	}
+	if expected, ok := q["radio_owner_epoch"]; ok && r.Epoch != expected {
+		return false
+	}
+	if expected, ok := q["sender_token"]; ok && r.Token != expected {
+		return false
+	}
+	return true
+}
+
 func (s *radioProducerSenderClient) Evidence(ctx context.Context, n radioProducerEvidence) (radioProducerEvidence, error) {
 	r, e := s.call(ctx, "capabilities", map[string]any{"schema": "podconnect.radio-sender.v1"})
 	if e != nil {

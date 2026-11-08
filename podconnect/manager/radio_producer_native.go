@@ -218,18 +218,7 @@ func (n *radioProducerNativeClient) invoke(ctx context.Context, action string, q
 		return radioProducerNativeReply{Custody: custody}, nil
 	}
 	if discriminator.Schema == "podconnect.native_radio_handoff_rejected.v1" {
-		var rejected struct {
-			radioProducerNativeRequest
-			Rejected bool   `json:"operation_rejected"`
-			Effects  *bool  `json:"effects_started"`
-			Terminal bool   `json:"terminal"`
-			Reason   string `json:"reason"`
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
-		expected := q
-		expected.Schema = "podconnect.native_radio_handoff_rejected.v1"
-		if decoder.Decode(&rejected) != nil || decoder.Decode(new(any)) != io.EOF || rejected.radioProducerNativeRequest != expected || q.Token != "" || !rejected.Rejected || rejected.Effects == nil || *rejected.Effects || !rejected.Terminal || rejected.Reason != "stale_intent" {
+		if !producerNativeRejectionMatches(raw, q) {
 			return r, errRadioUnknown
 		}
 		return r, &radioProducerOperationRejected{Receipt: append(json.RawMessage{}, raw...)}
@@ -269,6 +258,21 @@ func (n *radioProducerNativeClient) invoke(ctx context.Context, action string, q
 	}
 	n.mu.Unlock()
 	return r, nil
+}
+
+func producerNativeRejectionMatches(raw json.RawMessage, q radioProducerNativeRequest) bool {
+	var rejected struct {
+		radioProducerNativeRequest
+		Rejected bool   `json:"operation_rejected"`
+		Effects  *bool  `json:"effects_started"`
+		Terminal bool   `json:"terminal"`
+		Reason   string `json:"reason"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	expected := q
+	expected.Schema = "podconnect.native_radio_handoff_rejected.v1"
+	return !(decoder.Decode(&rejected) != nil || decoder.Decode(new(any)) != io.EOF || rejected.radioProducerNativeRequest != expected || q.Token != "" || !rejected.Rejected || rejected.Effects == nil || *rejected.Effects || !rejected.Terminal || rejected.Reason != "stale_intent")
 }
 
 func decodeProducerNativeCompletion(raw json.RawMessage, q radioProducerNativeRequest, action string) (radioProducerNativeReply, error) {
