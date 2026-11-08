@@ -191,7 +191,7 @@ jobs:
           done
           # Earlier branch runs keep the causal before/after proofs for the
           # unchanged layers. Build the full translation units with the bridge.
-          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park composed-c-test; do
+          for layer in test engine wire-test wire-engine ingress-test ingress-engine preempt-test preempt-engine edge-fences custody-test custody-engine disjoint-test disjoint-engine intent decoder private-c station-start park activate composed-c-test; do
             git apply "$patch_dir/radio-primary-route-prototype-$layer.patch"
           done
           autoreconf -fi
