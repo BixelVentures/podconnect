@@ -1,0 +1,424 @@
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -315,11 +315,14 @@
+ {
+   OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME,
+   OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT,
++  OUTPUT_PRIMARY_SPOTIFY_RETURN_BARRIER,
++  OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN,
+ };
+ struct output_primary_spotify_return_request
+ {
+   struct output_primary_spotify_park_request park;
+   struct output_primary_radio_custody radio;
++  struct output_queue_writer current_writer;
+   char intent[37];
+   uint64_t native_revision;
+ };
+@@ -328,11 +331,14 @@
+   struct output_primary_spotify_return_request binding;
+   enum output_radio_reacquire_phase phase;
+   struct output_transport_identity route;
++  bool newly_opened;
++  struct output_radio_reacquire_request resume_arm; /* Player owner only. */
+ };
+ int outputs_primary_spotify_return(enum output_primary_spotify_return_action,
+     const struct output_primary_spotify_return_request *, struct output_primary_spotify_return_result *);
+ bool outputs_primary_spotify_return_constructor_current(uint64_t);
+ bool outputs_primary_spotify_return_wire_current(uint64_t, const void *, uint64_t);
++int outputs_airplay_primary_spotify_return_open(uint64_t, const void *);
+ enum output_primary_radio_start_phase
+ {
+   OUTPUT_PRIMARY_RADIO_START_PENDING,
+--- a/src/outputs_radio_handoff.inc.c
++++ b/src/outputs_radio_handoff.inc.c
+@@ -133,7 +133,7 @@
+   return outputs_radio_move_delegated_current(id,true) || !s || s->result.phase==OUTPUT_RADIO_PREPARED || s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED;
+ }
+ bool outputs_radio_handoff_blocked(uint64_t id)
+-{struct radio_handoff_slot *s=radio_handoff_find(id);return outputs_radio_parked_absence_blocked(id) || outputs_radio_absence_blocked(id) || radio_handoff_fault || (s && !outputs_radio_move_delegated_current(id,false) && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED);}
++{struct radio_handoff_slot *s=radio_handoff_find(id);return outputs_radio_parked_absence_blocked(id) || outputs_radio_absence_blocked(id) || radio_handoff_fault || (s && (s->primary_return_revoked || (!outputs_radio_move_delegated_current(id,false) && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED)));}
+ uint64_t outputs_radio_handoff_generation(uint64_t id)
+ {struct radio_handoff_slot *s=radio_handoff_find(id);return s?s->result.effect_generation:0;}
+ bool outputs_radio_handoff_effect_current(uint64_t id,uint64_t generation,bool stop)
+@@ -141,6 +141,7 @@
+   struct radio_handoff_slot *s=radio_handoff_find(id);
+   if(radio_handoff_fault)return false;
+   if(!s)return generation==0;
++  if(!stop && radio_primary_park_command(&s->result.command) && s->primary_return_revoked)return false;
+   if(outputs_radio_move_delegated_current(id,false))return !stop && generation==s->result.effect_generation;
+   if(s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED)return generation==s->result.effect_generation;
+   if(!stop && radio_primary_park_command(&s->result.command))return false;
+@@ -247,17 +248,35 @@
+         || !r->radio_owner_epoch)goto fault;
+     for(j=0;j<i;j++)if(radio_handoffs[j].result.command.identity.device_id==r->identity.device_id)goto fault;
+     struct output_radio_handoff_result *saved=&radio_handoffs[i].result;
+-    if (radio_primary_park_command(r)
++    bool local_park = radio_primary_park_command(r);
++    if (local_park
+         && (strcmp(r->radio_process, r->identity.process) || !saved->requires_native_pause
+             || (saved->phase != OUTPUT_RADIO_PREPARED && saved->phase != OUTPUT_RADIO_STOPPING
+-                && saved->phase != OUTPUT_RADIO_SUSPENDED && saved->phase != OUTPUT_RADIO_UNKNOWN)
++                && saved->phase != OUTPUT_RADIO_SUSPENDED && saved->phase != OUTPUT_RADIO_UNKNOWN
++                && saved->phase != OUTPUT_RADIO_REACQUIRED)
+             || (saved->phase == OUTPUT_RADIO_SUSPENDED && (saved->stop_code != 200 || saved->stop_cseq <= 0))))
+       goto fault;
+     /* A terminal record was written only after the current radio drain ticket
+      * was consumed durably. It carries no authority to restore a live route.
+      * Ordinary START has its own crash journal after a delegated release. */
+     bool released=saved->phase==OUTPUT_RADIO_RELEASED;
+-    if(saved->phase==OUTPUT_RADIO_REACQUIRED){
++    if (local_park && saved->phase == OUTPUT_RADIO_REACQUIRED)
++      {
++        struct output_radio_reacquire_result *resume = &saved->resume;
++        if (!saved->effect_generation || saved->stop_code != 200 || saved->stop_cseq <= 0
++            || !radio_handoff_uuid(resume->command.intent_id)
++            || resume->command.native_revision <= r->native_revision || resume->command.native_revision == UINT64_MAX
++            || (resume->phase != OUTPUT_RADIO_REACQUIRE_OPENED && resume->phase != OUTPUT_RADIO_REACQUIRE_DELEGATED)
++            || (resume->phase == OUTPUT_RADIO_REACQUIRE_OPENED && !resume->writer_barrier_verified)
++            || (resume->phase == OUTPUT_RADIO_REACQUIRE_DELEGATED
++                && (strnlen(resume->delegated_token, sizeof(resume->delegated_token)) != 32
++                    || !transport_hex(resume->delegated_token, 32))))
++          goto fault;
++        /* Only a separate START delegation can transfer startup ownership. */
++        released = resume->phase == OUTPUT_RADIO_REACQUIRE_DELEGATED;
++        retired = released || retired;
++      }
++    else if(saved->phase==OUTPUT_RADIO_REACQUIRED){
+       struct output_radio_reacquire_result *v=&saved->resume;
+       if(!memchr(v->command.challenge,0,sizeof(v->command.challenge))
+           || !memchr(v->command.drain_signature,0,sizeof(v->command.drain_signature))
+@@ -613,7 +632,7 @@
+ }
+ 
+ static bool
+-primary_spotify_park_writer_closed(const struct radio_handoff_slot *slot)
++primary_spotify_park_source_retained(const struct radio_handoff_slot *slot)
+ {
+   struct start_slot *spotify = start_active;
+   const struct output_radio_handoff_request *park = &slot->result.command;
+@@ -628,10 +647,17 @@
+       && native_owner_equal(&park->native_owner, &spotify->result.command.committed_native_owner)
+       && transport_identity_equal(old, &spotify->result.route_identity)
+       && !transport_pin && !transport_generation_exhausted && !room_volume_pin_busy() && !room_volume_undrained()
+-      && start_process_current(&park->writer.native_process)
+-      && start_all_writers_closed(&park->writer.native_process, park->writer.pipe_device, park->writer.pipe_inode) == 1;
++      && start_process_current(&park->writer.native_process);
+ }
+ 
++static bool
++primary_spotify_park_writer_closed(const struct radio_handoff_slot *slot)
++{
++  const struct output_queue_writer *writer = &slot->result.command.writer;
++  return primary_spotify_park_source_retained(slot)
++      && start_all_writers_closed(&writer->native_process, writer->pipe_device, writer->pipe_inode) == 1;
++}
++
+ bool
+ outputs_primary_spotify_park_attach_current(const struct output_primary_radio_start_request *request,
+     const char *token)
+--- a/src/outputs_radio_reacquire.inc.c
++++ b/src/outputs_radio_reacquire.inc.c
+@@ -66,7 +66,7 @@
+ static bool radio_reacquired_current(uint64_t id,uint64_t inc,uint64_t epoch,const void *session,bool pcm)
+ {
+   struct radio_handoff_slot *s=radio_handoff_find(id);struct output_device *d=outputs_device_get(id);struct output_transport_identity actual;
+-  if(!s)return false;
++  if(!s || (radio_primary_park_command(&s->result.command) && s->primary_return_revoked))return false;
+   struct output_radio_reacquire_result *v=s->result.phase==OUTPUT_RADIO_PREPARED?&s->previous_source:&s->result.resume;
+   const void *expected=s->result.phase==OUTPUT_RADIO_PREPARED?s->previous_session:s->resume_session;
+   uint64_t generation=s->result.phase==OUTPUT_RADIO_PREPARED?s->previous_pcm_generation:s->resume_pcm_generation;
+@@ -247,7 +247,7 @@
+ bool outputs_radio_reacquire_start_admissible(const struct output_start_request *r)
+ {
+   struct radio_handoff_slot *s=r?radio_handoff_find(r->device_id):NULL;struct output_transport_identity actual;
+-  if(!r || !s || radio_handoff_fault || !r->old_owner_present || r->move_existing_session)return false;
++  if(!r || !s || radio_handoff_fault || s->primary_return_revoked || !r->old_owner_present || r->move_existing_session)return false;
+   for(size_t i=0;i<ARRAY_SIZE(radio_handoffs);i++)if(&radio_handoffs[i]!=s && radio_handoffs[i].used
+       && (radio_handoffs[i].result.phase==OUTPUT_RADIO_PREPARED || radio_handoffs[i].result.phase==OUTPUT_RADIO_STOPPING))return false;
+   struct output_radio_reacquire_result *v=&s->result.resume;
+@@ -270,6 +270,7 @@
+ {
+   struct radio_handoff_slot *s=r?radio_handoff_find(r->device_id):NULL;
+   if(!s || s->result.phase==OUTPUT_RADIO_RELEASED)return 0;
++  if(s->primary_return_revoked)return -1;
+   bool future=s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_BARRIER_READY && s->result.resume.future_start_bound
+     && !strcmp(r->offer_id,s->result.resume.command.start_offer_id) && !strcmp(r->binding_id,s->result.resume.command.start_binding_id)
+     && !strcmp(r->content_digest,s->result.resume.command.start_content_digest) && !strcmp(r->native_incarnation,s->result.resume.command.start_native_incarnation)
+@@ -348,7 +349,7 @@
+ 
+ static bool
+ primary_spotify_return_source_current(const struct radio_handoff_slot *slot, const struct output_device *d,
+-    const struct output_primary_spotify_return_request *request)
++    const struct output_primary_spotify_return_request *request, bool writer_closed)
+ {
+   struct output_transport_identity source;
+   int base_volume;
+@@ -362,7 +363,9 @@
+       && radio_transport_identity_get(d->id, &source, false) == 0 && radio_reacquire_source_equal(old, &source)
+       && d->base_revision && db_attention_base_get(d->id, &base_volume) == 0
+       && base_volume == d->volume && base_volume == slot->result.command.initial_volume_percent
+-      && primary_spotify_park_writer_closed(slot) && primary_spotify_return_reader_current(start_active, old);
++      && primary_spotify_park_source_retained(slot)
++      && (!writer_closed || (primary_spotify_park_writer_closed(slot)
++          && primary_spotify_return_reader_current(start_active, old)));
+ }
+ 
+ static bool
+@@ -373,13 +376,15 @@
+   if (!slot || !d || !session || d->session != session || slot->resume_session != session
+       || !slot->primary_return.intent[0] || slot->primary_return_revoked || generation != slot->result.effect_generation
+       || (slot->result.resume.phase != OUTPUT_RADIO_REACQUIRE_CONNECTING
+-          && slot->result.resume.phase != OUTPUT_RADIO_REACQUIRE_ROUTE_READY)
++          && slot->result.resume.phase != OUTPUT_RADIO_REACQUIRE_ROUTE_READY
++          && slot->result.resume.phase != OUTPUT_RADIO_REACQUIRE_BARRIER_READY)
+       || !radio_primary_park_sole_selected(d))
+     return false;
+   const struct output_transport_identity *old = &slot->result.command.identity;
+   return d->session_epoch == old->session_epoch + 4 && d->route_revision == old->route_revision + 2
+       && transport_selection_revision == old->selection_revision + 3
+-      && primary_spotify_return_source_current(slot, d, &slot->primary_return);
++      && primary_spotify_return_source_current(slot, d, &slot->primary_return,
++          slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_CONNECTING);
+ }
+ 
+ bool
+@@ -395,6 +400,19 @@
+   return false;
+ }
+ 
++static bool
++primary_spotify_return_fresh_writer(const struct output_queue_writer *writer, const struct output_queue_writer *parked)
++{
++  return radio_handoff_uuid(writer->native_process.boot_id)
++      && strnlen(writer->input_path_digest, sizeof(writer->input_path_digest)) == 64
++      && !strcmp(writer->native_process.boot_id, parked->native_process.boot_id)
++      && writer->native_process.pid == parked->native_process.pid
++      && writer->native_process.proc_start_ticks == parked->native_process.proc_start_ticks
++      && writer->pipe_device == parked->pipe_device && writer->pipe_inode == parked->pipe_inode
++      && writer->source_epoch == parked->source_epoch && writer->open_generation > parked->open_generation
++      && writer->open_generation != UINT64_MAX && !strcmp(writer->input_path_digest, parked->input_path_digest);
++}
++
+ static void
+ primary_spotify_return_connected(struct output_device *d, enum output_device_state state)
+ {
+@@ -421,13 +439,16 @@
+     const struct output_primary_spotify_return_request *request, struct output_primary_spotify_return_result *out)
+ {
+   uint64_t id;
+-  if (!request || !out || (action != OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME && action != OUTPUT_PRIMARY_SPOTIFY_RETURN_RESULT)
++  if (!request || !out || action < OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME || action > OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN
+       || !radio_native_source_owner_valid(&request->park.owner)
+       || safe_atou64(request->park.owner.homepod_id, &id) < 0 || !id
+-      || !radio_handoff_uuid(request->park.action) || !transport_hex(request->park.token, 32)
++      || !radio_handoff_uuid(request->park.action) || strnlen(request->park.token, sizeof(request->park.token)) != 32
++      || !transport_hex(request->park.token, 32)
+       || !radio_handoff_uuid(request->park.route.process)
++      || strnlen(request->park.route.input_path_digest, sizeof(request->park.route.input_path_digest)) != 64
+       || !transport_hex(request->park.route.input_path_digest, 64)
+       || !radio_handoff_uuid(request->park.writer.native_process.boot_id)
++      || strnlen(request->park.writer.input_path_digest, sizeof(request->park.writer.input_path_digest)) != 64
+       || !transport_hex(request->park.writer.input_path_digest, 64)
+       || !radio_handoff_uuid(request->intent) || request->native_revision == UINT64_MAX
+       || request->native_revision <= request->park.native_revision || !radio_handoff_uuid(request->radio.process)
+@@ -454,12 +475,12 @@
+           return 0;
+         }
+       if (action != OUTPUT_PRIMARY_SPOTIFY_RETURN_CONSUME || resume->phase != OUTPUT_RADIO_REACQUIRE_NONE
+-          || !primary_spotify_return_source_current(slot, d, request) || d->selected || d->session
++          || !primary_spotify_return_source_current(slot, d, request, true) || d->selected || d->session
+           || d->session_epoch != old->session_epoch + 3 || d->route_revision != old->route_revision + 1
+           || transport_selection_revision != old->selection_revision + 2 || primary_spotify_return_scope)
+         return -1;
+       if (!start_retirement_reader(start_active, old)
+-          || !primary_spotify_return_source_current(slot, d, request))
++          || !primary_spotify_return_source_current(slot, d, request, true))
+         return -1;
+       for (struct output_device *other = outputs_device_list; other; other = other->next)
+         if (other->selected)
+@@ -490,7 +511,7 @@
+       outputs_device_select(d, -1);
+       int started = radio_primary_park_sole_selected(d) && d->route_revision == old->route_revision + 2
+           && transport_selection_revision == old->selection_revision + 3
+-          && primary_spotify_return_source_current(slot, d, request)
++          && primary_spotify_return_source_current(slot, d, request, true)
+         ? outputs_device_start(d, primary_spotify_return_connected, false) : -1;
+       primary_spotify_return_scope = 0;
+       if (started <= 0)
+@@ -501,23 +522,99 @@
+       || !primary_spotify_return_receipt_equal(&request->radio, &slot->primary_return.radio))
+     return -1;
+ 
++  if (action == OUTPUT_PRIMARY_SPOTIFY_RETURN_BARRIER || action == OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN)
++    {
++      const struct output_queue_writer *writer = &request->current_writer;
++      if (!primary_spotify_return_fresh_writer(writer, &slot->result.command.writer))
++        return -1;
++      if (resume->phase == OUTPUT_RADIO_REACQUIRE_OPENED || (action == OUTPUT_PRIMARY_SPOTIFY_RETURN_BARRIER
++          && resume->phase == OUTPUT_RADIO_REACQUIRE_BARRIER_READY))
++        {
++          if (!queue_writer_equal(writer, &resume->command.current_writer))
++            return -1;
++        }
++      else
++        {
++          struct output_transport_identity actual;
++          if (!d || !primary_spotify_return_route_current(id, d->session, slot->result.effect_generation)
++              || !outputs_airplay_primary_spotify_session_current(d, d->session)
++              || !outputs[d->type]->device_start_drained || !outputs[d->type]->device_start_drained(d)
++              || radio_transport_identity_get(id, &actual, true) < 0
++              || !transport_identity_equal(&actual, &resume->route_identity))
++            return -1;
++          if (action == OUTPUT_PRIMARY_SPOTIFY_RETURN_BARRIER)
++            {
++              if (resume->phase != OUTPUT_RADIO_REACQUIRE_ROUTE_READY
++                  || !primary_spotify_return_reader_current(start_active, old)
++                  || !radio_reacquire_live_source(slot, writer, true))
++                return -1;
++              resume->command.current_writer = *writer;
++              resume->writer_barrier_verified = true;
++              resume->phase = OUTPUT_RADIO_REACQUIRE_BARRIER_READY;
++              if (radio_handoff_save() < 0)
++                {
++                  radio_reacquire_unknown(slot);
++                  return -1;
++                }
++            }
++          else
++            {
++              if (resume->phase != OUTPUT_RADIO_REACQUIRE_BARRIER_READY || !resume->writer_barrier_verified
++                  || !queue_writer_equal(writer, &resume->command.current_writer)
++                  || !radio_reacquire_live_source(slot, writer, false) || slot->result.effect_generation == UINT64_MAX)
++                return -1;
++              slot->result.effect_generation++;
++              slot->result.phase = OUTPUT_RADIO_REACQUIRED;
++              resume->phase = OUTPUT_RADIO_REACQUIRE_OPENED;
++              if (radio_handoff_save() < 0 || outputs_airplay_primary_spotify_return_open(id, slot->resume_session) < 0)
++                {
++                  radio_reacquire_unknown(slot);
++                  return -1;
++                }
++              radio_reacquire_retire_transport(id);
++              out->newly_opened = true;
++              out->resume_arm = resume->command;
++            }
++        }
++    }
++
+   out->phase = resume->phase;
+-  if (out->phase == OUTPUT_RADIO_REACQUIRE_CONNECTING || out->phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY)
++  if (out->phase == OUTPUT_RADIO_REACQUIRE_OPENED)
+     {
++      struct output_transport_identity actual;
++      if (!slot->primary_return_revoked && d
++          && radio_reacquired_current(id, d->incarnation, d->session_epoch, d->session, true)
++          && radio_transport_identity_get(id, &actual, true) == 0
++          && transport_identity_equal(&actual, &resume->route_identity))
++        out->route = actual;
++      else
++        out->phase = OUTPUT_RADIO_REACQUIRE_UNKNOWN;
++    }
++  else if (out->phase == OUTPUT_RADIO_REACQUIRE_CONNECTING || out->phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY
++      || out->phase == OUTPUT_RADIO_REACQUIRE_BARRIER_READY)
++    {
+       if (!d || !primary_spotify_return_route_current(id, d->session, slot->result.effect_generation))
+         out->phase = OUTPUT_RADIO_REACQUIRE_UNKNOWN;
+-      else if (out->phase == OUTPUT_RADIO_REACQUIRE_ROUTE_READY)
++      else if (out->phase != OUTPUT_RADIO_REACQUIRE_CONNECTING)
+         {
+           struct output_transport_identity actual;
+           if (!outputs_airplay_primary_spotify_session_current(d, d->session)
+               || radio_transport_identity_get(id, &actual, true) < 0
+-              || !transport_identity_equal(&actual, &resume->route_identity))
++              || !transport_identity_equal(&actual, &resume->route_identity)
++              || (out->phase == OUTPUT_RADIO_REACQUIRE_BARRIER_READY
++                  && (!resume->writer_barrier_verified || !radio_queue_writer_pcm_current(&resume->command.current_writer,
++                      &actual, NULL, slot->resume_pcm_generation))))
+             out->phase = OUTPUT_RADIO_REACQUIRE_UNKNOWN;
+           else
+             out->route = actual;
+         }
+     }
++  if (out->phase == OUTPUT_RADIO_REACQUIRE_BARRIER_READY || out->phase == OUTPUT_RADIO_REACQUIRE_OPENED)
++    out->binding.current_writer = resume->command.current_writer;
+   if (out->phase == OUTPUT_RADIO_REACQUIRE_UNKNOWN)
+-    slot->primary_return_revoked = true;
++    {
++      slot->primary_return_revoked = true;
++      out->newly_opened = false;
++    }
+   return 0;
+ }
+--- a/src/outputs/airplay.c
++++ b/src/outputs/airplay.c
+@@ -266,6 +266,7 @@
+   char *primary_radio_custody;
+   bool primary_radio_successor;
+   bool primary_spotify_return;
++  bool primary_spotify_return_opened;
+   int primary_radio_control_fd;
+   unsigned short primary_radio_control_port;
+   uint64_t primary_radio_route_revision, primary_spotify_park_generation;
+@@ -650,8 +651,15 @@
+       && outputs_primary_spotify_park_session_current(session->device_id, session, context->radio_generation,
+           context->cur_request->seq_type == AIRPLAY_SEQ_STOP);
+   if (session->primary_spotify_return)
+-    return context->cur_request->seq_type != AIRPLAY_SEQ_STOP
+-      && outputs_primary_spotify_return_wire_current(session->device_id, session, context->radio_generation);
++    {
++      if (!session->primary_spotify_return_opened)
++        return context->cur_request->seq_type != AIRPLAY_SEQ_STOP
++          && outputs_primary_spotify_return_wire_current(session->device_id, session, context->radio_generation);
++      struct output_device *device = outputs_device_get(session->device_id);
++      if (!device || device->session != session || device->incarnation != session->device_incarnation
++          || device->session_epoch != session->session_epoch)
++        return false;
++    }
+   return outputs_radio_handoff_effect_current(session->device_id, context->radio_generation, context->radio_stop);
+ }
+ 
+@@ -2516,8 +2524,6 @@
+   struct airplay_master_session *master;
+   ptrdiff_t slot;
+ 
+-  if (session->primary_spotify_return)
+-    return false; /* This route has no reopened writer barrier yet. */
+   if (!outputs_radio_absence_emission_allowed(session->device_id) || !outputs_radio_parked_absence_emission_allowed(session->device_id) || !outputs_radio_parked_bridge_emission_allowed(session->device_id,session->device_incarnation,session->session_epoch,session) || !outputs_radio_other_emission_allowed(session->device_id,session->device_incarnation,session->session_epoch,session) || !outputs_radio_sender_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) || (!session->primary_spotify_park_generation && !outputs_radio_handoff_emission_current(session->device_id)) || session->attention_retiring || session->recovery_only)
+     return false;
+   if (session->primary_radio)
+@@ -2525,8 +2531,11 @@
+       && (!outputs_start_gate_closed() || outputs_start_disjoint_radio_gate(session->device_id));
+   if (outputs_start_gate_closed())
+     return false;
+-  if(outputs_start_source_owned() && !outputs_radio_parked_bridge_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_other_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_reacquired_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_start_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session))return false;
+-  if (!session->attention_managed && !session->start_route_managed)
++  if (session->primary_spotify_return && (!session->primary_spotify_return_opened
++      || !outputs_radio_reacquired_emission_current(session->device_id, session->device_incarnation, session->session_epoch, session)))
++    return false;
++  if(!session->primary_spotify_return && outputs_start_source_owned() && !outputs_radio_parked_bridge_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_other_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_radio_reacquired_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session) && !outputs_start_emission_current(session->device_id,session->device_incarnation,session->session_epoch,session))return false;
++  if (!session->attention_managed && !session->start_route_managed && !session->primary_spotify_return)
+     return true; // Ordinary legacy sessions retain their original contract.
+   device = outputs_device_get(session->device_id);
+   if (!device || !device->selected || session->attention_suspended
+@@ -6152,6 +6161,20 @@
+   if(!s || s!=expected || !s->master_session || s->master_session->packet_serial==UINT64_MAX)return -1;
+   s->emission_floor=s->master_session->packet_serial+1;return 0;
+ }
++int
++outputs_airplay_primary_spotify_return_open(uint64_t id, const void *expected)
++{
++  struct output_device *device = outputs_device_get(id);
++  if (!outputs_airplay_primary_spotify_session_current(device, expected))
++    return -1;
++  struct airplay_session *session = device->session;
++  if (!session->primary_spotify_return || session->primary_spotify_return_opened
++      || outputs_airplay_radio_emission_floor(id, expected) < 0)
++    return -1;
++  session->primary_spotify_return_opened = true;
++  return 0;
++}
++
+ static bool airplay_start_drained(struct output_device *device)
+ {
+   struct airplay_session *s=device->session;
