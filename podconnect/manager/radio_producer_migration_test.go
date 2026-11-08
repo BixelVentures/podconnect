@@ -154,18 +154,20 @@ func TestRadioProducerMigrationPrimaryTerminalHistory(t *testing.T) {
 
 func TestRadioProducerMigrationRejectionRequiresExactTypedOperation(t *testing.T) {
 	const epoch, generation = "1", "2"
-	native, sender, action := strings.Repeat("a", 64), attentionUUID(), attentionUUID()
+	native, sender, action, commandID := strings.Repeat("a", 64), attentionUUID(), attentionUUID(), attentionUUID()
 	token, digest := strings.Repeat("b", 32), strings.Repeat("c", 64)
 	legacy := radioProducerRecord{
 		Terminal: true, Outcome: "rejected", Stage: "no-effects-rejected",
+		Fence: radioFence{Token: action, ActionID: commandID, Generation: 2},
 		Request: radioProducerReserve{
-			radioProducerIdentity: radioProducerIdentity{Process: native, Target: "room", Handoff: action, Generation: 2},
+			radioProducerIdentity: radioProducerIdentity{Process: native, Target: "room", Handoff: action, ActionID: commandID, Generation: 2},
 			ExpectedIntent:        radioProducerIntent{Process: native, Revision: "1"},
-			Peer:                  radioProducerPeer{Process: sender, OwnerGeneration: 1, ReceiverDigest: digest},
+			Peer: radioProducerPeer{Process: sender, OwnerGeneration: 1, ReceiverDigest: digest, Target: "room", CandidateID: action,
+				Operation: radioProducerIdentity{Process: sender, Target: "room", Handoff: action, ActionID: commandID, Generation: 2}},
 		},
 	}
 	legacy.Request.Peer.Proof, _ = json.Marshal(map[string]string{
-		"device_id": "1", "operation_id": action, "operation_generation": generation,
+		"schema": "podconnect.radio-sender.v1", "device_id": "1", "operation_id": action, "operation_generation": generation,
 		"radio_process": sender, "radio_owner_epoch": epoch, "sender_token": token,
 	})
 	nativeWire := nativeProducerWire(legacy.Request)
@@ -200,6 +202,14 @@ func TestRadioProducerMigrationRejectionRequiresExactTypedOperation(t *testing.T
 		if producerLegacyHistoryTerminal(nil, other) {
 			t.Fatal("accepted reconciliation without retained sender proof")
 		}
+	}
+
+	other := legacy
+	spliced := attentionUUID()
+	other.Request.Peer.Proof = json.RawMessage(strings.ReplaceAll(string(legacy.Request.Peer.Proof), action, spliced))
+	other.CancellationReceipt = json.RawMessage(strings.ReplaceAll(string(legacy.CancellationReceipt), action, spliced))
+	if producerLegacyHistoryTerminal(nil, other) {
+		t.Fatal("accepted cancellation from another candidate operation")
 	}
 
 	predecessor := radioPrimarySession{Process: attentionUUID(), Operation: attentionUUID(), DeviceID: "1", Incarnation: "2", Epoch: "3", Route: "4"}

@@ -22,6 +22,7 @@ type primaryRadioFixture struct {
 	replaceReply string
 	waitReplace  bool
 	expiredStop  bool
+	rejectFirst  string
 }
 
 func (f *primaryRadioFixture) PrimaryState(context.Context) (radioPrimaryState, error) {
@@ -77,7 +78,14 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 		}
 	case "prepare_start":
 		result.Phase = "prepared"
+		if f.rejectFirst == phase {
+			result.Phase = "rejected"
+		}
 	case "start":
+		if f.rejectFirst == phase {
+			result.Phase = "rejected"
+			return result, nil
+		}
 		result.Phase = "playing"
 		session := f.session
 		if r.Primary.IncumbentSession != nil {
@@ -234,7 +242,7 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 }
 
 func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
-	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown"} {
+	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown", "rejected-preflight-first", "rejected-decode-first"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -278,6 +286,32 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 			q := radioCommand{ActionID: attentionUUID(), Action: "start", StationID: "p3", TargetID: target,
 				ExpectedRevision: current.Revision, ExpectedProcessID: current.ProcessID,
 				ExpectedGeneration: current.Generation, ExpectedOwnerGeneration: current.OwnerGeneration}
+			if variant == "rejected-preflight-first" || variant == "rejected-decode-first" {
+				f.rejectFirst = "start"
+				want := []string{"reserve", "prepare_start", "start"}
+				if variant == "rejected-preflight-first" {
+					f.rejectFirst, want = "prepare_start", want[:2]
+				}
+				state, err := c.execute(ctx, q)
+				if err == nil || state.SourceKind != "spotify" || !reflect.DeepEqual(f.calls, want) || p.active != "" {
+					t.Fatalf("receiver-free rejection changed Spotify or emitted another operation: %v %v", state, err)
+				}
+				c.refresh(ctx)
+				if !reflect.DeepEqual(f.calls, want) {
+					t.Fatal("passive observation replayed the rejected action")
+				}
+				current := c.snapshot()
+				q.ActionID, q.StationID = attentionUUID(), "p1"
+				q.ExpectedRevision, q.ExpectedGeneration = current.Revision, current.Generation
+				q.ExpectedOwnerGeneration = current.OwnerGeneration
+				f.rejectFirst, f.calls = "", nil
+				state, err = c.execute(ctx, q)
+				if err != nil || state.StationID != "p1" || state.SourceKind != "radio" ||
+					!reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {
+					t.Fatalf("new explicit selection did not recover: %v %v", state, err)
+				}
+				return
+			}
 			started, err := c.execute(ctx, q)
 			if !reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {
 				t.Fatalf("exact start path %v", f.calls)

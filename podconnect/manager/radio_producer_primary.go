@@ -402,17 +402,17 @@ func (p *radioProducer) primaryPrepareReplacement(ctx context.Context, f radioFe
 	if receipt.Phase != "replacement_rejected" {
 		return errRadioUnknown
 	}
-	return p.primaryRejectReplacement(r, receipt)
+	return p.primaryRejectNoEffects(r, receipt)
 }
 
 // Only an exact terminal owner receipt can retire the candidate before any
 // receiver STOP. A timeout or malformed reply still holds the operation.
-func (p *radioProducer) primaryRejectReplacement(r radioProducerRecord, receipt radioPrimaryReceipt) error {
+func (p *radioProducer) primaryRejectNoEffects(r radioProducerRecord, receipt radioPrimaryReceipt) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	current := p.records[r.Fence.Token]
 	if current.Fence != r.Fence || current.Stage != r.Stage || current.Preempted || current.Terminal || current.Primary == nil ||
-		current.Primary.IncumbentSession == nil || p.active != current.Primary.Incumbent || p.evidence.NativeProcess != receipt.Process {
+		(current.Primary.Incumbent != "" && current.Primary.IncumbentSession == nil) || p.active != current.Primary.Incumbent || p.evidence.NativeProcess != receipt.Process {
 		return errRadioUnknown
 	}
 	state := *current.Primary
@@ -491,9 +491,14 @@ func (p *radioProducer) primaryEffect(ctx context.Context, f radioFence, phase, 
 		return errRadioUnknown
 	}
 	receipt, err = p.primaryWait(ctx, q, receipt)
-	if err == nil && phase == "stop" && r.Primary.IncumbentSession != nil &&
-		receipt.Phase == "replacement_rejected" && receipt.Observation == nil && receipt.TeardownCSeq == 0 {
-		return p.primaryRejectReplacement(r, receipt)
+	if err == nil && receipt.Observation == nil && receipt.TeardownCSeq == 0 {
+		if phase == "stop" && r.Primary.IncumbentSession != nil && receipt.Phase == "replacement_rejected" {
+			return p.primaryRejectNoEffects(r, receipt)
+		}
+		if (phase == "prepare_start" || phase == "start") && r.Primary.Incumbent == "" &&
+			receipt.Phase == "rejected" && receipt.Session == nil {
+			return p.primaryRejectNoEffects(r, receipt)
+		}
 	}
 	if err != nil || !primaryTerminalReceipt(q, receipt, r.Primary.Device) {
 		return errRadioUnknown

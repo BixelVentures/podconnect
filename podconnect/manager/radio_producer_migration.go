@@ -27,9 +27,16 @@ func producerLegacyHistoryTerminal(records map[string]radioProducerRecord, recor
 		case "preflight-rejected", "preflight-reconciled":
 			return true
 		case "no-effects-rejected":
+			request, peer := record.Request, record.Request.Peer
+			operation := peer.Operation
 			var query map[string]any
-			if !producerNativeRejectionMatches(record.NativeRejection, nativeProducerWire(record.Request)) ||
-				json.Unmarshal(record.Request.Peer.Proof, &query) != nil || query == nil {
+			if !producerNativeRejectionMatches(record.NativeRejection, nativeProducerWire(request)) ||
+				request.Handoff != record.Fence.Token || request.ActionID != record.Fence.ActionID || request.Generation != record.Fence.Generation ||
+				operation.Process != peer.Process || operation.Handoff != request.Handoff || operation.ActionID != request.ActionID ||
+				operation.Generation != request.Generation || operation.Target != request.Target || peer.Target != request.Target ||
+				peer.CandidateID != operation.Handoff || json.Unmarshal(peer.Proof, &query) != nil || query == nil ||
+				query["schema"] != "podconnect.radio-sender.v1" || query["operation_id"] != operation.Handoff ||
+				query["operation_generation"] != strconv.FormatUint(operation.Generation, 10) {
 				return false
 			}
 			var cancelled radioProducerSenderReply
@@ -52,15 +59,23 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	}
 	if record.Outcome == "rejected" && record.Stage == "no-effects-rejected" {
 		command, receipt := primary.LastCommand, primary.LastReceipt
-		if command == nil || receipt == nil || (command.Phase != "prepare_replace" && command.Phase != "stop") || primary.Session != nil ||
-			receipt.Phase != "replacement_rejected" || receipt.TeardownCSeq != 0 || receipt.Observation != nil {
+		if command == nil || receipt == nil || primary.Session != nil || receipt.TeardownCSeq != 0 || receipt.Observation != nil {
 			return false
 		}
 		q := *command
 		q.ForPhase = receipt.ForPhase
-		return primary.IncumbentSession != nil && q.Session != nil && *q.Session == *primary.IncumbentSession &&
-			(q.ForPhase == "" || q.ForPhase == command.Phase) && q.matches(*receipt) &&
-			producerPrimaryStopOperation(*receipt, record) && receipt.Process == record.Request.Process
+		if (q.ForPhase != "" && q.ForPhase != command.Phase) || !q.matches(*receipt) ||
+			!producerPrimaryStopOperation(*receipt, record) || receipt.Process != record.Request.Process {
+			return false
+		}
+		switch command.Phase {
+		case "prepare_replace", "stop":
+			return primary.IncumbentSession != nil && q.Session != nil && *q.Session == *primary.IncumbentSession &&
+				receipt.Phase == "replacement_rejected"
+		case "prepare_start", "start":
+			return primary.Incumbent == "" && q.Session == nil && receipt.Session == nil && receipt.Phase == "rejected"
+		}
+		return false
 	}
 	if record.Outcome != "committed" || record.Stage != "terminal" {
 		return false
@@ -108,7 +123,7 @@ func producerPrimaryStopTerminal(record radioProducerRecord) bool {
 }
 
 func producerPrimaryStopOperation(receipt radioPrimaryReceipt, operation radioProducerRecord) bool {
-	return receipt.Handoff == operation.Fence.Token && receipt.Action == operation.Fence.ActionID &&
+	return receipt.Schema == primaryRadioSchema && receipt.Handoff == operation.Fence.Token && receipt.Action == operation.Fence.ActionID &&
 		receipt.Generation == strconv.FormatUint(operation.Fence.Generation, 10) &&
 		receipt.OwnerGeneration == strconv.FormatUint(operation.Fence.OwnerGeneration, 10) &&
 		receipt.Target == operation.Request.Target && receipt.From == operation.Request.From &&

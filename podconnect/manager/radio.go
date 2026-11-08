@@ -330,7 +330,8 @@ func (c *radioCoordinator) execute(ctx context.Context, q radioCommand) (radioSt
 		err = c.backend.Volume(effect, f, old.TargetID, *q.VolumePercent)
 	}
 	if err != nil {
-		return c.complete(generation, old, f, err, true)
+		var noEffects *radioProducerNoReceiverEffects
+		return c.complete(generation, old, f, err, !errors.As(err, &noEffects))
 	}
 	observation, err := c.backend.Finish(effect, f)
 	if err != nil {
