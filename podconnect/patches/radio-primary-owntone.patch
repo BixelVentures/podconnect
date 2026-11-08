@@ -6613,3 +6613,25 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..277277b675b967433dc936adfa812323
    if(input_ready)input_deinit();
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
+diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
+--- a/tests/outputs_attention_owner.c
++++ b/tests/outputs_attention_owner.c
+@@ -22,6 +22,18 @@
+ 
+ /* This output ledger fixture has no AirPlay or anonymous streaming backend.
+  * Their actual ownership/drain behavior is exercised by airplay_callback_owner. */
++bool outputs_airplay_primary_radio_owns(const struct output_device *device)
++{ (void)device; return false; }
++bool outputs_airplay_primary_radio_independent(const struct output_device *device)
++{ (void)device; return false; }
++bool outputs_airplay_primary_spotify_session_current(const struct output_device *device, const void *session)
++{ (void)device; (void)session; return false; }
++void outputs_airplay_primary_radio_remove(struct output_device *device)
++{ (void)device; assert(!"ledger fixture reached primary radio removal"); }
++int outputs_airplay_primary_radio_preempt(struct output_device *device)
++{ (void)device; assert(!"ledger fixture reached primary radio preemption"); return -1; }
++void outputs_airplay_spotify_start_retire(void) {}
++bool outputs_airplay_spotify_start_drained(void) { return true; }
+ int outputs_airplay_radio_emission_floor(uint64_t id,const void *session){(void)id;(void)session;return -1;}
+ int outputs_airplay_radio_pairing_key_digest(uint64_t id,char out[65]){(void)id;(void)out;return -1;}
+ int outputs_airplay_radio_controller_id(char out[17]){(void)out;return -1;}
