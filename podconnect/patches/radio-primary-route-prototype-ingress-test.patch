@@ -1,0 +1,100 @@
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -687,6 +687,7 @@
+   int short_salts, padded_salts, pc70_peer_sessions;
+   bool primary_route_receiver, primary_route_auth_required;
+   char session_uri[256];
++  unsigned short requested_control_port;
+   struct output_attention_result handoff;
+   struct output_room_volume_request volume_command;
+   struct output_room_volume_result volume_result;
+@@ -889,6 +890,14 @@
+     plist_t setup = NULL;
+     if (body && bytes) plist_from_bin((const char *)body, bytes, &setup);
+     bool stream_setup = setup && plist_dict_get_item(setup, "streams");
++    if (f->primary_route_receiver && stream_setup)
++      {
++        plist_t stream = plist_array_get_item(plist_dict_get_item(setup, "streams"), 0);
++        uint64_t port = 0;
++        plist_get_uint_val(plist_dict_get_item(stream, "controlPort"), &port);
++        assert(port > 0 && port <= UINT16_MAX);
++        f->requested_control_port = (unsigned short)port;
++      }
+     if (setup) plist_free(setup);
+     if(stream_setup) {
+       plist_t streams=plist_new_array(),stream=plist_new_dict();
+@@ -1536,7 +1545,21 @@
+ }
+ 
+ static int
+-primary_radio_wire_case(void)
++primary_radio_wire_resend(struct recovery_wire_fixture *f, unsigned short port, uint16_t sequence)
++{
++  struct sockaddr_in destination = { .sin_family = AF_INET, .sin_port = htons(port),
++    .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
++  uint8_t request[8] = { 0x80, 0xd5, 0, 0, sequence >> 8, sequence & 0xff, 0, 1 };
++  uint16_t observed;
++
++  assert(sendto(f->udp_fd, request, sizeof(request), 0,
++      (struct sockaddr *)&destination, sizeof(destination)) == sizeof(request));
++  event_base_loop(f->base, EVLOOP_NONBLOCK);
++  return primary_radio_wire_packets(f, &observed);
++}
++
++static int
++primary_radio_wire_case(bool ingress_red)
+ {
+   struct recovery_wire_fixture music = { .udp_fd = -1 }, radio = { .udp_fd = -1 };
+   struct airplay_primary_radio_route route, next;
+@@ -1544,6 +1567,7 @@
+   char database[] = "/tmp/primary-radio-wire-db-XXXXXX";
+   int file = mkstemp(database), result = 0;
+   uint16_t music_seq = 0, radio_seq = 0, first_music_seq;
++  unsigned short old_radio_control_port;
+   uint8_t a[AIRPLAY_SAMPLES_PER_PACKET * 4] = { 0 }, b[sizeof(a)];
+   struct output_buffer music_pcm = { 0 }, radio_pcm = { 0 };
+ 
+@@ -1581,6 +1605,8 @@
+   airplay_write(&music_pcm);
+   assert(primary_radio_wire_packets(&music, &music_seq) == 1);
+   first_music_seq = music_seq;
++  assert(music.requested_control_port == airplay_control_svc.port);
++  assert(primary_radio_wire_resend(&music, music.requested_control_port, music_seq) == 1);
+ 
+   assert(airplay_primary_radio_start(radio.device, &route) == 0);
+ #ifdef RADIO_PRIMARY_SESSION_PROOF
+@@ -1604,6 +1630,16 @@
+   assert(airplay_primary_radio_write(&route, &radio_pcm) == 0);
+   assert(primary_radio_wire_packets(&radio, &radio_seq) == 1);
+   assert(primary_radio_wire_packets(&music, &music_seq) == 0);
++  old_radio_control_port = radio.requested_control_port;
++  int resent = primary_radio_wire_resend(&radio, old_radio_control_port, radio_seq);
++  if (ingress_red && resent == 1 && old_radio_control_port == airplay_control_svc.port)
++    {
++      fputs("RADIO_PRIMARY_INGRESS_RED: unauthenticated shared datagram reached B's ring\n", stderr);
++      result = 1;
++      goto cleanup;
++    }
++  assert(!resent && old_radio_control_port != airplay_control_svc.port);
++  assert(primary_radio_wire_resend(&radio, airplay_control_svc.port, radio_seq) == 0);
+   assert(airplay_primary_radio_revoke(&route) == 0);
+   assert(airplay_primary_radio_write(&route, &radio_pcm) < 0);
+   packets_resend(radio.device->session, radio_seq, 1);
+@@ -1622,6 +1658,7 @@
+   assert(primary_radio_wire_packets(&radio, &radio_seq) == 0);
+   assert(airplay_primary_radio_write(&next, &radio_pcm) == 0);
+   assert(primary_radio_wire_packets(&radio, &radio_seq) == 1);
++  assert(primary_radio_wire_resend(&radio, old_radio_control_port, radio_seq) == 0);
+ 
+   primary_radio_wire_receiver_reset(&radio); /* Real unexpected RTSP disconnect. */
+   primary_radio_wire_wait(&radio, false);
+@@ -1668,7 +1705,8 @@
+   gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
+   if (argc == 3 && (!strcmp(argv[1], "--pc70-recover-fenced") || !strcmp(argv[1], "--pc70-recover-terminal")))
+     return manual_release_recover_process_case(argv[2], !strcmp(argv[1], "--pc70-recover-fenced"));
+-  if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-wire")) return primary_radio_wire_case();
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-wire")) return primary_radio_wire_case(false);
++  if (argc == 2 && !strcmp(argv[1], "--radio-primary-ingress-red")) return primary_radio_wire_case(true);
+   if (argc == 2 && !strcmp(argv[1], "--radio-primary-output-route")) return radio_primary_output_route_case();
+   if (argc == 2 && !strcmp(argv[1], "--metadata-pipe-owner")) return metadata_pipe_owner_case();
+   if (argc == 2 && !strcmp(argv[1], "--attention-recovery-wire"))
