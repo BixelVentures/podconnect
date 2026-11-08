@@ -1,0 +1,44 @@
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1951,6 +1951,32 @@
+ #include "httpd_jsonapi_radio_sender.inc.c"
+ #include "httpd_jsonapi_radio_reacquire.inc.c"
+ 
++/* The composed primary build exposes this private, read-only capability.
++ * Current custody remains a separate observation and effect admission is
++ * never granted by this response. */
++static int
++jsonapi_reply_primary_radio_readiness(struct httpd_request *hreq)
++{
++  uint64_t id;
++  struct output_radio_admission admission = { 0 };
++  json_object *reply;
++  if (outputs_radio_sender_role()
++      || safe_atou64(hreq->path_parts[2], &id) < 0 || !id || id == UINT64_MAX)
++    return HTTP_BADREQUEST;
++  if (player_radio_admission_get(id, &admission) < 0)
++    return 409;
++  reply = json_object_new_object();
++  if (!reply)
++    return HTTP_SERVUNAVAIL;
++  json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_primary_radio_readiness.v1"));
++  json_object_object_add(reply, "process_id", json_object_new_string(admission.process_id));
++  attention_json_u64(reply, "device_id", admission.device_id);
++  attention_json_u64(reply, "device_incarnation", admission.device_incarnation);
++  json_object_object_add(reply, "legacy_admission_open", json_object_new_boolean(admission.admission_open));
++  json_object_object_add(reply, "physical_result_verified", json_object_new_boolean(false));
++  return transport_json_reply(hreq, reply);
++}
++
+ static int
+ jsonapi_reply_transport_write(struct httpd_request *hreq)
+ {
+@@ -5210,6 +5236,7 @@
+     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/radio-handoff/capabilities$", jsonapi_reply_radio_capability },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/source-state$", jsonapi_reply_radio_source_state },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/reacquire$", jsonapi_reply_radio_reacquire },
++    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/radio-handoff/primary-readiness$", jsonapi_reply_primary_radio_readiness },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/(move|move-state)$", jsonapi_reply_radio_move },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/(source-move|source-move-state)$", jsonapi_reply_radio_source_move },
+     { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/other-target$", jsonapi_reply_radio_other_target },

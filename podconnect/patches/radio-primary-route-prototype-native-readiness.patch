@@ -1,0 +1,218 @@
+diff --git a/daemon/radio_primary.go b/daemon/radio_primary.go
+--- a/daemon/radio_primary.go
++++ b/daemon/radio_primary.go
+@@ -122,24 +122,7 @@
+ 		return
+ 	}
+ 	if c.Query {
+-		app.radio.mu.Lock()
+-		revision := strconv.FormatUint(app.radio.Intent, 10)
+-		app.radio.mu.Unlock()
+-		targets := []radioTarget{}
+-		for i, id := range app.cfg.DeviceAliasRoomIDs {
+-			if i < len(app.cfg.DeviceAliases) && i < len(app.cfg.DeviceAliasHomePodIDs) && id != "" {
+-				targets = append(targets, radioTarget{id, app.cfg.DeviceAliases[i], app.cfg.DeviceAliasHomePodIDs[i], "unknown", false, i == 0, ""})
+-			}
+-		}
+-		req.Reply(struct {
+-			Schema      string                   `json:"schema"`
+-			Process     string                   `json:"process_id"`
+-			Revision    string                   `json:"native_revision"`
+-			Targets     []radioTarget            `json:"configured_targets"`
+-			Missing     []string                 `json:"missing_proofs"`
+-			Observation *radioPrimaryObservation `json:"observation"`
+-		}{nativePrimarySchema, radioProcessID(process), revision, targets,
+-			[]string{"primary_exact_spotify_park_and_return_unverified", "primary_decoder_shutdown_unverified"}, nil}, nil)
++		req.Reply(app.radioPrimaryReadiness(ctx, process), nil)
+ 		return
+ 	}
+ 	// Keep the private prototype dormant until the same-target park/handback
+diff --git a/daemon/radio_reacquire.go b/daemon/radio_reacquire.go
+--- a/daemon/radio_reacquire.go
++++ b/daemon/radio_reacquire.go
+@@ -391,6 +391,9 @@
+ 		return err
+ 	}
+ 	defer response.Body.Close()
++	if _, ok := out.(*radioPrimaryCapability); ok && method == http.MethodGet && (response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusBadRequest) {
++		return errPrimaryCapabilityUnsupported
++	}
+ 	raw, err = io.ReadAll(io.LimitReader(response.Body, 16385))
+ 	if err != nil || len(raw) > 16384 || response.StatusCode != http.StatusOK {
+ 		return ErrAliasConflict
+diff --git a/daemon/radio_primary_readiness.go b/daemon/radio_primary_readiness.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/radio_primary_readiness.go
+@@ -0,0 +1,103 @@
++package daemon
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"strconv"
++	"strings"
++)
++
++const primaryRadioCapabilitySchema = "podconnect.output_primary_radio_readiness.v1"
++
++var errPrimaryCapabilityUnsupported = errors.New("primary radio capability endpoint unsupported")
++
++type radioPrimaryCapability struct {
++	Schema      string `json:"schema"`
++	Process     string `json:"process_id"`
++	Device      string `json:"device_id"`
++	Incarnation string `json:"device_incarnation"`
++	LegacyOpen  *bool  `json:"legacy_admission_open"`
++	Physical    *bool  `json:"physical_result_verified"`
++}
++
++func (c radioPrimaryCapability) valid(device string) bool {
++	return c.Schema == primaryRadioCapabilitySchema && c.Device == device &&
++		volumeUUID.MatchString(c.Process) && volumeCounter(c.Incarnation) && c.Incarnation != "0" &&
++		c.LegacyOpen != nil && c.Physical != nil && !*c.Physical
++}
++
++type radioPrimaryReadinessState struct {
++	Schema      string                   `json:"schema"`
++	Protocol    string                   `json:"protocol,omitempty"`
++	Process     string                   `json:"process_id"`
++	Revision    string                   `json:"native_revision"`
++	Targets     []radioTarget            `json:"configured_targets"`
++	Missing     []string                 `json:"missing_proofs"`
++	Observation *radioPrimaryObservation `json:"observation"`
++}
++
++// Only the exact composed C build publishes the authenticated capability.
++// Capability and inventory alone are never a source observation. Until the
++// actor reports its matching current owner this path remains visibly closed.
++func (app *App) radioPrimaryReadiness(ctx context.Context, process contentProcess) radioPrimaryReadinessState {
++	app.radio.mu.Lock()
++	intent, failed := app.radio.Intent, app.radio.failed
++	app.radio.mu.Unlock()
++	s := radioPrimaryReadinessState{
++		Schema: nativePrimarySchema, Process: radioProcessID(process), Revision: strconv.FormatUint(intent, 10),
++		Targets: []radioTarget{}, Missing: []string{"primary_c_capability_unverified"},
++	}
++	if failed || !app.radioEnabled() || !roomTransportURL(app.cfg.RoomTransportOwnToneURL) ||
++		len(app.cfg.DeviceAliasRoomIDs) != len(app.cfg.DeviceAliases) || len(app.cfg.DeviceAliasHomePodIDs) != len(app.cfg.DeviceAliases) {
++		return s
++	}
++	rooms, devices := map[string]bool{}, map[string]bool{}
++	for i, id := range app.cfg.DeviceAliasRoomIDs {
++		device := app.cfg.DeviceAliasHomePodIDs[i]
++		if !nativeOwnerASCII(id, 255) || !homePodIDPattern.MatchString(device) || !volumeCounter(device) || device == "0" || rooms[id] || devices[device] {
++			return s
++		}
++		rooms[id], devices[device] = true, true
++		s.Targets = append(s.Targets, radioTarget{id, app.cfg.DeviceAliases[i], device, "unknown", false, i == 0, ""})
++	}
++	unsupported := 0
++	cProcess := ""
++	base := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/")
++	for _, target := range s.Targets {
++		var c radioPrimaryCapability
++		endpoint := base + "/api/outputs/" + target.HomePodID + "/radio-handoff/primary-readiness"
++		err := radioControlHTTP(ctx, http.MethodGet, endpoint, app.cfg.RadioHandoffControlToken, nil, &c)
++		if errors.Is(err, errPrimaryCapabilityUnsupported) {
++			// Released C maps an unrecognized JSON path to 400. Neither
++			// 400 nor 404 alone establishes an older working owner.
++			var legacy radioAvailabilityAdmission
++			legacyEndpoint := base + "/api/outputs/" + target.HomePodID + "/radio-admission"
++			if radioControlHTTP(ctx, http.MethodGet, legacyEndpoint, app.cfg.RadioHandoffControlToken, nil, &legacy) != nil ||
++				legacy.Schema != "podconnect.output_radio_admission.v1" || legacy.Physical || !legacy.Open ||
++				legacy.DeviceID != target.HomePodID || !volumeUUID.MatchString(legacy.Process) ||
++				!volumeCounter(legacy.Incarnation) || legacy.Incarnation == "0" || (cProcess != "" && legacy.Process != cProcess) {
++				return s
++			}
++			cProcess = legacy.Process
++			unsupported++
++			continue
++		}
++		if err != nil || !c.valid(target.HomePodID) || (cProcess != "" && c.Process != cProcess) {
++			return s
++		}
++		cProcess = c.Process
++	}
++	app.radio.mu.Lock()
++	stable := app.radio.Intent == intent && !app.radio.failed
++	app.radio.mu.Unlock()
++	if !stable || ctx.Err() != nil || len(s.Targets) == 0 {
++		return s
++	}
++	if unsupported == len(s.Targets) {
++		s.Protocol = "v1" // Manager still requires fresh v1 evidence from this Native process.
++	} else if unsupported == 0 && cProcess != "" {
++		s.Missing = []string{"primary_current_owner_unverified"}
++	}
++	return s
++}
+diff --git a/daemon/radio_primary_readiness_test.go b/daemon/radio_primary_readiness_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/radio_primary_readiness_test.go
+@@ -0,0 +1,63 @@
++package daemon
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestPrimaryRadioReadinessSeparatesCapabilityFromCurrentOwner(t *testing.T) {
++	const token = "0123456789abcdef0123456789abcdef"
++	process := contentProcess{BootID: "boot", PID: "31", StartTicks: "20"}
++	app := &App{cfg: &Config{
++		DeviceAliases: []string{"Kitchen"}, DeviceAliasRoomIDs: []string{"kitchen"}, DeviceAliasHomePodIDs: []string{"42"},
++		RadioHandoffControlToken: token, RadioHandoffOwnerURL: "http://127.0.0.1:4010",
++		RadioHandoffStatePath: filepath.Join(t.TempDir(), "radio.json"), RoomTransportOwnToneURL: "http://127.0.0.1:3689",
++	}}
++	const legacy = `{"schema":"podconnect.output_radio_admission.v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","admission_open":true,"physical_result_verified":false}`
++	const capability = `{"schema":"podconnect.output_primary_radio_readiness.v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","legacy_admission_open":true,"physical_result_verified":false}`
++	for _, tc := range []struct {
++		name, body, legacy, protocol, missing string
++		status                                int
++	}{
++		{"old C released route-miss and exact legacy owner", "", legacy, "v1", "primary_c_capability_unverified", http.StatusBadRequest},
++		{"old C route 404 and exact legacy owner", "", legacy, "v1", "primary_c_capability_unverified", http.StatusNotFound},
++		{"route miss alone is not old C", "", "", "", "primary_c_capability_unverified", http.StatusBadRequest},
++		{"new C alone is not owner proof", capability, "", "", "primary_current_owner_unverified", http.StatusOK},
++		{"different receiver", strings.Replace(capability, `"42"`, `"43"`, 1), "", "", "primary_c_capability_unverified", http.StatusOK},
++		{"truncated response", capability[:25], "", "", "primary_c_capability_unverified", http.StatusOK},
++		{"unavailable C is not old C", "", "", "", "primary_c_capability_unverified", http.StatusServiceUnavailable},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			old := http.DefaultTransport
++			defer func() { http.DefaultTransport = old }()
++			reads := 0
++			http.DefaultTransport = pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++				reads++
++				if r.Method != http.MethodGet || r.Header.Get("X-PodConnect-Token") != token {
++					t.Fatalf("unexpected capability request %s %s", r.Method, r.URL.Path)
++				}
++				if r.URL.Path == "/api/outputs/42/radio-admission" && reads == 2 {
++					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tc.legacy))}, nil
++				}
++				if r.URL.Path != "/api/outputs/42/radio-handoff/primary-readiness" || reads != 1 {
++					t.Fatalf("unexpected capability path %s", r.URL.Path)
++				}
++				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
++			})
++			got := app.radioPrimaryReadiness(context.Background(), process)
++			wantReads := 1
++			if tc.status == http.StatusBadRequest || tc.status == http.StatusNotFound {
++				wantReads++
++			}
++			if reads != wantReads || got.Process != radioProcessID(process) || got.Protocol != tc.protocol || got.Observation != nil ||
++				len(got.Missing) != 1 || got.Missing[0] != tc.missing || len(got.Targets) != 1 ||
++				got.Targets[0].Selectable || got.Targets[0].ReceiverDigest != "" {
++				t.Fatalf("unexpected readiness %v", got)
++			}
++		})
++	}
++}
