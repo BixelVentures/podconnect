@@ -194,7 +194,7 @@ jobs:
             git apply "$patch_dir/$patch.patch"
           done
           # CI-only fixture overlays are applied after the immutable production stack.
-          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-writer-stat-churn-ci; do
+          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-writer-stat-churn-ci paused-queue-owner-c; do
             patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
             git apply --check "$patch"
             git apply "$patch"
@@ -239,6 +239,7 @@ jobs:
           sudo -n env PC_MOVE_CLOCK_PROBE=1 PC_HOLD_MOVE_SETUP=1 timeout 15 src/airplay_callback_owner --move-wire
           sudo -n env PC_MOVE_CLOCK_PROBE=1 PC_HOLD_MOVE_SETUP=1 PC_MOVE_CLOCK_PAUSED=1 timeout 15 src/airplay_callback_owner --move-wire
           sudo -n timeout 25 src/airplay_callback_owner --move-pause-resume-wire
+          sudo -n env PC_PAUSED_QUEUE_OWNER=1 timeout 50 src/airplay_callback_owner --move-pause-resume-wire
           sudo -n src/airplay_callback_owner --queue-connect-wire
           sudo -n src/airplay_callback_owner --move-retire-wire
           sudo -n src/airplay_callback_owner --move-retire-live-wire
@@ -279,7 +280,7 @@ jobs:
   selected-start-clock:
     needs: [build-fork, build-owntone]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install shared libraries for the existing compiled fixtures

@@ -1,0 +1,151 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 19bed7c..346f06a 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -974,6 +974,10 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+             && !(f->mode == 29 && (getenv("PC_NATIVE_START_EXPECT_PAUSE_LOSS") || getenv("PC70_RELEASE_COMPOSE"))))
+         || (f->mode == 17 && f->phase != 4) || bytes || !f->device->session || !strstr(header, "\r\nRTP-Info: seq="))
+       {recovery_wire_fail(f,"unexpected ordinary FLUSH");goto done;}
++  } else if(!strncmp(header,"POST /feedback ",15) && f->mode==24
++      && completed_move_real_resume && getenv("PC_PAUSED_QUEUE_OWNER")) {
++    if(bytes || !f->cipher || !f->device->session)
++      {recovery_wire_fail(f,"invalid queue continuation feedback");goto done;}
+   } else if(!strncmp(header,"TEARDOWN ",9)) {
+     enum output_attention_recovery_state state;struct output_attention_proof proof;
+     f->teardowns++;
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index f61dfaa..4dc7d6b 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -995,14 +995,17 @@ struct ordinary_resume_flow {
+   struct player_source *source;struct input_fifo_identity reader;
+   bool retain;const struct output_native_owner *owner;void *session;
+   uint64_t epoch,route;struct timespec paused_at;
++  const struct output_queue_writer *queue_writer;
++  size_t pcm_bytes;unsigned post_queue_reads;struct timespec refill_at;
+   struct output_room_volume_request volume;struct output_room_volume_result volume_result;
+ };
+ static void *ordinary_resume_pcm(void *arg)
+ {
+   struct ordinary_resume_flow *flow=arg;
+   char pcm[400000]={0};size_t offset=0;
+-  while(offset<sizeof(pcm)) {
+-    ssize_t n=write(flow->writer,pcm+offset,sizeof(pcm)-offset);
++  size_t total=flow->pcm_bytes ? flow->pcm_bytes : sizeof(pcm);
++  while(offset<total) {
++    ssize_t n=write(flow->writer,pcm,MIN(sizeof(pcm),total-offset));
+     if(n<0 && errno==EINTR)continue;
+     if(n<=0)break;
+     offset+=n;
+@@ -1014,6 +1017,13 @@ static void real_move_transport(struct ordinary_resume_flow *flow,const char *ac
+   struct recovery_wire_fixture *f=flow->fixture;
+   struct output_transport_request q={.device_id=f->device->id,.bound=true,.percent=-1,.native_revision=revision};
+   struct output_transport_result prepared,result;q.native_owner=*flow->owner;
++  if(!strcmp(action,"queue")){
++    assert(flow->queue_writer);
++    q.writer=*flow->queue_writer;
++    memset(q.queue.observation_id,'c',32);
++    memset(q.queue.occurrence_id,'d',24);
++    strcpy(q.queue.session_id,q.native_owner.session_id);
++  }
+   strcpy(q.action,action);memset(q.native_prepare_id,'7',32);memset(q.args_digest,'8',64);
+   strcpy(q.expected_input_path_digest,transport_input_path_digest);
+   assert(outputs_transport_prepare(&q,&prepared)==0);q=prepared.command;
+@@ -1075,7 +1085,7 @@ static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
+         && f->device->session==flow->session && f->device->session_epoch==flow->epoch
+         && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
+       puts("PASS real ten-second completed MOVE STOP timer rearms exact retained AP2 session after bound volume");
+-      real_move_transport(flow,"resume",12);
++      real_move_transport(flow,flow->queue_writer ? "queue" : "resume",12);
+       /* The already-armed STOP may run after C ACK and before Native PCM. */
+       assert(event_pending(f->device->stop_timer,EV_TIMEOUT,NULL)
+         && f->device->stop_timer_session==flow->session
+@@ -1084,7 +1094,9 @@ static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
+       assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
+         && ((struct airplay_session *)flow->session)->state!=AIRPLAY_STATE_TEARDOWN
+         && f->device->route_revision==flow->route && transport_pause_owned(f->device->id));
+-      puts("PASS exact Resume C ACK retains same AP2 at already-armed STOP before first same-writer PCM");
++      puts(flow->queue_writer
++        ? "PASS exact Queue C ACK retains same AP2 at already-armed STOP before first same-writer PCM"
++        : "PASS exact Resume C ACK retains same AP2 at already-armed STOP before first same-writer PCM");
+       resume=true;
+     }
+     if(resume) {
+@@ -1095,14 +1107,30 @@ static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
+         evbuffer_drain(f->plain,evbuffer_get_length(f->plain));assert(!outputs_transport_busy());
+       }
+       char packet[2048];while(recv(f->udp_fd,packet,sizeof(packet),MSG_DONTWAIT)>0){}
++      if(flow->queue_writer){
++        flow->pcm_bytes=3500000; /* Over fifteen seconds of 44.1k stereo PCM after initial input buffering. */
++        assert(!clock_gettime(CLOCK_MONOTONIC,&flow->refill_at));
++      }
+       assert(!pthread_create(&flow->thread,NULL,ordinary_resume_pcm,flow));flow->phase=2;
+     }
++  }else if(flow->phase==2 && flow->queue_writer && !atomic_load(&flow->done)
++      && player_state==PLAY_PLAYING){
++    struct timespec now;assert(!clock_gettime(CLOCK_MONOTONIC,&now));
++    long elapsed=(now.tv_sec-flow->refill_at.tv_sec)*1000+(now.tv_nsec-flow->refill_at.tv_nsec)/1000000;
++    if(elapsed>=(long)(flow->post_queue_reads+1)*1000){
++      struct output_transport_identity route;bool busy,owned,absent;
++      assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch);
++      assert(outputs_transport_bound_state_get(f->device->id,flow->owner,&route,&busy,&owned,&absent)==0 && !busy);
++      assert(route.session_epoch==flow->epoch && route.route_revision==flow->route);
++      flow->post_queue_reads++;
++    }
+   }else if(flow->phase==2 && atomic_load(&flow->done) && player_state==PLAY_PLAYING
+       && f->device->session
+       && ((struct airplay_session *)f->device->session)->state==AIRPLAY_STATE_STREAMING) {
+     struct timespec deadline;struct input_fifo_identity actual={0};
+     char packet;assert(recv(f->udp_fd,&packet,1,MSG_DONTWAIT)==1);
+-    pb_timer_stop();assert(!pthread_join(flow->thread,NULL) && flow->written==400000);
++    pb_timer_stop();
++    assert(!pthread_join(flow->thread,NULL) && flow->written==(ssize_t)(flow->pcm_bytes ? flow->pcm_bytes : 400000));
+     clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
+     assert(input_fifo_owner_get(flow->source->item_id,flow->source->path,false,0,0,&deadline,&actual)==0);
+     assert(actual.device==flow->reader.device && actual.inode==flow->reader.inode
+@@ -1111,6 +1139,15 @@ static void ordinary_resume_poll(evutil_socket_t fd,short what,void *arg)
+     if(flow->retain)assert(f->device->session==flow->session && f->device->session_epoch==flow->epoch
+       && f->device->route_revision==flow->route && outputs_start_move_source_transition_current());
+     else assert(start_route_clean_absent());
++    if(flow->queue_writer){
++      struct output_transport_identity read,queue;bool busy,owned,absent;
++      assert(outputs_transport_bound_state_get(f->device->id,flow->owner,&read,&busy,&owned,&absent)==0 && !busy);
++      assert(outputs_queue_state_get(f->device->id,flow->owner,flow->queue_writer,&queue,&busy)==0
++        && !busy && transport_identity_equal(&read,&queue));
++      assert(flow->post_queue_reads>=15);
++      real_move_transport(flow,"pause",13);
++      puts("PASS accepted queue followed by sustained same-writer RTP, 15 fresh bound reads, and a second explicit Pause");
++    }
+     flow->phase=3;event_base_loopbreak(f->base);return;
+   }
+  again:
+@@ -1141,7 +1178,7 @@ static void ordinary_pause_resume_case(struct recovery_wire_fixture *f,int write
+ }
+ 
+ static void completed_move_real_pause_resume_case(struct recovery_wire_fixture *f,int writer,
+-    const struct output_native_owner *owner)
++    const struct output_native_owner *owner,const struct output_queue_writer *queue_writer)
+ {
+   struct db_queue_item *item=db_queue_fetch_byitemid(transport_input_item);assert(item);
+   session_start(source_create(item,0));free_queue_item(item,0);session_update_read_start(0);
+@@ -1152,8 +1189,9 @@ static void completed_move_real_pause_resume_case(struct recovery_wire_fixture *
+   cmdbase=commands_base_new(f->base,NULL);assert(cmdbase);
+   int result=-1;assert(playback_start_bh(NULL,&result)==COMMAND_END && result==0);pb_timer_stop();
+   struct ordinary_resume_flow flow={.fixture=f,.writer=writer,.source=pb_session.playing_now,.phase=-2,
+-    .retain=true,.owner=owner,.session=f->device->session,.epoch=f->device->session_epoch,.route=f->device->route_revision};
+-  struct timespec deadline;struct timeval soon={0,1000},bound={20,0};
++    .retain=true,.owner=owner,.session=f->device->session,.epoch=f->device->session_epoch,
++    .route=f->device->route_revision,.queue_writer=getenv("PC_PAUSED_QUEUE_OWNER") ? queue_writer : NULL};
++  struct timespec deadline;struct timeval soon={0,1000},bound={flow.queue_writer ? 42 : 20,0};
+   clock_gettime(CLOCK_MONOTONIC,&deadline);deadline.tv_sec++;
+   assert(input_fifo_owner_get(flow.source->item_id,flow.source->path,false,0,0,&deadline,&flow.reader)==0);
+   int flags=fcntl(writer,F_GETFL);assert(flags>=0 && fcntl(writer,F_SETFL,flags&~O_NONBLOCK)==0);
+@@ -2417,7 +2455,7 @@ static int start35_wire_case(int mode)
+         .pipe_inode=r->writer_pipe_inode,.source_epoch=0,.open_generation=1};
+       proof.native_process=r->native_process;memcpy(proof.input_path_digest,r->expected_input_path_digest,65);
+       queue_actual_same_reader(target,&r->committed_native_owner,&proof,fifo);
+-      if(completed_move_real_resume)completed_move_real_pause_resume_case(&f,writer,&r->committed_native_owner);
++      if(completed_move_real_resume)completed_move_real_pause_resume_case(&f,writer,&r->committed_native_owner,&proof);
+       else completed_move_pause_confirmation_case(target,&r->committed_native_owner,&writer);
+       goto cleanup;
+     }

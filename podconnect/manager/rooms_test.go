@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -30,7 +32,7 @@ func TestRoomFillLegacyVsNew(t *testing.T) {
 	dataDir = "/data"
 	r0 := &Room{ID: "r0", Idx: 0, Name: "Kitchen"}
 	r0.fill()
-	if r0.ConfigDir != "/data/go-librespot" || r0.OwnDir != "/data/owntone" || r0.Pipe != "/srv/media/spotify" {
+	if r0.ConfigDir != "/data/go-librespot" || r0.OwnDir != "/data/owntone" || r0.Pipe != "/data/media/spotify" {
 		t.Fatalf("r0 legacy paths wrong: %+v", r0)
 	}
 	if r0.Librespot != "http://localhost:3678" || r0.OwnTone != "http://localhost:3689" {
@@ -49,6 +51,53 @@ func TestRoomFillLegacyVsNew(t *testing.T) {
 	}
 	if r1.Librespot != "http://localhost:3701" || r1.OwnTone != "http://localhost:3801" {
 		t.Fatalf("r1 urls wrong: %s %s", r1.Librespot, r1.OwnTone)
+	}
+}
+
+func TestPrimaryRoomPersistentFIFOConfig(t *testing.T) {
+	previousDataDir, previousStore := dataDir, store
+	dataDir = t.TempDir()
+	store = newRoomStore()
+	t.Cleanup(func() {
+		dataDir, store = previousDataDir, previousStore
+	})
+	room := &Room{ID: "r0", Idx: 0, Name: "Primary"}
+	room.fill()
+	if err := ensurePipes(room); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(room.Pipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renderGLConfig(room); err != nil {
+		t.Fatal(err)
+	}
+	if err := renderOTConfig(room); err != nil {
+		t.Fatal(err)
+	}
+	native, err := os.ReadFile(filepath.Join(room.ConfigDir, "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownTone, err := os.ReadFile(room.OwnConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(native), "audio_output_pipe: "+room.Pipe+"\n") ||
+		!strings.Contains(string(ownTone), `directories = { "`+filepath.Dir(room.Pipe)+`" }`) {
+		t.Fatal("primary Native and OwnTone must share the durable FIFO layout")
+	}
+	room.fill()
+	if err := ensurePipes(room); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(room.Pipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("a second startup replaced the persistent FIFO")
 	}
 }
 
