@@ -1,3 +1,8 @@
+## Speakers 0.26.79 — recover radio after a recorded Spotify retirement
+
+- At cold startup, release the idle START gate for an already retired Spotify session when the prior Native process is proven gone, the FIFO is quiet, and no receiver is active.
+- Preserve the retirement receipt. Unproven ownership stays blocked, and startup sends no playback command.
+
 ## Speakers 0.26.78 — recover radio readiness after a completed Spotify START
 
 - On startup, recover an old completed Spotify START when its process and FIFO checks prove that the previous writer and route are gone. This lets radio become available after a clean cold start.
