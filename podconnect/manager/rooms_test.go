@@ -55,9 +55,12 @@ func TestRoomFillLegacyVsNew(t *testing.T) {
 }
 
 func TestPrimaryRoomPersistentFIFOConfig(t *testing.T) {
-	previousDataDir := dataDir
+	previousDataDir, previousStore := dataDir, store
 	dataDir = t.TempDir()
-	t.Cleanup(func() { dataDir = previousDataDir })
+	store = newRoomStore()
+	t.Cleanup(func() {
+		dataDir, store = previousDataDir, previousStore
+	})
 	room := &Room{ID: "r0", Idx: 0, Name: "Primary"}
 	room.fill()
 	if err := ensurePipes(room); err != nil {
