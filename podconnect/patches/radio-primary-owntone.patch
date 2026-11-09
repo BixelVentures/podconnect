@@ -7048,10 +7048,10 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..8357cdf7a91ef15bce8578b5f9a74294e556a94b 100644
+index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..4d01cd0eaa43450b1c30c55560a14ec71a6d05ec 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -338,6 +338,140 @@ static void start_gate_process_successor(const char *path,const struct output_na
+@@ -338,6 +338,142 @@ static void start_gate_process_successor(const char *path,const struct output_na
    free(changed.payload);free(saved.payload);
    sqlite3_close(hdl);hdl=NULL;
  }
@@ -7063,6 +7063,8 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..8357cdf7a91ef15bce8578b5f9a74294
 +  struct stat fifo;
 +  char old_path[] = "/tmp/start-cold-old-fifo-XXXXXX";
 +  json_object *record;
++  /* The fork inherits earlier transport tests; a cold player has no input. */
++  outputs_transport_input_changed(0, NULL, false);
 +  sqlite3_close(hdl);
 +  assert(sqlite3_open(owner_database_path, &hdl) == SQLITE_OK);
 +  assert(db_start_guard_load(&saved) == 1 && stat(path, &fifo) == 0);
@@ -7192,7 +7194,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..8357cdf7a91ef15bce8578b5f9a74294
  static void exact_start_durable_gate(void)
  {
    char path[]="/tmp/start-owner-fifo-XXXXXX";int fd=mkstemp(path),status,pipes[2];pid_t native,owner,successor;
-@@ -378,7 +512,38 @@ static void exact_start_durable_gate(void)
+@@ -378,7 +514,38 @@ static void exact_start_durable_gate(void)
      successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
      assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    }
