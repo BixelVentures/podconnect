@@ -484,7 +484,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..7adeda5cd24504555b5f688fd36b49f5
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..7cc4861c92fbfba7ae23a3799ff969f3fd2fd372 100644
+index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..715a8d94f407a20b612da2ea11d3dcf80f8bd289 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -492,7 +492,7 @@ index 0a423d495c8c65bd364d4dffe939e9b03325ed1f..7cc4861c92fbfba7ae23a3799ff969f3
  #include <time.h>
  #include <sys/stat.h>
 +#include <sys/ioctl.h>
-+#include <sys/file.h>
++#include <sys/sysmacros.h>
  #include <stdatomic.h>
  #include <limits.h>
  #include <dirent.h>
@@ -4118,7 +4118,7 @@ index c9b66c43ddc44dabc573471024ffa1937319e7ab..aa61bd887b10ece74ea72106abdc607e
          || outputs_airplay_radio_pairing_key_digest(r->device_id,peer)<0)return -1;
      if(radio_sender.result.phase==RADIO_SENDER_DRAINED && r->device_id==radio_sender.result.device_id && !radio_sender.relinquished){
 diff --git a/src/outputs_release.inc.c b/src/outputs_release.inc.c
-index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..60b9ccc6072024c5e95474ae7e0c7eb33da1229b 100644
+index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..f5e8770e88b8e119a27bedaacc6822968f97576b 100644
 --- a/src/outputs_release.inc.c
 +++ b/src/outputs_release.inc.c
 @@ -698,19 +698,19 @@ outputs_transport_release_confirm(uint64_t id, const char *token, const char *pr
@@ -4145,7 +4145,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..60b9ccc6072024c5e95474ae7e0c7eb3
      }
    while (valid)
      {
-@@ -795,24 +795,364 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
+@@ -795,24 +795,376 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
  		break;
  	      }
  	  fclose(info);
@@ -4261,14 +4261,19 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..60b9ccc6072024c5e95474ae7e0c7eb3
 +}
 +
 +static bool
-+start_cold_primary_fifo(struct stat *current)
++start_cold_primary_configured(void)
 +{
-+  if (!cfg || !start_cold_primary_directory(START_OWNER_DATA) || !start_cold_primary_directory(START_CANONICAL_MEDIA))
-+    return false;
-+  cfg_t *library = cfg_getsec(cfg, "library");
++  cfg_t *library = cfg ? cfg_getsec(cfg, "library") : NULL;
 +  return library && cfg_size(library, "directories") == 1
 +      && !strcmp(cfg_getnstr(library, "directories", 0), START_CANONICAL_MEDIA)
-+      && cfg_getint(library, "pipe_sample_rate") == 44100 && cfg_getint(library, "pipe_bits_per_sample") == 16
++      && cfg_getint(library, "pipe_sample_rate") == 44100 && cfg_getint(library, "pipe_bits_per_sample") == 16;
++}
++
++static bool
++start_cold_primary_fifo(struct stat *current)
++{
++  return start_cold_primary_configured() && start_cold_primary_directory(START_OWNER_DATA)
++      && start_cold_primary_directory(START_CANONICAL_MEDIA)
 +      && lstat(START_CANONICAL_FIFO, current) == 0 && S_ISFIFO(current->st_mode)
 +      && !current->st_uid && current->st_nlink == 1;
 +}
@@ -4395,8 +4400,15 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..60b9ccc6072024c5e95474ae7e0c7eb3
 +      goto done;
 +    }
 +  stage = "fifo_before_reader";
-+  if (terminal && start_cold_legacy_unreachable(&pipe, &current))
-+    migrated = true;
++  if (!strcmp(pipe.expected_input_path, START_LEGACY_FIFO) && start_cold_primary_configured())
++    {
++      if (!terminal || !start_cold_legacy_unreachable(&pipe, &current))
++        {
++          denial = "legacy_fifo_migration";
++          goto done;
++        }
++      migrated = true;
++    }
 +  else
 +    {
 +      if (!start_pipe_registered(&pipe, digest))
@@ -4517,7 +4529,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..60b9ccc6072024c5e95474ae7e0c7eb3
  }
  
  void
-@@ -891,7 +1231,8 @@ release_predecessor_payload_valid(json_object *o)
+@@ -891,7 +1243,8 @@ release_predecessor_payload_valid(json_object *o)
    char manual_token[33], reservation[33], path[4096];
    uint64_t n;
    bool move, valid = false;
@@ -4719,7 +4731,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..47ed2eeaa88884926c78fe8edadf0c81
    if(!s->result.command.move_existing_session){
      if(!start_unique_writer_fd(&s->result.command.native_process,s->result.pipe_device,
 diff --git a/src/outputs_start_journal.inc.c b/src/outputs_start_journal.inc.c
-index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762950369c2 100644
+index 2fcbcb0187b091918cf1911f37a2f606b8154b15..d19b9dd8653104ec38d3c6a70db66dfe8953e081 100644
 --- a/src/outputs_start_journal.inc.c
 +++ b/src/outputs_start_journal.inc.c
 @@ -38,6 +38,13 @@ static bool start_retired_reopen_pending;
@@ -4758,7 +4770,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
      if(!S_ISFIFO(st.st_mode) || (uint64_t)st.st_dev!=device || (uint64_t)st.st_ino!=inode)continue;
      if(snprintf(path,sizeof(path),"/proc/%" PRIu64 "/fdinfo/%llu",process->pid,fd)>=(int)sizeof(path)
          || !(info=fopen(path,"r"))){result=-1;break;}
-@@ -197,23 +208,170 @@ static int start_all_writers_closed_raw(const struct output_native_process *proc
+@@ -197,23 +208,199 @@ static int start_all_writers_closed_raw(const struct output_native_process *proc
    if(!start_process_current(process) && !start_old_process_retired())return -1;
    return result;
  }
@@ -4796,17 +4808,47 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +#define START_LEGACY_FIFO START_LEGACY_MEDIA "/spotify"
 +#endif
 +
++/* Linux reports an exclusive flock on the exact descriptor that shares
++ * the locked open description. A separately opened fd for the same inode
++ * has no lock line and cannot retain this owner's lifetime fence. */
++static bool
++start_owner_fence_fd_locked(const char *path, const struct stat *fence)
++{
++  FILE *info = fopen(path, "r");
++  if (!info)
++    return false;
++  char line[256], extra;
++  int owner;
++  unsigned index, device_major, device_minor;
++  uint64_t inode;
++  bool held = false;
++  while (fgets(line, sizeof(line), info))
++    if (sscanf(line, "lock: %u: FLOCK ADVISORY WRITE %d %x:%x:%" SCNu64 " 0 EOF %c",
++          &index, &owner, &device_major, &device_minor, &inode, &extra) == 5
++        && device_major == major(fence->st_dev) && device_minor == minor(fence->st_dev)
++        && inode == (uint64_t)fence->st_ino)
++      {
++        held = true;
++        break;
++      }
++  fclose(info);
++  return held;
++}
++
 +static const char *
 +start_owner_fence_current(struct stat *fence)
 +{
 +  const char *generation = getenv("PODCONNECT_PRIMARY_OWNER_FENCE");
 +  struct stat named;
++  struct proc_native_scope scope = { 0 };
 +  if (!transport_hex(generation, 32) || lstat(START_OWNER_FENCE_PATH, &named) < 0
 +      || !S_ISREG(named.st_mode) || (named.st_mode & 0777) != 0600 || named.st_uid || named.st_nlink != 1
 +      || fstat(START_OWNER_FENCE_FD, fence) < 0 || named.st_dev != fence->st_dev || named.st_ino != fence->st_ino
-+      || flock(START_OWNER_FENCE_FD, LOCK_EX | LOCK_NB) < 0)
++      || !proc_native_scope_enter(&scope))
 +    return NULL;
-+  return generation;
++  bool held = start_owner_fence_fd_locked("/proc/self/fdinfo/3", fence);
++  proc_native_scope_leave(&scope);
++  return held ? generation : NULL;
 +}
 +
 +static bool
@@ -4825,14 +4867,14 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +static bool
 +start_owner_fence_add(json_object *o, const struct output_start_request *request)
 +{
-+  struct stat fence, native_fence;
++  struct stat fence;
 +  struct proc_native_scope scope = { 0 };
 +  char path[64];
 +  if (strcmp(request->expected_input_path, START_CANONICAL_FIFO))
 +    return true;
 +  const char *generation = start_owner_fence_current(&fence);
 +  if (!generation)
-+    return true;
++    return false;
 +  if (start_journal.payload && !strcmp(start_journal.token, request->token))
 +    {
 +      json_object *previous = json_tokener_parse(start_journal.payload), *proof;
@@ -4858,11 +4900,10 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +    }
 +  if (!start_process_current(&request->native_process))
 +    return false;
-+  snprintf(path, sizeof(path), "/proc/%" PRIu64 "/fd/%d", request->native_process.pid, START_OWNER_FENCE_FD);
++  snprintf(path, sizeof(path), "/proc/%" PRIu64 "/fdinfo/%d", request->native_process.pid, START_OWNER_FENCE_FD);
 +  if (!proc_native_scope_enter(&scope))
 +    return false;
-+  bool bound = stat(path, &native_fence) == 0
-+      && native_fence.st_dev == fence.st_dev && native_fence.st_ino == fence.st_ino;
++  bool bound = start_owner_fence_fd_locked(path, &fence);
    proc_native_scope_leave(&scope);
 -  return result>=0 && (start_process_current(process) || start_old_process_retired()) ? result : -1;
 +  if (!bound || !start_process_current(&request->native_process))
@@ -4878,7 +4919,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +    return true;
 +  json_object_put(proof);
 +  return false;
- }
++}
 +
 +/* A denial is a fixed category. The existing bool callers use the same reads. */
 +static const char *
@@ -4899,7 +4940,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +  if (result == 0 || (result == 1 && ticks != start_journal.proc_start_ticks))
 +    return NULL;
 +  return result == 1 ? "predecessor_live" : "predecessor_unreadable";
-+}
+ }
 +
  static bool start_old_process_retired(void)
  {
@@ -4910,7 +4951,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 -  result=start_process_ticks(start_journal.pid,&ticks);
 -  return result==0 || (result==1 && ticks!=start_journal.proc_start_ticks);
 +  return start_old_process_retirement_denial() == NULL;
- }
++}
 +static bool
 +start_cold_completed_shape(json_object *record, bool allow_retired_move)
 +{
@@ -4932,12 +4973,12 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
 +      && json_object_is_type(value, json_type_boolean) && (bool)json_object_get_boolean(value) == move
 +      && json_object_object_get_ex(record, "actual_native_owner", &value)
 +      && json_object_is_type(value, json_type_object);
-+}
+ }
 +
  static bool
  start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
  {
-@@ -247,23 +405,34 @@ start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
+@@ -247,23 +434,34 @@ start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
    has_retirement=valid && json_object_object_get_ex(o,"retirement_outcome",&v);
    if(has_retirement){
      const char *outcome;
@@ -4977,7 +5018,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
        valid=token && reservation && incarnation
          && JRU("retirement_writer_source_epoch",writer_epoch) && JRU("retirement_writer_fd",writer_fd)
          && JRU("retirement_pipe_device",pipe_device) && JRU("retirement_pipe_inode",pipe_inode)
-@@ -276,7 +445,7 @@ start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
+@@ -276,7 +474,7 @@ start_journal_payload_legacy_valid_for(const struct db_start_guard *record)
  #undef JRU
  #undef JRB
      if(valid){
@@ -4986,7 +5027,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
          valid=!writer_epoch && !writer_fd && !pipe_device && !pipe_inode && !input_item_id && !admitted_epoch && !input_epoch
            && !deadline_sec && !deadline_nsec && !reader_ready_closed && !reopen_consumed;
        else {
-@@ -325,7 +494,7 @@ start_journal_payload_legacy_valid(void)
+@@ -325,7 +523,7 @@ start_journal_payload_legacy_valid(void)
    return start_journal_payload_legacy_valid_for(&start_journal);
  }
  static bool
@@ -4995,7 +5036,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
  {
    json_tokener *tok = json_tokener_new();
    json_object *o = NULL, *schema;
-@@ -342,7 +511,28 @@ start_journal_payload_valid(void)
+@@ -342,7 +540,28 @@ start_journal_payload_valid(void)
        && json_object_is_type(o, json_type_object) && json_object_object_get_ex(o, "schema", &schema)
        && json_object_is_type(schema, json_type_string))
      {
@@ -5025,7 +5066,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
  	valid = release_journal_payload_valid(o);
        else if (!strcmp(json_object_get_string(schema), "podconnect.output_manual_release_start_journal.v1")
                 || !strcmp(json_object_get_string(schema), "podconnect.output_manual_release_move_journal.v1"))
-@@ -353,6 +543,11 @@ start_journal_payload_valid(void)
+@@ -353,6 +572,11 @@ start_journal_payload_valid(void)
    if(o)json_object_put(o);
    json_tokener_free(tok);return valid;
  }
@@ -5037,7 +5078,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
  static void start_journal_startup(void)
  {
    free(start_journal.payload);memset(&start_journal,0,sizeof(start_journal));
-@@ -360,9 +555,10 @@ static void start_journal_startup(void)
+@@ -360,9 +584,10 @@ static void start_journal_startup(void)
    start_retired_reopen_pending=false;
    start_retired_stage_ready=false;
    start_retired_stage_path[0]=0;
@@ -5049,7 +5090,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..23b29276a55578d8a6640a3cc7467762
      {
        ret = -1;
        origin = START_JOURNAL_FAULT_PAYLOAD;
-@@ -437,7 +633,7 @@ static int start_journal_save(struct start_slot *s)
+@@ -437,7 +662,7 @@ static int start_journal_save(struct start_slot *s)
    json_object_object_add(route,"process",json_object_new_string(s->result.route_identity.process));json_object_object_add(route,"input_path_digest",json_object_new_string(s->result.route_identity.input_path_digest));
  #undef JS
  #undef JN
@@ -6480,10 +6521,10 @@ index aec54e58c3a3f3ac7af17936924dd368453ac7e3..19bed7c8c3f368886f1895dfc5da3d42
    if (argc == 2 && !strcmp(argv[1], "--move-pause-resume-wire"))
      { completed_move_real_resume=true; return start35_wire_case(24); }
 diff --git a/tests/outputs_attention_owner.c b/tests/outputs_attention_owner.c
-index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e768dc473 100644
+index d9560b42190217ed8a1135c7f5a555e9676ae851..539da885cb2dbd4238f52d502ec30244e1d6d102 100644
 --- a/tests/outputs_attention_owner.c
 +++ b/tests/outputs_attention_owner.c
-@@ -6,14 +6,47 @@
+@@ -6,14 +6,48 @@
   * Root admits any compilation/execution separately using the existing owner.
   */
  #include <assert.h>
@@ -6494,6 +6535,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
++#include <sys/file.h>
  #include <sys/queue.h>
  #include <event2/keyvalq_struct.h>
  
@@ -6531,7 +6573,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
  #define db_speaker_get actual_db_speaker_get
  #define db_speaker_save actual_db_speaker_save
  #include "../src/db.c"
-@@ -22,6 +55,18 @@
+@@ -22,6 +56,18 @@
  
  /* This output ledger fixture has no AirPlay or anonymous streaming backend.
   * Their actual ownership/drain behavior is exercised by airplay_callback_owner. */
@@ -6550,7 +6592,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
  int outputs_airplay_radio_emission_floor(uint64_t id,const void *session){(void)id;(void)session;return -1;}
  int outputs_airplay_radio_pairing_key_digest(uint64_t id,char out[65]){(void)id;(void)out;return -1;}
  int outputs_airplay_radio_controller_id(char out[17]){(void)out;return -1;}
-@@ -88,16 +133,20 @@ input_fifo_retire_empty(const char *path, uint64_t dev, uint64_t ino, uint64_t e
+@@ -88,16 +134,20 @@ input_fifo_retire_empty(const char *path, uint64_t dev, uint64_t ino, uint64_t e
    (void)out;
    return -1;
  }
@@ -6576,7 +6618,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
  }
  int
  input_fifo_stage_reader(const char *path, struct input_fifo_identity *out)
-@@ -269,6 +318,16 @@ static const char *connect_diagnostic_message;
+@@ -269,6 +319,16 @@ static const char *connect_diagnostic_message;
  static char connect_diagnostic_buffer[128];
  void DPRINTF(int severity, int domain, const char *format, ...)
  {
@@ -6593,7 +6635,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
    if (start_state_diagnostic_capture && !strncmp(format,"START state rejected: ",strlen("START state rejected: "))) {
      va_list args; assert(severity==E_LOG && (domain==L_PLAYER || domain==L_HTTPD));
      va_start(args,format); int written=vsnprintf(start_state_diagnostic_message,sizeof(start_state_diagnostic_message),format,args); va_end(args);
-@@ -306,10 +365,11 @@ const char *player_pmap(void *pointer)
+@@ -306,10 +366,11 @@ const char *player_pmap(void *pointer)
    return "controlled-owner-pointer";
  }
  
@@ -6606,7 +6648,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
    return 0;
  }
  
-@@ -827,6 +887,7 @@ static void retiring_start_waits_destroy_and_fences_old_callback(void)
+@@ -827,6 +888,7 @@ static void retiring_start_waits_destroy_and_fences_old_callback(void)
    output_airplay.device_probe = inert_start;
    output_airplay.device_stop = inert_stop;
    restart_calls = completions = 0;
@@ -6614,7 +6656,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..757d2f522a487baeea8346e982d3235e
    assert(outputs_device_start(a, completed_start, false) == 1);
    owned = a->attention_restart_callback;
    assert(outputs_device_start(a, completed_start, false) == -1);
-@@ -1964,6 +2025,10 @@ int main(int argc,char **argv)
+@@ -1964,6 +2026,10 @@ int main(int argc,char **argv)
      int fd=mkstemp(owner_database_path);
      assert(fd>=0); close(fd);
      assert(sqlite3_open(owner_database_path,&hdl) == SQLITE_OK);
@@ -7629,10 +7671,10 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150432a81a0 100644
+index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa5872032e 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -338,10 +338,283 @@ static void start_gate_process_successor(const char *path,const struct output_na
+@@ -338,10 +338,334 @@ static void start_gate_process_successor(const char *path,const struct output_na
    free(changed.payload);free(saved.payload);
    sqlite3_close(hdl);hdl=NULL;
  }
@@ -7790,6 +7832,8 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
 +    }
 +  fixture.payload = strdup(json_object_to_json_string_ext(record, JSON_C_TO_STRING_PLAIN));
 +  assert(fixture.payload && db_start_guard_save(&saved, &fixture) == 0);
++  if (migration)
++    assert(db_file_id_bypath(path) == 0);
 +  json_object_put(record);
 +  outputs_attention_uuid(outputs_process);
 +  start_journal_startup();
@@ -7807,15 +7851,20 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
 +      outputs_device_get(1)->selected = false;
 +      if (migration)
 +        {
-+          assert(mkfifo(cold_legacy_fifo, 0600) == 0);
++          assert(link(old_path, cold_legacy_fifo) == 0);
 +          int writer = open(cold_legacy_fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 +          assert(writer >= 0);
-+          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "fifo_registration", 0, 0);
++          assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", cold_legacy_fifo)) == 0);
++          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "legacy_fifo_migration", 0, 0);
 +          assert(outputs_start_busy());
 +          close(writer);
-+          assert(unlink(cold_legacy_fifo) == 0);
++          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "legacy_fifo_migration", 0, 0);
++          assert(outputs_start_busy());
++          assert(unlink(cold_legacy_fifo) == 0 && unlink(old_path) == 0);
++          assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", old_path)) == 0);
++          assert(db_file_id_bypath(path) == 0);
 +          assert(unsetenv("PODCONNECT_PRIMARY_OWNER_FENCE") == 0);
-+          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "fifo_registration", 0, 0);
++          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "legacy_fifo_migration", 0, 0);
 +          assert(setenv("PODCONNECT_PRIMARY_OWNER_FENCE", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", 1) == 0);
 +        }
 +      else if (changed_boot)
@@ -7903,10 +7952,54 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
 +  free(current.payload);
 +  free(fixture.payload);
 +  free(saved.payload);
-+  if (changed_boot)
++  if (changed_boot && !migration)
 +    assert(unlink(old_path) == 0);
 +  sqlite3_close(hdl);
 +  hdl = NULL;
++}
++
++static void
++start_gate_primary_fence_stamps(void)
++{
++  for (int independent = 0; independent <= 1; independent++)
++    {
++      int ready[2], release[2], status;
++      assert(pipe(ready) == 0 && pipe(release) == 0);
++      pid_t native = fork();
++      assert(native >= 0);
++      if (!native)
++        {
++          close(ready[0]);
++          close(release[1]);
++          if (independent)
++            {
++              int fd = open(cold_owner_fence, O_RDWR | O_CLOEXEC);
++              assert(fd >= 0 && dup2(fd, START_OWNER_FENCE_FD) == START_OWNER_FENCE_FD);
++              close(fd);
++            }
++          char byte;
++          assert(write(ready[1], "x", 1) == 1 && read(release[0], &byte, 1) == 1);
++          _exit(0);
++        }
++      close(ready[1]);
++      close(release[0]);
++      char byte;
++      assert(read(ready[0], &byte, 1) == 1 && close(ready[0]) == 0);
++      struct output_native_process process = { .pid = native };
++      assert(start_boot_id(process.boot_id) && start_process_ticks(native, &process.proc_start_ticks) == 1);
++      struct output_start_request request = start_gate_fixture_request(cold_canonical_fifo, &process);
++      json_object *record = json_object_new_object();
++      assert(record);
++      uid_t original = geteuid();
++      assert(seteuid(65534) == 0);
++      assert(start_owner_fence_add(record, &request) == !independent);
++      assert(geteuid() == 65534 && seteuid(original) == 0);
++      json_object *proof;
++      assert(json_object_object_get_ex(record, "primary_owner_fence", &proof) == !independent);
++      json_object_put(record);
++      assert(write(release[1], "x", 1) == 1 && close(release[1]) == 0);
++      assert(waitpid(native, &status, 0) == native && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++    }
 +}
 +
  static void exact_start_durable_gate(void)
@@ -7917,7 +8010,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -378,7 +651,103 @@ static void exact_start_durable_gate(void)
+@@ -378,7 +702,102 @@ static void exact_start_durable_gate(void)
      successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
      assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    }
@@ -7969,7 +8062,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
 +  if (geteuid() == 0)
 +    {
 +      char root[] = "/tmp/cold-primary-layout-XXXXXX";
-+      assert(mkdtemp(root));
++      assert(mkdtemp(root) && chmod(root, 0755) == 0);
 +      snprintf(cold_owner_data, sizeof(cold_owner_data), "%s/data", root);
 +      snprintf(cold_owner_fence, sizeof(cold_owner_fence), "%s/data/owner", root);
 +      snprintf(cold_canonical_media, sizeof(cold_canonical_media), "%s/data/media", root);
@@ -7998,16 +8091,15 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..45e48a05709030a678eeb7ac7cd23150
 +              assert(sqlite3_open(owner_database_path, &hdl) == SQLITE_OK);
 +              assert(setenv("PODCONNECT_PRIMARY_OWNER_FENCE", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", 1) == 0);
 +              cfg_setlist(cfg_getsec(cfg, "library"), "directories", 1, cold_canonical_media);
++              if (mode == 0)
++                start_gate_primary_fence_stamps();
 +              if (mode != 0)
 +                assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", cold_canonical_fifo)) == 0);
 +              enum cold_completed_kind kind = mode == 2 ? COLD_COMPLETED_START : COLD_RETIRED_START;
 +              start_gate_cold_completed(cold_canonical_fifo, false, true, mode == 0, false, kind);
-+              if (mode != 0)
-+                {
-+                  assert(sqlite3_open(owner_database_path, &hdl) == SQLITE_OK);
-+                  assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", path)) == 0);
-+                  sqlite3_close(hdl);
-+                }
++              assert(sqlite3_open(owner_database_path, &hdl) == SQLITE_OK);
++              assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", path)) == 0);
++              sqlite3_close(hdl);
 +              _exit(0);
 +            }
 +          assert(waitpid(successor, &status, 0) == successor && WIFEXITED(status) && WEXITSTATUS(status) == 0);
