@@ -1,3 +1,8 @@
+## Speakers 0.26.77 — keep Spotify-to-radio handoff when a descriptor disappears
+
+- Prevent an unrelated disappearing Native file descriptor from closing the Spotify park at TEARDOWN. Every FIFO writer census now discards an incomplete scan and performs one fresh complete scan of the same live owner.
+- A still-open writer and an unprovable scan are now logged separately. Real writer conflicts, repeated disappearance and changed process identity stay closed. No playback command is repeated.
+
 ## Speakers 0.26.76 — diagnose primary radio startup refusals
 
 - Log the first failed check when OwnTone cannot prove an idle radio source. The reason distinguishes receiver availability, START or journal custody, and a present FIFO writer from an incomplete FIFO proof.
