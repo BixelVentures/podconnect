@@ -172,17 +172,24 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.evidence.NativeProcess != "" && p.evidence.NativeProcess != state.Process {
+		return nil, nil, errRadioUnknown
+	}
 	for token, record := range p.records {
 		if record.Primary == nil && producerLegacyHistoryTerminal(p.records, record) {
+			continue
+		}
+		if primaryLegacyInvalidReserve(record) {
+			record.Terminal, record.Outcome, record.Stage = true, "rejected", "legacy-reserve-invalid-action"
+			if err := p.storeLocked(record); err != nil {
+				return nil, nil, err
+			}
 			continue
 		}
 		if record.Primary == nil || !record.Terminal || record.Observation.SourceKind == "radio" &&
 			record.Observation.State == "playing" && !record.SourceDrained && !p.live[token] {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
 		}
-	}
-	if p.evidence.NativeProcess != "" && p.evidence.NativeProcess != state.Process {
-		return nil, nil, errRadioUnknown
 	}
 	if state.Observation.SourceKind == "radio" {
 		active := p.records[p.active]
@@ -200,6 +207,23 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	p.evidence.Targets = append([]radioTarget(nil), targets...)
 	backend.replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
 	return targets, nil, nil
+}
+
+// The old adapter sent the compact caller ID verbatim. The primary Native
+// HTTP owner has always rejected this shape before reaching its actor. The
+// corrected adapter saves the actual reserve command before sending it, so a
+// missing reply to a valid command can never match this historical case.
+func primaryLegacyInvalidReserve(r radioProducerRecord) bool {
+	primary, fence, request := r.Primary, r.Fence, r.Request
+	return r.Stage == "native-reserve-attempted" && !r.Terminal && r.Outcome == "" &&
+		!r.Preempted && !r.SourceDrained && r.Observation == (radioNativeObservation{}) && primary != nil &&
+		*primary == (radioPrimaryRecord{Device: primary.Device, Station: primary.Station}) &&
+		producerCounter(primary.Device, false) && radioStreamURLs[primary.Station] != "" &&
+		producerUUID(fence.Token) && producerHex(fence.ActionID, 32) && fence.Generation > 0 &&
+		fence.OwnerGeneration == 0 && request.OwnerGeneration == 0 &&
+		request.Handoff == fence.Token && request.ActionID == fence.ActionID && request.Generation == fence.Generation &&
+		request.Target != "" && producerHex(request.Process, 64) && request.ExpectedIntent.Process == request.Process &&
+		producerCounter(request.ExpectedIntent.Revision, true)
 }
 
 func primaryOwnsPlaying(state radioPrimaryState, incumbent radioProducerRecord) bool {
@@ -330,13 +354,14 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 	r.Primary = &state
 	r.Request.From = from
 	r.Stage = "native-reserve-attempted"
+	q := r.primaryCommand("reserve")
+	q.Session = state.IncumbentSession
+	state.LastCommand = &q
 	if err := p.storeLocked(r); err != nil {
 		p.mu.Unlock()
 		return r.Fence, err
 	}
 	p.live[r.Fence.Token] = true
-	q := r.primaryCommand("reserve")
-	q.Session = state.IncumbentSession
 	p.mu.Unlock()
 
 	if ctx.Err() != nil {
@@ -368,10 +393,19 @@ func (p *radioProducer) primaryReserve(ctx context.Context, from, to, action str
 	return current.Fence, err
 }
 
+func (r radioProducerRecord) primaryWireAction() string {
+	if producerUUID(r.Fence.ActionID) {
+		return r.Fence.ActionID
+	}
+	// As in v1, the per-operation Handoff UUID is the Native wire ID for an
+	// opaque caller ID. The public action and its journal fence stay unchanged.
+	return r.Fence.Token
+}
+
 func (r radioProducerRecord) primaryCommand(phase string) radioPrimaryCommand {
 	q := radioPrimaryCommand{
 		Schema: primaryRadioSchema, Phase: phase, Process: r.Request.Process, Handoff: r.Fence.Token,
-		Action: r.Fence.ActionID, Generation: strconv.FormatUint(r.Fence.Generation, 10), Target: r.Request.Target,
+		Action: r.primaryWireAction(), Generation: strconv.FormatUint(r.Fence.Generation, 10), Target: r.Request.Target,
 		ExpectedRevision: r.Request.ExpectedIntent.Revision, From: r.Request.From,
 	}
 	if r.Fence.OwnerGeneration != 0 {

@@ -2,6 +2,7 @@
 
 - At cold startup, release the idle START gate for an already retired Spotify session when the prior Native process is proven gone, the FIFO is quiet, and no receiver is active.
 - Preserve the retirement receipt. Unproven ownership stays blocked, and startup sends no playback command.
+- Accept PodView radio actions that use compact task IDs while preserving their original receipts and replay protection.
 
 ## Speakers 0.26.78 — recover radio readiness after a completed Spotify START
 
