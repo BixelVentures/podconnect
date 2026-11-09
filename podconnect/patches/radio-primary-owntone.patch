@@ -4117,7 +4117,7 @@ index c9b66c43ddc44dabc573471024ffa1937319e7ab..aa61bd887b10ece74ea72106abdc607e
          || outputs_airplay_radio_pairing_key_digest(r->device_id,peer)<0)return -1;
      if(radio_sender.result.phase==RADIO_SENDER_DRAINED && r->device_id==radio_sender.result.device_id && !radio_sender.relinquished){
 diff --git a/src/outputs_release.inc.c b/src/outputs_release.inc.c
-index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..d7d041d0343cfd6386d5dd2d12d421925b9aa85d 100644
+index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..ec78380a1b3b2756afe9c95ceac78c88bc14d2c7 100644
 --- a/src/outputs_release.inc.c
 +++ b/src/outputs_release.inc.c
 @@ -698,19 +698,19 @@ outputs_transport_release_confirm(uint64_t id, const char *token, const char *pr
@@ -4144,7 +4144,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..d7d041d0343cfd6386d5dd2d12d42192
      }
    while (valid)
      {
-@@ -795,24 +795,240 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
+@@ -795,24 +795,257 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
  		break;
  	      }
  	  fclose(info);
@@ -4186,11 +4186,30 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..d7d041d0343cfd6386d5dd2d12d42192
 +  return release_fifo_writer_denial(device, inode) == NULL;
 +}
 +
++/* On the exact opened FIFO, the kernel can answer without reading other
++ * processes. tee never consumes source bytes. A zero result means both an
++ * empty FIFO and no connected writers. */
++static const char *
++start_cold_fifo_kernel_denial(int fd)
++{
++  int probe[2];
++  if (pipe2(probe, O_CLOEXEC | O_NONBLOCK) < 0)
++    return "fifo_probe_unavailable";
++  ssize_t result = tee(fd, probe[1], 1, SPLICE_F_NONBLOCK);
++  int error = errno;
++  close(probe[0]);
++  close(probe[1]);
++  if (result == 0)
++    return NULL;
++  if (result > 0)
++    return "fifo_pcm_pending";
++  return error == EAGAIN ? "writer_present" : "fifo_probe_unavailable";
++}
++
 +static const char *
 +start_cold_fifo_denial(const char *path, const struct stat *current, uint64_t old_device, uint64_t old_inode)
 +{
 +  struct stat observed;
-+  int bytes = -1;
 +  int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
 +  if (fd < 0)
 +    return "fifo_open";
@@ -4201,17 +4220,15 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..d7d041d0343cfd6386d5dd2d12d42192
 +      denial = "fifo_identity";
 +      goto done;
 +    }
-+  denial = release_fifo_writer_denial(old_device, old_inode);
++  /* A different inode can still have a writer, even after this path names a
++   * replacement. Only the actual opened inode qualifies for the kernel read. */
++  if (((uint64_t)current->st_dev != old_device || (uint64_t)current->st_ino != old_inode)
++      && (denial = release_fifo_writer_denial(old_device, old_inode)))
++    goto done;
++  denial = start_cold_fifo_kernel_denial(fd);
 +  if (denial)
 +    goto done;
-+  if (((uint64_t)current->st_dev != old_device || (uint64_t)current->st_ino != old_inode)
-+      && (denial = release_fifo_writer_denial(current->st_dev, current->st_ino)))
-+    goto done;
-+  if (ioctl(fd, FIONREAD, &bytes) != 0)
-+    denial = "fifo_pcm_unreadable";
-+  else if (bytes != 0)
-+    denial = "fifo_pcm_pending";
-+  else if (stat(path, &observed) != 0 || !S_ISFIFO(observed.st_mode)
++  if (stat(path, &observed) != 0 || !S_ISFIFO(observed.st_mode)
 +      || observed.st_dev != current->st_dev || observed.st_ino != current->st_ino)
 +    denial = "fifo_identity";
 +  else if (!start_contexts_drained())
@@ -7363,10 +7380,10 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3277924eb 100644
+index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..058ec4beda5e4f7660cade0609278e95fda85115 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -338,6 +338,188 @@ static void start_gate_process_successor(const char *path,const struct output_na
+@@ -338,6 +338,239 @@ static void start_gate_process_successor(const char *path,const struct output_na
    free(changed.payload);free(saved.payload);
    sqlite3_close(hdl);hdl=NULL;
  }
@@ -7389,6 +7406,36 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
 +    }
 +}
 +
++/* The deployed census encounters processes under other UIDs. Keep one
++ * actually alive while testing the kernel proof, without access to the FIFO. */
++static pid_t
++start_gate_cold_foreign_process(int *release)
++{
++  if (geteuid() != 0)
++    return 0;
++  int ready[2], done[2];
++  assert(pipe(ready) == 0 && pipe(done) == 0);
++  pid_t child = fork();
++  assert(child >= 0);
++  if (!child)
++    {
++      close(ready[0]);
++      close(done[1]);
++      assert(setgid(65534) == 0 && setuid(65534) == 0);
++      int unrelated = open("/dev/null", O_RDONLY | O_CLOEXEC);
++      char marker;
++      assert(unrelated >= 0 && write(ready[1], "x", 1) == 1 && read(done[0], &marker, 1) == 1);
++      _exit(0);
++    }
++  close(ready[1]);
++  close(done[0]);
++  char marker;
++  assert(read(ready[0], &marker, 1) == 1);
++  close(ready[0]);
++  *release = done[1];
++  return child;
++}
++
 +enum cold_completed_kind
 +{
 +  COLD_COMPLETED_START,
@@ -7406,7 +7453,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
 +  const char *kind_name = move ? "move" : "start";
 +  const char *outcome_name = terminal ? "retired_known" : "none";
 +  const int phase = unknown ? OUTPUT_START_UNKNOWN : OUTPUT_START_COMPLETED;
-+  const unsigned scans = changed_boot ? 2 : 1;
++  const unsigned scans = changed_boot ? 1 : 0;
 +  struct db_start_guard saved = { 0 }, fixture, current = { 0 };
 +  struct stat fifo;
 +  char old_path[] = "/tmp/start-cold-old-fifo-XXXXXX";
@@ -7482,19 +7529,31 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
 +  fixture_cold_reader_empty = true;
 +  if (!unknown && !old_alive && (!foreign_namespace || changed_boot) && kind != COLD_COMPLETED_MOVE)
 +    {
++      int release = -1;
++      pid_t foreign = changed_boot ? 0 : start_gate_cold_foreign_process(&release);
 +      fixture_cold_census_unreadable = true;
 +      outputs_device_get(1)->selected = true;
 +      start_gate_cold_attempt(kind_name, phase, outcome_name, "scope", "output_not_idle", 0, 0);
 +      outputs_device_get(1)->selected = false;
-+      start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "writer_census_incomplete", 1, 0);
-+      fixture_cold_census_unreadable = false;
 +      if (changed_boot)
 +        {
++          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "writer_census_incomplete", 1, 0);
++          fixture_cold_census_unreadable = false;
 +          int old_writer = open(old_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 +          assert(old_writer >= 0);
 +          start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "writer_present", 1, 0);
 +          assert(start_startup_quarantine == !terminal && outputs_start_busy());
 +          close(old_writer);
++        }
++      else
++        {
++          /* The old census fails with denied proc even if the open FIFO
++           * itself has no writer. The replacement must prove the same inode. */
++          cold_diagnostic_capture = true;
++          cold_census_reads = 0;
++          assert(start_cold_fifo_denial(path, &fifo, fifo.st_dev, fifo.st_ino) == NULL);
++          cold_diagnostic_capture = false;
++          assert(cold_census_reads == 0);
 +        }
 +      int reader = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 +      int writer = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -7505,7 +7564,9 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
 +      close(writer);
 +      start_gate_cold_attempt(kind_name, phase, outcome_name, "fifo_before_reader", "fifo_pcm_pending", scans, 0);
 +      assert(start_startup_quarantine == !terminal && outputs_start_busy());
-+      close(reader); /* The last reader drops the old bytes without emitting them. */
++      char pending;
++      assert(read(reader, &pending, 1) == 1 && pending == 'x');
++      close(reader);
 +      fixture_cold_reader_empty = false;
 +      start_gate_cold_attempt(kind_name, phase, outcome_name, "reader", "reader_retirement", scans, 1);
 +      assert(start_startup_quarantine == !terminal && outputs_start_busy());
@@ -7532,6 +7593,13 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
 +      fixture_cold_restore_selected = true;
 +      struct output_device *rediscovered = add_device(2);
 +      assert(!rediscovered->selected && !rediscovered->session);
++      fixture_cold_census_unreadable = false;
++      if (foreign)
++        {
++          int status;
++          assert(write(release, "x", 1) == 1 && close(release) == 0);
++          assert(waitpid(foreign, &status, 0) == foreign && WIFEXITED(status) && WEXITSTATUS(status) == 0);
++        }
 +    }
 +  else
 +    {
@@ -7555,7 +7623,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..39aa75c4b2ce74fb67e6aa5f9724f1e3
  static void exact_start_durable_gate(void)
  {
    char path[]="/tmp/start-owner-fifo-XXXXXX";int fd=mkstemp(path),status,pipes[2];pid_t native,owner,successor;
-@@ -378,7 +560,51 @@ static void exact_start_durable_gate(void)
+@@ -378,7 +611,51 @@ static void exact_start_durable_gate(void)
      successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
      assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    }
