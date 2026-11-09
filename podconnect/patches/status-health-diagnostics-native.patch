@@ -1,0 +1,308 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index f0cd26f..39d80a3 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -32,6 +32,7 @@ type ConcreteApiServer struct {
+ 	roomVolumes  roomVolumeStore
+ 	roomContents contentStore
+ 	roomMoves    moveStore
++	healthProbe  nativeHealthProbe
+ 	log          librespot.Logger
+ 
+ 	allowOrigin string
+@@ -444,8 +445,15 @@ func (s *StubApiServer) Close() error {
+ }
+ 
+ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter) {
++	s.handleRequestWithDispatch(req, w, nil)
++}
++
++func (s *ConcreteApiServer) handleRequestWithDispatch(req ApiRequest, w http.ResponseWriter, dispatched func()) {
+ 	req.resp = make(chan apiResponse, 1)
+ 	s.requests <- req
++	if dispatched != nil {
++		dispatched()
++	}
+ 	resp := <-req.resp
+ 
+ 	if resp.err != nil {
+@@ -558,14 +566,7 @@ func (s *ConcreteApiServer) serve() {
+ 			},
+ 		}, w)
+ 	}))
+-	m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+-		if r.Method != "GET" {
+-			w.WriteHeader(http.StatusMethodNotAllowed)
+-			return
+-		}
+-
+-		s.handleRequest(ApiRequest{Type: ApiRequestTypeStatus}, w)
+-	})
++	m.HandleFunc("/status", s.handleStatus)
+ 	m.HandleFunc("/player/aliases", s.handleAliases)
+ 	m.HandleFunc("/radio/handoff/", s.handleRadioHTTP)
+ 	m.HandleFunc("/radio/primary", s.handleRadioPrimaryHTTP)
+diff --git a/daemon/status_health_probe.go b/daemon/status_health_probe.go
+new file mode 100644
+index 0000000..35129f6
+--- /dev/null
++++ b/daemon/status_health_probe.go
+@@ -0,0 +1,141 @@
++package daemon
++
++import (
++	"context"
++	"net"
++	"net/http"
++	"runtime"
++	"strings"
++	"sync/atomic"
++	"time"
++)
++
++const (
++	nativeHealthProbeHeader    = "X-PodConnect-Health-Probe"
++	nativeHealthMinimumWait    = 4900 * time.Millisecond
++	nativeHealthReportInterval = 30 * time.Second
++	nativeHealthStackCapacity  = 512
++	nativeHealthStackFrames    = 12
++)
++
++var nativeHealthClock = time.Now()
++
++type nativeHealthProbe struct {
++	last atomic.Int64
++}
++
++func (s *ConcreteApiServer) handleStatus(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet {
++		w.WriteHeader(http.StatusMethodNotAllowed)
++		return
++	}
++	req := ApiRequest{Type: ApiRequestTypeStatus}
++	if !isNativeHealthProbe(r) {
++		s.handleRequest(req, w)
++		return
++	}
++	var sent, done atomic.Bool
++	started := time.Now()
++	stop := context.AfterFunc(r.Context(), func() {
++		phase := "queued"
++		if sent.Load() {
++			phase = "await_status_reply"
++		}
++		s.healthProbe.report(s.log.Warnf, phase, time.Since(started), &done)
++	})
++	defer func() {
++		done.Store(true)
++		stop()
++	}()
++	s.handleRequestWithDispatch(req, w, func() { sent.Store(true) })
++}
++
++func isNativeHealthProbe(r *http.Request) bool {
++	values := r.Header.Values(nativeHealthProbeHeader)
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	return len(values) == 1 && values[0] == "1" && err == nil && net.ParseIP(host).IsLoopback()
++}
++
++func (p *nativeHealthProbe) report(log func(string, ...any), phase string, elapsed time.Duration, done *atomic.Bool) {
++	if done.Load() || elapsed < nativeHealthMinimumWait {
++		return
++	}
++	now := time.Since(nativeHealthClock).Nanoseconds()
++	last := p.last.Load()
++	if (last != 0 && now-last < int64(nativeHealthReportInterval)) || !p.last.CompareAndSwap(last, now) {
++		return
++	}
++	records := make([]runtime.StackRecord, nativeHealthStackCapacity)
++	n, ok := runtime.GoroutineProfile(records)
++	if !ok {
++		log("native_health_probe phase=%s stack_capacity_exceeded=true", phase)
++		return
++	}
++	var forwarder, actor, worker, pipe string
++	for _, record := range records[:n] {
++		kind, symbols := nativeHealthFrames(record.Stack())
++		switch kind {
++		case "forwarder":
++			if forwarder == "" {
++				forwarder = symbols
++			}
++		case "actor":
++			if actor == "" {
++				actor = symbols
++			}
++		case "worker":
++			if worker == "" {
++				worker = symbols
++			}
++		case "pipe":
++			if pipe == "" {
++				pipe = symbols
++			}
++		}
++	}
++	log("native_health_probe phase=%s forwarder=%q actor=%q worker=%q pipe=%q", phase, forwarder, actor, worker, pipe)
++}
++
++// GoroutineProfile contains PCs only. Emit validated symbols without arguments,
++// paths, line numbers or addresses. Keep only the four fixed owner stacks.
++func nativeHealthFrames(pcs []uintptr) (string, string) {
++	const prefix = "github.com/devgianlu/go-librespot/"
++	frames := runtime.CallersFrames(pcs)
++	kind := ""
++	var symbols []string
++	for {
++		frame, more := frames.Next()
++		switch frame.Function {
++		case prefix + "daemon.(*App).forwardAPI":
++			kind = "forwarder"
++		case prefix + "daemon.(*AppPlayer).Run", prefix + "daemon.(*AppPlayer).runFailedTransport",
++			prefix + "daemon.(*AppPlayer).dispatchAPIAndPark", prefix + "daemon.(*AppPlayer).handlePlayerEvent":
++			kind = "actor"
++		case prefix + "player.(*Player).manageLoop":
++			kind = "worker"
++		case prefix + "output.(*pipeOutput).outputLoop":
++			kind = "pipe"
++		}
++		name := strings.TrimPrefix(frame.Function, prefix)
++		if len(symbols) < nativeHealthStackFrames && nativeHealthSymbol(name) {
++			symbols = append(symbols, name)
++		}
++		if !more {
++			break
++		}
++	}
++	return kind, strings.Join(symbols, ";")
++}
++
++func nativeHealthSymbol(name string) bool {
++	if name == "" || len(name) > 128 {
++		return false
++	}
++	for _, c := range name {
++		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') &&
++			!strings.ContainsRune("._/*()-", c) {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/daemon/status_health_probe_test.go b/daemon/status_health_probe_test.go
+new file mode 100644
+index 0000000..a25f15d
+--- /dev/null
++++ b/daemon/status_health_probe_test.go
+@@ -0,0 +1,111 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++)
++
++type healthProbeLogger struct {
++	librespot.NullLogger
++	reports chan string
++}
++
++func (l *healthProbeLogger) Warnf(format string, args ...any) {
++	l.reports <- fmt.Sprintf(format, args...)
++}
++
++func TestNativeHealthProbeRequiresExactLoopbackMarker(t *testing.T) {
++	r := httptest.NewRequest(http.MethodGet, "/status", nil)
++	r.Header.Set(nativeHealthProbeHeader, "1")
++	if isNativeHealthProbe(r) {
++		t.Fatal("nonloopback may not request stacks")
++	}
++	r.RemoteAddr = "[::1]:1234"
++	if !isNativeHealthProbe(r) {
++		t.Fatal("exact IPv6 loopback marker")
++	}
++	r.Header.Add(nativeHealthProbeHeader, "1")
++	if isNativeHealthProbe(r) {
++		t.Fatal("duplicate marker accepted")
++	}
++}
++
++func TestNativeHealthProbeFastStatusKeepsReplyAndDoesNotLog(t *testing.T) {
++	logger := &healthProbeLogger{reports: make(chan string, 1)}
++	server := &ConcreteApiServer{log: logger, requests: make(chan ApiRequest)}
++	replied := make(chan struct{})
++	go func() {
++		request := <-server.requests
++		request.Reply(nil, ErrNoSession)
++		close(replied)
++	}()
++	ctx, cancel := context.WithCancel(context.Background())
++	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/status", nil)
++	req.RemoteAddr = "127.0.0.1:1234"
++	req.Header.Set(nativeHealthProbeHeader, "1")
++	out := httptest.NewRecorder()
++	server.handleStatus(out, req)
++	cancel()
++	<-replied
++	if out.Code != http.StatusNoContent || out.Body.Len() != 0 || server.healthProbe.last.Load() != 0 {
++		t.Fatal("fast unpaired response or diagnostic changed", out.Code, out.Body.String())
++	}
++}
++
++func TestNativeHealthProbeAfterClientDeadlineDoesNotChangeStatusReply(t *testing.T) {
++	_, _, _ = idleAliasFixture(t) // Real worker stack, without a provider connection.
++	logger := &healthProbeLogger{reports: make(chan string, 2)}
++	server := &ConcreteApiServer{log: logger, requests: make(chan ApiRequest)}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/status", nil)
++	req.RemoteAddr = "127.0.0.1:1234"
++	req.Header.Set(nativeHealthProbeHeader, "1")
++	out := httptest.NewRecorder()
++	finished := make(chan struct{})
++	go func() { server.handleStatus(out, req); close(finished) }()
++	var accepted ApiRequest
++	select {
++	case accepted = <-server.requests:
++	case <-time.After(time.Second):
++		t.Fatal("request was not handed to forwarder")
++	}
++	select {
++	case report := <-logger.reports:
++		if !strings.Contains(report, "phase=await_status_reply") ||
++			!strings.Contains(report, "player.(*Player).manageLoop") ||
++			strings.Contains(report, ".go:") || strings.Contains(report, "0x") {
++			t.Fatalf("unexpected bounded symbol-only report: %s", report)
++		}
++	case <-time.After(7 * time.Second):
++		t.Fatal("client deadline did not produce the diagnostic")
++	}
++	select {
++	case <-finished:
++		t.Fatal("diagnostic released the actor reply boundary")
++	default:
++	}
++	server.healthProbe.report(logger.Warnf, "queued", 5*time.Second, &atomic.Bool{})
++	select {
++	case <-logger.reports:
++		t.Fatal("duplicate status report inside rate limit")
++	default:
++	}
++	accepted.Reply(map[string]bool{"healthy": true}, nil)
++	select {
++	case <-finished:
++	case <-time.After(time.Second):
++		t.Fatal("original reply did not settle")
++	}
++	if out.Code != http.StatusOK || out.Body.String() != "{\"healthy\":true}\n" {
++		t.Fatalf("diagnostic changed HTTP reply: %d %q", out.Code, out.Body)
++	}
++}

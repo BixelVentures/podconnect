@@ -1,3 +1,8 @@
+## Speakers 0.26.81 — identify unresponsive playback ownership
+
+- Log whether a local Native status probe failed by timeout, transport, or HTTP response. An overdue local probe can report bounded forwarding, actor and worker function names without request data.
+- This diagnostic release investigates controls becoming unavailable after an accepted queue choice. Playback and watchdog behavior are unchanged.
+
 ## Speakers 0.26.80 — recover radio after a retired Spotify room move
 
 - After a restart, a recorded, fully retired Spotify room move can release the idle gate once the prior process is proven gone, the FIFO is quiet, and no receiver is active.
