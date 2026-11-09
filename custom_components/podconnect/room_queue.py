@@ -14,7 +14,7 @@ import uuid
 from homeassistant.exceptions import HomeAssistantError
 
 from .artwork import validate_spotify_artwork
-from .observations import current
+from .observations import QUEUE_CACHE_S, current
 from .room_transport import valid_identity
 from .speakers import SpeakersError
 
@@ -162,6 +162,37 @@ class RoomQueue:
         self.preparations = {}
         self.read_revision = 0
         self._queue_read_log_after = {}
+        self._metadata_task = None
+
+    def _warm_queue_metadata(self, hass, entry_id):
+        if self._metadata_task is not None and not self._metadata_task.done():
+            return
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            return
+        data = self.commands.data
+        reader = data.observations
+        if (
+            reader._queue_cache is not None
+            and time.monotonic() - reader._queue_cached_at < reader._queue_cache_ttl
+        ):
+            return
+
+        def verify():
+            current(hass, entry_id, data)
+            if data.observations is not reader:
+                raise HomeAssistantError("PodConnect account observations replaced")
+
+        async def warm():
+            try:
+                verify()
+                await reader.queue(entry_id, 20, verify)
+            except HomeAssistantError:
+                return
+
+        self._metadata_task = entry.async_create_background_task(
+            hass, warm(), "podconnect native queue labels", eager_start=False
+        )
 
     def _trace_read_failure(self, reason, observed=None):
         try:
@@ -344,13 +375,14 @@ class RoomQueue:
         metadata = {}
         cache = getattr(self.commands.data.observations, "_queue_cache", None)
         cached_at = getattr(self.commands.data.observations, "_queue_cached_at", 0)
-        if (
+        cache_current = (
             isinstance(cache, dict)
             and cache.get("ok") is True
             and cache.get("config_entry_id") == entry
             and cache.get("owner_epoch") == latest["owner_epoch"]
-            and 0 <= time.monotonic() - cached_at < 10
-        ):
+            and 0 <= time.monotonic() - cached_at < QUEUE_CACHE_S
+        )
+        if cache_current:
             for row in cache.get("items", []):
                 if isinstance(row, dict) and isinstance(row.get("uri"), str):
                     metadata[row["uri"]] = row
@@ -400,6 +432,10 @@ class RoomQueue:
                     "artwork": artwork["url"] if artwork else None,
                 }
             )
+        # Account metadata can label an existing Native occurrence, but it
+        # cannot supply order, membership, authority, or an action deadline.
+        if not cache_current and any(not row["metadata_known"] for row in items):
+            self._warm_queue_metadata(hass, entry)
         return {
             **{
                 key: latest[key]

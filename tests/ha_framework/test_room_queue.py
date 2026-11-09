@@ -67,6 +67,10 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         }
 
     async def _backend(self, request):
+        if request.path == "/spotify/me/player/queue":
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.headers.get("Authorization"), "Bearer inert-fixture-only")
+            return web.json_response({"queue": []})
         if request.path == "/api/room-queue/state":
             self.queue_reads.append(dict(request.query))
             self.queue_headers.append(request.headers.get("X-Podconnect-Queue-Metadata"))
@@ -451,6 +455,117 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual([row["artist"] for row in value["items"]], ["Faktisk kunstner"] * 2)
         self.assertEqual([row["artwork"] for row in value["items"]], ["https://i.scdn.co/image/" + "a" * 40] * 2)
         self.assertNotEqual(value["items"][0]["option_id"], value["items"][1]["option_id"])
+
+    async def test_room_read_warms_only_exact_account_labels_without_waiting(self):
+        data = self.entries[0].runtime_data
+        uri = "spotify:track:" + "0" * 22
+        foreign_uri = "spotify:track:" + "1" * 22
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.holds.append(release)
+        requests = 0
+
+        async def account_queue():
+            nonlocal requests
+            requests += 1
+            entered.set()
+            await release.wait()
+            return {
+                "queue": [
+                    {
+                        "type": "track",
+                        "uri": foreign_uri,
+                        "name": "Foreign",
+                        "artists": [],
+                    },
+                    {
+                        "type": "track",
+                        "uri": uri,
+                        "name": "Exact song",
+                        "artists": [{"name": "Artist"}],
+                    },
+                ],
+            }
+
+        with patch.object(data.observations.api, "queue", account_queue):
+            cold = await asyncio.wait_for(self.queue_read(), 1)
+            self.assertEqual(
+                [row["metadata_known"] for row in cold["items"]], [False, False]
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            concurrent = await asyncio.wait_for(self.queue_read(), 1)
+            self.assertEqual(
+                [row["metadata_known"] for row in concurrent["items"]], [False, False]
+            )
+            self.assertEqual(requests, 1)
+            release.set()
+            await asyncio.wait_for(
+                asyncio.shield(data.commands.room_queue._metadata_task), 1
+            )
+
+            warm = await self.queue_read()
+            self.assertEqual([row["name"] for row in warm["items"]], ["Exact song"] * 2)
+            self.assertEqual([row["artist"] for row in warm["items"]], ["Artist"] * 2)
+            self.assertEqual(
+                [row["metadata_known"] for row in warm["items"]], [True, True]
+            )
+            self.assertEqual(
+                warm["queue"]["queue_revision"], cold["queue"]["queue_revision"]
+            )
+            for key in ("option_id", "index", "uri"):
+                self.assertEqual(
+                    [row[key] for row in warm["items"]],
+                    [row[key] for row in cold["items"]],
+                )
+            self.assertEqual(requests, 1)
+            data.observations._queue_cached_at -= 11
+            data.observations._queue_next_read_at = 0
+            expired = await self.queue_read()
+            self.assertEqual(
+                [row["metadata_known"] for row in expired["items"]], [False, False]
+            )
+            await asyncio.wait_for(
+                asyncio.shield(data.commands.room_queue._metadata_task), 1
+            )
+            refreshed = await self.queue_read()
+            self.assertEqual(
+                [row["name"] for row in refreshed["items"]], ["Exact song"] * 2
+            )
+            self.assertEqual(requests, 2)
+        self.assertEqual(self.queue_posts, [])
+
+    async def test_room_metadata_warm_cannot_publish_after_replacement_or_cancel(self):
+        entry = self.entries[0]
+        data = entry.runtime_data
+        reader = data.observations
+        for mode in ("replacement", "cancel"):
+            with self.subTest(mode=mode):
+                entered, release = asyncio.Event(), asyncio.Event()
+                self.holds.append(release)
+
+                async def account_queue(entered=entered, release=release):
+                    entered.set()
+                    await release.wait()
+                    return {"queue": []}
+
+                reader._queue_next_read_at = 0
+                with patch.object(reader.api, "queue", account_queue):
+                    await self.queue_read()
+                    await asyncio.wait_for(entered.wait(), 1)
+                    task = data.commands.room_queue._metadata_task
+                    if mode == "replacement":
+                        entry.runtime_data = copy.copy(data)
+                        try:
+                            release.set()
+                            await asyncio.wait_for(asyncio.shield(task), 1)
+                        finally:
+                            entry.runtime_data = data
+                    else:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(asyncio.shield(task), 1)
+                self.assertIsNone(reader._queue_cache)
+                self.assertFalse(reader._queue_busy)
+        self.assertEqual(self.queue_posts, [])
 
     async def test_new_control_accepts_old_manager_queue_shape(self):
         self.entries[0].runtime_data.observations._queue_cache = None
