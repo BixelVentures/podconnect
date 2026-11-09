@@ -1,0 +1,317 @@
+diff --git a/daemon/radio_primary.go b/daemon/radio_primary.go
+index 93c314e..3a56817 100644
+--- a/daemon/radio_primary.go
++++ b/daemon/radio_primary.go
+@@ -122,6 +122,9 @@ func (s *ConcreteApiServer) handleRadioPrimaryHTTP(w http.ResponseWriter, r *htt
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+ 	defer cancel()
++	if call.Query {
++		call.Context = ctx
++	}
+ 	data, err := s.roomTransportAsk(ctx, apiRadioPrimaryHTTP, call)
+ 	if err == ErrForbidden {
+ 		w.WriteHeader(http.StatusForbidden)
+@@ -143,7 +146,9 @@ func (app *App) handleRadioPrimaryAPI(ctx context.Context, req ApiRequest) {
+ 		return
+ 	}
+ 	if c.Query {
+-		req.Reply(app.radioPrimaryReadiness(ctx, process), nil)
++		queryCtx, cancel := queueOperationContext(ctx, c.Context)
++		defer cancel()
++		req.Reply(app.radioPrimaryReadiness(queryCtx, process), nil)
+ 		return
+ 	}
+ 	if !app.radioEnabled() || c.Request.Process != radioProcessID(process) ||
+diff --git a/daemon/radio_primary_observation.go b/daemon/radio_primary_observation.go
+index 9e64ae1..87152ac 100644
+--- a/daemon/radio_primary_observation.go
++++ b/daemon/radio_primary_observation.go
+@@ -31,6 +31,7 @@ type radioPrimaryActorStateRequest struct {
+ 	State     radioPrimaryReadinessState
+ 	CProcess  string
+ 	Receivers map[string]string
++	Context   context.Context
+ }
+ 
+ func (app *App) primaryRadioActorAsk(ctx context.Context, kind ApiRequestType, call any) (any, error) {
+@@ -80,7 +81,9 @@ func (p *AppPlayer) primaryRadioReadOwner(ctx context.Context, device string, qu
+ 
+ // The same Native actor owns source observation and effects. No persisted hold
+ // becomes a new authority after restart, and a paused writer remains Spotify.
+-func (p *AppPlayer) radioPrimaryActorState(ctx context.Context, request radioPrimaryActorStateRequest) (any, error) {
++func (p *AppPlayer) radioPrimaryActorState(parent context.Context, request radioPrimaryActorStateRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
+ 	app, state := p.app, request.State
+ 	if ctx.Err() != nil || p.state == nil || p.state.player == nil || app.manualReleasePending() {
+ 		return nil, ErrAliasConflict
+diff --git a/daemon/radio_primary_readiness.go b/daemon/radio_primary_readiness.go
+index d05fe05..173ac53 100644
+--- a/daemon/radio_primary_readiness.go
++++ b/daemon/radio_primary_readiness.go
+@@ -110,7 +110,7 @@ func (app *App) radioPrimaryReadiness(ctx context.Context, process contentProces
+ 	} else if unsupported == 0 && len(receivers) > 0 && cProcess != "" {
+ 		s.Missing = []string{"primary_current_owner_unverified"}
+ 		observed, err := app.primaryRadioActorAsk(ctx, apiRadioPrimaryActorState, radioPrimaryActorStateRequest{
+-			State: s, CProcess: cProcess, Receivers: receivers,
++			State: s, CProcess: cProcess, Receivers: receivers, Context: ctx,
+ 		})
+ 		if verified, ok := observed.(radioPrimaryReadinessState); err == nil && ok && verified.Observation != nil {
+ 			s = verified
+diff --git a/daemon/radio_primary_readiness_test.go b/daemon/radio_primary_readiness_test.go
+index 28e0b33..a20a96a 100644
+--- a/daemon/radio_primary_readiness_test.go
++++ b/daemon/radio_primary_readiness_test.go
+@@ -4,9 +4,13 @@ import (
+ 	"context"
+ 	"io"
+ 	"net/http"
++	"net/http/httptest"
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++	"time"
++
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ )
+ 
+ func TestPrimaryRadioReadinessSeparatesCapabilityFromCurrentOwner(t *testing.T) {
+@@ -61,3 +65,67 @@ func TestPrimaryRadioReadinessSeparatesCapabilityFromCurrentOwner(t *testing.T)
+ 		})
+ 	}
+ }
++
++func TestPrimaryRadioReadinessActorReleasesCancelledHTTPRead(t *testing.T) {
++	if _, ok := nativeContentProcess(); !ok {
++		t.Skip("requires actual Linux process certificate")
++	}
++	const token = "0123456789abcdef0123456789abcdef"
++	app := &App{cfg: &Config{
++		DeviceAliases: []string{"Kitchen"}, DeviceAliasRoomIDs: []string{"kitchen"}, DeviceAliasHomePodIDs: []string{"42"},
++		RadioHandoffControlToken: token, RadioHandoffOwnerURL: "http://127.0.0.1:4010",
++		RadioHandoffStatePath: filepath.Join(t.TempDir(), "radio.json"), RoomTransportOwnToneURL: "http://127.0.0.1:3689",
++	}, currentAPI: make(chan ApiRequest), currentDone: make(chan struct{})}
++	const capability = `{"schema":"podconnect.output_primary_radio_readiness.v1","effect_protocol":"primary_route_v1","process_id":"a411aa42-8b70-4bf4-a37d-81b0519db7df","device_id":"42","device_incarnation":"3","legacy_admission_open":true,"physical_result_verified":false}`
++	previous := http.DefaultTransport
++	defer func() { http.DefaultTransport = previous }()
++	http.DefaultTransport = pc13RoundTrip(func(r *http.Request) (*http.Response, error) {
++		if r.Method != http.MethodGet || r.URL.Path != "/api/outputs/42/radio-handoff/primary-readiness" {
++			t.Error("cancelled actor unexpectedly attempted a second source read")
++		}
++		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(capability))}, nil
++	})
++	server := &ConcreteApiServer{requests: make(chan ApiRequest)}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	r := httptest.NewRequestWithContext(ctx, http.MethodGet, "/radio/primary", nil)
++	r.Header.Set("X-PodConnect-Token", token)
++	handlerDone := make(chan struct{})
++	appDone := make(chan struct{})
++	go func() { server.handleRadioPrimaryHTTP(httptest.NewRecorder(), r); close(handlerDone) }()
++	go func() { app.handleRadioPrimaryAPI(context.Background(), <-server.requests); close(appDone) }()
++	var actorRequest ApiRequest
++	select {
++	case actorRequest = <-app.currentAPI:
++	case <-time.After(time.Second):
++		t.Fatal("live readiness did not reach the exact Native actor")
++	}
++	cancel()
++	// Hold the first owner mutex. A cancelled request must return before trying
++	// to acquire it rather than occupying the serialized actor after client loss.
++	app.radio.mu.Lock()
++	owner := &AppPlayer{app: app, state: &State{player: &connectpb.PlayerState{}}}
++	actorDone := make(chan error, 1)
++	go func() {
++		_, err := owner.handleApiRequest(context.Background(), actorRequest)
++		actorDone <- err
++	}()
++	select {
++	case err := <-actorDone:
++		app.radio.mu.Unlock()
++		if err != ErrAliasConflict {
++			t.Fatal("cancelled actor published authority", err)
++		}
++	case <-time.After(time.Second):
++		app.radio.mu.Unlock()
++		<-actorDone
++		t.Fatal("passive Native actor waited on its owner after HTTP cancellation")
++	}
++	for _, done := range []chan struct{}{handlerDone, appDone} {
++		select {
++		case <-done:
++		case <-time.After(time.Second):
++			t.Fatal("cancelled readiness waiter did not release")
++		}
++	}
++}
+diff --git a/output/room_move.go b/output/room_move.go
+index b5b2638..9ec67dd 100644
+--- a/output/room_move.go
++++ b/output/room_move.go
+@@ -49,7 +49,8 @@ func (out *pipeOutput) SetMoveStateUnderStartLock(paused, fenced bool) {
+ }
+ 
+ // MoveControlPipeOutput adds the existing pipe control interruption only for an
+-// admitted MOVE quiesce. Read-only transport observations keep WithStartLock.
++// admitted MOVE quiesce or exact queue-writer inspection. Other read-only
++// transport observations keep WithStartLock.
+ type MoveControlPipeOutput interface {
+ 	MovePipeOutput
+ 	OpenedWriterIdentity() MovePipeIdentity
+diff --git a/player/pipe_liveness_test.go b/player/pipe_liveness_test.go
+index afc9a23..c73c810 100644
+--- a/player/pipe_liveness_test.go
++++ b/player/pipe_liveness_test.go
+@@ -1,7 +1,10 @@
+ package player
+ 
+ import (
++	"bytes"
++	"context"
+ 	"io"
++	"runtime"
+ 	"sync/atomic"
+ 	"syscall"
+ 	"testing"
+@@ -205,3 +208,115 @@ func TestPipeSeekPreservesPausedStateAndDoesNotWaitForConsumer(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestQueueWriterInspectionWhileKeeperFIFOIsFull(t *testing.T) {
++	path := queueFIFO(t)
++	p, err := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "pipe", AudioOutputPipe: path,
++		AudioOutputPipeFormat: "s16le", ExternalVolume: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	old := &queueEOFSource{1}
++	if err = p.SetPrimaryStream(old, true, false); err != nil {
++		t.Fatal(err)
++	}
++	guard := func(mutate func()) error { mutate(); return nil }
++	writer, epoch, err := p.RoomMove(context.Background(), "inspect", old, output.MovePipeIdentity{}, "", false, guard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	filler, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	filled := 0
++	zero := make([]byte, 4096)
++	for {
++		n, e := syscall.Write(filler, zero)
++		if e == syscall.EAGAIN {
++			break
++		}
++		if e != nil {
++			syscall.Close(filler)
++			t.Fatal(e)
++		}
++		filled += n
++	}
++	syscall.Close(filler)
++	if filled == 0 {
++		t.Fatal("keeper FIFO was not filled")
++	}
++	next := &replacementPCM{entered: make(chan struct{})}
++	if err = p.GuardedQueueTransport(context.Background(), next, old, writer, epoch, guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-next.entered:
++	case <-time.After(time.Second):
++		t.Fatal("accepted queue successor did not begin PCM")
++	}
++	// Witness the real kernel write before asking the serialized worker for ownership.
++	blocked := false
++	dump := make([]byte, 1<<16)
++	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline) && !blocked; {
++		n := runtime.Stack(dump, true)
++		for _, goroutine := range bytes.Split(dump[:n], []byte("\n\n")) {
++			if bytes.Contains(goroutine, []byte("(*pipeOutput).outputLoop")) &&
++				bytes.Contains(goroutine, []byte("(*File).Write")) {
++				blocked = true
++				break
++			}
++		}
++		if !blocked {
++			time.Sleep(time.Millisecond)
++		}
++	}
++	if !blocked {
++		t.Fatal("queue writer never reached the blocked kernel write")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
++	defer cancel()
++	gotWriter, gotEpoch, err := p.RoomMove(ctx, "inspect", next, output.MovePipeIdentity{}, "", true, guard)
++	if err != nil || gotWriter != writer || gotEpoch != epoch {
++		t.Fatalf("passive queue writer inspection did not join the exact full FIFO: %v", err)
++	}
++
++	wrongGuard := func(func()) error {
++		t.Error("changed source reached ownership callback")
++		return nil
++	}
++	if _, _, err = p.RoomMove(ctx, "inspect", old, output.MovePipeIdentity{}, "", true, wrongGuard); err == nil {
++		t.Fatal("full FIFO admitted a displaced source")
++	}
++
++	reader, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer syscall.Close(reader)
++	// The read must observe every prefill byte followed by the complete original
++	// successor chunk. Inspection cannot flush, replay, or replace pending PCM.
++	got := make([]byte, 0, filled+8192)
++	buffer := make([]byte, 8192)
++	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline) && len(got) < filled+8192; {
++		n, e := syscall.Read(reader, buffer)
++		if n > 0 {
++			got = append(got, buffer[:n]...)
++		}
++		if e != nil && e != syscall.EAGAIN {
++			t.Fatal(e)
++		}
++		if n <= 0 {
++			time.Sleep(time.Millisecond)
++		}
++	}
++	if len(got) != filled+8192 || !bytes.Equal(got[:filled], make([]byte, filled)) {
++		t.Fatalf("inspection changed pending FIFO length or prefill: got %d bytes", len(got))
++	}
++	for i := filled; i < len(got); i += 2 {
++		if got[i] != 0 || got[i+1] != 64 {
++			t.Fatal("inspection changed successor PCM")
++		}
++	}
++}
+diff --git a/player/room_move.go b/player/room_move.go
+index b4f869e..147dda4 100644
+--- a/player/room_move.go
++++ b/player/room_move.go
+@@ -76,6 +76,20 @@ func (p *Player) applyRoomMove(command *roomMoveCommand, out *output.Output, sou
+ 		}
+ 	}
+ 	withLock := pipe.WithStartLock
++	if command.phase == "inspect" {
++		controlled, ok := pipe.(output.MoveControlPipeOutput)
++		if !ok {
++			return result, fmt.Errorf("queue writer observation unavailable")
++		}
++		// A live FIFO write holds the same mutex while the reader may be idle.
++		// Join it with the existing PCM-preserving control interruption. The
++		// inspection callback receives no ability to pause or clear PCM.
++		withLock = func(ctx context.Context, apply func(output.PipeIdentity, func(bool)) error) error {
++			return controlled.WithMoveControlLock(ctx, func(identity output.PipeIdentity, _ func(bool)) error {
++				return apply(identity, nil)
++			})
++		}
++	}
+ 	if command.phase == "verify-pause" || command.phase == "verify-current" {
+ 		verify, ok := pipe.(interface {
+ 			WithPauseVerifyLock(context.Context, func(output.PipeIdentity, func(bool)) error) error
