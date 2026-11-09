@@ -66,6 +66,8 @@ jobs:
           git apply "$patch_dir/radio-primary-native.patch"
           git apply --check "$patch_dir/status-health-diagnostics-native.patch"
           git apply "$patch_dir/status-health-diagnostics-native.patch"
+          git apply --check "$patch_dir/queue-writer-inspection-native.patch"
+          git apply "$patch_dir/queue-writer-inspection-native.patch"
           fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
           git apply --check "$fixture"
           git apply "$fixture"
