@@ -1,3 +1,8 @@
+## Speakers 0.26.80 — recover radio after a retired Spotify room move
+
+- After a restart, a recorded, fully retired Spotify room move can release the idle gate once the prior process is proven gone, the FIFO is quiet, and no receiver is active.
+- Preserve the retirement receipt and leave unretired moves blocked. Startup does not resume playback.
+
 ## Speakers 0.26.79 — recover radio after a recorded Spotify retirement
 
 - At cold startup, release the idle START gate for an already retired Spotify session when the prior Native process is proven gone, the FIFO is quiet, and no receiver is active.
