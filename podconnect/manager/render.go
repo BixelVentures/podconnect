@@ -138,7 +138,7 @@ func renderOTConfig(r *Room) error {
 	if err := os.MkdirAll(r.OwnDir, 0o755); err != nil {
 		return err
 	}
-	mediaDir := filepath.Dir(r.Pipe) // /srv/media or /srv/media/rooms/<id>
+	mediaDir := filepath.Dir(r.Pipe)
 	cfg := fmt.Sprintf(`general {
 	uid = "owntone"
 	db_path = "%s/songs3.db"

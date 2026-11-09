@@ -1354,6 +1354,14 @@ func main() {
 	defer stopSignals()
 	store = newRoomStore()
 	mgr = newRoomManager(store)
+	if dataDir == "/data" {
+		fence, err := openPrimaryOwnerFence(dataDir)
+		if err != nil {
+			log.Fatalf("primary owner lifetime fence unavailable: %v", err)
+		}
+		defer fence.file.Close() // Never unlock the shared description while a child retains it.
+		mgr.primaryOwnerFence = fence
+	}
 	// Radio prepares only its own private settings. A failed radio opt-in must
 	// never prevent the existing Spotify service from starting.
 	if err := ensureRadioWorkerSettings(); err != nil {

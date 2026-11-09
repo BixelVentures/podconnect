@@ -83,11 +83,12 @@ func (r *Room) fill() {
 	r.Librespot = fmt.Sprintf("http://localhost:%d", r.GLPort)
 	r.OwnTone = fmt.Sprintf("http://localhost:%d", r.OTPort)
 	if r.Idx == 0 {
-		// Legacy paths — same creds, device_id, library, pipe the single-room setup used.
+		// Preserve the room database and Spotify identity. The primary FIFO now
+		// lives with its durable owner journal across add-on replacement.
 		r.ConfigDir = filepath.Join(dataDir, "go-librespot")
 		r.OwnDir = filepath.Join(dataDir, "owntone")
 		r.OwnConf = filepath.Join(dataDir, "rooms", r.ID, "owntone.conf")
-		r.Pipe = "/srv/media/spotify"
+		r.Pipe = filepath.Join(dataDir, "media", "spotify")
 		return
 	}
 	base := filepath.Join(dataDir, "rooms", r.ID)

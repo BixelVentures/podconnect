@@ -30,6 +30,7 @@ import (
 // roomRuntime is the live process state for one room.
 type roomRuntime struct {
 	room        *Room
+	ownerFence  *primaryOwnerFence
 	stop        chan struct{}
 	done        chan struct{}
 	stopOnce    sync.Once
@@ -50,10 +51,11 @@ type roomRuntime struct {
 
 // roomManager owns every room's runtime, guarded by a mutex.
 type roomManager struct {
-	mu       sync.Mutex
-	runtimes map[string]*roomRuntime
-	store    *roomStore
-	stopping bool
+	mu                sync.Mutex
+	runtimes          map[string]*roomRuntime
+	store             *roomStore
+	stopping          bool
+	primaryOwnerFence *primaryOwnerFence
 }
 
 func newRoomManager(store *roomStore) *roomManager {
@@ -76,6 +78,9 @@ func (m *roomManager) ensureRunning(r *Room) {
 		return
 	}
 	rt := &roomRuntime{room: r, stop: make(chan struct{}), done: make(chan struct{})}
+	if r.Idx == 0 {
+		rt.ownerFence = m.primaryOwnerFence
+	}
 	rt.att.loadCustody(filepath.Join(dataDir, "rooms", r.ID, "attention-custody.json"), r.ID)
 	m.runtimes[r.ID] = rt
 	m.mu.Unlock()
@@ -127,10 +132,10 @@ func (rt *roomRuntime) supervise() {
 	r := rt.room
 
 	go rt.keepAlive("go-librespot", &rt.glCmd, func() *exec.Cmd {
-		return exec.Command("go-librespot", "--config_dir", r.ConfigDir)
+		return rt.ownerFence.bind(exec.Command("go-librespot", "--config_dir", r.ConfigDir))
 	})
 	go rt.keepAlive("owntone", &rt.otCmd, func() *exec.Cmd {
-		return exec.Command("owntone", "-f", "-c", r.OwnConf)
+		return rt.ownerFence.bind(exec.Command("owntone", "-f", "-c", r.OwnConf))
 	})
 
 	// go-librespot hang watchdog (folded gl-watchdog): poll /status; restart after ~90s unresponsive.

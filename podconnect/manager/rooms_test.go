@@ -30,7 +30,7 @@ func TestRoomFillLegacyVsNew(t *testing.T) {
 	dataDir = "/data"
 	r0 := &Room{ID: "r0", Idx: 0, Name: "Kitchen"}
 	r0.fill()
-	if r0.ConfigDir != "/data/go-librespot" || r0.OwnDir != "/data/owntone" || r0.Pipe != "/srv/media/spotify" {
+	if r0.ConfigDir != "/data/go-librespot" || r0.OwnDir != "/data/owntone" || r0.Pipe != "/data/media/spotify" {
 		t.Fatalf("r0 legacy paths wrong: %+v", r0)
 	}
 	if r0.Librespot != "http://localhost:3678" || r0.OwnTone != "http://localhost:3689" {
