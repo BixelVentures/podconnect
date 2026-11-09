@@ -4118,7 +4118,7 @@ index c9b66c43ddc44dabc573471024ffa1937319e7ab..aa61bd887b10ece74ea72106abdc607e
          || outputs_airplay_radio_pairing_key_digest(r->device_id,peer)<0)return -1;
      if(radio_sender.result.phase==RADIO_SENDER_DRAINED && r->device_id==radio_sender.result.device_id && !radio_sender.relinquished){
 diff --git a/src/outputs_release.inc.c b/src/outputs_release.inc.c
-index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..f5e8770e88b8e119a27bedaacc6822968f97576b 100644
+index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..77ae2909a90e6f5368d2027199b330353d5b4192 100644
 --- a/src/outputs_release.inc.c
 +++ b/src/outputs_release.inc.c
 @@ -698,19 +698,19 @@ outputs_transport_release_confirm(uint64_t id, const char *token, const char *pr
@@ -4278,8 +4278,8 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..f5e8770e88b8e119a27bedaacc682296
 +      && !current->st_uid && current->st_nlink == 1;
 +}
 +
-+/* Only the retired canonical predecessor in a previous kernel boot can
-+ * migrate from the add-on's private, nonpersistent legacy filesystem. */
++/* Only a validated completed or retired canonical predecessor from a
++ * previous kernel boot can migrate from the add-on's private filesystem. */
 +static bool
 +start_cold_legacy_unreachable(const struct output_start_request *pipe, struct stat *current)
 +{
@@ -4402,7 +4402,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..f5e8770e88b8e119a27bedaacc682296
 +  stage = "fifo_before_reader";
 +  if (!strcmp(pipe.expected_input_path, START_LEGACY_FIFO) && start_cold_primary_configured())
 +    {
-+      if (!terminal || !start_cold_legacy_unreachable(&pipe, &current))
++      if (!start_cold_legacy_unreachable(&pipe, &current))
 +        {
 +          denial = "legacy_fifo_migration";
 +          goto done;
@@ -7671,10 +7671,10 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa5872032e 100644
+index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..67a91db418d77a46c965442807b686f0ce2ff5e3 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -338,10 +338,334 @@ static void start_gate_process_successor(const char *path,const struct output_na
+@@ -338,10 +338,349 @@ static void start_gate_process_successor(const char *path,const struct output_na
    free(changed.payload);free(saved.payload);
    sqlite3_close(hdl);hdl=NULL;
  }
@@ -7733,6 +7733,9 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +  COLD_RETIRED_START,
 +  COLD_COMPLETED_MOVE,
 +  COLD_RETIRED_MOVE,
++  COLD_CANCELLED_START,
++  COLD_PENDING_RETIREMENT,
++  COLD_UNKNOWN_RETIREMENT,
 +};
 +
 +static void
@@ -7742,7 +7745,12 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +  const bool terminal = kind == COLD_RETIRED_START || kind == COLD_RETIRED_MOVE;
 +  const bool move = kind == COLD_COMPLETED_MOVE || kind == COLD_RETIRED_MOVE;
 +  const char *kind_name = move ? "move" : "start";
-+  const char *outcome_name = terminal ? "retired_known" : "none";
++  const bool unfinished = kind == COLD_PENDING_RETIREMENT || kind == COLD_UNKNOWN_RETIREMENT;
++  const bool cancelled = kind == COLD_CANCELLED_START;
++  const enum output_retirement_outcome prior = terminal ? OUTPUT_RETIRE_RETIRED_KNOWN
++      : kind == COLD_PENDING_RETIREMENT ? OUTPUT_RETIRE_PENDING
++      : kind == COLD_UNKNOWN_RETIREMENT ? OUTPUT_RETIRE_UNKNOWN : OUTPUT_RETIRE_NONE;
++  const char *outcome_name = start_cold_outcome_name(prior);
 +  const int phase = unknown ? OUTPUT_START_UNKNOWN : OUTPUT_START_COMPLETED;
 +  const bool migration = *cold_legacy_fifo && changed_boot;
 +  const bool fenced = *cold_canonical_fifo && !changed_boot;
@@ -7767,7 +7775,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +  record = json_tokener_parse(saved.payload);
 +  assert(record);
 +  json_object_object_add(record, "phase", json_object_new_int(phase));
-+  json_object_object_add(record, "cancelled", json_object_new_boolean(false));
++  json_object_object_add(record, "cancelled", json_object_new_boolean(cancelled));
 +  json_object_object_add(record, "writer_pending", json_object_new_boolean(false));
 +  json_object_object_add(record, "writer_source_epoch", json_object_new_int(1));
 +  json_object_object_add(record, "pipe_device", json_object_new_uint64(fifo.st_dev));
@@ -7798,12 +7806,12 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +      json_object_object_add(record, "schema", json_object_new_string("podconnect.output_move_journal.v1"));
 +      json_object_object_add(record, "move_existing_session", json_object_new_boolean(true));
 +    }
-+  if (terminal)
++  if (terminal || unfinished)
 +    {
 +      json_object *native_incarnation, *writer_fd;
 +      assert(json_object_object_get_ex(record, "native_incarnation", &native_incarnation)
 +          && json_object_object_get_ex(record, "writer_fd", &writer_fd));
-+      json_object_object_add(record, "retirement_outcome", json_object_new_string("retired_known"));
++      json_object_object_add(record, "retirement_outcome", json_object_new_string(outcome_name));
 +      json_object_object_add(record, "retirement_token", json_object_new_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 +      json_object_object_add(record, "retirement_reservation", json_object_new_string("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 +      json_object_object_add(record, "retirement_native_incarnation", json_object_get(native_incarnation));
@@ -7813,7 +7821,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +      json_object_object_add(record, "retirement_pipe_inode", json_object_new_uint64(fifo.st_ino));
 +      json_object_object_add(record, "retirement_input_item_id", json_object_new_int(1));
 +      json_object_object_add(record, "retirement_admitted_input_epoch", json_object_new_int(1));
-+      json_object_object_add(record, "retirement_input_epoch", json_object_new_int(2));
++      json_object_object_add(record, "retirement_input_epoch", json_object_new_int(unfinished ? 1 : 2));
 +      json_object_object_add(record, "retirement_deadline_sec", json_object_new_int(1));
 +      json_object_object_add(record, "retirement_reader_ready_closed", json_object_new_boolean(true));
 +    }
@@ -7837,11 +7845,11 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +  json_object_put(record);
 +  outputs_attention_uuid(outputs_process);
 +  start_journal_startup();
-+  const enum output_retirement_outcome prior = terminal ? OUTPUT_RETIRE_RETIRED_KNOWN : OUTPUT_RETIRE_NONE;
 +  assert(!start_journal_fault && start_startup_quarantine == !terminal && outputs_start_busy()
 +         && start_retired_reopen_pending == terminal && start_journal_retirement_outcome == prior);
 +  fixture_cold_reader_empty = true;
-+  if (!unknown && !old_alive && (!foreign_namespace || changed_boot || fenced) && kind != COLD_COMPLETED_MOVE)
++  const bool bad_shape = kind == COLD_COMPLETED_MOVE || cancelled;
++  if (!unknown && !old_alive && (!foreign_namespace || changed_boot || fenced) && !bad_shape && !unfinished)
 +    {
 +      int release = -1;
 +      pid_t foreign = changed_boot ? 0 : start_gate_cold_foreign_process(&release);
@@ -7914,13 +7922,18 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +             && start_route_clean_absent() && !start_active
 +             && !outputs_device_get(1)->selected && !outputs_device_get(1)->session);
 +      assert(start_journal_retirement_outcome == (terminal ? OUTPUT_RETIRE_RETIRED_KNOWN : OUTPUT_RETIRE_COLD_KNOWN));
-+      if (terminal)
++      if (terminal || migration)
 +        {
 +          record = json_tokener_parse(fixture.payload);
 +          assert(record);
-+          json_object_object_add(record, "retirement_reopen_consumed", json_object_new_boolean(true));
-+          assert(start_journal_retirement_reopen_consumed
-+              && !strcmp(json_object_to_json_string_ext(record, JSON_C_TO_STRING_PLAIN), start_journal.payload));
++          if (terminal)
++            {
++              json_object_object_add(record, "retirement_reopen_consumed", json_object_new_boolean(true));
++              assert(start_journal_retirement_reopen_consumed);
++            }
++          else
++            json_object_object_add(record, "retirement_outcome", json_object_new_string("cold_retired"));
++          assert(!strcmp(json_object_to_json_string_ext(record, JSON_C_TO_STRING_PLAIN), start_journal.payload));
 +          json_object_put(record);
 +        }
 +      outputs_attention_uuid(outputs_process);
@@ -7941,8 +7954,10 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +    }
 +  else
 +    {
-+      const char *stage = old_alive || foreign_namespace ? "predecessor" : "journal";
-+      const char *reason = old_alive ? "predecessor_live" : foreign_namespace ? "predecessor_namespace" : "journal_shape";
++      const bool invisible = foreign_namespace && !changed_boot;
++      const char *stage = old_alive || invisible ? "predecessor" : "journal";
++      const char *reason = old_alive ? "predecessor_live" : invisible ? "predecessor_namespace"
++          : unfinished ? "journal_outcome" : "journal_shape";
 +      start_gate_cold_attempt(kind_name, phase, outcome_name, stage, reason, 0, 0);
 +      assert(start_startup_quarantine == !terminal && outputs_start_busy()
 +             && start_retired_reopen_pending == terminal && start_journal_retirement_outcome == prior
@@ -7952,7 +7967,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +  free(current.payload);
 +  free(fixture.payload);
 +  free(saved.payload);
-+  if (changed_boot && !migration)
++  if (changed_boot && (!migration || bad_shape || unfinished))
 +    assert(unlink(old_path) == 0);
 +  sqlite3_close(hdl);
 +  hdl = NULL;
@@ -8010,7 +8025,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -378,7 +702,102 @@ static void exact_start_durable_gate(void)
+@@ -378,7 +717,109 @@ static void exact_start_durable_gate(void)
      successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
      assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    }
@@ -8073,8 +8088,13 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +      assert(mkdir(cold_owner_data, 0755) == 0 && mkdir(cold_canonical_media, 0755) == 0
 +          && mkdir(cold_legacy_parent, 0755) == 0 && mkdir(cold_legacy_media, 0755) == 0
 +          && mkfifo(cold_canonical_fifo, 0600) == 0);
-+      for (int mode = 0; mode < 3; mode++)
++      const enum cold_completed_kind migration_cases[] = {
++        COLD_RETIRED_START, COLD_COMPLETED_START, COLD_COMPLETED_MOVE, COLD_CANCELLED_START,
++        COLD_PENDING_RETIREMENT, COLD_UNKNOWN_RETIREMENT,
++      };
++      for (size_t mode = 0; mode < ARRAY_SIZE(migration_cases) + 2; mode++)
 +        {
++          const bool migration = mode < ARRAY_SIZE(migration_cases);
 +          successor = fork();
 +          assert(successor >= 0);
 +          if (!successor)
@@ -8093,10 +8113,11 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +              cfg_setlist(cfg_getsec(cfg, "library"), "directories", 1, cold_canonical_media);
 +              if (mode == 0)
 +                start_gate_primary_fence_stamps();
-+              if (mode != 0)
++              if (!migration)
 +                assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", cold_canonical_fifo)) == 0);
-+              enum cold_completed_kind kind = mode == 2 ? COLD_COMPLETED_START : COLD_RETIRED_START;
-+              start_gate_cold_completed(cold_canonical_fifo, false, true, mode == 0, false, kind);
++              enum cold_completed_kind kind = migration ? migration_cases[mode]
++                  : mode == ARRAY_SIZE(migration_cases) ? COLD_COMPLETED_START : COLD_RETIRED_START;
++              start_gate_cold_completed(cold_canonical_fifo, false, true, migration, false, kind);
 +              assert(sqlite3_open(owner_database_path, &hdl) == SQLITE_OK);
 +              assert(attention_sql(sqlite3_mprintf("UPDATE files SET path=%Q WHERE id=1", path)) == 0);
 +              sqlite3_close(hdl);
@@ -8108,7 +8129,8 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..88a34052efd3b584d7b9e3cf965183aa
 +          && rmdir(cold_canonical_media) == 0 && rmdir(cold_owner_data) == 0
 +          && rmdir(cold_legacy_media) == 0 && rmdir(cold_legacy_parent) == 0 && rmdir(root) == 0);
 +      cold_canonical_fifo[0] = cold_legacy_fifo[0] = 0;
-+      puts("PASS primary FIFO migration: retired legacy only after boot change; reachable old FIFO and missing guard deny; fresh same-boot fenced owner opens idle");
++      puts("PASS primary FIFO migration: exact completed START.none and retired legacy after boot change; "
++           "pending, UNKNOWN, cancelled, unretired MOVE, reachable FIFO and missing fence deny; same-boot fenced successor opens idle");
 +    }
    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,false);_exit(0);}
    assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);

@@ -1,7 +1,8 @@
 ## Speakers 0.26.84 — keep the primary audio owner across add-on updates
 
 - Keep the primary Spotify FIFO in persistent add-on data. The Manager and both primary processes share one kernel lifetime lock so a successor can verify that its predecessor released ownership, including across PID namespaces.
-- Recover an eligible legacy retired Spotify record only after a confirmed host boot change and proof that the old FIFO is inaccessible and the new FIFO is idle. Preserve the retirement record and open the idle gate without resuming playback.
+- Recover an eligible legacy completed or retired Spotify record only after a confirmed host boot change and proof that the old FIFO is inaccessible and the new FIFO is idle. Open the idle gate without resuming playback.
+- Keep the current receiver and subsequent controls available after an accepted queue selection that begins while Spotify is paused.
 - If rolling back after new journal entries have been written, restore the pre-update Speakers data backup with the previous image.
 
 ## Control 0.10.39 — populate native queue titles without blocking controls

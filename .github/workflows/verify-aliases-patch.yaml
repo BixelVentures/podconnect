@@ -280,7 +280,7 @@ jobs:
   selected-start-clock:
     needs: [build-fork, build-owntone]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install shared libraries for the existing compiled fixtures
