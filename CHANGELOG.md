@@ -1,3 +1,13 @@
+## Control 0.10.39 — populate native queue titles without blocking controls
+
+- Warm missing queue labels through the existing account reader in the background. Match labels by exact Spotify URI while preserving the native queue order, occurrence IDs and action authority.
+- Bound refreshes and discard late results after account replacement or cancellation.
+
+## Speakers 0.26.83 — identify blocked cold radio recovery
+
+- Report the first failed cold START recovery check using finite diagnostic categories without private identifiers or request data.
+- Recovery policy, playback actions and ownership checks are unchanged. This prepares the remaining Green radio investigation; it does not claim radio acceptance.
+
 ## Speakers 0.26.82 — keep queue changes and controls responsive
 
 - Prevent passive radio ownership checks from blocking playback status and controls when a queue change fills the audio pipe.
