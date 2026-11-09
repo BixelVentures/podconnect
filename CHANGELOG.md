@@ -1,3 +1,8 @@
+## Speakers 0.26.78 — recover radio readiness after a completed Spotify START
+
+- On startup, recover an old completed Spotify START when its process and FIFO checks prove that the previous writer and route are gone. This lets radio become available after a clean cold start.
+- Unknown outcomes and unproven writer or receiver state stay blocked. Recovery preserves the old record and sends no playback command.
+
 ## Speakers 0.26.77 — keep Spotify-to-radio handoff when a descriptor disappears
 
 - Prevent an unrelated disappearing Native file descriptor from closing the Spotify park at TEARDOWN. Every FIFO writer census now discards an incomplete scan and performs one fresh complete scan of the same live owner.
