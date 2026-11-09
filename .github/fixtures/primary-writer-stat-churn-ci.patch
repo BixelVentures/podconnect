@@ -1,5 +1,5 @@
 diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
-index 19bed7c..fd02f65 100644
+index 19bed7c..9309834 100644
 --- a/tests/airplay_callback_owner.c
 +++ b/tests/airplay_callback_owner.c
 @@ -8,6 +8,7 @@
@@ -21,7 +21,7 @@ index 19bed7c..fd02f65 100644
  #include "../src/evrtsp/evrtsp.h"
  static struct evrtsp_request *fixture_request_new(void (*)(struct evrtsp_request *,void *),void *);
  static void *fixture_calloc(size_t n, size_t size);
-@@ -57,6 +61,94 @@ fixture_primary_decoder_before_done(void)
+@@ -57,6 +61,128 @@ fixture_primary_decoder_before_done(void)
  #define PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE() fixture_primary_decoder_before_done()
  #include "../src/outputs/airplay.c"
  #undef PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE
@@ -42,6 +42,24 @@ index 19bed7c..fd02f65 100644
 +  int length = snprintf(fixture_primary_churn_path, sizeof(fixture_primary_churn_path),
 +      "/proc/%ld/fd/%d", (long)getpid(), fixture_primary_churn_fd);
 +  assert(length > 0 && (size_t)length < sizeof(fixture_primary_churn_path));
++}
++
++static int fixture_primary_finalize_churn_fd = -1;
++static unsigned int fixture_primary_finalize_churn_count;
++static uint64_t fixture_primary_finalize_churn_device;
++static char fixture_primary_finalize_churn_path[96];
++
++static void
++fixture_primary_finalize_churn_arm(uint64_t device_id)
++{
++  int descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
++  assert(descriptor >= 0 && fixture_primary_finalize_churn_fd < 0 && !fixture_primary_finalize_churn_count);
++  fixture_primary_finalize_churn_fd = fcntl(descriptor, F_DUPFD_CLOEXEC, 160);
++  assert(fixture_primary_finalize_churn_fd >= 160 && close(descriptor) == 0);
++  int length = snprintf(fixture_primary_finalize_churn_path, sizeof(fixture_primary_finalize_churn_path),
++      "/proc/%ld/fd/%d", (long)getpid(), fixture_primary_finalize_churn_fd);
++  assert(length > 0 && (size_t)length < sizeof(fixture_primary_finalize_churn_path));
++  fixture_primary_finalize_churn_device = device_id;
 +}
 +
 +static void
@@ -87,6 +105,22 @@ index 19bed7c..fd02f65 100644
 +static int
 +fixture_primary_writer_stat(const char *path, struct stat *result)
 +{
++  if (fixture_primary_finalize_churn_fd >= 0 && !strcmp(path, fixture_primary_finalize_churn_path))
++    {
++      const struct radio_handoff_slot *slot = radio_handoff_find(fixture_primary_finalize_churn_device);
++      /* Only the park finalize census: STOP accepted and every session context drained. */
++      if (slot && slot->result.phase == OUTPUT_RADIO_STOPPING && slot->stop_accepted && slot->drained)
++        {
++          assert(close(fixture_primary_finalize_churn_fd) == 0);
++          fixture_primary_finalize_churn_fd = -1;
++          int status = stat(path, result);
++          assert(status < 0 && errno == ENOENT);
++          fixture_primary_finalize_churn_count++;
++          fputs("FORCED primary park finalize writer scan saw a vanished unrelated FD\n", stderr);
++          errno = ENOENT;
++          return status;
++        }
++    }
 +  if (fixture_primary_churn_fd >= 0 && fixture_primary_scan_errno
 +      && !strcmp(path, fixture_primary_churn_path))
 +    {
@@ -117,7 +151,7 @@ index 19bed7c..fd02f65 100644
  #undef evrtsp_request_new
  #undef calloc
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 924a4e3..eb4d924 100644
+index fa67d64..53298b6 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -2022,12 +2022,18 @@ primary_radio_station_replace_wire(struct recovery_wire_fixture *previous, struc
@@ -139,9 +173,25 @@ index 924a4e3..eb4d924 100644
    assert(out->phase == OUTPUT_PRIMARY_RADIO_START_OBSERVED && destination->pc70_peer_sessions == destination_peers + 1
        && out->custody.epoch == candidate.epoch + (previous == destination ? 2 : 1)
        && out->custody.route == candidate.route && !strcmp(out->custody.operation, candidate.action)
-@@ -3319,6 +3325,8 @@ static int start35_wire_case(int mode)
+@@ -3313,6 +3319,9 @@ static int start35_wire_case(int mode)
+           && result.phase == OUTPUT_PRIMARY_SPOTIFY_PARK_PREPARED && f.device->session && !f.teardowns);
+       assert(!close(writer));
+       writer = -1;
++      bool finalize_churn = getenv("PC_PRIMARY_SPOTIFY_FINALIZE_STAT_CHURN") != NULL;
++      if (finalize_churn)
++        fixture_primary_finalize_churn_arm(f.device->id);
+       assert(outputs_primary_spotify_park(OUTPUT_PRIMARY_SPOTIFY_PARK_CONFIRM, &exact, &result) == 0
+           && result.phase == OUTPUT_PRIMARY_SPOTIFY_PARK_PENDING);
+       for (int i = 0; i < 1500 && result.phase == OUTPUT_PRIMARY_SPOTIFY_PARK_PENDING; i++)
+@@ -3326,7 +3335,14 @@ static int start35_wire_case(int mode)
+           && f.device->session_epoch == exact.route.session_epoch + 1
            && f.device->route_revision == exact.route.route_revision + 1
            && !outputs_radio_handoff_emission_current(f.device->id));
++      if (finalize_churn)
++        {
++          assert(fixture_primary_finalize_churn_count == 1 && fixture_primary_finalize_churn_fd == -1);
++          puts("PASS park finalize rescans after a vanished unrelated Native FD");
++        }
        struct radio_handoff_slot *retained = radio_handoff_find(f.device->id);
 +      if (getenv("PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN"))
 +        fixture_primary_writer_scan_fail_closed(&exact.writer, fifo);
