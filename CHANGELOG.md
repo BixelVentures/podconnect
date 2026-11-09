@@ -1,3 +1,9 @@
+## Speakers 0.26.82 — keep queue changes and controls responsive
+
+- Prevent passive radio ownership checks from blocking playback status and controls when a queue change fills the audio pipe.
+- Preserve pending audio, the exact writer and session guards while inspecting ownership. Cancel passive reads when their request ends.
+- Startup radio quarantine remains a separate investigation; this release does not bypass its ownership checks.
+
 ## Speakers 0.26.81 — identify unresponsive playback ownership
 
 - Log whether a local Native status probe failed by timeout, transport, or HTTP response. An overdue local probe can report bounded forwarding, actor and worker function names without request data.
