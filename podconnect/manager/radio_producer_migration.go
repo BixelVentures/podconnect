@@ -57,6 +57,9 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	if primary == nil || !record.Terminal || record.Preempted {
 		return false
 	}
+	if record.Stage == primaryLegacyRejectedStage {
+		return primaryLegacyInvalidReserve(record)
+	}
 	if record.Outcome == "rejected" && record.Stage == "no-effects-rejected" {
 		command, receipt := primary.LastCommand, primary.LastReceipt
 		if command == nil || receipt == nil || primary.Session != nil || receipt.TeardownCSeq != 0 || receipt.Observation != nil {
@@ -86,7 +89,7 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	if !record.SourceDrained {
 		return false
 	}
-	if producerUUID(primary.ReleaseActionID) && primary.ReleaseActionID != record.Fence.ActionID && primary.TeardownCSeq > 0 {
+	if producerUUID(primary.ReleaseActionID) && primary.ReleaseActionID != record.primaryWireAction() && primary.TeardownCSeq > 0 {
 		// The passive same-owner release path has no separate Manager
 		// command. Its exact old session was checked before this fsync.
 		return primary.Session.valid()
@@ -123,7 +126,8 @@ func producerPrimaryStopTerminal(record radioProducerRecord) bool {
 }
 
 func producerPrimaryStopOperation(receipt radioPrimaryReceipt, operation radioProducerRecord) bool {
-	return receipt.Schema == primaryRadioSchema && receipt.Handoff == operation.Fence.Token && receipt.Action == operation.Fence.ActionID &&
+	return receipt.Schema == primaryRadioSchema && receipt.Handoff == operation.Fence.Token &&
+		receipt.Action == operation.primaryWireAction() &&
 		receipt.Generation == strconv.FormatUint(operation.Fence.Generation, 10) &&
 		receipt.OwnerGeneration == strconv.FormatUint(operation.Fence.OwnerGeneration, 10) &&
 		receipt.Target == operation.Request.Target && receipt.From == operation.Request.From &&

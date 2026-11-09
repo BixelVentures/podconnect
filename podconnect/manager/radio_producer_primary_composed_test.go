@@ -209,7 +209,8 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 	trace := &primaryComposedTransport{next: http.DefaultTransport}
 	client.http.client.Transport = trace
 	for i, station := range []string{"p3", "p1", "p6-beat"} {
-		q := radioCommand{ActionID: attentionUUID(), Action: "start", StationID: station, TargetID: target,
+		// PodVoice sends its compact offer task ID as the public action identity.
+		q := radioCommand{ActionID: strings.ReplaceAll(attentionUUID(), "-", ""), Action: "start", StationID: station, TargetID: target,
 			ExpectedRevision: current.Revision, ExpectedProcessID: current.ProcessID,
 			ExpectedGeneration: current.Generation, ExpectedOwnerGeneration: current.OwnerGeneration}
 		body, err := json.Marshal(q)

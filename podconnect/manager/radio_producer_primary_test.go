@@ -36,12 +36,19 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 	if err != nil || json.Unmarshal(raw, &r) != nil {
 		f.t.Fatalf("effect lacks a durable journal entry: %v", err)
 	}
-	if r.Primary == nil || r.Fence.Token != q.Handoff || r.Fence.ActionID != q.Action ||
+	wantAction := r.Fence.ActionID
+	if !producerUUID(wantAction) {
+		wantAction = r.Fence.Token
+	}
+	if r.Primary == nil || r.Fence.Token != q.Handoff || wantAction != q.Action || !producerUUID(q.Action) ||
 		r.Request.Target != q.Target || r.Request.Process != q.Process || q.Schema != primaryRadioSchema {
 		f.t.Fatalf("effect was not journaled under the exact action: %+v", q)
 	}
-	if q.Phase != "reserve" && r.Primary.LastCommand == nil {
+	if (q.Phase != "reserve" || wantAction != r.Fence.ActionID) && r.Primary.LastCommand == nil {
 		f.t.Fatal("effect command missing from the journal")
+	}
+	if q.Phase == "reserve" && wantAction != r.Fence.ActionID && !q.matches(radioPrimaryReceipt{radioPrimaryCommand: *r.Primary.LastCommand}) {
+		f.t.Fatal("journal did not retain the exact mapped reserve command before dispatch")
 	}
 	result := radioPrimaryReceipt{radioPrimaryCommand: q}
 	phase := q.Phase
@@ -259,7 +266,7 @@ func TestPrimaryRadioProducerReplacesOnlyAfterReservedPreflight(t *testing.T) {
 }
 
 func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
-	for _, variant := range []string{"disjoint", "same-target", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown", "rejected-preflight-first", "rejected-decode-first", "lost-rejected-preflight-first", "lost-rejected-decode-first"} {
+	for _, variant := range []string{"disjoint", "same-target", "podview-task", "lost-start", "wrong-stop", "passive-exact", "passive-wrong-session", "passive-incomplete", "passive-old", "passive-unknown", "rejected-preflight-first", "rejected-decode-first", "lost-rejected-preflight-first", "lost-rejected-decode-first"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			f := &primaryRadioFixture{t: t,
@@ -303,6 +310,9 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 			q := radioCommand{ActionID: attentionUUID(), Action: "start", StationID: "p3", TargetID: target,
 				ExpectedRevision: current.Revision, ExpectedProcessID: current.ProcessID,
 				ExpectedGeneration: current.Generation, ExpectedOwnerGeneration: current.OwnerGeneration}
+			if variant == "podview-task" {
+				q.ActionID = strings.Repeat("a", 32)
+			}
 			if strings.Contains(variant, "rejected-") {
 				lost := strings.HasPrefix(variant, "lost-")
 				f.rejectFirst = "start"
@@ -371,6 +381,9 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 			}
 			q = radioCommand{ActionID: attentionUUID(), Action: "stop", ExpectedRevision: started.Revision,
 				ExpectedProcessID: started.ProcessID, ExpectedGeneration: started.Generation, ExpectedOwnerGeneration: started.OwnerGeneration}
+			if variant == "podview-task" {
+				q.ActionID = strings.Repeat("b", 32)
+			}
 			stopped, err := c.execute(ctx, q)
 			if !reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start", "reserve", "stop", "result"}) {
 				t.Fatalf("stop must issue one effect and one passive read: %v", f.calls)
@@ -383,6 +396,94 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 			}
 			if err != nil || stopped.State != "stopped" || p.active != "" {
 				t.Fatalf("exact stop failed: %+v %v", stopped, err)
+			}
+		})
+	}
+}
+
+func TestPrimaryRadioRestartsOnlyAfterImpossibleLegacyReserve(t *testing.T) {
+	for _, variant := range []string{"legacy-compact", "mapped-wire", "canonical", "mismatched-fence",
+		"legacy-hold", "legacy-peer", "retained-custody", "drain-ticket", "rejected-with-custody"} {
+		t.Run(variant, func(t *testing.T) {
+			ctx := context.Background()
+			process := strings.Repeat("a", 64)
+			f := &primaryRadioFixture{t: t, state: radioPrimaryState{
+				Schema: primaryRadioSchema, Process: process, Revision: "7",
+				Targets: []radioProducerTarget{
+					{radioTarget: radioTarget{ID: "r0", Selectable: true, Availability: "available"}, HomePodID: "1"},
+				},
+				Observation: &radioNativeObservation{State: "stopped", SourceKind: "spotify", TargetID: "r0",
+					ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20},
+			}}
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			journalDir := filepath.Join(directory, "private-journal")
+			p, err := newPrimaryRadioProducer(f, journalDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			action, handoff := strings.Repeat("b", 32), attentionUUID()
+			if variant == "canonical" {
+				action = attentionUUID()
+			}
+			r := radioProducerRecord{
+				Fence: radioFence{Token: handoff, ActionID: action, Generation: 3},
+				Request: radioProducerReserve{
+					radioProducerIdentity: radioProducerIdentity{
+						Process: process, Handoff: handoff, ActionID: action, Generation: 3, Target: "r0",
+					},
+					ExpectedIntent: radioProducerIntent{Process: process, Revision: "7"}, From: "r0",
+				},
+				Stage: "native-reserve-attempted", Primary: &radioPrimaryRecord{Device: "1", Station: "p3"},
+			}
+			if variant == "mapped-wire" {
+				command := r.primaryCommand("reserve")
+				command.Action = handoff
+				r.Primary.LastCommand = &command
+			}
+			if variant == "mismatched-fence" {
+				r.Request.ActionID = strings.Repeat("c", 32)
+			}
+			switch variant {
+			case "legacy-hold":
+				r.Native.Token = "retained"
+			case "legacy-peer":
+				r.Request.Peer.Proof = json.RawMessage(`{"fixture":"retained"}`)
+			case "retained-custody":
+				r.Request.Retained = &radioProducerPrior{}
+			case "drain-ticket":
+				r.DrainTicket = json.RawMessage(`{"fixture":"retained"}`)
+			case "rejected-with-custody":
+				r.Terminal, r.Outcome, r.Stage = true, "rejected", primaryLegacyRejectedStage
+				r.Sender.Proof = json.RawMessage(`{"fixture":"retained"}`)
+			}
+			if err = p.storeLocked(r); err != nil {
+				t.Fatal(err)
+			}
+			p, err = newPrimaryRadioProducer(f, journalDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = p.Ready(ctx)
+			wantReady := variant == "legacy-compact"
+			if (err == nil) != wantReady || len(f.calls) != 0 {
+				t.Fatalf("startup readiness=%t Native command count=%d, want readiness=%t", err == nil, len(f.calls), wantReady)
+			}
+			_, persisted, err := openRadioProducerJournal(journalDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := persisted[handoff]
+			if row.Fence != r.Fence || row.Terminal != (wantReady || r.Terminal) || wantReady && row.Outcome != "rejected" {
+				t.Fatal("startup did not preserve the exact legacy caller fence and outcome")
+			}
+			if producerPrimaryHistoryTerminal(persisted, row) != wantReady {
+				t.Fatal("only the exact rejected historical record may allow legacy startup")
+			}
+			if wantReady && (p.primaryPrepare(ctx, "p3", "r0", action, 4) == nil || len(f.calls) != 0) {
+				t.Fatal("a preserved rejected action must not gain admission or replay")
 			}
 		})
 	}
