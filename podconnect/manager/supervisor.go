@@ -16,7 +16,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -155,12 +157,14 @@ func (rt *roomRuntime) supervise() {
 			if !warmedUp {
 				continue
 			}
-			if glHealthy(healthURL) {
+			health := probeGLHealth(&http.Client{Timeout: 5 * time.Second}, healthURL)
+			if health.kind == "ok" {
 				fails = 0
 				continue
 			}
 			fails++
-			log.Printf("rooms[%s]: go-librespot health check failed (%d/3)", r.ID, fails)
+			log.Printf("rooms[%s]: go-librespot health check failed (%d/3) class=%s http_status=%d",
+				r.ID, fails, health.kind, health.status)
 			if fails >= 3 {
 				log.Printf("rooms[%s]: go-librespot unresponsive — restarting it", r.ID)
 				rt.restartGL()
@@ -383,17 +387,31 @@ func logLines(prefix string, rc io.ReadCloser) {
 	}
 }
 
-// glHealthy reports whether go-librespot's /status answers within a short timeout.
-func glHealthy(url string) bool {
-	cl := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cl.Get(url)
+type glHealthResult struct {
+	kind   string
+	status int
+}
+
+func probeGLHealth(client *http.Client, url string) glHealthResult {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return glHealthResult{kind: "transport"}
+	}
+	req.Header.Set("X-PodConnect-Health-Probe", "1")
+	resp, err := client.Do(req)
+	if err != nil {
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			return glHealthResult{kind: "timeout"}
+		}
+		return glHealthResult{kind: "transport"}
 	}
 	resp.Body.Close()
-	// A healthy authenticated idle player is 200; an unpaired engine is 204.
-	// Errors are not readiness evidence.
-	return resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent
+	// An authenticated idle player is 200; an unpaired engine is 204.
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+		return glHealthResult{kind: "ok", status: resp.StatusCode}
+	}
+	return glHealthResult{kind: "http", status: resp.StatusCode}
 }
 
 // boolFlag is a tiny mutex-guarded bool — the per-room test-tone gate (replaces the global
