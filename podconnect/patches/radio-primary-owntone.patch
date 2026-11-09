@@ -6045,7 +6045,7 @@ index d9560b4..6e438c6 100644
      assert(outputs_attention_startup() == 0);
  
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 40ebe09716eb4c4b19b08356268f8447f913088c..a2426b607ff761678284ceab1501d14b14bbddaf 100644
+index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523d6e92444 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -1315,6 +1315,13 @@ struct native_start_wire {
@@ -6587,7 +6587,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a2426b607ff761678284ceab1501d14b
    struct output_start_state state;assert(outputs_start_state_get(r,&state)==0 && state.ready);
    assert(outputs_start_prepare(r,&f.start_result)==0);*r=f.start_result.command;memset(r->native_reservation_id,'e',32);r->pending_native_mutators_drained=true;
    /* Fill a genuine FIFO and block a genuine old writer before C opens its reader. */
-@@ -2381,6 +2786,20 @@ static int start35_wire_case(int mode)
+@@ -2381,10 +2786,25 @@ static int start35_wire_case(int mode)
    assert(errno==EAGAIN);assert(!fcntl(writer,F_SETFL,fcntl(writer,F_GETFL)&~O_NONBLOCK));
    pending.fd=writer;assert(pthread_create(&writer_thread,NULL,start_fifo_finish,&pending)==0);
    assert(outputs_start_commit(r,&f.start_result)==0 && f.start_result.phase==OUTPUT_START_GATE_DRAINING && outputs_start_gate_closed());
@@ -6608,7 +6608,12 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a2426b607ff761678284ceab1501d14b
    outputs_write(NULL,0,0,NULL,NULL); /* Actual ALL-backend gate precedes buffer dereference. */
    assert(worker_init()==0);worker_ready=true;assert(input_init()==0);input_ready=true;
    if(mode==18 || mode==26 || mode==27 || mode==28){
-@@ -2786,7 +3205,411 @@ static int start35_wire_case(int mode)
+     player_tick_interval.tv_nsec=50000000;
++    pb_write_deficit_max = PLAYER_WRITE_BEHIND_MAX * 1000000 / player_tick_interval.tv_nsec;
+     pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
+     assert(pb_timer_fd>=0);
+     pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
+@@ -2786,7 +3206,411 @@ static int start35_wire_case(int mode)
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -7021,7 +7026,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a2426b607ff761678284ceab1501d14b
   cleanup:
    if(mode==29){
      event_free(keep_alive_timer);keep_alive_timer=NULL;
-@@ -2794,6 +3617,20 @@ static int start35_wire_case(int mode)
+@@ -2794,6 +3618,20 @@ static int start35_wire_case(int mode)
    }
    if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
    while(airplay_sessions)session_cleanup(airplay_sessions);
