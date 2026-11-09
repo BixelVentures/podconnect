@@ -57,6 +57,9 @@ func producerPrimaryHistoryTerminal(records map[string]radioProducerRecord, reco
 	if primary == nil || !record.Terminal || record.Preempted {
 		return false
 	}
+	if record.Stage == primaryLegacyRejectedStage {
+		return primaryLegacyInvalidReserve(record)
+	}
 	if record.Outcome == "rejected" && record.Stage == "no-effects-rejected" {
 		command, receipt := primary.LastCommand, primary.LastReceipt
 		if command == nil || receipt == nil || primary.Session != nil || receipt.TeardownCSeq != 0 || receipt.Observation != nil {

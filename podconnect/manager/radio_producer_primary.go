@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strconv"
@@ -179,8 +180,14 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 		if record.Primary == nil && producerLegacyHistoryTerminal(p.records, record) {
 			continue
 		}
+		if record.Stage == primaryLegacyRejectedStage {
+			if !primaryLegacyInvalidReserve(record) {
+				return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
+			}
+			continue
+		}
 		if primaryLegacyInvalidReserve(record) {
-			record.Terminal, record.Outcome, record.Stage = true, "rejected", "legacy-reserve-invalid-action"
+			record.Terminal, record.Outcome, record.Stage = true, "rejected", primaryLegacyRejectedStage
 			if err := p.storeLocked(record); err != nil {
 				return nil, nil, err
 			}
@@ -209,21 +216,47 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	return targets, nil, nil
 }
 
+const primaryLegacyRejectedStage = "legacy-reserve-invalid-action"
+
 // The old adapter sent the compact caller ID verbatim. The primary Native
 // HTTP owner has always rejected this shape before reaching its actor. The
 // corrected adapter saves the actual reserve command before sending it, so a
 // missing reply to a valid command can never match this historical case.
 func primaryLegacyInvalidReserve(r radioProducerRecord) bool {
 	primary, fence, request := r.Primary, r.Fence, r.Request
-	return r.Stage == "native-reserve-attempted" && !r.Terminal && r.Outcome == "" &&
-		!r.Preempted && !r.SourceDrained && r.Observation == (radioNativeObservation{}) && primary != nil &&
-		*primary == (radioPrimaryRecord{Device: primary.Device, Station: primary.Station}) &&
-		producerCounter(primary.Device, false) && radioStreamURLs[primary.Station] != "" &&
-		producerUUID(fence.Token) && producerHex(fence.ActionID, 32) && fence.Generation > 0 &&
-		fence.OwnerGeneration == 0 && request.OwnerGeneration == 0 &&
-		request.Handoff == fence.Token && request.ActionID == fence.ActionID && request.Generation == fence.Generation &&
-		request.Target != "" && producerHex(request.Process, 64) && request.ExpectedIntent.Process == request.Process &&
-		producerCounter(request.ExpectedIntent.Revision, true)
+	attempt := r.Stage == "native-reserve-attempted" && !r.Terminal && r.Outcome == ""
+	rejected := r.Stage == primaryLegacyRejectedStage && r.Terminal && r.Outcome == "rejected"
+	if (!attempt && !rejected) || r.Preempted || r.SourceDrained || r.Observation != (radioNativeObservation{}) ||
+		primary == nil || *primary != (radioPrimaryRecord{Device: primary.Device, Station: primary.Station}) ||
+		!producerCounter(primary.Device, false) || radioStreamURLs[primary.Station] == "" ||
+		!producerUUID(fence.Token) || !producerHex(fence.ActionID, 32) || fence.Generation == 0 ||
+		fence.OwnerGeneration != 0 || request.OwnerGeneration != 0 || request.Handoff != fence.Token ||
+		request.ActionID != fence.ActionID || request.Generation != fence.Generation || request.Target == "" ||
+		!producerHex(request.Process, 64) || request.ExpectedIntent.Process != request.Process ||
+		!producerCounter(request.ExpectedIntent.Revision, true) {
+		return false
+	}
+	if r.Controller != "" || r.PreemptAction != "" || request.Prior != nil || request.Retained != nil {
+		return false
+	}
+	for _, hold := range [...]radioProducerHold{r.Native, r.Sender} {
+		if hold.radioProducerIdentity != (radioProducerIdentity{}) || hold.SourceGeneration != 0 || hold.Token != "" {
+			return false
+		}
+	}
+	peer := request.Peer
+	if peer.Operation != (radioProducerIdentity{}) || peer.Process != "" || peer.OwnerGeneration != 0 ||
+		peer.Target != "" || peer.ReceiverDigest != "" || peer.SourceGeneration != 0 ||
+		peer.CandidateID != "" || peer.TargetAuth != nil {
+		return false
+	}
+	for _, proof := range [...]json.RawMessage{r.Native.Proof, r.Sender.Proof, peer.Proof, r.NativeRelease,
+		r.NativeRejection, r.CancellationReceipt, r.PreemptChallenge, r.DrainTicket} {
+		if len(proof) != 0 && string(proof) != "null" {
+			return false
+		}
+	}
+	return true
 }
 
 func primaryOwnsPlaying(state radioPrimaryState, incumbent radioProducerRecord) bool {

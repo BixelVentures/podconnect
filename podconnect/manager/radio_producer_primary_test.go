@@ -402,7 +402,8 @@ func TestPrimaryRadioProducerExactStartStopAndUnknown(t *testing.T) {
 }
 
 func TestPrimaryRadioRestartsOnlyAfterImpossibleLegacyReserve(t *testing.T) {
-	for _, variant := range []string{"legacy-compact", "mapped-wire", "canonical", "mismatched-fence"} {
+	for _, variant := range []string{"legacy-compact", "mapped-wire", "canonical", "mismatched-fence",
+		"legacy-hold", "legacy-peer", "retained-custody", "drain-ticket", "rejected-with-custody"} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
 			process := strings.Repeat("a", 64)
@@ -445,6 +446,19 @@ func TestPrimaryRadioRestartsOnlyAfterImpossibleLegacyReserve(t *testing.T) {
 			if variant == "mismatched-fence" {
 				r.Request.ActionID = strings.Repeat("c", 32)
 			}
+			switch variant {
+			case "legacy-hold":
+				r.Native.Token = "retained"
+			case "legacy-peer":
+				r.Request.Peer.Proof = json.RawMessage(`{"fixture":"retained"}`)
+			case "retained-custody":
+				r.Request.Retained = &radioProducerPrior{}
+			case "drain-ticket":
+				r.DrainTicket = json.RawMessage(`{"fixture":"retained"}`)
+			case "rejected-with-custody":
+				r.Terminal, r.Outcome, r.Stage = true, "rejected", primaryLegacyRejectedStage
+				r.Sender.Proof = json.RawMessage(`{"fixture":"retained"}`)
+			}
 			if err = p.storeLocked(r); err != nil {
 				t.Fatal(err)
 			}
@@ -462,8 +476,11 @@ func TestPrimaryRadioRestartsOnlyAfterImpossibleLegacyReserve(t *testing.T) {
 				t.Fatal(err)
 			}
 			row := persisted[handoff]
-			if row.Fence != r.Fence || row.Terminal != wantReady || wantReady && row.Outcome != "rejected" {
+			if row.Fence != r.Fence || row.Terminal != (wantReady || r.Terminal) || wantReady && row.Outcome != "rejected" {
 				t.Fatal("startup did not preserve the exact legacy caller fence and outcome")
+			}
+			if producerPrimaryHistoryTerminal(persisted, row) != wantReady {
+				t.Fatal("only the exact rejected historical record may allow legacy startup")
 			}
 			if wantReady && (p.primaryPrepare(ctx, "p3", "r0", action, 4) == nil || len(f.calls) != 0) {
 				t.Fatal("a preserved rejected action must not gain admission or replay")
