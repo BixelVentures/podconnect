@@ -1,0 +1,1215 @@
+diff --git a/daemon/autoplay_preview.go b/daemon/autoplay_preview.go
+new file mode 100644
+index 0000000..a697ae0
+--- /dev/null
++++ b/daemon/autoplay_preview.go
+@@ -0,0 +1,296 @@
++package daemon
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++const (
++	apiRoomAutoplayPrepare  ApiRequestType = "room_autoplay_prepare"
++)
++
++const (
++	autoplayPreviewLifetime = 2 * time.Minute
++	autoplayPreviewTimeout  = 3 * time.Second
++	autoplayPreviewHistory  = 256
++)
++
++type autoplayStation struct {
++	context     *connectpb.Context
++	tracks      *tracks.List
++	occurrences tracks.QueueObservation
++}
++
++type autoplayPreview struct {
++	owner        *nativeQueueOffer
++	options      *connectpb.ContextPlayerOptions
++	uri          string
++	played       string
++	until        time.Time
++	pending      <-chan *autoplayStation
++	pendingUntil time.Time
++	done         <-chan struct{}
++	cancel       context.CancelFunc
++	station      *autoplayStation
++	choice       *nativeQueueOffer
++	actionItems  []nativeQueueItem
++	displayIDs   []string
++	metadata     map[string]queueMetadata
++}
++
++// The player actor owns the preview and publishes no playback state from its worker.
++func (p *AppPlayer) warmAutoplayPreview(ctx context.Context, offer *nativeQueueOffer) {
++	p.collectAutoplayPreview()
++	if len(offer.Snapshot.Items) != 0 || offer.Snapshot.Truncated || !p.canPreviewAutoplay() {
++		p.clearAutoplayPreview()
++		return
++	}
++	if current := p.autoplayPreview; current != nil {
++		if p.autoplayPreviewCurrent(current) && current.owner.Writer.Wire == offer.Writer.Wire {
++			return
++		}
++		p.clearAutoplayPreview()
++		if p.autoplayPreview != nil {
++			return // A cancelled resolve is still leaving the provider call.
++		}
++	}
++	client := p.sess.Spclient()
++	if client == nil {
++		return
++	}
++	// The exact empty bound observation has already established end of context.
++	// Snapshot only resident history, without a second page read on the actor.
++	recent := offer.Tracks.ResidentAutoplayHistory(autoplayPreviewHistory)
++	if len(recent) == 0 {
++		return
++	}
++	state := p.state.player
++	result := make(chan *autoplayStation, 1)
++	done := make(chan struct{})
++	readCtx, cancel := context.WithTimeout(ctx, autoplayPreviewTimeout)
++	pendingUntil, _ := readCtx.Deadline()
++	preview := &autoplayPreview{
++		owner: offer, options: proto.Clone(state.Options).(*connectpb.ContextPlayerOptions),
++		uri: state.ContextUri, played: state.GetTrack().GetUri(),
++		until: time.Now().Add(autoplayPreviewLifetime), pending: result, pendingUntil: pendingUntil, done: done, cancel: cancel,
++	}
++	p.autoplayPreview = preview
++	log := p.app.log
++	uri, played, shuffle := preview.uri, preview.played, preview.options.GetShufflingContext()
++	go func() {
++		defer close(done)
++		defer cancel()
++		station, err := resolveAutoplayHistory(readCtx, client, uri, recent, played)
++		if err != nil || !strings.HasPrefix(station.GetUri(), "spotify:station:") {
++			result <- nil
++			return
++		}
++		staged, err := tracks.NewTrackListFromContext(readCtx, log, client, station)
++		if err == nil {
++			err = prepareContextOrder(readCtx, staged, firstAutoplayTrack,
++				shuffle && len(station.GetRestrictions().GetDisallowTogglingShuffleReasons()) == 0)
++		}
++		if err != nil || readCtx.Err() != nil {
++			result <- nil
++			return
++		}
++		occurrences, err := staged.ObserveStation(readCtx)
++		if err != nil {
++			result <- nil
++			return
++		}
++		result <- &autoplayStation{station, staged, occurrences}
++	}()
++}
++
++func firstAutoplayTrack(*connectpb.ContextTrack) bool { return true }
++
++func (p *AppPlayer) canPreviewAutoplay() bool {
++	state := p.state.player
++	return !p.app.cfg.DisableAutoplay && state.Options != nil && state.IsPlaying && !state.IsPaused &&
++		!state.Options.RepeatingContext && !state.Options.RepeatingTrack &&
++		!strings.HasPrefix(state.ContextUri, "spotify:station:")
++}
++
++func (p *AppPlayer) autoplayPreviewSnapshotCurrent(preview *autoplayPreview) bool {
++	offer := preview.owner
++	return p.autoplayPreview == preview && time.Now().Before(preview.until) &&
++		p.state == offer.State && p.state.player == offer.PlayerState && p.state.tracks == offer.Tracks &&
++		offer.Tracks.TransportRevision() == offer.Snapshot.QueueRevision &&
++		p.sess == offer.Session && p.player == offer.Player && p.primaryStream == offer.Primary &&
++		p.roomTransportGeneration == offer.Generation && p.canPreviewAutoplay() &&
++		p.state.player.ContextUri == preview.uri && p.state.player.GetTrack().GetUri() == preview.played &&
++		proto.Equal(p.state.player.Options, preview.options)
++}
++
++func (p *AppPlayer) autoplayPreviewCurrent(preview *autoplayPreview) bool {
++	if !p.autoplayPreviewSnapshotCurrent(preview) {
++		return false
++	}
++	owner := *preview.owner.BoundOwner
++	current, err := p.roomTransportIdentity(owner.AccountUserID, owner.TargetID, owner.RoomID, owner.HomePodID)
++	return err == nil && current == owner
++}
++
++func (p *AppPlayer) collectAutoplayPreview() {
++	preview := p.autoplayPreview
++	if preview == nil || preview.pending == nil {
++		return
++	}
++	select {
++	case preview.station = <-preview.pending:
++		preview.pending = nil
++		if preview.until.IsZero() {
++			p.autoplayPreview = nil
++		}
++	default:
++	}
++}
++
++func (p *AppPlayer) clearAutoplayPreview() {
++	if preview := p.autoplayPreview; preview != nil {
++		preview.cancel()
++		if preview.pending == nil {
++			p.autoplayPreview = nil
++		} else {
++			preview.until = time.Time{}
++		}
++	}
++}
++
++type prospectiveQueueRow struct {
++	tracks.QueueOccurrence
++	Selection queueSelection
++	DisplayID string
++	Metadata  queueMetadata
++}
++
++type prospectiveQueueView struct {
++	Rows      []prospectiveQueueRow
++	Truncated bool
++}
++
++// readAutoplayPreview is internal to the actor. It neither issues a current
++// queue offer nor starts a resolve. Returned rows cannot mutate the station.
++func (p *AppPlayer) readAutoplayPreview(ctx context.Context, owner roomTransportIdentity, renew bool) (any, error) {
++	p.collectAutoplayPreview()
++	preview := p.autoplayPreview
++	if preview == nil || *preview.owner.BoundOwner != owner || !p.autoplayPreviewCurrent(preview) {
++		return nil, ErrAliasConflict
++	}
++	if preview.station == nil {
++		return prospectiveQueueView{}, nil
++	}
++	if !p.autoplayPreviewWriterCurrent(ctx, preview) {
++		return nil, ErrAliasConflict
++	}
++	if renew || preview.choice == nil || !time.Now().Before(preview.choice.Expires) {
++		choice := *preview.owner
++		choice.Expires = minTime(preview.until, time.Now().Add(queueOfferLifetime))
++		id, err := randomQueueID(16)
++		if err != nil {
++			return nil, err
++		}
++		choice.Snapshot.ObservationID = id
++		if preview.actionItems == nil {
++			items := make([]nativeQueueItem, 0, len(preview.station.occurrences.Items))
++			for _, row := range preview.station.occurrences.Items {
++				id, err := randomQueueID(12)
++				if err != nil {
++					return nil, err
++				}
++				items = append(items, nativeQueueItem{id, row.Position, row.URI, false})
++			}
++			preview.actionItems = items
++		}
++		choice.Snapshot.Items = preview.actionItems
++		choice.Snapshot.Truncated = preview.station.occurrences.Truncated
++		if !validRoomQueueObservation(&choice) {
++			return nil, ErrAliasConflict
++		}
++		preview.choice = &choice
++	}
++	snapshot := preview.choice.Snapshot
++	if preview.displayIDs == nil {
++		displayIDs := make([]string, len(snapshot.Items))
++		for i := range displayIDs {
++			id, err := randomQueueID(12)
++			if err != nil {
++				return nil, err
++			}
++			displayIDs[i] = "display-" + id
++		}
++		preview.displayIDs = displayIDs
++	}
++	if client := p.sess.Spclient(); client != nil {
++		if metadata := p.queueMetadata.readAndWarm(owner.AccountUserID, p.sess, client, snapshot.Items); len(metadata) != 0 {
++			if preview.metadata == nil {
++				preview.metadata = make(map[string]queueMetadata)
++			}
++			for uri, label := range metadata {
++				preview.metadata[uri] = label
++			}
++		}
++	}
++	view := prospectiveQueueView{Rows: make([]prospectiveQueueRow, len(snapshot.Items)), Truncated: snapshot.Truncated}
++	for i, item := range snapshot.Items {
++		view.Rows[i] = prospectiveQueueRow{preview.station.occurrences.Items[i],
++			queueSelection{snapshot.ObservationID, owner.SessionID, snapshot.QueueRevision, item.ID},
++			preview.displayIDs[i], preview.metadata[item.URI]}
++	}
++	return view, nil
++}
++
++func (p *AppPlayer) prepareAutoplaySelection(parent context.Context, request roomTransportPrepareRequest) (any, error) {
++	ctx, cancel := queueOperationContext(parent, request.Context)
++	defer cancel()
++	if request.Action != "queue" || request.VolumePercent != 0 || request.PositionMS != nil ||
++		request.OptionsRoute != nil || request.ExpectedReleaseOwner != nil ||
++		!validOptionArguments(request.Action, request.ShuffleEnabled, request.RepeatMode) || !validQueueSelection(request.Queue) {
++		return nil, ErrBadRequest
++	}
++	owner, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
++	if err != nil || !nativeBoundOwnerValid(owner) {
++		return nil, ErrAliasConflict
++	}
++	selection := *request.Queue
++	preview := p.autoplayPreview
++	if preview == nil || preview.station == nil || preview.choice == nil ||
++		*preview.owner.BoundOwner != owner || preview.choice.Snapshot.ObservationID != selection.ObservationID ||
++		!p.autoplayPreviewCurrent(preview) || !p.strongQueueCurrent(preview.choice, owner) ||
++		selection.SessionID != owner.SessionID || selection.QueueRevision != preview.choice.Snapshot.QueueRevision {
++		return nil, ErrAliasConflict
++	}
++	observed := preview.choice
++	preview.choice = nil
++	for _, item := range observed.Snapshot.Items {
++		if item.ID == selection.OccurrenceID {
++			return p.prepareBoundQueueOffer(parent, ctx, owner, selection, observed, item.Position, preview)
++		}
++	}
++	return nil, ErrAliasConflict
++}
++
++func (p *AppPlayer) takeAutoplayPreview(ctx context.Context) *autoplayPreview {
++	p.collectAutoplayPreview()
++	preview := p.autoplayPreview
++	defer p.clearAutoplayPreview()
++	if preview == nil || preview.station == nil || !p.autoplayPreviewCurrent(preview) ||
++		!p.autoplayPreviewWriterCurrent(ctx, preview) {
++		return nil
++	}
++	return preview
++}
++
++func (p *AppPlayer) autoplayPreviewWriterCurrent(ctx context.Context, preview *autoplayPreview) bool {
++	// Same read-only writer inspection as a bound queue read, without an offer.
++	checkCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
++	defer cancel()
++	writer, err := p.captureQueueWriter(checkCtx, *preview.owner.BoundOwner, nil)
++	return err == nil && writer.Wire == preview.owner.Writer.Wire && p.autoplayPreviewCurrent(preview)
++}
+diff --git a/daemon/autoplay_promotion.go b/daemon/autoplay_promotion.go
+new file mode 100644
+index 0000000..f01ca4e
+--- /dev/null
++++ b/daemon/autoplay_promotion.go
+@@ -0,0 +1,103 @@
++package daemon
++
++import (
++	"context"
++	"time"
++
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++type autoplayDisplayRow struct {
++	Occurrence tracks.QueueOccurrence
++	ID         string
++	Metadata   queueMetadata
++}
++
++type autoplayPromotion struct {
++	owner *nativeQueueOffer
++	rows  []autoplayDisplayRow
++}
++
++type autoplayPromotionRead struct {
++	Owner         roomTransportIdentity
++	ObservationID string
++}
++
++type autoplayPromotedRow struct {
++	QueueID   string
++	DisplayID string
++	Metadata  queueMetadata
++}
++
++// Record only the suffix of the exact staged station whose source is now
++// published. This data never populates or reuses a queue action offer.
++func (p *AppPlayer) recordAutoplayPromotion(preview *autoplayPreview, selected int) {
++	p.autoplayPromotion = nil
++	previous := preview.owner
++	owner := *previous.BoundOwner
++	current, err := p.roomTransportIdentity(owner.AccountUserID, owner.TargetID, owner.RoomID, owner.HomePodID)
++	if err != nil {
++		return
++	}
++	// Natural autoplay can change playback session, but not the App, room or
++	// writer. A fresh ordinary queue read must still prove the same writer.
++	owner.SessionID = current.SessionID
++	if owner != current || p.sess != previous.Session || p.player != previous.Player ||
++		p.state != previous.State || p.state.player.ContextUri != preview.station.context.Uri ||
++		selected < 0 || selected >= len(preview.displayIDs)-1 {
++		return
++	}
++	observation := preview.station.occurrences
++	playing := p.state.player.GetTrack()
++	if row := observation.Items[selected]; row.UID != playing.GetUid() || row.URI != playing.GetUri() {
++		return
++	}
++	rows := make([]autoplayDisplayRow, 0, len(preview.displayIDs)-selected-1)
++	for i := selected + 1; i < len(preview.displayIDs); i++ {
++		row := observation.Items[i]
++		row.Position = len(rows)
++		rows = append(rows, autoplayDisplayRow{row, preview.displayIDs[i], preview.metadata[row.URI]})
++	}
++	p.autoplayPromotion = &autoplayPromotion{
++		owner: &nativeQueueOffer{
++			Snapshot: nativeQueueSnapshot{QueueRevision: p.state.tracks.TransportRevision()},
++			State:    p.state, Tracks: p.state.tracks, Expires: preview.until, BoundOwner: &current,
++			PlayerState: p.state.player, Session: p.sess, Player: p.player, Primary: p.primaryStream,
++			Generation: p.roomTransportGeneration, Writer: previous.Writer,
++		},
++		rows: rows,
++	}
++}
++
++func (p *AppPlayer) readAutoplayPromotion(ctx context.Context, request autoplayPromotionRead) (any, error) {
++	promotion := p.autoplayPromotion
++	current := p.queueOccurrenceOffer
++	if promotion == nil || current == nil || current.Snapshot.ObservationID != request.ObservationID ||
++		!p.strongQueueCurrent(promotion.owner, request.Owner) || !p.strongQueueCurrent(current, request.Owner) ||
++		current.Writer == nil || current.Writer.Wire != promotion.owner.Writer.Wire {
++		return nil, ErrAliasConflict
++	}
++	checkCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
++	defer cancel()
++	writer, err := p.captureQueueWriter(checkCtx, request.Owner, nil)
++	if err != nil || writer.Wire != current.Writer.Wire || !p.strongQueueCurrent(current, request.Owner) ||
++		!p.strongQueueCurrent(promotion.owner, request.Owner) {
++		return nil, ErrAliasConflict
++	}
++	return reconcileAutoplayRows(promotion.rows, current)
++}
++
++func reconcileAutoplayRows(expected []autoplayDisplayRow, current *nativeQueueOffer) ([]autoplayPromotedRow, error) {
++	if len(expected) > len(current.Occurrences) || len(current.Occurrences) != len(current.Snapshot.Items) {
++		return nil, ErrAliasConflict
++	}
++	rows := make([]autoplayPromotedRow, len(expected))
++	for i, row := range expected {
++		item := current.Snapshot.Items[i]
++		if current.Occurrences[i] != row.Occurrence || item.Position != i || item.URI != row.Occurrence.URI || item.Queued {
++			return nil, ErrAliasConflict
++		}
++		rows[i] = autoplayPromotedRow{item.ID, row.ID, row.Metadata}
++	}
++	return rows, nil
++}
+diff --git a/daemon/autoplay_queue_http.go b/daemon/autoplay_queue_http.go
+new file mode 100644
+index 0000000..783423d
+--- /dev/null
++++ b/daemon/autoplay_queue_http.go
+@@ -0,0 +1,118 @@
++package daemon
++
++import (
++	"context"
++	"net/http"
++	"time"
++)
++
++const queueAutoplayHeader = "X-Podconnect-Queue-Autoplay"
++
++func queueAutoplayOptIn(r *http.Request) (enabled, valid bool) {
++	values := r.Header.Values(queueAutoplayHeader)
++	if len(values) == 0 {
++		return false, true
++	}
++	valid = len(values) == 1 && values[0] == "1"
++	return valid, valid
++}
++
++type queueAutoplayPendingResponse struct {
++	Kind string `json:"kind"`
++}
++
++type queueAutoplayPreviewResponse struct {
++	Kind          string                   `json:"kind"`
++	ObservationID string                   `json:"observation_id"`
++	Revision      uint64                   `json:"queue_revision"`
++	Expires       int                      `json:"expires_after_ms"`
++	Items         []nativeQueueItem        `json:"items"`
++	Truncated     bool                     `json:"truncated"`
++	DisplayIDs    map[string]string        `json:"display_ids"`
++	Metadata      map[string]queueMetadata `json:"metadata,omitempty"`
++}
++
++type queueAutoplayPromotionResponse struct {
++	Kind       string                   `json:"kind"`
++	DisplayIDs map[string]string        `json:"display_ids"`
++	Metadata   map[string]queueMetadata `json:"metadata,omitempty"`
++}
++
++// Run inside the queue read actor turn so current, preview and promotion are
++// all bound to the one just-issued ordinary observation.
++func (p *AppPlayer) autoplayQueueExtension(ctx context.Context, current queueStateResponse) any {
++	if len(current.Items) == 0 && !current.Truncated {
++		value, err := p.readAutoplayPreview(ctx, current.Owner, true)
++		if err != nil {
++			return nil
++		}
++		view := value.(prospectiveQueueView)
++		if len(view.Rows) == 0 {
++			preview := p.autoplayPreview
++			if preview.pending != nil && time.Now().Before(preview.pendingUntil) &&
++				preview.owner.Writer.Wire == current.Writer {
++				return queueAutoplayPendingResponse{Kind: "pending"}
++			}
++			return nil
++		}
++		choice := p.autoplayPreview.choice
++		expires := min(current.Expires, int(time.Until(choice.Expires).Milliseconds()))
++		if expires < 1 {
++			return nil
++		}
++		response := queueAutoplayPreviewResponse{
++			Kind: "preview", ObservationID: choice.Snapshot.ObservationID,
++			Revision: choice.Snapshot.QueueRevision, Expires: expires, Items: choice.Snapshot.Items,
++			Truncated: view.Truncated, DisplayIDs: make(map[string]string, len(view.Rows)),
++			Metadata: make(map[string]queueMetadata),
++		}
++		for _, row := range view.Rows {
++			response.DisplayIDs[row.Selection.OccurrenceID] = row.DisplayID
++			if row.Metadata.Name != "" {
++				response.Metadata[row.URI] = row.Metadata
++			}
++		}
++		return response
++	}
++	value, err := p.readAutoplayPromotion(ctx, autoplayPromotionRead{current.Owner, current.ObservationID})
++	if err != nil {
++		return nil
++	}
++	rows := value.([]autoplayPromotedRow)
++	response := queueAutoplayPromotionResponse{
++		Kind: "promotion", DisplayIDs: make(map[string]string, len(rows)),
++		Metadata: make(map[string]queueMetadata),
++	}
++	for i, row := range rows {
++		response.DisplayIDs[row.QueueID] = row.DisplayID
++		if row.Metadata.Name != "" {
++			response.Metadata[current.Items[i].URI] = row.Metadata
++		}
++	}
++	return response
++}
++
++// Wait for the original provider work off the player actor. Reserve part of
++// the existing HTTP deadline for one fresh owner read, with pending as fallback.
++func (s *ConcreteApiServer) finishAutoplayQueueRead(ctx context.Context, request roomTransportStateRequest, pending queueStateResponse) (any, error) {
++	deadline, _ := ctx.Deadline()
++	waitUntil := deadline.Add(-250 * time.Millisecond)
++	if !time.Now().Before(waitUntil) {
++		return pending, nil
++	}
++	started := time.Now()
++	wait, cancel := context.WithDeadline(ctx, waitUntil)
++	defer cancel()
++	select {
++	case <-pending.autoplayDone:
++		if wait.Err() == nil {
++			return s.roomTransportAsk(ctx, apiRoomBoundQueueAutoplayFinish, request)
++		}
++	case <-wait.Done():
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	pending.Expires -= int(time.Since(started).Milliseconds())
++	return pending, nil
++}
+diff --git a/daemon/controls.go b/daemon/controls.go
+index be84257..8c1b0b4 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -295,10 +295,10 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
+ 		return fmt.Errorf("failed creating track list: %w", err)
+ 	}
+ 
+-	return p.loadPreparedContext(ctx, spotCtx, ctxTracks, skipTo, paused, drop)
++	return p.loadPreparedContext(ctx, spotCtx, ctxTracks, skipTo, paused, drop, false)
+ }
+ 
+-func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.Context, ctxTracks *tracks.List, skipTo skipToFunc, paused, drop bool) error {
++func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.Context, ctxTracks *tracks.List, skipTo skipToFunc, paused, drop, ordered bool) error {
+ 	p.state.setPaused(paused)
+ 
+ 	sessionId := make([]byte, 16)
+@@ -332,9 +332,30 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
+ 	p.state.player.Timestamp = time.Now().UnixMilli()
+ 	p.state.player.PositionAsOfTimestamp = 0
+ 
++	if !ordered {
++		if err := prepareContextOrder(ctx, ctxTracks, skipTo, p.state.player.Options.ShufflingContext); err != nil {
++			return err
++		}
++	}
++
++	p.state.tracks = ctxTracks
++	p.state.player.Track = ctxTracks.CurrentTrack()
++	p.state.player.PrevTracks = ctxTracks.PrevTracks()
++	p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
++	p.state.player.Index = ctxTracks.Index()
++
++	// load current track into stream
++	if err := p.loadCurrentTrack(ctx, paused, drop); err != nil {
++		return fmt.Errorf("failed loading current track (load context): %w", err)
++	}
++
++	return nil
++}
++
++func prepareContextOrder(ctx context.Context, ctxTracks *tracks.List, skipTo skipToFunc, shuffle bool) error {
+ 	if skipTo == nil {
+ 		// if shuffle is enabled, we'll start from a random track
+-		if err := ctxTracks.ToggleShuffle(ctx, p.state.player.Options.ShufflingContext); err != nil {
++		if err := ctxTracks.ToggleShuffle(ctx, shuffle); err != nil {
+ 			return fmt.Errorf("failed shuffling context")
+ 		}
+ 
+@@ -349,22 +370,10 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
+ 		}
+ 
+ 		// shuffle afterwards
+-		if err := ctxTracks.ToggleShuffle(ctx, p.state.player.Options.ShufflingContext); err != nil {
++		if err := ctxTracks.ToggleShuffle(ctx, shuffle); err != nil {
+ 			return fmt.Errorf("failed shuffling context")
+ 		}
+ 	}
+-
+-	p.state.tracks = ctxTracks
+-	p.state.player.Track = ctxTracks.CurrentTrack()
+-	p.state.player.PrevTracks = ctxTracks.PrevTracks()
+-	p.state.player.NextTracks = ctxTracks.NextTracks(ctx, nil)
+-	p.state.player.Index = ctxTracks.Index()
+-
+-	// load current track into stream
+-	if err := p.loadCurrentTrack(ctx, paused, drop); err != nil {
+-		return fmt.Errorf("failed loading current track (load context): %w", err)
+-	}
+-
+ 	return nil
+ }
+ 
+@@ -770,13 +779,23 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
+ 	// GoStart below rewinds an exhausted context. Retain the track that actually
+ 	// reached this boundary, rather than inventing a seed from the rewound queue.
+ 	playedTrackURI := p.state.player.GetTrack().GetUri()
++	var preview *autoplayPreview
++	if !forceNext {
++		preview = p.takeAutoplayPreview(ctx)
++	}
++
+ 	if p.state.tracks != nil {
+ 		if !forceNext && p.state.player.Options.RepeatingTrack {
+ 			hasNextTrack = true
+ 			p.state.player.IsPaused = false
+ 		} else {
+ 			// try to get the next track
+-			hasNextTrack = p.state.tracks.GoNext(ctx)
++			var nextErr error
++			hasNextTrack, nextErr = p.state.tracks.GoNextWithError(ctx)
++			if nextErr != nil {
++				p.app.log.WithError(nextErr).Error("failed going to next track")
++				preview = nil
++			}
+ 
+ 			// if we could not get the next track we probably ended the context
+ 			if !hasNextTrack {
+@@ -805,6 +824,16 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
+ 	if !hasNextTrack && !p.app.cfg.DisableAutoplay && !strings.HasPrefix(p.state.player.ContextUri, "spotify:station:") {
+ 		p.state.player.Suppressions = &connectpb.Suppressions{}
+ 
++		if preview != nil {
++			station := preview.station
++			if err := p.loadPreparedContext(ctx, station.context, station.tracks, nil, false, drop, true); err != nil {
++				p.app.log.WithError(err).Warn("failed loading prepared autoplay station")
++				return false, nil
++			}
++			p.recordAutoplayPromotion(preview, 0)
++			return true, nil
++		}
++
+ 		// Consider all tracks as recent because we got here by reaching the end of the context
+ 		var prevTrackUris []string
+ 		if p.state.tracks != nil {
+diff --git a/daemon/player.go b/daemon/player.go
+index 4261414..68c029a 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -63,6 +63,8 @@ type AppPlayer struct {
+ 	queueOccurrenceOffer             *nativeQueueOffer
+ 	queuePresentationContinuation    *nativeQueueOffer
+ 	queueMetadata                    queueMetadataCache
++	autoplayPreview                  *autoplayPreview
++	autoplayPromotion                *autoplayPromotion
+ 	app                              *App
+ 	sess                             *session.Session
+ 
+@@ -719,7 +721,7 @@ func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPay
+ 		}
+ 	}
+ 
+-	return p.loadPreparedContext(ctx, req.Command.Context, ctxTracks, skipTo, req.Command.Options.InitiallyPaused, true)
++	return p.loadPreparedContext(ctx, req.Command.Context, ctxTracks, skipTo, req.Command.Options.InitiallyPaused, true, false)
+ }
+ 
+ func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request) error {
+@@ -774,7 +776,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		}
+ 	}
+ 	switch req.Type {
+-	case ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypePause, apiContentClaim, apiMoveClaim, apiRoomBoundPrepare, apiRoomTransportPrepare:
++	case ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypePause, apiContentClaim, apiMoveClaim, apiRoomBoundPrepare, apiRoomAutoplayPrepare, apiRoomTransportPrepare:
+ 		if req.Type != ApiRequestTypePause && p.radioSourceMoveIntentBlocked() {
+ 			return nil, ErrAliasConflict
+ 		}
+@@ -784,7 +786,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 	}
+ 	if p.radioHeld() {
+ 		switch req.Type {
+-		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue:
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish:
+ 		case ApiRequestTypeWebApi:
+ 			data, ok := req.Data.(ApiRequestDataWebApi)
+ 			if !ok || data.Method != "GET" {
+@@ -842,6 +844,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 			}
+ 		}
+ 	}
++	// The queue read bounds its own request. Its detached preview follows
++	// the actor lifetime, rather than the HTTP request that warmed it.
++	switch req.Type {
++	case apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish:
++		return p.observeRoomQueue(ctx, req.Data.(roomTransportStateRequest),
++			req.Type != apiRoomBoundQueue, req.Type == apiRoomBoundQueueAutoplay)
++	}
++
+ 	// Limit ourselves to 30 seconds for handling API requests
+ 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+@@ -854,9 +864,6 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		p.invalidateRoomTransportGeneration()
+ 	}
+ 	switch req.Type {
+-	case apiRoomBoundQueue:
+-		return p.observeRoomQueue(ctx, req.Data.(roomTransportStateRequest))
+-
+ 	case apiMoveObserve:
+ 		return p.captureMove(req.Data.(roomVolumeScope))
+ 	case apiMoveOffer:
+@@ -919,6 +926,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		return p.prepareRoomTransportVersion(ctx, req.Data.(roomTransportPrepareRequest), true)
+ 	case apiRoomBoundConsume:
+ 		return p.consumeRoomTransportVersion(ctx, req.Data.(roomTransportConsumeRequest), true)
++	case apiRoomAutoplayPrepare:
++		return p.prepareAutoplaySelection(ctx, req.Data.(roomTransportPrepareRequest))
+ 	case apiRoomTransportState:
+ 		return p.roomTransportState(ctx, req.Data.(roomTransportStateRequest))
+ 	case apiRoomTransportPrepare:
+@@ -1326,6 +1335,7 @@ func (p *AppPlayer) Close() {
+ 
+ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+ 	defer p.clearRoomTransport()
++	defer p.clearAutoplayPreview()
+ 	transportCleanup := time.NewTicker(time.Second)
+ 	defer transportCleanup.Stop()
+ 	err := p.sess.Dealer().Connect(ctx)
+@@ -1353,6 +1363,10 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ 			return
+ 		case <-transportCleanup.C:
+ 			p.discardExpiredRoomTransport()
++			p.collectAutoplayPreview()
++			if preview := p.autoplayPreview; preview != nil && !p.autoplayPreviewCurrent(preview) {
++				p.clearAutoplayPreview()
++			}
+ 		case <-p.stop:
+ 			return
+ 		case pkt, ok := <-apRecv:
+@@ -1441,6 +1455,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+ // disconnect. Never execute or replay commands against this stranded session.
+ func (p *AppPlayer) runFailedTransport(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
+ 	p.clearRoomTransport()
++	p.clearAutoplayPreview()
+ 	for {
+ 		select {
+ 		case <-p.stop:
+diff --git a/daemon/queue_occurrence.go b/daemon/queue_occurrence.go
+index 42df3e9..0f10c7f 100644
+--- a/daemon/queue_occurrence.go
++++ b/daemon/queue_occurrence.go
+@@ -61,6 +61,7 @@ type nativeQueueSnapshot struct {
+ }
+ type nativeQueueOffer struct {
+ 	Snapshot    nativeQueueSnapshot
++	Occurrences []tracks.QueueOccurrence
+ 	State       *State
+ 	Tracks      *tracks.List
+ 	Alias       ApiAliasBinding
+@@ -198,7 +199,7 @@ func (p *AppPlayer) newQueueObservation(parent context.Context, request queueRea
+ 		}
+ 		result.Items = append(result.Items, nativeQueueItem{occurrence, row.Position, row.URI, row.Queued})
+ 	}
+-	return &nativeQueueOffer{Snapshot: result, State: p.state, Tracks: p.state.tracks, Alias: *binding, Expires: time.Now().Add(queueOfferLifetime)}, nil
++	return &nativeQueueOffer{Snapshot: result, Occurrences: observed.Items, State: p.state, Tracks: p.state.tracks, Alias: *binding, Expires: time.Now().Add(queueOfferLifetime)}, nil
+ }
+ 
+ // Build detached observations so a failed bound read cannot replace another token.
+diff --git a/daemon/room_next.go b/daemon/room_next.go
+index 6f36aaa..a2133a8 100644
+--- a/daemon/room_next.go
++++ b/daemon/room_next.go
+@@ -28,6 +28,10 @@ func resolveAutoplayContext(ctx context.Context, sp *spclient.Spclient, contextU
+ 			recent = append(recent, track.Uri)
+ 		}
+ 	}
++	return resolveAutoplayHistory(ctx, sp, contextURI, recent, playedURI)
++}
++
++func resolveAutoplayHistory(ctx context.Context, sp *spclient.Spclient, contextURI string, recent []string, playedURI string) (*connectpb.Context, error) {
+ 	if err := ctx.Err(); err != nil {
+ 		return nil, err
+ 	}
+@@ -63,26 +67,7 @@ func (p *AppPlayer) prepareRoomTransportTrack(ctx context.Context, previous bool
+ 			return nil, nil, err
+ 		}
+ 		state.SessionId = base64.StdEncoding.EncodeToString(sessionID)
+-		state.ContextUri, state.ContextUrl = spotCtx.Uri, spotCtx.Url
+-		state.Restrictions, state.ContextRestrictions = spotCtx.Restrictions, spotCtx.Restrictions
+-		if spotCtx.Restrictions != nil {
+-			if len(spotCtx.Restrictions.DisallowTogglingShuffleReasons) > 0 {
+-				state.Options.ShufflingContext = false
+-			}
+-			if len(spotCtx.Restrictions.DisallowTogglingRepeatTrackReasons) > 0 {
+-				state.Options.RepeatingTrack = false
+-			}
+-			if len(spotCtx.Restrictions.DisallowTogglingRepeatContextReasons) > 0 {
+-				state.Options.RepeatingContext = false
+-			}
+-		}
+-		state.Suppressions = &connectpb.Suppressions{}
+-		if state.ContextMetadata == nil {
+-			state.ContextMetadata = map[string]string{}
+-		}
+-		for key, value := range spotCtx.Metadata {
+-			state.ContextMetadata[key] = value
+-		}
++		applyAutoplayContext(state, spotCtx)
+ 		if err = staged.ToggleShuffle(ctx, state.Options.ShufflingContext); err != nil {
+ 			return nil, nil, fmt.Errorf("prepare autoplay shuffle: %w", err)
+ 		}
+@@ -98,3 +83,26 @@ func (p *AppPlayer) prepareRoomTransportTrack(ctx context.Context, previous bool
+ 	state.Track, state.PrevTracks, state.NextTracks, state.Index = staged.CurrentTrack(), staged.PrevTracks(), staged.NextTracks(ctx, nil), staged.Index()
+ 	return staged, state, nil
+ }
++
++func applyAutoplayContext(state *connectpb.PlayerState, spotCtx *connectpb.Context) {
++	state.ContextUri, state.ContextUrl = spotCtx.Uri, spotCtx.Url
++	state.Restrictions, state.ContextRestrictions = spotCtx.Restrictions, spotCtx.Restrictions
++	if spotCtx.Restrictions != nil {
++		if len(spotCtx.Restrictions.DisallowTogglingShuffleReasons) > 0 {
++			state.Options.ShufflingContext = false
++		}
++		if len(spotCtx.Restrictions.DisallowTogglingRepeatTrackReasons) > 0 {
++			state.Options.RepeatingTrack = false
++		}
++		if len(spotCtx.Restrictions.DisallowTogglingRepeatContextReasons) > 0 {
++			state.Options.RepeatingContext = false
++		}
++	}
++	state.Suppressions = &connectpb.Suppressions{}
++	if state.ContextMetadata == nil {
++		state.ContextMetadata = map[string]string{}
++	}
++	for key, value := range spotCtx.Metadata {
++		state.ContextMetadata[key] = value
++	}
++}
+diff --git a/daemon/room_queue.go b/daemon/room_queue.go
+index d7b0062..ddc8501 100644
+--- a/daemon/room_queue.go
++++ b/daemon/room_queue.go
+@@ -22,10 +22,13 @@ import (
+ 	"github.com/devgianlu/go-librespot/output"
+ 	"github.com/devgianlu/go-librespot/player"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/tracks"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+ const apiRoomBoundQueue ApiRequestType = "room_bound_queue"
++const apiRoomBoundQueueAutoplay ApiRequestType = "room_bound_queue_autoplay"
++const apiRoomBoundQueueAutoplayFinish ApiRequestType = "room_bound_queue_autoplay_finish"
+ const queuePurpose = "queue_occurrence_v1"
+ 
+ type queueSelection struct {
+@@ -50,6 +53,7 @@ type queueTransportProof struct {
+ 	Selection      queueSelection
+ 	Position       int
+ 	Observation    *nativeQueueOffer
++	Preview        *autoplayPreview
+ 	Owner          *AppPlayer
+ 	EffectEnqueued bool
+ 	EffectJoined   bool
+@@ -66,6 +70,8 @@ type queueMetadata struct {
+ 	Artwork string `json:"artwork,omitempty"`
+ }
+ type queueStateResponse struct {
++	Autoplay any `json:"autoplay,omitempty"`
++	autoplayDone <-chan struct{}
+ 	Metadata      map[string]queueMetadata `json:"metadata,omitempty"`
+ 	Schema        string                   `json:"schema"`
+ 	Ready         bool                     `json:"ready"`
+@@ -243,7 +249,7 @@ func (p *AppPlayer) strongQueueCurrent(offer *nativeQueueOffer, identity roomTra
+ 	latest, err := p.roomTransportIdentity(identity.AccountUserID, identity.TargetID, identity.RoomID, identity.HomePodID)
+ 	return err == nil && latest == identity && nativeBoundOwnerValid(latest)
+ }
+-func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTransportStateRequest) (any, error) {
++func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTransportStateRequest, includeAutoplay, warmAutoplay bool) (any, error) {
+ 	ctx, cancel := queueOperationContext(parent, request.Context)
+ 	defer cancel()
+ 	identity, err := p.roomTransportIdentity(request.AccountUserID, request.TargetID, request.RoomID, request.HomePodID)
+@@ -277,11 +283,29 @@ func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTranspo
+ 		retainQueuePresentation(previous, offer)
+ 	}
+ 	p.queueOccurrenceOffer = offer
++	if warmAutoplay {
++		p.warmAutoplayPreview(parent, offer)
++	}
+ 	var metadata map[string]queueMetadata
+-	if client := p.sess.Spclient(); client != nil {
++	if client := p.sess.Spclient(); client != nil && (!includeAutoplay || len(offer.Snapshot.Items) > 0) {
+ 		metadata = p.queueMetadata.readAndWarm(identity.AccountUserID, p.sess, client, offer.Snapshot.Items)
+ 	}
+-	return queueStateResponse{Schema: "podconnect.native_room_queue_state.v1", Ready: true, Purpose: queuePurpose, Owner: identity, ObservationID: offer.Snapshot.ObservationID, Revision: offer.Snapshot.QueueRevision, Expires: min(remaining, 10000), Items: offer.Snapshot.Items, Truncated: offer.Snapshot.Truncated, Writer: writer.Wire, Physical: false, Metadata: metadata}, nil
++	response := queueStateResponse{Schema: "podconnect.native_room_queue_state.v1", Ready: true, Purpose: queuePurpose, Owner: identity, ObservationID: offer.Snapshot.ObservationID, Revision: offer.Snapshot.QueueRevision, Expires: min(remaining, 10000), Items: offer.Snapshot.Items, Truncated: offer.Snapshot.Truncated, Writer: writer.Wire, Physical: false, Metadata: metadata}
++	if includeAutoplay {
++		response.Autoplay = p.autoplayQueueExtension(ctx, response)
++		if _, pending := response.Autoplay.(queueAutoplayPendingResponse); pending {
++			response.autoplayDone = p.autoplayPreview.done
++		}
++		response.Expires = min(int(time.Until(offer.Expires).Milliseconds()), 10000)
++		if response.Expires < 1 || ctx.Err() != nil {
++			return nil, ErrAliasConflict
++		}
++		if preview, ok := response.Autoplay.(queueAutoplayPreviewResponse); ok {
++			preview.Expires = min(preview.Expires, response.Expires)
++			response.Autoplay = preview
++		}
++	}
++	return response, nil
+ }
+ 
+ // A successful exact queue selection removes the upcoming prefix through the
+@@ -289,7 +313,7 @@ func (p *AppPlayer) observeRoomQueue(parent context.Context, request roomTranspo
+ func (p *AppPlayer) recordQueueContinuation(offer *nativeTransportOffer) {
+ 	p.queuePresentationContinuation = nil
+ 	queue := offer.Queue
+-	if queue == nil || queue.Owner != p || !offer.Published || !queue.EffectEnqueued || !queue.EffectJoined ||
++	if queue == nil || queue.Preview != nil || queue.Owner != p || !offer.Published || !queue.EffectEnqueued || !queue.EffectJoined ||
+ 		queue.Observation == nil || queue.Observation.BoundOwner == nil || offer.Writer == nil ||
+ 		p.state == nil || p.state != offer.State || p.sess != offer.Session || p.player != offer.Player ||
+ 		p.primaryStream == nil || p.primaryStream != offer.PreparedStream ||
+@@ -370,27 +394,50 @@ func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransp
+ 	if position < 0 {
+ 		return nil, ErrBadRequest
+ 	}
+-	offer := &nativeTransportOffer{Bound: true, Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: observed.Snapshot.QueueRevision, State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Queue: &queueTransportProof{Selection: *request.Queue, Position: position, Observation: observed, Owner: p}}
++	return p.prepareBoundQueueOffer(parent, ctx, identity, *request.Queue, observed, position, nil)
++}
++
++func (p *AppPlayer) prepareBoundQueueOffer(parent, ctx context.Context, identity roomTransportIdentity, selection queueSelection, observed *nativeQueueOffer, position int, preview *autoplayPreview) (any, error) {
++	offer := &nativeTransportOffer{Bound: true, Generation: p.roomTransportGeneration, OriginalPlayerState: p.state.player, QueueRevision: observed.Snapshot.QueueRevision, State: p.state, Session: p.sess, Player: p.player, Primary: p.primaryStream, Tracks: p.state.tracks, OwnToneURL: p.app.cfg.RoomTransportOwnToneURL, InputPath: p.app.cfg.AudioOutputPipe, Queue: &queueTransportProof{Selection: selection, Position: position, Observation: observed, Preview: preview, Owner: p}}
+ 	owned := true
+ 	defer func() {
+ 		if owned {
+ 			offer.discardPrepared()
+ 		}
+ 	}()
+-	staged, err := p.state.tracks.PrepareQueueOccurrence(ctx, request.Queue.QueueRevision, position)
++	current := func() bool {
++		return ctx.Err() == nil && parent.Err() == nil && p.strongQueueCurrent(observed, identity) &&
++			(preview == nil || p.autoplayPreviewCurrent(preview))
++	}
++	state := proto.Clone(p.state.player).(*connectpb.PlayerState)
++	var staged *tracks.List
++	var err error
++	if preview == nil {
++		staged, err = p.state.tracks.PrepareQueueOccurrence(ctx, selection.QueueRevision, position)
++	} else {
++		station := preview.station
++		staged, err = station.tracks.PrepareStationOccurrence(ctx, position)
++		if err == nil {
++			selected := staged.CurrentTrack()
++			expected := station.occurrences.Items[position]
++			if selected.GetUri() != expected.URI || selected.GetUid() != expected.UID {
++				return nil, ErrAliasConflict
++			}
++			applyAutoplayContext(state, station.context)
++		}
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++	if !current() {
+ 		return nil, ErrAliasConflict
+ 	}
+-	state := proto.Clone(p.state.player).(*connectpb.PlayerState)
+ 	state.Track = staged.CurrentTrack()
+ 	state.PrevTracks = staged.PrevTracks()
+ 	state.NextTracks = staged.NextTracks(ctx, nil)
+ 	state.Index = staged.Index()
+ 	state.IsPaused = false
+-	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++	if !current() {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	// Stream identity is resolved from the exact staged native occurrence, never an input URI.
+@@ -401,7 +448,7 @@ func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransp
+ 	offer.PreparedTracks = staged
+ 	offer.PreparedState = state
+ 	offer.PreparedStream = stream
+-	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++	if !current() {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	revision, err := p.nextNativeIntent()
+@@ -412,7 +459,7 @@ func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransp
+ 	offer.Expires = minTime(observed.Expires, time.Now().Add(roomTransportLifetime))
+ 	offer.Snapshot = roomTransportSnapshot{roomTransportIdentity: identity, Schema: "podconnect.native_room_queue_prepare.v1", Action: "queue", NativeRevision: revision, ExpiresAfterMS: int(time.Until(offer.Expires).Milliseconds())}
+ 	writer, err := p.captureQueueWriter(ctx, identity, offer)
+-	if err != nil || writer == nil || writer.Wire != observed.Writer.Wire || !p.strongQueueCurrent(observed, identity) {
++	if err != nil || writer == nil || writer.Wire != observed.Writer.Wire || !current() {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	offer.Writer = writer
+@@ -428,13 +475,13 @@ func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransp
+ 		Queue    queueSelection        `json:"queue"`
+ 		Writer   queueWriterWire       `json:"writer_proof"`
+ 		Revision string                `json:"native_revision"`
+-	}{identity, "queue", *request.Queue, writer.Wire, revision})
++	}{identity, "queue", selection, writer.Wire, revision})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	digest := sha256.Sum256(raw)
+ 	offer.Snapshot.ArgsDigest = hex.EncodeToString(digest[:])
+-	if ctx.Err() != nil || parent.Err() != nil || !p.strongQueueCurrent(observed, identity) {
++	if !current() {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	remaining := int(time.Until(offer.Expires).Milliseconds())
+@@ -443,7 +490,7 @@ func (p *AppPlayer) prepareBoundQueue(parent context.Context, request roomTransp
+ 	}
+ 	p.storeRoomTransportOffer(offer)
+ 	owned = false
+-	return queuePrepareResponse{"podconnect.native_room_queue_prepare.v1", queuePurpose, id, identity, revision, "queue", 0, offer.Snapshot.ArgsDigest, remaining, *request.Queue, writer.Wire}, nil
++	return queuePrepareResponse{"podconnect.native_room_queue_prepare.v1", queuePurpose, id, identity, revision, "queue", 0, offer.Snapshot.ArgsDigest, remaining, selection, writer.Wire}, nil
+ }
+ func minTime(a, b time.Time) time.Time {
+ 	if a.Before(b) {
+@@ -498,7 +545,20 @@ func (s *ConcreteApiServer) handleRoomQueue(w http.ResponseWriter, r *http.Reque
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+ 	defer cancel()
+-	data, err := s.roomTransportAsk(ctx, apiRoomBoundQueue, roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, false})
++	enabled, valid := queueAutoplayOptIn(r)
++	if !valid {
++		w.WriteHeader(400)
++		return
++	}
++	typ := apiRoomBoundQueue
++	if enabled {
++		typ = apiRoomBoundQueueAutoplay
++	}
++	request := roomTransportStateRequest{q.Get("account_user_id"), q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), ctx, false}
++	data, err := s.roomTransportAsk(ctx, typ, request)
++	if result, ok := data.(queueStateResponse); err == nil && enabled && ok && result.autoplayDone != nil {
++		data, err = s.finishAutoplayQueueRead(ctx, request, result)
++	}
+ 	roomTransportResponse(w, data, err)
+ }
+ 
+diff --git a/daemon/room_queue_test.go b/daemon/room_queue_test.go
+index c225d9a..c47be47 100644
+--- a/daemon/room_queue_test.go
++++ b/daemon/room_queue_test.go
+@@ -151,7 +151,7 @@ func TestQueueFailedBoundReadPreservesExistingObservation(t *testing.T) {
+ 	retained := offer.Queue.Observation
+ 	p.queueOccurrenceOffer = retained
+ 	// The failed scope check must not consume or replace another current token.
+-	if _, err := p.observeRoomQueue(context.Background(), roomTransportStateRequest{AccountUserID: "foreign"}); err == nil {
++	if _, err := p.observeRoomQueue(context.Background(), roomTransportStateRequest{AccountUserID: "foreign"}, false, false); err == nil {
+ 		t.Fatal("unbound read was admitted")
+ 	}
+ 	if p.queueOccurrenceOffer != retained {
+diff --git a/daemon/room_transport.go b/daemon/room_transport.go
+index e521b4a..9e3df2a 100644
+--- a/daemon/room_transport.go
++++ b/daemon/room_transport.go
+@@ -513,7 +513,8 @@ func (p *AppPlayer) transportOfferCurrentAtLocked(offer *nativeTransportOffer, p
+ 	}
+ 	if offer.Queue != nil {
+ 		q := offer.Queue
+-		if !offer.Bound || offer.Snapshot.Action != "queue" || q.Owner != p || q.Observation == nil || q.Observation.BoundOwner == nil || *q.Observation.BoundOwner != offer.Snapshot.roomTransportIdentity || !time.Now().Before(q.Observation.Expires) || q.Selection.SessionID != offer.Snapshot.SessionID || q.Selection.QueueRevision != offer.QueueRevision || q.Observation.Writer == nil || offer.Writer == nil || q.Observation.Writer.Wire != offer.Writer.Wire || !p.queueWriterCurrentLocked(offer.Writer, offer) {
++		if !offer.Bound || offer.Snapshot.Action != "queue" || q.Owner != p || q.Observation == nil || q.Observation.BoundOwner == nil || *q.Observation.BoundOwner != offer.Snapshot.roomTransportIdentity || !time.Now().Before(q.Observation.Expires) || q.Selection.SessionID != offer.Snapshot.SessionID || q.Selection.QueueRevision != offer.QueueRevision || q.Observation.Writer == nil || offer.Writer == nil || q.Observation.Writer.Wire != offer.Writer.Wire ||
++			(q.Preview != nil && !p.autoplayPreviewSnapshotCurrent(q.Preview)) || !p.queueWriterCurrentLocked(offer.Writer, offer) {
+ 			return false
+ 		}
+ 	}
+@@ -656,6 +657,9 @@ func (p *AppPlayer) effectRoomTransport(parent context.Context, request roomTran
+ 	}
+ 	if offer.Queue != nil {
+ 		p.recordQueueContinuation(offer)
++		if preview := offer.Queue.Preview; preview != nil {
++			p.recordAutoplayPromotion(preview, offer.Queue.Position)
++		}
+ 		return queueAccepted(offer), nil
+ 	}
+ 	p.recordRoomEffect(offer)
+diff --git a/daemon/room_transport_http.go b/daemon/room_transport_http.go
+index b36fa1c..d46b705 100644
+--- a/daemon/room_transport_http.go
++++ b/daemon/room_transport_http.go
+@@ -231,6 +231,14 @@ func (s *ConcreteApiServer) handleRoomTransportPrepare(w http.ResponseWriter, r
+ 	if roomBoundRequest(r) {
+ 		typ = apiRoomBoundPrepare
+ 	}
++	enabled, valid := queueAutoplayOptIn(r)
++	if !valid || enabled && (typ != apiRoomBoundPrepare || request.Action != "queue") {
++		w.WriteHeader(400)
++		return
++	}
++	if enabled {
++		typ = apiRoomAutoplayPrepare
++	}
+ 	data, err := s.roomTransportAsk(ctx, typ, request)
+ 	roomTransportResponse(w, data, err)
+ }
+diff --git a/tracks/queue_occurrence.go b/tracks/queue_occurrence.go
+index 0492ab7..fe51e22 100644
+--- a/tracks/queue_occurrence.go
++++ b/tracks/queue_occurrence.go
+@@ -6,6 +6,7 @@ import (
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
+ 	"math"
++	"strings"
+ )
+ 
+ const MaxQueueOccurrences = 20
+@@ -34,6 +35,33 @@ func (tl *List) invalidateQueueObservation() {
+ // ObserveUpcoming is called only by the existing serialized native player owner.
+ // It exposes the same upcoming order GoNext consumes, never the REST account queue.
+ func (tl *List) ObserveUpcoming(ctx context.Context) (QueueObservation, error) {
++	return tl.observeOccurrences(ctx, false)
++}
++
++// ObserveStation includes the first selected occurrence in a detached station.
++func (tl *List) ObserveStation(ctx context.Context) (QueueObservation, error) {
++	if tl == nil || tl.ctx == nil || !strings.HasPrefix(tl.ctx.Uri(), "spotify:station:") || tl.playingQueue || len(tl.queue) != 0 {
++		return QueueObservation{}, fmt.Errorf("detached station unavailable")
++	}
++	return tl.observeOccurrences(ctx, true)
++}
++
++// PrepareStationOccurrence stages a position in the detached station without
++// advancing the retained natural successor.
++func (tl *List) PrepareStationOccurrence(ctx context.Context, position int) (*List, error) {
++	if position < 0 || position >= MaxQueueOccurrences {
++		return nil, fmt.Errorf("invalid station position")
++	}
++	if position > 0 {
++		return tl.PrepareQueueOccurrence(ctx, tl.TransportRevision(), position-1)
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	return tl.cloneForPreparation()
++}
++
++func (tl *List) observeOccurrences(ctx context.Context, includeCurrent bool) (QueueObservation, error) {
+ 	result := QueueObservation{Revision: tl.queueRevision, Items: []QueueOccurrence{}}
+ 	if tl.queueRevisionExhausted || tl.tracks == nil || tl.tracks.pos < 0 || tl.ctx == nil {
+ 		return result, fmt.Errorf("queue occurrence owner unavailable")
+@@ -49,6 +77,11 @@ func (tl *List) ObserveUpcoming(ctx context.Context) (QueueObservation, error) {
+ 		result.Items = append(result.Items, QueueOccurrence{Position: len(result.Items), URI: provided.Uri, UID: track.Uid, Queued: queued})
+ 		return nil
+ 	}
++	if includeCurrent {
++		if err := appendTrack(tl.tracks.get().item, false); err != nil {
++			return QueueObservation{}, err
++		}
++	}
+ 	start := 0
+ 	if tl.playingQueue {
+ 		start = 1
+@@ -127,3 +160,16 @@ func (tl *List) SelectUpcoming(ctx context.Context, revision uint64, position in
+ 	tl.playingQueue = false
+ 	return nil
+ }
++
++// ResidentAutoplayHistory is used after a complete terminal observation. Keep the
++// old EOS seed order, or skip preview when that full seed does not fit the bound.
++func (tl *List) ResidentAutoplayHistory(limit int) []string {
++	if tl.tracks == nil || len(tl.tracks.list) > limit {
++		return nil
++	}
++	recent := make([]string, 0, len(tl.tracks.list))
++	for _, row := range tl.tracks.list {
++		recent = append(recent, librespot.ContextTrackToProvidedTrack(tl.ctx.Type(), row.item).Uri)
++	}
++	return recent
++}
+diff --git a/tracks/room_transport.go b/tracks/room_transport.go
+index d4a6f69..cb9be00 100644
+--- a/tracks/room_transport.go
++++ b/tracks/room_transport.go
+@@ -57,7 +57,7 @@ func (tl *List) PrepareTransportWithRepeat(ctx context.Context, previous bool, p
+ 	} else if previous {
+ 		clone.GoPrev()
+ 	} else {
+-		advanced, err := clone.goNext(ctx)
++		advanced, err := clone.GoNextWithError(ctx)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/tracks/tracks.go b/tracks/tracks.go
+index e24dab4..fa22065 100644
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -276,15 +276,15 @@ func (tl *List) PeekNext(ctx context.Context) *connectpb.ContextTrack {
+ }
+ 
+ func (tl *List) GoNext(ctx context.Context) bool {
+-	advanced, err := tl.goNext(ctx)
++	advanced, err := tl.GoNextWithError(ctx)
+ 	if err != nil {
+ 		tl.log.WithError(err).Error("failed going to next track")
+ 	}
+ 	return advanced
+ }
+ 
+-// Keep exhaustion distinct from a failed page read for detached preparation.
+-func (tl *List) goNext(ctx context.Context) (bool, error) {
++// GoNextWithError keeps exhaustion distinct from a failed page read.
++func (tl *List) GoNextWithError(ctx context.Context) (bool, error) {
+ 	tl.invalidateQueueObservation()
+ 	if tl.playingQueue {
+ 		tl.queue = tl.queue[1:]

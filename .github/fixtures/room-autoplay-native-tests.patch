@@ -1,0 +1,720 @@
+diff --git a/daemon/autoplay_preview.go b/daemon/autoplay_preview.go
+index a697ae0..07bc194 100644
+--- a/daemon/autoplay_preview.go
++++ b/daemon/autoplay_preview.go
+@@ -11,7 +11,9 @@ import (
+ )
+ 
+ const (
++	apiRoomAutoplayPreview  ApiRequestType = "room_autoplay_preview"
+ 	apiRoomAutoplayPrepare  ApiRequestType = "room_autoplay_prepare"
++	apiRoomAutoplayPromoted ApiRequestType = "room_autoplay_promoted"
+ )
+ 
+ const (
+diff --git a/daemon/autoplay_preview_test.go b/daemon/autoplay_preview_test.go
+new file mode 100644
+index 0000000..74f9f54
+--- /dev/null
++++ b/daemon/autoplay_preview_test.go
+@@ -0,0 +1,619 @@
++package daemon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"os"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/player"
++	connectpb "github.com/devgianlu/go-librespot/proto/spotify/connectstate"
++	"github.com/devgianlu/go-librespot/session"
++	"github.com/devgianlu/go-librespot/tracks"
++	"google.golang.org/protobuf/proto"
++)
++
++func TestAutoplayPreviewStagesOnlyOnceAndLeavesPlaybackUntouched(t *testing.T) {
++	p := nextFixture(t)
++	p.sess = &session.Session{}
++	calls := 0
++	entered := make(chan struct{})
++	release := make(chan struct{})
++	nextSessionField(p.sess, "sp", nextSpclient(t, &calls, nextTrack, func() {
++		close(entered)
++		<-release
++	}))
++	before := proto.Clone(p.state.player)
++	ctx := context.Background()
++	snapshot, err := p.state.tracks.ObserveUpcoming(ctx)
++	if err != nil || len(snapshot.Items) != 0 {
++		t.Fatal("expected a complete empty queue", err)
++	}
++	offer := &nativeQueueOffer{Tracks: p.state.tracks}
++	p.warmAutoplayPreview(ctx, offer)
++	<-entered
++	if p.autoplayPreview == nil || !proto.Equal(before, p.state.player) ||
++		p.state.tracks.TransportRevision() != snapshot.Revision || p.primaryStream != nil {
++		t.Fatal("preview changed current playback while resolving")
++	}
++	preview := p.autoplayPreview
++	close(release)
++	station := <-preview.pending
++	if calls != 1 || station == nil || station.context.GetUri() != nextStation ||
++		len(station.occurrences.Items) != 1 || station.occurrences.Items[0].URI != nextTrack {
++		t.Fatal("did not prepare exact provider station")
++	}
++	if !proto.Equal(before, p.state.player) || p.state.tracks != offer.Tracks {
++		t.Fatal("resolved preview published playback")
++	}
++}
++
++func TestAutoplayPreviewRejectsChangedStateBeforeWriterInspection(t *testing.T) {
++	for _, mode := range []string{"manual", "owner", "context", "options", "expired"} {
++		t.Run(mode, func(t *testing.T) {
++			p := nextFixture(t)
++			offer := &nativeQueueOffer{
++				State: p.state, PlayerState: p.state.player, Tracks: p.state.tracks, Generation: p.roomTransportGeneration,
++			}
++			offer.Snapshot.QueueRevision = p.state.tracks.TransportRevision()
++			_, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			preview := &autoplayPreview{
++				owner: offer, options: proto.Clone(p.state.player.Options).(*connectpb.ContextPlayerOptions),
++				uri: pContext, played: oldTrack, until: time.Now().Add(autoplayPreviewLifetime),
++				cancel: cancel, station: &autoplayStation{},
++			}
++			p.autoplayPreview = preview
++			switch mode {
++			case "manual":
++				p.state.tracks.AddToQueue(&connectpb.ContextTrack{Uri: nextTrack})
++			case "owner":
++				p.roomTransportGeneration++
++			case "context":
++				p.state.player.ContextUri = "spotify:playlist:0000000000000000000006"
++			case "options":
++				p.state.player.Options.ShufflingContext = true
++			case "expired":
++				preview.until = time.Time{}
++			}
++			if p.takeAutoplayPreview(context.Background()) != nil || p.autoplayPreview != nil {
++				t.Fatal("stale preview survived an ownership change")
++			}
++		})
++	}
++}
++
++func TestAutoplayPreviewHistoryIsBoundedAndOrdered(t *testing.T) {
++	ctx := context.Background()
++	log := &librespot.NullLogger{}
++	rows := []*connectpb.ContextTrack{{Uri: oldTrack}, {Uri: nextTrack}}
++	list, err := tracks.NewTrackListFromContext(ctx, log, nil, &connectpb.Context{
++		Uri: pContext, Pages: []*connectpb.ContextPage{{Tracks: rows}},
++	})
++	if err != nil || !list.GoStart(ctx) || !list.GoNext(ctx) {
++		t.Fatal("resident fixture", err)
++	}
++	if got := list.ResidentAutoplayHistory(1); got != nil {
++		t.Fatal("preview changed the existing resolver seed by truncating")
++	}
++	if got := list.ResidentAutoplayHistory(2); len(got) != 2 || got[0] != oldTrack || got[1] != nextTrack {
++		t.Fatal("preview changed the existing resolver seed order", got)
++	}
++}
++
++var previewResolves atomic.Int32
++var holdPreviewResolver chan struct{}
++var previewResolverEntered chan struct{}
++
++// Runs only in the existing actual Linux FIFO and private receiver fixture.
++func testAutoplayPreviewActualC(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player, server *ConcreteApiServer) {
++	t.Helper()
++	owner, err := p.radioSourceOwner()
++	if err != nil {
++		t.Fatal(err)
++	}
++	before := proto.Clone(p.state.player)
++	oldSource, err := worker.Start35CurrentSource(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	scope := url.Values{"account_user_id": {owner.AccountUserID}, "target_id": {owner.TargetID}, "room_id": {owner.RoomID}, "homepod_id": {owner.HomePodID}}
++	read := func(count int) queueStateResponse {
++		t.Helper()
++		response := httptest.NewRecorder()
++		server.handleRoomQueue(response, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-queue?"+scope.Encode(), nil).WithContext(ctx))
++		var observed queueStateResponse
++		var fields map[string]json.RawMessage
++		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &observed) != nil ||
++			json.Unmarshal(response.Body.Bytes(), &fields) != nil || (count == 0 && len(fields) != 11) ||
++			observed.Schema != "podconnect.native_room_queue_state.v1" ||
++			observed.Owner != owner || len(observed.Items) != count {
++			t.Fatalf("bound empty queue read %d", response.Code)
++		}
++		return observed
++	}
++	initial := read(0)
++	if p.autoplayPreview != nil {
++		t.Fatal("ordinary HTTP read initiated autoplay work")
++	}
++	pendingMode := os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") == "pending"
++	completionMode := os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") == "complete"
++	if pendingMode || completionMode {
++		holdPreviewResolver = make(chan struct{})
++		previewResolverEntered = make(chan struct{})
++		defer func() {
++			select {
++			case <-holdPreviewResolver:
++			default:
++				close(holdPreviewResolver)
++			}
++		}()
++	}
++	warmCtx := ctx
++	if pendingMode {
++		var cancel context.CancelFunc
++		warmCtx, cancel = context.WithTimeout(ctx, 400*time.Millisecond)
++		defer cancel()
++	}
++	var pendingObserved chan bool
++	if completionMode {
++		pendingObserved = make(chan bool, 1)
++		go func() {
++			select {
++			case <-previewResolverEntered:
++			case <-ctx.Done():
++				pendingObserved <- false
++				return
++			}
++			// The resolver is held while the same actor answers this second
++			// request. This proves the initial HTTP wait did not block the actor.
++			value, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, owner)
++			view, ok := value.(prospectiveQueueView)
++			pendingObserved <- err == nil && ok && len(view.Rows) == 0
++			close(holdPreviewResolver)
++		}()
++	}
++	warmRequest := httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-queue?"+scope.Encode(), nil).WithContext(warmCtx)
++	warmRequest.Header.Set(queueAutoplayHeader, "1")
++	warmReply := httptest.NewRecorder()
++	server.handleRoomQueue(warmReply, warmRequest)
++	if warmReply.Code != http.StatusOK {
++		t.Fatal("opt-in read could not warm autoplay", warmReply.Code)
++	}
++	if completionMode {
++		if !<-pendingObserved {
++			t.Fatal("player actor did not answer while the resolver was held")
++		}
++		var envelope struct {
++			Autoplay queueAutoplayPreviewResponse `json:"autoplay"`
++		}
++		if json.Unmarshal(warmReply.Body.Bytes(), &envelope) != nil || envelope.Autoplay.Kind != "preview" ||
++			len(envelope.Autoplay.Items) != 3 || previewResolves.Load() != 1 {
++			t.Fatal("first HTTP read did not complete from the one in-flight resolver")
++		}
++		t.Log("PASS first opt-in HTTP GET waited off actor and returned ready after one resolver")
++	}
++	if pendingMode {
++		var envelope struct {
++			Autoplay map[string]json.RawMessage `json:"autoplay"`
++			Items    []nativeQueueItem          `json:"items"`
++		}
++		if json.Unmarshal(warmReply.Body.Bytes(), &envelope) != nil || len(envelope.Items) != 0 ||
++			len(envelope.Autoplay) != 1 || string(envelope.Autoplay["kind"]) != `"pending"` {
++			t.Fatal("held first HTTP read did not return exact pending sidecar")
++		}
++		read(0) // Ordinary clients still see only v1 during the held read.
++		close(holdPreviewResolver)
++	}
++	currentOffer := p.queueOccurrenceOffer
++	preview := p.autoplayPreview
++	if preview == nil {
++		t.Fatal("bound read did not warm a detached station")
++	}
++	readProspective := func() prospectiveQueueView {
++		t.Helper()
++		result, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, owner)
++		if err != nil {
++			t.Fatal("internal prospective read", err)
++		}
++		return result.(prospectiveQueueView)
++	}
++	projected := readProspective()
++	for limit := time.Now().Add(time.Second); (len(projected.Rows) == 0 || projected.Rows[0].Metadata.Name == "") && time.Now().Before(limit); {
++		time.Sleep(5 * time.Millisecond)
++		projected = readProspective()
++	}
++	if len(projected.Rows) != 3 || projected.Truncated || projected.Rows[0].Metadata.Artist != "station fixture artist" {
++		t.Fatal("expected three complete provider occurrences")
++	}
++	for i, uid := range []string{"first", "second", "third"} {
++		item := projected.Rows[i]
++		if item.Position != i || item.UID != uid || item.URI != p.state.player.GetTrack().GetUri() || item.Queued {
++			t.Fatalf("wrong detached occurrence at position %d: %+v", i, item)
++		}
++	}
++	projected.Rows[1].UID = "caller-mutated"
++	if next := readProspective(); next.Rows[1].UID != "second" || next.Rows[1].Selection != projected.Rows[1].Selection || next.Rows[1].DisplayID != projected.Rows[1].DisplayID {
++		t.Fatal("caller mutated actor-owned projection")
++	}
++	stale := owner
++	stale.SessionID += "-superseded"
++	if _, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, stale); !errors.Is(err, ErrAliasConflict) {
++		t.Fatal("stale scope could read detached occurrences", err)
++	}
++	if p.queueOccurrenceOffer != currentOffer {
++		t.Fatal("opt-in read renewed ordinary queue authority")
++	}
++	if latest := read(0); latest.Writer != initial.Writer || latest.Revision != initial.Revision {
++		t.Fatal("opt-in read changed writer or actual queue revision")
++	}
++
++	current, err := worker.Start35CurrentSource(ctx)
++	if err != nil || current != oldSource || !proto.Equal(before, p.state.player) ||
++		preview.station == nil || len(preview.station.occurrences.Items) != 3 || preview.station.occurrences.Items[1].UID != "second" ||
++		previewResolves.Load() != 1 {
++		t.Fatalf("preview mismatch source=%t state=%t same_offer=%t ready=%t calls=%d err=%v", current == oldSource, proto.Equal(before, p.state.player), p.autoplayPreview == preview, preview.station != nil, previewResolves.Load(), err)
++	}
++	if pendingMode {
++		var ready queueAutoplayPreviewResponse
++		readAutoplayHTTP(t, ctx, server, owner, &ready)
++		if ready.Kind != "preview" || len(ready.Items) != 3 || previewResolves.Load() != 1 {
++			t.Fatal("next explicit read did not publish exact ready rows")
++		}
++		t.Log("PASS first opt-in HTTP read reports pending without authority, next explicit read publishes ready from one resolve")
++	}
++	mode := os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW")
++	if mode == "choose" || mode == "manual-commit" || mode == "stale-commit" {
++		testAutoplayChoiceActualC(t, ctx, p, worker, server, owner, projected.Rows, initial.Writer, mode)
++		return
++	}
++	if mode == "manual" {
++		if _, err := server.roomTransportAsk(ctx, ApiRequestTypeAddToQueue, p.state.player.GetTrack().GetUri()); err != nil {
++			t.Fatal("manual queue insert", err)
++		}
++		if _, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, owner); !errors.Is(err, ErrAliasConflict) {
++			t.Fatal("manual insertion retained stale prospective projection", err)
++		}
++		ordinary := read(1)
++		if !ordinary.Items[0].Queued || previewResolves.Load() != 1 || ordinary.Writer != initial.Writer {
++			t.Fatal("manual queue did not supersede prospective without another resolve or writer change")
++		}
++		t.Log("PASS manual insertion withdrew prospective projection and ordinary v1 kept the exact queued item and writer")
++		return
++	}
++	// Invoke the same natural exhaustion path used by the worker EOS event.
++	// C still holds the exact live writer; the fixture does not wait for a
++	// full-length test recording to end.
++	advanced, err := p.advanceNext(ctx, false, false)
++	if err != nil || !advanced || previewResolves.Load() != 1 || p.autoplayPreview != nil ||
++		p.state.tracks != preview.station.tracks || p.state.player.ContextUri != nextStation ||
++		p.state.player.Track.Uid != "first" {
++		t.Fatal("natural EOS did not reuse the exact detached station", err)
++	}
++	if _, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, owner); !errors.Is(err, ErrAliasConflict) {
++		t.Fatal("prior scope remained readable after EOS adoption", err)
++	}
++	promotedOwner, err := p.radioSourceOwner()
++	if err != nil || promotedOwner.SessionID == owner.SessionID {
++		t.Fatal("expected natural EOS to publish new playback session", err)
++	}
++	proveAutoplayPromotion(t, ctx, p, server, promotedOwner, projected.Rows[1:])
++	t.Log("PASS natural EOS reused one resolve and reconciled both exact display survivors across the new session")
++}
++
++func TestDetachedStationProjectionTruncatesWithoutDeduplicating(t *testing.T) {
++	ctx := context.Background()
++	id, err := librespot.SpotifyIdFromUri(nextTrack)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, count := range []int{tracks.MaxQueueOccurrences, tracks.MaxQueueOccurrences + 1} {
++		rows := make([]*connectpb.ContextTrack, count)
++		for i := range rows {
++			rows[i] = &connectpb.ContextTrack{Gid: id.Id(), Uid: "duplicate-provider-uid"}
++		}
++		list, err := tracks.NewTrackListFromContext(ctx, &librespot.NullLogger{}, nil, &connectpb.Context{
++			Uri: nextStation, Pages: []*connectpb.ContextPage{{Tracks: rows}},
++		})
++		if err != nil || !list.GoStart(ctx) {
++			t.Fatal("station fixture", err)
++		}
++		ordinary, err := list.ObserveUpcoming(ctx)
++		if err != nil {
++			t.Fatal(err)
++		}
++		prospective, err := list.ObserveStation(ctx)
++		if err != nil || len(prospective.Items) != tracks.MaxQueueOccurrences ||
++			prospective.Truncated != (count > tracks.MaxQueueOccurrences) ||
++			len(ordinary.Items) != count-1 || ordinary.Truncated {
++			t.Fatalf("wrong occurrence limits at %d: %v", count, err)
++		}
++		for i, row := range prospective.Items {
++			if row.Position != i || row.URI != nextTrack || row.UID != "duplicate-provider-uid" || row.Queued {
++				t.Fatalf("lost original occurrence at %d: %+v", i, row)
++			}
++		}
++	}
++}
++
++// Crosses actual C through the existing prepared bound queue transaction.
++func testAutoplayChoiceActualC(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player, server *ConcreteApiServer, owner roomTransportIdentity, projected []prospectiveQueueRow, writer queueWriterWire, mode string) {
++	t.Helper()
++	endpoint := p.app.cfg.RoomTransportOwnToneURL + "/api/outputs/" + owner.HomePodID
++	post := func(path string, value any, out any) {
++		t.Helper()
++		body, _ := json.Marshal(value)
++		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, bytes.NewReader(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Content-Type", "application/json")
++		reply, err := http.DefaultClient.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer reply.Body.Close()
++		if reply.StatusCode != http.StatusOK || json.NewDecoder(reply.Body).Decode(out) != nil {
++			t.Fatalf("actual C %s status=%d", path, reply.StatusCode)
++		}
++	}
++	readRoute := func() roomVolumeRoute {
++		t.Helper()
++		var state directPauseOutputState
++		post("/transport/bound-state", map[string]any{"native_owner": owner}, &state)
++		if !state.OK {
++			t.Fatal("actual C owner no longer bound")
++		}
++		return state.Identity
++	}
++	route := readRoute()
++	oldVolume, oldPrimary, preview := p.state.device.Volume, p.primaryStream, p.autoplayPreview
++	first := queueAutoplayPreviewResponse{}
++	firstQueue := readAutoplayHTTP(t, ctx, server, owner, &first)
++	renewed := queueAutoplayPreviewResponse{}
++	renewedQueue := readAutoplayHTTP(t, ctx, server, owner, &renewed)
++	if first.Kind != "preview" || renewed.Kind != "preview" || len(renewed.Items) != 3 || len(first.Items) != 3 ||
++		first.ObservationID == renewed.ObservationID || firstQueue.ObservationID == renewedQueue.ObservationID ||
++		first.Revision != renewed.Revision || first.Items[1] != renewed.Items[1] ||
++		renewed.DisplayIDs[renewed.Items[1].ID] != projected[1].DisplayID || renewed.Items[1].ID != projected[1].Selection.OccurrenceID ||
++		len(renewedQueue.Items) != 0 || renewed.Truncated || renewed.Expires <= 0 ||
++		renewed.Metadata[renewed.Items[1].URI] != projected[1].Metadata {
++		t.Fatal("HTTP preview renewal changed the exact occurrence or display identity")
++	}
++	selection := queueSelection{renewed.ObservationID, owner.SessionID, renewed.Revision, renewed.Items[1].ID}
++	prepareHTTP := func(selection queueSelection, header string) *httptest.ResponseRecorder {
++		t.Helper()
++		request := roomTransportPrepareRequest{AccountUserID: owner.AccountUserID, TargetID: owner.TargetID,
++			RoomID: owner.RoomID, HomePodID: owner.HomePodID, Action: "queue", Queue: &selection}
++		body, _ := json.Marshal(request)
++		httpRequest := httptest.NewRequest(http.MethodPost, "/player/room_transport/bound-prepare", bytes.NewReader(body)).WithContext(ctx)
++		if header != "" {
++			httpRequest.Header.Set(queueAutoplayHeader, header)
++		}
++		recorder := httptest.NewRecorder()
++		server.handleRoomTransportPrepare(recorder, httpRequest)
++		return recorder
++	}
++	stale := selection
++	stale.SessionID += "-superseded"
++	if response := prepareHTTP(stale, "1"); response.Code != http.StatusConflict {
++		t.Fatal("wrong owner obtained prospective prepare", response.Code)
++	}
++	stale = selection
++	stale.ObservationID = first.ObservationID
++	if response := prepareHTTP(stale, "1"); response.Code != http.StatusConflict {
++		t.Fatal("previous preview observation remained actionable", response.Code)
++	}
++	if response := prepareHTTP(selection, ""); response.Code != http.StatusConflict {
++		t.Fatal("legacy prepare admitted prospective ID", response.Code)
++	}
++	if response := prepareHTTP(selection, "0"); response.Code != http.StatusBadRequest {
++		t.Fatal("bad version reached prospective prepare", response.Code)
++	}
++	response := prepareHTTP(selection, "1")
++	var prepared queuePrepareResponse
++	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &prepared) != nil {
++		t.Fatal("exact projected occurrence HTTP prepare", response.Code)
++	}
++	if p.primaryStream != oldPrimary || preview.station.tracks.CurrentTrack().Uid != "first" ||
++		prepared.Queue != selection || prepared.Writer != writer {
++		t.Fatal("prepare advanced the natural station or live writer")
++	}
++	if response := prepareHTTP(selection, "1"); response.Code != http.StatusConflict {
++		t.Fatal("prospective prepare replay was accepted", response.Code)
++	}
++	prepareC := func(id, digest, action, revision string, selection *queueSelection) string {
++		t.Helper()
++		body := map[string]any{"native_prepare_id": id, "args_digest": digest,
++			"action": action, "native_revision": revision, "native_owner": owner}
++		if selection != nil {
++			body["queue"], body["writer_proof"] = *selection, writer
++		}
++		var result directPauseOutputPrepare
++		post("/transport/bound-prepare", body, &result)
++		if result.Token == "" || result.Identity != route {
++			t.Fatal("actual C lost exact route at prepare")
++		}
++		return result.Token
++	}
++	commit := func(id, token string) int {
++		t.Helper()
++		raw, _ := json.Marshal(roomTransportCommitRequest{id, token})
++		response := httptest.NewRecorder()
++		server.handleRoomTransportCommit(response, httptest.NewRequest(http.MethodPost,
++			"/player/room_transport/bound-commit", bytes.NewReader(raw)).WithContext(ctx))
++		return response.Code
++	}
++	token := prepareC(prepared.PrepareID, prepared.Digest, "queue", prepared.Revision, &selection)
++	if mode == "stale-commit" {
++		p.aliasMu.Lock()
++		p.advanceAliasRevisionLocked()
++		p.aliasMu.Unlock()
++		if commit(prepared.PrepareID, token) == http.StatusOK || p.primaryStream != oldPrimary || preview.station.tracks.CurrentTrack().Uid != "first" {
++			t.Fatal("changed alias owner reached stale commit")
++		}
++		t.Log("PASS changed alias owner fenced already C-prepared prospective queue before C commit")
++		return
++	}
++	if mode == "manual-commit" {
++		if _, err := server.roomTransportAsk(ctx, ApiRequestTypeAddToQueue, p.state.player.GetTrack().GetUri()); err != nil {
++			t.Fatal("manual insertion before commit", err)
++		}
++		if commit(prepared.PrepareID, token) == http.StatusOK || p.primaryStream != oldPrimary ||
++			preview.station.tracks.CurrentTrack().Uid != "first" || readRoute() != route {
++			t.Fatal("stale prospective commit after manual insertion changed live owner")
++		}
++		t.Log("PASS actual manual insertion fenced already C-prepared prospective queue before C commit")
++		return
++	}
++	if code := commit(prepared.PrepareID, token); code != http.StatusOK {
++		t.Fatal("prospective commit", code)
++	}
++	if commit(prepared.PrepareID, token) == http.StatusOK || p.state.player.SessionId != owner.SessionID ||
++		p.state.player.ContextUri != nextStation || p.state.player.Track.Uid != "second" ||
++		p.state.device.Volume != oldVolume || readRoute() != route || preview.station.tracks.CurrentTrack().Uid != "first" {
++		t.Fatal("selection lost exact UID/route/session/volume or advanced the detached natural list")
++	}
++	source, err := worker.Start35CurrentSource(ctx)
++	exactWriter, writerErr := p.app.completedWriterCurrent(p, owner)
++	if err != nil || writerErr != nil || source != p.primaryStream.Source || p.primaryStream == oldPrimary ||
++		exactWriter == nil || exactWriter.writer.FD != writer.FD || exactWriter.writer.PipeIdentity != writer.Pipe ||
++		exactWriter.epoch != writer.Epoch {
++		t.Fatal("selection did not install a new decoder on the exact prior writer", err, writerErr)
++	}
++	proveAutoplayPromotion(t, ctx, p, server, owner, projected[2:])
++	if _, err := server.roomTransportAsk(ctx, ApiRequestTypePause, nil); err != nil || !p.state.player.IsPaused || readRoute() != route {
++		t.Fatal("subsequent bound Pause", err)
++	}
++	value, err := server.roomTransportAsk(ctx, apiRoomBoundPrepare, roomTransportPrepareRequest{
++		AccountUserID: owner.AccountUserID, TargetID: owner.TargetID, RoomID: owner.RoomID, HomePodID: owner.HomePodID, Action: "next"})
++	if err != nil {
++		t.Fatal("subsequent bound Next prepare", err)
++	}
++	next := value.(roomTransportSnapshot)
++	nextToken := prepareC(next.PrepareID, next.ArgsDigest, "next", next.NativeRevision, nil)
++	if commit(next.PrepareID, nextToken) != http.StatusOK || p.state.player.Track.Uid != "third" ||
++		p.state.player.SessionId != owner.SessionID || p.state.player.ContextUri != nextStation ||
++		readRoute() != route || previewResolves.Load() != 1 {
++		t.Fatal("subsequent bound Next lost provider occurrence or owner")
++	}
++	t.Log("PASS one projected duplicate committed in place, replay rejected, then bound Pause/Next selected the third occurrence")
++}
++
++func proveAutoplayPromotion(t *testing.T, ctx context.Context, p *AppPlayer, server *ConcreteApiServer, owner roomTransportIdentity, expected []prospectiveQueueRow) {
++	t.Helper()
++	scope := url.Values{"account_user_id": {owner.AccountUserID}, "target_id": {owner.TargetID}, "room_id": {owner.RoomID}, "homepod_id": {owner.HomePodID}}
++	read := func() queueStateResponse {
++		t.Helper()
++		response := httptest.NewRecorder()
++		server.handleRoomQueue(response, httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-queue?"+scope.Encode(), nil).WithContext(ctx))
++		var observed queueStateResponse
++		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &observed) != nil ||
++			observed.Schema != "podconnect.native_room_queue_state.v1" || observed.Owner != owner || len(observed.Items) != len(expected) {
++			t.Fatalf("ordinary queue missing promoted provider suffix: %d", response.Code)
++		}
++		for _, row := range expected {
++			if strings.Contains(response.Body.String(), row.DisplayID) || strings.Contains(response.Body.String(), row.Selection.OccurrenceID) {
++				t.Fatal("display or prospective authority leaked into ordinary v1")
++			}
++		}
++		return observed
++	}
++	readMap := func(ordinary queueStateResponse) []autoplayPromotedRow {
++		t.Helper()
++		currentOffer := p.queueOccurrenceOffer
++		value, err := server.roomTransportAsk(ctx, apiRoomAutoplayPromoted, autoplayPromotionRead{owner, ordinary.ObservationID})
++		if err != nil || p.queueOccurrenceOffer != currentOffer {
++			t.Fatal("exact display reconciliation failed or renewed action authority", err)
++		}
++		mapping := value.([]autoplayPromotedRow)
++		if len(mapping) != len(expected) {
++			t.Fatal("wrong number of reconciled rows")
++		}
++		for i, row := range mapping {
++			if row.QueueID != ordinary.Items[i].ID || row.DisplayID != expected[i].DisplayID ||
++				row.Metadata != expected[i].Metadata || row.Metadata.Artist != "station fixture artist" {
++				t.Fatalf("wrong reconciled row at %d: %+v", i, row)
++			}
++		}
++		return mapping
++	}
++	ordinary := read()
++	uri := expected[0].URI
++	for limit := time.Now().Add(time.Second); ordinary.Metadata[uri].Name == "" && time.Now().Before(limit); {
++		time.Sleep(5 * time.Millisecond)
++		ordinary = read()
++	}
++	if ordinary.Metadata[uri] != expected[0].Metadata {
++		t.Fatal("ordinary v1 metadata did not match the provider label from the preview")
++	}
++	rows := readMap(ordinary)
++	rows[0].DisplayID = "caller-mutated"
++	renewed := read()
++	readMap(renewed)
++	if _, err := server.roomTransportAsk(ctx, apiRoomAutoplayPromoted, autoplayPromotionRead{owner, ordinary.ObservationID}); !errors.Is(err, ErrAliasConflict) {
++		t.Fatal("stale ordinary observation could reconcile", err)
++	}
++	for _, id := range []string{expected[0].DisplayID, expected[0].Selection.OccurrenceID} {
++		ordinary = read()
++		selection := queueSelection{ordinary.ObservationID, owner.SessionID, ordinary.Revision, id}
++		body, _ := json.Marshal(roomTransportPrepareRequest{AccountUserID: owner.AccountUserID, TargetID: owner.TargetID,
++			RoomID: owner.RoomID, HomePodID: owner.HomePodID, Action: "queue", Queue: &selection})
++		reply := httptest.NewRecorder()
++		server.handleRoomTransportPrepare(reply, httptest.NewRequest(http.MethodPost, "/player/room_transport/bound-prepare", bytes.NewReader(body)).WithContext(ctx))
++		if reply.Code == http.StatusOK {
++			t.Fatal("non-v1 ID gained ordinary action authority")
++		}
++	}
++	promotion := queueAutoplayPromotionResponse{}
++	promoted := readAutoplayHTTP(t, ctx, server, owner, &promotion)
++	if promotion.Kind != "promotion" || len(promotion.DisplayIDs) != len(expected) {
++		t.Fatal("HTTP promotion omitted exact display mappings")
++	}
++	for i, item := range promoted.Items {
++		if promotion.DisplayIDs[item.ID] != expected[i].DisplayID || promotion.Metadata[item.URI] != expected[i].Metadata {
++			t.Fatal("HTTP promotion changed survivor display identity or metadata")
++		}
++	}
++	t.Log("PASS opt-in HTTP promotion joined exact provider UID/position and label to fresh v1 IDs, retaining separate display IDs")
++}
++
++func TestAutoplayPromotionCannotMatchDuplicateURIAtWrongUID(t *testing.T) {
++	const uid = "provider-occurrence"
++	expected := []autoplayDisplayRow{{Occurrence: tracks.QueueOccurrence{URI: nextTrack, UID: uid}, ID: "display-one"}}
++	ordinary := &nativeQueueOffer{
++		Snapshot:    nativeQueueSnapshot{Items: []nativeQueueItem{{URI: nextTrack, ID: "ordinary-action"}}},
++		Occurrences: []tracks.QueueOccurrence{{URI: nextTrack, UID: "same-uri-different-occurrence"}},
++	}
++	if rows, err := reconcileAutoplayRows(expected, ordinary); !errors.Is(err, ErrAliasConflict) || rows != nil {
++		t.Fatal("another occurrence borrowed the label or display identity", err)
++	}
++}
++
++func readAutoplayHTTP(t *testing.T, ctx context.Context, server *ConcreteApiServer, owner roomTransportIdentity, extension any) queueStateResponse {
++	t.Helper()
++	scope := url.Values{"account_user_id": {owner.AccountUserID}, "target_id": {owner.TargetID}, "room_id": {owner.RoomID}, "homepod_id": {owner.HomePodID}}
++	request := httptest.NewRequest(http.MethodGet, "/player/room_transport/bound-queue?"+scope.Encode(), nil).WithContext(ctx)
++	request.Header.Set(queueAutoplayHeader, "1")
++	recorder := httptest.NewRecorder()
++	server.handleRoomQueue(recorder, request)
++	var ordinary queueStateResponse
++	var envelope struct {
++		Autoplay json.RawMessage `json:"autoplay"`
++	}
++	if recorder.Code != http.StatusOK || json.Unmarshal(recorder.Body.Bytes(), &ordinary) != nil ||
++		json.Unmarshal(recorder.Body.Bytes(), &envelope) != nil || json.Unmarshal(envelope.Autoplay, extension) != nil ||
++		ordinary.Schema != "podconnect.native_room_queue_state.v1" || ordinary.Owner != owner {
++		t.Fatal("opt-in HTTP queue omitted exact ordinary/extended response", recorder.Code)
++	}
++	return ordinary
++}
+diff --git a/daemon/player.go b/daemon/player.go
+index 68c029a..1c280e7 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -786,7 +786,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 	}
+ 	if p.radioHeld() {
+ 		switch req.Type {
+-		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish:
++		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish, apiRoomAutoplayPreview, apiRoomAutoplayPromoted:
+ 		case ApiRequestTypeWebApi:
+ 			data, ok := req.Data.(ApiRequestDataWebApi)
+ 			if !ok || data.Method != "GET" {
+@@ -926,6 +926,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 		return p.prepareRoomTransportVersion(ctx, req.Data.(roomTransportPrepareRequest), true)
+ 	case apiRoomBoundConsume:
+ 		return p.consumeRoomTransportVersion(ctx, req.Data.(roomTransportConsumeRequest), true)
++	case apiRoomAutoplayPreview:
++		return p.readAutoplayPreview(ctx, req.Data.(roomTransportIdentity), false)
++	case apiRoomAutoplayPromoted:
++		return p.readAutoplayPromotion(ctx, req.Data.(autoplayPromotionRead))
+ 	case apiRoomAutoplayPrepare:
+ 		return p.prepareAutoplaySelection(ctx, req.Data.(roomTransportPrepareRequest))
+ 	case apiRoomTransportState:
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index e5ab7fa..ce035cd 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -727,6 +727,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					configureSelectedStage(t, p, options)
+ 				}
+ 			}
++			if os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") != "" {
++				options.CountryCode = proto.String("DK")
++				p.prodInfo = &ProductInfo{}
++			}
+ 			worker, err := player.NewPlayer(options)
+ 			if err != nil {
+ 				t.Fatal(err)
+@@ -1584,6 +1588,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 			time.Sleep(10 * time.Millisecond)
+ 		}
+ 	}
++	if os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") != "" {
++		testAutoplayPreviewActualC(t, ctx, p, worker, server)
++	}
+ 	if mode == "episode-commit" {
+ 		if !stream.Media.IsEpisode() || stream.Media.Id().Uri() != request.Args.EpisodeURI || p.state.player.Track.Uri != request.Args.EpisodeURI || p.app.startCustody != op || op.CReceipt == nil || op.CReceipt.ContentDigest != op.ContentDigest || !receipt.Accepted || receipt.OperationID != op.Offer.OfferID {
+ 			t.Fatal("episode lost accepted START shape/identity")
+@@ -1832,6 +1839,21 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+ 		status := 200
+ 		header := make(http.Header)
+ 		switch {
++		case os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") != "" && r.URL.Path == "/context-resolve/v1/autoplay":
++			if previewResolves.Add(1) != 1 {
++				return nil, fmt.Errorf("unexpected second autoplay request")
++			}
++			if mode := os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW"); mode == "pending" || mode == "complete" {
++				close(previewResolverEntered)
++				select {
++				case <-holdPreviewResolver:
++				case <-r.Context().Done():
++					return nil, r.Context().Err()
++				}
++			}
++			data, _ = json.Marshal(&connectpb.Context{Uri: nextStation, Pages: []*connectpb.ContextPage{{Tracks: []*connectpb.ContextTrack{
++				{Gid: id.Id(), Uid: "first"}, {Uri: id.Uri(), Uid: "second"}, {Uri: id.Uri(), Uid: "third"},
++			}}}})
+ 		case strings.HasPrefix(r.URL.Path, "/context-resolve/v1/"):
+ 			resolved := id.Uri()
+ 			if episodeMode == "episode-resolved-overflow" {
+@@ -1873,6 +1895,9 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+ 				}
+ 			case extpb.ExtensionKind_TRACK_V4:
+ 				message = &metadatapb.Track{Gid: metadataID.Id(), Duration: proto.Int32(55000), Name: proto.String("synthetic"), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("synthetic"), Date: &metadatapb.Date{}}}
++				if os.Getenv("PC_NATIVE_AUTOPLAY_PREVIEW") != "" {
++					message.(*metadatapb.Track).Artist = []*metadatapb.Artist{{Name: proto.String("station fixture artist")}}
++				}
+ 			case extpb.ExtensionKind_AUDIO_FILES:
+ 				message = &filespb.AudioFilesExtensionResponse{Files: []*filespb.ExtendedAudioFile{{File: &metadatapb.AudioFile{FileId: bytes.Repeat([]byte{1}, 20), Format: metadatapb.AudioFile_FLAC_FLAC.Enum()}}}}
+ 			default:
