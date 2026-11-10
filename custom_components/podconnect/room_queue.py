@@ -22,6 +22,7 @@ PURPOSE = "queue_occurrence_v1"
 ACTION = "play_queue_occurrence"
 _H32 = re.compile(r"[a-f0-9]{32}")
 _H24 = re.compile(r"[a-f0-9]{24}")
+_DISPLAY_ID = re.compile(r"display-[a-f0-9]{24}")
 _H64 = re.compile(r"[a-f0-9]{64}")
 _DEC = re.compile(r"0|[1-9][0-9]{0,19}")
 _TRACK = re.compile(r"spotify:track:[A-Za-z0-9]{22}")
@@ -262,7 +263,7 @@ class RoomQueue:
             raise CommandRejected("stale_observation")
         return observed
 
-    async def read(self, hass, entry, target, room, homepod):
+    async def read(self, hass, entry, target, room, homepod, *, autoplay_preview=False):
         from .commands import CommandRejected
 
         observed = None
@@ -277,7 +278,9 @@ class RoomQueue:
             self.observations.clear()
             started = time.monotonic()
             reason = "speakers_unavailable"
-            value = await self.commands.data.speakers.room_queue_state(scope)
+            value = await self.commands.data.speakers.room_queue_state(
+                scope, autoplay_preview=autoplay_preview
+            )
             reason = "playback_after_unavailable"
             latest = self.commands.controls(entry, target)
             observed = latest
@@ -308,7 +311,10 @@ class RoomQueue:
         }
         if (
             not isinstance(value, dict)
-            or set(value) != keys
+            or (
+                set(value) != keys
+                and (not autoplay_preview or set(value) != keys | {"autoplay"})
+            )
             or value["schema"] != "podconnect.room_queue_state.v1"
             or value["ok"] is not True
             or value["purpose"] != PURPOSE
@@ -351,6 +357,22 @@ class RoomQueue:
                 self._trace_read_failure("queue_rows_invalid", latest)
                 raise CommandRejected("room_queue_unavailable")
             seen.add(row["id"])
+        autoplay = None
+        if "autoplay" in value:
+            autoplay = value["autoplay"]
+            if (
+                not isinstance(autoplay, dict)
+                or set(autoplay) != {"kind", "display_ids"}
+                or autoplay["kind"] not in ("preview", "promotion")
+                or not isinstance(display_ids := autoplay["display_ids"], dict)
+                or not display_ids
+                or not display_ids.keys() <= seen
+                or (autoplay["kind"] == "preview" and display_ids.keys() != seen)
+                or not all(_hex(display_id, _DISPLAY_ID) for display_id in display_ids.values())
+                or len(set(display_ids.values())) != len(display_ids)
+            ):
+                self._trace_read_failure("queue_payload_invalid", latest)
+                raise CommandRejected("room_queue_unavailable")
         from datetime import datetime
 
         stamp = datetime.fromisoformat(latest["observation"]["observed_at"]).timestamp()
@@ -434,7 +456,11 @@ class RoomQueue:
             )
         # Account metadata can label an existing Native occurrence, but it
         # cannot supply order, membership, authority, or an action deadline.
-        if not cache_current and any(not row["metadata_known"] for row in items):
+        if (
+            (autoplay is None or autoplay["kind"] != "preview")
+            and not cache_current
+            and any(not row["metadata_known"] for row in items)
+        ):
             self._warm_queue_metadata(hass, entry)
         return {
             **{
@@ -450,6 +476,7 @@ class RoomQueue:
                 )
             },
             "schema": "podconnect.room_queue_controls.v1",
+            **({"autoplay": copy.deepcopy(autoplay)} if autoplay is not None else {}),
             "purpose": PURPOSE,
             "native": copy.deepcopy(value["native"]),
             "route": copy.deepcopy(value["route"]),

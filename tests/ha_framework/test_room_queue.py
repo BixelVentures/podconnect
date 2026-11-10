@@ -17,6 +17,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
     async def asyncSetUp(self):
         self.queue_reads = []
         self.queue_headers = []
+        self.autoplay_headers = []
         self.queue_posts = []
         self.queue_hold = False
         self.queue_entered = asyncio.Event()
@@ -74,6 +75,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         if request.path == "/api/room-queue/state":
             self.queue_reads.append(dict(request.query))
             self.queue_headers.append(request.headers.get("X-Podconnect-Queue-Metadata"))
+            self.autoplay_headers.append(request.headers.get("X-Podconnect-Queue-Autoplay"))
             value = {
                 "schema": "podconnect.room_queue_state.v1",
                 "ok": True,
@@ -126,7 +128,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
             return web.json_response(value)
         return await super()._backend(request)
 
-    async def queue_read(self):
+    async def queue_read(self, **options):
         return await self.hass.services.async_call(
             "podconnect",
             "get_room_queue_controls",
@@ -136,6 +138,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
                 "target_id": "spotify-one",
                 "room_id": "room-alpha",
                 "homepod_id": "123",
+                **options,
             },
             blocking=True,
             return_response=True,
@@ -220,6 +223,74 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(self._writes(), [])
         saved = owner.room_queue.observations["c" * 32]
         return result, saved, source_until
+
+    async def test_autoplay_opt_in_preserves_native_action_authority(self):
+        def add_preview(value):
+            value["autoplay"] = {
+                "kind": "preview",
+                "display_ids": {f"{i:024x}": f"display-{i + 2:024x}" for i in range(2)},
+            }
+
+        legacy = await self.queue_read()
+        self.assertTrue(legacy["ok"])
+        self.assertNotIn("autoplay", legacy)
+        self.queue_corrupt_state = add_preview
+        preview = await self.queue_read(autoplay_preview=True)
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["schema"], legacy["schema"])
+        self.assertEqual(preview["autoplay"]["kind"], "preview")
+        self.assertEqual(preview["actions"], ["play_queue_occurrence"])
+        self.assertEqual(self.autoplay_headers, [None, "1"])
+        self.assertEqual(self.queue_headers, ["1", "1"])
+        self.assertEqual(self.queue_posts, [])
+
+        body = self.queue_request()
+        bad_body = copy.deepcopy(body)
+        option = body["args"]["occurrence_id"]
+        bad_body["args"]["occurrence_id"] = preview["autoplay"]["display_ids"][option]
+        self.assertFalse((await self.queue_call("prepare_room_queue", bad_body))["ok"])
+        self.assertEqual(self.queue_posts, [])
+        self.assertTrue((await self.queue_call("prepare_room_queue", body))["ok"])
+        self.assertEqual(len(self.queue_posts), 1)
+        self.assertEqual(self._writes(), [])
+
+    async def test_autoplay_sidecar_strict_opt_in_and_shape(self):
+        def sidecar(kind, display_ids):
+            self.queue_corrupt_state = lambda value: value.update(
+                autoplay={"kind": kind, "display_ids": display_ids}
+            )
+
+        first, second, foreign = (f"{i:024x}" for i in range(3))
+        first_display, second_display = f"display-{first}", f"display-{second}"
+        sidecar("promotion", {first: first_display})
+        self.assertFalse((await self.queue_read(autoplay_preview=False))["ok"])
+        promoted = await self.queue_read(autoplay_preview=True)
+        self.assertTrue(promoted["ok"])
+        self.assertEqual(promoted["autoplay"]["display_ids"], {first: first_display})
+        for kind, ids in (
+            ("preview", {first: first_display}),
+            ("preview", {first: first_display, second: first_display}),
+            ("promotion", {foreign: second_display}),
+            ("promotion", {first: first}),
+            ("promotion", {}),
+        ):
+            with self.subTest(kind=kind, ids=ids):
+                sidecar(kind, ids)
+                self.assertFalse((await self.queue_read(autoplay_preview=True))["ok"])
+        def display_only(value):
+            value["autoplay"] = {
+                "kind": "preview",
+                "display_ids": {first: first_display, second: second_display},
+            }
+            value["actions"] = []
+
+        self.queue_corrupt_state = display_only
+        preview = await self.queue_read(autoplay_preview=True)
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["actions"], [])
+        self.assertFalse((await self.queue_call("prepare_room_queue", self.queue_request()))["ok"])
+        self.assertEqual(self.queue_posts, [])
+        self.assertEqual(self._writes(), [])
 
     async def test_queue_metadata_processing_never_extends_source_deadline(self):
         result, _, source_until = await self._queue_with_processing_delay()

@@ -953,6 +953,10 @@ get_room_queue_controls:
       required: true
     homepod_id:
       required: true
+    autoplay_preview:
+      required: false
+      selector:
+        boolean:
 prepare_room_queue:
   name: Forbered rummets køvalg
   description: Forbered ét opaque køvalg uden afspilning; godkendelse skal kontrolleres igen før commit.
