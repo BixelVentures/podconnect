@@ -579,7 +579,7 @@ index 62dd016..341ef9a 100644
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 82dfaca..1433eb2 100644
+index 82dfaca..a597977 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -842,7 +842,7 @@ index 82dfaca..1433eb2 100644
    if (device->session && device->attention_retiring_session == device->session)
      {
        // The first command waits for exact native destruction, never claims running.
-@@ -2272,6 +2429,742 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
+@@ -2272,6 +2429,744 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
      }
  }
  
@@ -1347,8 +1347,10 @@ index 82dfaca..1433eb2 100644
 +  json_object *record, *field;
 +  bool valid;
 +
-+  if (!start_route_clean_absent() || start_journal_retirement_outcome != OUTPUT_RETIRE_COLD_KNOWN
-+      || !start_contexts_drained() || transport_pin || transport_custody_busy()
++  bool current_start_isolated = start_journal_retirement_outcome == OUTPUT_RETIRE_COLD_KNOWN
++      || (archived && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN
++          && start_journal_retirement_reopen_consumed);
++  if (!start_route_clean_absent() || !current_start_isolated || !start_contexts_drained() || transport_pin || transport_custody_busy()
 +      || room_volume_pin_busy() || room_volume_undrained()
 +      || !slot->primary_cold_candidate || slot->result.phase != OUTPUT_RADIO_UNKNOWN
 +      || slot->session || slot->primary_session || slot->resume_session || slot->previous_session
@@ -1585,7 +1587,7 @@ index 82dfaca..1433eb2 100644
  int
  outputs_device_stop(struct output_device *device, output_status_cb cb)
  {
-@@ -2281,6 +3174,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
+@@ -2281,6 +3176,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
    if (outputs[device->type]->disabled || !outputs[device->type]->device_stop)
      return -1;
  
@@ -1594,7 +1596,7 @@ index 82dfaca..1433eb2 100644
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3604,101 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3606,101 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -1696,7 +1698,7 @@ index 82dfaca..1433eb2 100644
  int
  outputs_init(void)
  {
-@@ -2785,6 +3775,7 @@ outputs_init(void)
+@@ -2785,6 +3777,7 @@ outputs_init(void)
    return 0;
  }
  

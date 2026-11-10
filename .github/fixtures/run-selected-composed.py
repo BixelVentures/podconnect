@@ -224,11 +224,18 @@ def run_primary_cold_detachment():
                     prior["PC_NATIVE_PRIMARY_STOP_RESTART"] = "1"
                 run_live("prior", "a", prior, "PASS real old START and encrypted P1 parked", manager)
                 run_cold_read("witness", "b", "PASS restarted C recorded")
-                run_live("current", "c", dict(PC70_COLD_RESTART="1", PC_NATIVE_PRIMARY_COLD_REPLAY="1",
-                         PC_NATIVE_PRIMARY_COLD_COMPOSED="1", PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY="1",
-                         PC_NATIVE_PRIMARY_COLD_FRESH_RADIO="1"),
-                         "PASS cold new owner authenticated fresh Spotify", True)
-                run_cold_read("after-p6", "d", "PASS restarted C recorded", PC_NATIVE_PRIMARY_COLD_NEXT_PARK="1")
+                current = dict(PC70_COLD_RESTART="1", PC_NATIVE_PRIMARY_COLD_REPLAY="1",
+                               PC_NATIVE_PRIMARY_COLD_COMPOSED="1", PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY="1")
+                if env.get("PC_NATIVE_PRIMARY_COLD_GRACEFUL_SPOTIFY"):
+                    if manager:
+                        raise RuntimeError("graceful Spotify regression does not select a new station")
+                    run_live("current", "c", current, "PASS fresh Spotify RTP then real Native Close", True)
+                    run_cold_read("after-graceful", "d", "PASS archived P1 revalidated",
+                                  PC_NATIVE_PRIMARY_COLD_AFTER_GRACEFUL="1")
+                else:
+                    current["PC_NATIVE_PRIMARY_COLD_FRESH_RADIO"] = "1"
+                    run_live("current", "c", current, "PASS cold new owner authenticated fresh Spotify", True)
+                    run_cold_read("after-p6", "d", "PASS restarted C recorded", PC_NATIVE_PRIMARY_COLD_NEXT_PARK="1")
             finally:
                 subprocess.run(["umount", str(data)], check=True)
     finally:
