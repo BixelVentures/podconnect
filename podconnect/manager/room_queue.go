@@ -67,7 +67,7 @@ type nativeRoomQueueState struct {
 
 type queueAutoplayDisplay struct {
 	Kind       string            `json:"kind"`
-	DisplayIDs map[string]string `json:"display_ids"`
+	DisplayIDs map[string]string `json:"display_ids,omitempty"`
 }
 
 type nativeQueueAutoplayPreview struct {
@@ -295,6 +295,12 @@ func projectQueueAutoplay(n *nativeRoomQueueState, opted bool) (queueAutoplayDis
 	var ids map[string]string
 	var metadata map[string]queueDisplayMetadata
 	switch discriminator.Kind {
+	case "pending":
+		if queueClosedJSON(*n.Autoplay, &discriminator) != nil || len(n.Items) != 0 || n.Truncated {
+			return queueAutoplayDisplay{}, false
+		}
+		n.Autoplay = nil
+		return queueAutoplayDisplay{Kind: "pending"}, true
 	case "preview":
 		var preview nativeQueueAutoplayPreview
 		if queueClosedJSON(*n.Autoplay, &preview) != nil || len(n.Items) != 0 || n.Truncated ||
@@ -429,16 +435,20 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expired", 409)
 		return
 	}
-	read := roomQueueRead{n, o.Identity, claim, started.Add(time.Duration(n.Expires) * time.Millisecond), display.Kind == "preview"}
-	roomQueueStore.Lock()
-	roomQueueStore.Read = &read
-	roomQueueStore.Unlock()
+	actions := []string{}
+	if display.Kind != "pending" {
+		read := roomQueueRead{n, o.Identity, claim, started.Add(time.Duration(n.Expires) * time.Millisecond), display.Kind == "preview"}
+		roomQueueStore.Lock()
+		roomQueueStore.Read = &read
+		roomQueueStore.Unlock()
+		actions = append(actions, "play_queue_occurrence")
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	queue := map[string]any{"observation_id": n.Observation, "queue_revision": n.Revision, "expires_after_ms": remaining, "items": n.Items, "truncated": n.Truncated}
 	if values := r.Header.Values("X-Podconnect-Queue-Metadata"); len(values) == 1 && values[0] == "1" && len(n.Metadata) > 0 {
 		queue["metadata"] = n.Metadata
 	}
-	response := map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": queue, "actions": []string{"play_queue_occurrence"}, "physical_result_verified": false}
+	response := map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": queue, "actions": actions, "physical_result_verified": false}
 	if display.Kind != "" {
 		response["autoplay"] = display
 	}

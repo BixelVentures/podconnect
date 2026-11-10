@@ -521,3 +521,40 @@ func TestRoomQueueAutoplaySelectsOnlyExactOptedOccurrence(t *testing.T) {
 		})
 	}
 }
+
+func TestRoomQueueAutoplayPendingCannotStage(t *testing.T) {
+	for _, name := range []string{"exact", "foreign-route", "ordinary-rows", "extra-field"} {
+		t.Run(name, func(t *testing.T) {
+			f := newRoomQueueFixture(t)
+			second := strings.Repeat("2", 24)
+			if read := f.read(t); read.Code != http.StatusOK || roomQueueStore.Read == nil {
+				t.Fatal("initial ordinary read did not establish custody", read.Code)
+			}
+			f.Autoplay = json.RawMessage(`{"kind":"pending"}`)
+			f.EmptyOrdinary = name != "ordinary-rows"
+			f.OldC = name == "foreign-route"
+			if name == "extra-field" {
+				f.Autoplay = json.RawMessage(`{"kind":"pending","display_ids":{}}`)
+			}
+			out := f.read(t, "1")
+			if name == "exact" {
+				var response struct {
+					Actions  []string        `json:"actions"`
+					Autoplay json.RawMessage `json:"autoplay"`
+				}
+				if err := json.Unmarshal(out.Body.Bytes(), &response); out.Code != http.StatusOK || err != nil ||
+					response.Actions == nil || len(response.Actions) != 0 || string(response.Autoplay) != `{"kind":"pending"}` {
+					t.Fatal("pending read lacked exact projection or offered actions", out.Code, out.Body.String())
+				}
+			} else if out.Code != http.StatusConflict {
+				t.Fatal("invalid pending read was accepted", out.Code)
+			}
+			if roomQueueStore.Read != nil || f.prepare(t, second).Code != http.StatusConflict || len(f.Writes) != 0 {
+				t.Fatal("pending admitted old or new selection authority")
+			}
+			if len(f.AutoplayReads) != 2 || !f.AutoplayReads[1] {
+				t.Fatal("pending caused another read or fallback", f.AutoplayReads)
+			}
+		})
+	}
+}
