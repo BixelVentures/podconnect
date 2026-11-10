@@ -51,3 +51,4 @@ a15b9c18b2e38a617e1cc9af2ec28b62bb818c25d94985cb50bf9729c0d930b0  /patches/deale
 b3a114a83109aecf027bcfeccc9aefe4fb87282da728e539db849e9bfa676149  /patches/radio-primary-native.patch
 387989c95252e316d7c321896736a6e5821f94769db44b4dd0bf96bc91485643  /patches/status-health-diagnostics-native.patch
 71e014a60e3e88827a8feac52f964d589fc606cdee09ba368241ad1ad5dcb650  /patches/queue-writer-inspection-native.patch
+7f84b6791c79c0a8e5a3a44fdabbb65abae217b04f62bd0d5d68ae3ff46d080a  /patches/connect-transfer-retirement-native.patch

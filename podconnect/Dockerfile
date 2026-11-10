@@ -132,6 +132,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/status-health-diagnostics-native.patch \
   && git apply --check /patches/queue-writer-inspection-native.patch \
   && git apply /patches/queue-writer-inspection-native.patch \
+  && git apply --check /patches/connect-transfer-retirement-native.patch \
+  && git apply /patches/connect-transfer-retirement-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
