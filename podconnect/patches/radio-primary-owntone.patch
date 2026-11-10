@@ -484,7 +484,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..7adeda5cd24504555b5f688fd36b49f5
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b94353aa2b5f6 100644
+index 82dfaca947cfa8dd947b3e2b85dde956796113f5..f81280f075296f66a4caa2186641c89fdd008abe 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -732,7 +732,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
    if (device->session && device->attention_retiring_session == device->session)
      {
        // The first command waits for exact native destruction, never claims running.
-@@ -2272,6 +2415,227 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
+@@ -2272,6 +2415,260 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
      }
  }
  
@@ -945,6 +945,39 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
 +  return status;
 +}
 +
++/* Record local transport isolation only. The pending row keeps its
++ * original operation and zero TEARDOWN receipt, so STOP cannot succeed. */
++int
++outputs_primary_radio_custody_isolate(uint64_t id, const char *pending)
++{
++  struct output_primary_radio_custody prior;
++  struct output_device *device = outputs_device_get(id);
++  struct radio_handoff_slot *park = radio_handoff_find(id);
++  char key[64];
++  if (!pending || !primary_radio_custody_valid(pending, id, false)
++      || !primary_radio_custody_decode(pending, id, &prior) || prior.stop_action[0]
++      || strcmp(prior.process, outputs_process) || !device || device->busy || device->prevent_playback
++      || device->attention_lease || device->attention_retiring_session || device->attention_restart_pending
++      || device->attention_restoring || !start_contexts_drained()
++      || !primary_spotify_park_local_idle(park, device, &prior))
++    return -1;
++  json_object *row = json_tokener_parse(pending);
++  json_object *marker = json_object_new_string("rtsp_control_lost");
++  if (!row || !marker || json_object_object_add(row, "local_isolation", marker) < 0)
++    {
++      if (row)
++        json_object_put(row);
++      if (marker)
++        json_object_put(marker);
++      return -1;
++    }
++  primary_radio_custody_key(key, id);
++  const char *raw = json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN);
++  int status = raw ? db_radio_handoff_save_key(key, pending, raw) : -1;
++  json_object_put(row);
++  return status;
++}
++
 +void
 +outputs_primary_radio_drain_complete(uint64_t id, uint64_t incarnation, uint64_t epoch, bool confirmed)
 +{
@@ -960,7 +993,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
  int
  outputs_device_stop(struct output_device *device, output_status_cb cb)
  {
-@@ -2281,6 +2645,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
+@@ -2281,6 +2678,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
    if (outputs[device->type]->disabled || !outputs[device->type]->device_stop)
      return -1;
  
@@ -969,7 +1002,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3075,94 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3108,94 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -1064,7 +1097,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
  int
  outputs_init(void)
  {
-@@ -2785,6 +3239,7 @@ outputs_init(void)
+@@ -2785,6 +3272,7 @@ outputs_init(void)
    return 0;
  }
  
@@ -1073,7 +1106,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..2f408f5688d12212abec606b896b9435
  outputs_deinit(void)
  {
 diff --git a/src/outputs.h b/src/outputs.h
-index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f30ed71911 100644
+index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..e841d76c3e11609c59cdc9a18bf28fab7762c56b 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
 @@ -169,6 +169,13 @@ struct output_radio_admission {
@@ -1133,7 +1166,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f3
  bool outputs_radio_handoff_source_reserved(void);
  bool outputs_radio_handoff_emission_current(uint64_t);
  uint64_t outputs_radio_handoff_generation(uint64_t);
-@@ -269,6 +309,106 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
+@@ -269,6 +309,107 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
  int outputs_airplay_radio_receiver_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_pairing_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_controller_id(char [17]);
@@ -1235,12 +1268,13 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f3
 +char *outputs_primary_radio_custody_begin(uint64_t, uint64_t, uint64_t, uint64_t, const char *,
 +    const struct output_primary_radio_custody *);
 +int outputs_primary_radio_custody_release(uint64_t, const char *, int);
++int outputs_primary_radio_custody_isolate(uint64_t, const char *);
 +bool outputs_callback_is_primary_radio_restart(int);
 +void outputs_airplay_primary_radio_remove(struct output_device *);
  void outputs_radio_handoff_teardown(uint64_t,uint64_t,uint64_t,const void *,int,int);
  void outputs_radio_handoff_drained(uint64_t,uint64_t,uint64_t,const void *);
  
-@@ -329,7 +469,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
+@@ -329,7 +470,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
  int outputs_start_complete(const struct output_start_request *,struct output_start_result *);
  int outputs_start_cancel(const char *,const char *,struct output_start_result *);
  int outputs_start_result_get(uint64_t,const char *,struct output_start_result *);
@@ -1249,7 +1283,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f3
  struct output_retirement_request {
    uint64_t device_id,writer_source_epoch,writer_fd,pipe_device,pipe_inode,input_epoch;
    char completed_token[33],retirement_token[33],native_reservation_id[33],native_incarnation[33];
-@@ -353,7 +493,10 @@ bool outputs_start_move_source_transition_current(void);
+@@ -353,7 +494,10 @@ bool outputs_start_move_source_transition_current(void);
  bool outputs_start_move_eof_transition_current(void);
  bool outputs_streaming_exclusive_available(void);
  void outputs_airplay_start_retire_all(void);
@@ -1260,7 +1294,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f3
  bool outputs_start_emission_current(uint64_t,uint64_t,uint64_t,const void *);
  bool outputs_start_bound_owner_current(const struct output_native_owner *,const struct output_transport_identity *,bool);
  bool outputs_start_gate_closed(void);
-@@ -363,6 +506,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
+@@ -363,6 +507,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
  bool outputs_start_retired_stage_reader(void);
  void
  outputs_transport_release_recover_pending(void);
@@ -1269,7 +1303,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..683acc4eea24ecfa5d5782aeb30d39f3
  bool outputs_start_retired_normal_admit(uint32_t,const char *);
  bool outputs_start_source_current(const char *,const char **,struct timespec *);
 diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
-index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355ed9e1f9e 100644
+index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..1b6be81142e661492a6c31b4dab998caf5d87322 100644
 --- a/src/outputs/airplay.c
 +++ b/src/outputs/airplay.c
 @@ -21,6 +21,8 @@
@@ -1290,7 +1324,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  
    // Number of samples that we tell the output to buffer (this will mean that
    // the position that we send in the sync packages are offset by this amount
-@@ -244,8 +248,28 @@ struct airplay_attention_request;
+@@ -244,8 +248,29 @@ struct airplay_attention_request;
  struct airplay_room_volume_request;
  struct airplay_seq_ctx;
  
@@ -1308,6 +1342,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  bool primary_radio;
 +  struct primary_radio_decode *primary_radio_decoder;
 +  bool primary_radio_revoked;
++  bool primary_radio_control_lost;
 +  int primary_radio_teardown_cseq;
 +  char *primary_radio_custody;
 +  bool primary_radio_successor;
@@ -1319,11 +1354,12 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    char radio_receiver_key_digest[65];
    bool radio_custody_managed;
    uint64_t device_id;
-@@ -546,6 +570,99 @@ airplay_device_start(struct output_device *device, int callback_id);
+@@ -546,6 +571,100 @@ airplay_device_start(struct output_device *device, int callback_id);
  static void
  sequence_start(enum airplay_seq_type seq_type, struct airplay_session *session, void *arg, const char *log_caller);
  static bool sequence_callback_current(const struct airplay_seq_ctx *context);
 +static void primary_radio_decoder_detach(struct airplay_session *);
++static void primary_radio_decoder_retire_control_loss(struct airplay_session *);
 +static bool primary_radio_station_current(const struct airplay_session *);
 +static const char *primary_radio_station_action(const struct airplay_session *);
 +static const struct output_primary_radio_custody *primary_radio_station_release(const struct airplay_session *);
@@ -1419,7 +1455,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  
  static int
  recovery_sequence_current(void *arg)
-@@ -558,7 +675,11 @@ static int start_sequence_guard(void *arg)
+@@ -558,7 +677,11 @@ static int start_sequence_guard(void *arg)
  static int radio_sequence_guard(void *arg)
  {
    struct airplay_seq_ctx *c=arg;
@@ -1432,7 +1468,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
        || !outputs_radio_other_effect_current(c->session->device_id,c->radio_other_generation)
        || !outputs_radio_absence_effect_current(c->session->device_id,c->radio_absence_generation)
        || !outputs_radio_parked_absence_effect_current(c->session->device_id,c->radio_parked_generation)
-@@ -1176,7 +1297,7 @@ session_status(struct airplay_session *session)
+@@ -1176,7 +1299,7 @@ session_status(struct airplay_session *session)
  	state = OUTPUT_STATE_FAILED;
      }
  
@@ -1441,7 +1477,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
      outputs_cb_exact(session->callback_id, session->device_id, session->device_incarnation,
          session->session_epoch, session, state);
    else
-@@ -1235,7 +1356,7 @@ master_session_cleanup(struct airplay_master_session *ams)
+@@ -1235,7 +1358,7 @@ master_session_cleanup(struct airplay_master_session *ams)
  }
  
  static struct airplay_master_session *
@@ -1450,7 +1486,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  {
    struct airplay_master_session *ams;
    uint64_t buffer_duration_ms;
-@@ -1246,7 +1367,8 @@ master_session_make(struct media_quality *quality, bool use_ptp)
+@@ -1246,7 +1369,8 @@ master_session_make(struct media_quality *quality, bool use_ptp)
    // First check if we already have a suitable session
    for (ams = airplay_master_sessions; ams; ams = ams->next)
      {
@@ -1460,7 +1496,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  	return ams;
      }
  
-@@ -1294,6 +1416,7 @@ master_session_make(struct media_quality *quality, bool use_ptp)
+@@ -1294,6 +1418,7 @@ master_session_make(struct media_quality *quality, bool use_ptp)
  
    ams->quality = *quality;
    ams->use_ptp = use_ptp;
@@ -1468,7 +1504,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    ams->samples_per_packet = AIRPLAY_SAMPLES_PER_PACKET;
    ams->rawbuf_size = STOB(ams->samples_per_packet, quality->bits_per_sample, quality->channels);
    ams->output_buffer_samples = (buffer_duration_ms - AIRPLAY_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
-@@ -1318,6 +1441,7 @@ session_free(struct airplay_session *session)
+@@ -1318,6 +1443,7 @@ session_free(struct airplay_session *session)
    if (!session)
      return;
  
@@ -1476,7 +1512,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (session->master_session)
      master_session_cleanup(session->master_session);
  
-@@ -1359,6 +1483,9 @@ session_free(struct airplay_session *session)
+@@ -1359,6 +1485,9 @@ session_free(struct airplay_session *session)
    if (session->server_fd >= 0)
      close(session->server_fd);
  
@@ -1486,7 +1522,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (session->ptpd_slave_id > 0)
      ptpd_slave_remove(session->ptpd_slave_id);
  
-@@ -1383,6 +1510,8 @@ session_cleanup(struct airplay_session *session)
+@@ -1383,6 +1512,8 @@ session_cleanup(struct airplay_session *session)
  {
    struct airplay_session *s;
    bool retiring = session->attention_retiring;
@@ -1495,7 +1531,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    uint64_t id = session->device_id, incarnation = session->device_incarnation, epoch = session->session_epoch;
    const void *old_session = session;
    struct output_attention_result recovery = session->recovery_operation;
-@@ -1404,7 +1533,10 @@ session_cleanup(struct airplay_session *session)
+@@ -1404,8 +1535,12 @@ session_cleanup(struct airplay_session *session)
  	s->next = session->next;
      }
  
@@ -1505,9 +1541,11 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  else
 +    outputs_device_session_remove_exact(session->device_id, session);
  
++  primary_radio_decoder_retire_control_loss(session);
    session_free(session);
    outputs_radio_handoff_drained(id,incarnation,epoch,old_session);
-@@ -1414,6 +1546,13 @@ session_cleanup(struct airplay_session *session)
+   outputs_radio_sender_drained(id,incarnation,epoch,old_session);
+@@ -1414,6 +1549,13 @@ session_cleanup(struct airplay_session *session)
      outputs_attention_handoff_drained(&recovery);
    else if (recovery.operation)
      outputs_attention_complete(&recovery,accepted ? OUTPUT_ATTENTION_PROTOCOL_ACCEPTED : OUTPUT_ATTENTION_UNKNOWN,code,cseq);
@@ -1521,7 +1559,18 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (retiring)
      outputs_attention_retirement_finished(id, incarnation, epoch, old_session);
  }
-@@ -1646,6 +1785,42 @@ session_cipher_setup(struct airplay_session *session, const uint8_t *key, size_t
+@@ -1479,6 +1621,10 @@ rtsp_close_cb(struct evrtsp_connection *evcon, void *arg)
+ 
+   DPRINTF(E_LOG, L_AIRPLAY, "Device '%s' closed RTSP connection\n", session->devname);
+ 
++  /* The callback reports loss of the established local control connection.
++   * It cannot identify who initiated the socket close. */
++  session->primary_radio_control_lost = session->ctrl == evcon && primary_radio_live(session)
++      && session->primary_spotify_park_generation && session->primary_radio_decoder;
+   deferred_session_failure(session);
+ }
+ 
+@@ -1646,6 +1792,42 @@ session_cipher_setup(struct airplay_session *session, const uint8_t *key, size_t
    return -1;
  }
  
@@ -1564,7 +1613,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  static int
  session_ids_set(struct airplay_session *session)
  {
-@@ -1706,6 +1881,9 @@ session_ids_set(struct airplay_session *session)
+@@ -1706,6 +1888,9 @@ session_ids_set(struct airplay_session *session)
        goto error;
      }
  
@@ -1574,7 +1623,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (family == AF_INET)
      session->local_v4_address = address;
    else
-@@ -1721,44 +1899,59 @@ session_ids_set(struct airplay_session *session)
+@@ -1721,44 +1906,59 @@ session_ids_set(struct airplay_session *session)
  static struct airplay_session *
  session_find_by_address(union net_sockaddr *peer_addr)
  {
@@ -1654,7 +1703,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    CHECK_NULL(L_AIRPLAY, session->deferredev = evtimer_new(evbase_player, deferred_session_failure_cb, session));
  
    session->devname = strdup(device->name);
-@@ -1793,7 +1986,7 @@ session_make(struct output_device *device, int callback_id)
+@@ -1793,7 +1993,7 @@ session_make(struct output_device *device, int callback_id)
  	goto error;
      }
  
@@ -1663,7 +1712,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (!session->master_session)
      {
        DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", device->name);
-@@ -1804,10 +1997,10 @@ session_make(struct output_device *device, int callback_id)
+@@ -1804,10 +2004,10 @@ session_make(struct output_device *device, int callback_id)
    session->next = airplay_sessions;
    airplay_sessions = session;
  
@@ -1676,7 +1725,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
      {
        session_cleanup(session);
        return NULL;
-@@ -1830,6 +2023,12 @@ session_make(struct output_device *device, int callback_id)
+@@ -1830,6 +2030,12 @@ session_make(struct output_device *device, int callback_id)
  }
  
  
@@ -1689,7 +1738,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  /* ----------------------------- Metadata handling -------------------------- */
  
  static void
-@@ -1906,6 +2105,9 @@ airplay_metadata_send_generic(struct airplay_session *session, struct output_met
+@@ -1906,6 +2112,9 @@ airplay_metadata_send_generic(struct airplay_session *session, struct output_met
  {
    struct airplay_metadata *rmd = metadata->priv;
  
@@ -1699,7 +1748,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (session->wanted_metadata & AIRPLAY_MD_WANTS_PROGRESS)
      sequence_start(AIRPLAY_SEQ_SEND_PROGRESS, session, metadata, "SET_PARAMETER (progress)");
  
-@@ -2326,10 +2528,18 @@ attention_emission_current(struct airplay_session *session, const struct rtp_pac
+@@ -2326,10 +2535,18 @@ attention_emission_current(struct airplay_session *session, const struct rtp_pac
    struct airplay_master_session *master;
    ptrdiff_t slot;
  
@@ -1721,7 +1770,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
      return true; // Ordinary legacy sessions retain their original contract.
    device = outputs_device_get(session->device_id);
    if (!device || !device->selected || session->attention_suspended
-@@ -2494,6 +2704,8 @@ control_packet_send(struct airplay_session *session, struct rtp_packet *pkt)
+@@ -2494,6 +2711,8 @@ control_packet_send(struct airplay_session *session, struct rtp_packet *pkt)
  	return;
      }
  
@@ -1730,7 +1779,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    ret = sendto(fd, pkt->data, pkt->data_len, 0, &session->naddr.sa, addrlen);
    if (ret < 0)
      DPRINTF(E_LOG, L_AIRPLAY, "Could not send playback sync to device '%s': %s\n", session->devname, strerror(errno));
-@@ -2541,6 +2753,13 @@ packets_resend(struct airplay_session *session, uint16_t seqnum, int len)
+@@ -2541,6 +2760,13 @@ packets_resend(struct airplay_session *session, uint16_t seqnum, int len)
        session->devname, seqnum, len, rtp_session->seqnum, rtp_session->pktbuf_len);
  }
  
@@ -1744,7 +1793,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  static int
  packets_send(struct airplay_master_session *ams)
  {
-@@ -2568,12 +2787,12 @@ packets_send(struct airplay_master_session *ams)
+@@ -2568,12 +2794,12 @@ packets_send(struct airplay_master_session *ams)
        if (session->state == AIRPLAY_STATE_CONNECTED)
  	{
  	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
@@ -1759,7 +1808,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  	}
      }
  
-@@ -3089,7 +3308,8 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *se
+@@ -3089,7 +3315,8 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *se
    stream = plist_new_dict();
    wplist_dict_add_uint(stream, "audioFormat", 262144); // 0x40000 ALAC/44100/16/2
    wplist_dict_add_string(stream, "audioMode", "default");
@@ -1769,7 +1818,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    wplist_dict_add_uint(stream, "ct", 2); // Compression type, 1 LPCM, 2 ALAC, 3 AAC, 4 AAC ELD, 32 OPUS
    wplist_dict_add_bool(stream, "isMedia", true); // ?
    wplist_dict_add_uint(stream, "latencyMax", 88200); // TODO how do these latencys work?
-@@ -3366,9 +3586,11 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *ses
+@@ -3366,9 +3593,11 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *ses
    const char *pin = arg;
    char device_id_hex[16 + 1];
  
@@ -1782,7 +1831,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    if (pin)
      session->pair_type = PAIR_CLIENT_HOMEKIT_NORMAL;
  
-@@ -3432,7 +3654,7 @@ payload_make_pair_verify2(struct evrtsp_request *req, struct airplay_session *se
+@@ -3432,7 +3661,7 @@ payload_make_pair_verify2(struct evrtsp_request *req, struct airplay_session *se
  static void
  start_failure(struct airplay_session *session)
  {
@@ -1791,7 +1840,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    struct output_device *device;
  
    device = outputs_device_get(session->device_id);
-@@ -3459,7 +3681,7 @@ start_failure(struct airplay_session *session)
+@@ -3459,7 +3688,7 @@ start_failure(struct airplay_session *session)
  static void
  start_retry(struct airplay_session *session)
  {
@@ -1800,7 +1849,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    struct output_device *device;
    int callback_id = session->callback_id;
  
-@@ -3730,6 +3952,8 @@ response_handler_teardown(struct evrtsp_request *req, struct airplay_session *se
+@@ -3730,6 +3959,8 @@ response_handler_teardown(struct evrtsp_request *req, struct airplay_session *se
    if(header)safe_atoi32(header,&cseq);
    outputs_radio_handoff_teardown(session->device_id,session->device_incarnation,session->session_epoch,session,req->response_code,cseq);
    outputs_radio_sender_teardown(session->device_id,session->device_incarnation,session->session_epoch,session,req->response_code,cseq);
@@ -1809,7 +1858,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    session->state = AIRPLAY_STATE_STOPPED;
    return AIRPLAY_SEQ_CONTINUE;
  }
-@@ -3785,6 +4009,13 @@ response_handler_info_generic(struct evrtsp_request *req, struct airplay_session
+@@ -3785,6 +4016,13 @@ response_handler_info_generic(struct evrtsp_request *req, struct airplay_session
      session->pair_type=PAIR_CLIENT_HOMEKIT_NORMAL;session->state=AIRPLAY_STATE_INFO;
      return AIRPLAY_SEQ_PAIR_VERIFY;
    }
@@ -1823,7 +1872,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    // Identify next sequence based on response
    if (session->statusflags & AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED)
      {
-@@ -3915,6 +4146,7 @@ response_handler_pair_setup1(struct evrtsp_request *req, struct airplay_session
+@@ -3915,6 +4153,7 @@ response_handler_pair_setup1(struct evrtsp_request *req, struct airplay_session
  
    if (session->pair_type == PAIR_CLIENT_HOMEKIT_TRANSIENT && req->response_code == RTSP_CONNECTION_AUTH_REQUIRED)
      {
@@ -1831,7 +1880,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
        device = outputs_device_get(session->device_id);
        if (!device)
  	return AIRPLAY_SEQ_ABORT;
-@@ -3966,7 +4198,7 @@ response_handler_pair_setup2(struct evrtsp_request *req, struct airplay_session
+@@ -3966,7 +4205,7 @@ response_handler_pair_setup2(struct evrtsp_request *req, struct airplay_session
  static enum airplay_seq_type
  response_handler_pair_setup3(struct evrtsp_request *req, struct airplay_session *session)
  {
@@ -1840,7 +1889,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    struct output_device *device;
    const char *authorization_key;
    enum airplay_seq_type seq_type;
-@@ -4017,7 +4249,7 @@ response_handler_pair_verify1(struct evrtsp_request *req, struct airplay_session
+@@ -4017,7 +4256,7 @@ response_handler_pair_verify1(struct evrtsp_request *req, struct airplay_session
  	return AIRPLAY_SEQ_ABORT;
  
        // The dedicated role keeps its configured credential on failure.
@@ -1849,7 +1898,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  
        return AIRPLAY_SEQ_ABORT;
      }
-@@ -4132,7 +4364,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
+@@ -4132,7 +4371,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
      return AIRPLAY_SEQ_ABORT;
  
    // A failed radio verification cannot mutate the imported identity.
@@ -1858,7 +1907,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  
    session->state = AIRPLAY_STATE_AUTH;
  
-@@ -4272,7 +4504,8 @@ sequence_callback_current(const struct airplay_seq_ctx *context)
+@@ -4272,7 +4511,8 @@ sequence_callback_current(const struct airplay_seq_ctx *context)
  {
    const struct airplay_session *session = context->session;
    struct output_device *device;
@@ -1868,7 +1917,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
        || !outputs_radio_other_effect_current(session->device_id,context->radio_other_generation)
        || !outputs_radio_absence_effect_current(session->device_id,context->radio_absence_generation)
        || !outputs_radio_parked_absence_effect_current(session->device_id,context->radio_parked_generation)
-@@ -4341,7 +4574,8 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
+@@ -4341,7 +4581,8 @@ sequence_continue_cb(struct evrtsp_request *req, void *arg)
        return;
      }
  
@@ -1878,7 +1927,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
      const char *header=evrtsp_find_header(req->input_headers,"CSeq");int cseq;
      if(!header || safe_atoi32(header,&cseq)<0 || cseq!=seq_ctx->start_request_cseq)goto error;
    }
-@@ -4474,6 +4708,21 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
+@@ -4474,6 +4715,21 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
  	goto error;
      }
  
@@ -1900,7 +1949,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
    uri = (cur_request->uri) ? cur_request->uri : session->session_url;
  
    DPRINTF(E_DBG, L_AIRPLAY, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, session->devname);
-@@ -4856,11 +5105,19 @@ airplay_device_start(struct output_device *device, int callback_id)
+@@ -4856,11 +5112,19 @@ airplay_device_start(struct output_device *device, int callback_id)
    if (!session)
      return -1;
  
@@ -1920,7 +1969,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  static int
  airplay_device_stop(struct output_device *device, int callback_id)
  {
-@@ -4936,7 +5193,7 @@ airplay_device_authorize(struct output_device *device, const char *pin, int call
+@@ -4936,7 +5200,7 @@ airplay_device_authorize(struct output_device *device, const char *pin, int call
  }
  
  static void
@@ -1929,7 +1978,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  {
    struct airplay_master_session *ams;
    struct airplay_session *session;
-@@ -4944,6 +5201,9 @@ airplay_write(struct output_buffer *obuf)
+@@ -4944,6 +5208,9 @@ airplay_write(struct output_buffer *obuf)
  
    for (ams = airplay_master_sessions; ams; ams = ams->next)
      {
@@ -1939,7 +1988,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
        for (i = 0; obuf->data[i].buffer; i++)
  	{
  	  if (!quality_is_equal(&obuf->data[i].quality, &ams->rtp_session->quality))
-@@ -4975,7 +5235,8 @@ airplay_write(struct output_buffer *obuf)
+@@ -4975,7 +5242,8 @@ airplay_write(struct output_buffer *obuf)
    // initialization sync and rtp packets via packets_sync_send and packets_send)
    for (session = airplay_sessions; session; session = session->next)
      {
@@ -1949,16 +1998,35 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
  	continue;
  
        // Start sending progress to keep ATV's alive
-@@ -4987,6 +5248,1170 @@ airplay_write(struct output_buffer *obuf)
+@@ -4987,135 +5255,1382 @@ airplay_write(struct output_buffer *obuf)
      }
  }
  
+-static int
+-airplay_init(void)
 +static void
 +airplay_write(struct output_buffer *obuf)
-+{
+ {
+-  int ret;
+-  int i;
+-  int timing_port;
+-  int control_port;
 +  airplay_write_source(obuf, NULL);
 +}
-+
+ 
+-  airplay_device_id = libhash;
+-  if(outputs_radio_sender_role()){
+-    const char *controller=cfg_getstr(cfg_getsec(cfg,"general"),"radio_controller_id");
+-    uint64_t pinned=0;airplay_device_id=0;
+-    if(!controller || strnlen(controller,17)!=16)return -1;
+-    for(i=0;i<16;i++){
+-      unsigned char c=controller[i];
+-      if(!((c>='0' && c<='9') || (c>='A' && c<='F')))return -1;
+-      pinned=(pinned<<4)|(c<='9'?c-'0':c-'A'+10);
+-    }
+-    if(!pinned)return -1;
+-    airplay_device_id=pinned;
+-  }
 +/* These entry points remain local to the primary output owner. The isolated
 + * fixture calls them on its player thread; no Manager/Native path is enabled. */
 +static struct airplay_session *
@@ -1966,23 +2034,37 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +    const struct output_primary_radio_start_request *replacement, const struct output_primary_radio_custody *released)
 +{
 +  struct airplay_session *session;
-+
+ 
+-  uuid_make(airplay_ptp_clock_uuid);
 +  if (!device || !route || device->type != OUTPUT_TYPE_AIRPLAY || !device->advertised
 +      || device->selected || device->session || device->route_revision == UINT64_MAX
 +      || (!park_token && (!outputs_primary_radio_transport_available(device->id) || outputs_radio_handoff_blocked(device->id)))
 +      || outputs_radio_sender_role())
 +    return NULL;
-+
+ 
+-  // Check alignment of enum seq_type with airplay_seq_definition and
+-  // airplay_seq_request
+-  for (i = 0; i < ARRAY_SIZE(airplay_seq_definition); i++)
+-    {
+-      if (airplay_seq_definition[i].seq_type != i || airplay_seq_request[i][0].seq_type != i)
+-        {
+-	  DPRINTF(E_LOG, L_AIRPLAY, "Bug! Misalignment between sequence enum and structs: %d, %d, %d\n", i, airplay_seq_definition[i].seq_type, airplay_seq_request[i][0].seq_type);
+-	  return -1;
+-        }
+-    }
 +  session = session_make_for_source(device, -1, true, park_token, replacement, released);
 +  if (!session)
 +    return NULL;
-+
+ 
+-  CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
 +  *route = (struct airplay_primary_radio_route) {
 +    device->id, session->device_incarnation, session->session_epoch, device->route_revision,
 +  };
 +  return session;
 +}
-+
+ 
+-  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "user_agent");
+-  airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
 +static int
 +airplay_primary_radio_start(struct output_device *device, struct airplay_primary_radio_route *route)
 +{
@@ -1992,33 +2074,74 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  sequence_start(AIRPLAY_SEQ_START, session, NULL, "primary_radio_start");
 +  return 0;
 +}
-+
+ 
+-  timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
+-  ret = service_start(&airplay_timing_svc, timing_svc_cb, timing_port, "AirPlay timing");
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay time synchronization failed to start\n");
+-      goto out_free_timer;
+-    }
 +static struct airplay_session *
 +airplay_primary_radio_session(const struct airplay_primary_radio_route *route)
 +{
 +  struct output_device *device = outputs_device_get(route->device_id);
 +  struct airplay_session *session = device && device->type == OUTPUT_TYPE_AIRPLAY ? device->session : NULL;
-+
+ 
+-  control_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "control_port");
+-  ret = service_start(&airplay_control_svc, control_svc_cb, control_port, "AirPlay control");
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay playback control failed to start\n");
+-      goto out_stop_timing;
+-    }
 +  if (!session || !session->primary_radio || !primary_radio_binding_current(session)
 +      || route->incarnation != session->device_incarnation || route->epoch != session->session_epoch
 +      || route->revision != session->primary_radio_route_revision)
 +    return NULL;
-+
+ 
+-  ret = airplay_events_init();
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay events failed to start\n");
+-      goto out_stop_control;
+-    }
 +  return session;
 +}
-+
+ 
+-  // libhash is just a seed to make the clock id unique
+-  ret = ptpd_init(libhash);
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay PTP daemon unavailable, only NTP will be available\n");
+-      airplay_ptp_is_disabled = true;
+-    }
 +static int
 +airplay_primary_radio_write(const struct airplay_primary_radio_route *route, struct output_buffer *obuf)
 +{
 +  struct airplay_session *session = airplay_primary_radio_session(route);
-+
+ 
+-  ret = mdns_browse("_airplay._tcp", airplay_device_cb, MDNS_CONNECTION_TEST);
+-  if (ret < 0)
+-    {
+-      DPRINTF(E_LOG, L_AIRPLAY, "Could not add mDNS browser for AirPlay devices\n");
+-      goto out_stop_events;
+-    }
 +  if (!session || !attention_emission_current(session, NULL))
 +    return -1;
-+
+ 
 +  airplay_write_source(obuf, session);
-+  return 0;
+   return 0;
 +}
-+
+ 
+- out_stop_events:
+-  airplay_events_deinit();
+- out_stop_control:
+-  service_stop(&airplay_control_svc);
+- out_stop_timing:
+-  service_stop(&airplay_timing_svc);
+- out_free_timer:
+-  event_free(keep_alive_timer);
 +static int airplay_primary_radio_revoke(const struct airplay_primary_radio_route *);
 +
 +/* One producer per attached radio route. Only the player event loop can
@@ -2057,6 +2180,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  struct primary_radio_station_operation *operation;
 +  const char *url; /* immutable station registry storage */
 +  struct event *tick;
++  char *isolation_custody; /* Player-owned pending bytes, never a STOP receipt. */
 +  pthread_mutex_t mutex;
 +  pthread_cond_t space;
 +  struct timespec stop_deadline; /* Player-owned after exact revocation. */
@@ -2066,7 +2190,8 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  size_t head, count;
 +  uint8_t pcm[PRIMARY_RADIO_QUEUE_PACKETS][PRIMARY_RADIO_PACKET_BYTES];
 +};
-+
+ 
+-  return -1;
 +static void
 +primary_radio_decode_unref(struct primary_radio_decode *decoder)
 +{
@@ -2082,25 +2207,31 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +{
 +  struct primary_radio_decode *decoder = arg;
 +  return atomic_load(&decoder->cancelled);
-+}
-+
-+static void
+ }
+ 
+ static void
+-airplay_deinit(void)
 +primary_radio_decode_cancel(struct primary_radio_decode *decoder)
-+{
+ {
+-  struct airplay_session *session;
 +  pthread_mutex_lock(&decoder->mutex);
 +  atomic_store(&decoder->cancelled, true);
 +  decoder->count = 0;
 +  pthread_cond_signal(&decoder->space);
 +  pthread_mutex_unlock(&decoder->mutex);
 +}
-+
+ 
+-  airplay_events_deinit();
+-  service_stop(&airplay_control_svc);
+-  service_stop(&airplay_timing_svc);
 +static void
 +primary_radio_station_finish(struct primary_radio_station_operation *operation,
 +    enum output_primary_radio_start_phase phase)
 +{
 +  operation->result = (struct output_primary_radio_start_result) { .phase = phase };
 +}
-+
+ 
+-  event_free(keep_alive_timer);
 +static void
 +primary_radio_decoder_drop(struct primary_radio_decode *decoder)
 +{
@@ -2121,9 +2252,36 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  if (decoder->session)
 +    decoder->session->primary_radio_decoder = NULL;
 +  decoder->session = NULL;
++  free(decoder->isolation_custody);
 +  primary_radio_decode_unref(decoder);
 +}
 +
++/* The owner has removed the exact session. Keep only the decoder reference
++ * until its cancellation and resource cleanup are observed on this loop. */
++static void
++primary_radio_decoder_retire_control_loss(struct airplay_session *session)
++{
++  struct primary_radio_decode *decoder = session->primary_radio_decoder;
++  struct timeval next = { 0, PRIMARY_RADIO_PACKET_US };
++  if (!session->primary_radio_control_lost || session->primary_radio_revoked
++      || session->primary_radio_teardown_cseq || !session->primary_radio_custody
++      || !decoder || !decoder->operation
++      || decoder->operation->result.phase != OUTPUT_PRIMARY_RADIO_START_OBSERVED
++      || clock_gettime(CLOCK_MONOTONIC, &decoder->stop_deadline) < 0)
++    return;
++  decoder->isolation_custody = strdup(session->primary_radio_custody);
++  if (!decoder->isolation_custody)
++    return;
++  decoder->stop_deadline.tv_sec += PRIMARY_RADIO_START_SECONDS;
++  primary_radio_decode_cancel(decoder);
++  primary_radio_station_finish(decoder->operation, OUTPUT_PRIMARY_RADIO_START_UNKNOWN);
++  session->primary_radio_decoder = NULL;
++  decoder->session = NULL;
++  if (evtimer_add(decoder->tick, &next) < 0)
++    primary_radio_decoder_drop(decoder);
++}
+ 
+-  for (session = airplay_sessions; airplay_sessions; session = airplay_sessions)
 +static void
 +primary_radio_decoder_detach(struct airplay_session *session)
 +{
@@ -2146,14 +2304,16 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  struct evbuffer *buffer = evbuffer_new();
 +
 +  while (stream && buffer && !primary_radio_decode_cancelled(decoder))
-+    {
+     {
+-      airplay_sessions = session->next;
 +      if (evbuffer_get_length(buffer) < PRIMARY_RADIO_PACKET_BYTES)
 +        {
 +          if (transcode(buffer, NULL, stream, 1) <= 0)
 +            break;
 +          continue;
 +        }
-+
+ 
+-      session_free(session);
 +      pthread_mutex_lock(&decoder->mutex);
 +      while (decoder->count == PRIMARY_RADIO_QUEUE_PACKETS && !primary_radio_decode_cancelled(decoder))
 +        pthread_cond_wait(&decoder->space, &decoder->mutex);
@@ -2164,8 +2324,10 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +          decoder->count++;
 +        }
 +      pthread_mutex_unlock(&decoder->mutex);
-+    }
-+
+     }
+ 
+-  // After freeing sessions, since that's where the active ptp peers get removed
+-  ptpd_deinit();
 +  if (stream) transcode_cleanup(&stream);
 +  if (buffer) evbuffer_free(buffer);
 +#ifdef PRIMARY_RADIO_DECODER_TEST_BEFORE_DONE
@@ -2177,18 +2339,29 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  primary_radio_decode_unref(decoder);
 +  atomic_fetch_sub(&primary_radio_decoder_workers, 1);
 +  return NULL;
-+}
-+
+ }
+ 
+-void outputs_airplay_start_retire_all(void)
+-{ while(airplay_sessions)session_cleanup(airplay_sessions); }
+-bool outputs_airplay_start_all_drained(void)
 +static bool
 +primary_radio_before_deadline(struct timespec deadline)
-+{
+ {
+-  struct airplay_session *s;
+-  for(s=airplay_sessions;s;s=s->next)if(s->sequence_requests || s->room_volume_requests || s->attention_requests || s->reqs_in_flight
+-      || (s->deferredev && event_pending(s->deferredev,EV_TIMEOUT,NULL)))return false;
+-  return true;
 +  struct timespec now;
 +  return clock_gettime(CLOCK_MONOTONIC, &now) == 0 && timespec_cmp(now, deadline) < 0;
-+}
+ }
+-int outputs_airplay_radio_emission_floor(uint64_t id,const void *expected)
 +
 +static bool
 +primary_radio_station_before_deadline(const struct primary_radio_station_operation *operation)
-+{
+ {
+-  struct output_device *d=outputs_device_get(id);struct airplay_session *s=d?d->session:NULL;
+-  if(!s || s!=expected || !s->master_session || s->master_session->packet_serial==UINT64_MAX)return -1;
+-  s->emission_floor=s->master_session->packet_serial+1;return 0;
 +  return primary_radio_before_deadline(operation->deadline);
 +}
 +
@@ -2217,7 +2390,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  const struct primary_radio_decode *decoder = session->primary_radio_decoder;
 +  const struct primary_radio_station_operation *operation = decoder ? decoder->operation : NULL;
 +  return operation && operation->predecessor_release.device_id ? &operation->predecessor_release : NULL;
-+}
+ }
 +
 +static void
 +primary_radio_station_packet_sent(struct airplay_session *session)
@@ -2517,6 +2690,19 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  (void)fd;
 +  (void)events;
 +
++  if (decoder->isolation_custody)
++    {
++      pthread_mutex_lock(&decoder->mutex);
++      done = decoder->done && !decoder->count;
++      pthread_mutex_unlock(&decoder->mutex);
++      bool current = primary_radio_before_deadline(decoder->stop_deadline);
++      if (done && current)
++        outputs_primary_radio_custody_isolate(decoder->route.device_id, decoder->isolation_custody);
++      if (done || !current
++          || evtimer_add(decoder->tick, &next) < 0)
++        primary_radio_decoder_drop(decoder);
++      return;
++    }
 +  if (!session)
 +    {
 +      if (primary_radio_station_attach_ready(decoder))
@@ -3117,22 +3303,132 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +  return 0;
 +}
 +
- static int
- airplay_init(void)
- {
-@@ -5102,20 +6527,56 @@ airplay_deinit(void)
- }
- 
- void outputs_airplay_start_retire_all(void)
--{ while(airplay_sessions)session_cleanup(airplay_sessions); }
--bool outputs_airplay_start_all_drained(void)
++static int
++airplay_init(void)
++{
++  int ret;
++  int i;
++  int timing_port;
++  int control_port;
++
++  airplay_device_id = libhash;
++  if(outputs_radio_sender_role()){
++    const char *controller=cfg_getstr(cfg_getsec(cfg,"general"),"radio_controller_id");
++    uint64_t pinned=0;airplay_device_id=0;
++    if(!controller || strnlen(controller,17)!=16)return -1;
++    for(i=0;i<16;i++){
++      unsigned char c=controller[i];
++      if(!((c>='0' && c<='9') || (c>='A' && c<='F')))return -1;
++      pinned=(pinned<<4)|(c<='9'?c-'0':c-'A'+10);
++    }
++    if(!pinned)return -1;
++    airplay_device_id=pinned;
++  }
++
++  uuid_make(airplay_ptp_clock_uuid);
++
++  // Check alignment of enum seq_type with airplay_seq_definition and
++  // airplay_seq_request
++  for (i = 0; i < ARRAY_SIZE(airplay_seq_definition); i++)
++    {
++      if (airplay_seq_definition[i].seq_type != i || airplay_seq_request[i][0].seq_type != i)
++        {
++	  DPRINTF(E_LOG, L_AIRPLAY, "Bug! Misalignment between sequence enum and structs: %d, %d, %d\n", i, airplay_seq_definition[i].seq_type, airplay_seq_request[i][0].seq_type);
++	  return -1;
++        }
++    }
++
++  CHECK_NULL(L_AIRPLAY, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
++
++  airplay_user_agent = cfg_getstr(cfg_getsec(cfg, "airplay_shared"), "user_agent");
++  airplay_client_name = cfg_getstr(cfg_getsec(cfg, "library"), "name");
++
++  timing_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "timing_port");
++  ret = service_start(&airplay_timing_svc, timing_svc_cb, timing_port, "AirPlay timing");
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay time synchronization failed to start\n");
++      goto out_free_timer;
++    }
++
++  control_port = cfg_getint(cfg_getsec(cfg, "airplay_shared"), "control_port");
++  ret = service_start(&airplay_control_svc, control_svc_cb, control_port, "AirPlay control");
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay playback control failed to start\n");
++      goto out_stop_timing;
++    }
++
++  ret = airplay_events_init();
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay events failed to start\n");
++      goto out_stop_control;
++    }
++
++  // libhash is just a seed to make the clock id unique
++  ret = ptpd_init(libhash);
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay PTP daemon unavailable, only NTP will be available\n");
++      airplay_ptp_is_disabled = true;
++    }
++
++  ret = mdns_browse("_airplay._tcp", airplay_device_cb, MDNS_CONNECTION_TEST);
++  if (ret < 0)
++    {
++      DPRINTF(E_LOG, L_AIRPLAY, "Could not add mDNS browser for AirPlay devices\n");
++      goto out_stop_events;
++    }
++
++  return 0;
++
++ out_stop_events:
++  airplay_events_deinit();
++ out_stop_control:
++  service_stop(&airplay_control_svc);
++ out_stop_timing:
++  service_stop(&airplay_timing_svc);
++ out_free_timer:
++  event_free(keep_alive_timer);
++
++  return -1;
++}
++
++static void
++airplay_deinit(void)
++{
++  struct airplay_session *session;
++
++  airplay_events_deinit();
++  service_stop(&airplay_control_svc);
++  service_stop(&airplay_timing_svc);
++
++  event_free(keep_alive_timer);
++
++  for (session = airplay_sessions; airplay_sessions; session = airplay_sessions)
++    {
++      airplay_sessions = session->next;
++
++      session_free(session);
++    }
++
++  for (size_t i = 0; i < ARRAY_SIZE(primary_radio_station_operations); i++)
++    {
++      struct primary_radio_decode *decoder = primary_radio_station_operations[i].decoder;
++      if (decoder && decoder->isolation_custody)
++        primary_radio_decoder_drop(decoder);
++    }
++
++  // After freeing sessions, since that's where the active ptp peers get removed
++  ptpd_deinit();
++}
++
++void outputs_airplay_start_retire_all(void)
 +{ while (airplay_sessions) session_cleanup(airplay_sessions); }
 +
 +void outputs_airplay_spotify_start_retire(void)
- {
--  struct airplay_session *s;
--  for(s=airplay_sessions;s;s=s->next)if(s->sequence_requests || s->room_volume_requests || s->attention_requests || s->reqs_in_flight
--      || (s->deferredev && event_pending(s->deferredev,EV_TIMEOUT,NULL)))return false;
++{
 +  for (;;)
 +    {
 +      struct airplay_session *s = airplay_sessions;
@@ -3151,20 +3447,20 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..7e5fb301757ada0985e2dceef8189355
 +        && (s->sequence_requests || s->room_volume_requests || s->attention_requests || s->reqs_in_flight
 +            || (s->deferredev && event_pending(s->deferredev, EV_TIMEOUT, NULL))))
 +      return false;
-   return true;
- }
++  return true;
++}
 +
 +bool outputs_airplay_start_all_drained(void)
 +{ return airplay_contexts_drained(false); }
 +
 +bool outputs_airplay_spotify_start_drained(void)
 +{ return airplay_contexts_drained(true); }
- int outputs_airplay_radio_emission_floor(uint64_t id,const void *expected)
- {
-   struct output_device *d=outputs_device_get(id);struct airplay_session *s=d?d->session:NULL;
-   if(!s || s!=expected || !s->master_session || s->master_session->packet_serial==UINT64_MAX)return -1;
-   s->emission_floor=s->master_session->packet_serial+1;return 0;
- }
++int outputs_airplay_radio_emission_floor(uint64_t id,const void *expected)
++{
++  struct output_device *d=outputs_device_get(id);struct airplay_session *s=d?d->session:NULL;
++  if(!s || s!=expected || !s->master_session || s->master_session->packet_serial==UINT64_MAX)return -1;
++  s->emission_floor=s->master_session->packet_serial+1;return 0;
++}
 +int
 +outputs_airplay_primary_spotify_return_open(uint64_t id, const void *expected)
 +{
@@ -3224,7 +3520,7 @@ index dae3206db01217fed6a2efc9a784dba644826e82..0c3162530a52e34453fa416e0e214b1b
    d=outputs_device_get(id);
    if(d && (d->selected || d->session))return 1;
 diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
-index bcf702fb9c3564e749d05b94ecbeab1543816078..2ea4117f7abef0072a1ab9e05b55b841d381589d 100644
+index bcf702fb9c3564e749d05b94ecbeab1543816078..e9f63fbbf776fd0e4574f92e9f697e5fca123619 100644
 --- a/src/outputs_radio_handoff.inc.c
 +++ b/src/outputs_radio_handoff.inc.c
 @@ -4,17 +4,23 @@
@@ -3529,7 +3825,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..2ea4117f7abef0072a1ab9e05b55b841
      radio_stop_scope=d->id;
      int ret=outputs_device_stop(d,radio_handoff_stop_cb);
      radio_stop_scope=0;
-@@ -400,3 +538,225 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -400,3 +538,232 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
    radio_handoff_finalize(s);
    *out=s->result;return 0;
  }
@@ -3701,18 +3997,25 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..2ea4117f7abef0072a1ab9e05b55b841
 +}
 +
 +static bool
++primary_spotify_park_local_idle(const struct radio_handoff_slot *slot, const struct output_device *d,
++    const struct output_primary_radio_custody *prior)
++{
++  if (!primary_spotify_park_scope_current(slot, d) || !slot->primary_session
++      || !outputs_primary_radio_session_equal(prior, &slot->primary_route))
++    return false;
++  const struct output_transport_identity *old = &slot->result.command.identity;
++  return d->advertised && !d->selected && !d->session && prior->epoch < UINT64_MAX - 2
++      && d->session_epoch == prior->epoch + 1 && d->route_revision == old->route_revision + 1
++      && transport_selection_revision == old->selection_revision + 2
++      && slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_NONE
++      && primary_spotify_park_writer_closed(slot);
++}
++
++static bool
 +primary_spotify_park_stopped_current(const struct radio_handoff_slot *slot, const struct output_device *d,
 +    const struct output_primary_radio_custody *released)
 +{
-+  if (!primary_spotify_park_scope_current(slot, d) || !slot->primary_session
-+      || !outputs_primary_radio_session_equal(released, &slot->primary_route))
-+    return false;
-+  const struct output_transport_identity *old = &slot->result.command.identity;
-+  return d->advertised && !d->selected && !d->session && released->epoch < UINT64_MAX - 2
-+      && d->session_epoch == released->epoch + 1 && d->route_revision == old->route_revision + 1
-+      && transport_selection_revision == old->selection_revision + 2
-+      && slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_NONE
-+      && primary_spotify_park_writer_closed(slot) && outputs_primary_radio_release_current(released);
++  return primary_spotify_park_local_idle(slot, d, released) && outputs_primary_radio_release_current(released);
 +}
 +
 +bool
@@ -6828,7 +7131,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..539da885cb2dbd4238f52d502ec30244
      assert(outputs_attention_startup() == 0);
  
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd8f572e5c 100644
+index 40ebe09716eb4c4b19b08356268f8447f913088c..b0bbf24e1c34225860245c1054d3db9e798a3906 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -1315,6 +1315,13 @@ struct native_start_wire {
@@ -7396,7 +7699,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd
      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
      assert(pb_timer_fd>=0);
      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
-@@ -2786,7 +3206,465 @@ static int start35_wire_case(int mode)
+@@ -2786,7 +3206,547 @@ static int start35_wire_case(int mode)
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -7524,6 +7827,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd
 +          && !strcmp(station.custody.operation, start.action) && station.custody.epoch == start.epoch + 2);
 +      assert(primary_radio_wire_packets(&f, &radio_seq) >= 1);
 +      bool replace_station = getenv("PC_PRIMARY_SPOTIFY_REPLACE") != NULL;
++      const char *control_loss = getenv("PC_PRIMARY_SPOTIFY_CONTROL_LOSS");
 +      int radio_sessions = 2; /* Original Spotify and the first radio session. */
 +      struct output_primary_radio_custody previous_stop;
 +      if (replace_station)
@@ -7533,7 +7837,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd
 +          struct output_primary_radio_start_result expired;
 +          primary_radio_station_replace_wire(&f, &f, &expired_prior, start.generation + 1,
 +              stations[0], exact.token, &expired, &previous_stop, true);
-+          for (size_t i = 0; i < ARRAY_SIZE(stations); i++)
++          for (size_t i = 0; i < (control_loss ? 1 : ARRAY_SIZE(stations)); i++)
 +            {
 +              struct output_primary_radio_custody prior = station.custody;
 +              primary_radio_station_replace_wire(&f, &f, &prior, start.generation + i + 2,
@@ -7542,7 +7846,88 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd
 +              assert(primary_spotify_park_writer_closed(retained)
 +                  && outputs_primary_radio_session_equal(&retained->primary_route, &station.custody));
 +            }
-+          puts("PASS three encrypted station sessions share the exact parked Spotify output through two drained replacements");
++          puts(control_loss ? "PASS P3 then P1 on the parked Spotify output"
++              : "PASS three encrypted station sessions share the exact parked Spotify output through two drained replacements");
++        }
++      if (control_loss)
++        {
++          const int teardowns = f.teardowns;
++          assert(f.peer);
++          atomic_store(&fixture_hold_primary_decoder_done, true);
++          (void)primary_radio_wire_packets(&f, &radio_seq);
++          const bool local_cleanup = !strcmp(control_loss, "local-cleanup");
++          if (local_cleanup)
++            session_cleanup(f.device->session);
++          else
++            {
++              bufferevent_free(f.peer);
++              f.peer = NULL;
++            }
++          for (int i = 0; i < 1500 && f.device->session; i++)
++            {
++              event_base_loop(f.base, EVLOOP_NONBLOCK);
++              usleep(1000);
++            }
++          struct output_primary_radio_custody lost;
++          struct output_primary_radio_start_request candidate;
++          struct output_start_state music;
++          assert(!f.device->session && f.teardowns == teardowns);
++          assert(outputs_primary_radio_custody_read(f.device->id, &lost) == 1
++              && outputs_primary_radio_session_equal(&lost, &station.custody)
++              && !lost.stop_action[0] && !lost.teardown_cseq);
++          int radio_ready = outputs_airplay_primary_station_target(f.device->id, &candidate);
++          int music_state = outputs_start_state_get(r, &music);
++          printf("PEER LOSS without Stop: C old custody retained, no CSeq; radio_ready=%d music_state=%d music_ready=%d\n",
++              radio_ready, music_state, music_state == 0 && music.ready);
++          assert(radio_ready < 0 && (music_state < 0 || !music.ready));
++          for (int i = 0; i < 1500 && !atomic_load(&fixture_primary_decoders_held); i++)
++            { event_base_loop(f.base, EVLOOP_NONBLOCK); usleep(1000); }
++          assert(atomic_load(&fixture_primary_decoders_held) == 1);
++          char key[64], *row = NULL;
++          primary_radio_custody_key(key, f.device->id);
++          assert(db_radio_handoff_load_key(key, &row) == 1 && !strstr(row, "local_isolation"));
++          const bool live_writer = !strcmp(control_loss, "writer");
++          const bool wrong_epoch = !strcmp(control_loss, "epoch");
++          const bool changed_custody = !strcmp(control_loss, "cas");
++          const bool changed_process = !strcmp(control_loss, "process");
++          int writer_fd = -1;
++          if (live_writer)
++            {
++              writer_fd = open(fifo, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++              assert(writer_fd >= 0 && !primary_spotify_park_writer_closed(retained));
++            }
++          if (wrong_epoch)
++            f.device->session_epoch++;
++          if (changed_custody)
++            {
++              char *claim = outputs_primary_radio_custody_claim(f.device->id, row,
++                  "43a14ca1-b7d4-4a6a-b8db-f01c218f9f72");
++              assert(claim);
++              free(claim);
++            }
++          if (changed_process)
++            outputs_attention_uuid(outputs_process);
++          free(row);
++          assert(!primary_radio_wire_packets(&f, &radio_seq));
++          atomic_store(&fixture_hold_primary_decoder_done, false);
++          for (int i = 0; i < 1500; i++)
++            { event_base_loop(f.base, EVLOOP_NONBLOCK); usleep(1000); }
++          row = NULL;
++          assert(db_radio_handoff_load_key(key, &row) == 1);
++          const bool isolated = strstr(row, "\"local_isolation\":\"rtsp_control_lost\"") != NULL;
++          assert(isolated == !strcmp(control_loss, "isolated"));
++          assert(strstr(row, "\"teardown_cseq\":0") && !f.device->session && f.teardowns == teardowns);
++          assert(!outputs_primary_radio_custody_available(f.device->id));
++          if (isolated)
++            assert(outputs_primary_radio_custody_read(f.device->id, &lost) < 0);
++          free(row);
++          if (writer_fd >= 0)
++            close(writer_fd);
++          if (isolated)
++            puts("PASS peer-close records local isolation only after decoder completion, without STOP or replay");
++          else
++            puts("PASS control-loss isolation refused incompatible custody or missing control callback");
++          goto cleanup;
 +        }
 +      const char *stop = "43a14ca1-b7d4-4a6a-b8db-f01c218f9f72";
 +      f.require_decoder_drain = true;
@@ -7863,7 +8248,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd
   cleanup:
    if(mode==29){
      event_free(keep_alive_timer);keep_alive_timer=NULL;
-@@ -2794,6 +3672,20 @@ static int start35_wire_case(int mode)
+@@ -2794,6 +3754,20 @@ static int start35_wire_case(int mode)
    }
    if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
    while(airplay_sessions)session_cleanup(airplay_sessions);
