@@ -1,0 +1,189 @@
+diff --git a/daemon/app.go b/daemon/app.go
+index bdea720..211b9db 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -309,6 +309,17 @@ func (app *App) replaceAppPlayer(ctx context.Context, expected *AppPlayer, creat
+ 		if closing {
+ 			return nil, fmt.Errorf("daemon is closing")
+ 		}
++		if old != nil && expected == old {
++			// This logout owns the joined predecessor even if its receiver
++			// vanished before the normal retirement request.
++			app.settleRejectedSTARTAfterLogout(ctx, old)
++			app.ownerMu.Lock()
++			closing = app.closed || ctx.Err() != nil
++			app.ownerMu.Unlock()
++			if closing {
++				return nil, fmt.Errorf("daemon is closing")
++			}
++		}
+ 		next, err := create(ctx)
+ 		app.ownerMu.Lock()
+ 		if app.closed || ctx.Err() != nil || err != nil {
+diff --git a/daemon/room_retirement.go b/daemon/room_retirement.go
+index e0134ee..7ae6e5f 100644
+--- a/daemon/room_retirement.go
++++ b/daemon/room_retirement.go
+@@ -14,24 +14,27 @@ import (
+ 	"github.com/devgianlu/go-librespot/output"
+ )
+ 
++var errRetirementPrepareConflict = errors.New("output retirement rejected before admission")
++
+ type retirementAttempt struct {
+-	owner       *AppPlayer
+-	purpose     string
+-	baseURL     string
+-	deviceID    string
+-	completed   string
+-	reservation string
+-	incarnation string
+-	process     contentProcess
+-	writer      output.MovePipeIdentity
+-	generation  uint64
+-	writerEpoch string
+-	inputEpoch  string
+-	retirement  string
+-	prepared    bool
+-	closedPrior bool
+-	startSource *contentOperation
+-	moveSource  *moveOperation
++	owner           *AppPlayer
++	purpose         string
++	baseURL         string
++	deviceID        string
++	completed       string
++	reservation     string
++	incarnation     string
++	process         contentProcess
++	writer          output.MovePipeIdentity
++	generation      uint64
++	writerEpoch     string
++	inputEpoch      string
++	retirement      string
++	prepared        bool
++	prepareRejected bool
++	closedPrior     bool
++	startSource     *contentOperation
++	moveSource      *moveOperation
+ }
+ 
+ type retirementReceipt struct {
+@@ -82,7 +85,14 @@ func retirementHTTP(ctx context.Context, method, url string, body, out any) erro
+ 	}
+ 	defer reply.Body.Close()
+ 	raw, err := io.ReadAll(io.LimitReader(reply.Body, 16385))
+-	if err != nil || len(raw) > 16384 || reply.StatusCode != http.StatusOK {
++	if err != nil || len(raw) > 16384 {
++		return ErrAliasConflict
++	}
++	if method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/retire/prepare") &&
++		reply.StatusCode == http.StatusConflict {
++		return errRetirementPrepareConflict
++	}
++	if reply.StatusCode != http.StatusOK {
+ 		return ErrAliasConflict
+ 	}
+ 	return strictContentJSON(raw, out)
+@@ -240,18 +250,18 @@ func (app *App) prepareCompletedRetirementFor(owner *AppPlayer) *retirementAttem
+ 		if errors.Is(err, context.DeadlineExceeded) {
+ 			reason = "timeout"
+ 		}
+-		app.retirementFailed(&a)
++		app.retirementFailed(&a, errors.Is(err, errRetirementPrepareConflict))
+ 		return nil
+ 	}
+ 	if !volumeHex32.MatchString(reply.RetirementToken) {
+ 		outcome, reason = "receipt_rejected", "invalid_token"
+-		app.retirementFailed(&a)
++		app.retirementFailed(&a, false)
+ 		return nil
+ 	}
+ 	a.retirement = reply.RetirementToken
+ 	if !a.validPrepare(reply) {
+ 		outcome, reason = "receipt_rejected", "invalid_receipt"
+-		app.retirementFailed(&a)
++		app.retirementFailed(&a, false)
+ 		return nil
+ 	}
+ 	app.moveCustodyMu.Lock()
+@@ -273,9 +283,10 @@ func (app *App) prepareCompletedRetirementFor(owner *AppPlayer) *retirementAttem
+ 	return &a
+ }
+ 
+-func (app *App) retirementFailed(a *retirementAttempt) {
++func (app *App) retirementFailed(a *retirementAttempt, rejected bool) {
+ 	app.moveCustodyMu.Lock()
+ 	if app.retirementPending == a {
++		a.prepareRejected = rejected
+ 		app.moveCustodyUnknown = true
+ 	}
+ 	app.moveCustodyMu.Unlock()
+@@ -340,17 +351,28 @@ func (app *App) completeRetirementFor(a *retirementAttempt) {
+ // its original FIFO writer is already gone. Only C can establish an exact
+ // terminal witness for that old completed START before a successor may write.
+ func (app *App) retireClosedPriorStartFor(ctx context.Context, current *AppPlayer) error {
+-	if ctx.Err() != nil {
++	app.moveCustodyMu.Lock()
++	op := app.startCustody
++	app.moveCustodyMu.Unlock()
++	if op == nil || op.Owner == current {
+ 		return ErrAliasConflict
+ 	}
++	return app.retireClosedSTART(ctx, op.Owner, op, false)
++}
++
++// A logout can settle only the exact rejected prepare of the joined owner.
++// A request with an unknown outcome cannot enter this new path.
++func (app *App) settleRejectedSTARTAfterLogout(ctx context.Context, old *AppPlayer) {
+ 	app.moveCustodyMu.Lock()
+ 	op := app.startCustody
+-	if op == nil || op.Owner == nil || op.Owner == current {
+-		app.moveCustodyMu.Unlock()
++	app.moveCustodyMu.Unlock()
++	_ = app.retireClosedSTART(ctx, old, op, true)
++}
++
++func (app *App) retireClosedSTART(ctx context.Context, old *AppPlayer, op *contentOperation, rejectedOnly bool) error {
++	if ctx.Err() != nil || old == nil || op == nil || op.Owner != old {
+ 		return ErrAliasConflict
+ 	}
+-	old := op.Owner
+-	app.moveCustodyMu.Unlock()
+ 
+ 	old.roomCloseMu.Lock()
+ 	done := old.roomCloseDone
+@@ -365,9 +387,11 @@ func (app *App) retireClosedPriorStartFor(ctx context.Context, current *AppPlaye
+ 	}
+ 
+ 	app.moveCustodyMu.Lock()
++	prior := app.retirementPending
+ 	if ctx.Err() != nil || app.startCustody != op || app.moveCustody != nil || app.startOutputPermit != nil ||
+ 		app.openedWriterOwner != old || app.queueWriterBusyLocked() ||
+-		(app.retirementPending != nil && (app.retirementPending.closedPrior || app.retirementPending.owner != old || app.retirementPending.startSource != op)) {
++		(prior != nil && (prior.closedPrior || prior.owner != old || prior.startSource != op)) ||
++		(rejectedOnly && (prior == nil || !prior.prepareRejected || prior.prepared || !app.retirementCurrentLocked(prior))) {
+ 		app.moveCustodyMu.Unlock()
+ 		return ErrAliasConflict
+ 	}
+@@ -426,12 +450,16 @@ func (app *App) retireClosedPriorStartFor(ctx context.Context, current *AppPlaye
+ 
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+-	if app.retirementPending != &a || app.startCustody != op || app.moveCustody != nil ||
+-		app.startOutputPermit != nil || app.queueWriterBusyLocked() ||
+-		app.openedWriterOwner != old || app.openedWriter != a.writer ||
+-		app.openedWriterGeneration != writerGeneration || !terminal {
++	current := app.retirementPending == &a && app.startCustody == op && app.moveCustody == nil &&
++		app.startOutputPermit == nil && !app.queueWriterBusyLocked() &&
++		app.openedWriterOwner == old && app.openedWriter == a.writer &&
++		app.openedWriterGeneration == writerGeneration
++	if !current || !terminal {
+ 		if app.retirementPending == &a {
+ 			app.moveCustodyUnknown = true
++			if current && rejectedOnly && errors.Is(err, errRetirementPrepareConflict) {
++				app.retirementPending = prior
++			}
+ 		}
+ 		return ErrAliasConflict
+ 	}
