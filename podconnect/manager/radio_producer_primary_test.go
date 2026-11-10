@@ -559,7 +559,7 @@ func TestPrimaryRadioIsolationRecoversOnlyExactLiveCustody(t *testing.T) {
 	for _, variant := range []string{
 		"exact", "no-proof", "wrong-process", "wrong-session", "wrong-owner", "older-revision",
 		"older-observation", "missing-capability", "closed-target", "wrong-device", "stop-receipt",
-		"restart", "unresolved-stop",
+		"restart", "unresolved-stop", "restart-after-adoption", "different-target",
 	} {
 		t.Run(variant, func(t *testing.T) {
 			ctx := context.Background()
@@ -580,6 +580,11 @@ func TestPrimaryRadioIsolationRecoversOnlyExactLiveCustody(t *testing.T) {
 					Process: attentionUUID(), Operation: attentionUUID(), DeviceID: "1",
 					Incarnation: "3", Epoch: "4", Route: "0",
 				},
+			}
+			if variant == "different-target" {
+				f.state.Targets = append(f.state.Targets, radioProducerTarget{
+					radioTarget: radioTarget{ID: "r2", Selectable: true, Availability: "available"}, HomePodID: "2",
+				})
 			}
 			dir, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
@@ -668,7 +673,7 @@ func TestPrimaryRadioIsolationRecoversOnlyExactLiveCustody(t *testing.T) {
 					t.Fatalf("passive isolation dispatched an effect: %v", f.calls)
 				}
 			}
-			if variant != "exact" {
+			if variant != "exact" && variant != "restart-after-adoption" && variant != "different-target" {
 				if c.snapshot().State != "unknown" || p.active != incumbent || p.records[incumbent].SourceDrained {
 					t.Fatalf("invalid proof retired live custody: %+v", c.snapshot())
 				}
@@ -687,6 +692,27 @@ func TestPrimaryRadioIsolationRecoversOnlyExactLiveCustody(t *testing.T) {
 			}
 			if _, err = c.execute(ctx, start); err == nil || len(f.calls) != 0 {
 				t.Fatal("an old action could replay")
+			}
+			switch variant {
+			case "restart-after-adoption":
+				restarted, err := newPrimaryRadioProducer(f, p.journal.directory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.state.IsolatedSession = nil
+				f.state.Revision = "10"
+				f.state.Observation = &radioNativeObservation{
+					State: "idle", SourceKind: "none", ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
+				}
+				if err = newRadioCoordinator(restarted).enable(ctx); err == nil {
+					t.Fatal("fresh Manager treated durable local isolation as restart authority")
+				}
+				return
+			case "different-target":
+				if _, err := c.execute(ctx, command("start", "p1", "r2")); err == nil || len(f.calls) != 0 {
+					t.Fatalf("local isolation authorized a different advertised target: err=%v calls=%v", err, f.calls)
+				}
+				return
 			}
 			ready := f.state
 			f.state.IsolatedSession = nil

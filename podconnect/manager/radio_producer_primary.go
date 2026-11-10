@@ -217,6 +217,10 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 			}
 			continue
 		}
+		// A live local isolation observation is not a durable release receipt.
+		if record.Primary != nil && record.Primary.Isolation != nil && !p.live[token] {
+			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
+		}
 		if record.Primary == nil || !record.Terminal || record.Observation.SourceKind == "radio" &&
 			record.Observation.State == "playing" && !record.SourceDrained && !p.live[token] {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
@@ -316,6 +320,9 @@ func (p *radioProducer) primaryPrepare(ctx context.Context, station, target, act
 	}
 	if !p.primaryIsolationReadCurrentLocked(state) {
 		return errRadioUnknown
+	}
+	if state.IsolatedSession != nil && state.Observation.TargetID != target {
+		return errRadioUnavailable
 	}
 	candidate := &radioPrimaryRecord{Device: device, Station: station}
 	if p.active != "" {
