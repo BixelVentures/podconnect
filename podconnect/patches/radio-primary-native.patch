@@ -1125,10 +1125,10 @@ index 0000000..67c2f43
 +}
 diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
 new file mode 100644
-index 0000000..e9520b6
+index 0000000..f011dc4
 --- /dev/null
 +++ b/daemon/radio_primary_cold_test.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,326 @@
 +package daemon
 +
 +import (
@@ -1138,9 +1138,11 @@ index 0000000..e9520b6
 +	"net/http/httptest"
 +	"os"
 +	"path/filepath"
++	"strconv"
 +	"strings"
 +	"sync/atomic"
 +	"testing"
++	"time"
 +
 +	"github.com/devgianlu/go-librespot/output"
 +)
@@ -1295,6 +1297,163 @@ index 0000000..e9520b6
 +			}
 +		})
 +	}
++}
++
++func TestPrimaryRadioColdDetachmentActualOwnTone(t *testing.T) {
++	if os.Getenv("PC_NATIVE_PRIMARY_COLD_COMPOSED") == "" {
++		t.Skip("requires the isolated cold OwnTone fixture")
++	}
++	journal, endpoint := os.Getenv("PC_NATIVE_COLD_RADIO_JOURNAL"), os.Getenv("PC_NATIVE_PRIMARY_HTTP_URL")
++	fixture, fifo := os.Getenv("PC_NATIVE_START_URL"), os.Getenv("PC_NATIVE_START_PIPE")
++	token := os.Getenv("PC_PRIMARY_HTTP_TOKEN")
++	if !filepath.IsAbs(journal) || !filepath.IsAbs(fifo) || !radioWireLoopbackURL(endpoint) ||
++		!radioWireLoopbackURL(fixture) || !volumeHex64.MatchString(token) {
++		t.Fatal("missing isolated cold fixture inputs")
++	}
++	p, op := contentFixture(t)
++	app := p.app
++	app.cfg.RadioHandoffStatePath = journal
++	app.cfg.RadioHandoffControlToken = token
++	app.cfg.RoomTransportOwnToneURL, app.cfg.RadioHandoffOwnerURL = endpoint, endpoint
++	app.cfg.AudioOutputPipe = fifo
++	if err := app.initRadio(); err != nil {
++		t.Fatal(err)
++	}
++	var h *radioHold
++	for _, hold := range app.radio.Holds {
++		if hold.Phase == "unknown" && hold.WriterParked {
++			if h != nil {
++				t.Fatal("more than one prior parked hold")
++			}
++			h = hold
++		}
++	}
++	if h == nil || h.owner != nil || h.primary != nil || !app.radioOutputFence.Load() ||
++		h.Primary == nil || h.PrimaryPark == nil || h.PrimaryPending == nil || h.PrimaryStatus == nil ||
++		h.Request.ProcessID == radioProcessID(op.Capture.Process) ||
++		h.PrimaryStatus.Request.Station != "p1" || h.PrimaryAction != "" ||
++		h.PrimaryPending.PriorRelease != nil && h.PrimaryPending.PriorRelease.radioPrimaryBinding == *h.Primary {
++		t.Fatal("missing cold P1 journal with unresolved old receiver and preserved Spotify park")
++	}
++	prior, priorIntent := *h.Primary, app.radio.Intent
++	oldCommand := h.PrimaryPending.Reserve
++	room, device := h.Request.TargetID, prior.DeviceID
++	app.cfg.DeviceAliases = []string{"fixture-main"}
++	app.cfg.DeviceAliasRoomIDs = []string{room}
++	app.cfg.DeviceAliasHomePodIDs = []string{device}
++	p.initAliasRegistry()
++	p.primaryStream = nil
++	p.state.player.IsPlaying = false
++	p.state.player.IsPaused = false
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	state := app.radioPrimaryReadiness(ctx, op.Capture.Process)
++	if state.ColdDetachment == nil || state.ColdDetachment.Session != prior || state.ColdDetachment.Target.Process == prior.Process ||
++		state.ColdDetachment.Process != oldCommand.Process || state.ColdDetachment.Handoff != oldCommand.Handoff ||
++		state.ColdDetachment.Generation != oldCommand.Owner || state.ColdDetachment.Room != room ||
++		state.Observation != nil || state.Protocol != "" || state.IsolatedSession != nil || state.ReleasedSession != nil ||
++		app.radioOutputFence.Load() || app.radio.Intent != priorIntent+1 {
++		t.Fatalf("cold receipt failed to retire old Native custody without advertising source (proof=%t, revision changed=%t, current observation=%t)",
++			state.ColdDetachment != nil, app.radio.Intent != priorIntent, state.Observation != nil)
++	}
++	proof := *state.ColdDetachment
++	if err := app.initRadio(); err != nil {
++		t.Fatal(err)
++	}
++	if app.radioOutputFence.Load() || !primaryRadioColdDetached(app.radio.Holds[room]) ||
++		app.radio.Intent != priorIntent+1 || app.radio.Holds[room].owner != nil || app.radio.Holds[room].primary != nil {
++		t.Fatal("exact cold marker was not persisted independently of actor identity")
++	}
++
++	app.currentAPI, app.currentDone = make(chan ApiRequest), make(chan struct{})
++	actor, done := app.currentAPI, app.currentDone
++	go func() {
++		defer close(done)
++		for req := range actor {
++			if req.Type != apiRadioPrimaryActorState {
++				req.Reply(nil, ErrAliasConflict)
++				continue
++			}
++			value, err := p.radioPrimaryActorState(ctx, req.Data.(radioPrimaryActorStateRequest))
++			req.Reply(value, err)
++		}
++	}()
++	defer func() { close(actor); <-done }()
++	state = app.radioPrimaryReadiness(ctx, op.Capture.Process)
++	if state.ColdDetachment == nil || *state.ColdDetachment != proof || state.Observation == nil ||
++		state.Observation.Source != "none" || state.Observation.State != "idle" ||
++		state.Protocol != "primary" || len(state.Missing) != 0 || len(state.Targets) != 1 || !state.Targets[0].Selectable ||
++		state.Session != nil || state.IsolatedSession != nil || state.ReleasedSession != nil || state.TeardownCSeq != nil {
++		t.Fatalf("current C idle owner was not independently observed (observation=%t, protocol=%s, missing=%v)",
++			state.Observation != nil, state.Protocol, state.Missing)
++	}
++	oldCommand.Phase, oldCommand.ForPhase, oldCommand.Station = "result", "start", "p1"
++	if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
++		t.Fatal("the previous Native process replayed its radio result")
++	}
++	if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_RADIO") != "" {
++		q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(op.Capture.Process),
++			Handoff: "af124cc3-29d2-4d15-9c6d-dca284a02fe1", Action: "32dc86c8-c852-4df7-bb7a-4656f3fae1a4",
++			Generation: strconv.FormatUint(app.radio.Generation+1, 10), Target: room, Intent: state.Revision}
++		ask := func(r radioPrimaryCommand) radioPrimaryReply {
++			t.Helper()
++			value, err := p.radioPrimaryActor(ctx, r)
++			ack, ok := value.(radioPrimaryReply)
++			if err != nil || !ok {
++				t.Fatalf("fresh Native %s failed: %v", r.Phase, err)
++			}
++			return ack
++		}
++		q.Owner = ask(q).Owner
++		q.Phase, q.Station = "prepare_start", "p6-beat"
++		if ask(q).Phase != "prepared" {
++			t.Fatal("fresh decoder admission did not prepare")
++		}
++		q.Phase = "start"
++		playing := ask(q)
++		q.Phase, q.ForPhase = "result", "start"
++		for playing.Phase == "pending" && ctx.Err() == nil {
++			time.Sleep(20 * time.Millisecond)
++			playing = ask(q)
++		}
++		if playing.Phase != "playing" || playing.Session == nil || playing.Session.Process != proof.Target.Process ||
++			playing.Session.DeviceID != device || playing.Session.Operation != q.Action || *playing.Session == prior {
++			t.Fatal("explicit fresh start did not acquire distinct current C receiver custody")
++		}
++		for ctx.Err() == nil {
++			request, _ := http.NewRequestWithContext(ctx, http.MethodGet, fixture+"/fixture/rtp", nil)
++			response, err := http.DefaultClient.Do(request)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var rtp struct {
++				Radio int `json:"primary_radio"`
++			}
++			err = json.NewDecoder(response.Body).Decode(&rtp)
++			response.Body.Close()
++			if err != nil || response.StatusCode != http.StatusOK {
++				t.Fatal("missing fresh receiver observation", err)
++			}
++			if rtp.Radio > 0 {
++				break
++			}
++			time.Sleep(20 * time.Millisecond)
++		}
++		if ctx.Err() != nil {
++			t.Fatal("fresh station produced no authenticated loopback RTP")
++		}
++	}
++	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, fixture+"/fixture/done", strings.NewReader("{}"))
++	response, err := http.DefaultClient.Do(request)
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		t.Fatalf("fixture completion returned HTTP %d", response.StatusCode)
++	}
++	t.Log("actual C cold receipt retired old P1 without old STOP or replay; fresh owner independently proved")
 +}
 diff --git a/daemon/radio_primary_composed_test.go b/daemon/radio_primary_composed_test.go
 new file mode 100644
@@ -3226,10 +3385,10 @@ index 0000000..be5442a
 +}
 diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
 new file mode 100644
-index 0000000..1ea9f47
+index 0000000..e7c0825
 --- /dev/null
 +++ b/daemon/radio_primary_same_composed_test.go
-@@ -0,0 +1,545 @@
+@@ -0,0 +1,551 @@
 +package daemon
 +
 +import (
@@ -3317,6 +3476,12 @@ index 0000000..1ea9f47
 +	app.cfg.RadioHandoffOwnerURL = endpoint
 +	app.cfg.RadioHandoffControlToken = token
 +	app.cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "primary-radio.json")
++	if path := os.Getenv("PC_NATIVE_COLD_RADIO_JOURNAL"); path != "" {
++		if !filepath.IsAbs(path) {
++			t.Fatal("cold fixture requires an absolute journal path")
++		}
++		app.cfg.RadioHandoffStatePath = path
++	}
 +	if err := app.initRadio(); err != nil {
 +		t.Fatal(err)
 +	}
