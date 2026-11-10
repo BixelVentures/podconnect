@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -109,6 +110,7 @@ func (f *primaryRadioFixture) PrimaryCommand(_ context.Context, q radioPrimaryCo
 			OwnerGeneration: generation + 10, ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
 		}
 		f.state.Session, f.state.Observation = result.Session, result.Observation
+		f.state.IsolatedSession = nil
 	case "stop":
 		if f.expiredStop {
 			result.Phase = "replacement_rejected"
@@ -550,5 +552,183 @@ func testPassivePrimaryRelease(t *testing.T, ctx context.Context, p *radioProduc
 	}
 	if !reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {
 		t.Fatalf("passive release replayed a command: %v", f.calls)
+	}
+}
+
+func TestPrimaryRadioIsolationRecoversOnlyExactLiveCustody(t *testing.T) {
+	for _, variant := range []string{
+		"exact", "no-proof", "wrong-process", "wrong-session", "wrong-owner", "older-revision",
+		"older-observation", "missing-capability", "closed-target", "wrong-device", "stop-receipt",
+		"restart", "unresolved-stop", "restart-after-adoption", "different-target",
+	} {
+		t.Run(variant, func(t *testing.T) {
+			ctx := context.Background()
+			process := strings.Repeat("a", 64)
+			target := radioProducerTarget{
+				radioTarget: radioTarget{ID: "r1", Selectable: true, Availability: "available"}, HomePodID: "1",
+			}
+			f := &primaryRadioFixture{t: t,
+				state: radioPrimaryState{
+					Schema: primaryRadioSchema, Protocol: primaryRadioProtocol, Process: process, Revision: "7",
+					Targets: []radioProducerTarget{target}, Missing: []string{},
+					Capabilities: []string{primaryReplacementCapability},
+					Observation: &radioNativeObservation{
+						State: "idle", SourceKind: "none", ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
+					},
+				},
+				session: radioPrimarySession{
+					Process: attentionUUID(), Operation: attentionUUID(), DeviceID: "1",
+					Incarnation: "3", Epoch: "4", Route: "0",
+				},
+			}
+			if variant == "different-target" {
+				f.state.Targets = append(f.state.Targets, radioProducerTarget{
+					radioTarget: radioTarget{ID: "r2", Selectable: true, Availability: "available"}, HomePodID: "2",
+				})
+			}
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := newPrimaryRadioProducer(f, filepath.Join(dir, "private-journal"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.p = p
+			c := newRadioCoordinator(p)
+			if err = c.enable(ctx); err != nil {
+				t.Fatal(err)
+			}
+			command := func(action, station, target string) radioCommand {
+				s := c.snapshot()
+				return radioCommand{ActionID: attentionUUID(), Action: action, StationID: station, TargetID: target,
+					ExpectedRevision: s.Revision, ExpectedProcessID: s.ProcessID,
+					ExpectedGeneration: s.Generation, ExpectedOwnerGeneration: s.OwnerGeneration}
+			}
+			start := command("start", "p3", "r1")
+			started, err := c.execute(ctx, start)
+			if err != nil || started.State != "playing" {
+				t.Fatalf("incumbent did not start: %+v %v", started, err)
+			}
+			c.refresh(ctx) // Record the latest playing Native revision.
+			incumbent, startFence := p.active, c.fence
+			if variant == "unresolved-stop" {
+				f.lose = "stop"
+				if _, err = c.execute(ctx, command("stop", "", "")); err == nil {
+					t.Fatal("unresolved STOP unexpectedly succeeded")
+				}
+				f.expiredStop = true // The result read cannot produce a positive STOP.
+			} else {
+				f.state.Observation = nil
+				c.refresh(ctx)
+			}
+			if s := c.snapshot(); s.State != "unknown" || len(s.Actions) != 0 {
+				t.Fatalf("loss of current source must withdraw all controls: %+v", s)
+			}
+
+			isolated := radioPrimaryIsolation{radioPrimarySession: f.session, Reason: primaryIsolationReason}
+			f.state.IsolatedSession = &isolated
+			f.state.Revision = "9"
+			f.state.Session = nil
+			f.state.Observation = &radioNativeObservation{
+				State: "stopped", SourceKind: "none", TargetID: "r1",
+				OwnerGeneration: started.OwnerGeneration, ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
+			}
+			switch variant {
+			case "no-proof":
+				f.state.IsolatedSession = nil
+			case "wrong-process":
+				f.state.Process = strings.Repeat("b", 64)
+			case "wrong-session":
+				isolated.Epoch = "5"
+			case "wrong-owner":
+				f.state.Observation.OwnerGeneration++
+			case "older-revision":
+				f.state.Revision = "8"
+			case "older-observation":
+				f.state.Observation.ObservedAt = p.primaryObservedAt - 1
+			case "missing-capability":
+				f.state.Missing = nil
+			case "closed-target":
+				f.state.Targets[0].Selectable = false
+			case "wrong-device":
+				f.state.Targets[0].HomePodID = "2"
+			case "stop-receipt":
+				cseq, action := 42, attentionUUID()
+				f.state.TeardownCSeq, f.state.ReleaseActionID, f.state.ReleasedSession = &cseq, &action, &f.session
+			case "restart":
+				restarted, err := newPrimaryRadioProducer(f, p.journal.directory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = newRadioCoordinator(restarted).enable(ctx); err == nil {
+					t.Fatal("fresh Manager implicitly adopted old local isolation")
+				}
+				return
+			}
+			f.calls = nil
+			c.refresh(ctx)
+			for _, call := range f.calls {
+				if call != "result" {
+					t.Fatalf("passive isolation dispatched an effect: %v", f.calls)
+				}
+			}
+			if variant != "exact" && variant != "restart-after-adoption" && variant != "different-target" {
+				if c.snapshot().State != "unknown" || p.active != incumbent || p.records[incumbent].SourceDrained {
+					t.Fatalf("invalid proof retired live custody: %+v", c.snapshot())
+				}
+				return
+			}
+			retired := p.records[incumbent]
+			if s := c.snapshot(); s.State != "stopped" || s.SourceKind != "none" || !slices.Contains(s.Actions, "start") ||
+				p.active != "" || !retired.SourceDrained || retired.Primary.Isolation == nil {
+				t.Fatalf("exact proof did not restore fresh start: %+v", s)
+			}
+			if retired.Primary.StopReceipt != nil || retired.Primary.ReleaseActionID != "" || retired.Primary.TeardownCSeq != 0 {
+				t.Fatal("local isolation created a positive STOP receipt")
+			}
+			if _, err = c.result(ctx, started.ProcessID, start.ActionID, startFence.Generation); err == nil {
+				t.Fatal("isolation changed the historical action result")
+			}
+			if _, err = c.execute(ctx, start); err == nil || len(f.calls) != 0 {
+				t.Fatal("an old action could replay")
+			}
+			switch variant {
+			case "restart-after-adoption":
+				restarted, err := newPrimaryRadioProducer(f, p.journal.directory)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f.state.IsolatedSession = nil
+				f.state.Revision = "10"
+				f.state.Observation = &radioNativeObservation{
+					State: "idle", SourceKind: "none", ObservedAt: radioTestNow() - 1, ValidUntil: radioTestNow() + 20,
+				}
+				if err = newRadioCoordinator(restarted).enable(ctx); err == nil {
+					t.Fatal("fresh Manager treated durable local isolation as restart authority")
+				}
+				return
+			case "different-target":
+				if _, err := c.execute(ctx, command("start", "p1", "r2")); err == nil || len(f.calls) != 0 {
+					t.Fatalf("local isolation authorized a different advertised target: err=%v calls=%v", err, f.calls)
+				}
+				return
+			}
+			ready := f.state
+			f.state.IsolatedSession = nil
+			f.state.Revision = "8"
+			if _, err = c.execute(ctx, command("start", "p1", "r1")); err == nil || len(f.calls) != 0 {
+				t.Fatal("older Native read authorized a fresh user choice")
+			}
+			f.state = ready
+			// The receiver returns a fresh session for the new, explicit start.
+			f.session.Operation = attentionUUID()
+			f.session.Epoch = "5"
+			next, err := c.execute(ctx, command("start", "p1", "r1"))
+			if err != nil || next.State != "playing" || next.StationID != "p1" ||
+				!reflect.DeepEqual(f.calls, []string{"reserve", "prepare_start", "start"}) {
+				t.Fatalf("new explicit choice did not take only the fresh start path: %+v %v calls=%v", next, err, f.calls)
+			}
+		})
 	}
 }

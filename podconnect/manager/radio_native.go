@@ -314,17 +314,27 @@ func (c *radioCoordinator) refresh(ctx context.Context) {
 	}
 	var o radioNativeObservation
 	if unknown {
-		reconciler, ok := b.(interface {
-			Reconcile(context.Context, radioFence) (radioReconciliation, error)
-		})
-		if !ok {
-			return
+		var isolationConfirmed bool
+		if isolated, ok := b.(interface {
+			observePrimaryIsolation(context.Context, radioFence) (radioNativeObservation, error)
+		}); ok {
+			var err error
+			o, err = isolated.observePrimaryIsolation(ctx, f)
+			isolationConfirmed = err == nil
 		}
-		r, e := reconciler.Reconcile(ctx, f)
-		if e != nil || !validRadioReconciliation(r, f, operation) {
-			return
+		if !isolationConfirmed {
+			reconciler, ok := b.(interface {
+				Reconcile(context.Context, radioFence) (radioReconciliation, error)
+			})
+			if !ok {
+				return
+			}
+			r, e := reconciler.Reconcile(ctx, f)
+			if e != nil || !validRadioReconciliation(r, f, operation) {
+				return
+			}
+			o = r.Observation
 		}
-		o = r.Observation
 	} else {
 		observer, ok := b.(interface {
 			Observe(context.Context) (radioNativeObservation, error)

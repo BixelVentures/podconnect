@@ -1,3 +1,8 @@
+## Speakers 0.26.87 — recover fresh music choices after radio loses its output
+
+- Allow a fresh radio or Spotify choice on the same speaker after the old radio sender is proven closed. Preserve the paused Spotify source until a new explicit action is accepted.
+- Keep the earlier Stop outcome unknown and require an independently verified new owner for subsequent playback control and station changes.
+
 ## Speakers 0.26.86 — restore Spotify and radio availability after restart
 
 - Read a confirmed local radio release on the next restart without restoring the old playback route.

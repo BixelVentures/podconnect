@@ -97,6 +97,10 @@ if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPEC
     prefix += "resume-"
 if os.getenv("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"):
     prefix += "held-teardown-"
+if os.getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS"):
+    if not primary_same_target:
+        raise SystemExit("control loss requires the same-target fixture")
+    prefix += "control-loss-"
 root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
 ready = root / (prefix + mode + "-ready.json")
 ready.unlink(missing_ok=True)
@@ -106,6 +110,13 @@ if env.get("PC_NATIVE_PRIMARY_HOLD_TEARDOWN"):
     release = ready.with_name(ready.stem + "-release")
     release.unlink(missing_ok=True)
     env["PC_NATIVE_PRIMARY_HOLD_TEARDOWN"] = str(release)
+if env.get("PC_NATIVE_PRIMARY_CONTROL_LOSS"):
+    disconnect = ready.with_name(ready.stem + "-disconnect")
+    disconnect.unlink(missing_ok=True)
+    env["PC_NATIVE_PRIMARY_CONTROL_LOSS"] = str(disconnect)
+    if not manager_primary:
+        env["PC_NATIVE_PRIMARY_STOP_RESTART"] = "1"
+        env["PC_NATIVE_PRIMARY_NEW_SELECTION"] = "1"
 if manager_primary:
     manager_bin = pathlib.Path(env.get("PC_PRIMARY_MANAGER_TEST_BIN", ""))
     if not manager_bin.is_absolute() or not manager_bin.is_file():
@@ -243,6 +254,11 @@ with (
         for marker in ("PASS pending park poll preceded exact Spotify TEARDOWN acknowledgment",
                        "PASS same-target authenticated RTP"):
             print(next(line for line in log.splitlines() if line.startswith(marker)))
+    if os.getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS") and not n.returncode and not c_status:
+        log = (root / (prefix + mode + "-c.log")).read_text().splitlines()
+        for marker in ("PASS fixture closed the exact P1 RTSP peer",
+                       "PASS control-loss authenticated RTP"):
+            print(next(line for line in log if line.startswith(marker)))
     if manager_primary and not n.returncode and not c_status:
         for line in (root / (prefix + mode + "-c.log")).read_text().splitlines():
             if line.startswith(("PASS configured Manager receiver windows", "PASS same-target authenticated RTP")):

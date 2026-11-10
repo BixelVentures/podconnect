@@ -122,9 +122,11 @@ type radioProducerRecord struct {
 	DrainTicket         json.RawMessage        `json:"drain_ticket,omitempty"`
 }
 type radioProducer struct {
-	primaryObservedAt int64 // Latest matching observation of the active primary session.
-	primary           radioPrimaryPort
-	physicalAccepted  bool
+	primaryIsolation        *radioPrimaryIsolationBinding
+	primaryObservedRevision uint64
+	primaryObservedAt       int64 // Latest matching observation of the active primary session.
+	primary                 radioPrimaryPort
+	physicalAccepted        bool
 	// A deployed worker proves runtime custody from the actual process. Physical
 	// acceptance remains separately reported; it is not fabricated at activation.
 	runtimeReadinessOnly bool
