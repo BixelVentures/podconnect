@@ -1125,10 +1125,10 @@ index 0000000..67c2f43
 +}
 diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
 new file mode 100644
-index 0000000..f011dc4
+index 0000000..dcf2c5c
 --- /dev/null
 +++ b/daemon/radio_primary_cold_test.go
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,361 @@
 +package daemon
 +
 +import (
@@ -1145,6 +1145,7 @@ index 0000000..f011dc4
 +	"time"
 +
 +	"github.com/devgianlu/go-librespot/output"
++	"github.com/devgianlu/go-librespot/player"
 +)
 +
 +func TestPrimaryRadioColdDetachmentPreservesJournalUntilExactReceipt(t *testing.T) {
@@ -1299,10 +1300,8 @@ index 0000000..f011dc4
 +	}
 +}
 +
-+func TestPrimaryRadioColdDetachmentActualOwnTone(t *testing.T) {
-+	if os.Getenv("PC_NATIVE_PRIMARY_COLD_COMPOSED") == "" {
-+		t.Skip("requires the isolated cold OwnTone fixture")
-+	}
++func testPrimaryRadioColdDetachmentActualOwnTone(t *testing.T, p *AppPlayer, worker *player.Player) {
++	t.Helper()
 +	journal, endpoint := os.Getenv("PC_NATIVE_COLD_RADIO_JOURNAL"), os.Getenv("PC_NATIVE_PRIMARY_HTTP_URL")
 +	fixture, fifo := os.Getenv("PC_NATIVE_START_URL"), os.Getenv("PC_NATIVE_START_PIPE")
 +	token := os.Getenv("PC_PRIMARY_HTTP_TOKEN")
@@ -1310,7 +1309,10 @@ index 0000000..f011dc4
 +		!radioWireLoopbackURL(fixture) || !volumeHex64.MatchString(token) {
 +		t.Fatal("missing isolated cold fixture inputs")
 +	}
-+	p, op := contentFixture(t)
++	process, valid := nativeContentProcess()
++	if !valid {
++		t.Fatal("requires a real current Native process certificate")
++	}
 +	app := p.app
 +	app.cfg.RadioHandoffStatePath = journal
 +	app.cfg.RadioHandoffControlToken = token
@@ -1330,7 +1332,7 @@ index 0000000..f011dc4
 +	}
 +	if h == nil || h.owner != nil || h.primary != nil || !app.radioOutputFence.Load() ||
 +		h.Primary == nil || h.PrimaryPark == nil || h.PrimaryPending == nil || h.PrimaryStatus == nil ||
-+		h.Request.ProcessID == radioProcessID(op.Capture.Process) ||
++		h.Request.ProcessID == radioProcessID(process) ||
 +		h.PrimaryStatus.Request.Station != "p1" || h.PrimaryAction != "" ||
 +		h.PrimaryPending.PriorRelease != nil && h.PrimaryPending.PriorRelease.radioPrimaryBinding == *h.Primary {
 +		t.Fatal("missing cold P1 journal with unresolved old receiver and preserved Spotify park")
@@ -1342,13 +1344,19 @@ index 0000000..f011dc4
 +	app.cfg.DeviceAliasRoomIDs = []string{room}
 +	app.cfg.DeviceAliasHomePodIDs = []string{device}
 +	p.initAliasRegistry()
-+	p.primaryStream = nil
-+	p.state.player.IsPlaying = false
-+	p.state.player.IsPaused = false
++	p.primaryStream, p.roomTransportOffer = nil, nil
++	p.primaryLoadOrdinal = 0
++	p.state.tracks, p.state.player.Track = nil, nil
++	p.state.player.SessionId = ""
++	p.state.active, p.state.player.IsPlaying, p.state.player.IsPaused = false, false, false
++	p.state.player.PositionAsOfTimestamp = 0
++	if source, err := worker.Start35CurrentSource(context.Background()); err != nil || source != nil || app.openedWriterOwner != nil {
++		t.Fatalf("new Native actor already has a source or writer: %v", err)
++	}
 +
 +	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 +	defer cancel()
-+	state := app.radioPrimaryReadiness(ctx, op.Capture.Process)
++	state := app.radioPrimaryReadiness(ctx, process)
 +	if state.ColdDetachment == nil || state.ColdDetachment.Session != prior || state.ColdDetachment.Target.Process == prior.Process ||
 +		state.ColdDetachment.Process != oldCommand.Process || state.ColdDetachment.Handoff != oldCommand.Handoff ||
 +		state.ColdDetachment.Generation != oldCommand.Owner || state.ColdDetachment.Room != room ||
@@ -1380,7 +1388,7 @@ index 0000000..f011dc4
 +		}
 +	}()
 +	defer func() { close(actor); <-done }()
-+	state = app.radioPrimaryReadiness(ctx, op.Capture.Process)
++	state = app.radioPrimaryReadiness(ctx, process)
 +	if state.ColdDetachment == nil || *state.ColdDetachment != proof || state.Observation == nil ||
 +		state.Observation.Source != "none" || state.Observation.State != "idle" ||
 +		state.Protocol != "primary" || len(state.Missing) != 0 || len(state.Targets) != 1 || !state.Targets[0].Selectable ||
@@ -1392,8 +1400,49 @@ index 0000000..f011dc4
 +	if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
 +		t.Fatal("the previous Native process replayed its radio result")
 +	}
++	pollRTP := func(expect func(before, radio int) bool) {
++		t.Helper()
++		for ctx.Err() == nil {
++			request, _ := http.NewRequestWithContext(ctx, http.MethodGet, fixture+"/fixture/rtp", nil)
++			response, err := http.DefaultClient.Do(request)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var rtp struct {
++				Before int `json:"primary_before"`
++				Radio  int `json:"primary_radio"`
++			}
++			err = json.NewDecoder(response.Body).Decode(&rtp)
++			response.Body.Close()
++			if err != nil || response.StatusCode != http.StatusOK {
++				t.Fatal("missing fresh receiver observation", err)
++			}
++			if expect(rtp.Before, rtp.Radio) {
++				return
++			}
++			time.Sleep(20 * time.Millisecond)
++		}
++		t.Fatal("fresh action produced no authenticated loopback RTP")
++	}
++	if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY") != "" {
++		if os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") == "" {
++			t.Fatal("cold Spotify test requires the selected offline media fixture")
++		}
++		testPrimaryNewSpotifySelection(t, ctx, p, worker, nil, h.PrimaryPark.Owner, func() {
++			if p.primaryStream != nil || app.openedWriterOwner != nil {
++				t.Fatal("staging a fresh Spotify choice reopened the old writer")
++			}
++		})
++		pollRTP(func(before, radio int) bool { return before > 0 && radio == 0 })
++		state = app.radioPrimaryReadiness(ctx, process)
++		if state.Observation == nil || state.Observation.Source != "spotify" ||
++			state.Observation.State != "playing" || state.Observation.Target != room || state.Protocol != "primary" {
++			t.Fatal("fresh Spotify START did not own current output after cold detachment")
++		}
++		t.Log("fresh explicit Spotify START acquired the new C output and delivered authenticated RTP")
++	}
 +	if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_RADIO") != "" {
-+		q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(op.Capture.Process),
++		q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(process),
 +			Handoff: "af124cc3-29d2-4d15-9c6d-dca284a02fe1", Action: "32dc86c8-c852-4df7-bb7a-4656f3fae1a4",
 +			Generation: strconv.FormatUint(app.radio.Generation+1, 10), Target: room, Intent: state.Revision}
 +		ask := func(r radioPrimaryCommand) radioPrimaryReply {
@@ -1405,43 +1454,29 @@ index 0000000..f011dc4
 +			}
 +			return ack
 +		}
++		settle := func(q radioPrimaryCommand) radioPrimaryReply {
++			ack := ask(q)
++			q.Phase, q.ForPhase = "result", q.Phase
++			for ack.Phase == "pending" && ctx.Err() == nil {
++				time.Sleep(20 * time.Millisecond)
++				ack = ask(q)
++			}
++			return ack
++		}
 +		q.Owner = ask(q).Owner
 +		q.Phase, q.Station = "prepare_start", "p6-beat"
-+		if ask(q).Phase != "prepared" {
++		if settle(q).Phase != "prepared" {
 +			t.Fatal("fresh decoder admission did not prepare")
 +		}
 +		q.Phase = "start"
-+		playing := ask(q)
-+		q.Phase, q.ForPhase = "result", "start"
-+		for playing.Phase == "pending" && ctx.Err() == nil {
-+			time.Sleep(20 * time.Millisecond)
-+			playing = ask(q)
-+		}
++		playing := settle(q)
 +		if playing.Phase != "playing" || playing.Session == nil || playing.Session.Process != proof.Target.Process ||
 +			playing.Session.DeviceID != device || playing.Session.Operation != q.Action || *playing.Session == prior {
 +			t.Fatal("explicit fresh start did not acquire distinct current C receiver custody")
 +		}
-+		for ctx.Err() == nil {
-+			request, _ := http.NewRequestWithContext(ctx, http.MethodGet, fixture+"/fixture/rtp", nil)
-+			response, err := http.DefaultClient.Do(request)
-+			if err != nil {
-+				t.Fatal(err)
-+			}
-+			var rtp struct {
-+				Radio int `json:"primary_radio"`
-+			}
-+			err = json.NewDecoder(response.Body).Decode(&rtp)
-+			response.Body.Close()
-+			if err != nil || response.StatusCode != http.StatusOK {
-+				t.Fatal("missing fresh receiver observation", err)
-+			}
-+			if rtp.Radio > 0 {
-+				break
-+			}
-+			time.Sleep(20 * time.Millisecond)
-+		}
-+		if ctx.Err() != nil {
-+			t.Fatal("fresh station produced no authenticated loopback RTP")
++		pollRTP(func(_, radio int) bool { return radio > 0 })
++		if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
++			t.Fatal("old radio result reached the fresh station")
 +		}
 +	}
 +	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, fixture+"/fixture/done", strings.NewReader("{}"))
@@ -3385,10 +3420,10 @@ index 0000000..be5442a
 +}
 diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
 new file mode 100644
-index 0000000..e7c0825
+index 0000000..abf9d3e
 --- /dev/null
 +++ b/daemon/radio_primary_same_composed_test.go
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,552 @@
 +package daemon
 +
 +import (
@@ -3871,8 +3906,9 @@ index 0000000..e7c0825
 +		t.Fatalf("new Spotify content offer while radio plays returned HTTP %d: %v", rec.Code, err)
 +	}
 +	op := server.roomContents.get(control.Offer.OfferID, control.Offer.BindingID)
-+	if op == nil || op.Radio == nil || !op.Radio.Primary {
-+		t.Fatal("new Spotify offer lost the incumbent primary radio custody")
++	if op == nil || (incumbent == nil && op.Radio != nil) ||
++		(incumbent != nil && (op.Radio == nil || !op.Radio.Primary)) {
++		t.Fatal("new Spotify offer did not preserve the verified predecessor state")
 +	}
 +
 +	const selectedURI = "spotify:track:0000000000000000000004"
@@ -3911,7 +3947,7 @@ index 0000000..e7c0825
 +		case <-tick.C:
 +		}
 +	}
-+	if fresh == incumbent || fresh.Source == incumbent.Source || fresh.Media == nil || fresh.Media.Id().Uri() != selectedURI {
++	if fresh == incumbent || incumbent != nil && fresh.Source == incumbent.Source || fresh.Media == nil || fresh.Media.Id().Uri() != selectedURI {
 +		t.Fatal("prepared Spotify media is not the explicitly selected new track")
 +	}
 +	whileStaged()
@@ -4461,7 +4497,7 @@ index d00748f..6d61f49 100644
  	time.AfterFunc(5*time.Second, func() {
  		op.mu.Lock()
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index f4ee0c5..629aae7 100644
+index f4ee0c5..8c37e47 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -50,6 +50,17 @@ import (
@@ -4513,7 +4549,18 @@ index f4ee0c5..629aae7 100644
  				if strings.HasPrefix(mode, "episode-") {
  					configureSelectedStage(t, p, options, mode)
  				} else {
-@@ -755,12 +772,17 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -716,6 +733,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			}
+ 			defer worker.Close()
+ 			p.player = worker
++			if mode == "actual-c-primary-same-target" && os.Getenv("PC_NATIVE_PRIMARY_COLD_COMPOSED") != "" {
++				testPrimaryRadioColdDetachmentActualOwnTone(t, p, worker)
++				return
++			}
+ 			bootEmpty := os.Getenv("PC_NATIVE_RADIO_HTTP_BOOT_EMPTY")
+ 			if bootEmpty != "" && (bootEmpty != "1" || mode != "actual-c-radio-http" || os.Getenv("PC_NATIVE_RADIO_HTTP_SELECTED_PROVIDER") != "1" || os.Getenv("PC_NATIVE_RADIO_HTTP_EXPECT_RETURN") != "selected") {
+ 				t.Fatal("boot-empty wire mode requires actual radio HTTP, selected offline provider and explicit selected return")
+@@ -755,12 +776,17 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					source.eofFile = os.Getenv("PC_NATIVE_START_EOF_FILE")
  				}
  			}
@@ -4533,7 +4580,7 @@ index f4ee0c5..629aae7 100644
  				if e != nil {
  					t.Fatal(e)
  				}
-@@ -1040,7 +1062,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -1040,7 +1066,7 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			} else {
  				_, err = p.startPreparedDealerTransfer(ctx, paused, position)
  			}
@@ -4542,7 +4589,7 @@ index f4ee0c5..629aae7 100644
  			if good {
  				if err != nil {
  					if external && actualOutput != nil {
-@@ -1241,6 +1263,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -1241,6 +1267,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			if mode == "actual-c-radio-http" {
  				testServeActualRadioHTTP(t, p, worker, stream)
  			}
@@ -4552,7 +4599,7 @@ index f4ee0c5..629aae7 100644
  			if external && mode != "actual-c-radio-http" {
  				reply, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
  				if e != nil {
-@@ -1380,41 +1405,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1380,41 +1409,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  	if mode == "episode-commit" {
  		selectedHomePod = "202"
  	}
@@ -4615,7 +4662,7 @@ index f4ee0c5..629aae7 100644
  		raw, _ := json.Marshal(request)
  		rec := httptest.NewRecorder()
  		server.handleContentPrepare(rec, httptest.NewRequest("POST", "/player/room_content/prepare", bytes.NewReader(raw)))
-@@ -1427,28 +1440,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1427,28 +1444,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			phase, stagedStream := op.State, op.Stream
  			op.mu.Unlock()
  			if phase == "staged" && stagedStream != nil {
@@ -4714,7 +4761,7 @@ index f4ee0c5..629aae7 100644
  	if err == nil {
  		t.Fatal("expected unsupported noop")
  	}
-@@ -1456,6 +1535,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1456,6 +1539,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
  		t.Fatal("selected state not observed", err)
  	}
@@ -4731,7 +4778,7 @@ index f4ee0c5..629aae7 100644
  	if mode == "actual-c-selected-rtp" {
  		until := time.Now().Add(7 * time.Second)
  		client := &http.Client{Timeout: time.Second}
-@@ -1477,6 +1566,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1477,6 +1570,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			}
  			if observed.AudioPackets > 0 {
  				t.Logf("actual selected PCM reached C output and private peer as %d audio RTP packet(s)", observed.AudioPackets)
@@ -4741,7 +4788,7 @@ index f4ee0c5..629aae7 100644
  				break
  			}
  			if time.Now().After(until) {
-@@ -1711,7 +1803,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1711,7 +1807,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  	if len(episode) > 0 && episode[0] == "episode-commit" {
  		mediaBytes = selectedSustainedFLAC
  	}
