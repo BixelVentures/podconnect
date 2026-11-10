@@ -33,7 +33,7 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 		advertised = advertised || errors.Is(err, errRadioPrimaryAdvertised)
 		olderC := err == nil && state.Schema == primaryRadioSchema && state.Protocol == "v1" &&
 			producerHex(state.Process, 64) && producerCounter(state.Revision, true) &&
-			state.Observation == nil && state.Session == nil
+			state.Observation == nil && state.Session == nil && state.ColdDetachment == nil
 		if !advertised && (errors.Is(err, errRadioPrimaryUnsupported) || olderC) {
 			expectedProcess := ""
 			if olderC {
