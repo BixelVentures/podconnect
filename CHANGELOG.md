@@ -1,3 +1,8 @@
+## Speakers 0.26.86 — restore Spotify and radio availability after restart
+
+- Read a confirmed local radio release on the next restart without restoring the old playback route.
+- Recover availability after an interrupted Spotify start before the audio route opened, once the new process proves exclusive ownership and an idle audio pipe. Preserve the old result as unknown and require a fresh request to play.
+
 ## Speakers 0.26.85 — show the outcome of an audio-engine rescan
 
 - Show accepted, blocked and unknown results from Rescan without retrying the operation. Keep the result visible while the speaker list refreshes.
