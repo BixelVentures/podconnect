@@ -3223,7 +3223,7 @@ index dae3206db01217fed6a2efc9a784dba644826e82..0c3162530a52e34453fa416e0e214b1b
    d=outputs_device_get(id);
    if(d && (d->selected || d->session))return 1;
 diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
-index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036d6839730 100644
+index bcf702fb9c3564e749d05b94ecbeab1543816078..2ea4117f7abef0072a1ab9e05b55b841d381589d 100644
 --- a/src/outputs_radio_handoff.inc.c
 +++ b/src/outputs_radio_handoff.inc.c
 @@ -4,17 +4,23 @@
@@ -3271,7 +3271,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
    if(s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_CONNECTING || s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_ROUTE_READY || s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_BARRIER_READY)
      return !stop && generation==s->result.effect_generation;
    return stop && s->result.phase==OUTPUT_RADIO_STOPPING && generation==s->result.effect_generation;
-@@ -148,6 +156,24 @@ static bool radio_handoff_uuid(const char *s)
+@@ -148,6 +156,47 @@ static bool radio_handoff_uuid(const char *s)
    for(i=0;i<36;i++)if((i==8||i==13||i==18||i==23)?s[i]!='-':!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')))return false;
    return true;
  }
@@ -3280,6 +3280,29 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
 +{
 +  return !strcmp(r->sender_peer, RADIO_PRIMARY_SPOTIFY_PARK_PEER)
 +      && !memcmp(r->receiver_key_digest, (char[65]) { 0 }, sizeof(r->receiver_key_digest));
++}
++
++/* The startup normalizer writes this receipt after transferring custody to
++ * the independent START journal. Only historical identity survives. */
++static bool
++radio_primary_park_released(const struct output_radio_handoff_result *saved)
++{
++  const struct output_radio_reacquire_result *resume = &saved->resume;
++  struct output_radio_reacquire_result normalized;
++
++  if (!saved->effect_generation || saved->stop_code != 200 || saved->stop_cseq <= 0
++      || !radio_handoff_uuid(resume->command.intent_id)
++      || resume->command.native_revision <= saved->command.native_revision
++      || resume->command.native_revision == UINT64_MAX)
++    return false;
++
++  memset(&normalized, 0, sizeof(normalized));
++  normalized.phase = OUTPUT_RADIO_REACQUIRE_UNKNOWN;
++  memcpy(normalized.command.intent_id, resume->command.intent_id, sizeof(normalized.command.intent_id));
++  normalized.command.native_revision = resume->command.native_revision;
++  return !memcmp(resume, &normalized, sizeof(normalized))
++      && !memcmp(saved->suspended_signature, (char[sizeof(saved->suspended_signature)]) { 0 },
++          sizeof(saved->suspended_signature));
 +}
 +
 +static bool
@@ -3296,7 +3319,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
  static bool radio_handoff_equal(const struct output_radio_handoff_request *a,const struct output_radio_handoff_request *b,bool token)
  {
    return a && b && native_owner_equal(&a->native_owner,&b->native_owner)
-@@ -219,14 +245,39 @@ static void radio_handoff_startup(void)
+@@ -219,14 +268,40 @@ static void radio_handoff_startup(void)
          || !memchr(r->sender_peer,0,sizeof(r->sender_peer)) || !r->identity.device_id || !r->generation
          || !radio_handoff_uuid(r->handoff_id) || !transport_hex(r->token,32)
          || !radio_native_source_owner_valid(&r->native_owner) || !radio_handoff_uuid(r->radio_process)
@@ -3310,7 +3333,8 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
 +        && (strcmp(r->radio_process, r->identity.process) || !saved->requires_native_pause
 +            || (saved->phase != OUTPUT_RADIO_PREPARED && saved->phase != OUTPUT_RADIO_STOPPING
 +                && saved->phase != OUTPUT_RADIO_SUSPENDED && saved->phase != OUTPUT_RADIO_UNKNOWN
-+                && saved->phase != OUTPUT_RADIO_REACQUIRED)
++                && saved->phase != OUTPUT_RADIO_REACQUIRED && saved->phase != OUTPUT_RADIO_RELEASED)
++            || (saved->phase == OUTPUT_RADIO_RELEASED && !radio_primary_park_released(saved))
 +            || (saved->phase == OUTPUT_RADIO_SUSPENDED && (saved->stop_code != 200 || saved->stop_cseq <= 0))))
 +      goto fault;
      /* A terminal record was written only after the current radio drain ticket
@@ -3338,7 +3362,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
        struct output_radio_reacquire_result *v=&saved->resume;
        if(!memchr(v->command.challenge,0,sizeof(v->command.challenge))
            || !memchr(v->command.drain_signature,0,sizeof(v->command.drain_signature))
-@@ -241,7 +292,20 @@ static void radio_handoff_startup(void)
+@@ -241,7 +316,20 @@ static void radio_handoff_startup(void)
        released=true;retired=true;
      }
      radio_handoffs[i].used=true;saved->phase=released?OUTPUT_RADIO_RELEASED:OUTPUT_RADIO_UNKNOWN;
@@ -3359,7 +3383,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
      memset(radio_handoffs[i].result.suspended_signature,0,sizeof(radio_handoffs[i].result.suspended_signature));
    }
    json_object_put(root);free(value);
-@@ -276,17 +340,40 @@ static void radio_handoff_finalize(struct radio_handoff_slot *s)
+@@ -276,17 +364,40 @@ static void radio_handoff_finalize(struct radio_handoff_slot *s)
    RH_REQUIRE(r->identity.session_epoch!=UINT64_MAX&&d->session_epoch==r->identity.session_epoch+1,"finalize_session_epoch");
    RH_REQUIRE(outputs[d->type]->device_start_drained&&outputs[d->type]->device_start_drained(d),"finalize_contexts_pending");
    RH_REQUIRE(start_process_current(&r->writer.native_process),"finalize_native_process");
@@ -3408,7 +3432,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
    }
    s->result.phase=OUTPUT_RADIO_SUSPENDED;
    if(radio_handoff_save()<0)radio_handoff_fail(s,"finalize_durable_save");
-@@ -297,7 +384,7 @@ void outputs_radio_handoff_teardown(uint64_t id,uint64_t incarnation,uint64_t ep
+@@ -297,7 +408,7 @@ void outputs_radio_handoff_teardown(uint64_t id,uint64_t incarnation,uint64_t ep
    if(!s || s->result.phase!=OUTPUT_RADIO_STOPPING || s->session!=session
        || s->result.command.identity.device_incarnation!=incarnation || s->result.command.identity.session_epoch!=epoch)return;
    s->result.stop_code=code;s->result.stop_cseq=cseq;
@@ -3417,7 +3441,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
    if(!s->stop_accepted)radio_handoff_fail(s,"stop_not_accepted");
    else radio_handoff_finalize(s);
  }
-@@ -321,16 +408,23 @@ static void radio_handoff_stop_cb(struct output_device *device,enum output_devic
+@@ -321,16 +432,23 @@ static void radio_handoff_stop_cb(struct output_device *device,enum output_devic
  }
  /* action: 0 prepare, 1 confirm, 2 state, 3 reacquire (currently unavailable).
   * Neither prepare nor state changes the native App/queue/decoder. */
@@ -3443,7 +3467,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
    if(s && action==0 && (s->result.phase==OUTPUT_RADIO_RELEASED || s->result.phase==OUTPUT_RADIO_REACQUIRED)){
      if(!strcmp(r->handoff_id,s->result.command.handoff_id) || s->result.effect_generation==UINT64_MAX)return -1;
    }else if(s){
-@@ -340,9 +434,9 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -340,9 +458,9 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
    /* A declared user resume or sender STOP boolean is never sufficient. */
    if(action==3)return -1;
    if(action==0){
@@ -3456,7 +3480,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
          || !transport_identity_equal(&r->identity,&actual)
          || !radio_source_owner_current(&r->native_owner,&r->writer,&actual)
          || !radio_queue_writer_current(&r->writer,&actual,NULL)
-@@ -351,6 +445,12 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -351,6 +469,12 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
          || !outputs[d->type]->device_start_drained || !outputs[d->type]->device_start_drained(d)
          || d->incarnation!=actual.device_incarnation || d->session_epoch!=actual.session_epoch || !d->base_revision
          || db_attention_base_get(d->id,&manual_base)!=0 || manual_base!=d->volume || manual_base!=r->initial_volume_percent)return -1;
@@ -3469,7 +3493,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
      for(i=0;i<ARRAY_SIZE(outputs_cb_register);i++)if(outputs_cb_register[i].device==d && outputs_cb_register[i].cb && outputs_cb_register[i].ready)return -1;
      if(!s)for(i=0;i<ARRAY_SIZE(radio_handoffs);i++)if(!radio_handoffs[i].used){s=&radio_handoffs[i];break;}
      if(!s)return -1;
-@@ -362,7 +462,8 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -362,7 +486,8 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
      memset(s,0,sizeof(*s));s->previous_source=previous;s->previous_session=previous_session;s->previous_pcm_generation=previous_generation;s->result.effect_generation=next_effect;s->used=true;s->result.command=*r;s->result.phase=OUTPUT_RADIO_PREPARED;s->session=d->session;
      s->result.requires_native_pause=true;
      struct output_device *other;
@@ -3479,7 +3503,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
      unsigned char random[16];static const char hex[]="0123456789abcdef";gcry_randomize(random,sizeof(random),GCRY_STRONG_RANDOM);
      for(i=0;i<sizeof(random);i++){s->result.command.token[i*2]=hex[random[i]>>4];s->result.command.token[i*2+1]=hex[random[i]&15];}
      s->result.command.token[32]=0;
-@@ -388,10 +489,23 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -388,10 +513,23 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
      RC_REQUIRE(radio_transport_identity_get(d->id,&actual,true)==0,"confirm_route_unavailable");
      RC_REQUIRE(transport_identity_equal(&r->identity,&actual),"confirm_route_changed");
      RC_REQUIRE(outputs[d->type]->device_start_drained(d),"confirm_contexts_pending");
@@ -3504,7 +3528,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..04dc1ffda635ef4537aa66391a396036
      radio_stop_scope=d->id;
      int ret=outputs_device_stop(d,radio_handoff_stop_cb);
      radio_stop_scope=0;
-@@ -400,3 +514,225 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -400,3 +538,225 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
    radio_handoff_finalize(s);
    *out=s->result;return 0;
  }
@@ -6668,7 +6692,7 @@ index d9560b42190217ed8a1135c7f5a555e9676ae851..539da885cb2dbd4238f52d502ec30244
      assert(outputs_attention_startup() == 0);
  
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523d6e92444 100644
+index 40ebe09716eb4c4b19b08356268f8447f913088c..a416cc99bae271af5d94724832de08cd8f572e5c 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -1315,6 +1315,13 @@ struct native_start_wire {
@@ -7236,7 +7260,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
      pb_timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_CLOEXEC|TFD_NONBLOCK);
      assert(pb_timer_fd>=0);
      pb_timer_ev=event_new(f.base,pb_timer_fd,EV_READ|EV_PERSIST,playback_cb,NULL);
-@@ -2786,7 +3206,411 @@ static int start35_wire_case(int mode)
+@@ -2786,7 +3206,465 @@ static int start35_wire_case(int mode)
      fifo_live_reader_handoff_case(item,r->expected_input_path);
      puts("PASS actual START35 full fresh successor preserves gated route callback across real starvation; route35/open/completed and ordinary open-gate starvation remain correct");
    }
@@ -7455,6 +7479,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
 +      struct output_primary_spotify_return_request back = { 0 };
 +      struct output_primary_spotify_return_result returned;
 +      bool return_route = getenv("PC_PRIMARY_SPOTIFY_RETURN") != NULL;
++      struct output_radio_handoff_result opened_return = { 0 };
 +      if (return_route)
 +        {
 +          back.park = exact;
@@ -7534,6 +7559,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
 +              assert(outputs_primary_spotify_return(OUTPUT_PRIMARY_SPOTIFY_RETURN_OPEN, &back, &returned) == 0
 +                  && returned.phase == OUTPUT_RADIO_REACQUIRE_OPENED && !returned.newly_opened
 +                  && f.pc70_peer_sessions == radio_sessions + 1);
++              opened_return = radio_handoff_find(f.device->id)->result;
 +              assert(!close(writer));
 +              writer = -1;
 +              assert(outputs_primary_radio_spotify_owner(f.device->id, &exact.owner, &back.current_writer, &observed_owner) < 0);
@@ -7555,6 +7581,58 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
 +          && outputs_primary_spotify_park(OUTPUT_PRIMARY_SPOTIFY_PARK_RESULT, &exact, &result) == 0
 +          && result.phase == OUTPUT_PRIMARY_SPOTIFY_PARK_UNKNOWN
 +          && outputs_radio_handoff_blocked(f.device->id));
++      if (opened_return.phase == OUTPUT_RADIO_REACQUIRED)
++        {
++          struct radio_handoff_slot *slot = radio_handoff_find(f.device->id);
++          assert(slot && opened_return.resume.phase == OUTPUT_RADIO_REACQUIRE_OPENED);
++          slot->result = opened_return;
++          struct output_start_request successor = {
++            .device_id = f.device->id,
++            .native_revision = opened_return.resume.command.native_revision + 1,
++            .old_native_owner = opened_return.resume.command.intended_native_owner,
++          };
++          snprintf(successor.token, sizeof(successor.token), "%032x", 1);
++          assert(outputs_radio_reacquire_start_delegated(&successor) == 0);
++          assert(slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_DELEGATED);
++          radio_handoff_startup();
++          slot = radio_handoff_find(f.device->id);
++          assert(!radio_handoff_fault && slot && slot->result.phase == OUTPUT_RADIO_RELEASED);
++          assert(slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_UNKNOWN);
++          puts("primary Spotify delegated park normalized on first durable load");
++          char *normalized = strdup(radio_handoff_journal_expected);
++          assert(normalized);
++          radio_handoff_startup();
++          slot = radio_handoff_find(f.device->id);
++          assert(!radio_handoff_fault && slot && slot->result.phase == OUTPUT_RADIO_RELEASED);
++          assert(slot->result.resume.phase == OUTPUT_RADIO_REACQUIRE_UNKNOWN);
++          assert(!slot->resume_session && !slot->result.resume.writer_barrier_verified);
++          assert(!strcmp(radio_handoff_journal_expected, normalized));
++          free(normalized);
++          puts("PASS terminal primary Spotify park survives a second durable load without route authority");
++
++          struct output_radio_handoff_result released = slot->result;
++          const size_t index = slot - radio_handoffs;
++          for (int invalid = 0; invalid < 3; invalid++)
++            {
++              if (invalid == 0)
++                slot->result.stop_cseq = 0;
++              else if (invalid == 1)
++                slot->result.resume.command.native_revision = slot->result.command.native_revision;
++              else
++                slot->result.resume.writer_barrier_verified = true;
++              assert(radio_handoff_save() == 0);
++              radio_handoff_startup();
++              assert(radio_handoff_fault && outputs_radio_handoff_blocked(f.device->id));
++              slot = &radio_handoffs[index];
++              slot->used = true;
++              slot->result = released;
++              assert(radio_handoff_save() == 0);
++              radio_handoff_startup();
++              slot = radio_handoff_find(f.device->id);
++              assert(!radio_handoff_fault && slot && slot->result.phase == OUTPUT_RADIO_RELEASED);
++            }
++          puts("PASS missing STOP, stale intent and live writer claim still quarantine terminal primary park");
++        }
 +      puts("PASS one decoded worker consumes exact Spotify park and sends RTP on the same target, then exact STOP drains only radio");
 +    }
 +  if (!f.failed && primary_station)
@@ -7649,7 +7727,7 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..f61dfaab16ce368834f68c311b0f7523
   cleanup:
    if(mode==29){
      event_free(keep_alive_timer);keep_alive_timer=NULL;
-@@ -2794,6 +3618,20 @@ static int start35_wire_case(int mode)
+@@ -2794,6 +3672,20 @@ static int start35_wire_case(int mode)
    }
    if((mode==18 || mode==26 || mode==27 || mode==28 || mode==29) && pb_timer_ev){event_free(pb_timer_ev);pb_timer_ev=NULL;close(pb_timer_fd);}
    while(airplay_sessions)session_cleanup(airplay_sessions);
