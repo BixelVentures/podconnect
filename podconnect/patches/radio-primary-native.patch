@@ -1125,13 +1125,14 @@ index 0000000..67c2f43
 +}
 diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
 new file mode 100644
-index 0000000..0194b46
+index 0000000..6c69ca2
 --- /dev/null
 +++ b/daemon/radio_primary_cold_test.go
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,433 @@
 +package daemon
 +
 +import (
++	"bytes"
 +	"context"
 +	"encoding/json"
 +	"net/http"
@@ -1145,6 +1146,7 @@ index 0000000..0194b46
 +	"testing"
 +	"time"
 +
++	"github.com/devgianlu/go-librespot/mpris"
 +	"github.com/devgianlu/go-librespot/output"
 +	"github.com/devgianlu/go-librespot/player"
 +)
@@ -1375,20 +1377,37 @@ index 0000000..0194b46
 +		t.Fatal("exact cold marker was not persisted independently of actor identity")
 +	}
 +
-+	app.currentAPI, app.currentDone = make(chan ApiRequest), make(chan struct{})
++	api, err := NewApiServer(app.log, "127.0.0.1", 0, "", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := api.(*ConcreteApiServer)
++	defer server.Close()
++	app.server, app.mpris = server, mpris.DummyServer{}
++	p.prefetchTimer = time.NewTimer(time.Hour)
++	defer p.prefetchTimer.Stop()
++	actorContext, stopActor := context.WithCancel(ctx)
++	app.currentPlayer, app.currentAPI, app.currentDone = p, make(chan ApiRequest), make(chan struct{})
 +	actor, done := app.currentAPI, app.currentDone
++	dispatchDone := make(chan struct{})
 +	go func() {
 +		defer close(done)
-+		for req := range actor {
-+			if req.Type != apiRadioPrimaryActorState {
-+				req.Reply(nil, ErrAliasConflict)
-+				continue
++		for {
++			select {
++			case <-actorContext.Done():
++				return
++			case req := <-actor:
++				if !p.dispatchAPIAndPark(actorContext, req) {
++					return
++				}
 +			}
-+			value, err := p.radioPrimaryActorState(ctx, req.Data.(radioPrimaryActorStateRequest))
-+			req.Reply(value, err)
 +		}
 +	}()
-+	defer func() { close(actor); <-done }()
++	go func() {
++		defer close(dispatchDone)
++		app.forwardAPI(actorContext)
++	}()
++	defer func() { stopActor(); <-dispatchDone; <-done }()
 +	state = app.radioPrimaryReadiness(ctx, process)
 +	if state.ColdDetachment == nil || *state.ColdDetachment != proof || state.Observation == nil ||
 +		state.Observation.Source != "none" || state.Observation.State != "idle" ||
@@ -1397,13 +1416,19 @@ index 0000000..0194b46
 +		t.Fatalf("current C idle owner was not independently observed (observation=%t, protocol=%s, missing=%v)",
 +			state.Observation != nil, state.Protocol, state.Missing)
 +	}
-+	if manager := os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN"); manager != "" && os.Getenv("PC_PRIMARY_MANAGER_COLD_DATA") != "" {
-+		testColdPrimaryManagerRead(t, ctx, app, manager)
++	manager, managerData := os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN"), os.Getenv("PC_PRIMARY_MANAGER_COLD_DATA")
++	var finishManager func()
++	if manager != "" && managerData != "" {
++		finishManager = startColdPrimaryManager(t, ctx, server, manager, managerData)
 +	}
-+	oldCommand.Phase, oldCommand.ForPhase, oldCommand.Station = "result", "start", "p1"
-+	if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
-+		t.Fatal("the previous Native process replayed its radio result")
++	askOld := func() {
++		t.Helper()
++		oldCommand.Phase, oldCommand.ForPhase, oldCommand.Station = "result", "start", "p1"
++		if _, err := app.primaryRadioActorAsk(ctx, apiRadioPrimaryActor, oldCommand); err == nil {
++			t.Fatal("the previous Native process replayed its radio result")
++		}
 +	}
++	askOld()
 +	pollRTP := func(expect func(before, radio int) bool) {
 +		t.Helper()
 +		for ctx.Err() == nil {
@@ -1436,7 +1461,7 @@ index 0000000..0194b46
 +			if p.primaryStream != nil || app.openedWriterOwner != nil {
 +				t.Fatal("staging a fresh Spotify choice reopened the old writer")
 +			}
-+		})
++		}, server)
 +		pollRTP(func(before, radio int) bool { return before > 0 && radio == 0 })
 +		state = app.radioPrimaryReadiness(ctx, process)
 +		if state.Observation == nil || state.Observation.Source != "spotify" ||
@@ -1445,13 +1470,23 @@ index 0000000..0194b46
 +		}
 +		t.Log("fresh explicit Spotify START acquired the new C output and delivered authenticated RTP")
 +	}
-+	if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_RADIO") != "" {
++	if finishManager != nil {
++		if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY") == "" {
++			t.Fatal("cold Manager fixture requires the fresh Spotify proof before radio")
++		}
++		if err := os.WriteFile(filepath.Join(managerData, "spotify-ready"), nil, 0600); err != nil {
++			t.Fatal(err)
++		}
++		finishManager()
++		pollRTP(func(_, radio int) bool { return radio > 0 })
++		askOld()
++	} else if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_RADIO") != "" {
 +		q := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: radioProcessID(process),
 +			Handoff: "af124cc3-29d2-4d15-9c6d-dca284a02fe1", Action: "32dc86c8-c852-4df7-bb7a-4656f3fae1a4",
 +			Generation: strconv.FormatUint(app.radio.Generation+1, 10), Target: room, Intent: state.Revision}
 +		ask := func(r radioPrimaryCommand) radioPrimaryReply {
 +			t.Helper()
-+			value, err := p.radioPrimaryActor(ctx, r)
++			value, err := app.primaryRadioActorAsk(ctx, apiRadioPrimaryActor, r)
 +			ack, ok := value.(radioPrimaryReply)
 +			if err != nil || !ok {
 +				t.Fatalf("fresh Native %s failed: %v", r.Phase, err)
@@ -1479,9 +1514,7 @@ index 0000000..0194b46
 +			t.Fatal("explicit fresh start did not acquire distinct current C receiver custody")
 +		}
 +		pollRTP(func(_, radio int) bool { return radio > 0 })
-+		if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
-+			t.Fatal("old radio result reached the fresh station")
-+		}
++		askOld()
 +	}
 +	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, fixture+"/fixture/done", strings.NewReader("{}"))
 +	response, err := http.DefaultClient.Do(request)
@@ -1495,36 +1528,39 @@ index 0000000..0194b46
 +	t.Log("actual C cold receipt retired old P1 without old STOP or replay; fresh owner independently proved")
 +}
 +
-+func testColdPrimaryManagerRead(t *testing.T, ctx context.Context, app *App, manager string) {
++func startColdPrimaryManager(t *testing.T, ctx context.Context, server *ConcreteApiServer, manager, directory string) func() {
 +	t.Helper()
-+	api, err := NewApiServer(app.log, "127.0.0.1", 0, "", "", "")
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	server := api.(*ConcreteApiServer)
-+	defer server.Close()
-+	prior := app.server
-+	app.server = server
-+	dispatchCtx, cancel := context.WithCancel(ctx)
-+	done := make(chan struct{})
-+	go func() {
-+		defer close(done)
-+		app.forwardAPI(dispatchCtx)
-+	}()
-+	defer func() {
-+		cancel()
-+		<-done
-+		app.server = prior
-+	}()
-+
 +	endpoint := "http://" + server.listener.Addr().String()
 +	cmd := exec.CommandContext(ctx, manager, "-test.v", "-test.timeout=18s", "-test.run", "^TestConfiguredPrimaryRadioColdDetachmentComposed$")
 +	cmd.Env = append(os.Environ(), "PC_PRIMARY_MANAGER_NATIVE_URL="+endpoint)
-+	result, err := cmd.CombinedOutput()
-+	t.Logf("cold Manager result:\n%s", result)
-+	if err != nil {
-+		t.Fatal("actual Manager did not reconcile the old P1 journal", err)
++	var log bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &log, &log
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
 +	}
++	result := make(chan error, 1)
++	go func() { result <- cmd.Wait() }()
++	finish := func(err error) {
++		t.Helper()
++		t.Logf("cold Manager result:\n%s", log.String())
++		if err != nil {
++			t.Fatal("actual Manager did not reconcile and start fresh P6", err)
++		}
++	}
++	for ctx.Err() == nil {
++		if _, err := os.Stat(filepath.Join(directory, "reconciled")); err == nil {
++			return func() { finish(<-result) }
++		}
++		select {
++		case err := <-result:
++			finish(err)
++			t.Fatal("cold Manager exited before observing exact historical closure")
++		case <-time.After(20 * time.Millisecond):
++		}
++	}
++	finish(<-result)
++	t.Fatal("cold Manager did not expose the reconciliation fixture marker")
++	return nil
 +}
 diff --git a/daemon/radio_primary_composed_test.go b/daemon/radio_primary_composed_test.go
 new file mode 100644
@@ -3456,10 +3492,10 @@ index 0000000..be5442a
 +}
 diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
 new file mode 100644
-index 0000000..ab6612a
+index 0000000..211ed45
 --- /dev/null
 +++ b/daemon/radio_primary_same_composed_test.go
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,564 @@
 +package daemon
 +
 +import (
@@ -3911,27 +3947,32 @@ index 0000000..ab6612a
 +// Use the ordinary public content offer/prepare/commit handlers with the real
 +// actor, guarded C START and existing inert provider decoder fixtures.
 +func testPrimaryNewSpotifySelection(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player,
-+	incumbent *player.Stream, owner roomTransportIdentity, whileStaged func()) {
++	incumbent *player.Stream, owner roomTransportIdentity, whileStaged func(), supplied ...*ConcreteApiServer) {
 +	t.Helper()
 +	app := p.app
-+	app.mpris = mpris.DummyServer{}
-+	server := &ConcreteApiServer{log: app.log, requests: make(chan ApiRequest)}
-+	app.server = server
-+	p.prefetchTimer = time.NewTimer(time.Hour)
-+	defer p.prefetchTimer.Stop()
-+	done := make(chan struct{})
-+	go func() {
-+		defer close(done)
-+		for req := range server.requests {
-+			if !p.dispatchAPIAndPark(ctx, req) {
-+				return
++	var server *ConcreteApiServer
++	if len(supplied) != 0 {
++		server = supplied[0]
++	} else {
++		app.mpris = mpris.DummyServer{}
++		server = &ConcreteApiServer{log: app.log, requests: make(chan ApiRequest)}
++		app.server = server
++		p.prefetchTimer = time.NewTimer(time.Hour)
++		defer p.prefetchTimer.Stop()
++		done := make(chan struct{})
++		go func() {
++			defer close(done)
++			for req := range server.requests {
++				if !p.dispatchAPIAndPark(ctx, req) {
++					return
++				}
 +			}
-+		}
-+	}()
-+	defer func() {
-+		close(server.requests)
-+		<-done
-+	}()
++		}()
++		defer func() {
++			close(server.requests)
++			<-done
++		}()
++	}
 +
 +	scope := roomVolumeScope{owner.AccountUserID, owner.TargetID, owner.RoomID, owner.HomePodID}
 +	query := url.Values{
