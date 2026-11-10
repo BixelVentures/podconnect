@@ -75,7 +75,7 @@ index 54674ed..9b3597f 100644
  		return false // Receiver-only custody never owns the retained global FIFO.
  	}
 diff --git a/daemon/radio_content_staging.go b/daemon/radio_content_staging.go
-index 6f1716a..5eab073 100644
+index 6f1716a..afcbaf7 100644
 --- a/daemon/radio_content_staging.go
 +++ b/daemon/radio_content_staging.go
 @@ -19,6 +19,8 @@ type radioContentStage struct {
@@ -193,7 +193,7 @@ index 6f1716a..5eab073 100644
  	defer p.app.radio.mu.Unlock()
  	h := p.app.radio.Holds[op.Radio.HoldTarget]
 +	if op.Radio.Primary {
-+		return !p.app.radio.failed && op.Radio.PrimaryReady && h == op.Radio.hold && primaryRadioReleased(h) && p.app.radio.Intent == op.Radio.ClaimIntent
++		return !p.app.radio.failed && op.Radio.PrimaryReady && h == op.Radio.hold && primaryRadioContentReady(h) && p.app.radio.Intent == op.Radio.ClaimIntent
 +	}
  	if p.app.radio.failed || h == nil || h != op.Radio.hold || p.app.radio.Intent != op.Radio.ClaimIntent {
  		return false
