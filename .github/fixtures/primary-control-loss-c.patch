@@ -1,0 +1,79 @@
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1352,7 +1352,7 @@
+   struct evhttp *http;
+   atomic_bool done,completed,retired;
+   atomic_bool reset_audio;
+-  bool primary_teardown_released;
++  bool primary_teardown_released, primary_control_closed;
+   atomic_int audio_packets;
+   atomic_int primary_selected_packets;
+   struct start_slot *primary_initial_start;
+@@ -1497,7 +1497,8 @@
+         else
+           atomic_fetch_add(&wire->primary_packets[primary_source], 1);
+       }
+-    if (primary_source == 1 && (getenv("PC_PRIMARY_MANAGER_TEST_BIN") || getenv("PC_NATIVE_PRIMARY_STOP_RESTART")))
++    if (primary_source == 1 && (getenv("PC_PRIMARY_MANAGER_TEST_BIN") || getenv("PC_NATIVE_PRIMARY_STOP_RESTART")
++        || getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS")))
+       {
+         if (wire->primary_radio_epoch != wire->primary_session_epoch)
+           {
+@@ -1762,6 +1763,28 @@
+       if (f->failed)
+ 	return;
+   }
++  const char *lose_control = getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS");
++  if (lose_control && !wire->primary_control_closed && access(lose_control, F_OK) == 0
++      && atomic_load(&wire->primary_radio_packets[1]) > 0)
++    {
++      struct airplay_session *session = f->device->session;
++      const struct primary_radio_decode *decoder = session ? session->primary_radio_decoder : NULL;
++      const struct radio_handoff_slot *park = radio_handoff_find(f->device->id);
++      struct output_primary_radio_custody active;
++      if (!f->peer || f->teardowns != 2 || f->pc70_peer_sessions != 3 || !primary_radio_live(session)
++          || !decoder || !decoder->operation || strcmp(decoder->operation->request.station, "p1")
++          || !park || !primary_spotify_park_writer_closed(park)
++          || outputs_primary_radio_custody_read(f->device->id, &active) != 1
++          || !outputs_primary_radio_session_equal(&active, &park->primary_route)
++          || active.stop_action[0] || active.teardown_cseq)
++        {
++          recovery_wire_fail(f, "control loss requires the exact live P1 receiver and no claimed Stop");
++          return;
++        }
++      wire->primary_control_closed = true;
++      primary_radio_wire_receiver_reset(f);
++      fprintf(stderr, "PASS fixture closed the exact P1 RTSP peer after authenticated RTP and before any Stop\n");
++    }
+   if(!atomic_load(&wire->done)){evtimer_add(f->poll,&soon);return;}
+   if (getenv("PC_NATIVE_PRIMARY_HTTP_PORT"))
+     {
+@@ -1776,6 +1799,28 @@
+       int before = atomic_load(&wire->primary_packets[0]);
+       int radio = atomic_load(&wire->primary_packets[1]);
+       int after = atomic_load(&wire->primary_packets[2]);
++      if (lose_control)
++        {
++          const int selected = atomic_load(&wire->primary_selected_packets);
++          const struct airplay_session *session = f->device->session;
++          const struct primary_radio_decode *decoder = session ? session->primary_radio_decoder : NULL;
++          if (!wire->primary_control_closed || before < 1 || radio < 1 || (manager ? after < 1 : after != 0)
++              || atomic_load(&wire->primary_radio_packets[0]) < 1
++              || atomic_load(&wire->primary_radio_packets[1]) < 1
++              || atomic_load(&wire->primary_radio_packets[2]) < 1
++              || f->pc70_peer_sessions != (manager ? 5 : 6) || f->teardowns != 3
++              || (!manager && (selected < 1 || !start_active || start_active->result.phase != OUTPUT_START_COMPLETED
++                  || !primary_radio_live(session) || !decoder || !decoder->operation
++                  || strcmp(decoder->operation->request.station, "p6-beat"))))
++            {
++              recovery_wire_fail(f, "control-loss successor route or authenticated RTP windows differ");
++              return;
++            }
++          fprintf(stderr, "PASS control-loss authenticated RTP old=%d radio=%d selected=%d sessions=%d teardowns=%d\n",
++              before, radio, selected, f->pc70_peer_sessions, f->teardowns);
++          event_base_loopbreak(f->base);
++          return;
++        }
+       if (getenv("PC_NATIVE_PRIMARY_NEW_SELECTION"))
+         {
+           int selected = atomic_load(&wire->primary_selected_packets);
