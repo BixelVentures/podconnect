@@ -1,3 +1,7 @@
+## Speakers 0.26.89 — recover fresh playback after a Spotify transfer
+
+- Allow a new explicit Spotify choice after the previous speaker disconnects during a transfer, once Speakers verifies that the old writer and audio route are closed. Keep uncertain outcomes blocked and never replay the earlier request.
+
 ## Speakers 0.26.88 — recover playback after a cold radio restart
 
 - Allow fresh Spotify and radio choices after Speakers proves the prior parked route is locally detached. Preserve the historical radio result and keep unresolved ownership fenced.
