@@ -1,3 +1,7 @@
+## Speakers 0.26.88 — recover playback after a cold radio restart
+
+- Allow fresh Spotify and radio choices after Speakers proves the prior parked route is locally detached. Preserve the historical radio result and keep unresolved ownership fenced.
+
 ## Speakers 0.26.87 — recover fresh music choices after radio loses its output
 
 - Allow a fresh radio or Spotify choice on the same speaker after the old radio sender is proven closed. Preserve the paused Spotify source until a new explicit action is accepted.
