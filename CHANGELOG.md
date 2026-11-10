@@ -1,3 +1,7 @@
+## Speakers 0.26.90 and Control 0.10.40 — Spotify autoplay queue
+
+- Expose upcoming autoplay tracks through the existing room queue. Keep the remaining rows stable when autoplay becomes the active queue, and validate each explicit selection against the current session and audio route.
+
 ## Speakers 0.26.89 — recover fresh playback after a Spotify transfer
 
 - Allow a new explicit Spotify choice after the previous speaker disconnects during a transfer, once Speakers verifies that the old writer and audio route are closed. Keep uncertain outcomes blocked and never replay the earlier request.
