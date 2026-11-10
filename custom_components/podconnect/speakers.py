@@ -72,6 +72,7 @@ class SpeakersClient:
         budget: int = 5,
         room_read_reason: bool = False,
         queue_metadata: bool = False,
+        queue_autoplay: bool = False,
         playback_cursor: str | None = None,
     ):
         headers = {"Accept": "application/json"}
@@ -80,6 +81,8 @@ class SpeakersClient:
             headers["Cache-Control"] = "no-store"
         if queue_metadata:
             headers["X-Podconnect-Queue-Metadata"] = "1"
+        if queue_autoplay:
+            headers["X-Podconnect-Queue-Autoplay"] = "1"
         try:
             async with asyncio.timeout(budget):
                 async with self._web.request(
@@ -658,9 +661,12 @@ class SpeakersClient:
             budget=7,
         )
 
-    async def room_queue_state(self, scope):
+    async def room_queue_state(self, scope, *, autoplay_preview=False):
         return await self._request(
-            "GET", "/api/room-queue/state?" + urlencode(scope), queue_metadata=True
+            "GET",
+            "/api/room-queue/state?" + urlencode(scope),
+            queue_metadata=True,
+            queue_autoplay=autoplay_preview,
         )
 
     async def prepare_room_queue(self, scope, native, route, queue):

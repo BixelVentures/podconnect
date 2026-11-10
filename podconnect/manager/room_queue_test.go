@@ -14,6 +14,12 @@ import (
 )
 
 type roomQueueFixture struct {
+	Autoplay           json.RawMessage
+	EmptyOrdinary      bool
+	DenyAutoplay       bool
+	AutoplayReads      []bool
+	AutoplayPrepares   []bool
+	LastSelection      queueSelection
 	Metadata           map[string]queueDisplayMetadata
 	Scope              roomTransportScope
 	Owner              roomTransportIdentity
@@ -66,7 +72,7 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 	roomQueueClaim = func(room, target string) (startClaim, bool) {
 		return f.Claim, room == f.Scope.Room && target == f.Scope.Target
 	}
-	roomQueueRPC = func(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
+	roomQueueRPC = func(ctx context.Context, base, method, path string, body []byte, autoplay bool) ([]byte, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -75,7 +81,17 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 		}
 		switch {
 		case strings.HasPrefix(path, "/player/room_transport/bound-queue?"):
-			return json.Marshal(nativeRoomQueueState{"podconnect.native_room_queue_state.v1", true, roomQueuePurpose, f.Owner, strings.Repeat("a", 32), 7, 10000, []queueNativeItem{{strings.Repeat("1", 24), 0, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", true}, {strings.Repeat("2", 24), 1, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", false}}, f.Metadata, false, f.Writer, false})
+			f.AutoplayReads = append(f.AutoplayReads, autoplay)
+			state := nativeRoomQueueState{"podconnect.native_room_queue_state.v1", true, roomQueuePurpose, f.Owner, strings.Repeat("a", 32), 7, 10000, []queueNativeItem{{strings.Repeat("1", 24), 0, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", true}, {strings.Repeat("2", 24), 1, "spotify:track:AAAAAAAAAAAAAAAAAAAAAA", false}}, f.Metadata, false, f.Writer, false, nil}
+			if autoplay {
+				if f.Autoplay != nil {
+					state.Autoplay = &f.Autoplay
+				}
+				if f.EmptyOrdinary {
+					state.Items = []queueNativeItem{}
+				}
+			}
+			return json.Marshal(state)
 		case path == "/api/outputs/42/transport/bound-state":
 			var request struct {
 				Owner  roomTransportIdentity `json:"native_owner"`
@@ -103,6 +119,11 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 			}
 			if queueClosedJSON(body, &request) != nil || request.Action != "queue" || request.Percent != 0 || request.Queue.Occurrence != strings.Repeat("2", 24) || request.Room != "r0" || request.Homepod != "42" {
 				t.Fatalf("native selected exact occurrence incorrectly: %s", body)
+			}
+			f.AutoplayPrepares = append(f.AutoplayPrepares, autoplay)
+			f.LastSelection = request.Queue
+			if autoplay && f.DenyAutoplay {
+				return nil, fmt.Errorf("native prospective selection denied")
 			}
 			if f.RetireStage {
 				f.Claim.RT.live.beginRun(nil)
@@ -140,7 +161,7 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 			if f.BadCommit {
 				return []byte(`{"schema":"wrong"}`), nil
 			}
-			return json.Marshal(map[string]any{"schema": "podconnect.native_room_queue_commit.v1", "accepted_native": true, "purpose": roomQueuePurpose, "prepare_id": request.PrepareID, "observation_id": strings.Repeat("a", 32), "occurrence_id": strings.Repeat("2", 24), "queue_revision": 7, "native_owner": f.Owner, "native_revision": "1", "args_digest": strings.Repeat("c", 64), "physical_result_verified": false})
+			return json.Marshal(map[string]any{"schema": "podconnect.native_room_queue_commit.v1", "accepted_native": true, "purpose": roomQueuePurpose, "prepare_id": request.PrepareID, "observation_id": f.LastSelection.Observation, "occurrence_id": f.LastSelection.Occurrence, "queue_revision": f.LastSelection.Revision, "native_owner": f.Owner, "native_revision": "1", "args_digest": strings.Repeat("c", 64), "physical_result_verified": false})
 		default:
 			t.Fatalf("unexpected queue RPC %s %s", method, path)
 			return nil, fmt.Errorf("unexpected queue RPC")
@@ -148,16 +169,23 @@ func newRoomQueueFixture(t *testing.T) *roomQueueFixture {
 	}
 	return f
 }
-func (f *roomQueueFixture) read(t *testing.T) *httptest.ResponseRecorder {
+func (f *roomQueueFixture) read(t *testing.T, autoplay ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	q := url.Values{"account_user_id": {f.Scope.Account}, "target_id": {f.Scope.Target}, "room_id": {f.Scope.Room}, "homepod_id": {f.Scope.Homepod}}
 	out := httptest.NewRecorder()
-	roomQueueStateHandler(out, httptest.NewRequest(http.MethodGet, "/api/room-queue/state?"+q.Encode(), nil))
+	request := httptest.NewRequest(http.MethodGet, "/api/room-queue/state?"+q.Encode(), nil)
+	for _, value := range autoplay {
+		request.Header.Add(roomQueueAutoplayHeader, value)
+	}
+	roomQueueStateHandler(out, request)
 	return out
 }
 func (f *roomQueueFixture) prepare(t *testing.T, occurrence string) *httptest.ResponseRecorder {
 	t.Helper()
-	selection := queueSelection{strings.Repeat("a", 32), "session", 7, occurrence}
+	return f.prepareSelection(t, queueSelection{strings.Repeat("a", 32), "session", 7, occurrence})
+}
+func (f *roomQueueFixture) prepareSelection(t *testing.T, selection queueSelection) *httptest.ResponseRecorder {
+	t.Helper()
 	body, _ := json.Marshal(roomQueuePrepareRequest{f.Scope, f.Owner, f.Route, selection})
 	out := httptest.NewRecorder()
 	roomQueuePrepareHandler(out, httptest.NewRequest(http.MethodPost, "/api/room-queue/prepare", bytes.NewReader(body)))
@@ -403,5 +431,130 @@ func TestRoomQueueRejectsNestedDuplicateAndMissingProof(t *testing.T) {
 		if queueClosedJSON([]byte(raw), &value) == nil {
 			t.Fatal("accepted malformed queue JSON", raw)
 		}
+	}
+}
+
+func TestRoomQueueAutoplaySelectsOnlyExactOptedOccurrence(t *testing.T) {
+	const uri = "spotify:track:AAAAAAAAAAAAAAAAAAAAAA"
+	second := strings.Repeat("2", 24)
+	for _, kind := range []string{"preview", "promotion", "old-native", "default", "duplicate-header", "wrong-display-key", "ordinary-priority", "native-denied"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRoomQueueFixture(t)
+			preview := nativeQueueAutoplayPreview{
+				Kind: "preview", DisplayIDs: map[string]string{second: "display-" + strings.Repeat("c", 24)},
+				Observation: strings.Repeat("d", 32), Revision: 7, Expires: 4000,
+				Items: []queueNativeItem{{second, 0, uri, false}},
+			}
+			selection := queueSelection{strings.Repeat("a", 32), f.Owner.Session, 7, second}
+			var sidecar any = preview
+			switch kind {
+			case "preview", "native-denied":
+				f.EmptyOrdinary = true
+				selection.Observation = preview.Observation
+				f.DenyAutoplay = kind == "native-denied"
+			case "wrong-display-key":
+				f.EmptyOrdinary = true
+				preview.DisplayIDs = map[string]string{strings.Repeat("9", 24): "display-" + strings.Repeat("c", 24)}
+				sidecar = preview
+			case "promotion":
+				sidecar = nativeQueueAutoplayPromotion{Kind: kind, DisplayIDs: preview.DisplayIDs}
+			case "old-native":
+				sidecar = nil
+			}
+			if sidecar != nil {
+				f.Autoplay, _ = json.Marshal(sidecar)
+			}
+			headers := []string{"1"}
+			if kind == "default" {
+				headers = nil
+			}
+			if kind == "duplicate-header" {
+				headers = []string{"1", "1"}
+			}
+			out := f.read(t, headers...)
+			opted := len(headers) == 1
+			if len(f.AutoplayReads) != 1 || f.AutoplayReads[0] != opted || len(f.Writes) != 0 {
+				t.Fatalf("queue read negotiated wrongly or dispatched an effect: %v %v", f.AutoplayReads, f.Writes)
+			}
+			if kind == "wrong-display-key" || kind == "ordinary-priority" {
+				if out.Code != http.StatusConflict || roomQueueStore.Read != nil {
+					t.Fatal("invalid preview minted action custody", out.Code)
+				}
+				return
+			}
+			wantSidecar := kind == "preview" || kind == "promotion" || kind == "native-denied"
+			if out.Code != http.StatusOK || strings.Contains(out.Body.String(), `"autoplay"`) != wantSidecar ||
+				!strings.Contains(out.Body.String(), selection.Observation) {
+				t.Fatal(out.Code, out.Body.String())
+			}
+			if kind == "preview" {
+				oldSelection := selection
+				preview.Observation = strings.Repeat("e", 32)
+				f.Autoplay, _ = json.Marshal(preview)
+				selection.Observation = preview.Observation
+				fresh := f.read(t, "1")
+				if fresh.Code != http.StatusOK || !strings.Contains(fresh.Body.String(), selection.Observation) ||
+					!strings.Contains(fresh.Body.String(), preview.DisplayIDs[second]) ||
+					f.prepareSelection(t, oldSelection).Code != http.StatusConflict || len(f.Writes) != 0 {
+					t.Fatal("fresh read failed to preserve the display ID and replace old selection authority")
+				}
+			}
+			forged := selection
+			forged.Occurrence = "display-" + strings.Repeat("c", 24)
+			if attempt := f.prepareSelection(t, forged); attempt.Code != http.StatusConflict || len(f.Writes) != 0 {
+				t.Fatal("display identity acquired action authority")
+			}
+			result := f.prepareSelection(t, selection)
+			previewPrepare := kind == "preview" || kind == "native-denied"
+			if len(f.AutoplayPrepares) != 1 || f.AutoplayPrepares[0] != previewPrepare || f.LastSelection != selection {
+				t.Fatalf("prepare did not dispatch exact selected kind: %v", f.AutoplayPrepares)
+			}
+			if kind == "native-denied" {
+				if result.Code != http.StatusConflict || len(f.Writes) != 1 || f.prepareSelection(t, selection).Code != http.StatusConflict {
+					t.Fatal("denied preview retried, fell back, or reached output prepare")
+				}
+				return
+			}
+			if result.Code != http.StatusOK || roomQueueCommit(t).Code != http.StatusOK || roomQueueCommit(t).Code != http.StatusConflict {
+				t.Fatal("exact action did not commit once")
+			}
+		})
+	}
+}
+
+func TestRoomQueueAutoplayPendingCannotStage(t *testing.T) {
+	for _, name := range []string{"exact", "foreign-route", "ordinary-rows", "extra-field"} {
+		t.Run(name, func(t *testing.T) {
+			f := newRoomQueueFixture(t)
+			second := strings.Repeat("2", 24)
+			if read := f.read(t); read.Code != http.StatusOK || roomQueueStore.Read == nil {
+				t.Fatal("initial ordinary read did not establish custody", read.Code)
+			}
+			f.Autoplay = json.RawMessage(`{"kind":"pending"}`)
+			f.EmptyOrdinary = name != "ordinary-rows"
+			f.OldC = name == "foreign-route"
+			if name == "extra-field" {
+				f.Autoplay = json.RawMessage(`{"kind":"pending","display_ids":{}}`)
+			}
+			out := f.read(t, "1")
+			if name == "exact" {
+				var response struct {
+					Actions  []string        `json:"actions"`
+					Autoplay json.RawMessage `json:"autoplay"`
+				}
+				if err := json.Unmarshal(out.Body.Bytes(), &response); out.Code != http.StatusOK || err != nil ||
+					response.Actions == nil || len(response.Actions) != 0 || string(response.Autoplay) != `{"kind":"pending"}` {
+					t.Fatal("pending read lacked exact projection or offered actions", out.Code, out.Body.String())
+				}
+			} else if out.Code != http.StatusConflict {
+				t.Fatal("invalid pending read was accepted", out.Code)
+			}
+			if roomQueueStore.Read != nil || f.prepare(t, second).Code != http.StatusConflict || len(f.Writes) != 0 {
+				t.Fatal("pending admitted old or new selection authority")
+			}
+			if len(f.AutoplayReads) != 2 || !f.AutoplayReads[1] {
+				t.Fatal("pending caused another read or fallback", f.AutoplayReads)
+			}
+		})
 	}
 }

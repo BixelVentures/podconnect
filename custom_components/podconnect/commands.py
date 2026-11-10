@@ -1158,6 +1158,7 @@ def register_command_services(hass):
                 call.data["target_id"],
                 call.data["room_id"],
                 call.data["homepod_id"],
+                autoplay_preview=call.data.get("autoplay_preview", False),
             )
         except (CommandRejected, SpeakersError):
             return {
@@ -1336,7 +1337,11 @@ def register_command_services(hass):
         vol.Required("move_offer"): dict,
     }
     for name, handler, schema in (
-        ("get_room_queue_controls", room_queue_controls, room_identity),
+        (
+            "get_room_queue_controls",
+            room_queue_controls,
+            {**room_identity, vol.Optional("autoplay_preview"): bool},
+        ),
         ("prepare_room_queue", room_queue_prepare, queue_command_schema),
         (
             "control_room_queue",

@@ -57,11 +57,18 @@ var queueCurrentClaim = currentStartClaim
 var queueNativeRPC = doQueueNativeRPC
 
 func doQueueNativeRPC(ctx context.Context, base, method, path string, body []byte) ([]byte, error) {
+	return doRoomQueueRPC(ctx, base, method, path, body, false)
+}
+
+func doRoomQueueRPC(ctx context.Context, base, method, path string, body []byte, autoplay bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if autoplay {
+		req.Header.Set(roomQueueAutoplayHeader, "1")
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

@@ -259,6 +259,10 @@ manager_primary = mode == "actual-c-primary-manager"
 native_mode = "actual-c-primary-same-target" if manager_primary else mode
 primary_same_target = native_mode == "actual-c-primary-same-target"
 prefix = "pc52-selected-"
+if autoplay := os.getenv("PC_NATIVE_AUTOPLAY_PREVIEW"):
+    if autoplay not in {"complete", "pending", "choose", "manual-commit", "stale-commit"}:
+        raise SystemExit("unknown autoplay fixture mode")
+    prefix += f"autoplay-{autoplay}-"
 if os.getenv("PC_NATIVE_CANCEL_STAGED_SELECTION"):
     prefix += "cancel-staged-"
 if mode == "actual-c-primary-same-target" and os.getenv("PC_NATIVE_PRIMARY_EXPECT_RESUME"):
