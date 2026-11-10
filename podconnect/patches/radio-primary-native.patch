@@ -1125,10 +1125,10 @@ index 0000000..67c2f43
 +}
 diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
 new file mode 100644
-index 0000000..dcf2c5c
+index 0000000..0194b46
 --- /dev/null
 +++ b/daemon/radio_primary_cold_test.go
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,397 @@
 +package daemon
 +
 +import (
@@ -1137,6 +1137,7 @@ index 0000000..dcf2c5c
 +	"net/http"
 +	"net/http/httptest"
 +	"os"
++	"os/exec"
 +	"path/filepath"
 +	"strconv"
 +	"strings"
@@ -1396,6 +1397,9 @@ index 0000000..dcf2c5c
 +		t.Fatalf("current C idle owner was not independently observed (observation=%t, protocol=%s, missing=%v)",
 +			state.Observation != nil, state.Protocol, state.Missing)
 +	}
++	if manager := os.Getenv("PC_PRIMARY_MANAGER_TEST_BIN"); manager != "" && os.Getenv("PC_PRIMARY_MANAGER_COLD_DATA") != "" {
++		testColdPrimaryManagerRead(t, ctx, app, manager)
++	}
 +	oldCommand.Phase, oldCommand.ForPhase, oldCommand.Station = "result", "start", "p1"
 +	if _, err := p.radioPrimaryActor(ctx, oldCommand); err == nil {
 +		t.Fatal("the previous Native process replayed its radio result")
@@ -1489,6 +1493,38 @@ index 0000000..dcf2c5c
 +		t.Fatalf("fixture completion returned HTTP %d", response.StatusCode)
 +	}
 +	t.Log("actual C cold receipt retired old P1 without old STOP or replay; fresh owner independently proved")
++}
++
++func testColdPrimaryManagerRead(t *testing.T, ctx context.Context, app *App, manager string) {
++	t.Helper()
++	api, err := NewApiServer(app.log, "127.0.0.1", 0, "", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	server := api.(*ConcreteApiServer)
++	defer server.Close()
++	prior := app.server
++	app.server = server
++	dispatchCtx, cancel := context.WithCancel(ctx)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		app.forwardAPI(dispatchCtx)
++	}()
++	defer func() {
++		cancel()
++		<-done
++		app.server = prior
++	}()
++
++	endpoint := "http://" + server.listener.Addr().String()
++	cmd := exec.CommandContext(ctx, manager, "-test.v", "-test.timeout=18s", "-test.run", "^TestConfiguredPrimaryRadioColdDetachmentComposed$")
++	cmd.Env = append(os.Environ(), "PC_PRIMARY_MANAGER_NATIVE_URL="+endpoint)
++	result, err := cmd.CombinedOutput()
++	t.Logf("cold Manager result:\n%s", result)
++	if err != nil {
++		t.Fatal("actual Manager did not reconcile the old P1 journal", err)
++	}
 +}
 diff --git a/daemon/radio_primary_composed_test.go b/daemon/radio_primary_composed_test.go
 new file mode 100644
@@ -3420,10 +3456,10 @@ index 0000000..be5442a
 +}
 diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
 new file mode 100644
-index 0000000..abf9d3e
+index 0000000..ab6612a
 --- /dev/null
 +++ b/daemon/radio_primary_same_composed_test.go
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,559 @@
 +package daemon
 +
 +import (
@@ -3546,6 +3582,10 @@ index 0000000..abf9d3e
 +			t.Fatal("configured Manager scenario requires an actual upcoming Spotify item")
 +		}
 +		testConfiguredManagerPrimaryResume(t, ctx, p, worker, manager)
++		if os.Getenv("PC_PRIMARY_MANAGER_COLD_PRIOR") != "" {
++			assertSource(true)
++			return
++		}
 +		assertSource(false)
 +		if originalTracks.TransportRevision() != queueRevision || originalTracks.PeekNext(ctx).GetUri() != nextURI {
 +			t.Fatal("configured Manager handback changed the original queue occurrence")
@@ -3845,11 +3885,14 @@ index 0000000..abf9d3e
 +	output, err := cmd.CombinedOutput()
 +	t.Logf("configured Manager result:\n%s", output)
 +	if err != nil {
-+		t.Fatal("configured Manager did not complete the three observed stations", err)
++		t.Fatal("configured Manager did not complete the observed station journey", err)
 +	}
 +	parked, err := worker.InspectRadio(ctx)
 +	if err != nil || !parked.Suspended || !parked.WriterClosed || !app.radioOutputFence.Load() {
 +		t.Fatal("Manager radio did not retain the parked Spotify writer", err)
++	}
++	if os.Getenv("PC_PRIMARY_MANAGER_COLD_PRIOR") != "" {
++		return
 +	}
 +	resume, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/player/resume", nil)
 +	if err != nil {
@@ -4497,7 +4540,7 @@ index d00748f..6d61f49 100644
  	time.AfterFunc(5*time.Second, func() {
  		op.mu.Lock()
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index f4ee0c5..8c37e47 100644
+index f4ee0c5..65d2e6e 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -50,6 +50,17 @@ import (
@@ -4589,17 +4632,20 @@ index f4ee0c5..8c37e47 100644
  			if good {
  				if err != nil {
  					if external && actualOutput != nil {
-@@ -1241,6 +1267,9 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -1241,6 +1267,12 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  			if mode == "actual-c-radio-http" {
  				testServeActualRadioHTTP(t, p, worker, stream)
  			}
 +			if mode == "actual-c-primary-same-target" {
 +				testPrimarySameTargetWithActualSTART(t, p, worker, stream)
++				if os.Getenv("PC_PRIMARY_MANAGER_COLD_PRIOR") != "" {
++					return
++				}
 +			}
  			if external && mode != "actual-c-radio-http" {
  				reply, e := http.Post(os.Getenv("PC_NATIVE_START_URL")+"/fixture/done", "application/json", strings.NewReader("{}"))
  				if e != nil {
-@@ -1380,41 +1409,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1380,41 +1412,29 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  	if mode == "episode-commit" {
  		selectedHomePod = "202"
  	}
@@ -4662,7 +4708,7 @@ index f4ee0c5..8c37e47 100644
  		raw, _ := json.Marshal(request)
  		rec := httptest.NewRecorder()
  		server.handleContentPrepare(rec, httptest.NewRequest("POST", "/player/room_content/prepare", bytes.NewReader(raw)))
-@@ -1427,28 +1444,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1427,28 +1447,94 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			phase, stagedStream := op.State, op.Stream
  			op.mu.Unlock()
  			if phase == "staged" && stagedStream != nil {
@@ -4761,7 +4807,7 @@ index f4ee0c5..8c37e47 100644
  	if err == nil {
  		t.Fatal("expected unsupported noop")
  	}
-@@ -1456,6 +1539,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1456,6 +1542,16 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  	if err != nil || selected != stream.Source || p.primaryStream != stream || p.state.player.IsPaused || !p.state.player.IsPlaying || p.roomContentReservation != nil {
  		t.Fatal("selected state not observed", err)
  	}
@@ -4778,7 +4824,7 @@ index f4ee0c5..8c37e47 100644
  	if mode == "actual-c-selected-rtp" {
  		until := time.Now().Add(7 * time.Second)
  		client := &http.Client{Timeout: time.Second}
-@@ -1477,6 +1570,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1477,6 +1573,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			}
  			if observed.AudioPackets > 0 {
  				t.Logf("actual selected PCM reached C output and private peer as %d audio RTP packet(s)", observed.AudioPackets)
@@ -4788,7 +4834,7 @@ index f4ee0c5..8c37e47 100644
  				break
  			}
  			if time.Now().After(until) {
-@@ -1711,7 +1807,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1711,7 +1810,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  	if len(episode) > 0 && episode[0] == "episode-commit" {
  		mediaBytes = selectedSustainedFLAC
  	}
