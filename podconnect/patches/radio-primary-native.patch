@@ -75,7 +75,7 @@ index 54674ed..9b3597f 100644
  		return false // Receiver-only custody never owns the retained global FIFO.
  	}
 diff --git a/daemon/radio_content_staging.go b/daemon/radio_content_staging.go
-index 6f1716a..afcbaf7 100644
+index 6f1716a..d0fa02e 100644
 --- a/daemon/radio_content_staging.go
 +++ b/daemon/radio_content_staging.go
 @@ -19,6 +19,8 @@ type radioContentStage struct {
@@ -97,7 +97,7 @@ index 6f1716a..afcbaf7 100644
  	if h == nil {
  		for _, candidate := range app.radio.Holds {
  			if candidate.WriterParked {
-@@ -44,9 +49,15 @@ func (p *AppPlayer) radioContentSnapshot(scope roomVolumeScope) (*radioContentSt
+@@ -44,9 +49,20 @@ func (p *AppPlayer) radioContentSnapshot(scope roomVolumeScope) (*radioContentSt
  			}
  		}
  	}
@@ -107,6 +107,11 @@ index 6f1716a..afcbaf7 100644
  	}
 +	if h.Primary != nil {
 +		if !p.primaryContentOwns(h) || h.PrimaryPark != nil && h.Request.TargetID != scope.RoomID {
++			if app.log != nil && h.owner == nil && h.primary == nil && h.Phase == "unknown" &&
++				h.PrimaryPark != nil && h.WriterParked && h.Request.TargetID == scope.RoomID &&
++				h.Primary.DeviceID == scope.HomePodID && validPrimaryRadioHold(h) {
++				app.log.Warnf("content_read_failed stage=capture_unavailable reason=restored_primary_park_unknown")
++			}
 +			return nil, ErrAliasConflict
 +		}
 +		return &radioContentStage{HandoffID: h.Request.HandoffID, Generation: h.Request.Generation, HoldTarget: h.Request.TargetID, Primary: true, hold: h}, nil
@@ -114,7 +119,7 @@ index 6f1716a..afcbaf7 100644
  	if (h.owner != p && h.Absence == nil && h.Parked == nil) || (h.Latest == nil && h.Absence == nil && h.Parked == nil) || (h.Phase != "prepared" && h.Phase != "suspended" && h.Phase != "content_ready" && h.Phase != "content_bound" && !(h.Phase == "source_evolved" && radioAbsenceEvolved(h))) || !volumeHex32.MatchString(radioHoldToken(h)) {
  		return nil, ErrAliasConflict
  	}
-@@ -60,9 +71,18 @@ func (p *AppPlayer) radioContentCurrent(stage *radioContentStage) bool {
+@@ -60,9 +76,18 @@ func (p *AppPlayer) radioContentCurrent(stage *radioContentStage) bool {
  	app.radio.mu.Lock()
  	defer app.radio.mu.Unlock()
  	h := app.radio.Holds[stage.HoldTarget]
@@ -133,7 +138,7 @@ index 6f1716a..afcbaf7 100644
  // refreshRadioContent runs only after the original opaque command has been
  // consumed by commit. It never broadens the accepted URI, scope or lifetime.
  func (p *AppPlayer) refreshRadioContent(ctx context.Context, request contentActorRequest) (any, error) {
-@@ -150,6 +170,32 @@ func (p *AppPlayer) radioPrepareContentTransition(ctx context.Context, op *conte
+@@ -150,6 +175,32 @@ func (p *AppPlayer) radioPrepareContentTransition(ctx context.Context, op *conte
  	if op.Radio == nil {
  		return ErrAliasConflict
  	}
@@ -166,7 +171,7 @@ index 6f1716a..afcbaf7 100644
  	if op.Radio.Parked {
  		return p.bindRadioParkedStart(ctx, op.Radio.hold, op)
  	}
-@@ -169,7 +215,7 @@ func (p *AppPlayer) bindRadioContentStart(ctx context.Context, op *contentOperat
+@@ -169,7 +220,7 @@ func (p *AppPlayer) bindRadioContentStart(ctx context.Context, op *contentOperat
  	if stage == nil {
  		return nil
  	}
@@ -175,7 +180,7 @@ index 6f1716a..afcbaf7 100644
  		return nil
  	}
  	if stage.HoldTarget != op.Capture.Scope.RoomID {
-@@ -221,6 +267,12 @@ func (p *AppPlayer) completeRadioContent(op *contentOperation) error {
+@@ -221,6 +272,12 @@ func (p *AppPlayer) completeRadioContent(op *contentOperation) error {
  	app.radio.mu.Lock()
  	defer app.radio.mu.Unlock()
  	h := app.radio.Holds[op.Radio.HoldTarget]
@@ -188,7 +193,7 @@ index 6f1716a..afcbaf7 100644
  	if h == nil || h != op.Radio.hold || h.Phase != "content_bound" {
  		return ErrAliasConflict
  	}
-@@ -245,6 +297,9 @@ func (p *AppPlayer) radioContentIntentCurrent(op *contentOperation) bool {
+@@ -245,6 +302,9 @@ func (p *AppPlayer) radioContentIntentCurrent(op *contentOperation) bool {
  	p.app.radio.mu.Lock()
  	defer p.app.radio.mu.Unlock()
  	h := p.app.radio.Holds[op.Radio.HoldTarget]
@@ -198,7 +203,7 @@ index 6f1716a..afcbaf7 100644
  	if p.app.radio.failed || h == nil || h != op.Radio.hold || p.app.radio.Intent != op.Radio.ClaimIntent {
  		return false
  	}
-@@ -261,6 +316,9 @@ func (p *AppPlayer) unknownRadioContent(op *contentOperation) {
+@@ -261,6 +321,9 @@ func (p *AppPlayer) unknownRadioContent(op *contentOperation) {
  	p.app.radio.mu.Lock()
  	defer p.app.radio.mu.Unlock()
  	if h := p.app.radio.Holds[op.Radio.HoldTarget]; h != nil && h == op.Radio.hold {

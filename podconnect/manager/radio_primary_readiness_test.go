@@ -32,6 +32,10 @@ func TestConfiguredRadioBootstrapNegotiatesWithoutEffects(t *testing.T) {
 	wrongProcess.Process = strings.Repeat("f", 64)
 	incomplete := good
 	incomplete.Missing = []string{"no_owner_proof"}
+	missingCapability := good
+	missingCapability.Missing = []string{"primary_c_capability_unverified"}
+	missingOwner := good
+	missingOwner.Missing = []string{"primary_current_owner_unverified"}
 	malformed := good
 	malformed.Schema = "malformed-fixture"
 	unknown := good
@@ -53,6 +57,7 @@ func TestConfiguredRadioBootstrapNegotiatesWithoutEffects(t *testing.T) {
 		{"matched primary", []*radioPrimaryState{&good}, true, true, true, 0},
 		{"primary without opt-in", []*radioPrimaryState{&good}, false, false, false, 0},
 		{"no fallback after advertisement", []*radioPrimaryState{&incomplete, nil}, true, false, false, 0},
+		{"capability then owner proof", []*radioPrimaryState{&missingCapability, &missingCapability, &missingOwner, &good}, true, true, true, 0},
 		{"no fallback after malformed HTTP 200", []*radioPrimaryState{&malformed, nil}, true, false, false, 0},
 		{"no fallback after unknown field HTTP 200", []*radioPrimaryState{&unknown, nil}, true, false, false, 0},
 		{"pairing digest is not primary proof", []*radioPrimaryState{&fakePairing}, true, false, false, 0},
