@@ -1125,10 +1125,10 @@ index 0000000..67c2f43
 +}
 diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
 new file mode 100644
-index 0000000..6c69ca2
+index 0000000..536c01d
 --- /dev/null
 +++ b/daemon/radio_primary_cold_test.go
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,441 @@
 +package daemon
 +
 +import (
@@ -1470,7 +1470,15 @@ index 0000000..6c69ca2
 +		}
 +		t.Log("fresh explicit Spotify START acquired the new C output and delivered authenticated RTP")
 +	}
-+	if finishManager != nil {
++	if os.Getenv("PC_NATIVE_PRIMARY_COLD_GRACEFUL_SPOTIFY") != "" {
++		if finishManager != nil || os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY") == "" {
++			t.Fatal("graceful restart requires direct fresh Spotify without a Manager radio action")
++		}
++		app.moveCustodyMu.Lock()
++		fresh := app.startCustody
++		app.moveCustodyMu.Unlock()
++		testRetireCompletedSTART(t, p, worker, fresh)
++	} else if finishManager != nil {
 +		if os.Getenv("PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY") == "" {
 +			t.Fatal("cold Manager fixture requires the fresh Spotify proof before radio")
 +		}
@@ -4581,7 +4589,7 @@ index d00748f..6d61f49 100644
  	time.AfterFunc(5*time.Second, func() {
  		op.mu.Lock()
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index f4ee0c5..65d2e6e 100644
+index f4ee0c5..e5ab7fa 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
 @@ -50,6 +50,17 @@ import (
@@ -4875,7 +4883,31 @@ index f4ee0c5..65d2e6e 100644
  				break
  			}
  			if time.Now().After(until) {
-@@ -1711,7 +1810,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1493,22 +1592,7 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 		return
+ 	}
+ 	if os.Getenv("PC_SHUTDOWN_JOURNAL") != "" {
+-		p.app.moveCustodyMu.Lock()
+-		normal := p.app.startCustody == op && op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed"
+-		p.app.moveCustodyMu.Unlock()
+-		if !normal {
+-			t.Fatal("fresh actual START lacks completed custody")
+-		}
+-		// The fixture has no connected Dealer; instantiate the existing inert owner for Close.
+-		nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
+-		p.Close()
+-		p.app.moveCustodyMu.Lock()
+-		retired := worker.Closed() && p.app.startCustody == nil && p.app.retirementPending == nil && !p.app.moveCustodyUnknown
+-		p.app.moveCustodyMu.Unlock()
+-		if !retired {
+-			t.Fatal("normal shutdown did not finish actual C retirement")
+-		}
+-		t.Log("PASS fresh completed START -> real Native Close -> actual C retirement")
++		testRetireCompletedSTART(t, p, worker, op)
+ 	}
+ 	if os.Getenv("PC70_RELEASE_COMPOSE") == "start" {
+ 		testManualReleaseComposed(t, p, server)
+@@ -1711,7 +1795,7 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  	if len(episode) > 0 && episode[0] == "episode-commit" {
  		mediaBytes = selectedSustainedFLAC
  	}
@@ -4884,3 +4916,27 @@ index f4ee0c5..65d2e6e 100644
  		mediaBytes = selectedSustainedFLAC
  		if os.Getenv("PC_NATIVE_START_MODE") == "selected-sustained" {
  			selectedPCMProof = &selectedPCMState{gate: make(chan struct{}), ranges: map[int]int{}}
+@@ -2872,3 +2956,23 @@ func TestContentCStateReportsFirstSafeReason(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func testRetireCompletedSTART(t *testing.T, p *AppPlayer, worker *player.Player, op *contentOperation) {
++	t.Helper()
++	p.app.moveCustodyMu.Lock()
++	normal := op != nil && p.app.startCustody == op && op.Terminal && op.State == "complete" && op.CReceipt != nil && op.CReceipt.Phase == "completed"
++	p.app.moveCustodyMu.Unlock()
++	if !normal {
++		t.Fatal("fresh actual START lacks completed custody")
++	}
++	// The fixture has no connected Dealer; instantiate the existing inert owner for Close.
++	nextSessionField(p.sess, "dealer", dealer.NewDealer(p.app.log, &http.Client{}, nil, nil))
++	p.Close()
++	p.app.moveCustodyMu.Lock()
++	retired := worker.Closed() && p.app.startCustody == nil && p.app.retirementPending == nil && !p.app.moveCustodyUnknown
++	p.app.moveCustodyMu.Unlock()
++	if !retired {
++		t.Fatal("normal shutdown did not finish actual C retirement")
++	}
++	t.Log("PASS fresh completed START -> real Native Close -> actual C retirement")
++}
