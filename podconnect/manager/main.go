@@ -2120,6 +2120,7 @@ const indexHTML = `<!doctype html>
         <button id="addrescan" class="ghost" title="Restart the audio engine to re-scan the network — use if a just-powered-on device is missing">⟳ Rescan</button>
         <button id="addcancel" class="ghost">Cancel</button>
       </div>
+      <p id="rescanstatus" role="status"></p>
       <p id="adderr" class="err"></p>
     </div>
   </div>
@@ -2414,10 +2415,32 @@ document.getElementById('addcancel').onclick = function () {
 };
 document.getElementById('addrescan').onclick = async function () {
   if (!confirm('Rescan restarts the audio engine and briefly interrupts playback. Continue?')) return;
-  var st = document.getElementById('addstatus');
+  var st = document.getElementById('rescanstatus');
   this.disabled = true;
-  st.textContent = 'Rescanning — restarting engine (briefly interrupts playback)…'; st.className = 'status warn';
-  try { await fetch('api/rescan', { method:'POST' }); } catch (e) {}
+  st.textContent = 'Rescanning — restarting engine (briefly interrupts playback)…';
+  try {
+    var response = await fetch('api/rescan', { method:'POST' });
+    if (response.ok && (await response.json()).ok === true) {
+      st.textContent = 'Audio engine restarted.';
+    } else if (response.ok) {
+      st.textContent = 'Rescan outcome unknown. Check the Speakers log.';
+    } else {
+      var status = ' (HTTP ' + response.status + '). ';
+      st.textContent = 'Rescan outcome unknown' + status + 'Check the Speakers log.';
+      if (response.status === 409 || response.status === 503) {
+        var reason = await response.text().catch(function () { return ''; });
+        if (response.status === 409 && reason.trim() === 'original attention restoration pending') {
+          st.textContent = 'Rescan blocked' + status + 'Waiting for the original volume to be restored.';
+        } else if (response.status === 503 && reason.trim() === 'engine not running') {
+          st.textContent = 'Rescan unavailable' + status + 'The audio engine is not running.';
+        } else if (response.status === 503 && reason.trim() === 'no speaker yet') {
+          st.textContent = 'Rescan unavailable' + status + 'No primary speaker is configured.';
+        }
+      }
+    }
+  } catch (e) {
+    st.textContent = 'Rescan outcome unknown. Check the Speakers log.';
+  }
   var btn = this;
   setTimeout(function () { btn.disabled = false; }, 8000); // OwnTone needs a few seconds; the auto-poll repopulates the list
 };
