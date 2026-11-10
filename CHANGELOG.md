@@ -1,3 +1,8 @@
+## Speakers 0.26.85 — show the outcome of an audio-engine rescan
+
+- Show accepted, blocked and unknown results from Rescan without retrying the operation. Keep the result visible while the speaker list refreshes.
+- Preserve all existing audio ownership checks. An accepted rescan does not claim playback readiness.
+
 ## Speakers 0.26.84 — keep the primary audio owner across add-on updates
 
 - Keep the primary Spotify FIFO in persistent add-on data. The Manager and both primary processes share one kernel lifetime lock so a successor can verify that its predecessor released ownership, including across PID namespaces.
