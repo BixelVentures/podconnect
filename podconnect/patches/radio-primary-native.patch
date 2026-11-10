@@ -2843,10 +2843,10 @@ index 0000000..be5442a
 +}
 diff --git a/daemon/radio_primary_same_composed_test.go b/daemon/radio_primary_same_composed_test.go
 new file mode 100644
-index 0000000..a054eed
+index 0000000..770385d
 --- /dev/null
 +++ b/daemon/radio_primary_same_composed_test.go
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,545 @@
 +package daemon
 +
 +import (
@@ -3026,7 +3026,8 @@ index 0000000..a054eed
 +	}
 +	poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 })
 +
-+	if os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
++	controlLoss := os.Getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS")
++	if controlLoss == "" && os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") != "" {
 +		before := poll(func(c counts) bool { return c.Radio > 0 && c.After == 0 && c.Selected == 0 })
 +		testPrimaryNewSpotifySelection(t, ctx, p, worker, stream, owner, func() {
 +			assertSource(true)
@@ -3082,6 +3083,88 @@ index 0000000..a054eed
 +		}
 +		poll(func(c counts) bool { return c.After == 0 && c.Windows[1] > 0 })
 +		assertSource(true)
++		if controlLoss != "" {
++			if !filepath.IsAbs(controlLoss) || os.Getenv("PC_NATIVE_PRIMARY_NEW_SELECTION") == "" {
++				t.Fatal("control-loss scenario requires its isolated trigger and new Spotify fixture")
++			}
++			read := func() (radioPrimaryReadinessState, error) {
++				state := radioPrimaryReadinessState{Process: q.Process, Revision: strconv.FormatUint(app.radio.Intent, 10),
++					Targets: []radioTarget{{ID: owner.RoomID, HomePodID: owner.HomePodID}}}
++				result, err := p.radioPrimaryActorState(ctx, radioPrimaryActorStateRequest{State: state,
++					CProcess: again.Session.Process, Receivers: map[string]string{owner.HomePodID: again.Session.Incarnation}})
++				if err != nil {
++					return state, err
++				}
++				return result.(radioPrimaryReadinessState), nil
++			}
++			live, err := read()
++			if err != nil || live.Session == nil || *live.Session != *again.Session || live.Observation == nil ||
++				live.Observation.Source != "radio" || live.Observation.Station != "p1" {
++				t.Fatalf("missing current P1 binding before receiver loss: %v", err)
++			}
++			trigger, err := os.OpenFile(controlLoss, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := trigger.Close(); err != nil {
++				t.Fatal(err)
++			}
++			tick := time.NewTicker(20 * time.Millisecond)
++			defer tick.Stop()
++			for {
++				observed, err := read()
++				if err == nil && observed.IsolatedSession != nil {
++					if !observed.IsolatedSession.matches(again.Session) || observed.Session != nil ||
++						observed.ReleasedSession != nil || observed.TeardownCSeq != nil || observed.ReleaseActionID != nil ||
++						observed.Observation == nil || observed.Observation.State != "stopped" ||
++						observed.Observation.Source != "none" || observed.Observation.OwnerGeneration != live.Observation.OwnerGeneration ||
++						!primaryReturnCounter(observed.Revision, live.Revision, 1) || !observed.Targets[0].Selectable {
++						t.Fatal("actual receiver loss did not produce exact local isolation")
++					}
++					break
++				}
++				select {
++				case <-ctx.Done():
++					t.Fatalf("actual C isolation was never observed: %v", err)
++				case <-tick.C:
++				}
++			}
++			assertSource(true)
++			poll(func(c counts) bool { return c.After == 0 && c.Selected == 0 && c.Windows[2] == 0 })
++			testPrimaryNewSpotifySelection(t, ctx, p, worker, stream, owner, func() {
++				assertSource(true)
++				poll(func(c counts) bool { return c.After == 0 && c.Selected == 0 && c.Windows[2] == 0 })
++			})
++			poll(func(c counts) bool { return c.After == 0 && c.Selected > 0 && c.Windows[2] == 0 })
++			fresh, err := read()
++			if err != nil || fresh.Observation == nil || fresh.Observation.Source != "spotify" ||
++				fresh.Observation.State != "playing" || fresh.Observation.Target != owner.RoomID || fresh.IsolatedSession != nil {
++				t.Fatalf("fresh Spotify lacks an actual bound current output after isolation: %v", err)
++			}
++			if _, err = p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypePause}); err != nil {
++				t.Fatalf("Pause on recovered Spotify output failed: %v", err)
++			}
++			paused, err := read()
++			if err != nil || paused.Observation == nil || paused.Observation.Source != "spotify" ||
++				paused.Observation.State != "stopped" || paused.Observation.Target != owner.RoomID {
++				t.Fatalf("Pause did not retain the recovered Spotify output: %v", err)
++			}
++			q.Handoff, q.Generation, q.Action = "ac0ff645-a01f-4d2a-85e3-b0011d786e6d", "4", "b0587a71-b229-4c4c-a262-0677280feaa2"
++			q.Phase, q.Station, q.Owner, q.From, q.Session = "reserve", "", "", owner.RoomID, nil
++			q.Intent = paused.Revision
++			q.Owner = wait(q, "reserved").Owner
++			q.Phase, q.Station = "prepare_start", "p6"
++			wait(q, "prepared")
++			q.Phase = "start"
++			p6 := wait(q, "playing")
++			if p6.Session == nil || *p6.Session == *again.Session || p6.Session.DeviceID != owner.HomePodID ||
++				p6.Session.Operation != q.Action || !p.state.player.IsPaused {
++				t.Fatal("fresh radio did not own a separate same-output session with Spotify parked")
++			}
++			poll(func(c counts) bool { return c.After == 0 && c.Windows[2] > 0 })
++			t.Log("actual P1 peer loss recovered through explicit Spotify START, bound Pause, then fresh P6 RTP")
++			return
++		}
 +	}
 +
 +	app.mpris = mpris.DummyServer{}
