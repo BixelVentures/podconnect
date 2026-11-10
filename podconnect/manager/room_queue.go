@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 const roomQueuePurpose = "queue_occurrence_v1"
+const roomQueueAutoplayHeader = "X-Podconnect-Queue-Autoplay"
 
 type queueSelection struct {
 	Observation string `json:"observation_id"`
@@ -60,6 +62,29 @@ type nativeRoomQueueState struct {
 	Truncated   bool                            `json:"truncated"`
 	Writer      queueWriterProof                `json:"writer_proof"`
 	Physical    bool                            `json:"physical_result_verified"`
+	Autoplay    *json.RawMessage                `json:"autoplay,omitempty"`
+}
+
+type queueAutoplayDisplay struct {
+	Kind       string            `json:"kind"`
+	DisplayIDs map[string]string `json:"display_ids"`
+}
+
+type nativeQueueAutoplayPreview struct {
+	Kind        string                          `json:"kind"`
+	DisplayIDs  map[string]string               `json:"display_ids"`
+	Observation string                          `json:"observation_id"`
+	Revision    uint64                          `json:"queue_revision"`
+	Expires     int                             `json:"expires_after_ms"`
+	Items       []queueNativeItem               `json:"items"`
+	Truncated   bool                            `json:"truncated"`
+	Metadata    map[string]queueDisplayMetadata `json:"metadata,omitempty"`
+}
+
+type nativeQueueAutoplayPromotion struct {
+	Kind       string                          `json:"kind"`
+	DisplayIDs map[string]string               `json:"display_ids"`
+	Metadata   map[string]queueDisplayMetadata `json:"metadata,omitempty"`
 }
 type outputRoomQueueState struct {
 	Schema   string                  `json:"schema"`
@@ -100,10 +125,11 @@ type outputRoomQueuePrepare struct {
 	Expires   int                     `json:"expires_after_ms"`
 }
 type roomQueueRead struct {
-	Native  nativeRoomQueueState
-	Route   outputTransportIdentity
-	Claim   startClaim
-	Expires time.Time
+	Native   nativeRoomQueueState
+	Route    outputTransportIdentity
+	Claim    startClaim
+	Expires  time.Time
+	Autoplay bool
 }
 type roomQueuePrepareRequest struct {
 	Scope  roomTransportScope      `json:"scope"`
@@ -124,7 +150,7 @@ var roomQueueStore struct {
 	Prepared *roomQueuePrepared
 }
 var roomQueueClaim = currentStartClaim
-var roomQueueRPC = doQueueNativeRPC
+var roomQueueRPC = doRoomQueueRPC
 
 func queueClosedJSON(raw []byte, out any) error {
 	if len(raw) == 0 || len(raw) > 16384 || queueDuplicateJSON(raw) != nil {
@@ -254,6 +280,76 @@ func validQueueSelection(s queueSelection, state nativeRoomQueueState) bool {
 func validQueueState(n nativeRoomQueueState, claim startClaim, scope roomTransportScope) bool {
 	return n.Schema == "podconnect.native_room_queue_state.v1" && n.Ready && n.Purpose == roomQueuePurpose && !n.Physical && validTransportIdentity(n.Owner, scope) && queueOwnerSafe(n.Owner) && n.Owner.Incarnation == claim.Proof.AliasBinding.Incarnation && n.Owner.Registry == claim.Proof.AliasBinding.Registry && queueObservationPattern.MatchString(n.Observation) && n.Revision < 1<<53 && n.Expires > 0 && n.Expires <= 10000 && validQueueItems(n.Items) && validQueueWriter(n.Writer, claim)
 }
+
+// projectQueueAutoplay changes queue authority only for a fully bound preview.
+func projectQueueAutoplay(n *nativeRoomQueueState, opted bool) (queueAutoplayDisplay, bool) {
+	if n.Autoplay == nil {
+		return queueAutoplayDisplay{}, true
+	}
+	var discriminator struct {
+		Kind string `json:"kind"`
+	}
+	if !opted || json.Unmarshal(*n.Autoplay, &discriminator) != nil {
+		return queueAutoplayDisplay{}, false
+	}
+	var ids map[string]string
+	var metadata map[string]queueDisplayMetadata
+	switch discriminator.Kind {
+	case "preview":
+		var preview nativeQueueAutoplayPreview
+		if queueClosedJSON(*n.Autoplay, &preview) != nil || len(n.Items) != 0 || n.Truncated ||
+			!queueObservationPattern.MatchString(preview.Observation) || preview.Observation == n.Observation ||
+			preview.Revision != n.Revision || preview.Expires < 1 || preview.Expires > 10000 ||
+			len(preview.Items) == 0 || !validQueueItems(preview.Items) || len(preview.DisplayIDs) != len(preview.Items) {
+			return queueAutoplayDisplay{}, false
+		}
+		for _, item := range preview.Items {
+			if item.Queued {
+				return queueAutoplayDisplay{}, false
+			}
+		}
+		n.Observation, n.Expires, n.Items, n.Truncated = preview.Observation, min(n.Expires, preview.Expires), preview.Items, preview.Truncated
+		n.Metadata = nil
+		ids, metadata = preview.DisplayIDs, preview.Metadata
+	case "promotion":
+		var promotion nativeQueueAutoplayPromotion
+		if queueClosedJSON(*n.Autoplay, &promotion) != nil {
+			return queueAutoplayDisplay{}, false
+		}
+		ids, metadata = promotion.DisplayIDs, promotion.Metadata
+	default:
+		return queueAutoplayDisplay{}, false
+	}
+	if len(ids) == 0 || len(ids) > len(n.Items) {
+		return queueAutoplayDisplay{}, false
+	}
+	seen := make(map[string]bool, len(ids))
+	uris := make(map[string]bool, len(ids))
+	for _, item := range n.Items {
+		if display, ok := ids[item.ID]; ok {
+			suffix, ok := strings.CutPrefix(display, "display-")
+			if !ok || !queueOptionPattern.MatchString(suffix) || seen[display] || item.Queued {
+				return queueAutoplayDisplay{}, false
+			}
+			seen[display], uris[item.URI] = true, true
+		}
+	}
+	if len(seen) != len(ids) {
+		return queueAutoplayDisplay{}, false
+	}
+	for uri, label := range metadata {
+		if !uris[uri] {
+			return queueAutoplayDisplay{}, false
+		}
+		if n.Metadata == nil {
+			n.Metadata = make(map[string]queueDisplayMetadata)
+		}
+		n.Metadata[uri] = label
+	}
+	n.Autoplay = nil
+	return queueAutoplayDisplay{discriminator.Kind, ids}, true
+}
+
 func validQueueOutputState(o outputRoomQueueState, n nativeRoomQueueState, claim startClaim, scope roomTransportScope) bool {
 	return o.Schema == "podconnect.output_queue_state.v1" && o.OK && o.Purpose == roomQueuePurpose && !o.Physical && !o.Busy && len(o.Actions) == 1 && o.Actions[0] == "queue" && o.Owner == n.Owner && o.Writer == n.Writer && queueRouteValid(o.Identity, scope.Homepod) && o.Identity.InputDigest == configuredTransportInput(claim)
 }
@@ -303,9 +399,16 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	started := time.Now()
 	q := url.Values{"account_user_id": {scope.Account}, "target_id": {scope.Target}, "room_id": {scope.Room}, "homepod_id": {scope.Homepod}}
-	raw, err := roomQueueRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_transport/bound-queue?"+q.Encode(), nil)
+	values := r.Header.Values(roomQueueAutoplayHeader)
+	opted := len(values) == 1 && values[0] == "1"
+	raw, err := roomQueueRPC(ctx, claim.RT.room.Librespot, http.MethodGet, "/player/room_transport/bound-queue?"+q.Encode(), nil, opted)
 	var n nativeRoomQueueState
 	if err != nil || queueClosedJSON(raw, &n) != nil || !validQueueState(n, claim, scope) || !roomQueueClaimCurrent(claim, scope) {
+		http.Error(w, "native room queue unavailable", 409)
+		return
+	}
+	display, valid := projectQueueAutoplay(&n, opted)
+	if !valid {
 		http.Error(w, "native room queue unavailable", 409)
 		return
 	}
@@ -315,7 +418,7 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stateBody, _ := json.Marshal(map[string]any{"native_owner": n.Owner, "writer_proof": n.Writer})
-	raw, err = roomQueueRPC(ctx, claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(scope.Homepod)+"/transport/bound-state", stateBody)
+	raw, err = roomQueueRPC(ctx, claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(scope.Homepod)+"/transport/bound-state", stateBody, false)
 	var o outputRoomQueueState
 	if err != nil || queueClosedJSON(raw, &o) != nil || !validQueueOutputState(o, n, claim, scope) || !roomQueueClaimCurrent(claim, scope) {
 		http.Error(w, "output room queue unavailable", 409)
@@ -326,7 +429,7 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expired", 409)
 		return
 	}
-	read := roomQueueRead{n, o.Identity, claim, started.Add(time.Duration(n.Expires) * time.Millisecond)}
+	read := roomQueueRead{n, o.Identity, claim, started.Add(time.Duration(n.Expires) * time.Millisecond), display.Kind == "preview"}
 	roomQueueStore.Lock()
 	roomQueueStore.Read = &read
 	roomQueueStore.Unlock()
@@ -335,7 +438,11 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 	if values := r.Header.Values("X-Podconnect-Queue-Metadata"); len(values) == 1 && values[0] == "1" && len(n.Metadata) > 0 {
 		queue["metadata"] = n.Metadata
 	}
-	writeJSON(w, map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": queue, "actions": []string{"play_queue_occurrence"}, "physical_result_verified": false})
+	response := map[string]any{"schema": "podconnect.room_queue_state.v1", "ok": true, "purpose": roomQueuePurpose, "native": n.Owner, "route": o.Identity, "queue": queue, "actions": []string{"play_queue_occurrence"}, "physical_result_verified": false}
+	if display.Kind != "" {
+		response["autoplay"] = display
+	}
+	writeJSON(w, response)
 }
 
 func decodeRoomQueueBody(r *http.Request, out any) error {
@@ -390,7 +497,7 @@ func roomQueuePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	requestBody, _ := json.Marshal(map[string]any{"account_user_id": request.Scope.Account, "target_id": request.Scope.Target, "room_id": request.Scope.Room, "homepod_id": request.Scope.Homepod, "action": "queue", "volume_percent": 0, "queue": request.Queue})
 	started := time.Now()
-	raw, err := roomQueueRPC(ctx, read.Claim.RT.room.Librespot, http.MethodPost, "/player/room_transport/bound-prepare", requestBody)
+	raw, err := roomQueueRPC(ctx, read.Claim.RT.room.Librespot, http.MethodPost, "/player/room_transport/bound-prepare", requestBody, read.Autoplay)
 	var n nativeRoomQueuePrepare
 	if err != nil || queueClosedJSON(raw, &n) != nil || n.Schema != "podconnect.native_room_queue_prepare.v1" || n.Purpose != roomQueuePurpose || !queueObservationPattern.MatchString(n.PrepareID) || n.Owner != read.Native.Owner || !validBoundNativeRevision(n.Revision) || n.Action != "queue" || n.Percent != 0 || !transportDigest.MatchString(n.Digest) || n.Expires < 1 || n.Expires > 5000 || n.Queue != request.Queue || n.Writer != read.Native.Writer || !roomQueueCurrent(*read, request.Scope) {
 		http.Error(w, "native queue preparation unavailable", 409)
@@ -406,7 +513,7 @@ func roomQueuePrepareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stateBody, _ := json.Marshal(map[string]any{"native_owner": n.Owner, "writer_proof": n.Writer})
-	raw, err = roomQueueRPC(ctx, read.Claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(request.Scope.Homepod)+"/transport/bound-state", stateBody)
+	raw, err = roomQueueRPC(ctx, read.Claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(request.Scope.Homepod)+"/transport/bound-state", stateBody, false)
 	var state outputRoomQueueState
 	if err != nil || queueClosedJSON(raw, &state) != nil || !validQueueOutputState(state, read.Native, read.Claim, request.Scope) || state.Identity != request.Route || !roomQueueCurrent(*read, request.Scope) || !time.Now().Before(nativeDeadline) {
 		http.Error(w, "output queue state unavailable", 409)
@@ -414,7 +521,7 @@ func roomQueuePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	outputBody, _ := json.Marshal(map[string]any{"native_prepare_id": n.PrepareID, "args_digest": n.Digest, "action": "queue", "native_owner": n.Owner, "native_revision": n.Revision, "queue": n.Queue, "writer_proof": n.Writer})
 	cStarted := time.Now()
-	raw, err = roomQueueRPC(ctx, read.Claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(request.Scope.Homepod)+"/transport/bound-prepare", outputBody)
+	raw, err = roomQueueRPC(ctx, read.Claim.RT.room.OwnTone, http.MethodPost, "/api/outputs/"+url.PathEscape(request.Scope.Homepod)+"/transport/bound-prepare", outputBody, false)
 	var o outputRoomQueuePrepare
 	if err != nil || queueClosedJSON(raw, &o) != nil || o.Schema != "podconnect.output_queue_prepare.v1" || !o.OK || o.Purpose != roomQueuePurpose || !queueObservationPattern.MatchString(o.Token) || o.Identity != request.Route || o.Owner != n.Owner || o.Revision != n.Revision || o.PrepareID != n.PrepareID || o.Digest != n.Digest || o.Queue != n.Queue || o.Writer != n.Writer || o.Expires < 1 || o.Expires > 10000 || !roomQueueCurrent(*read, request.Scope) || !time.Now().Before(nativeDeadline) {
 		http.Error(w, "output queue preparation unavailable", 409)
@@ -474,7 +581,7 @@ func roomQueueCommitHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithDeadline(r.Context(), prepared.Expires)
 	defer cancel()
 	encoded, _ := json.Marshal(map[string]any{"prepare_id": body.PrepareID, "own_tone_token": prepared.Output.Token})
-	raw, err := roomQueueRPC(ctx, prepared.Read.Claim.RT.room.Librespot, http.MethodPost, "/player/room_transport/bound-commit", encoded)
+	raw, err := roomQueueRPC(ctx, prepared.Read.Claim.RT.room.Librespot, http.MethodPost, "/player/room_transport/bound-commit", encoded, false)
 	var ack struct {
 		Schema      string                `json:"schema"`
 		Accepted    bool                  `json:"accepted_native"`
