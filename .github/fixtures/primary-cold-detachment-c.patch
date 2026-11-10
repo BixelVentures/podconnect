@@ -1,0 +1,276 @@
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -25,9 +25,26 @@
+ #include "../src/conffile.c"
+ #define RADIO_SENDER_FIXTURE_SOURCE
+ static int fixture_primary_writer_stat(const char *path, struct stat *result);
++static void fixture_primary_cold_after_read(void);
++#define PRIMARY_COLD_DETACHMENT_AFTER_READ() fixture_primary_cold_after_read()
+ #define stat(path, result) fixture_primary_writer_stat(path, result)
+ #include "../src/outputs.c"
+ #undef stat
++#undef PRIMARY_COLD_DETACHMENT_AFTER_READ
++
++static bool fixture_primary_cold_open_writer;
++static int fixture_primary_cold_writer = -1;
++
++static void
++fixture_primary_cold_after_read(void)
++{
++  if (fixture_primary_cold_open_writer)
++    {
++      fixture_primary_cold_open_writer = false;
++      fixture_primary_cold_writer = open(START_CANONICAL_FIFO, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++      assert(fixture_primary_cold_writer >= 0);
++    }
++}
+ #include "../src/evrtsp/evrtsp.h"
+ static struct evrtsp_request *fixture_request_new(void (*)(struct evrtsp_request *,void *),void *);
+ static void *fixture_calloc(size_t n, size_t size);
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1781,6 +1781,28 @@
+           recovery_wire_fail(f, "control loss requires the exact live P1 receiver and no claimed Stop");
+           return;
+         }
++      if (getenv("PC_NATIVE_PRIMARY_COLD_PARK"))
++        {
++          json_object *start = start_journal.payload ? json_tokener_parse(start_journal.payload) : NULL;
++          json_object *fence;
++          uint64_t device, inode;
++          const char *generation;
++          struct stat actual_fence;
++          const char *live_generation = start_owner_fence_current(&actual_fence);
++          assert(start && start_cold_completed_shape(start, false)
++              && json_object_object_get_ex(start, "primary_owner_fence", &fence)
++              && start_owner_fence_parse(fence, &device, &inode, &generation)
++              && live_generation && !strcmp(live_generation, generation)
++              && device == (uint64_t)actual_fence.st_dev && inode == (uint64_t)actual_fence.st_ino
++              && park->result.phase == OUTPUT_RADIO_SUSPENDED
++              && park->result.stop_code == 200 && park->result.stop_cseq > 0
++              && active.epoch == park->result.command.identity.session_epoch + 4
++              && active.route == park->result.command.identity.route_revision + 1);
++          json_object_put(start);
++          fprintf(stderr, "PASS real old START and encrypted P1 parked with durable shared lifetime proof before process exit\n");
++          fflush(NULL);
++          _exit(0); /* Model an owner dying before any radio teardown callback. */
++        }
+       wire->primary_control_closed = true;
+       primary_radio_wire_receiver_reset(f);
+       fprintf(stderr, "PASS fixture closed the exact P1 RTSP peer after authenticated RTP and before any Stop\n");
+@@ -2150,6 +2172,8 @@
+   const char *cold_db = getenv("PC70_COLD_DATABASE"), *cold_fifo = getenv("PC70_COLD_FIFO");
+   const char *primary_port = getenv("PC_NATIVE_PRIMARY_HTTP_PORT");
+   bool cold = mode == 29 && cold_db && cold_fifo, cold_restart = cold && getenv("PC70_COLD_RESTART");
++  bool cold_primary = cold && getenv("PC_NATIVE_PRIMARY_COLD_PARK");
++  bool cold_replay = cold_primary && getenv("PC_NATIVE_PRIMARY_COLD_REPLAY");
+   int file = -1, placeholder = -1, writer = -1, reader = -1, item;
+   bool database_ready=false,input_ready=false,worker_ready=false;pthread_t writer_thread;struct start_fifo_writer pending={0};
+   struct input_fifo_identity fd={0};struct timespec deadline;struct media_file_info mfi={0};struct query_params qp={.type=Q_ITEMS};
+@@ -2187,6 +2211,13 @@
+   if(retired_keep_live_slot)player_state=PLAY_STOPPED; /* Actual player_init baseline. */
+   cfg=cfg_init(toplvl_cfg,0);assert(cfg);cfg_setstr(cfg_getsec(cfg,"general"),"db_path",database);
+   cfg_setbool(cfg_getsec(cfg,"library"),"pipe_autostart",false);
++  if (cold_primary)
++    {
++      cfg_setlist(cfg_getsec(cfg, "library"), "directories", 1, START_CANONICAL_MEDIA);
++      if (cold_restart)
++        cfg_setstr(cfg_getsec(cfg, "general"), "radio_handoff_secret",
++            "2222222222222222222222222222222222222222222222222222222222222222");
++    }
+   if (primary_port)
+     {
+       int port;
+@@ -2223,11 +2254,12 @@
+     outputs_radio_protocols_startup();
+   else
+     start_journal_startup();
+-  if (cold_restart && !getenv("PC_JOURNAL_INJECT_UNKNOWN"))
++  if (cold_restart && !cold_primary && !getenv("PC_JOURNAL_INJECT_UNKNOWN"))
+     rollback53_probe("new-version-retained-release", false);
+   if (cold_restart)
+     assert(outputs_start_gate_closed() && !start_journal_fault
+-           && start_journal_retirement_outcome == (getenv("PC_JOURNAL_INJECT_UNKNOWN") ? OUTPUT_RETIRE_UNKNOWN : OUTPUT_RETIRE_RETIRED_KNOWN));
++           && start_journal_retirement_outcome == (cold_primary ? (cold_replay ? OUTPUT_RETIRE_COLD_KNOWN : OUTPUT_RETIRE_NONE)
++               : getenv("PC_JOURNAL_INJECT_UNKNOWN") ? OUTPUT_RETIRE_UNKNOWN : OUTPUT_RETIRE_RETIRED_KNOWN));
+   else
+     assert(!outputs_start_gate_closed());
+   if(airplay_init()!=-1){f.failed=1;goto cleanup;}keep_alive_timer=NULL;
+@@ -2243,7 +2275,8 @@
+     extra->supports_encryption=1; /* Real AP2 discovery requires this capability. */
+   if (primary_park || primary_port)
+     f.primary_route_receiver = true;
+-  f.device=outputs_device_add(f.device,false);assert(f.device && outputs_device_volume_register(f.device,27,-1)==0);
++  f.device=outputs_device_add(f.device,false);
++  assert(f.device && (cold_primary && cold_restart || outputs_device_volume_register(f.device,27,-1)==0));
+   if (disjoint || primary_intent || primary_station || primary_park)
+     {
+       keep_alive_timer = evtimer_new(f.base, airplay_keep_alive_timer_cb, NULL);
+@@ -2363,6 +2396,165 @@
+ 	if (getenv("PC_REQUIRE_RTP_AUDIO"))
+ 	  target_extra->supports_encryption = 1;
+ 	assert(outputs_device_add(target, false) == target && outputs_device_volume_register(target, 65, -1) == 0);
++      }
++    if (cold_primary && cold_restart)
++      {
++        struct radio_handoff_slot *park = radio_handoff_find(f.device->id);
++        struct output_primary_radio_custody historical;
++        struct output_primary_radio_start_request radio = { 0 };
++        struct output_start_request request = { .device_id = f.device->id };
++        struct output_start_state music;
++        struct stat fifo_now;
++        uint64_t previous_device, previous_inode;
++        char *radio_before = NULL, *radio_after = NULL, *route_before = NULL, *route_after = NULL, key[64];
++        primary_radio_custody_key(key, f.device->id);
++        assert(db_radio_handoff_load(&radio_before) == 1 && db_radio_handoff_load_key(key, &route_before) == 1);
++        json_object *old_park_row = json_tokener_parse(radio_before);
++        json_object *old_route_row = json_tokener_parse(route_before);
++        char previous_park_digest[65] = { 0 }, previous_route_digest[65] = { 0 };
++        assert(primary_cold_detachment_unwrap(old_park_row, radio_before, previous_park_digest)
++            && primary_cold_detachment_unwrap(old_route_row, route_before, previous_route_digest)
++            && !!previous_park_digest[0] == cold_replay && !!previous_route_digest[0] == cold_replay);
++        assert(park && park->result.phase == OUTPUT_RADIO_UNKNOWN && !park->primary_session
++            && park->result.stop_code == 200 && park->result.stop_cseq > 0
++            && primary_radio_custody_decode(json_object_to_json_string_ext(old_route_row, JSON_C_TO_STRING_PLAIN),
++                f.device->id, &historical)
++            && !historical.teardown_cseq && !historical.stop_action[0]
++            && strcmp(historical.process, outputs_process)
++            && !strcmp(historical.process, park->result.command.identity.process)
++            && historical.incarnation == park->result.command.identity.device_incarnation
++            && historical.epoch == park->result.command.identity.session_epoch + 4
++            && historical.route == park->result.command.identity.route_revision + 1);
++        json_object *old_start = json_tokener_parse(start_journal.payload);
++        assert(old_start && start_cold_completed_shape(old_start, false)
++            && release_json_u64(old_start, "pipe_device", &previous_device)
++            && release_json_u64(old_start, "pipe_inode", &previous_inode)
++            && release_json_string(old_start, "input_path", request.expected_input_path, sizeof(request.expected_input_path))
++            && release_json_string(old_start, "input_path_digest", request.expected_input_path_digest,
++                sizeof(request.expected_input_path_digest))
++            && stat(fifo, &fifo_now) == 0
++            && start_cold_successor_fenced(old_start, &request, &fifo_now, previous_device, previous_inode));
++        const struct output_radio_handoff_request *prior_park = &park->result.command;
++        struct output_transport_identity completed_route;
++        struct output_native_owner completed_owner;
++        json_object *route_field, *owner_field;
++        uint64_t writer_epoch, writer_fd;
++        assert(park->result.requires_native_pause && radio_primary_park_command(prior_park)
++            && start_journal.pid == prior_park->writer.native_process.pid
++            && start_journal.proc_start_ticks == prior_park->writer.native_process.proc_start_ticks
++            && !strcmp(start_journal.boot_id, prior_park->writer.native_process.boot_id)
++            && !strcmp(start_journal.c_process, prior_park->identity.process)
++            && prior_park->writer.pipe_device == previous_device && prior_park->writer.pipe_inode == previous_inode
++            && !strcmp(request.expected_input_path_digest, prior_park->writer.input_path_digest)
++            && release_json_u64(old_start, "writer_source_epoch", &writer_epoch)
++            && release_json_u64(old_start, "writer_fd", &writer_fd)
++            && prior_park->writer.source_epoch == writer_epoch && prior_park->writer.writer_fd == writer_fd
++            && json_object_object_get_ex(old_start, "route_identity", &route_field)
++            && release_identity_parse(route_field, &completed_route)
++            && transport_identity_equal(&completed_route, &prior_park->identity)
++            && json_object_object_get_ex(old_start, "actual_native_owner", &owner_field)
++            && release_owner_parse(owner_field, &completed_owner)
++            && native_owner_equal(&completed_owner, &prior_park->native_owner));
++        assert(!start_old_process_retirement_denial());
++        const char *generation = getenv("PODCONNECT_PRIMARY_OWNER_FENCE");
++        char generation_copy[33];
++        assert(generation && strlen(generation) == 32);
++        memcpy(generation_copy, generation, sizeof(generation_copy));
++        assert(setenv("PODCONNECT_PRIMARY_OWNER_FENCE", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1) == 0);
++        assert(!start_cold_successor_fenced(old_start, &request, &fifo_now, previous_device, previous_inode));
++        assert(setenv("PODCONNECT_PRIMARY_OWNER_FENCE", generation_copy, 1) == 0);
++        int held_reader = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++        int held_writer = open(fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++        assert(held_reader >= 0 && held_writer >= 0);
++        const char *denial = start_cold_fifo_denial(fifo, &fifo_now, previous_device, previous_inode);
++        assert(denial && !strcmp(denial, "writer_present"));
++        assert(write(held_writer, "x", 1) == 1 && close(held_writer) == 0);
++        denial = start_cold_fifo_denial(fifo, &fifo_now, previous_device, previous_inode);
++        assert(denial && !strcmp(denial, "fifo_pcm_pending"));
++        char pending;
++        assert(read(held_reader, &pending, 1) == 1 && pending == 'x' && close(held_reader) == 0);
++        assert(!start_cold_fifo_denial(fifo, &fifo_now, previous_device, previous_inode));
++        puts("PASS exact old START owner/route/writer/FIFO matches the parked C row; same generation, live writer and buffered PCM deny");
++        if (!cold_replay)
++          {
++            struct db_start_guard stale_start = start_journal;
++            stale_start.proc_start_ticks++;
++            assert(db_primary_radio_cold_save(&start_journal, key, radio_before, "fixture first row",
++                "stale expected second row", "fixture second row") < 0);
++            assert(db_primary_radio_cold_save(&stale_start, key, radio_before, "fixture first row",
++                route_before, "fixture second row") < 0);
++            assert(db_radio_handoff_load(&radio_after) == 1 && db_radio_handoff_load_key(key, &route_after) == 1
++                && !strcmp(radio_before, radio_after) && !strcmp(route_before, route_after));
++            free(radio_after);
++            free(route_after);
++            radio_after = route_after = NULL;
++            puts("PASS stale second row rolls back first write and changed START cannot install a witness");
++          }
++        outputs_transport_release_recover_pending();
++        outputs_start_recover_cold_completed();
++        assert(start_route_clean_absent() && !outputs_start_gate_closed()
++            && !start_active && !f.device->selected && !f.device->session
++            && outputs_radio_handoff_blocked(f.device->id) && !outputs_primary_radio_custody_available(f.device->id));
++        assert(start_boot_id(request.native_process.boot_id));
++        request.native_process.pid = getpid();
++        assert(start_process_ticks(request.native_process.pid, &request.native_process.proc_start_ticks) == 1);
++        memset(request.native_incarnation, 'd', 32);
++        assert(outputs_start_state_get(&request, &music) == 0 && !music.ready
++            && outputs_airplay_primary_station_target(f.device->id, &radio) < 0);
++        struct output_primary_spotify_park_request old_binding = {
++          .owner = prior_park->native_owner, .writer = prior_park->writer,
++          .route = prior_park->identity, .native_revision = prior_park->native_revision,
++        };
++        memcpy(old_binding.action, prior_park->handoff_id, sizeof(old_binding.action));
++        memcpy(old_binding.token, prior_park->token, sizeof(old_binding.token));
++        struct output_primary_radio_start_request proof;
++        assert(outputs_primary_radio_cold_observe(&old_binding, &historical, &proof) == 0
++            && !strcmp(proof.process, outputs_process) && strcmp(proof.process, historical.process)
++            && proof.device_id == historical.device_id && proof.incarnation == f.device->incarnation);
++        struct output_primary_spotify_park_request wrong_park = old_binding;
++        wrong_park.writer.writer_fd++;
++        assert(outputs_primary_radio_cold_observe(&wrong_park, &historical, &proof) < 0);
++        wrong_park = old_binding;
++        wrong_park.token[0] = wrong_park.token[0] == 'a' ? 'b' : 'a';
++        assert(outputs_primary_radio_cold_observe(&wrong_park, &historical, &proof) < 0);
++        struct output_primary_radio_custody wrong_route = historical;
++        wrong_route.epoch++;
++        assert(outputs_primary_radio_cold_observe(&old_binding, &wrong_route, &proof) < 0);
++        wrong_route = historical;
++        wrong_route.teardown_cseq = 1;
++        assert(outputs_primary_radio_cold_observe(&old_binding, &wrong_route, &proof) < 0);
++        fixture_primary_cold_open_writer = true;
++        assert(outputs_primary_radio_cold_observe(&old_binding, &historical, &proof) < 0
++            && !fixture_primary_cold_open_writer && fixture_primary_cold_writer >= 0
++            && close(fixture_primary_cold_writer) == 0);
++        fixture_primary_cold_writer = -1;
++        assert(outputs_primary_radio_cold_observe(&old_binding, &historical, &proof) == 0);
++        struct db_start_guard stale_disk = start_journal;
++        stale_disk.proc_start_ticks++;
++        assert(db_start_guard_save(&start_journal, &stale_disk) == 0);
++        assert(outputs_primary_radio_cold_observe(&old_binding, &historical, &proof) < 0);
++        assert(db_start_guard_save(&stale_disk, &start_journal) == 0);
++        assert(outputs_primary_radio_cold_observe(&old_binding, &historical, &proof) == 0);
++        assert(db_radio_handoff_load(&radio_after) == 1 && db_radio_handoff_load_key(key, &route_after) == 1);
++        if (cold_replay)
++          assert(!strcmp(radio_before, radio_after) && !strcmp(route_before, route_after));
++        json_object *new_park_row = json_tokener_parse(radio_after);
++        json_object *new_route_row = json_tokener_parse(route_after);
++        char current_park_digest[65] = { 0 }, current_route_digest[65] = { 0 };
++        assert(primary_cold_detachment_unwrap(new_park_row, radio_after, current_park_digest)
++            && primary_cold_detachment_unwrap(new_route_row, route_after, current_route_digest)
++            && current_park_digest[0] && !strcmp(current_park_digest, current_route_digest)
++            && !strcmp(json_object_to_json_string_ext(old_park_row, JSON_C_TO_STRING_PLAIN),
++                json_object_to_json_string_ext(new_park_row, JSON_C_TO_STRING_PLAIN))
++            && !strcmp(json_object_to_json_string_ext(old_route_row, JSON_C_TO_STRING_PLAIN),
++                json_object_to_json_string_ext(new_route_row, JSON_C_TO_STRING_PLAIN)));
++        free(radio_before); free(radio_after); free(route_before); free(route_after);
++        json_object_put(old_start);
++        json_object_put(old_park_row); json_object_put(new_park_row);
++        json_object_put(old_route_row); json_object_put(new_route_row);
++        fprintf(stderr, "PASS restarted C %s exact cold detachment without STOP or fresh action authority\n",
++            cold_replay ? "revalidated without rewriting" : "recorded");
++        goto cleanup;
+       }
+     if (getenv("PC_JOURNAL_RELOAD_READ")) {
+       struct output_start_request probe={.device_id=1}; struct output_start_state read={0};

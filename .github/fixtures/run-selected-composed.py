@@ -81,6 +81,143 @@ def run_primary_radio_http():
                     c.wait()
 
 
+def run_primary_cold_detachment():
+    import contextlib
+    import fcntl
+    import tempfile
+
+    # /data must remain private to the test because the production proof is
+    # intentionally pinned to /data/media/spotify and its real lifetime lock.
+    outer_ns = os.getenv("PC_FIXTURE_HOST_MOUNT_NS")
+    if not outer_ns or outer_ns == os.readlink("/proc/self/ns/mnt"):
+        raise SystemExit("cold detachment requires a private mount namespace")
+    root = pathlib.Path(os.environ.get("PC_FIXTURE_ROOT", "/work"))
+    logs = pathlib.Path(tempfile.mkdtemp(prefix="pc52-selected-primary-cold-", dir=root))
+    data = pathlib.Path("/data")
+    created_mountpoint = not data.exists()
+    if data.is_symlink() or (not created_mountpoint and not data.is_dir()):
+        raise SystemExit("invalid cold fixture mountpoint")
+    if created_mountpoint:
+        data.mkdir(mode=0o755)
+    c_binary = ["src/airplay_callback_owner", "--native-start-wire"]
+    native_binary = [
+        os.environ.get("PC_NATIVE_TEST_BIN", "/work/native-tests"), "-test.v", "-test.timeout=15s",
+        "-test.run", "^TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer/actual-c-primary-same-target$",
+    ]
+
+    @contextlib.contextmanager
+    def owner_lifetime(generation):
+        fd = os.open(data / ".podconnect-primary-owner", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            if fd != 3:  # Exact descriptor number used by both production owners.
+                raise RuntimeError("cold fixture lifetime descriptor is not fd 3")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield dict(env, PODCONNECT_PRIMARY_OWNER_FENCE=generation * 32)
+        finally:
+            os.close(fd)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="primary-cold-data-", dir=root) as source:
+            pathlib.Path(source).chmod(0o755)
+            subprocess.run(["mount", "--bind", source, str(data)], check=True)
+            try:
+                (data / "media").mkdir(mode=0o755)
+                ready = logs / "ready.json"
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.bind(("127.0.0.1", 0))
+                    port = sock.getsockname()[1]
+                env = dict(
+                    os.environ,
+                    PC70_COLD_DATABASE=str(data / "songs3.db"),
+                    PC70_COLD_FIFO=str(data / "media/spotify"),
+                    PC_NATIVE_PRIMARY_COLD_PARK="1",
+                    PC_NATIVE_PRIMARY_CONTROL_LOSS=str(logs / "disconnect"),
+                    PC_NATIVE_PRIMARY_STOP_RESTART="1",
+                    PC_NATIVE_PRIMARY_NEW_SELECTION="1",
+                    PC_NATIVE_PRIMARY_HTTP_PORT=str(port),
+                    PC_PRIMARY_HTTP_TOKEN="2" * 64,
+                    PC_REQUIRE_RTP_AUDIO="1",
+                    PC_NATIVE_START_MODE="actual-c-primary-same-target",
+                    PC_NATIVE_START_READY_FILE=str(ready),
+                )
+                with owner_lifetime("a") as prior_env, (logs / "prior-c.log").open("w") as c_log:
+                    c = subprocess.Popen(c_binary, cwd=root, env=prior_env, pass_fds=(3,),
+                                         stdout=c_log, stderr=subprocess.STDOUT)
+                    native = None
+                    try:
+                        deadline = time.monotonic() + 5
+                        endpoint = f"http://127.0.0.1:{port}"
+                        while c.poll() is None and time.monotonic() < deadline:
+                            if ready.exists():
+                                try:
+                                    info = json.loads(ready.read_text())
+                                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                                        break
+                                except (OSError, ValueError):
+                                    pass
+                            time.sleep(0.025)
+                        else:
+                            raise RuntimeError("old C owner did not expose its fixture endpoints")
+                        if info.get("primary_url") != endpoint or info.get("pipe") != env["PC70_COLD_FIFO"]:
+                            raise RuntimeError("unexpected old owner fixture endpoints")
+                        with (logs / "prior-native.log").open("w") as native_log:
+                            native = subprocess.Popen(
+                                native_binary, cwd=root, pass_fds=(3,),
+                                env=dict(prior_env, PC_NATIVE_START_URL=info["url"],
+                                         PC_NATIVE_START_PIPE=info["pipe"], PC_NATIVE_PRIMARY_HTTP_URL=endpoint),
+                                stdout=native_log, stderr=subprocess.STDOUT,
+                            )
+                        if c.wait(timeout=15) or not any(
+                            line.startswith("PASS real old START and encrypted P1 parked")
+                            for line in (logs / "prior-c.log").read_text().splitlines()
+                        ):
+                            raise RuntimeError("old C did not persist its exact parked P1 before process exit")
+                        competing = os.open(data / ".podconnect-primary-owner", os.O_RDWR | os.O_NOFOLLOW)
+                        try:
+                            try:
+                                fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                print("PASS competing descriptor cannot acquire the old live lifetime lock")
+                            else:
+                                raise RuntimeError("old lifetime allowed a competing lock")
+                        finally:
+                            os.close(competing)
+                    finally:
+                        for process in (native, c):
+                            if process is not None and process.poll() is None:
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=2)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait()
+                for generation, name in (("b", "restarted"), ("c", "replay")):
+                    with owner_lifetime(generation) as fresh_env, (logs / f"{name}-c.log").open("w") as c_log:
+                        fresh_env["PC70_COLD_RESTART"] = "1"
+                        if name == "replay":
+                            fresh_env["PC_NATIVE_PRIMARY_COLD_REPLAY"] = "1"
+                        subprocess.run(c_binary, cwd=root, env=fresh_env, pass_fds=(3,),
+                                       stdout=c_log, stderr=subprocess.STDOUT, timeout=10, check=True)
+                    expected = ("PASS restarted C recorded" if name == "restarted"
+                                else "PASS restarted C revalidated without rewriting")
+                    marker = next((line for line in (logs / f"{name}-c.log").read_text().splitlines()
+                                   if line.startswith(expected)), None)
+                    if marker is None:
+                        raise RuntimeError(f"{name} owner did not verify exact cold detachment")
+                    print(marker)
+            finally:
+                subprocess.run(["umount", str(data)], check=True)
+    finally:
+        if created_mountpoint:
+            data.rmdir()
+        print(f"Cold detachment fixture logs: {logs}")
+
+
+if sys.argv[1] == "actual-c-primary-cold-detachment":
+    run_primary_cold_detachment()
+    sys.exit(0)
+
+
 if sys.argv[1] == "primary-radio-http":
     run_primary_radio_http()
     sys.exit(0)
