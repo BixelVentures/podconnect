@@ -126,6 +126,10 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 	if err = os.WriteFile(radioWorkerSettingsPath(), settings, 0600); err != nil {
 		t.Fatal(err)
 	}
+	lossMarker := os.Getenv("PC_NATIVE_PRIMARY_CONTROL_LOSS")
+	if lossMarker != "" && !filepath.IsAbs(lossMarker) {
+		t.Fatal("expected an absolute local receiver-loss trigger")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	radioOwner = configuredRadioOwner()
@@ -246,6 +250,13 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 		if receipt.Action != q.ActionID || receipt.Status != "accepted" || receipt.Retry {
 			t.Fatalf("Manager did not accept the exact %s action", station)
 		}
+		if lossMarker != "" && i == 2 {
+			for _, step := range trace.trace {
+				if strings.HasPrefix(step, "stop ") || strings.HasPrefix(step, "result/stop ") {
+					t.Fatalf("fresh P6 tried to stop the already isolated receiver: %s", step)
+				}
+			}
+		}
 		current = readState()
 		if current.State != "playing" || current.SourceKind != "radio" || current.StationID != station ||
 			current.TargetID != target || current.PhysicalVerified {
@@ -270,5 +281,59 @@ func TestConfiguredPrimaryRadioComposed(t *testing.T) {
 			return observed.Radio[i] > 0
 		})
 		t.Logf("verified configured Manager %s with authenticated receiver RTP", station)
+		if lossMarker != "" && i == 1 {
+			playing := current
+			producer.mu.Lock()
+			incumbent := producer.active
+			producer.mu.Unlock()
+			radioOwner.mu.Lock()
+			fence := radioOwner.fence
+			radioOwner.mu.Unlock()
+			resultPath := fmt.Sprintf("/api/radio/result?process_id=%s&action_id=%s&generation=%d",
+				playing.ProcessID, q.ActionID, fence.Generation)
+			readResult := func() *httptest.ResponseRecorder {
+				request := httptest.NewRequest(http.MethodGet, resultPath, nil).WithContext(ctx)
+				request.Header.Set("X-PodConnect-Token", token)
+				response := httptest.NewRecorder()
+				radioResultHandler(response, request)
+				return response
+			}
+			resultResp := readResult()
+			var result radioActionResult
+			if err := json.NewDecoder(resultResp.Body).Decode(&result); err != nil ||
+				resultResp.Code != http.StatusOK || result.ActionID != q.ActionID || result.Outcome != "committed" {
+				t.Fatal("historical result probe did not resolve the live P1 start before receiver loss")
+			}
+			trace.trace = nil
+			if err := os.WriteFile(lossMarker, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			wait(func() bool {
+				current = readState()
+				return current.State == "stopped" && current.SourceKind == "none" &&
+					current.TargetID == target && slices.Contains(current.Actions, "start")
+			})
+			producer.mu.Lock()
+			retired := producer.records[incumbent]
+			active := producer.active
+			producer.mu.Unlock()
+			if len(trace.trace) != 0 || active != "" || retired.Primary == nil || !retired.SourceDrained ||
+				retired.Primary.Isolation == nil || retired.Primary.StopReceipt != nil ||
+				retired.Primary.TeardownCSeq != 0 || retired.Primary.ReleaseActionID != "" ||
+				current.OwnerGeneration != playing.OwnerGeneration || current.Generation <= playing.Generation {
+				t.Fatal("passive loss recovery did not retain exact custody without a positive STOP")
+			}
+			if readResult().Code != http.StatusConflict || len(trace.trace) != 0 {
+				t.Fatal("passive isolation changed the historical action result")
+			}
+			replayReq := httptest.NewRequest(http.MethodPost, "/api/radio/action", bytes.NewReader(body)).WithContext(ctx)
+			replayReq.Header.Set("X-PodConnect-Token", token)
+			replayResp := httptest.NewRecorder()
+			radioActionHandler(replayResp, replayReq)
+			if replayResp.Code != http.StatusConflict || len(trace.trace) != 0 {
+				t.Fatal("old P1 action replayed after passive isolation")
+			}
+			t.Log("verified configured Manager observed exact receiver isolation without STOP or a new effect")
+		}
 	}
 }
