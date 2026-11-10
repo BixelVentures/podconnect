@@ -61,7 +61,7 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 // never stand in for a receiver/source observation or legacy pairing material.
 func primaryBootstrapStateReady(s radioPrimaryState) bool {
 	if s.Schema != primaryRadioSchema || s.Protocol != primaryRadioProtocol || !producerHex(s.Process, 64) || !producerCounter(s.Revision, true) ||
-		s.Missing == nil || len(s.Missing) != 0 || s.Session != nil || s.Observation == nil ||
+		s.Missing == nil || len(s.Missing) != 0 || s.Session != nil || s.IsolatedSession != nil || s.Observation == nil ||
 		!validRadioObservation(*s.Observation) || s.Observation.StationID != "" {
 		return false
 	}
