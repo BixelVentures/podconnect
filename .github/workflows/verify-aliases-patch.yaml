@@ -73,6 +73,9 @@ jobs:
           fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
           git apply --check "$fixture"
           git apply "$fixture"
+          fixture="$GITHUB_WORKSPACE/.github/fixtures/transfer-retirement-native.patch"
+          git apply --check "$fixture"
+          git apply "$fixture"
       - name: Test Manager radio and playback revision contracts
         run: cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1
       - name: Test Native queue, transport, output and retained packages

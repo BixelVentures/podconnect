@@ -1,0 +1,99 @@
+diff --git a/daemon/room_retirement_test.go b/daemon/room_retirement_test.go
+index 5dddfb9..df895d4 100644
+--- a/daemon/room_retirement_test.go
++++ b/daemon/room_retirement_test.go
+@@ -104,6 +104,94 @@ func retirementReply(purpose, phase, reservation string, writer output.MovePipeI
+ 	return r
+ }
+ 
++func TestLogoutSettlesOnlyDefinitivelyRejectedSTART(t *testing.T) {
++	for _, mode := range []string{"terminal", "closed_conflict", "closed_unknown", "ordinary_malformed", "ordinary_truncated_conflict"} {
++		t.Run(mode, func(t *testing.T) {
++			var app *App
++			var writer output.MovePipeIdentity
++			var first atomic.Pointer[retirementAttempt]
++			var normal, closed atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body struct {
++					Closed      bool   `json:"writer_already_closed"`
++					Reservation string `json:"native_reservation_id"`
++				}
++				if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/start/retire/prepare") ||
++					json.NewDecoder(r.Body).Decode(&body) != nil {
++					t.Error("unexpected retirement request")
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				if !body.Closed {
++					normal.Add(1)
++					app.moveCustodyMu.Lock()
++					first.Store(app.retirementPending)
++					app.moveCustodyMu.Unlock()
++					switch mode {
++					case "ordinary_malformed":
++						_, _ = io.WriteString(w, "{")
++					case "ordinary_truncated_conflict":
++						w.Header().Set("Content-Length", "8")
++						w.WriteHeader(http.StatusConflict)
++						_, _ = io.WriteString(w, "short")
++					default:
++						w.WriteHeader(http.StatusConflict)
++					}
++					return
++				}
++				closed.Add(1)
++				if mode == "closed_conflict" {
++					w.WriteHeader(http.StatusConflict)
++					return
++				}
++				reply := retirementReply("start", "prepare", body.Reservation, writer)
++				reply.Outcome, reply.InputEpoch, reply.ContextsDrained, reply.DurableTerminal, reply.RetiredWitness = "retired", "2", true, true, true
++				if mode == "closed_unknown" {
++					reply.Outcome, reply.OK = "unknown", false
++				}
++				_ = json.NewEncoder(w).Encode(reply)
++			}))
++			defer server.Close()
++			var old *AppPlayer
++			app, old, _ = retirementOwnerFixture(t, server.URL, "start")
++			writer = app.openedWriter
++			app.startCustody.Capture.Player = old.player
++			original := app.startCustody
++			app.currentPlayer = old
++			called := false
++			_, err := app.replaceAppPlayer(context.Background(), old, func(context.Context) (*AppPlayer, error) {
++				called = true
++				if !old.player.Closed() {
++					t.Fatal("published successor before old worker joined")
++				}
++				return nil, nil
++			})
++			if err != nil || !called || normal.Load() != 1 {
++				t.Fatal("replacement failed or repeated ordinary retirement", err)
++			}
++			switch mode {
++			case "terminal":
++				if closed.Load() != 1 || app.startCustody != nil || app.retirementPending != nil || app.moveCustodyUnknown {
++					t.Fatal("exact terminal did not clear old custody")
++				}
++			case "ordinary_malformed", "ordinary_truncated_conflict":
++				if closed.Load() != 0 || app.retirementPending != first.Load() || app.startCustody != original || !app.moveCustodyUnknown {
++					t.Fatal("ambiguous ordinary response triggered recovery or cleared custody")
++				}
++			case "closed_conflict":
++				if closed.Load() != 1 || app.retirementPending != first.Load() || app.startCustody != original || !app.moveCustodyUnknown {
++					t.Fatal("definitive closed rejection did not preserve original pending identity")
++				}
++			case "closed_unknown":
++				if closed.Load() != 1 || app.retirementPending == nil || app.retirementPending == first.Load() ||
++					!app.retirementPending.closedPrior || app.startCustody != original || !app.moveCustodyUnknown {
++					t.Fatal("ambiguous closed outcome opened or replaced old custody")
++				}
++			}
++		})
++	}
++}
++
+ func TestClosedPriorSTARTRequiresExactTerminalBeforeFreshWriter(t *testing.T) {
+ 	for _, failed := range []bool{false, true} {
+ 		name := "semantic_complete"
