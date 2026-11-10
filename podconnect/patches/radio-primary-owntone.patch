@@ -46,7 +46,7 @@ index 58c4eb34e903d351cd3c97248e45a7c28aa35a23..e2f12a524d82ded6f666232ac022c2bf
      { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/(source-move|source-move-state)$", jsonapi_reply_radio_source_move },
      { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/radio-handoff/other-target$", jsonapi_reply_radio_other_target },
 diff --git a/src/httpd_jsonapi_radio_reacquire.inc.c b/src/httpd_jsonapi_radio_reacquire.inc.c
-index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c84d5789ad 100644
+index 62dd016..341ef9a 100644
 --- a/src/httpd_jsonapi_radio_reacquire.inc.c
 +++ b/src/httpd_jsonapi_radio_reacquire.inc.c
 @@ -17,6 +17,77 @@ static int radio_named_identity_parse(json_object *body,const char *name,struct
@@ -127,7 +127,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
  static const char *radio_reacquire_phase_name(enum output_radio_reacquire_phase phase)
  {
    switch(phase){
-@@ -29,13 +100,392 @@ static const char *radio_reacquire_phase_name(enum output_radio_reacquire_phase
+@@ -29,13 +100,448 @@ static const char *radio_reacquire_phase_name(enum output_radio_reacquire_phase
      default:return "unknown";
    }
  }
@@ -391,6 +391,68 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
 +  return transport_json_reply(hreq, reply);
 +}
 +
++static bool
++primary_spotify_prepared_park_parse(json_object *park_json, struct output_primary_spotify_park_request *park)
++{
++  char schema[64], phase[16];
++  return json_object_is_type(park_json, json_type_object) && json_object_object_length(park_json) == 8
++      && transport_json_string(park_json, "schema", schema, sizeof(schema))
++      && !strcmp(schema, "podconnect.output_primary_spotify_park.v1")
++      && transport_json_string(park_json, "phase", phase, sizeof(phase)) && !strcmp(phase, "prepared")
++      && transport_json_string(park_json, "action", park->action, sizeof(park->action))
++      && transport_json_string(park_json, "token", park->token, sizeof(park->token))
++      && transport_native_counter(park_json, "native_revision", &park->native_revision) == 0
++      && radio_named_owner_parse(park_json, "native_owner", &park->owner) == 0
++      && radio_named_writer_parse(park_json, "writer_proof", &park->writer) == 0
++      && radio_named_identity_parse(park_json, "output_identity", &park->route) == 0;
++}
++
++static int
++jsonapi_reply_primary_radio_cold_detachment(struct httpd_request *hreq, json_object *body)
++{
++  struct output_primary_spotify_park_request park = { 0 };
++  struct output_primary_radio_custody prior = { 0 };
++  struct output_primary_radio_start_request target;
++  json_object *park_json;
++  uint64_t path_device;
++  char phase[16];
++
++  if (outputs_radio_sender_role() || json_object_object_length(body) != 4
++      || !transport_json_string(body, "phase", phase, sizeof(phase)) || strcmp(phase, "observe")
++      || !json_object_object_get_ex(body, "park", &park_json) || !primary_spotify_prepared_park_parse(park_json, &park)
++      || primary_radio_station_custody_parse(body, "prior_session", &prior, PRIMARY_CUSTODY_SESSION) < 0
++      || safe_atou64(hreq->path_parts[2], &path_device) < 0 || path_device != park.route.device_id
++      || path_device != prior.device_id)
++    return HTTP_BADREQUEST;
++  if (player_primary_radio_cold_observe(&park, &prior, &target) < 0)
++    return 409;
++
++  json_object *reply = json_object_new_object(), *current = json_object_new_object();
++  if (!reply || !current)
++    {
++      if (reply)
++        json_object_put(reply);
++      if (current)
++        json_object_put(current);
++      return HTTP_SERVUNAVAIL;
++    }
++  json_object_object_add(reply, "schema", json_object_new_string("podconnect.output_radio_primary_cold_detachment.v1"));
++  json_object_object_add(reply, "phase", json_object_new_string("isolated"));
++  json_object_object_add(reply, "park", json_object_get(park_json));
++  json_object_object_add(reply, "current_target", current);
++  json_object_object_add(current, "process", json_object_new_string(target.process));
++  attention_json_u64(current, "device_id", target.device_id);
++  attention_json_u64(current, "incarnation", target.incarnation);
++  attention_json_u64(current, "session_epoch", target.epoch);
++  attention_json_u64(current, "route_revision", target.route);
++  if (primary_radio_station_custody_reply(reply, "prior_session", &prior) < 0)
++    {
++      json_object_put(reply);
++      return HTTP_SERVUNAVAIL;
++    }
++  return transport_json_reply(hreq, reply);
++}
++
 +static int
 +jsonapi_reply_primary_spotify_return(struct httpd_request *hreq, json_object *body)
 +{
@@ -423,22 +485,11 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
 +      || (opens_writer && radio_named_writer_parse(body, "current_writer_proof", &request.current_writer) < 0)
 +      || !transport_json_string(body, "intent", request.intent, sizeof(request.intent))
 +      || transport_native_counter(body, "native_revision", &request.native_revision) < 0
-+      || !json_object_object_get_ex(body, "park", &park_json) || !json_object_is_type(park_json, json_type_object)
-+      || json_object_object_length(park_json) != 8
-+      || !transport_json_string(park_json, "schema", schema, sizeof(schema))
-+      || strcmp(schema, "podconnect.output_primary_spotify_park.v1")
-+      || !transport_json_string(park_json, "action", park->action, sizeof(park->action))
-+      || !transport_json_string(park_json, "token", park->token, sizeof(park->token))
-+      || transport_native_counter(park_json, "native_revision", &park->native_revision) < 0
-+      || radio_named_owner_parse(park_json, "native_owner", &park->owner) < 0
-+      || radio_named_writer_parse(park_json, "writer_proof", &park->writer) < 0
-+      || radio_named_identity_parse(park_json, "output_identity", &park->route) < 0
++      || !json_object_object_get_ex(body, "park", &park_json) || !primary_spotify_prepared_park_parse(park_json, park)
 +      || safe_atou64(hreq->path_parts[2], &path_device) < 0 || path_device != park->route.device_id)
 +    return HTTP_BADREQUEST;
 +
 +  char nested_phase[16];
-+  if (!transport_json_string(park_json, "phase", nested_phase, sizeof(nested_phase)) || strcmp(nested_phase, "prepared"))
-+    return HTTP_BADREQUEST;
 +  if (has_isolation)
 +    {
 +      if (primary_radio_station_custody_parse(body, "radio_isolation", radio, PRIMARY_CUSTODY_ISOLATION) < 0)
@@ -497,6 +548,11 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
 -  if(!body || !transport_json_string(body,"schema",schema,sizeof(schema)) || strcmp(schema,"podconnect.output_radio_reacquire.v1")
 -      || !transport_json_string(body,"phase",phase,sizeof(phase)))goto done;
 +  if (!body || !transport_json_string(body, "schema", schema, sizeof(schema))) goto done;
++  if (!strcmp(schema, "podconnect.output_radio_primary_cold_detachment.v1"))
++    {
++      ret = jsonapi_reply_primary_radio_cold_detachment(hreq, body);
++      goto done;
++    }
 +  if (!strcmp(schema, "podconnect.output_radio_primary_stop.v1"))
 +    {
 +      ret = jsonapi_reply_primary_radio_stop(hreq, body);
@@ -523,7 +579,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb687d9044 100644
+index 82dfaca..a597977 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -786,7 +842,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
    if (device->session && device->attention_retiring_session == device->session)
      {
        // The first command waits for exact native destruction, never claims running.
-@@ -2272,6 +2429,393 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
+@@ -2272,6 +2429,744 @@ outputs_attention_retirement_finished(uint64_t device_id, uint64_t incarnation,
      }
  }
  
@@ -835,6 +891,9 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +}
 +
 +static bool primary_radio_custody_successor_current(const char *, uint64_t);
++static bool primary_cold_custody_current(const char *, uint64_t);
++static int primary_cold_custody_consume(const char *, const char *, const char *);
++
 +
 +bool
 +outputs_primary_radio_custody_available(uint64_t id)
@@ -843,7 +902,8 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +  primary_radio_custody_key(key, id);
 +  int found = db_radio_handoff_load_key(key, &raw);
 +  bool available = found == 0 || (found == 1 && raw
-+      && (primary_radio_custody_valid(raw, id, true) || primary_radio_custody_successor_current(raw, id)));
++      && (primary_radio_custody_valid(raw, id, true) || primary_radio_custody_successor_current(raw, id)
++          || primary_cold_custody_current(raw, id)));
 +  free(raw);
 +  return available;
 +}
@@ -1014,6 +1074,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +    return NULL;
 +  primary_radio_custody_key(key, id);
 +  int found = db_radio_handoff_load_key(key, &previous);
++  bool cold = found == 1 && !predecessor && action && primary_cold_custody_current(previous, id);
 +  if (found < 0)
 +    goto done;
 +  if (predecessor && predecessor->local_isolation)
@@ -1025,7 +1086,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +    }
 +  else
 +    {
-+      if (found && (!previous || (!primary_radio_custody_valid(previous, id, true)
++      if (found && !cold && (!previous || (!primary_radio_custody_valid(previous, id, true)
 +          && !primary_radio_custody_successor_current(previous, id))))
 +        goto done;
 +      if (predecessor)
@@ -1054,7 +1115,8 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +  pending = raw ? strdup(raw) : NULL;
 +  json_object_put(row);
 +  if (pending && (!primary_radio_custody_valid(pending, id, false)
-+      || db_radio_handoff_save_key(key, previous, pending) < 0))
++      || (cold ? primary_cold_custody_consume(key, previous, pending)
++               : db_radio_handoff_save_key(key, previous, pending)) < 0))
 +    {
 +      free(pending);
 +      pending = NULL;
@@ -1165,6 +1227,351 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
 +  return status;
 +}
 +
++#define PRIMARY_COLD_DETACHMENT_FIELD "primary_cold_detachment"
++
++static struct {
++  uint64_t device_id;
++  char key[96];
++  char *custody;
++  char *history;
++} primary_cold_admission;
++
++static void
++primary_cold_detachment_reset(void)
++{
++  free(primary_cold_admission.custody);
++  free(primary_cold_admission.history);
++  memset(&primary_cold_admission, 0, sizeof(primary_cold_admission));
++}
++
++static bool
++primary_cold_custody_current(const char *raw, uint64_t id)
++{
++  char *history = NULL;
++  bool current = raw && !radio_handoff_fault && id == primary_cold_admission.device_id
++      && primary_cold_admission.custody && primary_cold_admission.history
++      && !strcmp(raw, primary_cold_admission.custody)
++      && db_radio_handoff_load_key(primary_cold_admission.key, &history) == 1
++      && !strcmp(history, primary_cold_admission.history);
++  free(history);
++  return current;
++}
++
++static int
++primary_cold_custody_consume(const char *key, const char *old, const char *next)
++{
++  json_object *history = json_tokener_parse(primary_cold_admission.history);
++  if (!history)
++    return -1;
++  json_object *successor = json_object_new_string(next);
++  if (!successor || json_object_object_add(history, "successor", successor) < 0)
++    {
++      if (successor)
++        json_object_put(successor);
++      json_object_put(history);
++      return -1;
++    }
++  const char *raw = json_object_to_json_string_ext(history, JSON_C_TO_STRING_PLAIN);
++  int ret = raw ? db_primary_radio_cold_consume(key, old, next, primary_cold_admission.key,
++      primary_cold_admission.history, raw) : -1;
++  json_object_put(history);
++  if (ret == 0)
++    primary_cold_detachment_reset();
++  return ret;
++}
++
++static void
++primary_cold_detachment_history_key(char key[96], const struct radio_handoff_slot *slot)
++{
++  snprintf(key, 96, "podconnect.radio-primary-cold-history.v1.%s", slot->result.command.handoff_id);
++}
++
++static void
++primary_cold_detachment_hex(const unsigned char bytes[32], char digest[65])
++{
++  static const char hex[] = "0123456789abcdef";
++  for (size_t i = 0; i < 32; i++)
++    {
++      digest[2 * i] = hex[bytes[i] >> 4];
++      digest[2 * i + 1] = hex[bytes[i] & 15];
++    }
++  digest[64] = '\0';
++}
++
++static bool
++primary_cold_detachment_digest(const char *start, const char *park, const char *route, char digest[65])
++{
++  gcry_md_hd_t md;
++  if (gcry_md_open(&md, GCRY_MD_SHA256, 0))
++    return false;
++  static const char domain[] = "podconnect.primary-cold-detachment.v1";
++  gcry_md_write(md, domain, sizeof(domain));
++  gcry_md_write(md, start, strlen(start) + 1);
++  gcry_md_write(md, park, strlen(park) + 1);
++  gcry_md_write(md, route, strlen(route) + 1);
++  const unsigned char *bytes = gcry_md_read(md, GCRY_MD_SHA256);
++  if (bytes)
++    primary_cold_detachment_hex(bytes, digest);
++  gcry_md_close(md);
++  return bytes != NULL;
++}
++
++static bool
++primary_cold_detachment_unwrap(json_object *row, const char *raw, char digest[65])
++{
++  json_object *field;
++  if (!row || !json_object_is_type(row, json_type_object)
++      || strcmp(raw, json_object_to_json_string_ext(row, JSON_C_TO_STRING_PLAIN)))
++    return false;
++  if (!json_object_object_get_ex(row, PRIMARY_COLD_DETACHMENT_FIELD, &field))
++    return true;
++  if (!json_object_is_type(field, json_type_string) || json_object_get_string_len(field) != 64
++      || !transport_hex(json_object_get_string(field), 64))
++    return false;
++  memcpy(digest, json_object_get_string(field), 65);
++  json_object_object_del(row, PRIMARY_COLD_DETACHMENT_FIELD);
++  return true;
++}
++
++static bool
++primary_cold_detachment_source(const struct radio_handoff_slot *slot,
++    const struct output_primary_radio_custody *prior, bool archived)
++{
++  const struct output_radio_handoff_request *park = &slot->result.command;
++  const struct output_transport_identity *old = &park->identity;
++  struct output_start_request pipe = { 0 };
++  struct output_transport_identity completed_route;
++  struct output_native_owner completed_owner;
++  struct stat fifo;
++  uint64_t device, inode, writer_epoch, writer_fd;
++  json_object *record, *field;
++  bool valid;
++
++  bool current_start_isolated = start_journal_retirement_outcome == OUTPUT_RETIRE_COLD_KNOWN
++      || (archived && start_journal_retirement_outcome == OUTPUT_RETIRE_RETIRED_KNOWN
++          && start_journal_retirement_reopen_consumed);
++  if (!start_route_clean_absent() || !current_start_isolated || !start_contexts_drained() || transport_pin || transport_custody_busy()
++      || room_volume_pin_busy() || room_volume_undrained()
++      || !slot->primary_cold_candidate || slot->result.phase != OUTPUT_RADIO_UNKNOWN
++      || slot->session || slot->primary_session || slot->resume_session || slot->previous_session
++      || !slot->result.requires_native_pause || !slot->result.effect_generation
++      || slot->result.stop_code != 200 || slot->result.stop_cseq <= 0
++      || !radio_primary_park_command(park)
++      || strcmp(prior->process, old->process) || !strcmp(prior->process, outputs_process)
++      || prior->device_id != old->device_id || prior->incarnation != old->device_incarnation
++      || prior->epoch < old->session_epoch || prior->epoch - old->session_epoch < 2
++      || (prior->epoch - old->session_epoch) % 2 || old->route_revision == UINT64_MAX
++      || prior->route != old->route_revision + 1 || prior->stop_action[0] || prior->teardown_cseq
++      || (!archived && (strcmp(start_journal.c_process, old->process)
++          || strcmp(start_journal.boot_id, park->writer.native_process.boot_id)
++          || start_journal.pid != park->writer.native_process.pid
++          || start_journal.proc_start_ticks != park->writer.native_process.proc_start_ticks)))
++    return false;
++  for (const struct output_device *d = outputs_device_list; d; d = d->next)
++    if (d->selected || d->session || d->busy || d->attention_lease || d->attention_retiring_session
++        || d->attention_restart_pending || d->attention_restoring)
++      return false;
++
++  const char *old_process_denial = start_old_process_retirement_denial();
++  if (old_process_denial && strcmp(old_process_denial, "predecessor_namespace"))
++    return false;
++  record = json_tokener_parse(start_journal.payload);
++  valid = start_cold_completed_shape(record, false)
++      && (archived || (json_object_object_get_ex(record, "actual_native_owner", &field)
++          && release_owner_parse(field, &completed_owner) && native_owner_equal(&completed_owner, &park->native_owner)
++          && json_object_object_get_ex(record, "route_identity", &field)
++          && release_identity_parse(field, &completed_route) && transport_identity_equal(&completed_route, old)
++          && release_json_u64(record, "writer_source_epoch", &writer_epoch) && writer_epoch == park->writer.source_epoch
++          && release_json_u64(record, "writer_fd", &writer_fd) && writer_fd == park->writer.writer_fd))
++      && release_json_u64(record, "pipe_device", &device) && device == park->writer.pipe_device
++      && release_json_u64(record, "pipe_inode", &inode) && inode == park->writer.pipe_inode
++      && release_json_string(record, "input_path", pipe.expected_input_path, sizeof(pipe.expected_input_path))
++      && release_json_string(record, "input_path_digest", pipe.expected_input_path_digest, sizeof(pipe.expected_input_path_digest))
++      && !strcmp(pipe.expected_input_path_digest, park->writer.input_path_digest)
++      && stat(pipe.expected_input_path, &fifo) == 0
++      && start_cold_successor_fenced(record, &pipe, &fifo, device, inode)
++      && !start_cold_fifo_denial(pipe.expected_input_path, &fifo, device, inode);
++  if (record)
++    json_object_put(record);
++  return valid;
++}
++
++/* A typed history is committed with both old rows. It can outlast a fresh
++ * START journal, but only a custody CAS can consume its old route. */
++static bool
++primary_cold_detachment_current(struct radio_handoff_slot *slot,
++    const struct output_primary_radio_custody *expected, bool store, bool admit)
++{
++  struct output_primary_radio_custody prior, successor;
++  char key[64], history_key[96], *park_raw = NULL, *route_raw = NULL, *history_raw = NULL;
++  char park_digest[65] = { 0 }, route_digest[65] = { 0 }, start_digest[65], digest[65];
++  json_object *park = NULL, *route = NULL, *history = NULL, *field;
++  bool current = false, consumed = false;
++
++  if (!slot || !slot->primary_cold_candidate || !start_journal.payload
++      || !radio_handoff_journal_expected || radio_handoff_fault
++      || !outputs_radio_absence_protocol_available())
++    return false;
++  for (size_t i = 0; i < ARRAY_SIZE(radio_handoffs); i++)
++    if (radio_handoffs[i].used && &radio_handoffs[i] != slot
++        && radio_handoffs[i].result.phase != OUTPUT_RADIO_RELEASED)
++      return false;
++  uint64_t id = slot->result.command.identity.device_id;
++  if (outputs_radio_absence_blocked(id) || outputs_radio_parked_absence_blocked(id)
++      || outputs_radio_absence_evolution_fenced(id))
++    return false;
++  primary_radio_custody_key(key, id);
++  primary_cold_detachment_history_key(history_key, slot);
++  if (db_primary_radio_cold_load(&start_journal, key, history_key, &park_raw, &route_raw, &history_raw) < 0
++      || strcmp(park_raw, radio_handoff_journal_expected))
++    goto done;
++#ifdef PRIMARY_COLD_DETACHMENT_AFTER_READ
++  PRIMARY_COLD_DETACHMENT_AFTER_READ();
++#endif
++  park = json_tokener_parse(park_raw);
++  route = json_tokener_parse(route_raw);
++  if (!primary_cold_detachment_unwrap(park, park_raw, park_digest)
++      || json_object_object_length(park) != 3
++      || !primary_cold_detachment_unwrap(route, route_raw, route_digest))
++    goto done;
++  const char *park_old = json_object_to_json_string_ext(park, JSON_C_TO_STRING_PLAIN);
++  const char *route_old = json_object_to_json_string_ext(route, JSON_C_TO_STRING_PLAIN);
++  if (history_raw)
++    {
++      history = json_tokener_parse(history_raw);
++      if (!history || !json_object_is_type(history, json_type_object)
++          || strcmp(history_raw, json_object_to_json_string_ext(history, JSON_C_TO_STRING_PLAIN))
++          || json_object_object_length(history) != 4
++          || !json_object_object_get_ex(history, "schema", &field) || !json_object_is_type(field, json_type_string)
++          || strcmp(json_object_get_string(field), "podconnect.output_radio_primary_cold_history.v1")
++          || !release_json_string(history, "start", start_digest, sizeof(start_digest))
++          || !transport_hex(start_digest, 64)
++          || !json_object_object_get_ex(history, "successor", &field) || !json_object_is_type(field, json_type_string)
++          || (size_t)json_object_get_string_len(field) != strlen(json_object_get_string(field)))
++        goto done;
++      const char *new_route = json_object_get_string(field);
++      consumed = new_route[0] != '\0';
++      if (!json_object_object_get_ex(history, "route", &field) || !json_object_is_type(field, json_type_string)
++          || !json_object_get_string_len(field)
++          || (size_t)json_object_get_string_len(field) != strlen(json_object_get_string(field)))
++        goto done;
++      const char *archived_route = json_object_get_string(field);
++      if (!consumed && strcmp(route_old, archived_route))
++        goto done;
++      if (consumed)
++        {
++          struct output_primary_radio_custody live;
++          if (expected || route_digest[0] || !primary_radio_custody_decode(new_route, id, &successor)
++              || successor.stop_action[0] || successor.teardown_cseq
++              || !primary_radio_custody_decode(route_old, id, &live)
++              || !outputs_primary_radio_session_equal(&successor, &live))
++            goto done;
++        }
++      route_old = archived_route;
++    }
++  else
++    {
++      if (park_digest[0] || route_digest[0] || !store)
++        goto done;
++      unsigned char bytes[32];
++      gcry_md_hash_buffer(GCRY_MD_SHA256, bytes, start_journal.payload, strlen(start_journal.payload));
++      primary_cold_detachment_hex(bytes, start_digest);
++    }
++  if (!primary_radio_custody_decode(route_old, id, &prior)
++      || (consumed && (!strcmp(successor.process, prior.process) || !strcmp(successor.operation, prior.operation)))
++      || (expected && (!outputs_primary_radio_session_equal(expected, &prior)
++          || expected->local_isolation || expected->stop_action[0] || expected->teardown_cseq))
++      || !primary_cold_detachment_digest(start_digest, park_old, route_old, digest))
++    goto done;
++  if (history_raw)
++    {
++      if (strcmp(park_digest, digest) || (!consumed && strcmp(route_digest, digest))
++          || !primary_cold_detachment_source(slot, &prior, true))
++        goto done;
++      if (admit)
++        {
++          primary_cold_detachment_reset();
++          if (!consumed)
++            {
++              primary_cold_admission.device_id = id;
++              memcpy(primary_cold_admission.key, history_key, strlen(history_key) + 1);
++              primary_cold_admission.custody = route_raw;
++              primary_cold_admission.history = history_raw;
++              route_raw = history_raw = NULL;
++            }
++          slot->primary_cold_detached = true;
++        }
++      current = true;
++      goto done;
++    }
++  if (!primary_cold_detachment_source(slot, &prior, false))
++    goto done;
++  history = json_object_new_object();
++  if (!history || json_object_object_add(history, "schema",
++          json_object_new_string("podconnect.output_radio_primary_cold_history.v1")) < 0
++      || json_object_object_add(history, "start", json_object_new_string(start_digest)) < 0
++      || json_object_object_add(history, "route", json_object_new_string(route_old)) < 0
++      || json_object_object_add(history, "successor", json_object_new_string("")) < 0
++      || json_object_object_add(park, PRIMARY_COLD_DETACHMENT_FIELD, json_object_new_string(digest)) < 0
++      || json_object_object_add(route, PRIMARY_COLD_DETACHMENT_FIELD, json_object_new_string(digest)) < 0)
++    goto done;
++  const char *new_park = json_object_to_json_string_ext(park, JSON_C_TO_STRING_PLAIN);
++  const char *new_route = json_object_to_json_string_ext(route, JSON_C_TO_STRING_PLAIN);
++  const char *new_history = json_object_to_json_string_ext(history, JSON_C_TO_STRING_PLAIN);
++  char *retained = new_park ? strdup(new_park) : NULL;
++  if (retained && new_route && new_history && db_primary_radio_cold_save(&start_journal, key, park_raw, new_park,
++      route_raw, new_route, history_key, new_history) == 0)
++    {
++      free(radio_handoff_journal_expected);
++      radio_handoff_journal_expected = retained;
++      retained = NULL;
++      current = true;
++    }
++  free(retained);
++
++ done:
++  if (park)
++    json_object_put(park);
++  if (route)
++    json_object_put(route);
++  if (history)
++    json_object_put(history);
++  free(park_raw);
++  free(route_raw);
++  free(history_raw);
++  return current;
++}
++
++static void
++primary_cold_detachment_record(void)
++{
++  for (size_t i = 0; i < ARRAY_SIZE(radio_handoffs); i++)
++    if (radio_handoffs[i].primary_cold_candidate
++        && primary_cold_detachment_current(&radio_handoffs[i], NULL, true, false))
++      (void)primary_cold_detachment_current(&radio_handoffs[i], NULL, false, true);
++}
++
++int
++outputs_primary_radio_cold_observe(const struct output_primary_spotify_park_request *park,
++    const struct output_primary_radio_custody *prior, struct output_primary_radio_start_request *target)
++{
++  if (!park || !prior || !target || prior->device_id != park->route.device_id)
++    return -1;
++  uint64_t id = prior->device_id;
++  struct radio_handoff_slot *slot = radio_handoff_find(id);
++  const struct output_device *d = outputs_device_get(id);
++  if (!d || !d->advertised || d->type != OUTPUT_TYPE_AIRPLAY || d->prevent_playback || !d->incarnation
++      || d->incarnation == UINT64_MAX || d->session_epoch == UINT64_MAX || d->route_revision == UINT64_MAX
++      || !slot || !radio_primary_park_binding_equal(park, &slot->result.command, true)
++      || !primary_cold_detachment_current(slot, prior, false, false))
++    return -1;
++  *target = (struct output_primary_radio_start_request) {
++    .device_id = id, .incarnation = d->incarnation, .epoch = d->session_epoch, .route = d->route_revision,
++  };
++  memcpy(target->process, outputs_process, sizeof(target->process));
++  return 0;
++}
++
 +void
 +outputs_primary_radio_drain_complete(uint64_t id, uint64_t incarnation, uint64_t epoch, bool confirmed)
 +{
@@ -1180,7 +1587,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
  int
  outputs_device_stop(struct output_device *device, output_status_cb cb)
  {
-@@ -2281,6 +2825,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
+@@ -2281,6 +3176,8 @@ outputs_device_stop(struct output_device *device, output_status_cb cb)
    if (outputs[device->type]->disabled || !outputs[device->type]->device_stop)
      return -1;
  
@@ -1189,7 +1596,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3255,101 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3606,101 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -1291,7 +1698,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
  int
  outputs_init(void)
  {
-@@ -2785,6 +3426,7 @@ outputs_init(void)
+@@ -2785,6 +3777,7 @@ outputs_init(void)
    return 0;
  }
  
@@ -1300,7 +1707,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..29c7d8568251a9d300f2aa5fe5ea98bb
  outputs_deinit(void)
  {
 diff --git a/src/outputs.h b/src/outputs.h
-index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..2412e0dd936316396bb040076e368ed633cc6bec 100644
+index 73b327d..31345be 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
 @@ -169,6 +169,13 @@ struct output_radio_admission {
@@ -1360,7 +1767,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..2412e0dd936316396bb040076e368ed6
  bool outputs_radio_handoff_source_reserved(void);
  bool outputs_radio_handoff_emission_current(uint64_t);
  uint64_t outputs_radio_handoff_generation(uint64_t);
-@@ -269,6 +309,113 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
+@@ -269,6 +309,115 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
  int outputs_airplay_radio_receiver_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_pairing_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_controller_id(char [17]);
@@ -1469,12 +1876,14 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..2412e0dd936316396bb040076e368ed6
 +    const struct output_primary_radio_custody *);
 +int outputs_primary_radio_custody_release(uint64_t, const char *, int);
 +int outputs_primary_radio_custody_isolate(uint64_t, const char *);
++int outputs_primary_radio_cold_observe(const struct output_primary_spotify_park_request *,
++    const struct output_primary_radio_custody *, struct output_primary_radio_start_request *);
 +bool outputs_callback_is_primary_radio_restart(int);
 +void outputs_airplay_primary_radio_remove(struct output_device *);
  void outputs_radio_handoff_teardown(uint64_t,uint64_t,uint64_t,const void *,int,int);
  void outputs_radio_handoff_drained(uint64_t,uint64_t,uint64_t,const void *);
  
-@@ -329,7 +476,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
+@@ -329,7 +478,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
  int outputs_start_complete(const struct output_start_request *,struct output_start_result *);
  int outputs_start_cancel(const char *,const char *,struct output_start_result *);
  int outputs_start_result_get(uint64_t,const char *,struct output_start_result *);
@@ -1483,7 +1892,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..2412e0dd936316396bb040076e368ed6
  struct output_retirement_request {
    uint64_t device_id,writer_source_epoch,writer_fd,pipe_device,pipe_inode,input_epoch;
    char completed_token[33],retirement_token[33],native_reservation_id[33],native_incarnation[33];
-@@ -353,7 +500,10 @@ bool outputs_start_move_source_transition_current(void);
+@@ -353,7 +502,10 @@ bool outputs_start_move_source_transition_current(void);
  bool outputs_start_move_eof_transition_current(void);
  bool outputs_streaming_exclusive_available(void);
  void outputs_airplay_start_retire_all(void);
@@ -1494,7 +1903,7 @@ index 73b327d3d3d20d23717dbf061c19dc0d3a69bfb4..2412e0dd936316396bb040076e368ed6
  bool outputs_start_emission_current(uint64_t,uint64_t,uint64_t,const void *);
  bool outputs_start_bound_owner_current(const struct output_native_owner *,const struct output_transport_identity *,bool);
  bool outputs_start_gate_closed(void);
-@@ -363,6 +513,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
+@@ -363,6 +515,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
  bool outputs_start_retired_stage_reader(void);
  void
  outputs_transport_release_recover_pending(void);
@@ -3758,10 +4167,10 @@ index dae3206db01217fed6a2efc9a784dba644826e82..0c3162530a52e34453fa416e0e214b1b
    d=outputs_device_get(id);
    if(d && (d->selected || d->session))return 1;
 diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
-index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba8e2d9dcf 100644
+index bcf702f..bb85148 100644
 --- a/src/outputs_radio_handoff.inc.c
 +++ b/src/outputs_radio_handoff.inc.c
-@@ -4,17 +4,23 @@
+@@ -4,17 +4,24 @@
   * evidence. All entry points execute on the existing player owner thread. */
  #define RADIO_HANDOFF_SLOTS 16
  #define RADIO_HANDOFF_KEY "podconnect.radio_handoff.v1"
@@ -3775,30 +4184,37 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
 +  struct output_primary_spotify_return_request primary_return; /* Runtime exact STOP receipt. */
    uint64_t resume_pcm_generation,previous_pcm_generation; /* Runtime only. */
 -  bool used,stop_accepted,drained;
-+  bool used,stop_accepted,drained,primary_return_revoked;
++  bool used,stop_accepted,drained,primary_return_revoked,primary_cold_candidate,primary_cold_detached;
  };
  static struct radio_handoff_slot radio_handoffs[RADIO_HANDOFF_SLOTS];
  static bool radio_handoff_fault;
  static char *radio_handoff_journal_expected;
  static uint64_t radio_stop_scope;
 +static uint64_t primary_spotify_return_scope;
++static void primary_cold_detachment_reset(void);
 +static bool radio_primary_park_command(const struct output_radio_handoff_request *);
  bool outputs_radio_handoff_stop_authorized(uint64_t id){return radio_stop_scope==id;}
  
  static bool radio_handoff_key_read(unsigned char key[32])
-@@ -128,7 +134,7 @@ bool outputs_radio_handoff_emission_current(uint64_t id)
-   return outputs_radio_move_delegated_current(id,true) || !s || s->result.phase==OUTPUT_RADIO_PREPARED || s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED;
+@@ -125,19 +132,22 @@ bool outputs_radio_handoff_emission_current(uint64_t id)
+     if(s && s->result.phase!=OUTPUT_RADIO_PREPARED && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED)return false;
+     return outputs_radio_other_fault_pcm_current(id);
+   }
+-  return outputs_radio_move_delegated_current(id,true) || !s || s->result.phase==OUTPUT_RADIO_PREPARED || s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED;
++  return outputs_radio_move_delegated_current(id,true) || !s || s->primary_cold_detached || s->result.phase==OUTPUT_RADIO_PREPARED || s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED;
  }
  bool outputs_radio_handoff_blocked(uint64_t id)
 -{struct radio_handoff_slot *s=radio_handoff_find(id);return outputs_radio_parked_absence_blocked(id) || outputs_radio_absence_blocked(id) || radio_handoff_fault || (s && !outputs_radio_move_delegated_current(id,false) && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED);}
-+{struct radio_handoff_slot *s=radio_handoff_find(id);return outputs_radio_parked_absence_blocked(id) || outputs_radio_absence_blocked(id) || radio_handoff_fault || (s && (s->primary_return_revoked || (!outputs_radio_move_delegated_current(id,false) && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED)));}
++{struct radio_handoff_slot *s=radio_handoff_find(id);return outputs_radio_parked_absence_blocked(id) || outputs_radio_absence_blocked(id) || radio_handoff_fault || (s && !s->primary_cold_detached && (s->primary_return_revoked || (!outputs_radio_move_delegated_current(id,false) && s->result.phase!=OUTPUT_RADIO_REACQUIRED && s->result.phase!=OUTPUT_RADIO_RELEASED)));}
  uint64_t outputs_radio_handoff_generation(uint64_t id)
- {struct radio_handoff_slot *s=radio_handoff_find(id);return s?s->result.effect_generation:0;}
+-{struct radio_handoff_slot *s=radio_handoff_find(id);return s?s->result.effect_generation:0;}
++{struct radio_handoff_slot *s=radio_handoff_find(id);return s && !s->primary_cold_detached ? s->result.effect_generation : 0;}
  bool outputs_radio_handoff_effect_current(uint64_t id,uint64_t generation,bool stop)
-@@ -136,8 +142,10 @@ bool outputs_radio_handoff_effect_current(uint64_t id,uint64_t generation,bool s
+ {
    struct radio_handoff_slot *s=radio_handoff_find(id);
    if(radio_handoff_fault)return false;
    if(!s)return generation==0;
++  if(s->primary_cold_detached)return !stop && generation==0;
 +  if(!stop && radio_primary_park_command(&s->result.command) && s->primary_return_revoked)return false;
    if(outputs_radio_move_delegated_current(id,false))return !stop && generation==s->result.effect_generation;
    if(s->result.phase==OUTPUT_RADIO_REACQUIRED || s->result.phase==OUTPUT_RADIO_RELEASED)return generation==s->result.effect_generation;
@@ -3806,7 +4222,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
    if(s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_CONNECTING || s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_ROUTE_READY || s->result.resume.phase==OUTPUT_RADIO_REACQUIRE_BARRIER_READY)
      return !stop && generation==s->result.effect_generation;
    return stop && s->result.phase==OUTPUT_RADIO_STOPPING && generation==s->result.effect_generation;
-@@ -148,6 +156,47 @@ static bool radio_handoff_uuid(const char *s)
+@@ -148,6 +158,47 @@ static bool radio_handoff_uuid(const char *s)
    for(i=0;i<36;i++)if((i==8||i==13||i==18||i==23)?s[i]!='-':!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')))return false;
    return true;
  }
@@ -3854,7 +4270,15 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
  static bool radio_handoff_equal(const struct output_radio_handoff_request *a,const struct output_radio_handoff_request *b,bool token)
  {
    return a && b && native_owner_equal(&a->native_owner,&b->native_owner)
-@@ -219,14 +268,40 @@ static void radio_handoff_startup(void)
+@@ -188,6 +239,7 @@ static void radio_handoff_startup(void)
+ {
+   char *value=NULL;json_object *root=NULL,*rows=NULL,*field=NULL;size_t i,j;bool retired=false;
+   int found=db_radio_handoff_load(&value);
++  primary_cold_detachment_reset();
+   memset(radio_handoffs,0,sizeof(radio_handoffs));radio_handoff_fault=false;
+   free(radio_handoff_journal_expected);radio_handoff_journal_expected=NULL;
+   if(found==0)return;
+@@ -219,14 +271,40 @@ static void radio_handoff_startup(void)
          || !memchr(r->sender_peer,0,sizeof(r->sender_peer)) || !r->identity.device_id || !r->generation
          || !radio_handoff_uuid(r->handoff_id) || !transport_hex(r->token,32)
          || !radio_native_source_owner_valid(&r->native_owner) || !radio_handoff_uuid(r->radio_process)
@@ -3897,9 +4321,11 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
        struct output_radio_reacquire_result *v=&saved->resume;
        if(!memchr(v->command.challenge,0,sizeof(v->command.challenge))
            || !memchr(v->command.drain_signature,0,sizeof(v->command.drain_signature))
-@@ -241,7 +316,20 @@ static void radio_handoff_startup(void)
+@@ -240,8 +318,22 @@ static void radio_handoff_startup(void)
+           || (v->phase==OUTPUT_RADIO_REACQUIRE_DELEGATED && (!memchr(v->delegated_token,0,sizeof(v->delegated_token)) || !transport_hex(v->delegated_token,32))))goto fault;
        released=true;retired=true;
      }
++    radio_handoffs[i].primary_cold_candidate = local_park && saved->phase == OUTPUT_RADIO_SUSPENDED;
      radio_handoffs[i].used=true;saved->phase=released?OUTPUT_RADIO_RELEASED:OUTPUT_RADIO_UNKNOWN;
 +    /* A local receipt may identify a consumed intent after restart. Its
 +     * session and writer authority are never recovered from serialized bytes. */
@@ -3918,7 +4344,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
      memset(radio_handoffs[i].result.suspended_signature,0,sizeof(radio_handoffs[i].result.suspended_signature));
    }
    json_object_put(root);free(value);
-@@ -276,17 +364,40 @@ static void radio_handoff_finalize(struct radio_handoff_slot *s)
+@@ -276,17 +368,40 @@ static void radio_handoff_finalize(struct radio_handoff_slot *s)
    RH_REQUIRE(r->identity.session_epoch!=UINT64_MAX&&d->session_epoch==r->identity.session_epoch+1,"finalize_session_epoch");
    RH_REQUIRE(outputs[d->type]->device_start_drained&&outputs[d->type]->device_start_drained(d),"finalize_contexts_pending");
    RH_REQUIRE(start_process_current(&r->writer.native_process),"finalize_native_process");
@@ -3967,7 +4393,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
    }
    s->result.phase=OUTPUT_RADIO_SUSPENDED;
    if(radio_handoff_save()<0)radio_handoff_fail(s,"finalize_durable_save");
-@@ -297,7 +408,7 @@ void outputs_radio_handoff_teardown(uint64_t id,uint64_t incarnation,uint64_t ep
+@@ -297,7 +412,7 @@ void outputs_radio_handoff_teardown(uint64_t id,uint64_t incarnation,uint64_t ep
    if(!s || s->result.phase!=OUTPUT_RADIO_STOPPING || s->session!=session
        || s->result.command.identity.device_incarnation!=incarnation || s->result.command.identity.session_epoch!=epoch)return;
    s->result.stop_code=code;s->result.stop_cseq=cseq;
@@ -3976,7 +4402,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
    if(!s->stop_accepted)radio_handoff_fail(s,"stop_not_accepted");
    else radio_handoff_finalize(s);
  }
-@@ -321,16 +432,23 @@ static void radio_handoff_stop_cb(struct output_device *device,enum output_devic
+@@ -321,17 +436,30 @@ static void radio_handoff_stop_cb(struct output_device *device,enum output_devic
  }
  /* action: 0 prepare, 1 confirm, 2 state, 3 reacquire (currently unavailable).
   * Neither prepare nor state changes the native App/queue/decoder. */
@@ -3997,12 +4423,20 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
 +    return -1;
    if(radio_handoff_fault)return -1;
    s=radio_handoff_find(r->identity.device_id);
+-  if(s && action==0 && (s->result.phase==OUTPUT_RADIO_RELEASED || s->result.phase==OUTPUT_RADIO_REACQUIRED)){
 +  if (primary_park && s && !radio_primary_park_command(&s->result.command))
 +    return -1;
-   if(s && action==0 && (s->result.phase==OUTPUT_RADIO_RELEASED || s->result.phase==OUTPUT_RADIO_REACQUIRED)){
++  if (s && s->primary_cold_detached)
++    {
++      if (!primary_park || action != 0 || !strcmp(r->handoff_id, s->result.command.handoff_id)
++          || s->result.effect_generation == UINT64_MAX)
++        return -1;
++    }
++  else if(s && action==0 && (s->result.phase==OUTPUT_RADIO_RELEASED || s->result.phase==OUTPUT_RADIO_REACQUIRED)){
      if(!strcmp(r->handoff_id,s->result.command.handoff_id) || s->result.effect_generation==UINT64_MAX)return -1;
    }else if(s){
-@@ -340,9 +458,9 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+     if(!radio_handoff_equal(r,&s->result.command,action!=0))return -1;
+@@ -340,9 +468,9 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
    /* A declared user resume or sender STOP boolean is never sufficient. */
    if(action==3)return -1;
    if(action==0){
@@ -4015,7 +4449,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
          || !transport_identity_equal(&r->identity,&actual)
          || !radio_source_owner_current(&r->native_owner,&r->writer,&actual)
          || !radio_queue_writer_current(&r->writer,&actual,NULL)
-@@ -351,6 +469,13 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -351,6 +479,13 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
          || !outputs[d->type]->device_start_drained || !outputs[d->type]->device_start_drained(d)
          || d->incarnation!=actual.device_incarnation || d->session_epoch!=actual.session_epoch || !d->base_revision
          || db_attention_base_get(d->id,&manual_base)!=0 || manual_base!=d->volume || manual_base!=r->initial_volume_percent)return -1;
@@ -4029,7 +4463,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
      for(i=0;i<ARRAY_SIZE(outputs_cb_register);i++)if(outputs_cb_register[i].device==d && outputs_cb_register[i].cb && outputs_cb_register[i].ready)return -1;
      if(!s)for(i=0;i<ARRAY_SIZE(radio_handoffs);i++)if(!radio_handoffs[i].used){s=&radio_handoffs[i];break;}
      if(!s)return -1;
-@@ -362,7 +487,8 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -362,7 +497,8 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
      memset(s,0,sizeof(*s));s->previous_source=previous;s->previous_session=previous_session;s->previous_pcm_generation=previous_generation;s->result.effect_generation=next_effect;s->used=true;s->result.command=*r;s->result.phase=OUTPUT_RADIO_PREPARED;s->session=d->session;
      s->result.requires_native_pause=true;
      struct output_device *other;
@@ -4039,7 +4473,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
      unsigned char random[16];static const char hex[]="0123456789abcdef";gcry_randomize(random,sizeof(random),GCRY_STRONG_RANDOM);
      for(i=0;i<sizeof(random);i++){s->result.command.token[i*2]=hex[random[i]>>4];s->result.command.token[i*2+1]=hex[random[i]&15];}
      s->result.command.token[32]=0;
-@@ -388,10 +514,23 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -388,10 +524,23 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
      RC_REQUIRE(radio_transport_identity_get(d->id,&actual,true)==0,"confirm_route_unavailable");
      RC_REQUIRE(transport_identity_equal(&r->identity,&actual),"confirm_route_changed");
      RC_REQUIRE(outputs[d->type]->device_start_drained(d),"confirm_contexts_pending");
@@ -4064,7 +4498,7 @@ index bcf702fb9c3564e749d05b94ecbeab1543816078..55c6c2767086a346e25df1794e8773ba
      radio_stop_scope=d->id;
      int ret=outputs_device_stop(d,radio_handoff_stop_cb);
      radio_stop_scope=0;
-@@ -400,3 +539,247 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
+@@ -400,3 +549,247 @@ int outputs_radio_handoff(int action,const struct output_radio_handoff_request *
    radio_handoff_finalize(s);
    *out=s->result;return 0;
  }
@@ -4715,7 +5149,7 @@ index c9b66c43ddc44dabc573471024ffa1937319e7ab..aa61bd887b10ece74ea72106abdc607e
          || outputs_airplay_radio_pairing_key_digest(r->device_id,peer)<0)return -1;
      if(radio_sender.result.phase==RADIO_SENDER_DRAINED && r->device_id==radio_sender.result.device_id && !radio_sender.relinquished){
 diff --git a/src/outputs_release.inc.c b/src/outputs_release.inc.c
-index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..b5725b5ebc6a39661c245200f4124acd980ef510 100644
+index 28b2719..f6aaa11 100644
 --- a/src/outputs_release.inc.c
 +++ b/src/outputs_release.inc.c
 @@ -426,6 +426,7 @@ release_journal_save(struct transport_release_record *r)
@@ -4750,7 +5184,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..b5725b5ebc6a39661c245200f4124acd
      }
    while (valid)
      {
-@@ -795,24 +796,462 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
+@@ -795,24 +796,466 @@ release_fifo_has_no_writers_raw(uint64_t device, uint64_t inode)
  		break;
  	      }
  	  fclose(info);
@@ -4988,6 +5422,8 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..b5725b5ebc6a39661c245200f4124acd
 +  return same;
 +}
 +
++static void primary_cold_detachment_record(void);
++
 +/* Startup only, before the player or its autostart loop begins. A proven
 + * retired writer leaves history, never a reconstructed route or grant. */
 +void
@@ -5211,6 +5647,8 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..b5725b5ebc6a39661c245200f4124acd
 +  start_retired_reopen_pending = false;
 +  atomic_store(&start_owned_latch, false);
 +  start_gate_set(false);
++  if (!interrupted && !migrated)
++    primary_cold_detachment_record();
 + done:
 +  if (denial)
 +    DPRINTF(E_LOG, L_PLAYER, "START cold recovery denied: kind=%s phase=%d outcome=%s stage=%s reason=%s\n",
@@ -5220,7 +5658,7 @@ index 28b2719bccef5da366bd6d47210e96fe6e0bc87e..b5725b5ebc6a39661c245200f4124acd
  }
  
  void
-@@ -891,7 +1330,8 @@ release_predecessor_payload_valid(json_object *o)
+@@ -891,7 +1334,8 @@ release_predecessor_payload_valid(json_object *o)
    char manual_token[33], reservation[33], path[4096];
    uint64_t n;
    bool move, valid = false;
@@ -5835,7 +6273,7 @@ index 2fcbcb0187b091918cf1911f37a2f606b8154b15..ea933024a7849088ef0fc824acb4522a
      start_retired_reopen_pending=s->retirement.outcome==OUTPUT_RETIRE_RETIRED_KNOWN;
      start_retired_stage_ready=false;}}
 diff --git a/src/player.c b/src/player.c
-index 0a02b75390eb2e034d7c0c075fa0e16993592f97..2b0627e73ac011424628a1cdb9be5810f4ff0476 100644
+index 0a02b75..ab27534 100644
 --- a/src/player.c
 +++ b/src/player.c
 @@ -3192,6 +3192,41 @@ static enum command_state radio_admission_command(void *arg,int *retval)
@@ -5880,7 +6318,7 @@ index 0a02b75390eb2e034d7c0c075fa0e16993592f97..2b0627e73ac011424628a1cdb9be5810
  struct player_radio_capability_command {uint64_t id;struct output_radio_capability *out;};
  static enum command_state radio_capability_command(void *arg,int *retval)
  {struct player_radio_capability_command *c=arg;*retval=outputs_radio_capability_get(c->id,c->out);return COMMAND_END;}
-@@ -3372,6 +3407,179 @@ int player_radio_reacquire(int action,const struct output_radio_reacquire_reques
+@@ -3372,6 +3407,202 @@ int player_radio_reacquire(int action,const struct output_radio_reacquire_reques
  {
    struct player_radio_reacquire_command c={action,r,out};return commands_exec_sync(cmdbase,radio_reacquire_command,NULL,&c);
  }
@@ -6027,6 +6465,29 @@ index 0a02b75390eb2e034d7c0c075fa0e16993592f97..2b0627e73ac011424628a1cdb9be5810
 +  return commands_exec_sync(cmdbase, primary_spotify_park_command, NULL, &c);
 +}
 +
++struct player_primary_radio_cold_command
++{
++  const struct output_primary_spotify_park_request *park;
++  const struct output_primary_radio_custody *prior;
++  struct output_primary_radio_start_request *target;
++};
++
++static enum command_state
++primary_radio_cold_command(void *arg, int *retval)
++{
++  const struct player_primary_radio_cold_command *c = arg;
++  *retval = outputs_primary_radio_cold_observe(c->park, c->prior, c->target);
++  return COMMAND_END;
++}
++
++int
++player_primary_radio_cold_observe(const struct output_primary_spotify_park_request *park,
++    const struct output_primary_radio_custody *prior, struct output_primary_radio_start_request *target)
++{
++  struct player_primary_radio_cold_command command = { park, prior, target };
++  return commands_exec_sync(cmdbase, primary_radio_cold_command, NULL, &command);
++}
++
 +struct player_primary_spotify_return_command
 +{
 +  enum output_primary_spotify_return_action action;
@@ -6060,7 +6521,7 @@ index 0a02b75390eb2e034d7c0c075fa0e16993592f97..2b0627e73ac011424628a1cdb9be5810
  struct player_radio_other_command {int action;const struct output_radio_other_target_request *r;struct output_radio_other_target_result *out;};
  static enum command_state radio_other_command(void *arg,int *retval)
  {
-@@ -4622,6 +4830,7 @@ player_init(void)
+@@ -4622,6 +4853,7 @@ player_init(void)
        goto error_outputs_deinit;
      }
    outputs_transport_release_recover_pending();
@@ -6069,10 +6530,10 @@ index 0a02b75390eb2e034d7c0c075fa0e16993592f97..2b0627e73ac011424628a1cdb9be5810
      DPRINTF(E_WARN,L_PLAYER,"Retired native PIPE could not stage a fresh reader; emission gate remains closed\n");
  
 diff --git a/src/player.h b/src/player.h
-index 7c0060ffad2a3a3a6cf36dc9cde8120a589f1340..07f97b35d9fa3ed64fb2794eeaeaca6eb0171629 100644
+index 7c0060f..df07346 100644
 --- a/src/player.h
 +++ b/src/player.h
-@@ -279,9 +279,24 @@ int player_retirement_result_get(uint64_t,bool,const char *,struct output_retire
+@@ -279,9 +279,26 @@ int player_retirement_result_get(uint64_t,bool,const char *,struct output_retire
  int player_radio_handoff(int,const struct output_radio_handoff_request *,struct output_radio_handoff_result *);
  
  int player_radio_reacquire(int,const struct output_radio_reacquire_request *,struct output_radio_reacquire_result *);
@@ -6083,6 +6544,8 @@ index 7c0060ffad2a3a3a6cf36dc9cde8120a589f1340..07f97b35d9fa3ed64fb2794eeaeaca6e
 +int player_primary_spotify_park(enum output_primary_spotify_park_action,
 +    const struct output_primary_spotify_park_request *, struct output_primary_spotify_park_result *);
 +
++int player_primary_radio_cold_observe(const struct output_primary_spotify_park_request *,
++    const struct output_primary_radio_custody *, struct output_primary_radio_start_request *);
 +int player_primary_spotify_return(enum output_primary_spotify_return_action,
 +    const struct output_primary_spotify_return_request *, struct output_primary_spotify_return_result *);
  
@@ -9189,3 +9652,144 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..87ab0da84fe9bee19f8dc44666aed3a9
    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,false);_exit(0);}
    assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,true,true,true);_exit(0);}
+diff --git a/src/db.c b/src/db.c
+index 06e18a0..e044881 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -7816,12 +7816,115 @@ int db_radio_handoff_load_key(const char *key,char **value)
+ int db_radio_handoff_load(char **value)
+ {return db_radio_handoff_load_key("podconnect.radio_handoff.v1",value);}
+ 
+-int db_radio_handoff_save_key(const char *key,const char *expected,const char *value)
++static int
++radio_handoff_write_key(const char *key, const char *expected, const char *value)
+ {
+   int ret;
+-  if(!key || !value || attention_transaction_begin()<0)return -1;
+-  if(expected)ret=attention_sql(sqlite3_mprintf("UPDATE admin SET value=%Q WHERE key=%Q AND value=%Q",value,key,expected));
+-  else ret=attention_sql(sqlite3_mprintf("INSERT INTO admin(key,value) VALUES(%Q,%Q)",key,value));
+-  if(ret==0 && sqlite3_changes(hdl)!=1)ret=-1;
++  if (expected)
++    ret = attention_sql(sqlite3_mprintf("UPDATE admin SET value=%Q WHERE key=%Q AND value=%Q", value, key, expected));
++  else
++    ret = attention_sql(sqlite3_mprintf("INSERT INTO admin(key,value) VALUES(%Q,%Q)", key, value));
++  return ret == 0 && sqlite3_changes(hdl) == 1 ? 0 : -1;
++}
++
++int db_radio_handoff_save_key(const char *key,const char *expected,const char *value)
++{
++  if (!key || !value || attention_transaction_begin() < 0)
++    return -1;
++  return attention_transaction_end(radio_handoff_write_key(key, expected, value));
++}
++
++static const char primary_cold_park_key[] = "podconnect.radio_handoff.v1";
++
++static bool
++primary_cold_key_valid(const char *key)
++{
++  static const char prefix[] = "podconnect.radio-primary-custody.v1.";
++  uint64_t device;
++  return key && !strncmp(key, prefix, sizeof(prefix) - 1)
++      && safe_atou64(key + sizeof(prefix) - 1, &device) == 0 && device && device != UINT64_MAX;
++}
++
++static bool
++primary_cold_start_current(const struct db_start_guard *expected)
++{
++  struct db_start_guard current = { 0 };
++  const bool match = db_start_guard_load(&current) == 1
++      && !strcmp(expected->token, current.token) && !strcmp(expected->c_process, current.c_process)
++      && !strcmp(expected->boot_id, current.boot_id) && expected->pid == current.pid
++      && expected->proc_start_ticks == current.proc_start_ticks && !strcmp(expected->payload, current.payload);
++  free(current.payload);
++  return match;
++}
++
++int
++db_primary_radio_cold_load(const struct db_start_guard *start, const char *custody_key,
++    const char *history_key, char **park, char **custody, char **history)
++{
++  if (!park || !custody || !history || !history_key)
++    return -1;
++  *park = *custody = *history = NULL;
++  if (!start || !start->payload || !primary_cold_key_valid(custody_key)
++      || !hdl || !sqlite3_get_autocommit(hdl) || attention_sql(sqlite3_mprintf("BEGIN")) < 0)
++    return -1;
++  bool current = primary_cold_start_current(start)
++      && db_radio_handoff_load_key(primary_cold_park_key, park) == 1
++      && db_radio_handoff_load_key(custody_key, custody) == 1
++      && db_radio_handoff_load_key(history_key, history) >= 0;
++  if (attention_transaction_end(current ? 0 : -1) == 0)
++    return 0;
++  free(*park);
++  free(*custody);
++  free(*history);
++  *park = *custody = *history = NULL;
++  return -1;
++}
++
++/* Storage only. An exact repeated pair is already committed; a mixed pair
++ * or changed START snapshot can never complete the other half. */
++int
++db_primary_radio_cold_save(const struct db_start_guard *start, const char *custody_key,
++    const char *expected_park, const char *park, const char *expected_custody, const char *custody,
++    const char *history_key, const char *history)
++{
++  char *current_park = NULL, *current_custody = NULL, *current_history = NULL;
++  int ret = -1;
++
++  if (!start || !start->payload || !primary_cold_key_valid(custody_key)
++      || !expected_park || !park || !strcmp(expected_park, park)
++      || !expected_custody || !custody || !strcmp(expected_custody, custody)
++      || !history_key || !history || attention_transaction_begin() < 0)
++    return -1;
++
++  if (!primary_cold_start_current(start)
++      || db_radio_handoff_load_key(primary_cold_park_key, &current_park) != 1
++      || db_radio_handoff_load_key(custody_key, &current_custody) != 1
++      || db_radio_handoff_load_key(history_key, &current_history) < 0)
++    goto done;
++
++  if (current_history && !strcmp(park, current_park) && !strcmp(custody, current_custody)
++      && !strcmp(history, current_history))
++    ret = 1;
++  else if (!current_history && radio_handoff_write_key(primary_cold_park_key, expected_park, park) == 0
++      && radio_handoff_write_key(custody_key, expected_custody, custody) == 0
++      && radio_handoff_write_key(history_key, NULL, history) == 0)
++    ret = 0;
++
++ done:
++  free(current_park);
++  free(current_custody);
++  free(current_history);
++  return attention_transaction_end(ret) < 0 ? -1 : ret;
++}
++
++int
++db_primary_radio_cold_consume(const char *custody_key, const char *expected, const char *next,
++    const char *history_key, const char *history, const char *consumed)
++{
++  if (!primary_cold_key_valid(custody_key) || !expected || !next || !history_key || !history
++      || !consumed || !strcmp(history, consumed) || attention_transaction_begin() < 0)
++    return -1;
++  int ret = radio_handoff_write_key(custody_key, expected, next) == 0
++      && radio_handoff_write_key(history_key, history, consumed) == 0 ? 0 : -1;
+   return attention_transaction_end(ret);
+ }
+diff --git a/src/db.h b/src/db.h
+index 19c33ac..0d4fc55 100644
+--- a/src/db.h
++++ b/src/db.h
+@@ -1063,3 +1063,11 @@ int db_start_guard_save(const struct db_start_guard *expected,const struct db_st
+ int db_radio_handoff_load(char **);
+ int db_radio_handoff_load_key(const char *,char **);
+ int db_radio_handoff_save_key(const char *,const char *,const char *);
++/* Read radio custody and its history from the same snapshot as START. */
++int db_primary_radio_cold_load(const struct db_start_guard *, const char *, const char *,
++    char **, char **, char **);
++/* 0 committed; 1 exact records already present; -1 no change. */
++int db_primary_radio_cold_save(const struct db_start_guard *, const char *,
++    const char *, const char *, const char *, const char *, const char *, const char *);
++int db_primary_radio_cold_consume(const char *, const char *, const char *,
++    const char *, const char *, const char *);

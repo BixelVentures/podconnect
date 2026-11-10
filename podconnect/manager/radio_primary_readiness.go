@@ -16,6 +16,13 @@ var errRadioPrimaryAdvertised = errors.New("native primary radio endpoint advert
 func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrapOptions, pause radioReadinessPause) (*radioProducerNativeClient, bool, error) {
 	var selected *radioProducerNativeClient
 	var primary, advertised bool
+	lastPrimaryReadiness := ""
+	reportPrimaryReadiness := func(reason string) {
+		if reason != lastPrimaryReadiness {
+			lastPrimaryReadiness = reason
+			log.Printf("radio: bootstrap phase=primary_wait result=%s", reason)
+		}
+	}
 	legacyProbe := radioLegacyBootstrapProbe()
 	err := waitRadioPassiveReadiness(ctx, func(readCtx context.Context) (bool, bool, error) {
 		n, err := newRadioProducerNativeClient(o.NativeURL, o.NativeToken)
@@ -26,7 +33,7 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 		advertised = advertised || errors.Is(err, errRadioPrimaryAdvertised)
 		olderC := err == nil && state.Schema == primaryRadioSchema && state.Protocol == "v1" &&
 			producerHex(state.Process, 64) && producerCounter(state.Revision, true) &&
-			state.Observation == nil && state.Session == nil
+			state.Observation == nil && state.Session == nil && state.ColdDetachment == nil
 		if !advertised && (errors.Is(err, errRadioPrimaryUnsupported) || olderC) {
 			expectedProcess := ""
 			if olderC {
@@ -39,6 +46,7 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 			return ready, !ready, readErr
 		}
 		if err != nil {
+			reportPrimaryReadiness("read_failed")
 			return false, true, err
 		}
 		advertised = true
@@ -48,8 +56,19 @@ func awaitConfiguredRadioBootstrap(ctx context.Context, o radioProducerBootstrap
 			return false, false, errRadioUnavailable
 		}
 		if !primaryBootstrapStateReady(state) {
+			reason := "state_not_ready"
+			if len(state.Missing) == 1 {
+				switch state.Missing[0] {
+				case "primary_c_capability_unverified":
+					reason = "c_capability_unverified"
+				case "primary_current_owner_unverified":
+					reason = "current_owner_unverified"
+				}
+			}
+			reportPrimaryReadiness(reason)
 			return false, true, errRadioUnavailable
 		}
+		reportPrimaryReadiness("ready")
 		n.primaryBootstrapProcess = state.Process
 		selected, primary = n, true
 		return true, false, nil

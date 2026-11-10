@@ -29,6 +29,31 @@ func (s radioPrimarySession) valid() bool {
 		producerCounter(s.Incarnation, false) && producerCounter(s.Epoch, false) && producerCounter(s.Route, true)
 }
 
+type radioPrimaryColdTarget struct {
+	Process     string `json:"process"`
+	DeviceID    string `json:"device_id"`
+	Incarnation string `json:"incarnation"`
+	Epoch       string `json:"session_epoch"`
+	Route       string `json:"route_revision"`
+}
+
+type radioPrimaryColdDetachment struct {
+	PriorNativeProcess string                 `json:"prior_native_process_id"`
+	PriorHandoff       string                 `json:"prior_handoff_id"`
+	PriorOwner         string                 `json:"prior_owner_generation"`
+	Target             string                 `json:"target_id"`
+	PriorSession       radioPrimarySession    `json:"prior_session"`
+	CurrentTarget      radioPrimaryColdTarget `json:"current_target"`
+}
+
+func (d radioPrimaryColdDetachment) valid() bool {
+	t := d.CurrentTarget
+	return producerHex(d.PriorNativeProcess, 64) && producerUUID(d.PriorHandoff) &&
+		producerCounter(d.PriorOwner, false) && d.Target != "" && d.PriorSession.valid() &&
+		producerUUID(t.Process) && t.Process != d.PriorSession.Process && t.DeviceID == d.PriorSession.DeviceID &&
+		producerCounter(t.Incarnation, false) && producerCounter(t.Epoch, true) && producerCounter(t.Route, true)
+}
+
 type radioPrimaryIsolation struct {
 	radioPrimarySession
 	Reason string `json:"local_isolation"`
@@ -64,19 +89,20 @@ type radioPrimaryReceipt struct {
 }
 
 type radioPrimaryState struct {
-	Protocol        string                  `json:"protocol,omitempty"`
-	Schema          string                  `json:"schema"`
-	Process         string                  `json:"process_id"`
-	Revision        string                  `json:"native_revision"`
-	Targets         []radioProducerTarget   `json:"configured_targets"`
-	Missing         []string                `json:"missing_proofs"`
-	Capabilities    []string                `json:"capabilities,omitempty"`
-	Observation     *radioNativeObservation `json:"observation,omitempty"`
-	Session         *radioPrimarySession    `json:"target_session,omitempty"`
-	IsolatedSession *radioPrimaryIsolation  `json:"isolated_session,omitempty"`
-	ReleasedSession *radioPrimarySession    `json:"released_session,omitempty"`
-	ReleaseActionID *string                 `json:"release_action_id,omitempty"`
-	TeardownCSeq    *int                    `json:"teardown_cseq,omitempty"`
+	ColdDetachment  *radioPrimaryColdDetachment `json:"cold_detachment,omitempty"`
+	Protocol        string                      `json:"protocol,omitempty"`
+	Schema          string                      `json:"schema"`
+	Process         string                      `json:"process_id"`
+	Revision        string                      `json:"native_revision"`
+	Targets         []radioProducerTarget       `json:"configured_targets"`
+	Missing         []string                    `json:"missing_proofs"`
+	Capabilities    []string                    `json:"capabilities,omitempty"`
+	Observation     *radioNativeObservation     `json:"observation,omitempty"`
+	Session         *radioPrimarySession        `json:"target_session,omitempty"`
+	IsolatedSession *radioPrimaryIsolation      `json:"isolated_session,omitempty"`
+	ReleasedSession *radioPrimarySession        `json:"released_session,omitempty"`
+	ReleaseActionID *string                     `json:"release_action_id,omitempty"`
+	TeardownCSeq    *int                        `json:"teardown_cseq,omitempty"`
 }
 
 type radioPrimaryPort interface {
@@ -113,17 +139,18 @@ func (n *radioProducerNativeClient) PrimaryCommand(ctx context.Context, q radioP
 }
 
 type radioPrimaryRecord struct {
-	Device           string                 `json:"device_id"`
-	Station          string                 `json:"station_id,omitempty"`
-	Incumbent        string                 `json:"incumbent,omitempty"`
-	IncumbentSession *radioPrimarySession   `json:"incumbent_session,omitempty"`
-	Session          *radioPrimarySession   `json:"target_session,omitempty"`
-	LastCommand      *radioPrimaryCommand   `json:"last_command,omitempty"`
-	LastReceipt      *radioPrimaryReceipt   `json:"last_receipt,omitempty"`
-	Isolation        *radioPrimaryIsolation `json:"local_isolation,omitempty"`
-	StopReceipt      *radioPrimaryReceipt   `json:"positive_stop_receipt,omitempty"`
-	ReleaseActionID  string                 `json:"release_action_id,omitempty"`
-	TeardownCSeq     int                    `json:"teardown_cseq,omitempty"`
+	ColdDetachment   *radioPrimaryColdDetachment `json:"cold_detachment,omitempty"`
+	Device           string                      `json:"device_id"`
+	Station          string                      `json:"station_id,omitempty"`
+	Incumbent        string                      `json:"incumbent,omitempty"`
+	IncumbentSession *radioPrimarySession        `json:"incumbent_session,omitempty"`
+	Session          *radioPrimarySession        `json:"target_session,omitempty"`
+	LastCommand      *radioPrimaryCommand        `json:"last_command,omitempty"`
+	LastReceipt      *radioPrimaryReceipt        `json:"last_receipt,omitempty"`
+	Isolation        *radioPrimaryIsolation      `json:"local_isolation,omitempty"`
+	StopReceipt      *radioPrimaryReceipt        `json:"positive_stop_receipt,omitempty"`
+	ReleaseActionID  string                      `json:"release_action_id,omitempty"`
+	TeardownCSeq     int                         `json:"teardown_cseq,omitempty"`
 }
 
 // Bootstrap continues to construct the v1 producer. The primary port is only
@@ -143,6 +170,9 @@ func (p *radioProducer) primaryState(ctx context.Context) (radioPrimaryState, er
 	state, err := p.primary.PrimaryState(ctx)
 	if err != nil || ctx.Err() != nil || state.Schema != primaryRadioSchema || !producerHex(state.Process, 64) || !producerCounter(state.Revision, true) {
 		return radioPrimaryState{}, errRadioUnavailable
+	}
+	if state.ColdDetachment != nil && (state.Protocol != primaryRadioProtocol || !state.ColdDetachment.valid()) {
+		return radioPrimaryState{}, errRadioUnknown
 	}
 	if state.IsolatedSession != nil && (state.Protocol != primaryRadioProtocol || !state.IsolatedSession.valid() ||
 		state.IsolatedSession.Reason != primaryIsolationReason || state.Session != nil ||
@@ -200,6 +230,7 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 	if p.evidence.NativeProcess != "" && p.evidence.NativeProcess != state.Process {
 		return nil, nil, errRadioUnknown
 	}
+	var coldRecord *radioProducerRecord
 	for token, record := range p.records {
 		if record.Primary == nil && producerLegacyHistoryTerminal(p.records, record) {
 			continue
@@ -221,9 +252,21 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 		if record.Primary != nil && record.Primary.Isolation != nil && !p.live[token] {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
 		}
-		if record.Primary == nil || !record.Terminal || record.Observation.SourceKind == "radio" &&
-			record.Observation.State == "playing" && !record.SourceDrained && !p.live[token] {
+		if record.Primary == nil || !record.Terminal {
 			return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
+		}
+		if record.Primary.ColdDetachment != nil {
+			if p.live[token] || !record.Primary.ColdDetachment.matchesRecord(record) {
+				return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
+			}
+			continue
+		}
+		if record.Observation.SourceKind == "radio" && record.Observation.State == "playing" && !record.SourceDrained && !p.live[token] {
+			if coldRecord != nil || p.active != "" || !primaryColdDetachmentMatches(state, record) {
+				return nil, []string{"durable_unknown_effect_custody"}, errRadioUnavailable
+			}
+			candidate := record
+			coldRecord = &candidate
 		}
 	}
 	if state.Observation.SourceKind == "radio" {
@@ -238,10 +281,52 @@ func (p *radioProducer) primaryReady(ctx context.Context) ([]radioTarget, []stri
 			return nil, nil, err
 		}
 	}
+	// Close only the prospective fence, after checking the entire journal.
+	// The original result is historical and never becomes live in this process.
+	if coldRecord != nil {
+		primary := *coldRecord.Primary
+		primary.ColdDetachment = state.ColdDetachment
+		coldRecord.Primary = &primary
+		if err := p.storeLocked(*coldRecord); err != nil {
+			return nil, nil, err
+		}
+	}
 	p.evidence.NativeProcess = state.Process
 	p.evidence.Targets = append([]radioTarget(nil), targets...)
 	backend.replacement = slices.Contains(state.Capabilities, primaryReplacementCapability)
 	return targets, nil, nil
+}
+
+func (d radioPrimaryColdDetachment) matchesRecord(record radioProducerRecord) bool {
+	return d.valid() && record.Primary != nil && record.Terminal && !record.Preempted && !record.SourceDrained &&
+		record.Outcome == "committed" && record.Stage == "terminal" &&
+		record.Request.Process == d.PriorNativeProcess && record.Request.Target == d.Target &&
+		record.Fence.Token == d.PriorHandoff && strconv.FormatUint(record.Fence.OwnerGeneration, 10) == d.PriorOwner &&
+		record.Primary.Session != nil && *record.Primary.Session == d.PriorSession && record.Primary.Device == d.PriorSession.DeviceID &&
+		record.Primary.StopReceipt == nil && record.Primary.ReleaseActionID == "" && record.Primary.TeardownCSeq == 0 &&
+		record.Observation.SourceKind == "radio" && record.Observation.State == "playing" &&
+		record.Observation.TargetID == d.Target && record.Observation.OwnerGeneration == record.Fence.OwnerGeneration
+}
+
+func primaryColdDetachmentMatches(state radioPrimaryState, record radioProducerRecord) bool {
+	d, o := state.ColdDetachment, state.Observation
+	if d == nil || o == nil || o.SourceKind != "none" || o.State != "idle" || o.StationID != "" ||
+		(o.TargetID != "" && o.TargetID != d.Target) || o.VolumePercent != nil ||
+		state.Session != nil || state.IsolatedSession != nil || state.ReleasedSession != nil ||
+		state.ReleaseActionID != nil || state.TeardownCSeq != nil || state.Process == d.PriorNativeProcess ||
+		!d.matchesRecord(record) {
+		return false
+	}
+	matched := false
+	for _, target := range state.Targets {
+		if target.HomePodID == d.CurrentTarget.DeviceID {
+			if matched || target.ID != d.Target || !target.Selectable || target.Availability != "available" {
+				return false
+			}
+			matched = true
+		}
+	}
+	return matched
 }
 
 const primaryLegacyRejectedStage = "legacy-reserve-invalid-action"
