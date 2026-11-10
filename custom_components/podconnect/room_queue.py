@@ -360,7 +360,11 @@ class RoomQueue:
         autoplay = None
         if "autoplay" in value:
             autoplay = value["autoplay"]
-            if (
+            if autoplay == {"kind": "pending"}:
+                if seen or queue["truncated"] or value["actions"]:
+                    self._trace_read_failure("queue_payload_invalid", latest)
+                    raise CommandRejected("room_queue_unavailable")
+            elif (
                 not isinstance(autoplay, dict)
                 or set(autoplay) != {"kind", "display_ids"}
                 or autoplay["kind"] not in ("preview", "promotion")
@@ -386,14 +390,15 @@ class RoomQueue:
         if remaining <= 0:
             self._trace_read_failure("queue_expired", latest)
             raise CommandRejected("room_queue_expired")
-        self.observations[queue["observation_id"]] = {
-            "value": copy.deepcopy(value),
-            "scope": scope,
-            "entry": entry,
-            "epoch": latest["owner_epoch"],
-            "poll": latest["poll_sequence"],
-            "deadline": monotonic_now + remaining,
-        }
+        if autoplay != {"kind": "pending"}:
+            self.observations[queue["observation_id"]] = {
+                "value": copy.deepcopy(value),
+                "scope": scope,
+                "entry": entry,
+                "epoch": latest["owner_epoch"],
+                "poll": latest["poll_sequence"],
+                "deadline": monotonic_now + remaining,
+            }
         metadata = {}
         cache = getattr(self.commands.data.observations, "_queue_cache", None)
         cached_at = getattr(self.commands.data.observations, "_queue_cached_at", 0)

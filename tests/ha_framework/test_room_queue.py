@@ -292,6 +292,42 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(self.queue_posts, [])
         self.assertEqual(self._writes(), [])
 
+    async def test_autoplay_pending_is_empty_and_has_no_action_observation(self):
+        def pending(value):
+            value["autoplay"] = {"kind": "pending"}
+            value["queue"]["items"] = []
+            value["actions"] = []
+
+        self.queue_corrupt_state = pending
+        value = await self.queue_read(autoplay_preview=True)
+        self.assertTrue(value["ok"])
+        self.assertEqual(value["autoplay"], {"kind": "pending"})
+        self.assertEqual(value["items"], [])
+        self.assertEqual(value["actions"], [])
+        owner = self.entries[0].runtime_data.commands.room_queue
+        self.assertEqual(owner.observations, {})
+        self.assertFalse((await self.queue_read())["ok"])
+
+        def with_actions(value):
+            pending(value)
+            value["actions"] = ["play_queue_occurrence"]
+
+        def with_rows(value):
+            pending(value)
+            value["queue"]["items"] = self.queue()["items"]
+
+        def truncated(value):
+            pending(value)
+            value["queue"]["truncated"] = True
+
+        for invalid in (with_actions, with_rows, truncated):
+            with self.subTest(invalid=invalid.__name__):
+                self.queue_corrupt_state = invalid
+                self.assertFalse((await self.queue_read(autoplay_preview=True))["ok"])
+        self.assertEqual(owner.observations, {})
+        self.assertEqual(self.queue_posts, [])
+        self.assertEqual(self._writes(), [])
+
     async def test_queue_metadata_processing_never_extends_source_deadline(self):
         result, _, source_until = await self._queue_with_processing_delay()
         self.assertLessEqual(result["valid_until"], source_until)
