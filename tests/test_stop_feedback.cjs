@@ -25,7 +25,7 @@ const handler = source.match(/st\.onclick = async function \(\) \{[\s\S]*?\n    
 const rescanHandler = source.match(/document\.getElementById\('addrescan'\)\.onclick = async function \(\) \{[\s\S]*?\n\};/)[0];
 (async () => {
   for (const [response, expected] of [
-    [{ok: true, status: 200, json: async () => ({ok: true})}, 'Audio engine restarted.'],
+    [{ok: true, status: 200, json: async () => ({ok: true})}, 'Rescan accepted. The audio engine is restarting.'],
     [{ok: false, status: 409, text: async () => 'original attention restoration pending\n'}, 'Rescan blocked (HTTP 409). Waiting for the original volume to be restored.'],
     [{ok: false, status: 503, text: async () => 'engine not running\n'}, 'Rescan unavailable (HTTP 503). The audio engine is not running.'],
     [{ok: false, status: 503, text: async () => 'engine replacement incomplete or superseded; retirement unknown\n'}, 'Rescan outcome unknown (HTTP 503). Check the Speakers log.'],

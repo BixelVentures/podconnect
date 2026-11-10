@@ -2421,7 +2421,7 @@ document.getElementById('addrescan').onclick = async function () {
   try {
     var response = await fetch('api/rescan', { method:'POST' });
     if (response.ok && (await response.json()).ok === true) {
-      st.textContent = 'Audio engine restarted.';
+      st.textContent = 'Rescan accepted. The audio engine is restarting.';
     } else if (response.ok) {
       st.textContent = 'Rescan outcome unknown. Check the Speakers log.';
     } else {
