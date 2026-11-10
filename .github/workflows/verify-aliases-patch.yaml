@@ -263,8 +263,8 @@ jobs:
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          for case in isolated writer epoch cas process local-cleanup; do
-            sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_CONTROL_LOSS="$case" src/airplay_callback_owner --radio-primary-disjoint-start
+          for case in isolated writer epoch cas process local-cleanup station spotify; do
+            sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 PC_PRIMARY_SPOTIFY_CONTROL_LOSS="$case" src/airplay_callback_owner --radio-primary-disjoint-start
           done
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_FINALIZE_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
           sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
