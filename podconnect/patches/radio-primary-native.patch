@@ -235,13 +235,14 @@ index d2dc25a..6dcb319 100644
  			return false
  		}
 diff --git a/daemon/radio_handoff.go b/daemon/radio_handoff.go
-index 2787ffb..3ea4cdf 100644
+index 2787ffb..b78dc4e 100644
 --- a/daemon/radio_handoff.go
 +++ b/daemon/radio_handoff.go
-@@ -69,6 +69,13 @@ type radioCReply struct {
+@@ -69,6 +69,14 @@ type radioCReply struct {
  	Signature     string   `json:"suspended_signature,omitempty"`
  }
  type radioHold struct {
++	PrimaryColdTarget  *radioPrimaryTarget     `json:"primary_cold_target,omitempty"`
 +	PrimaryIsolation   *radioPrimaryIsolation  `json:"primary_isolation,omitempty"`
 +	PrimaryStatus      *radioPrimaryActive     `json:"primary_status,omitempty"`
 +	PrimaryReturn      *radioPrimaryReturnWire `json:"primary_spotify_return,omitempty"`
@@ -252,7 +253,7 @@ index 2787ffb..3ea4cdf 100644
  	evolutionActive    bool
  	Request            radioRequest              `json:"request"`
  	Proof              radioCBinding             `json:"proof"`
-@@ -168,6 +175,30 @@ func (app *App) initRadio() error {
+@@ -168,6 +176,33 @@ func (app *App) initRadio() error {
  		return fmt.Errorf("invalid radio handoff journal")
  	}
  	for key, h := range disk.Holds {
@@ -265,7 +266,10 @@ index 2787ffb..3ea4cdf 100644
 +			if h.Primary != nil && !validPrimaryRadioHold(h) {
 +				return fmt.Errorf("invalid primary radio hold")
 +			}
-+			if !primaryRadioContentReady(h) {
++			if (h.PrimaryColdTarget != nil || h.Phase == "primary_cold_detached") && !primaryRadioColdDetached(h) {
++				return fmt.Errorf("invalid primary radio cold detachment")
++			}
++			if !primaryRadioContentReady(h) && !primaryRadioColdDetached(h) {
 +				h.Phase = "unknown"
 +			}
 +			if h.WriterParked || h.PauseUncertain {
@@ -283,7 +287,7 @@ index 2787ffb..3ea4cdf 100644
  		if h == nil || key != h.Request.TargetID || !validRadioRequest(h.Request) || h.Actions == nil {
  			return fmt.Errorf("invalid radio hold")
  		}
-@@ -349,6 +380,21 @@ func (app *App) handleRadioAPI(ctx context.Context, req ApiRequest) {
+@@ -349,6 +384,21 @@ func (app *App) handleRadioAPI(ctx context.Context, req ApiRequest) {
  		}
  		app.radio.mu.Unlock()
  	}
@@ -305,7 +309,7 @@ index 2787ffb..3ea4cdf 100644
  	// A released56 manual-release transaction owns the source until its
  	// exact terminal cleanup. Read-only radio results remain available.
  	if c.Action != "result" && c.Action != "observe" && app.manualReleasePending() {
-@@ -392,7 +438,16 @@ func (p *AppPlayer) radioHeld() bool {
+@@ -392,7 +442,16 @@ func (p *AppPlayer) radioHeld() bool {
  	}
  	p.app.radio.mu.Lock()
  	defer p.app.radio.mu.Unlock()
@@ -323,7 +327,7 @@ index 2787ffb..3ea4cdf 100644
  }
  
  func (p *AppPlayer) radioHandoffActor(ctx context.Context, a radioActorRequest) (any, error) {
-@@ -511,35 +566,7 @@ func (p *AppPlayer) radioHandoffActor(ctx context.Context, a radioActorRequest)
+@@ -511,35 +570,7 @@ func (p *AppPlayer) radioHandoffActor(ctx context.Context, a radioActorRequest)
  		}
  		if h.RequiresPause {
  			generation, _ := strconv.ParseUint(h.Proof.Generation, 10, 64)
@@ -360,7 +364,7 @@ index 2787ffb..3ea4cdf 100644
  				return nil, err
  			}
  		}
-@@ -580,6 +607,49 @@ func (p *AppPlayer) radioHasExclusiveLocked() bool {
+@@ -580,6 +611,49 @@ func (p *AppPlayer) radioHasExclusiveLocked() bool {
  	}
  	return false
  }
@@ -410,7 +414,7 @@ index 2787ffb..3ea4cdf 100644
  func (p *AppPlayer) radioOwnerCall(ctx context.Context, h *radioHold, action string) (*radioCReply, error) {
  	var ack radioCReply
  	endpoint := strings.TrimSuffix(p.app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + h.Proof.Output.DeviceID + "/radio-handoff/" + action
-@@ -700,6 +770,9 @@ func (p *AppPlayer) takeRadioDeferredEOF() []*player.Event {
+@@ -700,6 +774,9 @@ func (p *AppPlayer) takeRadioDeferredEOF() []*player.Event {
  func (app *App) refreshRadioOutputFenceLocked() {
  	held := app.radio.failed
  	for _, h := range app.radio.Holds {
@@ -436,7 +440,7 @@ index 82fa6c4..f0e0bd8 100644
  		Purpose  string          `json:"purpose"`
 diff --git a/daemon/radio_primary.go b/daemon/radio_primary.go
 new file mode 100644
-index 0000000..1888229
+index 0000000..f7fa0f2
 --- /dev/null
 +++ b/daemon/radio_primary.go
 @@ -0,0 +1,482 @@
@@ -920,7 +924,377 @@ index 0000000..1888229
 +}
 +
 +func primaryRadioRetired(h *radioHold) bool {
-+	return h != nil && !h.WriterParked && !h.PauseUncertain && (primaryRadioContentReady(h) || h.PrimaryPending != nil && h.Phase == "primary_rejected")
++	return h != nil && !h.WriterParked && !h.PauseUncertain && (primaryRadioContentReady(h) || primaryRadioColdDetached(h) || h.PrimaryPending != nil && h.Phase == "primary_rejected")
++}
+diff --git a/daemon/radio_primary_cold.go b/daemon/radio_primary_cold.go
+new file mode 100644
+index 0000000..67c2f43
+--- /dev/null
++++ b/daemon/radio_primary_cold.go
+@@ -0,0 +1,191 @@
++package daemon
++
++import (
++	"context"
++	"strconv"
++	"strings"
++)
++
++const cPrimaryColdDetachmentSchema = "podconnect.output_radio_primary_cold_detachment.v1"
++
++type radioPrimaryColdWire struct {
++	Schema  string               `json:"schema"`
++	Phase   string               `json:"phase"`
++	Park    radioPrimaryParkWire `json:"park"`
++	Session radioPrimaryBinding  `json:"prior_session"`
++}
++
++type radioPrimaryColdReceipt struct {
++	radioPrimaryColdWire
++	Target radioPrimaryTarget `json:"current_target"`
++}
++
++type radioPrimaryColdDetachment struct {
++	Process    string              `json:"prior_native_process_id"`
++	Handoff    string              `json:"prior_handoff_id"`
++	Generation string              `json:"prior_owner_generation"`
++	Room       string              `json:"target_id"`
++	Session    radioPrimaryBinding `json:"prior_session"`
++	Target     radioPrimaryTarget  `json:"current_target"`
++}
++
++// Use the completed operation and its retained park as one identity. A
++// reservation, claimed STOP, pending successor, or attempted return cannot
++// be rehabilitated by a receipt for another phase or receiver.
++func primaryColdHoldMatches(h *radioHold, room string) bool {
++	if h == nil || h.owner != nil || h.primary != nil || h.PrimaryPark == nil || h.PrimaryPark.Route == nil ||
++		h.PrimaryStatus == nil || h.PrimaryPending == nil || h.PrimaryReturn != nil ||
++		h.PrimaryAction != "" || h.ReacquirePhase != "" || h.PauseUncertain || !validPrimaryRadioHold(h) ||
++		primaryReplacementPending(h) || h.Request.TargetID != room {
++		return false
++	}
++	r, park, old := h.Request, h.PrimaryPark, h.Primary
++	reserve, status := h.PrimaryPending.Reserve, h.PrimaryStatus
++	if reserve.Process != r.ProcessID || reserve.Handoff != r.HandoffID || reserve.Action != r.ActionID ||
++		reserve.Target != room || reserve.Generation != r.Generation || reserve.Owner != r.Generation ||
++		reserve.Intent != r.ExpectedRevision ||
++		status.OwnerGeneration != r.Generation || status.Request.Action != old.Operation ||
++		status.Request.Generation != r.Generation || status.Request.Process != old.Process ||
++		status.Request.Device != old.DeviceID || status.Request.Incarnation != old.Incarnation ||
++		!nativeOwnerASCII(status.Request.Station, 31) {
++		return false
++	}
++	if stop := h.PrimaryPending.Stopped; stop != nil {
++		prior := h.PrimaryPending.PriorRelease
++		if !h.PrimaryPending.ReplacementDone || reserve.Session == nil || stop.Session == nil ||
++			*stop.Session != *reserve.Session || *stop.Session == *old || stop.Phase != "stop" ||
++			!primaryCommandMatches(*stop, reserve) || prior == nil || prior.TeardownCSeq <= 0 ||
++			prior.Action != reserve.Action || prior.radioPrimaryBinding != *stop.Session {
++			return false
++		}
++	}
++	if started := h.PrimaryPending.Started; started != nil &&
++		(started.Phase != "start" || started.Station != status.Request.Station || !primaryCommandMatches(*started, reserve)) {
++		return false
++	}
++	return park.Schema == cPrimaryParkSchema && park.Phase == "prepared" && volumeUUID.MatchString(park.Action) &&
++		volumeCounter(park.Revision) && park.Revision != "0" && volumeHex32.MatchString(park.Token) &&
++		park.Owner.RoomID == room && park.Owner.HomePodID == old.DeviceID && nativeBoundOwnerValid(park.Owner) &&
++		park.Route.valid() && park.Route.Process == old.Process && park.Route.DeviceID == old.DeviceID &&
++		park.Route.DeviceIncarnation == old.Incarnation && park.Route.InputPathDigest == park.Writer.InputDigest &&
++		radioProcessID(park.Writer.Process) == r.ProcessID
++}
++
++func primaryRadioColdDetached(h *radioHold) bool {
++	return h != nil && h.Phase == "primary_cold_detached" && !h.WriterParked && !h.RequiresPause &&
++		primaryColdHoldMatches(h, h.Request.TargetID) && h.PrimaryColdTarget != nil &&
++		h.PrimaryColdTarget.valid() && h.PrimaryColdTarget.Device == h.Primary.DeviceID &&
++		h.PrimaryColdTarget.Process != h.Primary.Process
++}
++
++func primaryColdEvidence(h *radioHold) *radioPrimaryColdDetachment {
++	return &radioPrimaryColdDetachment{Process: h.Request.ProcessID, Handoff: h.Request.HandoffID,
++		Generation: h.Request.Generation, Room: h.Request.TargetID, Session: *h.Primary, Target: *h.PrimaryColdTarget}
++}
++
++// Cold proof retires a historical journal entry. It is not an actor effect or
++// a current-owner grant, and does not require a new Spotify login.
++func (app *App) observePrimaryColdDetachment(ctx context.Context, process contentProcess, cProcess string,
++	receivers map[string]string, state *radioPrimaryReadinessState) {
++	if ctx.Err() != nil || app.manualReleasePending() {
++		return
++	}
++	app.radio.mu.Lock()
++	intent, generation := app.radio.Intent, app.radio.Generation
++	if app.radio.failed || state.Revision != strconv.FormatUint(intent, 10) {
++		app.radio.mu.Unlock()
++		return
++	}
++	var candidate *radioHold
++	var prior *radioPrimaryColdDetachment
++	var priorGeneration uint64
++	for room, hold := range app.radio.Holds {
++		if primaryRadioColdDetached(hold) {
++			oldGeneration, _ := strconv.ParseUint(hold.Request.Generation, 10, 64)
++			if oldGeneration == priorGeneration {
++				app.radio.mu.Unlock()
++				return
++			}
++			if oldGeneration > priorGeneration {
++				prior, priorGeneration = primaryColdEvidence(hold), oldGeneration
++			}
++		}
++		if primaryRadioRetired(hold) {
++			continue
++		}
++		if candidate != nil || hold == nil || hold.Phase != "unknown" || !hold.WriterParked ||
++			hold.PrimaryColdTarget != nil || !primaryColdHoldMatches(hold, room) ||
++			hold.Request.ProcessID == radioProcessID(process) || hold.Primary.Process == cProcess {
++			app.radio.mu.Unlock()
++			return
++		}
++		candidate = hold
++	}
++	if candidate == nil {
++		state.ColdDetachment = prior
++		app.radio.mu.Unlock()
++		return
++	}
++	room, device := candidate.Request.TargetID, candidate.Primary.DeviceID
++	configured := false
++	for _, target := range state.Targets {
++		if target.ID == room && target.HomePodID == device {
++			configured = true
++			break
++		}
++	}
++	candidateGeneration, _ := strconv.ParseUint(candidate.Request.Generation, 10, 64)
++	if candidateGeneration <= priorGeneration || !configured || receivers[device] == "" || intent == ^uint64(0) {
++		app.radio.mu.Unlock()
++		return
++	}
++	park := *candidate.PrimaryPark
++	route := *park.Route
++	park.Route = &route
++	wire := radioPrimaryColdWire{Schema: cPrimaryColdDetachmentSchema, Phase: "observe", Park: park, Session: *candidate.Primary}
++	app.radio.mu.Unlock()
++
++	var ack radioPrimaryColdReceipt
++	endpoint := strings.TrimSuffix(app.cfg.RoomTransportOwnToneURL, "/") + "/api/outputs/" + device + "/radio-handoff/reacquire"
++	if err := radioAuthenticatedHTTP(ctx, endpoint, app.cfg.RadioHandoffControlToken, wire, &ack); err != nil ||
++		ack.Schema != wire.Schema || ack.Phase != "isolated" || ack.Session != wire.Session ||
++		ack.Park.Route == nil || *ack.Park.Route != route || !ack.Target.valid() || ack.Target.Device != device ||
++		ack.Target.Process != cProcess || ack.Target.Incarnation != receivers[device] {
++		return
++	}
++	ack.Park.Route = &route
++	if ack.Park != park {
++		return
++	}
++
++	if app.manualReleasePending() {
++		return
++	}
++	app.radio.mu.Lock()
++	defer app.radio.mu.Unlock()
++	if ctx.Err() != nil || app.radio.failed || app.radio.Intent != intent || app.radio.Generation != generation || app.radio.Holds[room] != candidate ||
++		candidate.Phase != "unknown" || !candidate.WriterParked || !primaryColdHoldMatches(candidate, room) ||
++		*candidate.Primary != wire.Session || *candidate.PrimaryPark.Route != route {
++		return
++	}
++	currentPark := *candidate.PrimaryPark
++	currentPark.Route = &route
++	if currentPark != park {
++		return
++	}
++	for target, hold := range app.radio.Holds {
++		if target != room && !primaryRadioRetired(hold) {
++			return
++		}
++	}
++	closed := *candidate
++	closed.Phase, closed.WriterParked, closed.RequiresPause = "primary_cold_detached", false, false
++	closed.PrimaryColdTarget = &ack.Target
++	app.radio.Holds[room], app.radio.Intent = &closed, intent+1
++	if err := app.persistRadioLocked(); err != nil {
++		app.radio.Holds[room], app.radio.Intent = candidate, intent
++		return
++	}
++	app.refreshRadioOutputFenceLocked()
++	state.ColdDetachment, state.Revision = primaryColdEvidence(&closed), strconv.FormatUint(app.radio.Intent, 10)
++}
+diff --git a/daemon/radio_primary_cold_test.go b/daemon/radio_primary_cold_test.go
+new file mode 100644
+index 0000000..e9520b6
+--- /dev/null
++++ b/daemon/radio_primary_cold_test.go
+@@ -0,0 +1,167 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/devgianlu/go-librespot/output"
++)
++
++func TestPrimaryRadioColdDetachmentPreservesJournalUntilExactReceipt(t *testing.T) {
++	for _, mode := range []string{"missing", "wrong_predecessor", "wrong_park", "wrong_c_process", "persistence_failure", "interrupted_reply"} {
++		t.Run(mode, func(t *testing.T) {
++			p, op := contentFixture(t)
++			cfg := p.app.cfg
++			cfg.RadioHandoffControlToken = strings.Repeat("2", 64)
++			cfg.RadioHandoffStatePath = filepath.Join(t.TempDir(), "radio.json")
++			ctx := context.Background()
++			const oldC = "a411aa42-8b70-4bf4-a37d-81b0519db7df"
++			const newC = "6be0e1ce-092a-48b5-ab92-4a159ed2b7b2"
++			const p3 = "b3919fea-955b-4d4c-a581-c71cb92712b2"
++			const p1 = "87f6f7dd-2a03-4d75-9a62-6a7a2e089705"
++			const handoff = "ac0ff645-a01f-4d2a-85e3-b0011d786e6d"
++			oldNative := contentProcess{BootID: oldC, PID: "123", StartTicks: "42"}
++			oldProcess := radioProcessID(oldNative)
++			owner := *op.Capture.OldOwner
++			device, room := owner.HomePodID, owner.RoomID
++			digest := strings.Repeat("a", 64)
++			previous := radioPrimaryBinding{Process: oldC, DeviceID: device, Operation: p3, Incarnation: "4", Epoch: "9", Route: "8"}
++			incumbent := previous
++			incumbent.Operation, incumbent.Epoch = p1, "11"
++			park := radioPrimaryParkWire{Schema: cPrimaryParkSchema, Phase: "prepared", Action: p3, Revision: "2", Owner: owner,
++				Writer: queueWriterWire{Process: oldNative, FD: "3", Epoch: "5", Generation: "7", InputDigest: digest,
++					Pipe: output.PipeIdentity{Type: "fifo", Device: "1", Inode: "3"}},
++				Route: &roomVolumeRoute{Process: oldC, DeviceID: device, DeviceIncarnation: "4", SessionEpoch: "7",
++					RouteRevision: "7", SelectionRevision: "5", InputGeneration: "1", InputItemID: "1", InputPathDigest: digest},
++				Token: strings.Repeat("b", 32)}
++			reserve := radioPrimaryCommand{Schema: nativePrimarySchema, Phase: "reserve", Process: oldProcess, Handoff: handoff,
++				Generation: "2", Owner: "2", Action: p1, Target: room, Intent: "1", From: room, Session: &previous}
++			stop, start := reserve, reserve
++			stop.Phase, start.Phase, start.Station = "stop", "start", "p1"
++			h := &radioHold{
++				Request: radioRequest{Schema: "podconnect.native_radio_primary_hold.v1", ProcessID: oldProcess,
++					TargetID: room, HandoffID: handoff, ActionID: p1, ExpectedRevision: "1", Generation: "2"},
++				Phase: "primary_active", Actions: map[string]bool{}, WriterParked: true, RequiresPause: true,
++				Primary: &incumbent, PrimaryPark: &park,
++				PrimaryStatus: &radioPrimaryActive{OwnerGeneration: "2", Request: radioPrimaryStartWire{
++					Schema: cPrimaryStartSchema, Action: p1, Station: "p1", Generation: "2",
++					radioPrimaryTarget: radioPrimaryTarget{Process: oldC, Device: device, Incarnation: "4", Epoch: "9", Route: "8"}}},
++				PrimaryPending: &radioPrimaryPending{Reserve: reserve, Started: &start, Stopped: &stop, ReplacementDone: true,
++					PriorRelease: &radioPrimaryStopReceipt{radioPrimaryStopRequest: radioPrimaryStopRequest{
++						Schema: primaryRadioStopSchema, Phase: "released", Action: p1, radioPrimaryBinding: previous}, TeardownCSeq: 8}},
++			}
++
++			var reads atomic.Int32
++			var laterC atomic.Bool
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++				if req.Header.Get("X-PodConnect-Token") != cfg.RadioHandoffControlToken {
++					t.Error("unauthenticated C request")
++					w.WriteHeader(http.StatusForbidden)
++					return
++				}
++				if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/radio-handoff/primary-readiness") {
++					d := strings.Split(req.URL.Path, "/")[3]
++					process := newC
++					if laterC.Load() {
++						process = "b0587a71-b229-4c4c-a262-0677280feaa2"
++					}
++					physical := false
++					_ = json.NewEncoder(w).Encode(radioPrimaryCapability{Schema: primaryRadioCapabilitySchema,
++						Effects: "primary_route_v1", Process: process, Device: d, Incarnation: "4", LegacyOpen: &physical, Physical: &physical})
++					return
++				}
++				var wire radioPrimaryColdWire
++				if req.Method != http.MethodPost || req.URL.Path != "/api/outputs/"+device+"/radio-handoff/reacquire" ||
++					json.NewDecoder(req.Body).Decode(&wire) != nil || wire.Schema != cPrimaryColdDetachmentSchema ||
++					wire.Phase != "observe" || wire.Session != incumbent || wire.Park.Route == nil || *wire.Park.Route != *park.Route {
++					t.Error("unexpected request or old radio replay")
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				wire.Park.Route = park.Route
++				if wire.Park != park {
++					t.Error("cold request did not preserve the original Spotify park")
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				attempt := reads.Add(1)
++				ack := radioPrimaryColdReceipt{radioPrimaryColdWire: wire,
++					Target: radioPrimaryTarget{Process: newC, Device: device, Incarnation: "4", Epoch: "0", Route: "0"}}
++				ack.Phase = "isolated"
++				switch mode {
++				case "missing":
++					w.WriteHeader(http.StatusConflict)
++					return
++				case "wrong_predecessor":
++					ack.Session = previous
++				case "wrong_park":
++					ack.Park.Revision = "3"
++				case "wrong_c_process":
++					ack.Target.Process = oldC
++				case "interrupted_reply":
++					if attempt == 1 {
++						// The fixture owner has already durably isolated the old
++						// route. Lose only the first observation of that fact.
++						w.WriteHeader(http.StatusServiceUnavailable)
++						return
++					}
++				}
++				_ = json.NewEncoder(w).Encode(ack)
++			}))
++			defer server.Close()
++			cfg.RoomTransportOwnToneURL, cfg.RadioHandoffOwnerURL = server.URL, server.URL
++			seed := &App{cfg: cfg}
++			if err := seed.initRadio(); err != nil {
++				t.Fatal(err)
++			}
++			seed.radio.Holds[room], seed.radio.Intent, seed.radio.Generation = h, 2, 2
++			if err := seed.persistRadioLocked(); err != nil {
++				t.Fatal(err)
++			}
++			restart := &App{cfg: cfg}
++			if err := restart.initRadio(); err != nil {
++				t.Fatal(err)
++			}
++			if mode == "persistence_failure" {
++				if err := os.WriteFile(cfg.RadioHandoffStatePath+".pending", nil, 0600); err != nil {
++					t.Fatal(err)
++				}
++			}
++			first := restart.radioPrimaryReadiness(ctx, op.Capture.Process)
++			if first.ColdDetachment != nil || first.Protocol != "" || first.Observation != nil || first.Revision != "2" ||
++				!restart.radioOutputFence.Load() || restart.radio.Holds[room].Phase != "unknown" || reads.Load() != 1 {
++				t.Fatal("unproved or unpersisted detachment published authority")
++			}
++			if mode != "interrupted_reply" {
++				return
++			}
++			settled := restart.radioPrimaryReadiness(ctx, op.Capture.Process)
++			proof := settled.ColdDetachment
++			if proof == nil || proof.Session != incumbent || proof.Process != oldProcess || proof.Handoff != handoff ||
++				proof.Generation != "2" || proof.Room != room || proof.Target.Process != newC ||
++				settled.Revision != "3" || settled.Observation != nil || settled.Protocol != "" ||
++				settled.IsolatedSession != nil || settled.ReleasedSession != nil || settled.TeardownCSeq != nil ||
++				restart.radioOutputFence.Load() || !primaryRadioColdDetached(restart.radio.Holds[room]) || reads.Load() != 2 {
++				t.Fatal("exact passive receipt did not persist before dropping the old fence")
++			}
++			laterC.Store(true)
++			restartedAgain := &App{cfg: cfg}
++			if err := restartedAgain.initRadio(); err != nil {
++				t.Fatal(err)
++			}
++			again := restartedAgain.radioPrimaryReadiness(ctx, op.Capture.Process)
++			if again.ColdDetachment == nil || *again.ColdDetachment != *proof || again.Revision != "3" ||
++				again.Protocol != "" || again.Observation != nil || restartedAgain.radioOutputFence.Load() || reads.Load() != 2 ||
++				restartedAgain.radio.Holds[room].owner != nil || restartedAgain.radio.Holds[room].primary != nil {
++				t.Fatal("persisted detachment replayed or became a current owner on restart")
++			}
++		})
++	}
 +}
 diff --git a/daemon/radio_primary_composed_test.go b/daemon/radio_primary_composed_test.go
 new file mode 100644
@@ -1984,10 +2358,10 @@ index 0000000..0b6ca00
 +}
 diff --git a/daemon/radio_primary_readiness.go b/daemon/radio_primary_readiness.go
 new file mode 100644
-index 0000000..976bbfc
+index 0000000..c1e8e22
 --- /dev/null
 +++ b/daemon/radio_primary_readiness.go
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,127 @@
 +package daemon
 +
 +import (
@@ -2019,19 +2393,20 @@ index 0000000..976bbfc
 +}
 +
 +type radioPrimaryReadinessState struct {
-+	Schema          string                   `json:"schema"`
-+	Protocol        string                   `json:"protocol,omitempty"`
-+	Process         string                   `json:"process_id"`
-+	Revision        string                   `json:"native_revision"`
-+	Targets         []radioTarget            `json:"configured_targets"`
-+	Missing         []string                 `json:"missing_proofs"`
-+	Observation     *radioPrimaryObservation `json:"observation"`
-+	Session         *radioPrimaryBinding     `json:"target_session,omitempty"`
-+	Capabilities    []string                 `json:"capabilities,omitempty"`
-+	IsolatedSession *radioPrimaryIsolation   `json:"isolated_session,omitempty"`
-+	ReleasedSession *radioPrimaryBinding     `json:"released_session,omitempty"`
-+	ReleaseActionID *string                  `json:"release_action_id,omitempty"`
-+	TeardownCSeq    *int                     `json:"teardown_cseq,omitempty"`
++	ColdDetachment  *radioPrimaryColdDetachment `json:"cold_detachment,omitempty"`
++	Schema          string                      `json:"schema"`
++	Protocol        string                      `json:"protocol,omitempty"`
++	Process         string                      `json:"process_id"`
++	Revision        string                      `json:"native_revision"`
++	Targets         []radioTarget               `json:"configured_targets"`
++	Missing         []string                    `json:"missing_proofs"`
++	Observation     *radioPrimaryObservation    `json:"observation"`
++	Session         *radioPrimaryBinding        `json:"target_session,omitempty"`
++	Capabilities    []string                    `json:"capabilities,omitempty"`
++	IsolatedSession *radioPrimaryIsolation      `json:"isolated_session,omitempty"`
++	ReleasedSession *radioPrimaryBinding        `json:"released_session,omitempty"`
++	ReleaseActionID *string                     `json:"release_action_id,omitempty"`
++	TeardownCSeq    *int                        `json:"teardown_cseq,omitempty"`
 +}
 +
 +// Only the exact composed C build publishes the authenticated capability.
@@ -2095,6 +2470,9 @@ index 0000000..976bbfc
 +	app.radio.mu.Unlock()
 +	if !stable || ctx.Err() != nil || len(s.Targets) == 0 {
 +		return s
++	}
++	if unsupported == 0 && len(receivers) > 0 && cProcess != "" {
++		app.observePrimaryColdDetachment(ctx, process, cProcess, receivers, &s)
 +	}
 +	if unsupported == len(s.Targets) {
 +		s.Protocol = "v1" // Manager still requires fresh v1 evidence from this Native process.
