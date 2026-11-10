@@ -523,7 +523,7 @@ index 62dd0163f99733f8c383c990da10b771a4b9075b..9a2297b36340f23517bd363db17954c8
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 82dfaca947cfa8dd947b3e2b85dde956796113f5..6a92f39bb509ff935b2eb52369ae77e0a569bbbc 100644
+index 82dfaca947cfa8dd947b3e2b85dde956796113f5..73fc81bbd4947c7112497ec218f214ca16455d76 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -1178,7 +1178,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..6a92f39bb509ff935b2eb52369ae77e0
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3244,94 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3244,102 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -1198,18 +1198,26 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..6a92f39bb509ff935b2eb52369ae77e0
 +      || !radio_queue_writer_current(writer, route, NULL))
 +    return -1;
 +
-+  /* A parked/returning writer cannot fall through to the old START proof. */
++  const struct start_slot *spotify = start_active;
 +  if (slot && slot->primary_return.intent[0])
 +    {
 +      const struct output_radio_reacquire_result *v = &slot->result.resume;
-+      return slot->result.phase == OUTPUT_RADIO_REACQUIRED
-+        && v->phase == OUTPUT_RADIO_REACQUIRE_OPENED
-+        && native_owner_equal(owner, &v->command.intended_native_owner)
-+        && queue_writer_equal(writer, &v->command.current_writer)
-+        && transport_identity_equal(route, &v->route_identity)
-+        && radio_reacquired_current(id, d->incarnation, d->session_epoch, d->session, false) ? 0 : -1;
++      if (slot->result.phase != OUTPUT_RADIO_REACQUIRED)
++        return -1;
++      if (v->phase == OUTPUT_RADIO_REACQUIRE_OPENED)
++        return native_owner_equal(owner, &v->command.intended_native_owner)
++          && queue_writer_equal(writer, &v->command.current_writer)
++          && transport_identity_equal(route, &v->route_identity)
++          && radio_reacquired_current(id, d->incarnation, d->session_epoch, d->session, false) ? 0 : -1;
++
++      /* Only the exact completed START which received custody from this
++       * return can replace its live owner proof. */
++      if (v->phase != OUTPUT_RADIO_REACQUIRE_DELEGATED || !spotify
++          || spotify->result.phase != OUTPUT_START_COMPLETED || spotify->session != d->session
++          || !v->delegated_token[0] || strcmp(v->delegated_token, spotify->result.command.token)
++          || spotify->result.command.native_revision <= slot->primary_return.native_revision)
++        return -1;
 +    }
-+  const struct start_slot *spotify = start_active;
 +  if (!spotify || spotify->cancelled || spotify->result.phase != OUTPUT_START_COMPLETED
 +      || !spotify->result.actual_owner_present
 +      || !native_owner_equal(owner, &spotify->result.command.committed_native_owner)
@@ -1273,7 +1281,7 @@ index 82dfaca947cfa8dd947b3e2b85dde956796113f5..6a92f39bb509ff935b2eb52369ae77e0
  int
  outputs_init(void)
  {
-@@ -2785,6 +3408,7 @@ outputs_init(void)
+@@ -2785,6 +3416,7 @@ outputs_init(void)
    return 0;
  }
  
