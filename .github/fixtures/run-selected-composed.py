@@ -116,13 +116,88 @@ def run_primary_cold_detachment():
         finally:
             os.close(fd)
 
+    def stop(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def wait_ready(c, ready, port, fifo):
+        deadline = time.monotonic() + 5
+        endpoint = f"http://127.0.0.1:{port}"
+        while c.poll() is None and time.monotonic() < deadline:
+            if ready.exists():
+                try:
+                    info = json.loads(ready.read_text())
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except (OSError, ValueError):
+                    pass
+            time.sleep(0.025)
+        else:
+            raise RuntimeError("C owner did not expose its fixture endpoints")
+        if info.get("primary_url") != endpoint or info.get("pipe") != fifo:
+            raise RuntimeError("unexpected cold owner fixture endpoints")
+        return dict(PC_NATIVE_START_URL=info["url"], PC_NATIVE_START_PIPE=fifo,
+                    PC_NATIVE_PRIMARY_HTTP_URL=endpoint)
+
+    def run_live(name, generation, phase, marker, finish_native):
+        ready = logs / f"{name}-ready.json"
+        c_path = logs / f"{name}-c.log"
+        with owner_lifetime(generation) as scoped, c_path.open("w") as c_log:
+            scoped.update(phase, PC_NATIVE_START_READY_FILE=str(ready))
+            c = subprocess.Popen(c_binary, cwd=root, env=scoped, pass_fds=(3,),
+                                 stdout=c_log, stderr=subprocess.STDOUT)
+            try:
+                native_env = dict(scoped, **wait_ready(c, ready, port, scoped["PC70_COLD_FIFO"]))
+                with (logs / f"{name}-native.log").open("w") as native_log:
+                    native = subprocess.Popen(native_binary, cwd=root, env=native_env, pass_fds=(3,),
+                                              stdout=native_log, stderr=subprocess.STDOUT)
+                    try:
+                        if c.wait(timeout=22):
+                            raise RuntimeError(f"{name} C owner failed")
+                        if finish_native and native.wait(timeout=4):
+                            raise RuntimeError(f"{name} Native owner failed")
+                        if name == "prior":
+                            competing = os.open(data / ".podconnect-primary-owner", os.O_RDWR | os.O_NOFOLLOW)
+                            try:
+                                try:
+                                    fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                except BlockingIOError:
+                                    print("PASS competing descriptor cannot acquire the old shared lifetime lock")
+                                else:
+                                    raise RuntimeError("old lifetime allowed a competing lock")
+                            finally:
+                                os.close(competing)
+                    finally:
+                        stop(native)
+            finally:
+                stop(c)
+        print_marker(c_path, marker)
+
+    def print_marker(path, prefix):
+        marker = next((line for line in path.read_text().splitlines() if line.startswith(prefix)), None)
+        if marker is None:
+            raise RuntimeError(f"{path.name} lacks expected cold detachment proof")
+        print(marker)
+
+    def run_cold_read(name, generation, marker, **phase):
+        c_path = logs / f"{name}-c.log"
+        with owner_lifetime(generation) as scoped, c_path.open("w") as c_log:
+            scoped.update(phase, PC70_COLD_RESTART="1")
+            subprocess.run(c_binary, cwd=root, env=scoped, pass_fds=(3,),
+                           stdout=c_log, stderr=subprocess.STDOUT, timeout=10, check=True)
+        print_marker(c_path, marker)
+
     try:
         with tempfile.TemporaryDirectory(prefix="primary-cold-data-", dir=root) as source:
             pathlib.Path(source).chmod(0o755)
             subprocess.run(["mount", "--bind", source, str(data)], check=True)
             try:
                 (data / "media").mkdir(mode=0o755)
-                ready = logs / "ready.json"
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
@@ -130,81 +205,30 @@ def run_primary_cold_detachment():
                     os.environ,
                     PC70_COLD_DATABASE=str(data / "songs3.db"),
                     PC70_COLD_FIFO=str(data / "media/spotify"),
+                    PC_NATIVE_COLD_RADIO_JOURNAL=str(data / "native-radio.json"),
                     PC_NATIVE_PRIMARY_COLD_PARK="1",
-                    PC_NATIVE_PRIMARY_CONTROL_LOSS=str(logs / "disconnect"),
-                    PC_NATIVE_PRIMARY_STOP_RESTART="1",
                     PC_NATIVE_PRIMARY_NEW_SELECTION="1",
                     PC_NATIVE_PRIMARY_HTTP_PORT=str(port),
                     PC_PRIMARY_HTTP_TOKEN="2" * 64,
                     PC_REQUIRE_RTP_AUDIO="1",
                     PC_NATIVE_START_MODE="actual-c-primary-same-target",
-                    PC_NATIVE_START_READY_FILE=str(ready),
                 )
-                with owner_lifetime("a") as prior_env, (logs / "prior-c.log").open("w") as c_log:
-                    c = subprocess.Popen(c_binary, cwd=root, env=prior_env, pass_fds=(3,),
-                                         stdout=c_log, stderr=subprocess.STDOUT)
-                    native = None
-                    try:
-                        deadline = time.monotonic() + 5
-                        endpoint = f"http://127.0.0.1:{port}"
-                        while c.poll() is None and time.monotonic() < deadline:
-                            if ready.exists():
-                                try:
-                                    info = json.loads(ready.read_text())
-                                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                                        break
-                                except (OSError, ValueError):
-                                    pass
-                            time.sleep(0.025)
-                        else:
-                            raise RuntimeError("old C owner did not expose its fixture endpoints")
-                        if info.get("primary_url") != endpoint or info.get("pipe") != env["PC70_COLD_FIFO"]:
-                            raise RuntimeError("unexpected old owner fixture endpoints")
-                        with (logs / "prior-native.log").open("w") as native_log:
-                            native = subprocess.Popen(
-                                native_binary, cwd=root, pass_fds=(3,),
-                                env=dict(prior_env, PC_NATIVE_START_URL=info["url"],
-                                         PC_NATIVE_START_PIPE=info["pipe"], PC_NATIVE_PRIMARY_HTTP_URL=endpoint),
-                                stdout=native_log, stderr=subprocess.STDOUT,
-                            )
-                        if c.wait(timeout=15) or not any(
-                            line.startswith("PASS real old START and encrypted P1 parked")
-                            for line in (logs / "prior-c.log").read_text().splitlines()
-                        ):
-                            raise RuntimeError("old C did not persist its exact parked P1 before process exit")
-                        competing = os.open(data / ".podconnect-primary-owner", os.O_RDWR | os.O_NOFOLLOW)
-                        try:
-                            try:
-                                fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            except BlockingIOError:
-                                print("PASS competing descriptor cannot acquire the old live lifetime lock")
-                            else:
-                                raise RuntimeError("old lifetime allowed a competing lock")
-                        finally:
-                            os.close(competing)
-                    finally:
-                        for process in (native, c):
-                            if process is not None and process.poll() is None:
-                                process.terminate()
-                                try:
-                                    process.wait(timeout=2)
-                                except subprocess.TimeoutExpired:
-                                    process.kill()
-                                    process.wait()
-                for generation, name in (("b", "restarted"), ("c", "replay")):
-                    with owner_lifetime(generation) as fresh_env, (logs / f"{name}-c.log").open("w") as c_log:
-                        fresh_env["PC70_COLD_RESTART"] = "1"
-                        if name == "replay":
-                            fresh_env["PC_NATIVE_PRIMARY_COLD_REPLAY"] = "1"
-                        subprocess.run(c_binary, cwd=root, env=fresh_env, pass_fds=(3,),
-                                       stdout=c_log, stderr=subprocess.STDOUT, timeout=10, check=True)
-                    expected = ("PASS restarted C recorded" if name == "restarted"
-                                else "PASS restarted C revalidated without rewriting")
-                    marker = next((line for line in (logs / f"{name}-c.log").read_text().splitlines()
-                                   if line.startswith(expected)), None)
-                    if marker is None:
-                        raise RuntimeError(f"{name} owner did not verify exact cold detachment")
-                    print(marker)
+                manager = bool(env.get("PC_PRIMARY_MANAGER_TEST_BIN"))
+                if manager:
+                    (data / "manager").mkdir(mode=0o700)
+                    env["PC_PRIMARY_MANAGER_COLD_DATA"] = str(data / "manager")
+                prior = dict(PC_NATIVE_PRIMARY_CONTROL_LOSS=str(logs / "disconnect"))
+                if manager:
+                    prior["PC_PRIMARY_MANAGER_COLD_PRIOR"] = "1"
+                else:
+                    prior["PC_NATIVE_PRIMARY_STOP_RESTART"] = "1"
+                run_live("prior", "a", prior, "PASS real old START and encrypted P1 parked", manager)
+                run_cold_read("witness", "b", "PASS restarted C recorded")
+                run_live("current", "c", dict(PC70_COLD_RESTART="1", PC_NATIVE_PRIMARY_COLD_REPLAY="1",
+                         PC_NATIVE_PRIMARY_COLD_COMPOSED="1", PC_NATIVE_PRIMARY_COLD_FRESH_SPOTIFY="1",
+                         PC_NATIVE_PRIMARY_COLD_FRESH_RADIO="1"),
+                         "PASS cold new owner authenticated fresh Spotify", True)
+                run_cold_read("after-p6", "d", "PASS restarted C recorded", PC_NATIVE_PRIMARY_COLD_NEXT_PARK="1")
             finally:
                 subprocess.run(["umount", str(data)], check=True)
     finally:

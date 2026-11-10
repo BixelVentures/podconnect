@@ -320,6 +320,7 @@ jobs:
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_CONTROL_LOSS=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
           sudo -n unshare --mount --propagation private env PC_FIXTURE_HOST_MOUNT_NS="$(readlink /proc/self/ns/mnt)" \
             PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests \
+            PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests \
             python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-cold-detachment
           status=0
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target || status=1
