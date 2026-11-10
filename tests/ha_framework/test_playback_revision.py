@@ -32,6 +32,7 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.writes = []
         self.native_replies = asyncio.Queue()
         self.native_requests = asyncio.Queue()
+        self.native_reply_timeout = 2
         self.read_entered = asyncio.Event()
         self.release_read = asyncio.Event()
         self.hold_read = False
@@ -110,7 +111,7 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 return self.reply(0, changed=False)
             await self.native_requests.put(cursor)
             try:
-                async with asyncio.timeout(2):
+                async with asyncio.timeout(self.native_reply_timeout):
                     reply = await self.native_replies.get()
             except TimeoutError:
                 return web.Response(status=204)
@@ -262,8 +263,12 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
         # Lose the optional native path; the ordinary active poll must still run.
         self.title = "Polling fallback"
+        fallback_timeout = 4
+        # Keep the reconnect request available for the reset reply after the
+        # fallback poll. A short fixture 204 would queue a duplicate old cursor.
+        self.native_reply_timeout = fallback_timeout + 1
         await self.native_replies.put(None)
-        async with asyncio.timeout(4):
+        async with asyncio.timeout(fallback_timeout):
             while self.coordinator.data["playback"]["item"]["name"] != self.title:
                 await asyncio.sleep(0.02)
         self.assertEqual(self.provider_reads, reads + 3)
