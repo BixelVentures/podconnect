@@ -558,3 +558,38 @@ func TestRoomQueueAutoplayPendingCannotStage(t *testing.T) {
 		})
 	}
 }
+
+// Issue #140: every refused queue choice names its first failed check, so a
+// Green failure is read from the log instead of guessed.
+func TestRoomQueuePrepareRejectionNamesFirstFailedCheck(t *testing.T) {
+	f := newRoomQueueFixture(t)
+	var out bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	if got := f.prepare(t, strings.Repeat("2", 24)); got.Code != 409 {
+		t.Fatal("prepare without a read", got.Code)
+	}
+	if f.read(t).Code != 200 || f.prepare(t, strings.Repeat("9", 24)).Code != 409 {
+		t.Fatal("foreign occurrence admitted")
+	}
+	if f.read(t).Code != 200 || f.prepare(t, strings.Repeat("2", 24)).Code != 200 {
+		t.Fatal("prepare")
+	}
+	if f.read(t).Code != 200 || f.prepare(t, strings.Repeat("2", 24)).Code != 409 {
+		t.Fatal("second preparation admitted")
+	}
+	logged := out.String()
+	for _, want := range []string{
+		"room_queue_prepare event=rejected stage=no_current_read status=409",
+		"room_queue_prepare event=rejected stage=selection_not_in_read status=409",
+		"room_queue_prepare event=rejected stage=unconsumed_preparation status=409",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("missing %q in %q", want, logged)
+		}
+	}
+	if strings.Contains(logged, f.Scope.Account) || strings.Contains(logged, "session") {
+		t.Fatal("identifier leaked into diagnostics", logged)
+	}
+}

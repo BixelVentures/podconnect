@@ -12,7 +12,7 @@ import voluptuous as vol
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .const import DOMAIN, LOGGER
 from .observations import current
 from .speakers import SpeakersError
 from .targets import spotify_devices
@@ -29,6 +29,27 @@ _COMMAND_ACTIONS = (
     "play_context",
     "play_queue_occurrence",
 )
+
+
+def _log_not_accepted(action, receipt, sent):
+    """Finite action/outcome/kind only: say why, never what (#140)."""
+    kind = receipt.get("error_kind")
+    LOGGER.warning(
+        "command event=not_accepted action=%s outcome=%s kind=%s sent=%s",
+        action if action in _COMMAND_ACTIONS else "other",
+        receipt.get("outcome")
+        if receipt.get("outcome") in ("rejected", "unknown")
+        else "other",
+        kind
+        if isinstance(kind, str)
+        and len(kind) <= 64
+        and kind.replace("_", "").isalnum()
+        and kind.isascii()
+        else "other",
+        str(bool(sent)).lower(),
+    )
+
+
 _TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
@@ -225,6 +246,28 @@ class PlaybackCommands:
             and all(now is expected for now, expected in zip(binding, self.binding))
             and not data.api._web.closed
         )
+
+    def _remember_accepted_volume(self, target_id, percent):
+        """Speakers owns room volume; Spotify's device volume may never mirror it."""
+        baseline = None
+        for row in (self.data.coordinator.data or {}).get("devices", []) or []:
+            if isinstance(row, dict) and row.get("id") == target_id:
+                baseline = row.get("volume_percent")
+        self.accepted_volume = {
+            "target_id": target_id,
+            "percent": percent,
+            "baseline": baseline,
+        }
+
+    def displayed_volume(self, target_id, reported):
+        """Latest explicit accepted volume until Spotify reports another change."""
+        accepted = getattr(self, "accepted_volume", None)
+        if not accepted or accepted["target_id"] != target_id:
+            return reported
+        if reported in (accepted["baseline"], accepted["percent"]):
+            return accepted["percent"]
+        self.accepted_volume = None  # A newer external change wins.
+        return reported
 
     def controls(
         self,
@@ -708,8 +751,13 @@ class PlaybackCommands:
                 possible_effect=False,
             )
 
+        logged = []
+
         def rejected(kind):
-            return {**receipt, "error_kind": kind}
+            value = {**receipt, "error_kind": kind}
+            _log_not_accepted(action, value, False)
+            logged.append(True)
+            return value
 
         if action in {"seek", "shuffle", "repeat"} and room_transport is None:
             return rejected("native_room_required")
@@ -804,7 +852,12 @@ class PlaybackCommands:
                 # Native room transport/volume are idempotent intents: Speakers
                 # fences the exact account/room/output at commit, so a newer Web
                 # API poll or a prior command's floor must not reject them.
-                intent = room_transport is not None or room_volume is not None
+                # A prepared queue occurrence is fenced the same way by Speakers.
+                intent = (
+                    room_transport is not None
+                    or room_volume is not None
+                    or room_queue is not None
+                )
                 if observed["owner_epoch"] != epoch or (
                     not intent
                     and observed["poll_sequence"] != sequence
@@ -888,6 +941,10 @@ class PlaybackCommands:
                 )
                 if not ack["protocol_accepted"]:
                     receipt["error_kind"] = "outcome_unknown"
+                else:
+                    self._remember_accepted_volume(
+                        target_id, request["args"]["percent"]
+                    )
             elif room_transport is not None:
                 if action not in (
                     "pause",
@@ -1054,6 +1111,8 @@ class PlaybackCommands:
                 )
             receipt["observe_after_poll_sequence"] = self.poll_floor
             self.receipts[command_sequence] = (fingerprint, receipt, operation_id)
+            if receipt.get("outcome") != "accepted" and not logged:
+                _log_not_accepted(action, receipt, possible_send)
             self.busy = False
             if possible_send and self._refresh_owner_current(hass, entry_id):
                 await self.binding[1].async_refresh_after_command()

@@ -29,6 +29,29 @@ _TRACK = re.compile(r"spotify:track:[A-Za-z0-9]{22}")
 _LOGGER = logging.getLogger(__name__)
 
 
+# Finite CommandRejected kinds that may appear in a diagnostic log line.
+_REJECT_KINDS = frozenset(
+    {
+        "owner_replaced",
+        "stale_observation",
+        "room_queue_unavailable",
+        "room_queue_expired",
+        "target_not_current",
+        "invalid_target",
+        "capabilities_unavailable",
+        "unavailable",
+    }
+)
+
+
+def _first(*checks):
+    """Name the first failing check, so a rejection is never a guess (#140)."""
+    for failed, reason in checks:
+        if failed:
+            return reason
+    return None
+
+
 def _hex(value, pattern):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
@@ -255,11 +278,11 @@ class RoomQueue:
         observed = self.commands.controls(
             request["config_entry_id"], request["target_id"], for_command=True
         )
-        if (
-            observed["owner_epoch"] != request["owner_epoch"]
-            or observed["poll_sequence"] != request["expected_poll_sequence"]
-            or observed["poll_sequence"] <= self.commands.poll_floor
-        ):
+        # The selected occurrence is fenced by Speakers (observation, session,
+        # queue revision, route and writer) at prepare and commit. A routine
+        # Spotify Web API poll landing meanwhile is not a new owner and must
+        # not reject the user's explicit queue choice (issue #140).
+        if observed["owner_epoch"] != request["owner_epoch"]:
             raise CommandRejected("stale_observation")
         return observed
 
@@ -515,6 +538,16 @@ class RoomQueue:
             if time.monotonic() < value["deadline"]
         }
         active = False
+        stage = "request"
+
+        def reject(reason):
+            _LOGGER.warning(
+                "room_queue_prepare event=rejected reason=%s "
+                "physical_result_verified=false",
+                reason,
+            )
+            return rejected
+
         try:
             ctx = {
                 k: request[k]
@@ -523,42 +556,61 @@ class RoomQueue:
             if request["action"] != ACTION or not context(
                 ctx, request["target_id"], request["args"]
             ):
-                return rejected
+                return reject("request_invalid")
             sequence = request["command_sequence"]
-            if (
-                type(sequence) is not int
-                or not 1 <= sequence < 2**53
-                or sequence != commands.command_sequence + 1
-                or request["request_id"] != f"{request['owner_epoch']}:{sequence}"
-                or commands.busy
-                or len(self.preparations) >= 64
-            ):
-                return rejected
+            reason = _first(
+                (
+                    type(sequence) is not int or not 1 <= sequence < 2**53,
+                    "sequence_invalid",
+                ),
+                (sequence != commands.command_sequence + 1, "sequence_not_next"),
+                (
+                    request["request_id"] != f"{request['owner_epoch']}:{sequence}",
+                    "request_id_invalid",
+                ),
+                (commands.busy, "control_busy"),
+                (len(self.preparations) >= 64, "preparations_full"),
+            )
+            if reason:
+                return reject(reason)
             record = self.observations.get(request["args"]["observation_id"])
-            if record is None or time.monotonic() >= record["deadline"]:
-                return rejected
+            if record is None:
+                return reject("observation_unknown")
+            if time.monotonic() >= record["deadline"]:
+                return reject("observation_expired")
             value, scope = record["value"], record["scope"]
-            if (
-                record["entry"] != request["config_entry_id"]
-                or record["epoch"] != request["owner_epoch"]
-                or record["poll"] != request["expected_poll_sequence"]
-                or value["native"] != ctx["native"]
-                or value["route"] != ctx["route"]
-                or ACTION not in value["actions"]
-                or request["args"]["queue_revision"] != value["queue"]["queue_revision"]
-                or not any(
-                    row["id"] == request["args"]["occurrence_id"]
-                    for row in value["queue"]["items"]
-                )
-            ):
-                return rejected
+            reason = _first(
+                (record["entry"] != request["config_entry_id"], "entry_changed"),
+                (record["epoch"] != request["owner_epoch"], "epoch_changed"),
+                (record["poll"] != request["expected_poll_sequence"], "poll_mismatch"),
+                (value["native"] != ctx["native"], "native_mismatch"),
+                (value["route"] != ctx["route"], "route_mismatch"),
+                (ACTION not in value["actions"], "action_unavailable"),
+                (
+                    request["args"]["queue_revision"]
+                    != value["queue"]["queue_revision"],
+                    "revision_mismatch",
+                ),
+                (
+                    not any(
+                        row["id"] == request["args"]["occurrence_id"]
+                        for row in value["queue"]["items"]
+                    ),
+                    "occurrence_missing",
+                ),
+            )
+            if reason:
+                return reject(reason)
+            stage = "fresh_before_speakers"
             self._fresh(hass, request, scope)
             self.observations.pop(request["args"]["observation_id"])
             commands.busy = active = True
             started = time.monotonic()
+            stage = "speakers_prepare"
             staged = await commands.data.speakers.prepare_room_queue(
                 scope, ctx["native"], ctx["route"], request["args"]
             )
+            stage = "fresh_after_speakers"
             self._fresh(hass, request, scope)
             keys = {
                 "schema",
@@ -586,7 +638,7 @@ class RoomQueue:
                 or not writer(staged["writer_proof"], staged["route"])
                 or not _int(staged["expires_after_ms"], 1, 5000)
             ):
-                return rejected
+                return reject("speakers_response_invalid")
             deadline = min(
                 record["deadline"], started + staged["expires_after_ms"] / 1000
             )
@@ -594,10 +646,10 @@ class RoomQueue:
                 time.monotonic() >= deadline
                 or sequence != commands.command_sequence + 1
             ):
-                return rejected
+                return reject("expired_after_speakers")
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms < 1:
-                return rejected
+                return reject("expired_after_speakers")
             self.preparations[staged["prepare_id"]] = {
                 "request": copy.deepcopy(request),
                 "scope": scope,
@@ -628,8 +680,13 @@ class RoomQueue:
             SpeakersError,
             CommandRejected,
             HomeAssistantError,
-        ):
-            return rejected
+        ) as err:
+            detail = (
+                str(err)
+                if isinstance(err, CommandRejected) and str(err) in _REJECT_KINDS
+                else type(err).__name__
+            )
+            return reject(f"{stage}:{detail}")
         finally:
             if active:
                 commands.busy = False
@@ -639,11 +696,24 @@ class RoomQueue:
 
         record = self.preparations.pop(ctx["prepare_id"], None)
         original = {**request, **{k: v for k, v in ctx.items() if k != "prepare_id"}}
-        if (
-            record is None
-            or time.monotonic() >= record["deadline"]
-            or _fingerprint(original) != record["fingerprint"]
-        ):
+        reason = _first(
+            (record is None, "preparation_unknown"),
+            (
+                record is not None and time.monotonic() >= record["deadline"],
+                "preparation_expired",
+            ),
+            (
+                record is not None
+                and _fingerprint(original) != record["fingerprint"],
+                "request_changed",
+            ),
+        )
+        if reason:
+            _LOGGER.warning(
+                "room_queue_commit event=rejected reason=%s "
+                "physical_result_verified=false",
+                reason,
+            )
             raise CommandRejected("room_queue_expired")
         self._fresh(hass, request, record["scope"])
         guard()

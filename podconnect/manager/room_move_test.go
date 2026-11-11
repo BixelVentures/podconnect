@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -109,4 +110,32 @@ func TestMoveStateRejectsMixedOwnerConfigurationAndUnavailableSchemas(t *testing
 			t.Fatal("extra asserted authority accepted")
 		}
 	})
+}
+
+// Issue #140: a move that does not happen must say why in one bounded line.
+func TestRoomMoveUnknownAndBlockedCausesAreNamed(t *testing.T) {
+	if got := roomMoveUnknownCause(fmt.Errorf("x"), nil, false, true); got != "native_rpc_failed" {
+		t.Fatal(got)
+	}
+	if got := roomMoveUnknownCause(nil, fmt.Errorf("x"), false, true); got != "native_result_invalid" {
+		t.Fatal(got)
+	}
+	if got := roomMoveUnknownCause(nil, nil, false, false); got != "destination_binding_changed" {
+		t.Fatal(got)
+	}
+	if got := roomMoveUnknownCause(nil, nil, false, true); got != "" {
+		t.Fatal(got)
+	}
+	record := &roomMoveRecord{Result: roomMoveResult{State: "rejected"}}
+	if got := roomMoveCommitBlocked(record); got != "not_staged_rejected" {
+		t.Fatal(got)
+	}
+	var out bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	roomMoveLog("commit", "unknown", "native_rpc_failed")
+	if got := out.String(); !strings.Contains(got, "room_move event=commit state=unknown cause=native_rpc_failed") {
+		t.Fatal(got)
+	}
 }

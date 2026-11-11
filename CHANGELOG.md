@@ -1,3 +1,15 @@
+## Speakers 0.26.94 — hver afvisning siger hvorfor (#140)
+
+- Kø-læsning, kø-prepare/commit, lydstyrke, transport (pause m.m.) og højttalerskift logger nu én linje pr. afvisning eller uafklaret udfald med den første fejlende kontrol (fx `room_queue_prepare event=rejected stage=selection_not_in_read`, `room_move event=commit state=unknown cause=native_rpc_failed`). Kun faste navne; ingen konto-, rum-, sessions- eller tilbuds-id'er. Adfærd er uændret.
+
+## Control 0.10.41 — kø, pause og lydstyrke efter Green 11. nov (#140)
+
+- Hver afvist eller uafklaret kommando logger handling, udfald og årsag (`command event=not_accepted …`); kø-prepare logger den første fejlende kontrol (`room_queue_prepare event=rejected reason=…`), og Native-betjening fra HA-entiteten logger hvorfor ruten mangler (`native_command …`). Kun faste navne, ingen id'er.
+
+- Valg af en kørække afvises ikke længere, blot fordi en almindelig Spotify-poll lander mens Speakers forbereder valget. Speakers kontrollerer stadig observation, session, kørevision, rute og writer ved prepare og commit; en ny ejer (epoch/konto) afviser stadig.
+- Pause virker altid på Native-motoren: kan der ikke bindes en præcis rum-rute (fx efter et mislykket højttalerskift), pauser Control via Speakers' lokale `/api/stop` for primærrummet. Det kan aldrig starte eller flytte lyd; Fortsæt og øvrige handlinger er uændret lukkede uden rute.
+- HA-entitetens lydstyrke viser den senest accepterede rum-lydstyrke, indtil Spotify melder en anden ændring (Spotify spejler ikke Speakers' rum-lydstyrke).
+
 ## Speakers 0.26.93 — frigiv gendannet radio-slot efter genstart
 
 - Et gendannet, ukendt radio-park-slot fra en proces der er død frigives nu også når der ingen custody-række findes (Green-tilstanden efter 0.26.92). Kræver stadig: ingen session, ingen igangværende start, ingen åben Spotify-writer og ingen ventende cold-detachment. Hvert udfald (frigivet/bevaret + årsag) logges én gang.

@@ -62,20 +62,38 @@ func readRoomMove(ctx context.Context, scope roomTransportScope) (roomContentBin
 	var state nativeRoomMoveControls
 	binding, ok := roomContentBindingNow(scope)
 	if !ok {
-		return binding, state, fmt.Errorf("configured move destination unavailable")
+		return binding, state, fmt.Errorf("destination_unavailable")
 	}
 	q := url.Values{"account_user_id": {scope.Account}, "target_id": {scope.Target}, "room_id": {scope.Room}, "homepod_id": {scope.Homepod}}
 	started := time.Now()
 	raw, err := roomMoveRPC(ctx, binding.NativeURL, http.MethodGet, "/player/room_move/controls?"+q.Encode(), nil)
 	fields, shapeErr := contentFields(raw, "schema", "ready", "scope", "actions", "move_offer", "physical_result_verified", "alias_registry", "input_path_digest", "own_tone_url", "old_native_owner")
-	if err != nil || shapeErr != nil || decodeQueueManagerJSON(raw, &state) != nil || decodeQueueManagerJSON(fields["scope"], &state.Scope) != nil || decodeQueueManagerJSON(fields["move_offer"], &state.Offer) != nil || decodeQueueManagerJSON(fields["old_native_owner"], &state.OldOwner) != nil || !validRoomMoveOldOwner(binding, state.OldOwner) || state.Schema != "podconnect.native_room_move_controls.v1" || !state.Ready || state.Physical || state.Scope != scope || !validRoomMoveOffer(state.Offer) || !validRoomMoveActions(state.Actions) || state.Registry != binding.Registry || state.InputDigest != binding.PipeDigest || state.OutputURL != binding.OutputURL || !roomContentBindingCurrent(binding) {
-		return binding, state, fmt.Errorf("actual native move destination unavailable")
+	if err != nil {
+		return binding, state, fmt.Errorf("native_rpc_failed")
+	}
+	if shapeErr != nil || decodeQueueManagerJSON(raw, &state) != nil || decodeQueueManagerJSON(fields["scope"], &state.Scope) != nil || decodeQueueManagerJSON(fields["move_offer"], &state.Offer) != nil || decodeQueueManagerJSON(fields["old_native_owner"], &state.OldOwner) != nil || state.Schema != "podconnect.native_room_move_controls.v1" || state.Physical {
+		return binding, state, fmt.Errorf("native_controls_invalid")
+	}
+	if !state.Ready {
+		return binding, state, fmt.Errorf("native_not_ready")
+	}
+	if !validRoomMoveOldOwner(binding, state.OldOwner) {
+		return binding, state, fmt.Errorf("old_owner_mismatch")
+	}
+	if state.Scope != scope || !validRoomMoveOffer(state.Offer) || !validRoomMoveActions(state.Actions) {
+		return binding, state, fmt.Errorf("native_offer_invalid")
+	}
+	if state.Registry != binding.Registry || state.InputDigest != binding.PipeDigest || state.OutputURL != binding.OutputURL {
+		return binding, state, fmt.Errorf("destination_route_mismatch")
+	}
+	if !roomContentBindingCurrent(binding) {
+		return binding, state, fmt.Errorf("destination_binding_changed")
 	}
 	// Relative expiry can only shrink while traversing the manager. Native keeps
 	// the original absolute one-use offer deadline regardless of this descriptor.
 	remaining := state.Offer.Expires - int(time.Since(started).Milliseconds())
 	if remaining <= 0 {
-		return binding, state, fmt.Errorf("move offer expired")
+		return binding, state, fmt.Errorf("offer_expired")
 	}
 	state.Offer.Expires = remaining
 	return binding, state, nil
@@ -102,6 +120,7 @@ func roomMoveStateHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	_, state, err := readRoomMove(ctx, scope)
 	if err != nil {
+		roomMoveLog("state", "unavailable", err.Error())
 		http.Error(w, "move unavailable", 409)
 		return
 	}

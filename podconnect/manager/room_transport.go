@@ -380,18 +380,18 @@ func holdReleasedBridgeRoute(primary *Room, status glStatus, intent glTransportI
 }
 func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_transport", "method", "method", 405)
 		return
 	}
 	q := r.URL.Query()
 	s := roomTransportScope{q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), q.Get("account_user_id")}
 	if len(q) != 4 || !validTransportScope(s) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_transport", "arguments", "arguments", 400)
 		return
 	}
 	for _, v := range q {
 		if len(v) != 1 {
-			http.Error(w, "arguments", 400)
+			roomReject(w, "room_transport", "arguments", "arguments", 400)
 			return
 		}
 	}
@@ -404,7 +404,7 @@ func transportStateHandler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error_kind": "room_transport_unavailable", "retry_allowed": false, "reason": reason})
 		} else {
-			http.Error(w, "room transport unavailable", 409)
+			roomReject(w, "room_transport", "room_transport_unavailable", "room transport unavailable", 409)
 		}
 		return
 	}
@@ -459,16 +459,16 @@ func releaseRoomTransport() {
 }
 func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_transport", "method", "method", 405)
 		return
 	}
 	var body roomTransportRequest
 	if decodeTransportBody(r, &body) != nil || !validTransportScope(body.Scope) || !validTransportIdentity(body.Native, body.Scope) || !validOutputTransportIdentity(body.Route, body.Scope.Homepod) || !slices.Contains(transportActions, body.Action) || !validTransportPosition(body.Action, body.PositionMS) || !validTransportOptions(body.Action, body.ShuffleEnabled, body.RepeatMode) || body.Percent < 0 || body.Percent > 100 || body.Action != "volume" && body.Percent != 0 {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_transport", "arguments", "arguments", 400)
 		return
 	}
 	if !acquireRoomTransport() {
-		http.Error(w, "busy", 409)
+		roomReject(w, "room_transport", "busy", "busy", 409)
 		return
 	}
 	defer releaseRoomTransport()
@@ -481,7 +481,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil || n.Identity != body.Native || o.Identity != body.Route || o.Busy ||
 		claim.Released && claim.Paused && body.Action == "pause" ||
 		!slices.Contains(n.Actions, body.Action) || (!transportOptionAction(body.Action) && !slices.Contains(o.Actions, body.Action)) {
-		http.Error(w, "stale room transport", 409)
+		roomReject(w, "room_transport", "stale_room_transport", "stale room transport", 409)
 		return
 	}
 	request := map[string]any{"account_user_id": body.Scope.Account, "target_id": body.Scope.Target, "room_id": body.Scope.Room, "homepod_id": body.Scope.Homepod, "action": body.Action, "volume_percent": body.Percent}
@@ -504,13 +504,13 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	// Embedded structs are decoded by encoding/json, but strict field presence must
 	// validate their flattened identity independently of queue's struct walker.
 	if err != nil || decodeTransportPrepare(raw, &prepared) != nil || prepared.Schema != "podconnect.native_room_transport.v2" || !queueObservationPattern.MatchString(prepared.PrepareID) || prepared.roomTransportIdentity != body.Native || prepared.Action != body.Action || prepared.Percent != body.Percent || !sameTransportPosition(prepared.PositionMS, body.PositionMS) || !sameTransportOptions(prepared.ShuffleEnabled, body.ShuffleEnabled, prepared.RepeatMode, body.RepeatMode) || !transportDigest.MatchString(prepared.Digest) || prepared.Expires != 5000 || !validBoundNativeRevision(prepared.IntentRevision) || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
-		http.Error(w, "native preparation unavailable", 409)
+		roomReject(w, "room_transport", "native_preparation_unavailable", "native preparation unavailable", 409)
 		return
 	}
 	if transportOptionAction(body.Action) {
 		remaining := 5000 - int(time.Since(started).Milliseconds())
 		if remaining <= 0 {
-			http.Error(w, "expired", 409)
+			roomReject(w, "room_transport", "expired", "expired", 409)
 			return
 		}
 		roomTransportStore.Lock()
@@ -535,7 +535,7 @@ func transportPrepareHandler(w http.ResponseWriter, r *http.Request) {
 	var output outputTransportPrepare
 	remaining := 5000 - int(time.Since(started).Milliseconds())
 	if err != nil || decodeQueueManagerJSON(raw, &output) != nil || output.Schema != "podconnect.output_transport_prepare.v2" || !output.OK || !queueObservationPattern.MatchString(output.Token) || output.Identity != body.Route || output.Expires != 10000 || output.Owner != prepared.roomTransportIdentity || output.Revision != prepared.IntentRevision || remaining <= 0 || !transportRouteClaimCurrent(ctx, claim, body.Scope, body.Native, body.Route) {
-		http.Error(w, "output preparation unavailable", 409)
+		roomReject(w, "room_transport", "output_preparation_unavailable", "output preparation unavailable", 409)
 		return
 	}
 	roomTransportStore.Lock()
@@ -601,18 +601,18 @@ func decodeTransportPrepare(raw []byte, out *receiverTransportPrepare) error {
 }
 func transportCommitHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_transport", "method", "method", 405)
 		return
 	}
 	var body struct {
 		PrepareID string `json:"prepare_id"`
 	}
 	if decodeTransportBody(r, &body) != nil || !queueObservationPattern.MatchString(body.PrepareID) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_transport", "arguments", "arguments", 400)
 		return
 	}
 	if !acquireRoomTransport() {
-		http.Error(w, "busy", 409)
+		roomReject(w, "room_transport", "busy", "busy", 409)
 		return
 	}
 	defer releaseRoomTransport()
@@ -625,13 +625,13 @@ func transportCommitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	roomTransportStore.Unlock()
 	if offer == nil || !time.Now().Before(offer.Expires) {
-		http.Error(w, "stale room transport", 409)
+		roomReject(w, "room_transport", "stale_room_transport", "stale room transport", 409)
 		return
 	}
 	ctx, cancel := context.WithDeadline(r.Context(), offer.Expires)
 	defer cancel()
 	if !transportRouteClaimCurrent(ctx, offer.Claim, offer.Request.Scope, offer.Request.Native, offer.Request.Route) {
-		http.Error(w, "stale room transport", 409)
+		roomReject(w, "room_transport", "stale_room_transport", "stale room transport", 409)
 		return
 	}
 	encoded, _ := json.Marshal(map[string]any{"prepare_id": body.PrepareID, "own_tone_token": offer.Output.Token})

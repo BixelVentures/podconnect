@@ -278,6 +278,26 @@ class RoomVolumeFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(self._writes(), [])
         self.assertEqual((self.native_prepares, self.native_commits), (0, 0))
 
+    async def test_volume_accepted_room_volume_is_shown_on_entity_after_poll(self):
+        # Issue #140: PodView set 10 (accepted by Speakers) but the HA entity kept
+        # Spotify's 0.34 for 35 s because Spotify does not mirror room volume.
+        from homeassistant.helpers import entity_registry
+
+        coordinator = self.entries[0].runtime_data.coordinator
+        entity_id = entity_registry.async_get(self.hass).async_get_entity_id(
+            "media_player", "podconnect", "account-alpha_spotify-one"
+        )
+        self.assertIsNotNone(entity_id)
+        before = self.hass.states.get(entity_id).attributes.get("volume_level")
+        self.assertNotEqual(before, 0.1)
+        result = await self.volume_invoke(self.volume_request(10))
+        self.assertEqual(result["outcome"], "accepted")
+        await coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        self.assertEqual(
+            self.hass.states.get(entity_id).attributes.get("volume_level"), 0.1
+        )
+
     async def test_volume_invalid_percent_and_closed_service_never_prepare(self):
         for percent in (True, 1.5, float("nan"), -1, 101):
             result = await self.volume_invoke(self.volume_request(percent))
