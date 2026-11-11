@@ -1,5 +1,17 @@
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index e2f12a5..5f18966 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -1974,6 +1974,7 @@ jsonapi_reply_primary_radio_readiness(struct httpd_request *hreq)
+   attention_json_u64(reply, "device_id", admission.device_id);
+   attention_json_u64(reply, "device_incarnation", admission.device_incarnation);
+   json_object_object_add(reply, "legacy_admission_open", json_object_new_boolean(admission.admission_open));
++  json_object_object_add(reply, "park_handoff", json_object_new_string(admission.park_handoff));
+   json_object_object_add(reply, "physical_result_verified", json_object_new_boolean(false));
+   return transport_json_reply(hreq, reply);
+ }
 diff --git a/src/outputs.c b/src/outputs.c
-index f6f03f0..9cc5151 100644
+index f6f03f0..afd1e67 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -2840,6 +2840,82 @@ primary_cold_custody_current(const char *raw, uint64_t id)
@@ -85,6 +97,32 @@ index f6f03f0..9cc5151 100644
  static int
  primary_cold_custody_consume(const char *key, const char *old, const char *next)
  {
+@@ -3586,6 +3662,13 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+       ||!outputs_process[0]||!d->incarnation||d->incarnation==UINT64_MAX)return -1;
+   memset(out,0,sizeof(*out));snprintf(out->process_id,sizeof(out->process_id),"%s",outputs_process);
+   out->device_id=id;out->device_incarnation=d->incarnation;
++  /* C is the single owner of radio custody. Settle a provably orphaned park, then
++   * publish exactly which park (if any) it still holds so Native never needs its
++   * own persisted copy to stay authoritative. */
++  radio_orphan_release(id);
++  {struct radio_handoff_slot *held=radio_handoff_find(id);
++   if(held&&radio_primary_park_command(&held->result.command))
++     snprintf(out->park_handoff,sizeof(out->park_handoff),"%s",held->result.command.handoff_id);}
+   if(!outputs_radio_absence_protocol_available()||start_startup_quarantine)return 0;
+   struct radio_handoff_slot *source=radio_handoff_find(id);
+   struct radio_absence_slot *absence=radio_absence_find(id);
+diff --git a/src/outputs.h b/src/outputs.h
+index 34d3303..97f371b 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -167,6 +167,7 @@ struct output_radio_admission {
+   char process_id[37];
+   uint64_t device_id,device_incarnation;
+   bool admission_open;
++  char park_handoff[37]; /* Handoff id of a live primary Spotify park slot, or empty. */
+ };
+ int outputs_radio_admission_get(uint64_t,struct output_radio_admission *);
+ struct output_primary_radio_start_request;
 diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
 index 7348e4c..40acddb 100644
 --- a/src/outputs_radio_handoff.inc.c
