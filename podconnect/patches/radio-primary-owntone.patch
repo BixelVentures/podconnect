@@ -579,7 +579,7 @@ index 62dd016..341ef9a 100644
    if(action<0 || json_object_object_length(body)!=(action==0?7:action==5?20:15)
        || !json_object_object_get_ex(body,"hold",&hold) || radio_sender_hold_parse(hold,&r.hold)<0
 diff --git a/src/outputs.c b/src/outputs.c
-index 82dfaca..a597977 100644
+index 82dfaca..f6f03f0 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
 @@ -31,6 +31,8 @@
@@ -1596,7 +1596,7 @@ index 82dfaca..a597977 100644
    if (!device->session)
      return 0; // Device is already stopped, nothing to do
    if (device->attention_retiring_session == device->session)
-@@ -2709,6 +3606,101 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -2709,6 +3606,106 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
    return 0;
  }
  
@@ -1684,7 +1684,12 @@ index 82dfaca..a597977 100644
 +    }
 +  writers = radio_absence_fifo_writers(source);
 +  PRIMARY_ABSENCE_DENY(writers != 1, writers == 0 ? "fifo_writer_present" : "fifo_proof_incomplete");
-+  PRIMARY_ABSENCE_DENY(outputs_airplay_primary_station_target(id, target) < 0, "idle_target_unavailable");
++  const char *target_denial = outputs_airplay_primary_station_target_denial(id, target);
++  if (target_denial)
++    {
++      DPRINTF(E_LOG, L_PLAYER, "Primary radio absent owner denied: idle_target_unavailable/%s\n", target_denial);
++      return -1;
++    }
 +  for (struct output_device *d = outputs_device_list; d; d = d->next)
 +    PRIMARY_ABSENCE_DENY(d->selected || d->session, "another_output_selected_or_live");
 +  /* A writer may change outside this owner thread; recheck the same process
@@ -1698,7 +1703,7 @@ index 82dfaca..a597977 100644
  int
  outputs_init(void)
  {
-@@ -2785,6 +3777,7 @@ outputs_init(void)
+@@ -2785,6 +3782,7 @@ outputs_init(void)
    return 0;
  }
  
@@ -1707,7 +1712,7 @@ index 82dfaca..a597977 100644
  outputs_deinit(void)
  {
 diff --git a/src/outputs.h b/src/outputs.h
-index 73b327d..31345be 100644
+index 73b327d..34d3303 100644
 --- a/src/outputs.h
 +++ b/src/outputs.h
 @@ -169,6 +169,13 @@ struct output_radio_admission {
@@ -1767,7 +1772,7 @@ index 73b327d..31345be 100644
  bool outputs_radio_handoff_source_reserved(void);
  bool outputs_radio_handoff_emission_current(uint64_t);
  uint64_t outputs_radio_handoff_generation(uint64_t);
-@@ -269,6 +309,115 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
+@@ -269,6 +309,116 @@ bool outputs_radio_handoff_stop_authorized(uint64_t);
  int outputs_airplay_radio_receiver_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_pairing_key_digest(uint64_t,char [65]);
  int outputs_airplay_radio_controller_id(char [17]);
@@ -1830,6 +1835,7 @@ index 73b327d..31345be 100644
 +  struct output_primary_radio_custody custody;
 +};
 +int outputs_airplay_primary_station_target(uint64_t, struct output_primary_radio_start_request *);
++const char *outputs_airplay_primary_station_target_denial(uint64_t, struct output_primary_radio_start_request *);
 +int outputs_airplay_primary_station_preflight_target(uint64_t, struct output_primary_radio_start_request *);
 +int outputs_airplay_primary_station_preflight(const struct output_primary_radio_start_request *, struct output_primary_radio_start_result *);
 +int outputs_airplay_primary_station_replace_target(uint64_t, const struct output_primary_radio_custody *,
@@ -1883,7 +1889,7 @@ index 73b327d..31345be 100644
  void outputs_radio_handoff_teardown(uint64_t,uint64_t,uint64_t,const void *,int,int);
  void outputs_radio_handoff_drained(uint64_t,uint64_t,uint64_t,const void *);
  
-@@ -329,7 +478,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
+@@ -329,7 +479,7 @@ int outputs_start_open(const struct output_start_request *,struct output_start_r
  int outputs_start_complete(const struct output_start_request *,struct output_start_result *);
  int outputs_start_cancel(const char *,const char *,struct output_start_result *);
  int outputs_start_result_get(uint64_t,const char *,struct output_start_result *);
@@ -1892,7 +1898,7 @@ index 73b327d..31345be 100644
  struct output_retirement_request {
    uint64_t device_id,writer_source_epoch,writer_fd,pipe_device,pipe_inode,input_epoch;
    char completed_token[33],retirement_token[33],native_reservation_id[33],native_incarnation[33];
-@@ -353,7 +502,10 @@ bool outputs_start_move_source_transition_current(void);
+@@ -353,7 +503,10 @@ bool outputs_start_move_source_transition_current(void);
  bool outputs_start_move_eof_transition_current(void);
  bool outputs_streaming_exclusive_available(void);
  void outputs_airplay_start_retire_all(void);
@@ -1903,7 +1909,7 @@ index 73b327d..31345be 100644
  bool outputs_start_emission_current(uint64_t,uint64_t,uint64_t,const void *);
  bool outputs_start_bound_owner_current(const struct output_native_owner *,const struct output_transport_identity *,bool);
  bool outputs_start_gate_closed(void);
-@@ -363,6 +515,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
+@@ -363,6 +516,7 @@ bool outputs_start_retired_normal_autostart_ready(const char *path);
  bool outputs_start_retired_stage_reader(void);
  void
  outputs_transport_release_recover_pending(void);
@@ -1912,7 +1918,7 @@ index 73b327d..31345be 100644
  bool outputs_start_retired_normal_admit(uint32_t,const char *);
  bool outputs_start_source_current(const char *,const char **,struct timespec *);
 diff --git a/src/outputs/airplay.c b/src/outputs/airplay.c
-index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..97dc319deef645c3ac55a75112daa9be33a9f5a3 100644
+index 8a97210..2972b0a 100644
 --- a/src/outputs/airplay.c
 +++ b/src/outputs/airplay.c
 @@ -21,6 +21,8 @@
@@ -2612,7 +2618,7 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..97dc319deef645c3ac55a75112daa9be
  	continue;
  
        // Start sending progress to keep ATV's alive
-@@ -4987,135 +5259,1415 @@ airplay_write(struct output_buffer *obuf)
+@@ -4987,135 +5259,1433 @@ airplay_write(struct output_buffer *obuf)
      }
  }
  
@@ -3043,27 +3049,45 @@ index 8a97210e80d18e1a9c71bd2f08d9c249cba2bd48..97dc319deef645c3ac55a75112daa9be
 +    operation->last_fresh_rtp = sent;
 +}
 +
-+int
-+outputs_airplay_primary_station_target(uint64_t id, struct output_primary_radio_start_request *out)
++const char *
++outputs_airplay_primary_station_target_denial(uint64_t id, struct output_primary_radio_start_request *out)
 +{
 +  extern struct output_definition output_airplay;
 +  struct output_device *device = outputs_device_get(id);
 +  struct output_attention_state state;
-+  if (!out || !device || device->type != OUTPUT_TYPE_AIRPLAY || !device->advertised
-+      || device->selected || device->session || device->busy || device->prevent_playback
-+      || device->attention_retiring_session || device->attention_restart_pending
-+      || !device->extra_device_info || !((struct airplay_extra *)device->extra_device_info)->supports_encryption
-+      || output_airplay.disabled || !outputs_primary_radio_transport_available(id) || outputs_start_gate_closed()
-+      || outputs_radio_handoff_blocked(id) || outputs_radio_sender_role()
-+      || outputs_attention_state_get(id, &state) < 0 || state.lease || state.restoring || !state.recovery_idle
-+      || !outputs_primary_radio_custody_available(id))
-+    return -1;
++  if (!out || !device || device->type != OUTPUT_TYPE_AIRPLAY)
++    return "target_missing_or_wrong_type";
++  if (!device->advertised)
++    return "target_unadvertised";
++  if (device->selected || device->session || device->busy || device->prevent_playback
++      || device->attention_retiring_session || device->attention_restart_pending)
++    return "target_in_use";
++  if (!device->extra_device_info || !((struct airplay_extra *)device->extra_device_info)->supports_encryption)
++    return "target_encryption";
++  if (output_airplay.disabled || !outputs_primary_radio_transport_available(id))
++    return "target_transport";
++  if (outputs_start_gate_closed())
++    return "start_gate_closed";
++  if (outputs_radio_handoff_blocked(id))
++    return "radio_target_blocked";
++  if (outputs_radio_sender_role())
++    return "radio_sender_role";
++  if (outputs_attention_state_get(id, &state) < 0 || state.lease || state.restoring || !state.recovery_idle)
++    return "target_attention";
++  if (!outputs_primary_radio_custody_available(id))
++    return "radio_custody_unavailable";
 +  *out = (struct output_primary_radio_start_request) {
 +    .device_id = id, .incarnation = state.device_incarnation,
 +    .epoch = state.session_epoch, .route = state.route_revision,
 +  };
 +  memcpy(out->process, state.process, sizeof(out->process));
-+  return 0;
++  return NULL;
++}
++
++int
++outputs_airplay_primary_station_target(uint64_t id, struct output_primary_radio_start_request *out)
++{
++  return outputs_airplay_primary_station_target_denial(id, out) ? -1 : 0;
 +}
 +
 +static bool
@@ -5669,7 +5693,7 @@ index 28b2719..f6aaa11 100644
        || !json_object_is_type(manual, json_type_object)
        || strcmp(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), start_journal.payload))
 diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
-index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a290e2f8f26 100644
+index 17dd2b8..cd00cda 100644
 --- a/src/outputs_start.inc.c
 +++ b/src/outputs_start.inc.c
 @@ -22,6 +22,7 @@ struct start_slot {
@@ -5789,22 +5813,47 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
    if (start_startup_quarantine)
      return "startup_quarantine";
    if (!(start_active && !start_active->cancelled
-@@ -559,8 +609,14 @@ static bool start_available_reason(const struct output_start_request *r, bool di
-   if(outputs_radio_handoff_source_reserved() && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
-   if(outputs_radio_handoff_blocked(r->device_id) && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_absence_start_admissible(r) && !outputs_radio_move_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
+@@ -556,11 +606,28 @@ static const char *start_journal_denial(const struct output_start_request *r)
+ }
+ static bool start_available_reason(const struct output_start_request *r, bool diagnostic)
+ {
+-  if(outputs_radio_handoff_source_reserved() && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
+-  if(outputs_radio_handoff_blocked(r->device_id) && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r) && !outputs_radio_absence_start_admissible(r) && !outputs_radio_move_admissible(r) && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))return false;
++  /* Each predicate retains original short-circuit order and is evaluated once. */
++#define START_CHECK(test, reason) do { if (test) { if (diagnostic) DPRINTF(E_LOG,L_PLAYER,"START state rejected: " reason "\n"); return false; } } while (0)
++  START_CHECK(outputs_radio_handoff_source_reserved()
++      && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r)
++      && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r),
++      "radio_source_reserved");
++  START_CHECK(outputs_radio_handoff_blocked(r->device_id)
++      && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r)
++      && !outputs_radio_absence_start_admissible(r) && !outputs_radio_move_admissible(r)
++      && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r),
++      "radio_target_blocked");
    struct output_device *d=outputs_device_get(r->device_id),*scan; char digest[65];
-+  if (!outputs_primary_radio_custody_available(r->device_id))
-+    return false; /* An unproved radio drain never opens a START reservation. */
++  /* An unproved radio drain never opens a START reservation. */
++  START_CHECK(!outputs_primary_radio_custody_available(r->device_id), "radio_custody_unavailable");
    struct output_device *old=NULL;struct output_transport_identity old_identity;
    (void)outputs_transport_busy();
 +  for (scan = outputs_device_list; scan; scan = scan->next)
-+    if (scan->type == OUTPUT_TYPE_AIRPLAY && outputs_airplay_primary_radio_owns(scan)
-+        && !outputs_airplay_primary_radio_independent(scan))
-+      return false; /* Do not displace a pending or revoking radio connection. */
++    {
++      /* Do not displace a pending or revoking radio connection. */
++      START_CHECK(scan->type == OUTPUT_TYPE_AIRPLAY && outputs_airplay_primary_radio_owns(scan)
++          && !outputs_airplay_primary_radio_independent(scan), "radio_receiver_not_current");
++    }
    if(r->move_existing_session){
      if(!d || !d->advertised || d->type!=OUTPUT_TYPE_AIRPLAY || d->selected || d->session
          || outputs[d->type]->disabled || !outputs_streaming_exclusive_available()
-@@ -623,7 +679,7 @@ start_clean_absent_read(const struct output_start_request *r)
+@@ -576,8 +643,6 @@ static bool start_available_reason(const struct output_start_request *r, bool di
+       if(scan->selected && scan!=old)return false;
+     return true;
+   }
+-  /* Each predicate retains original short-circuit order and is evaluated once. */
+-#define START_CHECK(test, reason) do { if (test) { if (diagnostic) DPRINTF(E_LOG,L_PLAYER,"START state rejected: " reason "\n"); return false; } } while (0)
+   START_CHECK(!d,"target_missing");
+   START_CHECK(!outputs_process[0],"output_process");
+   START_CHECK(!d->advertised,"target_unadvertised");
+@@ -623,7 +688,7 @@ start_clean_absent_read(const struct output_start_request *r)
  {
    struct output_device *scan;
    struct stat before, after;
@@ -5813,7 +5862,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
    /* A detached, durably completed manual release is quiet while its autostart
     * gate remains closed. This read neither reopens it nor grants START. */
    if (!absent && !start_active && !start_scope && !outputs_start_source_owned() && outputs_start_gate_closed()
-@@ -688,17 +744,25 @@ int outputs_start_state_get(const struct output_start_request *r,struct output_s
+@@ -688,17 +753,25 @@ int outputs_start_state_get(const struct output_start_request *r,struct output_s
      }
    out->ready=start_available_reason(r,true) || outputs_radio_absence_current_start_observable(r) || outputs_radio_start_observable(r) || outputs_radio_absence_start_observable(r) || outputs_radio_move_observable(r) || outputs_radio_parked_bridge_start_observable(r);out->busy=!out->ready;return 0;
  }
@@ -5841,7 +5890,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
  static void start_fail(struct start_slot *s)
  {
    if (!s || s!=start_active || s->cancelled || s->result.phase==OUTPUT_START_OPENED || s->result.phase==OUTPUT_START_COMPLETED) return;
-@@ -801,11 +865,15 @@ int outputs_start_commit(const struct output_start_request *r,struct output_star
+@@ -801,11 +874,15 @@ int outputs_start_commit(const struct output_start_request *r,struct output_star
      s->cancelled=true;s->result.phase=OUTPUT_START_UNKNOWN;start_active=s;start_gate_set(true);start_observe(s,out);return 0;
    }
    if(re_start_pre_effect(s,&evolution)<0){s->cancelled=true;s->result.phase=OUTPUT_START_UNKNOWN;start_observe(s,out);return 0;}
@@ -5858,7 +5907,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
    s->deadline_ev=evtimer_new(evbase_player,start_expire,s);
    unsigned remaining=transport_remaining(&s->deadline);ttl.tv_sec=remaining/1000;ttl.tv_usec=(remaining%1000)*1000;
    if(!s->deadline_ev || evtimer_add(s->deadline_ev,&ttl)<0)start_fail(s);
-@@ -885,8 +953,8 @@ int outputs_start_barrier_done(const char *token,uint64_t input_epoch)
+@@ -885,8 +962,8 @@ int outputs_start_barrier_done(const char *token,uint64_t input_epoch)
          || old->attention_revision!=s->result.old_attention_revision || !old->selected
          || !outputs[old->type]->device_start_retire){start_fail(s);return -1;}
      outputs[old->type]->device_start_retire(old);
@@ -5869,7 +5918,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
    start_scope=s;
    for(d=outputs_device_list;d;d=d->next)outputs_device_deselect(d);
    d=outputs_device_get(s->result.command.device_id);
-@@ -950,7 +1018,7 @@ int outputs_start_open(const struct output_start_request *r,struct output_start_
+@@ -950,7 +1027,7 @@ int outputs_start_open(const struct output_start_request *r,struct output_start_
        || r->move_existing_session!=s->result.command.move_existing_session
        || strcmp(r->native_reservation_id,s->result.command.native_reservation_id) || r->writer_source_epoch!=s->result.writer_source_epoch
        || !native_owner_equal(&r->committed_native_owner,&s->result.command.intended_native_owner)
@@ -5878,7 +5927,7 @@ index 17dd2b894530e5c6abdf8df41086c0be3682ff39..6467230bb88a83a1c8a6ecf8657e7a29
        || !transport_identity_equal(&actual,&s->result.route_identity) || outputs_start_metadata_generation()==UINT64_MAX)return -1;
    d=outputs_device_get(s->result.command.device_id);
    if(d->base_revision!=s->target_base_revision || d->attention_revision!=s->target_attention_revision)return -1;
-@@ -1003,7 +1071,7 @@ int outputs_start_complete(const struct output_start_request *r,struct output_st
+@@ -1003,7 +1080,7 @@ int outputs_start_complete(const struct output_start_request *r,struct output_st
        || start_journal_fault || strcmp(start_journal.token,r->token) || strcmp(start_journal.c_process,outputs_process)
        || strcmp(r->native_reservation_id,s->result.command.native_reservation_id) || r->writer_source_epoch!=s->result.writer_source_epoch
        || !native_owner_equal(&r->committed_native_owner,&s->result.command.committed_native_owner)
@@ -9090,10 +9139,10 @@ index 40ebe09716eb4c4b19b08356268f8447f913088c..7b60d164f3bd26e138186b6856d5b553
    if(worker_ready)worker_deinit();
    if(writer>=0)close(writer);
 diff --git a/tests/start_gate_owner.inc.c b/tests/start_gate_owner.inc.c
-index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..87ab0da84fe9bee19f8dc44666aed3a91c5c8e6c 100644
+index 0f42245..c85bc31 100644
 --- a/tests/start_gate_owner.inc.c
 +++ b/tests/start_gate_owner.inc.c
-@@ -338,10 +338,444 @@ static void start_gate_process_successor(const char *path,const struct output_na
+@@ -338,10 +338,450 @@ static void start_gate_process_successor(const char *path,const struct output_na
    free(changed.payload);free(saved.payload);
    sqlite3_close(hdl);hdl=NULL;
  }
@@ -9185,6 +9234,12 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..87ab0da84fe9bee19f8dc44666aed3a9
 +    return -1;
 +  *out = (struct output_primary_radio_start_request) { .device_id = id, .incarnation = device->incarnation };
 +  return 0;
++}
++
++const char *
++outputs_airplay_primary_station_target_denial(uint64_t id, struct output_primary_radio_start_request *out)
++{
++  return outputs_airplay_primary_station_target(id, out) < 0 ? "fixture_target_unavailable" : NULL;
 +}
 +
 +static void
@@ -9539,7 +9594,7 @@ index 0f4224568cbc50c83c77f896fa2ddcc93afe1870..87ab0da84fe9bee19f8dc44666aed3a9
    cfg_opt_t options[]={CFG_SEC("library",library,0),CFG_END()};
    assert(fd>=0);close(fd);assert(unlink(path)==0 && mkfifo(path,0600)==0);
    assert(db_start_guard_schema_init()==0);start_journal_startup();assert(!start_startup_quarantine && !outputs_start_gate_closed());
-@@ -378,7 +812,112 @@ static void exact_start_durable_gate(void)
+@@ -378,7 +818,112 @@ static void exact_start_durable_gate(void)
      successor=fork();assert(successor>=0);if(!successor){start_gate_process_successor(path,&process,&fresh,false,false,false);_exit(0);}
      assert(waitpid(successor,&status,0)==successor && WIFEXITED(status) && WEXITSTATUS(status)==0);
    }
