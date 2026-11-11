@@ -119,11 +119,13 @@ func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 	request, parseErr := decodeRoomMoveRequest(raw)
 	if err != nil || len(raw) > 8192 || parseErr != nil {
+		roomMoveLog("prepare", "rejected", "arguments")
 		http.Error(w, "arguments", 400)
 		return
 	}
 	binding, ok := roomContentBindingNow(request.Scope)
 	if !ok {
+		roomMoveLog("prepare", "rejected", "destination_unavailable")
 		http.Error(w, "destination unavailable", 409)
 		return
 	}
@@ -138,6 +140,7 @@ func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
 		result := old.Result
 		roomMoveStore.Unlock()
 		if !matching {
+			roomMoveLog("prepare", "rejected", "operation_conflict")
 			http.Error(w, "operation conflict", 409)
 			return
 		}
@@ -156,6 +159,7 @@ func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(roomMoveStore.Records) >= 128 {
 		roomMoveStore.Unlock()
+		roomMoveLog("prepare", "rejected", "busy")
 		http.Error(w, "busy", 409)
 		return
 	}
@@ -168,15 +172,17 @@ func roomMovePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	roomMoveStore.Lock()
 	record.Preparing = false
 	record.InFlight--
+	cause := "native"
 	if terminalRoomMove(record.Result.State) {
-		result = record.Result
-	} else if rpcErr != nil || resultErr != nil || record.Cancelled || !roomContentBindingCurrent(binding) {
+		result, cause = record.Result, "already_terminal"
+	} else if cause = roomMoveUnknownCause(rpcErr, resultErr, record.Cancelled, roomContentBindingCurrent(binding)); cause != "" {
 		record.Result = moveUnknown(record)
 	} else {
-		record.Result = result
+		record.Result, cause = result, "native"
 	}
 	result = record.Result
 	roomMoveStore.Unlock()
+	roomMoveLog("prepare", result.State, cause)
 	writeRoomMoveResult(w, "prepare", result)
 }
 
@@ -216,6 +222,7 @@ func roomMoveOperation(w http.ResponseWriter, r *http.Request, endpoint, offer, 
 	record := roomMoveStore.Records[offer]
 	if record == nil || record.Request.Offer.Binding != binding {
 		roomMoveStore.Unlock()
+		roomMoveLog(endpoint, "rejected", "unknown_operation")
 		http.Error(w, "unknown operation", 409)
 		return
 	}
@@ -226,8 +233,9 @@ func roomMoveOperation(w http.ResponseWriter, r *http.Request, endpoint, offer, 
 		return
 	}
 	if endpoint == "commit" {
-		if record.Preparing || record.Dispatched || record.Cancelled || record.Result.State != "staged" || !roomContentBindingCurrent(record.Binding) {
+		if reason := roomMoveCommitBlocked(record); reason != "" {
 			roomMoveStore.Unlock()
+			roomMoveLog(endpoint, "rejected", reason)
 			http.Error(w, "not staged/current", 409)
 			return
 		}
@@ -272,14 +280,54 @@ func roomMoveOperation(w http.ResponseWriter, r *http.Request, endpoint, offer, 
 	}
 	// A terminal unknown never becomes a late success, even if another pending
 	// observation/cancel completes after it. Native independently retires effects.
+	cause := "already_terminal"
 	if !terminalRoomMove(record.Result.State) {
-		if rpcErr != nil || resultErr != nil || !roomContentBindingCurrent(record.Binding) || record.Cancelled && result.State == "complete" {
+		if cause = roomMoveUnknownCause(rpcErr, resultErr, record.Cancelled && result.State == "complete", roomContentBindingCurrent(record.Binding)); cause != "" {
 			record.Result = moveUnknown(record)
 		} else {
-			record.Result = result
+			record.Result, cause = result, "native"
 		}
 	}
 	result = record.Result
 	roomMoveStore.Unlock()
+	if endpoint != "result" || terminalRoomMove(result.State) {
+		roomMoveLog(endpoint, result.State, cause)
+	}
 	writeRoomMoveResult(w, endpoint, result)
+}
+
+// roomMoveLog states every move outcome and its cause in one bounded line (#140):
+// finite endpoint/state/cause names only, never room, offer or account identifiers.
+func roomMoveLog(endpoint, state, cause string) {
+	log.Printf("room_move event=%s state=%s cause=%s", endpoint, state, cause)
+}
+
+func roomMoveUnknownCause(rpcErr, resultErr error, cancelled, bindingCurrent bool) string {
+	switch {
+	case rpcErr != nil:
+		return "native_rpc_failed"
+	case resultErr != nil:
+		return "native_result_invalid"
+	case cancelled:
+		return "cancelled"
+	case !bindingCurrent:
+		return "destination_binding_changed"
+	}
+	return ""
+}
+
+func roomMoveCommitBlocked(record *roomMoveRecord) string {
+	switch {
+	case record.Preparing:
+		return "still_preparing"
+	case record.Dispatched:
+		return "already_dispatched"
+	case record.Cancelled:
+		return "cancelled"
+	case record.Result.State != "staged":
+		return "not_staged_" + record.Result.State
+	case !roomContentBindingCurrent(record.Binding):
+		return "destination_binding_changed"
+	}
+	return ""
 }

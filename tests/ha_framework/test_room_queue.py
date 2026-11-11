@@ -430,6 +430,25 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(len(self.queue_posts), 2)
         self.assertEqual(self.entries[0].runtime_data.commands.command_sequence, 1)
 
+    async def test_queue_prepare_rejection_names_first_failed_check(self):
+        # Issue #140: PodVoice only sees a not-ok preparation; Control must log why.
+        with self.assertLogs("custom_components.podconnect", "WARNING") as logs:
+            result = await self.queue_call("prepare_room_queue", self.queue_request())
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "room_queue_prepare event=rejected reason=observation_unknown",
+            "\n".join(logs.output),
+        )
+        await self.queue_read()
+        self.entries[0].runtime_data.coordinator.owner_epoch = "replaced"
+        with self.assertLogs("custom_components.podconnect", "WARNING") as logs:
+            result = await self.queue_call("prepare_room_queue", self.queue_request())
+        self.assertFalse(result["ok"])
+        joined = "\n".join(logs.output)
+        self.assertIn("room_queue_prepare event=rejected reason=", joined)
+        self.assertNotIn("session-a", joined)
+        self.assertNotIn("account-alpha", joined)
+
     async def test_queue_cancel_stage_no_effect_no_ledger_and_no_restage(self):
         self.queue_hold = True
         await self.queue_read()

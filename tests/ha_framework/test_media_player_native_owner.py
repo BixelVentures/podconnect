@@ -1424,8 +1424,17 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         await self.data.coordinator.async_refresh()
         self.local_stop_fixture, self.local_stops = True, []
         self.output_selected = ["123", "456"]
-        await self.hass.services.async_call(
-            "media_player", "media_pause", {"entity_id": self.entity_id}, blocking=True
+        with self.assertLogs("custom_components.podconnect", "WARNING") as logs:
+            await self.hass.services.async_call(
+                "media_player",
+                "media_pause",
+                {"entity_id": self.entity_id},
+                blocking=True,
+            )
+        self.assertIn(
+            "native_command event=route_unavailable action=pause "
+            "output=unavailable reason=ambiguous_output",
+            "\n".join(logs.output),
         )
         self.assertEqual(self.local_stops, [("POST", {"room": "r0"})])
         self.assertEqual(self._writes(), [])
@@ -1436,8 +1445,15 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         await self.data.coordinator.async_refresh()
         self.local_stop_fixture, self.local_stops = True, []
         self.output_selected = ["123", "456"]
-        with self.assertRaises(HomeAssistantError):
+        with (
+            self.assertLogs("custom_components.podconnect", "WARNING") as logs,
+            self.assertRaises(HomeAssistantError),
+        ):
             await self.native_call("media_play")
+        self.assertIn(
+            "native_command event=rejected action=resume kind=route_unavailable",
+            "\n".join(logs.output),
+        )
         self.assertEqual(self.local_stops, [])
         self.assertEqual(self._writes(), [])
 

@@ -12,7 +12,7 @@ import voluptuous as vol
 from homeassistant.core import SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import DOMAIN
+from .const import DOMAIN, LOGGER
 from .observations import current
 from .speakers import SpeakersError
 from .targets import spotify_devices
@@ -29,6 +29,27 @@ _COMMAND_ACTIONS = (
     "play_context",
     "play_queue_occurrence",
 )
+
+
+def _log_not_accepted(action, receipt, sent):
+    """Finite action/outcome/kind only: say why, never what (#140)."""
+    kind = receipt.get("error_kind")
+    LOGGER.warning(
+        "command event=not_accepted action=%s outcome=%s kind=%s sent=%s",
+        action if action in _COMMAND_ACTIONS else "other",
+        receipt.get("outcome")
+        if receipt.get("outcome") in ("rejected", "unknown")
+        else "other",
+        kind
+        if isinstance(kind, str)
+        and len(kind) <= 64
+        and kind.replace("_", "").isalnum()
+        and kind.isascii()
+        else "other",
+        str(bool(sent)).lower(),
+    )
+
+
 _TRACK_URI = re.compile(r"^spotify:track:[A-Za-z0-9]{22}$")
 _DISALLOWED = {
     "pause": "pausing",
@@ -730,8 +751,13 @@ class PlaybackCommands:
                 possible_effect=False,
             )
 
+        logged = []
+
         def rejected(kind):
-            return {**receipt, "error_kind": kind}
+            value = {**receipt, "error_kind": kind}
+            _log_not_accepted(action, value, False)
+            logged.append(True)
+            return value
 
         if action in {"seek", "shuffle", "repeat"} and room_transport is None:
             return rejected("native_room_required")
@@ -1085,6 +1111,8 @@ class PlaybackCommands:
                 )
             receipt["observe_after_poll_sequence"] = self.poll_floor
             self.receipts[command_sequence] = (fingerprint, receipt, operation_id)
+            if receipt.get("outcome") != "accepted" and not logged:
+                _log_not_accepted(action, receipt, possible_send)
             self.busy = False
             if possible_send and self._refresh_owner_current(hass, entry_id):
                 await self.binding[1].async_refresh_after_command()

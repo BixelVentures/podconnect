@@ -44,6 +44,30 @@ try:
 except ImportError:  # pragma: no cover - depends on HA core version
     _HAS_SEARCH = False
 
+_LOGGER = LOGGER
+_NATIVE_FAILURES = {
+    "PodConnect command owner changed": "owner_changed",
+    "Native command owner unavailable": "owner_unavailable",
+    "Native playback observation unavailable": "observation_unavailable",
+    "Native route unavailable": "route_unavailable",
+    "Native route changed": "route_changed",
+    "Native command admission unavailable": "admission_unavailable",
+    "Native command rejected or outcome unknown": "rejected_or_unknown",
+}
+_DIAGNOSTIC_KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _diagnostic_kind(value):
+    """Only finite snake_case kinds enter logs; never payloads or identifiers."""
+    return (
+        value
+        if isinstance(value, str) and _DIAGNOSTIC_KIND.fullmatch(value)
+        else "none"
+        if value is None
+        else "other"
+    )
+
+
 SUPPORTED = (
     MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
@@ -419,6 +443,15 @@ class PodConnectMediaPlayer(
                 or not isinstance(binding, dict)
                 or binding.get("target_id") != self._device_id
             ):
+                _LOGGER.warning(
+                    "native_command event=route_unavailable action=%s output=%s "
+                    "reason=%s",
+                    action,
+                    output.get("status")
+                    if output.get("status") in ("observed", "unavailable")
+                    else "invalid",
+                    _diagnostic_kind(output.get("reason")),
+                )
                 if action == "pause":
                     # Pause must always be possible on the Native engine, also
                     # when no exact room route is observed (e.g. after a failed
@@ -482,7 +515,21 @@ class PodConnectMediaPlayer(
                 raise HomeAssistantError("Native command rejected or outcome unknown")
             return True
         except (CommandRejected, SpeakersError) as err:
+            _LOGGER.warning(
+                "native_command event=rejected action=%s kind=%s",
+                action,
+                _diagnostic_kind(str(err))
+                if isinstance(err, CommandRejected)
+                else "speakers_error",
+            )
             raise HomeAssistantError("Native command unavailable") from err
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "native_command event=rejected action=%s kind=%s",
+                action,
+                _NATIVE_FAILURES.get(str(err), "other"),
+            )
+            raise
 
     async def async_media_play(self) -> None:
         if await self._native_command("resume"):

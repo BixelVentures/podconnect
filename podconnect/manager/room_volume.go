@@ -141,18 +141,18 @@ func currentRoomVolumeEffect(effect *receiverRoomEffect, s roomTransportScope, c
 }
 func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_volume", "method", "method", 405)
 		return
 	}
 	q := r.URL.Query()
 	s := roomTransportScope{q.Get("target_id"), q.Get("room_id"), q.Get("homepod_id"), q.Get("account_user_id")}
 	if len(q) != 4 || !validTransportScope(s) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_volume", "arguments", "arguments", 400)
 		return
 	}
 	for _, v := range q {
 		if len(v) != 1 {
-			http.Error(w, "arguments", 400)
+			roomReject(w, "room_volume", "arguments", "arguments", 400)
 			return
 		}
 	}
@@ -160,7 +160,7 @@ func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	claim, n, o, err := readRoomVolume(ctx, s)
 	if err != nil {
-		http.Error(w, "volume unavailable", 409)
+		roomReject(w, "room_volume", "volume_unavailable", "volume unavailable", 409)
 		return
 	}
 	actions := []string{}
@@ -171,12 +171,12 @@ func roomVolumeStateHandler(w http.ResponseWriter, r *http.Request) {
 }
 func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_volume", "method", "method", 405)
 		return
 	}
 	var b roomVolumeRequest
 	if decodeTransportBody(r, &b) != nil || !validRoomVolumeRequest(b) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_volume", "arguments", "arguments", 400)
 		return
 	}
 	roomVolumeStore.Lock()
@@ -192,7 +192,7 @@ func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if roomVolumeStore.Preparing || len(roomVolumeStore.Records) >= 128 {
 		roomVolumeStore.Unlock()
-		http.Error(w, "busy", 409)
+		roomReject(w, "room_volume", "busy", "busy", 409)
 		return
 	}
 	roomVolumeStore.Preparing = true
@@ -202,7 +202,7 @@ func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	claim, n, o, err := readRoomVolume(ctx, b.Scope)
 	if err != nil || n.Identity != b.Native || o.Identity != b.Route || o.Volume != b.Volume || o.Busy || len(n.Actions) != 1 || len(o.Actions) != 1 {
-		http.Error(w, "stale volume", 409)
+		roomReject(w, "room_volume", "stale_volume", "stale volume", 409)
 		return
 	}
 	encoded, _ := json.Marshal(b)
@@ -210,19 +210,19 @@ func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 	raw, err := roomTransportRPC(ctx, claim.RT.room.Librespot, http.MethodPost, "/player/room_volume/bound-prepare", encoded)
 	var p nativeRoomVolumePrepare
 	if err != nil || decodeQueueManagerJSON(raw, &p) != nil || p.Schema != "podconnect.native_room_volume_prepare.v2" || !queueObservationPattern.MatchString(p.ID) || p.Expires < 1 || p.Expires > 5000 || p.Physical || p.Scope != b.Scope || p.Native != b.Native || p.Route != b.Route || p.Volume != b.Volume || p.Action != b.Action || p.Percent != b.Percent || !transportClaimCurrent(claim, b.Scope) {
-		http.Error(w, "native volume preparation unavailable", 409)
+		roomReject(w, "room_volume", "native_volume_preparation_unavailable", "native volume preparation unavailable", 409)
 		return
 	}
 	expires := started.Add(time.Duration(p.Expires) * time.Millisecond)
 	remaining := int(time.Until(expires).Milliseconds())
 	if remaining <= 0 {
-		http.Error(w, "expired volume", 409)
+		roomReject(w, "room_volume", "expired_volume", "expired volume", 409)
 		return
 	}
 	roomVolumeStore.Lock()
 	if _, exists := roomVolumeStore.Records[p.ID]; exists {
 		roomVolumeStore.Unlock()
-		http.Error(w, "duplicate preparation", 409)
+		roomReject(w, "room_volume", "duplicate_preparation", "duplicate preparation", 409)
 		return
 	}
 	roomVolumeStore.Records[p.ID] = &roomVolumeRecord{Request: b, Claim: claim, Expires: expires}
@@ -231,14 +231,14 @@ func roomVolumePrepareHandler(w http.ResponseWriter, r *http.Request) {
 }
 func decodeRoomVolumeID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_volume", "method", "method", 405)
 		return "", false
 	}
 	var b struct {
 		ID string `json:"prepare_id"`
 	}
 	if decodeTransportBody(r, &b) != nil || !queueObservationPattern.MatchString(b.ID) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_volume", "arguments", "arguments", 400)
 		return "", false
 	}
 	return b.ID, true
@@ -281,7 +281,7 @@ func roomVolumeCommitHandler(w http.ResponseWriter, r *http.Request) {
 	record := roomVolumeStore.Records[id]
 	if record == nil || record.Dispatched || record.Cancelled {
 		roomVolumeStore.Unlock()
-		http.Error(w, "consumed or missing volume", 409)
+		roomReject(w, "room_volume", "consumed_or_missing_volume", "consumed or missing volume", 409)
 		return
 	}
 	// Consume before every await. Cancellation is allowed to race this request,
@@ -330,7 +330,7 @@ func roomVolumeCancelHandler(w http.ResponseWriter, r *http.Request) {
 	record := roomVolumeStore.Records[id]
 	if record == nil {
 		roomVolumeStore.Unlock()
-		http.Error(w, "missing volume", 404)
+		roomReject(w, "room_volume", "missing_volume", "missing volume", 404)
 		return
 	}
 	record.Cancelled = true
@@ -358,20 +358,20 @@ func roomVolumeCancelHandler(w http.ResponseWriter, r *http.Request) {
 }
 func roomVolumeResultHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method", 405)
+		roomReject(w, "room_volume", "method", "method", 405)
 		return
 	}
 	q := r.URL.Query()
 	id := q.Get("prepare_id")
 	if len(q) != 1 || len(q["prepare_id"]) != 1 || !queueObservationPattern.MatchString(id) {
-		http.Error(w, "arguments", 400)
+		roomReject(w, "room_volume", "arguments", "arguments", 400)
 		return
 	}
 	roomVolumeStore.Lock()
 	record := roomVolumeStore.Records[id]
 	if record == nil {
 		roomVolumeStore.Unlock()
-		http.Error(w, "missing volume", 404)
+		roomReject(w, "room_volume", "missing_volume", "missing volume", 404)
 		return
 	}
 	if record.Result != nil {
