@@ -11,10 +11,10 @@ index e2f12a5..5f18966 100644
    return transport_json_reply(hreq, reply);
  }
 diff --git a/src/outputs.c b/src/outputs.c
-index f6f03f0..afd1e67 100644
+index f6f03f0..cf98130 100644
 --- a/src/outputs.c
 +++ b/src/outputs.c
-@@ -2840,6 +2840,82 @@ primary_cold_custody_current(const char *raw, uint64_t id)
+@@ -2840,6 +2840,94 @@ primary_cold_custody_current(const char *raw, uint64_t id)
    return current;
  }
  
@@ -33,29 +33,34 @@ index f6f03f0..afd1e67 100644
 +  char key[64], *raw = NULL, *again = NULL;
 +  struct output_primary_radio_custody custody;
 +  const char *reason = NULL;
++  static uint64_t kept_id;
++  static const char *kept_stage;
 +
 +  if (!slot || !slot->used || !d || !radio_primary_park_command(&slot->result.command))
 +    return;
-+#define ORPHAN_KEEP(test, stage) do { if (test) { DPRINTF(E_LOG, L_PLAYER, "Radio orphan kept: output=%" PRIu64 " stage=%s\n", id, stage); return; } } while (0)
++  /* Cheap, read-only checks first: this runs on every readiness poll and START read,
++   * so a healthy station journey must never pay for a /proc scan. Log a refusal once. */
++#define ORPHAN_KEEP(test, stage) do { if (test) { if (kept_id != id || kept_stage != (stage)) { kept_id = id; kept_stage = (stage); DPRINTF(E_LOG, L_PLAYER, "Radio orphan kept: output=%" PRIu64 " stage=%s\n", id, stage); } return; } } while (0)
 +  ORPHAN_KEEP(slot->quarantined, "quarantined_record");
 +  ORPHAN_KEEP(radio_handoff_fault || radio_absence_fault || radio_parked_absence_fault, "fault");
 +  ORPHAN_KEEP(slot->result.phase != OUTPUT_RADIO_SUSPENDED && slot->result.phase != OUTPUT_RADIO_UNKNOWN, "phase");
 +  ORPHAN_KEEP(d->session, "live_session");
 +  ORPHAN_KEEP(outputs_start_busy() || start_journal_fault || start_startup_quarantine, "start_busy_or_fault");
-+  const struct output_queue_writer *writer = &slot->result.command.writer;
-+  ORPHAN_KEEP(start_all_writers_closed_scan(&writer->native_process, writer->pipe_device, writer->pipe_inode, true) != 1, "spotify_writer_open");
-+#undef ORPHAN_KEEP
 +  primary_radio_custody_key(key, id);
 +  int found = db_radio_handoff_load_key(key, &raw);
-+  if (found < 0)
++  /* No custody row is a legitimate passive park (cleanly stopped radio): never an orphan. */
++  if (found <= 0)
 +    return;
-+  if (found == 0)
-+    reason = "no_custody";
-+  else if (raw && primary_radio_custody_decode(raw, id, &custody)
++  if (raw && primary_radio_custody_decode(raw, id, &custody)
 +      && !custody.stop_action[0] && !custody.teardown_cseq && strcmp(custody.process, outputs_process))
 +    reason = "owner_process_gone";
++  /* A same-process local isolation (receiver control lost) is settled by the existing
++   * explicit Native return/fresh-action protocol; never released behind its back. */
 +  else if (raw && primary_radio_custody_decode_isolation(raw, id, &custody))
-+    reason = "receiver_control_lost";
++    {
++      free(raw);
++      return;
++    }
 +  else if (raw)
 +    {
 +      /* A peer-loss isolation row written by a process that has since died. */
@@ -75,12 +80,18 @@ index f6f03f0..afd1e67 100644
 +    }
 +  if (!reason)
 +    {
-+      DPRINTF(E_LOG, L_PLAYER, "Radio orphan kept: output=%" PRIu64 " stage=custody_owner_alive\n", id);
-+      free(raw);
++      free(raw); /* The owner is alive (or the radio is in a normal, unreleased state). */
 +      return;
 +    }
-+  if (found == 1 && (db_radio_handoff_load_key(key, &again) != 1 || strcmp(raw, again)
-+      || db_admin_delete(key) < 0))
++  /* Only now, with an orphaned owner established, prove no Spotify writer is open. */
++  const struct output_queue_writer *writer = &slot->result.command.writer;
++  if (start_all_writers_closed_scan(&writer->native_process, writer->pipe_device, writer->pipe_inode, true) != 1)
++    {
++      free(raw);
++      ORPHAN_KEEP(true, "spotify_writer_open");
++    }
++#undef ORPHAN_KEEP
++  if (db_radio_handoff_load_key(key, &again) != 1 || strcmp(raw, again) || db_admin_delete(key) < 0)
 +    {
 +      free(raw);
 +      free(again);
@@ -89,6 +100,7 @@ index f6f03f0..afd1e67 100644
 +  free(raw);
 +  free(again);
 +  DPRINTF(E_LOG, L_PLAYER, "Radio orphan released: output=%" PRIu64 " reason=%s phase=%d\n", id, reason, (int)slot->result.phase);
++  kept_id = 0;
 +  memset(slot, 0, sizeof(*slot));
 +  primary_cold_detachment_reset();
 +  (void)radio_handoff_save();
@@ -97,7 +109,7 @@ index f6f03f0..afd1e67 100644
  static int
  primary_cold_custody_consume(const char *key, const char *old, const char *next)
  {
-@@ -3586,6 +3662,13 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
+@@ -3586,6 +3674,13 @@ int outputs_radio_admission_get(uint64_t id,struct output_radio_admission *out)
        ||!outputs_process[0]||!d->incarnation||d->incarnation==UINT64_MAX)return -1;
    memset(out,0,sizeof(*out));snprintf(out->process_id,sizeof(out->process_id),"%s",outputs_process);
    out->device_id=id;out->device_incarnation=d->incarnation;
@@ -245,7 +257,7 @@ index 7598410..6f2280f 100644
    s=&radio_handoffs[0];s->used=true;s->result.effect_generation=12;s->result.command=r;s->result.phase=OUTPUT_RADIO_UNKNOWN;
    assert(radio_handoff_save()==0);
 diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
-index 7b60d16..d99db3b 100644
+index 7b60d16..3a9cbf7 100644
 --- a/tests/start35_wire_owner.inc.c
 +++ b/tests/start35_wire_owner.inc.c
 @@ -3358,6 +3358,19 @@ static int start35_wire_case(int mode)
@@ -293,8 +305,8 @@ index 7b60d16..d99db3b 100644
 +                  && outputs_primary_radio_custody_available(f.device->id);
 +              printf("RELEASE_CHECK mode=%s control_loss=%s released=%d radio_ready=%d\n", restart ? "restart" : "inplace",
 +                  control_loss, released, outputs_airplay_primary_station_target(f.device->id, &cand));
-+              if (!strcmp(control_loss, "writer"))
-+                assert(!released); /* An open Spotify writer is a live owner: never released. */
++              if (!strcmp(control_loss, "writer") || (!restart && !strcmp(control_loss, "isolated")))
++                assert(!released); /* Live Spotify writer, or same-process isolation owned by the Native return protocol. */
 +              else
 +                assert(released);
 +              if (released)
