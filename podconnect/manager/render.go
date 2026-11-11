@@ -120,12 +120,7 @@ server:
   address: 0.0.0.0
   port: %d
 `, r.OwnTone, r.Name, devID, roomBitrate(r), aliasesBlock, r.Pipe, startVolumePercent, r.GLPort)
-	path := filepath.Join(r.ConfigDir, "config.yml")
-	if boot := radioBootConfigForRoom(r); boot != nil && radioBootRegularDestination(path) {
-		cfg += fmt.Sprintf("radio_handoff_control_token: %q\nradio_handoff_owner_url: %q\nradio_handoff_state_path: %q\n", boot.Token, boot.Callback, boot.State)
-		return writeRadioBootConfig(path, []byte(cfg))
-	}
-	return os.WriteFile(path, []byte(cfg), 0o644)
+	return os.WriteFile(filepath.Join(r.ConfigDir, "config.yml"), []byte(cfg), 0o644)
 }
 
 // renderOTConfig writes the room's owntone.conf. db/cache/log live under r.OwnDir (legacy
@@ -163,10 +158,6 @@ mpd {
 	port = 0
 }
 `, r.OwnDir, r.OwnDir, r.OwnDir, r.OTWSPort, readBufferMs(), r.OTPort, r.Name, mediaDir)
-	if boot := radioBootConfigForRoom(r); boot != nil && radioBootRegularDestination(r.OwnConf) {
-		cfg = strings.Replace(cfg, "general {\n", fmt.Sprintf("general {\n\tradio_handoff_secret = %q\n\tradio_handoff_control_token = %q\n", boot.Secret, boot.Token), 1)
-		return writeRadioBootConfig(r.OwnConf, []byte(cfg))
-	}
 	return os.WriteFile(r.OwnConf, []byte(cfg), 0o644)
 }
 

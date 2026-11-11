@@ -1,582 +1,412 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 )
 
-type radioFake struct {
-	calls       []string
-	fail        string
-	gates       []string
-	observation radioNativeObservation
+// fakeRadioPlayer is an OwnTone JSON API stand-in for the radio player.
+type fakeRadioPlayer struct {
+	mu        sync.Mutex
+	state     string // "stop" | "play"
+	selected  []string
+	volumes   map[string]int
+	requests  []string
+	neverPlay bool
+	queue     []string
 }
 
-func (f *radioFake) call(s string) error {
-	f.calls = append(f.calls, s)
-	if s == f.fail {
-		return errors.New("unknown")
+func (f *fakeRadioPlayer) handler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/player":
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": f.state, "volume": 50})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/outputs":
+			outputs := []map[string]any{}
+			for _, row := range []struct{ id, name string }{{"101", "Køkken HomePod"}, {"107", "Fridas HomePod"}} {
+				selected := false
+				for _, id := range f.selected {
+					selected = selected || id == row.id
+				}
+				outputs = append(outputs, map[string]any{"id": row.id, "name": row.name, "type": "AirPlay 2", "selected": selected, "volume": f.volumes[row.id]})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"outputs": outputs})
+		case r.Method == http.MethodPut && r.URL.Path == "/api/outputs/set":
+			var body struct {
+				Outputs []string `json:"outputs"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.selected = body.Outputs
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/outputs/"):
+			var body struct {
+				Volume int `json:"volume"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.volumes[strings.TrimPrefix(r.URL.Path, "/api/outputs/")] = body.Volume
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/queue/items/add":
+			f.queue = []string{r.URL.Query().Get("uris")}
+			if r.URL.Query().Get("playback") == "start" && !f.neverPlay && len(f.selected) > 0 {
+				f.state = "play"
+			}
+			_, _ = io.WriteString(w, `{"count":1}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/player/stop":
+			f.state = "stop"
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPut && r.URL.Path == "/api/queue/clear":
+			f.queue = nil
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected radio player request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+}
+
+func (f *fakeRadioPlayer) effects() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for _, r := range f.requests {
+		if !strings.HasPrefix(r, "GET ") {
+			out = append(out, r)
+		}
 	}
+	return out
+}
+
+type fakeSpotify struct {
+	mu      sync.Mutex
+	route   string
+	playing bool
+	pauses  int
+}
+
+func (s *fakeSpotify) routeRoom() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.route, s.playing
+}
+func (s *fakeSpotify) pause() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pauses++
+	s.playing = false
 	return nil
 }
-func (f *radioFake) Ready(context.Context) ([]radioTarget, []string, error) {
-	return []radioTarget{{ID: "r1", Name: "Stuen", Availability: "available", Selectable: true}, {ID: "r2", Name: "Køkken", Availability: "available", Selectable: true}}, f.gates, nil
+
+func radioRooms() []*Room {
+	r0 := &Room{ID: "r0", Idx: 0, Name: "Køkkenalrum", HomepodName: "Køkken HomePod", HomepodID: "101"}
+	r6 := &Room{ID: "r6", Idx: 6, Name: "Svends", HomepodName: "Svends HomePod", HomepodID: "106"}
+	r7 := &Room{ID: "r7", Idx: 7, Name: "Fridas", HomepodName: "Fridas HomePod", HomepodID: "107"}
+	return []*Room{r0, r6, r7}
 }
-func (f *radioFake) Preflight(_ context.Context, s, t string) error {
-	return f.call("preflight:" + s + ":" + t)
-}
-func (f *radioFake) Reserve(_ context.Context, a, b, id string, g uint64) (radioFence, error) {
-	return radioFence{Token: "token", ActionID: id, Generation: g, OwnerGeneration: g + 1000}, f.call("reserve:" + a + ":" + b)
-}
-func (f *radioFake) PauseAndRelease(_ context.Context, _ radioFence, t string) error {
-	return f.call("pause-release:" + t)
-}
-func (f *radioFake) Start(_ context.Context, _ radioFence, s, t string) error {
-	f.observation = radioNativeObservation{State: "playing", SourceKind: "radio", StationID: s, TargetID: t, ObservedAt: time.Now().Unix() - 2, ValidUntil: time.Now().Unix() + 30}
-	return f.call("start:" + s + ":" + t)
-}
-func (f *radioFake) Stop(_ context.Context, _ radioFence, t string) error {
-	f.observation = radioNativeObservation{State: "stopped", SourceKind: "none", ObservedAt: time.Now().Unix() - 2, ValidUntil: time.Now().Unix() + 30}
-	return f.call("stop:" + t)
-}
-func (f *radioFake) Volume(_ context.Context, _ radioFence, t string, v int) error {
-	f.observation.VolumePercent = &v
-	return f.call("volume:" + t)
-}
-func (f *radioFake) Finish(_ context.Context, fence radioFence) (radioNativeObservation, error) {
-	f.observation.OwnerGeneration = fence.OwnerGeneration
-	return f.observation, f.call("finish")
-}
-func radioTestOwner(t *testing.T) (*radioCoordinator, *radioFake) {
+
+func newTestRadio(t *testing.T) (*radioPlayer, *fakeRadioPlayer, *fakeSpotify) {
 	t.Helper()
-	f := &radioFake{}
-	c := newRadioCoordinator(f)
-	if e := c.enable(context.Background()); e != nil {
-		t.Fatal(e)
-	}
-	return c, f
+	fake := &fakeRadioPlayer{state: "stop", volumes: map[string]int{"101": 20, "107": 15}}
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+	p := newRadioPlayer(radioPlayerConfig{Enabled: true})
+	p.base = server.URL
+	p.rooms = radioRooms
+	spotify := &fakeSpotify{route: "r0"}
+	p.spotify = spotify
+	previous := radioOwner
+	radioOwner = p
+	t.Cleanup(func() { radioOwner = previous })
+	return p, fake, spotify
 }
-func radioQ(c *radioCoordinator, id, a, s, t string) radioCommand {
-	x := c.snapshot()
-	return radioCommand{ActionID: id, Action: a, StationID: s, TargetID: t, ExpectedRevision: x.Revision, ExpectedProcessID: x.ProcessID, ExpectedGeneration: x.Generation, ExpectedOwnerGeneration: x.OwnerGeneration}
-}
-func radioDo(t *testing.T, c *radioCoordinator, id, a, s, target string) radioState {
+
+func radioStart(t *testing.T, p *radioPlayer, id, station, target string, volume *int) error {
 	t.Helper()
-	x, e := c.execute(context.Background(), radioQ(c, id, a, s, target))
-	if e != nil {
-		t.Fatal(e)
-	}
-	return x
+	_, err := p.execute(context.Background(), radioCommand{ActionID: id, Action: "start", StationID: station, TargetID: target, VolumePercent: volume})
+	return err
 }
-func TestRadioUnavailable(t *testing.T) {
-	c := newRadioCoordinator(nil)
-	s, e := c.execute(context.Background(), radioQ(c, "x", "start", "p3", "r1"))
-	if e == nil || s.Enabled || len(s.BlockedReasons) != 6 || s.PhysicalVerified {
-		t.Fatal(s, e)
+
+func TestRadioStartPlaysPlainStreamOnChosenSpeaker(t *testing.T) {
+	p, fake, spotify := newTestRadio(t)
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
+		t.Fatal(err)
 	}
-}
-func TestRadioCapabilitiesGate(t *testing.T) {
-	c := newRadioCoordinator(&radioFake{gates: []string{"missing"}})
-	if c.enable(context.Background()) == nil || c.snapshot().Enabled {
-		t.Fatal("unsafe enable")
+	s := p.snapshot()
+	if s.State != "playing" || s.SourceKind != "radio" || s.TargetID != "r7" || s.StationID != "p3" || s.VolumePercent == nil || *s.VolumePercent != startVolumePercent {
+		t.Fatalf("state %+v", s)
 	}
-}
-func TestRadioStartStopLeavesSpotifyPaused(t *testing.T) {
-	c, f := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	radioDo(t, c, "b", "stop", "", "")
-	want := []string{"preflight:p3:r1", "reserve::r1", "pause-release:r1", "start:p3:r1", "finish", "reserve:r1:", "stop:r1", "finish"}
-	if !reflect.DeepEqual(f.calls, want) {
-		t.Fatal(f.calls)
+	if len(fake.selected) != 1 || fake.selected[0] != "107" || fake.volumes["107"] != startVolumePercent || len(fake.queue) != 1 || fake.queue[0] != radioStreamURLs["p3"] {
+		t.Fatalf("player %+v %+v %+v", fake.selected, fake.volumes, fake.queue)
 	}
-}
-func TestRadioMoveOrdersEffects(t *testing.T) {
-	c, f := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	f.calls = nil
-	radioDo(t, c, "b", "move", "", "r2")
-	want := []string{"preflight:p3:r2", "reserve:r1:r2", "stop:r1", "pause-release:r2", "start:p3:r2", "finish"}
-	if !reflect.DeepEqual(f.calls, want) {
-		t.Fatal(f.calls)
+	if spotify.pauses != 0 {
+		t.Fatal("Spotify in another room was paused")
 	}
-}
-func TestRadioUnknownHasNoRetry(t *testing.T) {
-	for _, fail := range []string{"reserve::r1", "pause-release:r1", "start:p3:r1", "finish"} {
-		t.Run(fail, func(t *testing.T) {
-			c, f := radioTestOwner(t)
-			f.fail = fail
-			s, e := c.execute(context.Background(), radioQ(c, "a", "start", "p3", "r1"))
-			if e == nil || s.State != "unknown" {
-				t.Fatal(s, e)
-			}
-			n := len(f.calls)
-			_, e = c.execute(context.Background(), radioQ(c, "b", "start", "p1", "r2"))
-			if e == nil || n != len(f.calls) {
-				t.Fatal("replayed")
-			}
-		})
-	}
-}
-func TestRadioPreflightPreservesPlayback(t *testing.T) {
-	c, f := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	f.fail = "preflight:p1:r1"
-	f.calls = nil
-	s, e := c.execute(context.Background(), radioQ(c, "b", "start", "p1", "r1"))
-	if e == nil || s.State != "playing" || s.StationID != "p3" || len(f.calls) != 1 {
-		t.Fatal(s, e, f.calls)
-	}
-}
-func TestRadioDuplicatesDoNotRestart(t *testing.T) {
-	c, f := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	n := len(f.calls)
-	radioDo(t, c, "b", "start", "p3", "r1")
-	_, e := c.execute(context.Background(), radioQ(c, "a", "stop", "", ""))
-	if e == nil || n != len(f.calls) {
-		t.Fatal("duplicate")
-	}
-}
-func TestRadioInvalidIDsAndRestartBinding(t *testing.T) {
-	for _, change := range []func(*radioCommand){func(q *radioCommand) { q.TargetID = "all" }, func(q *radioCommand) { q.StationID = "https://evil" }, func(q *radioCommand) { q.ExpectedProcessID = "old" }, func(q *radioCommand) { q.ExpectedRevision = 0 }, func(q *radioCommand) { q.ExpectedGeneration = 42 }} {
-		c, f := radioTestOwner(t)
-		q := radioQ(c, "x", "start", "p3", "r1")
-		change(&q)
-		_, e := c.execute(context.Background(), q)
-		if e == nil || len(f.calls) != 0 {
-			t.Fatal("invalid accepted")
-		}
-	}
-}
-func TestRadioPreemptExactGeneration(t *testing.T) {
-	c, _ := radioTestOwner(t)
-	s := radioDo(t, c, "a", "start", "p3", "r1")
-	if c.observeNativePreempt("r2", s.Generation) || c.observeNativePreempt("r1", s.Generation-1) || !c.observeNativePreempt("r1", s.Generation) || c.snapshot().State != "unknown" {
-		t.Fatal("preempt")
-	}
-}
-func TestRadioHTTPAuthAndStrictJSON(t *testing.T) {
-	old := dataDir
-	defer func() { dataDir = old }()
-	dataDir = t.TempDir()
-	w := httptest.NewRecorder()
-	radioStateHandler(w, httptest.NewRequest("GET", "/api/radio/state", nil))
-	if w.Code != 401 {
-		t.Fatal(w.Code)
-	}
-	if e := os.WriteFile(filepath.Join(dataDir, "options.json"), []byte(`{"attention_token":"secret"}`), 0600); e != nil {
-		t.Fatal(e)
-	}
-	for _, body := range []string{`{"evil":true}`, `{} {}`, strings.Repeat("x", 5000)} {
-		r := httptest.NewRequest("POST", "/api/radio/action", strings.NewReader(body))
-		r.Header.Set("X-PodConnect-Token", "secret")
-		w = httptest.NewRecorder()
-		radioActionHandler(w, r)
-		if w.Code != 400 {
-			t.Fatal(w.Code, w.Body.String())
-		}
+	if got := strings.Join(s.Actions, ","); got != "start,stop,move,volume" {
+		t.Fatalf("actions %s", got)
 	}
 }
 
-func TestRadioTransportTokenScope(t *testing.T) {
-	old := dataDir
-	defer func() { dataDir = old }()
-	dataDir = t.TempDir()
-	options := filepath.Join(dataDir, "options.json")
-	const attention = "attention-fixture"
-	const radio = "radio-transport-fixture"
-	const native = "native-worker-fixture"
-	endpoints := []struct {
-		path    string
-		handler http.HandlerFunc
-	}{
-		{"/api/radio/state", radioStateHandler},
-		{"/api/radio/action", radioActionHandler},
-		{"/api/radio/result", radioResultHandler},
+func TestRadioStartPausesSpotifyOnTheSameSpeaker(t *testing.T) {
+	p, _, spotify := newTestRadio(t)
+	spotify.route, spotify.playing = "r0", true
+	if err := radioStart(t, p, "a1", "p1", "r0", nil); err != nil {
+		t.Fatal(err)
 	}
-	for _, config := range []struct {
-		name     string
-		options  string
-		accepted string
+	if spotify.pauses != 1 {
+		t.Fatal("radio did not take the speaker from Spotify")
+	}
+}
+
+func TestRadioStartFailureLeavesNoHold(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	fake.neverPlay = true
+	old := radioStartWait
+	t.Cleanup(func() { radioStartWait = old })
+	radioStartWait = 300 * time.Millisecond
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err == nil {
+		t.Fatal("start without audio was accepted")
+	}
+	s := p.snapshot()
+	if s.State != "stopped" || s.SourceKind != "none" || s.TargetID != "" {
+		t.Fatalf("failed start left radio state %+v", s)
+	}
+	if len(fake.selected) != 0 || len(fake.queue) != 0 || fake.state != "stop" {
+		t.Fatalf("failed start left a speaker held %+v %+v", fake.selected, fake.queue)
+	}
+	if p.playingOn("") || len(p.outputs) != 0 {
+		t.Fatal("failed start left a hold")
+	}
+	// Spotify is never blocked afterwards.
+	ran := false
+	spotifyTakesOver(func(http.ResponseWriter, *http.Request) { ran = true })(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/stop?room=r7", nil))
+	if !ran {
+		t.Fatal("Spotify command blocked")
+	}
+}
+
+func TestSpotifyCommandDuringRadioStopsRadioAndSucceeds(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, body string
 	}{
-		{"dedicated", `{"attention_token":"attention-fixture","radio_transport_token":"radio-transport-fixture","radio_native_token":"native-worker-fixture"}`, radio},
-		{"dedicated_with_invalid_attention", `{"attention_token":false,"radio_transport_token":"radio-transport-fixture"}`, radio},
-		{"legacy", `{"attention_token":"attention-fixture","radio_native_token":"native-worker-fixture"}`, attention},
-		{"blank", `{"attention_token":"attention-fixture","radio_transport_token":"  "}`, attention},
-		{"invalid", `{"attention_token":"attention-fixture","radio_transport_token":true}`, ""},
-		{"missing", `{"radio_native_token":"native-worker-fixture"}`, ""},
+		{"pause by room query", "/api/stop?room=r7", ""},
+		{"volume by body room", "/api/volume", `{"volume":8,"room":"r7"}`},
+		{"room transport prepare scope", "/api/room-transport/prepare", `{"scope":{"room_id":"r7","target_id":"t","homepod_id":"107","account_user_id":"a"},"action":"pause"}`},
+		{"move destination", "/api/room-move/prepare", `{"destination":{"room_id":"r7"}}`},
 	} {
-		t.Run(config.name, func(t *testing.T) {
-			if err := os.WriteFile(options, []byte(config.options), 0600); err != nil {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fake, _ := newTestRadio(t)
+			if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
 				t.Fatal(err)
 			}
-			for _, endpoint := range endpoints {
-				for _, credential := range []string{"", attention, radio, native} {
-					// An authorized but invalid method proves admission without
-					// consulting or changing the active radio owner.
-					r := httptest.NewRequest(http.MethodPut, endpoint.path, nil)
-					r.Header.Set("X-PodConnect-Token", credential)
-					w := httptest.NewRecorder()
-					endpoint.handler(w, r)
-					want := http.StatusUnauthorized
-					if credential != "" && credential == config.accepted {
-						want = http.StatusMethodNotAllowed
-					}
-					if w.Code != want {
-						t.Errorf("%s credential scope: got %d, want %d", endpoint.path, w.Code, want)
-					}
+			var gotBody string
+			handler := spotifyTakesOver(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				gotBody = string(raw)
+				if p.playingOn("r7") {
+					t.Error("Spotify command ran while radio still held the speaker")
 				}
+				w.WriteHeader(http.StatusOK)
+			})
+			rec := httptest.NewRecorder()
+			handler(rec, httptest.NewRequest(http.MethodPost, tc.path, bytes.NewBufferString(tc.body)))
+			if rec.Code != 200 || gotBody != tc.body {
+				t.Fatalf("Spotify command did not run unchanged: %d %q", rec.Code, gotBody)
 			}
-			if config.name == "dedicated" {
-				r := httptest.NewRequest(http.MethodPost, "/api/attention", nil)
-				r.Header.Set("X-PodConnect-Token", radio)
-				if attentionAuthed(r) {
-					t.Fatal("radio credential admitted on the attention lane")
-				}
-				r.Header.Set("X-PodConnect-Token", attention)
-				if !attentionAuthed(r) {
-					t.Fatal("attention credential lost its existing admission")
-				}
+			if s := p.snapshot(); s.State != "stopped" || s.SourceKind != "none" {
+				t.Fatalf("radio still playing: %+v", s)
+			}
+			if len(fake.selected) != 0 || fake.state != "stop" {
+				t.Fatal("radio player still holds the HomePod")
 			}
 		})
 	}
 }
 
-func TestRadioDoesNotStopObservedSpotifySource(t *testing.T) {
-	c, f := radioTestOwner(t)
-	c.state.State = "playing"
-	c.state.SourceKind = "spotify"
-	c.state.TargetID = "r1"
-	if _, e := c.execute(context.Background(), radioQ(c, "a", "stop", "", "")); e == nil {
-		t.Fatal("Spotify source offered radio stop")
+func TestSpotifyCommandForAnotherSpeakerLeavesRadio(t *testing.T) {
+	p, _, spotify := newTestRadio(t)
+	spotify.route = "r0"
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
+		t.Fatal(err)
 	}
-	if len(f.calls) != 0 {
-		t.Fatal("radio stopped Spotify", f.calls)
+	spotifyTakesOver(func(http.ResponseWriter, *http.Request) {})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/stop?room=r0", nil))
+	if !p.playingOn("r7") {
+		t.Fatal("pausing Spotify in another room stopped the radio")
 	}
-	radioDo(t, c, "b", "start", "p3", "r1")
-	for _, call := range f.calls {
-		if call == "stop:r1" {
-			t.Fatal("radio generic stopped Spotify", f.calls)
+}
+
+func TestSpotifyPlaybackOnRadioSpeakerStopsRadio(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
+		t.Fatal(err)
+	}
+	p.spotifyPlaying("r6")
+	if !p.playingOn("r7") {
+		t.Fatal("Spotify elsewhere stopped radio")
+	}
+	p.spotifyPlaying("r7")
+	deadline := time.Now().Add(2 * time.Second)
+	for p.playingOn("r7") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.playingOn("r7") || len(fake.effects()) == 0 || fake.state != "stop" {
+		t.Fatal("Spotify playback did not take the speaker")
+	}
+}
+
+func TestRadioStateReadIsSideEffectFree(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	dir := t.TempDir()
+	oldDir := dataDir
+	dataDir = dir
+	t.Cleanup(func() { dataDir = oldDir })
+	if err := os.WriteFile(filepath.Join(dir, "options.json"), []byte(`{"radio_transport_token":"tok"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	oldOut := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOut) })
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/radio/state", nil)
+		req.Header.Set("X-PodConnect-Token", "tok")
+		radioStateHandler(rec, req)
+		if rec.Code != 200 {
+			t.Fatal(rec.Code)
 		}
+		var s radioState
+		if json.Unmarshal(rec.Body.Bytes(), &s) != nil || !s.Enabled || s.Schema != "podconnect.radio.v1" || len(s.BlockedReasons) != 0 {
+			t.Fatalf("radio not enabled: %s", rec.Body.String())
+		}
+		p.watch(context.Background())
+	}
+	if effects := fake.effects(); len(effects) != 0 {
+		t.Fatalf("state reads caused effects: %v", effects)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("idle reads logged: %q", logs.String())
 	}
 }
 
-type radioReconFake struct {
-	*radioFake
-	result      radioReconciliation
-	readErr     error
-	reads       int
-	observation radioNativeObservation
-}
-
-func (f *radioReconFake) Reconcile(context.Context, radioFence) (radioReconciliation, error) {
-	f.reads++
-	return f.result, f.readErr
-}
-func (f *radioReconFake) Observe(context.Context) (radioNativeObservation, error) {
-	f.reads++
-	return f.observation, f.readErr
-}
-func TestRadioKeepsSourceObservationTime(t *testing.T) {
-	c, f := radioTestOwner(t)
-	s := radioDo(t, c, "a", "start", "p3", "r1")
-	if s.ObservedAt == nil || *s.ObservedAt != f.observation.ObservedAt || *s.ValidUntil != f.observation.ValidUntil || *s.ObservedAt == time.Now().Unix() {
-		t.Fatal("manager manufactured source time", s)
+func TestRadioActionHTTPContract(t *testing.T) {
+	p, _, _ := newTestRadio(t)
+	dir := t.TempDir()
+	oldDir := dataDir
+	dataDir = dir
+	t.Cleanup(func() { dataDir = oldDir })
+	if err := os.WriteFile(filepath.Join(dir, "options.json"), []byte(`{"attention_token":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-}
-func TestRadioUnknownReconcilesOnlyMatchingDurableTerminal(t *testing.T) {
-	for _, failure := range []string{"reserve::r1", "start:p3:r1", "finish"} {
-		t.Run(failure, func(t *testing.T) {
-			c, base := radioTestOwner(t)
-			f := &radioReconFake{radioFake: base}
-			c.backend = f
-			base.fail = failure
-			s, e := c.execute(context.Background(), radioQ(c, "a", "start", "p3", "r1"))
-			if e == nil || s.State != "unknown" {
-				t.Fatal(s, e)
-			}
-			calls := len(base.calls)
-			o := radioNativeObservation{State: "playing", SourceKind: "radio", StationID: "p3", TargetID: "r1", OwnerGeneration: 1000 + s.Generation, ObservedAt: time.Now().Unix() - 1, ValidUntil: time.Now().Unix() + 30}
-			f.result = radioReconciliation{ActionID: "foreign", Generation: s.Generation, Token: c.fence.Token, Terminal: true, Outcome: "committed", Observation: o}
-			c.refresh(context.Background())
-			if c.snapshot().State != "unknown" {
-				t.Fatal("foreign unlocked")
-			}
-			f.result.ActionID = "a"
-			f.result.Terminal = false
-			c.refresh(context.Background())
-			if c.snapshot().State != "unknown" {
-				t.Fatal("nonterminal unlocked")
-			}
-			f.result.Terminal = true
-			f.readErr = context.DeadlineExceeded
-			c.refresh(context.Background())
-			if c.snapshot().State != "unknown" {
-				t.Fatal("timeout unlocked")
-			}
-			f.readErr = nil
-			f.result.Observation.TargetID = "r2"
-			c.refresh(context.Background())
-			if c.snapshot().State != "unknown" {
-				t.Fatal("wrong output unlocked")
-			}
-			f.result.Observation = o
-			c.refresh(context.Background())
-			if c.snapshot().State != "playing" || calls != len(base.calls) {
-				t.Fatal("reconciliation did not settle read-only", c.snapshot(), base.calls)
-			}
-		})
+	post := func(body string) (int, map[string]any) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/radio/action", strings.NewReader(body))
+		req.Header.Set("X-PodConnect-Token", "legacy")
+		radioActionHandler(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
 	}
-}
-func TestRadioOldSameOwnerObservationCannotRollBack(t *testing.T) {
-	c, base := radioTestOwner(t)
-	s := radioDo(t, c, "a", "start", "p3", "r1")
-	f := &radioReconFake{radioFake: base, observation: base.observation}
-	f.observation.OwnerGeneration = s.OwnerGeneration
-	f.observation.ObservedAt = *s.ObservedAt - 1
-	v := 99
-	f.observation.VolumePercent = &v
-	c.backend = f
-	c.refresh(context.Background())
-	after := c.snapshot()
-	if *after.ObservedAt != *s.ObservedAt || after.VolumePercent != nil {
-		t.Fatal("old read rolled state backward", after)
+	// Stale expected_* values from an older read no longer reject: last command wins.
+	code, out := post(`{"action_id":"x1","action":"start","station_id":"p3","target_id":"r7","expected_revision":1,"expected_process_id":"old","expected_owner_generation":0,"expected_generation":0}`)
+	if code != 200 || out["status"] != "accepted" || out["schema"] != "podconnect.radio-action.v1" {
+		t.Fatalf("start %d %v", code, out)
+	}
+	code, out = post(`{"action_id":"x1","action":"start","station_id":"p3","target_id":"r7","expected_revision":1,"expected_process_id":"old","expected_owner_generation":0,"expected_generation":0}`)
+	if code != 200 || out["status"] != "accepted" {
+		t.Fatalf("duplicate %d %v", code, out)
+	}
+	code, out = post(`{"action_id":"x2","action":"start","station_id":"nope","target_id":"r7","expected_revision":1,"expected_process_id":"","expected_owner_generation":0,"expected_generation":0}`)
+	if code != 409 || out["status"] != "rejected" {
+		t.Fatalf("invalid %d %v", code, out)
+	}
+	s := p.snapshot()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/radio/result?process_id="+s.ProcessID+"&action_id=x1&generation=1", nil)
+	req.Header.Set("X-PodConnect-Token", "legacy")
+	radioResultHandler(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"outcome":"committed"`) || !strings.Contains(rec.Body.String(), `"terminal":true`) {
+		t.Fatalf("result %d %s", rec.Code, rec.Body.String())
+	}
+	code, out = post(`{"action_id":"x3","action":"stop","expected_revision":0,"expected_process_id":"","expected_owner_generation":0,"expected_generation":0}`)
+	if code != 200 || out["status"] != "accepted" || p.playingOn("") {
+		t.Fatalf("stop %d %v", code, out)
 	}
 }
 
-type radioBadFinish struct{ *radioFake }
-
-func (f *radioBadFinish) Finish(_ context.Context, fence radioFence) (radioNativeObservation, error) {
-	o := f.observation
-	o.OwnerGeneration = fence.OwnerGeneration
-	o.TargetID = "r2"
-	return o, nil
-}
-func TestRadioWrongOutputReceiptIsUnknown(t *testing.T) {
-	c, base := radioTestOwner(t)
-	c.backend = &radioBadFinish{base}
-	s, e := c.execute(context.Background(), radioQ(c, "a", "start", "p3", "r1"))
-	if e == nil || s.State != "unknown" || s.ObservedAt != nil {
-		t.Fatal("wrong native output accepted", s, e)
+func TestRadioDisabledByOptionReportsUnavailable(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	p.cfg.Enabled = false
+	p.refresh(context.Background())
+	s := p.snapshot()
+	if s.Enabled || len(s.Actions) != 0 || len(s.BlockedReasons) != 1 || s.BlockedReasons[0] != "radio_disabled" {
+		t.Fatalf("%+v", s)
+	}
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a", Action: "start", StationID: "p3", TargetID: "r0"}); err == nil {
+		t.Fatal("disabled radio started")
+	}
+	if len(fake.effects()) != 0 {
+		t.Fatal("disabled radio touched the player")
 	}
 }
 
-type radioBlockedPreflight struct {
-	*radioFake
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (f *radioBlockedPreflight) Preflight(ctx context.Context, s, target string) error {
-	close(f.entered)
-	select {
-	case <-f.release:
-		return f.radioFake.Preflight(ctx, s, target)
-	case <-ctx.Done():
-		return ctx.Err()
+func TestRadioMoveAndVolumeStayOnOwnPlayer(t *testing.T) {
+	p, fake, spotify := newTestRadio(t)
+	if err := radioStart(t, p, "a1", "p8-jazz", "r0", nil); err != nil {
+		t.Fatal(err)
 	}
-}
-func TestRadioConcurrentCommandAndPreemptDuringPreflight(t *testing.T) {
-	c, base := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	base.calls = nil
-	f := &radioBlockedPreflight{base, make(chan struct{}), make(chan struct{})}
-	c.backend = f
-	done := make(chan error, 1)
-	q := radioQ(c, "b", "start", "p1", "r1")
-	go func() { _, e := c.execute(context.Background(), q); done <- e }()
-	<-f.entered
-	pending := c.snapshot()
-	if _, e := c.execute(context.Background(), radioQ(c, "c", "start", "p8-jazz", "r2")); e == nil {
-		t.Fatal("concurrent command admitted")
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a2", Action: "move", TargetID: "r7"}); err != nil {
+		t.Fatal(err)
 	}
-	if !c.observeNativePreempt("r1", pending.Generation) {
-		t.Fatal("exact native preempt rejected")
+	if s := p.snapshot(); s.TargetID != "r7" || s.StationID != "p8-jazz" || len(fake.selected) != 1 || fake.selected[0] != "107" {
+		t.Fatalf("move %+v %v", s, fake.selected)
 	}
-	close(f.release)
-	if <-done == nil {
-		t.Fatal("stale preempted operation succeeded")
+	five := 5
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a3", Action: "volume", VolumePercent: &five}); err != nil {
+		t.Fatal(err)
 	}
-	if len(base.calls) != 1 || base.calls[0] != "preflight:p1:r1" || c.snapshot().SourceKind != "unknown" {
-		t.Fatal("preempted operation performed effects", base.calls, c.snapshot())
+	if fake.volumes["107"] != 5 || *p.snapshot().VolumePercent != 5 {
+		t.Fatal("volume not on radio output")
 	}
-}
-func TestRadioCancelledPreflightHasNoReceiverEffects(t *testing.T) {
-	c, base := radioTestOwner(t)
-	f := &radioBlockedPreflight{base, make(chan struct{}), make(chan struct{})}
-	c.backend = f
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	s, e := c.execute(ctx, radioQ(c, "a", "start", "p3", "r1"))
-	if e == nil || len(base.calls) != 0 || s.State != "idle" {
-		t.Fatal(s, e, base.calls)
+	if spotify.pauses != 0 {
+		t.Fatal("radio paused Spotify that was not playing on its speaker")
 	}
 }
 
-type radioOrderedReads struct {
-	*radioFake
-	entered      chan struct{}
-	release      chan struct{}
-	older, newer radioNativeObservation
-	reads        atomic.Int32
-}
-
-func (f *radioOrderedReads) Observe(context.Context) (radioNativeObservation, error) {
-	if f.reads.Add(1) == 1 {
-		close(f.entered)
-		<-f.release
-		return f.older, nil
+func TestRadioStartsAtTheSharedStartVolume(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	fake.volumes["107"] = 90 // the radio player's own remembered level
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
+		t.Fatal(err)
 	}
-	return f.newer, nil
-}
-func TestRadioOutOfOrderConcurrentReadsKeepNewestSource(t *testing.T) {
-	c, base := radioTestOwner(t)
-	s := radioDo(t, c, "a", "start", "p3", "r1")
-	older := base.observation
-	older.OwnerGeneration = s.OwnerGeneration
-	oldVolume, newVolume := 10, 20
-	older.VolumePercent = &oldVolume
-	newer := older
-	newer.ObservedAt++
-	newer.VolumePercent = &newVolume
-	f := &radioOrderedReads{radioFake: base, entered: make(chan struct{}), release: make(chan struct{}), older: older, newer: newer}
-	c.backend = f
-	done := make(chan struct{})
-	go func() { c.refresh(context.Background()); close(done) }()
-	<-f.entered
-	c.refresh(context.Background())
-	close(f.release)
-	<-done
-	after := c.snapshot()
-	if *after.ObservedAt != newer.ObservedAt || after.VolumePercent == nil || *after.VolumePercent != newVolume {
-		t.Fatal("late old HTTP read rolled volume back", after)
+	if fake.volumes["107"] != startVolumePercent || startVolumePercent != 35 {
+		t.Fatalf("radio started at %d", fake.volumes["107"])
 	}
-}
-
-func TestRadioEqualTimestampConflictingReadCannotRollBack(t *testing.T) {
-	c, base := radioTestOwner(t)
-	s := radioDo(t, c, "a", "start", "p3", "r1")
-	v := 10
-	f := &radioReconFake{radioFake: base, observation: base.observation}
-	f.observation.OwnerGeneration = s.OwnerGeneration
-	f.observation.VolumePercent = &v
-	c.backend = f
-	c.refresh(context.Background())
-	after := c.snapshot()
-	if after.VolumePercent != nil || *after.ObservedAt != *s.ObservedAt || after.Revision != s.Revision {
-		t.Fatal("equal-second conflicting read applied", after)
+	// A start cannot carry its own level: the 35 % rule is the only start level.
+	ten := 10
+	if err := radioStart(t, p, "a2", "p1", "r0", &ten); err == nil {
+		t.Fatal("start with its own volume was accepted")
 	}
-}
-
-func TestRadioActionsMatchCurrentStateAndExecutionAdmission(t *testing.T) {
-	for _, tc := range []struct {
-		name, state, source        string
-		enabled, pending, measured bool
-		want                       []string
-	}{{"disabled", "idle", "unknown", false, false, false, []string{}}, {"idle", "idle", "none", true, false, false, []string{"start"}}, {"stopped", "stopped", "none", true, false, false, []string{"start"}}, {"error", "error", "none", true, false, false, []string{"start"}}, {"spotify", "playing", "spotify", true, false, true, []string{"start"}}, {"unknown", "unknown", "unknown", true, false, true, []string{}}, {"preparing", "preparing", "radio", true, false, true, []string{}}, {"busy", "playing", "radio", true, true, true, []string{}}, {"radio-no-volume", "playing", "radio", true, false, false, []string{"start", "stop", "move"}}, {"radio-volume", "playing", "radio", true, false, true, []string{"start", "stop", "move", "volume"}}} {
-		t.Run(tc.name, func(t *testing.T) {
-			c, f := radioTestOwner(t)
-			c.state.State = tc.state
-			c.state.SourceKind = tc.source
-			c.state.Enabled = tc.enabled
-			c.pending = tc.pending
-			c.state.StationID = "p3"
-			c.state.TargetID = "r1"
-			observed, until := time.Now().Unix()-1, time.Now().Unix()+30
-			c.state.ObservedAt = &observed
-			c.state.ValidUntil = &until
-			if tc.measured {
-				v := 30
-				c.state.VolumePercent = &v
-			}
-			snapshot := c.snapshot()
-			if !reflect.DeepEqual(snapshot.Actions, tc.want) || !reflect.DeepEqual(snapshot.Capabilities, []string{"start", "stop", "move", "volume"}) {
-				t.Fatal(snapshot.Actions, snapshot.Capabilities)
-			}
-			for _, action := range []string{"start", "stop", "move", "volume"} {
-				offered := false
-				for _, a := range tc.want {
-					offered = offered || a == action
-				}
-				if offered {
-					continue
-				}
-				q := radioQ(c, "blocked-"+action, action, "", "")
-				if action == "start" {
-					q.StationID = "p1"
-					q.TargetID = "r2"
-				}
-				if action == "move" {
-					q.TargetID = "r2"
-				}
-				if action == "volume" {
-					v := 20
-					q.VolumePercent = &v
-				}
-				before := len(f.calls)
-				if _, e := c.execute(context.Background(), q); e == nil || len(f.calls) != before {
-					t.Fatal("unoffered action admitted", action, f.calls)
-				}
-			}
-		})
+	// After an explicit volume change, a move is a new start and uses 35 % again.
+	five := 5
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a3", Action: "volume", VolumePercent: &five}); err != nil {
+		t.Fatal(err)
 	}
-}
-func TestRadioStaleOrMissingTargetOffersCannotExposeRouteControls(t *testing.T) {
-	c, _ := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	expired := time.Now().Unix() - 1
-	c.state.ValidUntil = &expired
-	v := 30
-	c.state.VolumePercent = &v
-	if got := c.snapshot().Actions; !reflect.DeepEqual(got, []string{"start"}) {
-		t.Fatal(got)
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a4", Action: "move", TargetID: "r0"}); err != nil {
+		t.Fatal(err)
 	}
-	c.state.State = "stopped"
-	c.state.Targets = []radioTarget{{ID: "r1", Availability: "unavailable", Selectable: false}}
-	if len(c.snapshot().Actions) != 0 {
-		t.Fatal(c.snapshot().Actions)
-	}
-}
-func TestRadioMeasuredVolumeOfferActuallyExecutes(t *testing.T) {
-	c, f := radioTestOwner(t)
-	radioDo(t, c, "a", "start", "p3", "r1")
-	v := 30
-	c.state.VolumePercent = &v
-	q := radioQ(c, "b", "volume", "", "")
-	next := 20
-	q.VolumePercent = &next
-	s, e := c.execute(context.Background(), q)
-	if e != nil || s.VolumePercent == nil || *s.VolumePercent != 20 {
-		t.Fatal(s, e, f.calls)
-	}
-}
-
-func TestRadioNativePreemptDoesNotInventSourceOrOwnerEpoch(t *testing.T) {
-	c, base := radioTestOwner(t)
-	before := radioDo(t, c, "play", "start", "p3", "r1")
-	if !c.observeNativePreempt("r1", before.Generation) {
-		t.Fatal("preempt rejected")
-	}
-	after := c.snapshot()
-	if after.OwnerGeneration != before.OwnerGeneration || after.SourceKind != "unknown" || after.State != "unknown" || after.VolumePercent != nil || after.ObservedAt != nil || after.ValidUntil != nil || len(after.Actions) != 0 {
-		t.Fatal("preempt invented actual source", after)
-	}
-	// The next actual observation may use the SAME source epoch; local command
-	// invalidation must not manufacture a higher owner that rejects that proof.
-	actual := radioNativeObservation{State: "playing", SourceKind: "spotify", TargetID: "r1", OwnerGeneration: before.OwnerGeneration, ObservedAt: time.Now().Unix(), ValidUntil: time.Now().Unix() + 2}
-	reconciler := &radioReconFake{radioFake: base, result: radioReconciliation{ActionID: c.fence.ActionID, Generation: c.fence.Generation, Token: c.fence.Token, Terminal: true, Outcome: "preempted", Observation: actual}}
-	c.backend = reconciler
-	c.refresh(context.Background())
-	if got := c.snapshot(); got.OwnerGeneration != before.OwnerGeneration || got.SourceKind != "spotify" {
-		t.Fatal("next actual source rejected", got)
+	if fake.volumes["101"] != startVolumePercent || *p.snapshot().VolumePercent != startVolumePercent {
+		t.Fatalf("move started at %d", fake.volumes["101"])
 	}
 }

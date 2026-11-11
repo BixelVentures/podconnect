@@ -14,10 +14,10 @@ index a697ae0..07bc194 100644
  const (
 diff --git a/daemon/autoplay_preview_test.go b/daemon/autoplay_preview_test.go
 new file mode 100644
-index 0000000..74f9f54
+index 0000000..f6e615d
 --- /dev/null
 +++ b/daemon/autoplay_preview_test.go
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,643 @@
 +package daemon
 +
 +import (
@@ -137,7 +137,7 @@ index 0000000..74f9f54
 +// Runs only in the existing actual Linux FIFO and private receiver fixture.
 +func testAutoplayPreviewActualC(t *testing.T, ctx context.Context, p *AppPlayer, worker *player.Player, server *ConcreteApiServer) {
 +	t.Helper()
-+	owner, err := p.radioSourceOwner()
++	owner, err := autoplayFixtureSourceOwner(p)
 +	if err != nil {
 +		t.Fatal(err)
 +	}
@@ -322,7 +322,7 @@ index 0000000..74f9f54
 +	if _, err := server.roomTransportAsk(ctx, apiRoomAutoplayPreview, owner); !errors.Is(err, ErrAliasConflict) {
 +		t.Fatal("prior scope remained readable after EOS adoption", err)
 +	}
-+	promotedOwner, err := p.radioSourceOwner()
++	promotedOwner, err := autoplayFixtureSourceOwner(p)
 +	if err != nil || promotedOwner.SessionID == owner.SessionID {
 +		t.Fatal("expected natural EOS to publish new playback session", err)
 +	}
@@ -637,20 +637,35 @@ index 0000000..74f9f54
 +	}
 +	return ordinary
 +}
++
++// autoplayFixtureSourceOwner names the bound owner of the currently selected
++// alias room, exactly as the bound queue read expects it.
++func autoplayFixtureSourceOwner(p *AppPlayer) (roomTransportIdentity, error) {
++	if p == nil || p.sess == nil || p.app == nil || p.state == nil || p.state.device == nil {
++		return roomTransportIdentity{}, ErrAliasConflict
++	}
++	account, bound := p.sess.BoundUsername()
++	if !bound {
++		return roomTransportIdentity{}, ErrAliasConflict
++	}
++	p.aliasMu.Lock()
++	room, hp := "", ""
++	for _, alias := range p.aliasRegistry {
++		if alias.ID == p.state.device.SelectedAliasId && alias.RoomID != "" {
++			room, hp = alias.RoomID, alias.HomePodID
++		}
++	}
++	p.aliasMu.Unlock()
++	if room == "" {
++		return roomTransportIdentity{}, ErrAliasConflict
++	}
++	return p.roomTransportIdentity(account, p.app.deviceId, room, hp)
++}
 diff --git a/daemon/player.go b/daemon/player.go
-index 68c029a..1c280e7 100644
+index ae391cd..7548798 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -786,7 +786,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
- 	}
- 	if p.radioHeld() {
- 		switch req.Type {
--		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish:
-+		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish, apiRoomAutoplayPreview, apiRoomAutoplayPromoted:
- 		case ApiRequestTypeWebApi:
- 			data, ok := req.Data.(ApiRequestDataWebApi)
- 			if !ok || data.Method != "GET" {
-@@ -926,6 +926,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -775,6 +775,10 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		return p.prepareRoomTransportVersion(ctx, req.Data.(roomTransportPrepareRequest), true)
  	case apiRoomBoundConsume:
  		return p.consumeRoomTransportVersion(ctx, req.Data.(roomTransportConsumeRequest), true)
@@ -662,10 +677,10 @@ index 68c029a..1c280e7 100644
  		return p.prepareAutoplaySelection(ctx, req.Data.(roomTransportPrepareRequest))
  	case apiRoomTransportState:
 diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
-index e5ab7fa..ce035cd 100644
+index 8653909..d790cbd 100644
 --- a/daemon/room_content_test.go
 +++ b/daemon/room_content_test.go
-@@ -727,6 +727,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+@@ -687,6 +687,10 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
  					configureSelectedStage(t, p, options)
  				}
  			}
@@ -676,7 +691,7 @@ index e5ab7fa..ce035cd 100644
  			worker, err := player.NewPlayer(options)
  			if err != nil {
  				t.Fatal(err)
-@@ -1584,6 +1588,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+@@ -1410,6 +1414,9 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
  			time.Sleep(10 * time.Millisecond)
  		}
  	}
@@ -686,7 +701,7 @@ index e5ab7fa..ce035cd 100644
  	if mode == "episode-commit" {
  		if !stream.Media.IsEpisode() || stream.Media.Id().Uri() != request.Args.EpisodeURI || p.state.player.Track.Uri != request.Args.EpisodeURI || p.app.startCustody != op || op.CReceipt == nil || op.CReceipt.ContentDigest != op.ContentDigest || !receipt.Accepted || receipt.OperationID != op.Offer.OfferID {
  			t.Fatal("episode lost accepted START shape/identity")
-@@ -1832,6 +1839,21 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1673,6 +1680,21 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  		status := 200
  		header := make(http.Header)
  		switch {
@@ -708,7 +723,7 @@ index e5ab7fa..ce035cd 100644
  		case strings.HasPrefix(r.URL.Path, "/context-resolve/v1/"):
  			resolved := id.Uri()
  			if episodeMode == "episode-resolved-overflow" {
-@@ -1873,6 +1895,9 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
+@@ -1714,6 +1736,9 @@ func configureSelectedStage(t *testing.T, p *AppPlayer, options *player.Options,
  				}
  			case extpb.ExtensionKind_TRACK_V4:
  				message = &metadatapb.Track{Gid: metadataID.Id(), Duration: proto.Int32(55000), Name: proto.String("synthetic"), Number: proto.Int32(1), DiscNumber: proto.Int32(1), Album: &metadatapb.Album{Name: proto.String("synthetic"), Date: &metadatapb.Date{}}}

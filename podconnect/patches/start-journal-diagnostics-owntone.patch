@@ -39,21 +39,19 @@ index d263898..28b2719 100644
      }
    start_startup_quarantine = false;
 diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
-index 9d24eb7..17dd2b8 100644
+index dbf3141..59217a7 100644
 --- a/src/outputs_start.inc.c
 +++ b/src/outputs_start.inc.c
-@@ -534,20 +534,25 @@ bool outputs_start_emission_current(uint64_t id,uint64_t incarnation,uint64_t ep
-     && transport_identity_get(id,&actual)==0 && transport_identity_equal(&actual,&s->result.route_identity)
-     && (!outputs_radio_auto_resume_enabled() || start_reader_pcm_current(s,&actual));
+@@ -512,19 +512,24 @@ bool outputs_start_emission_current(uint64_t id,uint64_t incarnation,uint64_t ep
+   return (s->result.phase==OUTPUT_START_OPENED || s->result.phase==OUTPUT_START_COMPLETED)
+     && transport_identity_get(id,&actual)==0 && transport_identity_equal(&actual,&s->result.route_identity);
  }
 -static bool start_journal_admission(const struct output_start_request *r)
 +static const char *start_journal_denial(const struct output_start_request *r)
  {
 -  if(start_journal_fault)return false;
--  if(!start_startup_quarantine && (outputs_radio_absence_current_start_admissible(r) || outputs_radio_other_start_admissible(r) || outputs_radio_reacquire_start_admissible(r) || outputs_radio_absence_start_admissible(r) || outputs_radio_move_admissible(r) || outputs_radio_parked_bridge_start_admissible(r) || outputs_radio_parked_bridge_move_admissible(r)))return true;
 -  if(!start_journal.token[0] || start_old_process_retired())return true;
 +  if(start_journal_fault)return start_journal_fault_reason();
-+  if(!start_startup_quarantine && (outputs_radio_absence_current_start_admissible(r) || outputs_radio_other_start_admissible(r) || outputs_radio_reacquire_start_admissible(r) || outputs_radio_absence_start_admissible(r) || outputs_radio_move_admissible(r) || outputs_radio_parked_bridge_start_admissible(r) || outputs_radio_parked_bridge_move_admissible(r)))return NULL;
 +  if(!start_journal.token[0] || start_old_process_retired())return NULL;
    if(start_journal_retirement_outcome==OUTPUT_RETIRE_RETIRED_KNOWN
 -      && start_journal_payload_valid() && !start_startup_quarantine)return true;
@@ -77,7 +75,7 @@ index 9d24eb7..17dd2b8 100644
  }
  static bool start_available_reason(const struct output_start_request *r, bool diagnostic)
  {
-@@ -585,7 +590,13 @@ static bool start_available_reason(const struct output_start_request *r, bool di
+@@ -560,7 +565,13 @@ static bool start_available_reason(const struct output_start_request *r, bool di
    START_CHECK(transport_pin,"transport_pin");
    START_CHECK(room_volume_pin_busy(),"volume_pin");
    START_CHECK(room_volume_undrained(),"volume_undrained");

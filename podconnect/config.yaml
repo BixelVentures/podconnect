@@ -1,6 +1,6 @@
 ---
 name: "PodConnect Speakers"
-version: "0.26.94"
+version: "0.26.95"
 slug: "podconnect"
 image: "ghcr.io/bixelventures/{arch}-podconnect"   # pull a prebuilt image instead of compiling on-device
 description: "Turns your HomePods into Spotify Connect speakers (the audio engine for PodConnect)"
@@ -23,20 +23,12 @@ map:
   - type: addon_config
     read_only: false
 options:
-  # Radio starts idle with its own private identity and runtime custody.
-  # Only an explicit channel selection can acquire a speaker or start audio.
+  # Radio is a plain DR stream on its own player. Last command wins: a radio start takes the
+  # chosen speaker, and any Spotify command for that speaker stops the radio.
   radio_enabled: true
-  radio_owner_mode: "builtin"
-  radio_containment: "worker"
-  radio_native_url: ""
-  radio_physical_accepted: false
-  radio_transport_token: ""  # external radio manager API; empty uses the legacy attention token
-  radio_native_token: ""
-  radio_handoff_secret: ""
-  radio_sender_admin_password: ""
+  radio_transport_token: ""  # radio API token for PodVoice; empty uses the attention token
   radio_sender_api_port: 3989
   radio_sender_ws_port: 3990
-  radio_cgroup_parent: ""
   # Naming + HomePod selection live in the PANEL (Add speaker / ✎ Rename / ⚙ Settings) — the legacy
   # speaker_name/homepod_name seeds were removed (they only ever fed first-boot migration).
   bitrate: "320"             # GLOBAL DEFAULT — overridable per-room in the panel (⚙ Settings)
@@ -47,16 +39,17 @@ options:
   connect_aliases: []        # ADVANCED override for the Spotify Connect menu room names. Empty (default) = auto-derive one alias per room you add in the panel, in panel order. Set names ONLY to override — order MUST match your rooms.
 schema:
   radio_enabled: "bool?"
-  radio_owner_mode: "list(external|builtin)?"
-  radio_containment: "list(worker|cgroup)?"
+  radio_transport_token: "password?"
+  radio_sender_api_port: "int(1024,65535)?"
+  radio_sender_ws_port: "int(1024,65535)?"
+  # Retired radio custody options. Kept optional so saved settings still validate; ignored.
+  radio_owner_mode: "str?"
+  radio_containment: "str?"
   radio_native_url: "str?"
   radio_physical_accepted: "bool?"
-  radio_transport_token: "password?"
   radio_native_token: "str?"
   radio_handoff_secret: "str?"
   radio_sender_admin_password: "str?"
-  radio_sender_api_port: "int(1024,65535)?"
-  radio_sender_ws_port: "int(1024,65535)?"
   radio_cgroup_parent: "str?"
   bitrate: "list(96|160|320)"
   network_interface: "str?"

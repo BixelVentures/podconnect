@@ -121,13 +121,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/queue-metadata-background-native.patch \
   && git apply --check /patches/dealer-fieldcodes-native.patch \
   && git apply /patches/dealer-fieldcodes-native.patch \
-  && sha256sum -c /patches/radio-handoff-native.sha256 \
-  && git apply --check /patches/radio-handoff-native.patch \
-  && git apply /patches/radio-handoff-native.patch \
   && git apply --check /patches/queue-occurrence-continuity-native.patch \
   && git apply /patches/queue-occurrence-continuity-native.patch \
-  && git apply --check /patches/radio-primary-native.patch \
-  && git apply /patches/radio-primary-native.patch \
   && git apply --check /patches/status-health-diagnostics-native.patch \
   && git apply /patches/status-health-diagnostics-native.patch \
   && git apply --check /patches/queue-writer-inspection-native.patch \
@@ -136,8 +131,6 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/connect-transfer-retirement-native.patch \
   && git apply --check /patches/room-autoplay-native.patch \
   && git apply /patches/room-autoplay-native.patch \
-  && git apply --check /patches/radio-orphan-park-native.patch \
-  && git apply /patches/radio-orphan-park-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -152,21 +145,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libsodium-dev libjson-c-dev libwebsockets-dev libcurl4-openssl-dev libprotobuf-c-dev \
       libunistring-dev libgnutls28-dev libconfuse-dev libxml2-dev nodejs npm ca-certificates \
       libflac-dev libvorbis-dev libogg-dev \
-      avahi-daemon dbus libnss-mdns ffmpeg curl jq tar iproute2 \
+      avahi-daemon dbus libnss-mdns ffmpeg curl jq tar iproute2 sqlite3 \
   && rm -rf /var/lib/apt/lists/*
 
 # --- OwnTone (AirPlay 2 sender) — built from source (no ARM64 package exists) ---
 ARG OWNTONE_REF=29.2
-COPY patches/radio-handoff-owntone.patch /patches/radio-handoff-owntone.patch
-COPY patches/radio-handoff-owntone.sha256 /patches/radio-handoff-owntone.sha256
 COPY patches/start-journal-diagnostics-owntone.patch /patches/start-journal-diagnostics-owntone.patch
 COPY patches/start-journal-diagnostics-owntone.sha256 /patches/start-journal-diagnostics-owntone.sha256
-COPY patches/radio-primary-owntone.patch /patches/radio-primary-owntone.patch
-COPY patches/radio-primary-owntone.sha256 /patches/radio-primary-owntone.sha256
-COPY patches/radio-startup-diagnostics-owntone.patch /patches/radio-startup-diagnostics-owntone.patch
-COPY patches/radio-startup-diagnostics-owntone.sha256 /patches/radio-startup-diagnostics-owntone.sha256
-COPY patches/radio-orphan-release-owntone.patch /patches/radio-orphan-release-owntone.patch
-COPY patches/radio-orphan-release-owntone.sha256 /patches/radio-orphan-release-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -322,21 +307,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/retire-fieldcodes-owntone.sha256 \
   && git apply --check /patches/retire-fieldcodes-owntone.patch \
   && git apply /patches/retire-fieldcodes-owntone.patch \
-  && sha256sum -c /patches/radio-handoff-owntone.sha256 \
-  && git apply --check /patches/radio-handoff-owntone.patch \
-  && git apply /patches/radio-handoff-owntone.patch \
   && sha256sum -c /patches/start-journal-diagnostics-owntone.sha256 \
   && git apply --check /patches/start-journal-diagnostics-owntone.patch \
   && git apply /patches/start-journal-diagnostics-owntone.patch \
-  && sha256sum -c /patches/radio-primary-owntone.sha256 \
-  && git apply --check /patches/radio-primary-owntone.patch \
-  && git apply /patches/radio-primary-owntone.patch \
-  && sha256sum -c /patches/radio-startup-diagnostics-owntone.sha256 \
-  && git apply --check /patches/radio-startup-diagnostics-owntone.patch \
-  && git apply /patches/radio-startup-diagnostics-owntone.patch \
-  && sha256sum -c /patches/radio-orphan-release-owntone.sha256 \
-  && git apply --check /patches/radio-orphan-release-owntone.patch \
-  && git apply /patches/radio-orphan-release-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \
@@ -359,19 +332,6 @@ RUN chmod +x /usr/local/bin/go-librespot
 
 # Dedicated user for OwnTone (it drops privileges to this uid).
 RUN useradd -r -s /usr/sbin/nologin owntone || true
-
-# Radio gets a different permanent identity and a fixed-target pre-exec helper.
-# Existing Spotify processes, users and resource limits are left untouched.
-RUN useradd -r -s /usr/sbin/nologin podradio
-RUN test -x /usr/bin/prlimit \
-  && test "$(id -u podradio)" != "$(id -u owntone)" \
-  && test "$(id -g podradio)" != "$(id -g owntone)"
-COPY radio-worker/worker.c /tmp/podconnect-radio-worker.c
-RUN mkdir -p /usr/libexec \
-  && cc -O2 -Wall -Wextra -Werror -o /usr/libexec/podconnect-radio-worker /tmp/podconnect-radio-worker.c \
-  && chown root:root /usr/libexec/podconnect-radio-worker \
-  && chmod 0755 /usr/libexec/podconnect-radio-worker \
-  && rm /tmp/podconnect-radio-worker.c
 
 # PodConnect manager binary (serves the Ingress picker UI)
 COPY --from=manager-build /podconnect-manager /usr/local/bin/podconnect-manager

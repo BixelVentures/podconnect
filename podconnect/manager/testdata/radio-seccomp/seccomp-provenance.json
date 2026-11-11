@@ -1,9 +1,0 @@
-{
-  "upstream": "https://github.com/moby/profiles",
-  "commit": "4b8214fc4971e06172938a1f1554ccff6647ee80",
-  "source": "https://raw.githubusercontent.com/moby/profiles/4b8214fc4971e06172938a1f1554ccff6647ee80/seccomp/default.json",
-  "original_sha256": "6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6",
-  "derived_sha256": "108b7ba359976409912511a8ce36bcf6fd0f5932a23f2ad3a2a1f1a5b8e247f7",
-  "change": "Only clone3 becomes allowed; every other syscall rule, architecture, default errno and capability condition remains semantically identical. No CAP_SYS_ADMIN/NET_ADMIN or privileged mode.",
-  "purpose": "Actual clone3 UseCgroupFD launch inside a task-owned delegated cgroup; no clone-then-move race."
-}

@@ -57,34 +57,21 @@ jobs:
           done
           git apply --check "$patch_dir/dealer-fieldcodes-native.patch"
           git apply "$patch_dir/dealer-fieldcodes-native.patch"
-          sed "s@ /patches/@ $patch_dir/@" "$patch_dir/radio-handoff-native.sha256" | sha256sum -c -
-          git apply --check "$patch_dir/radio-handoff-native.patch"
-          git apply "$patch_dir/radio-handoff-native.patch"
-          git apply --check "$patch_dir/queue-occurrence-continuity-native.patch"
-          git apply "$patch_dir/queue-occurrence-continuity-native.patch"
-          git apply --check "$patch_dir/radio-primary-native.patch"
-          git apply "$patch_dir/radio-primary-native.patch"
-          git apply --check "$patch_dir/status-health-diagnostics-native.patch"
-          git apply "$patch_dir/status-health-diagnostics-native.patch"
-          git apply --check "$patch_dir/queue-writer-inspection-native.patch"
-          git apply "$patch_dir/queue-writer-inspection-native.patch"
-          git apply --check "$patch_dir/connect-transfer-retirement-native.patch"
-          git apply "$patch_dir/connect-transfer-retirement-native.patch"
-          git apply --check "$patch_dir/room-autoplay-native.patch"
-          git apply "$patch_dir/room-autoplay-native.patch"
-          git apply --check "$patch_dir/radio-orphan-park-native.patch"
-          git apply "$patch_dir/radio-orphan-park-native.patch"
-          fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
-          git apply --check "$fixture"
-          git apply "$fixture"
-          fixture="$GITHUB_WORKSPACE/.github/fixtures/transfer-retirement-native.patch"
-          git apply --check "$fixture"
-          git apply "$fixture"
-          fixture="$GITHUB_WORKSPACE/.github/fixtures/room-autoplay-native-tests.patch"
-          git apply --check "$fixture"
-          git apply "$fixture"
-      - name: Test Manager radio and playback revision contracts
-        run: cd podconnect/manager && go test ./... -run '^(TestPrimaryRadio|TestRadio|TestProducer|TestPlaybackRevision|TestConfiguredRadioBootstrap)' -count=1
+          for patch in queue-occurrence-continuity-native.patch status-health-diagnostics-native.patch queue-writer-inspection-native.patch connect-transfer-retirement-native.patch room-autoplay-native.patch; do
+            git apply --check "$patch_dir/$patch"
+            git apply "$patch_dir/$patch"
+          done
+          for fixture in transfer-retirement-native room-autoplay-native-tests; do
+            git apply --check "$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
+            git apply "$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
+          done
+          # Spotify control never passes a radio custody gate again.
+          if grep -rqE 'radioHeld|radioMutationAllowed|radioOutputFence' daemon player output; then
+            echo "radio custody gate found in Native" >&2
+            exit 1
+          fi
+      - name: Test Manager radio, room status and legacy cleanup
+        run: cd podconnect/manager && go test ./... -run '^(TestRadio|TestSpotify|TestRooms|TestActiveRoute|TestStartupCleanup|TestImageBuilds|TestPlaybackRevision)' -count=1
       - name: Test Native queue, transport, output and retained packages
         run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
       - name: Build existing daemon-test artifact for composed fixture
@@ -93,14 +80,6 @@ jobs:
         with:
           name: selected-native-tests
           path: /tmp/native-tests
-          if-no-files-found: error
-          retention-days: 3
-      - name: Build configured Manager test for the composed radio fixture
-        run: cd podconnect/manager && go test -race -c -o /tmp/primary-manager-tests .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: primary-manager-tests
-          path: /tmp/primary-manager-tests
           if-no-files-found: error
           retention-days: 3
       - name: Build patched fork
@@ -200,17 +179,21 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone radio-startup-diagnostics-owntone radio-orphan-release-owntone; do
+          for patch in retire-fieldcodes-owntone start-journal-diagnostics-owntone; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"
           done
           # CI-only fixture overlays are applied after the immutable production stack.
-          for fixture in connect-retired-playback-clock-ci primary-start-owner-diagnostic-ci primary-held-teardown-c primary-writer-stat-churn-ci paused-queue-owner-c primary-control-loss-c primary-cold-detachment-c; do
+          for fixture in connect-retired-playback-clock-ci paused-queue-owner-c; do
             patch="$GITHUB_WORKSPACE/.github/fixtures/$fixture.patch"
             git apply --check "$patch"
             git apply "$patch"
           done
+          if grep -rqE 'radio_handoff|radio-handoff' src; then
+            echo "radio custody found in OwnTone" >&2
+            exit 1
+          fi
       - name: Compile and run actual queue C owner modes
         run: |
           set -Eeuo pipefail
@@ -260,34 +243,12 @@ jobs:
           sudo -n src/airplay_callback_owner --start-retire-closed-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire
-      - name: Verify primary radio using the actual OwnTone owner and encoder
-        working-directory: /tmp/owntone
-        run: |
-          set -Eeuo pipefail
-          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
-          src/airplay_callback_owner --radio-primary-decode
-          src/airplay_callback_owner --radio-primary-station-start
-          PC_PRIMARY_RADIO_DECODER_STALL=1 src/airplay_callback_owner --radio-primary-station-start
-          sudo -n env PC_PRIMARY_RADIO_INTENT=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_RADIO_STATION=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_PARK_REOPEN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN=1 PC_PRIMARY_SPOTIFY_PARK_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          for case in isolated writer epoch cas process local-cleanup station spotify; do
-            sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_REPLACE=1 PC_PRIMARY_SPOTIFY_RETURN_WRITER=1 PC_PRIMARY_SPOTIFY_CONTROL_LOSS="$case" src/airplay_callback_owner --radio-primary-disjoint-start
-          done
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_FINALIZE_STAT_CHURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_SPOTIFY_PARK=1 PC_PRIMARY_SPOTIFY_STOP_RESTART=1 PC_PRIMARY_SPOTIFY_RETURN=1 src/airplay_callback_owner --radio-primary-disjoint-start
-          sudo -n env PC_PRIMARY_RADIO_STATION=1 PC_PRIMARY_RADIO_REPLACE_DISJOINT=1 src/airplay_callback_owner --radio-primary-disjoint-start
       - uses: actions/upload-artifact@v4
         with:
           name: selected-c-callback
           path: |
             /tmp/owntone/src/airplay_callback_owner
             /tmp/owntone/sqlext/.libs/owntone-sqlext.so
-            /tmp/owntone/tests/fixtures/radio-sender-fixture.mp3
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
@@ -314,35 +275,6 @@ jobs:
         with:
           name: selected-native-tests
           path: /tmp/owntone
-      - uses: actions/download-artifact@v4
-        with:
-          name: primary-manager-tests
-          path: /tmp/owntone
-      - name: Verify exact primary Native actor through production OwnTone HTTP
-        working-directory: /tmp/owntone
-        run: |
-          set -Eeuo pipefail
-          chmod +x src/airplay_callback_owner native-tests primary-manager-tests
-          install -m 644 tests/fixtures/radio-sender-fixture.mp3 /tmp/radio-sender-fixture.mp3
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" primary-radio-http
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_HOLD_TEARDOWN=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_EXPECT_RESUME=1 PC_NATIVE_PRIMARY_STOP_RESTART=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_CONTROL_LOSS=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target
-          sudo -n unshare --mount --propagation private env PC_FIXTURE_HOST_MOUNT_NS="$(readlink /proc/self/ns/mnt)" \
-            PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests \
-            PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests \
-            python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-cold-detachment
-          sudo -n unshare --mount --propagation private env PC_FIXTURE_HOST_MOUNT_NS="$(readlink /proc/self/ns/mnt)" \
-            PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests \
-            PC_NATIVE_PRIMARY_COLD_GRACEFUL_SPOTIFY=1 \
-            python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-cold-detachment
-          status=0
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_NEW_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-same-target || status=1
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-manager || status=1
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_PRIMARY_CONTROL_LOSS=1 PC_PRIMARY_MANAGER_TEST_BIN=/tmp/owntone/primary-manager-tests python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-primary-manager || status=1
-          exit "$status"
       - name: Verify held fresh START and explicit late paused Resume against actual C
         working-directory: /tmp/owntone
         run: |
@@ -353,7 +285,6 @@ jobs:
           if ldd src/airplay_callback_owner native-tests | grep -q 'not found'; then exit 1; fi
           trap 'status=$?; if [ "$status" -ne 0 ]; then cat pc52-selected-*-c.log pc52-selected-*-native.log 2>/dev/null || true; fi; exit "$status"' EXIT
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_METADATA_PRESENT=1 PC_REQUIRE_RTP_AUDIO=1 PC_HOLD_START_SETUP=1 PC_REQUIRE_FIRST_SYNC_CLOCK=1 PC_SHUTDOWN_JOURNAL=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-selected-rtp
-          sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_METADATA_PRESENT=1 PC_REQUIRE_RTP_AUDIO=1 PC_NATIVE_CANCEL_STAGED_SELECTION=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-selected-rtp
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_METADATA_PRESENT=1 PC_REQUIRE_RTP_AUDIO=1 PC_LATE_PAUSED_RESUME=1 PC_REQUIRE_FIRST_SYNC_CLOCK=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-paused
           sudo -n env PC_FIXTURE_ROOT=/tmp/owntone PC_NATIVE_TEST_BIN=/tmp/owntone/native-tests PC_NATIVE_START_EXPECT_PAUSE_RETAINED=1 PC_NATIVE_START_EXPECT_PAUSE_LOSS=1 python3 "$GITHUB_WORKSPACE/.github/fixtures/run-selected-composed.py" actual-c-native-pause
           for mode in complete pending choose manual-commit stale-commit; do

@@ -1,5 +1,5 @@
 diff --git a/daemon/api_server.go b/daemon/api_server.go
-index f0cd26f..39d80a3 100644
+index 152ffad..550e426 100644
 --- a/daemon/api_server.go
 +++ b/daemon/api_server.go
 @@ -32,6 +32,7 @@ type ConcreteApiServer struct {
@@ -40,8 +40,8 @@ index f0cd26f..39d80a3 100644
 -	})
 +	m.HandleFunc("/status", s.handleStatus)
  	m.HandleFunc("/player/aliases", s.handleAliases)
- 	m.HandleFunc("/radio/handoff/", s.handleRadioHTTP)
- 	m.HandleFunc("/radio/primary", s.handleRadioPrimaryHTTP)
+ 	m.HandleFunc("/player/play", func(w http.ResponseWriter, r *http.Request) {
+ 		if r.Method != "POST" {
 diff --git a/daemon/status_health_probe.go b/daemon/status_health_probe.go
 new file mode 100644
 index 0000000..35129f6
