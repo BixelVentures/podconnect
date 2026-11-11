@@ -161,6 +161,8 @@ COPY patches/start-journal-diagnostics-owntone.patch /patches/start-journal-diag
 COPY patches/start-journal-diagnostics-owntone.sha256 /patches/start-journal-diagnostics-owntone.sha256
 COPY patches/radio-primary-owntone.patch /patches/radio-primary-owntone.patch
 COPY patches/radio-primary-owntone.sha256 /patches/radio-primary-owntone.sha256
+COPY patches/radio-startup-diagnostics-owntone.patch /patches/radio-startup-diagnostics-owntone.patch
+COPY patches/radio-startup-diagnostics-owntone.sha256 /patches/radio-startup-diagnostics-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -325,6 +327,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/radio-primary-owntone.sha256 \
   && git apply --check /patches/radio-primary-owntone.patch \
   && git apply /patches/radio-primary-owntone.patch \
+  && sha256sum -c /patches/radio-startup-diagnostics-owntone.sha256 \
+  && git apply --check /patches/radio-startup-diagnostics-owntone.patch \
+  && git apply /patches/radio-startup-diagnostics-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

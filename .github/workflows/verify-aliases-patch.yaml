@@ -198,7 +198,7 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone; do
+          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone radio-startup-diagnostics-owntone; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"

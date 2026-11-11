@@ -1,3 +1,7 @@
+## Speakers 0.26.92 — diagnose blocked radio handoff
+
+- Log why a restored radio handoff row closes startup and which radio state blocks a Spotify start. Existing ownership, playback actions and recovery decisions are unchanged.
+
 ## Speakers 0.26.91 — diagnose speaker readiness
 
 - Report the first readiness check that rejects a configured output for Spotify start or radio. Existing ownership, playback actions and recovery decisions are unchanged.
