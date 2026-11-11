@@ -226,6 +226,28 @@ class PlaybackCommands:
             and not data.api._web.closed
         )
 
+    def _remember_accepted_volume(self, target_id, percent):
+        """Speakers owns room volume; Spotify's device volume may never mirror it."""
+        baseline = None
+        for row in (self.data.coordinator.data or {}).get("devices", []) or []:
+            if isinstance(row, dict) and row.get("id") == target_id:
+                baseline = row.get("volume_percent")
+        self.accepted_volume = {
+            "target_id": target_id,
+            "percent": percent,
+            "baseline": baseline,
+        }
+
+    def displayed_volume(self, target_id, reported):
+        """Latest explicit accepted volume until Spotify reports another change."""
+        accepted = getattr(self, "accepted_volume", None)
+        if not accepted or accepted["target_id"] != target_id:
+            return reported
+        if reported in (accepted["baseline"], accepted["percent"]):
+            return accepted["percent"]
+        self.accepted_volume = None  # A newer external change wins.
+        return reported
+
     def controls(
         self,
         entry_id,
@@ -804,7 +826,12 @@ class PlaybackCommands:
                 # Native room transport/volume are idempotent intents: Speakers
                 # fences the exact account/room/output at commit, so a newer Web
                 # API poll or a prior command's floor must not reject them.
-                intent = room_transport is not None or room_volume is not None
+                # A prepared queue occurrence is fenced the same way by Speakers.
+                intent = (
+                    room_transport is not None
+                    or room_volume is not None
+                    or room_queue is not None
+                )
                 if observed["owner_epoch"] != epoch or (
                     not intent
                     and observed["poll_sequence"] != sequence
@@ -888,6 +915,10 @@ class PlaybackCommands:
                 )
                 if not ack["protocol_accepted"]:
                     receipt["error_kind"] = "outcome_unknown"
+                else:
+                    self._remember_accepted_volume(
+                        target_id, request["args"]["percent"]
+                    )
             elif room_transport is not None:
                 if action not in (
                     "pause",

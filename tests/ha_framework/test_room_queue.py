@@ -404,20 +404,31 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertTrue(all(path.endswith("prepare") for path, _ in self.queue_posts))
         self.assertEqual(self.entries[0].runtime_data.commands.command_sequence, 0)
 
-    async def test_queue_stage_poll_replaced_never_commit(self):
+    async def test_queue_routine_poll_during_stage_still_prepares_and_commits(self):
+        # Issue #140: on Green a Spotify poll (every 3 s while playing, plus
+        # Native revision refreshes) landed while Speakers staged the choice,
+        # so prepare_room_queue answered not-ok and PodVoice logged
+        # validate_preparation/invalid_response. Speakers fences the occurrence.
         self.queue_hold = True
         await self.queue_read()
-        running = self._task(
-            self.queue_call("prepare_room_queue", self.queue_request())
-        )
+        body = self.queue_request()
+        running = self._task(self.queue_call("prepare_room_queue", body))
         await asyncio.wait_for(self.queue_entered.wait(), 2)
         await self.entries[0].runtime_data.coordinator.async_refresh()
         self.queue_release.set()
-        result = await running
-        self.assertFalse(result["ok"])
+        prepared = await running
+        self.assertTrue(prepared["ok"])
+        self.assertEqual(prepared["schema"], "podconnect.room_queue_preparation.v1")
         self.assertEqual(len(self.queue_posts), 1)
         self.assertFalse(self.entries[0].runtime_data.commands.busy)
         self.assertEqual(self.entries[0].runtime_data.commands.command_sequence, 0)
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        result = await self.queue_call(
+            "control_room_queue", body | {"prepare_id": prepared["prepare_id"]}
+        )
+        self.assertEqual(result["outcome"], "accepted")
+        self.assertEqual(len(self.queue_posts), 2)
+        self.assertEqual(self.entries[0].runtime_data.commands.command_sequence, 1)
 
     async def test_queue_cancel_stage_no_effect_no_ledger_and_no_restage(self):
         self.queue_hold = True
@@ -436,7 +447,7 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
 
     async def test_queue_commit_owner_replaced_after_stage_rejects_before_send(self):
         body, prepared = await self.stage()
-        await self.entries[0].runtime_data.coordinator.async_refresh()
+        self.entries[0].runtime_data.coordinator.owner_epoch = "replaced"
         result = await self.queue_call(
             "control_room_queue", body | {"prepare_id": prepared["prepare_id"]}
         )

@@ -255,11 +255,11 @@ class RoomQueue:
         observed = self.commands.controls(
             request["config_entry_id"], request["target_id"], for_command=True
         )
-        if (
-            observed["owner_epoch"] != request["owner_epoch"]
-            or observed["poll_sequence"] != request["expected_poll_sequence"]
-            or observed["poll_sequence"] <= self.commands.poll_floor
-        ):
+        # The selected occurrence is fenced by Speakers (observation, session,
+        # queue revision, route and writer) at prepare and commit. A routine
+        # Spotify Web API poll landing meanwhile is not a new owner and must
+        # not reject the user's explicit queue choice (issue #140).
+        if observed["owner_epoch"] != request["owner_epoch"]:
             raise CommandRejected("stale_observation")
         return observed
 

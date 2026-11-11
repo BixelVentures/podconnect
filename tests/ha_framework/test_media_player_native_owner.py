@@ -94,6 +94,19 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         return value
 
     async def _backend(self, request):
+        if getattr(self, "local_stop_fixture", False):
+            if request.path == "/api/rooms" and request.method == "GET":
+                return web.json_response(
+                    {
+                        "rooms": [
+                            {"id": "r0", "homepod_id": "123", "alias": False},
+                            {"id": "r6", "homepod_id": "456", "alias": True},
+                        ]
+                    }
+                )
+            if request.path == "/api/stop":
+                self.local_stops.append((request.method, dict(request.query)))
+                return web.json_response({"ok": True})
         if self.source_selection_fixture:
             if (
                 request.path == "/api/rooms"
@@ -1402,6 +1415,31 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             ["/api/room-transport/prepare", "/api/room-transport/commit"],
         )
         self.assertIsNone(self.entity._optimistic_playing)
+
+    async def test_media_native_pause_after_failed_move_pauses_locally(self):
+        # Issue #140: after a failed move both HomePods stayed selected, no exact
+        # route could be bound and Pause failed with "Native route unavailable".
+        # Pause must always stop the Native engine, without any Spotify mutation.
+        self.playing = True
+        await self.data.coordinator.async_refresh()
+        self.local_stop_fixture, self.local_stops = True, []
+        self.output_selected = ["123", "456"]
+        await self.hass.services.async_call(
+            "media_player", "media_pause", {"entity_id": self.entity_id}, blocking=True
+        )
+        self.assertEqual(self.local_stops, [("POST", {"room": "r0"})])
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.room_posts, [])
+
+    async def test_media_native_resume_without_route_stays_closed(self):
+        self.playing = False
+        await self.data.coordinator.async_refresh()
+        self.local_stop_fixture, self.local_stops = True, []
+        self.output_selected = ["123", "456"]
+        with self.assertRaises(HomeAssistantError):
+            await self.native_call("media_play")
+        self.assertEqual(self.local_stops, [])
+        self.assertEqual(self._writes(), [])
 
     async def native_call(self, service, **kwargs):
         return await self.hass.services.async_call(

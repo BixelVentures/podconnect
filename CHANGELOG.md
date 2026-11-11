@@ -1,3 +1,9 @@
+## Control 0.10.41 — kø, pause og lydstyrke efter Green 11. nov (#140)
+
+- Valg af en kørække afvises ikke længere, blot fordi en almindelig Spotify-poll lander mens Speakers forbereder valget. Speakers kontrollerer stadig observation, session, kørevision, rute og writer ved prepare og commit; en ny ejer (epoch/konto) afviser stadig.
+- Pause virker altid på Native-motoren: kan der ikke bindes en præcis rum-rute (fx efter et mislykket højttalerskift), pauser Control via Speakers' lokale `/api/stop` for primærrummet. Det kan aldrig starte eller flytte lyd; Fortsæt og øvrige handlinger er uændret lukkede uden rute.
+- HA-entitetens lydstyrke viser den senest accepterede rum-lydstyrke, indtil Spotify melder en anden ændring (Spotify spejler ikke Speakers' rum-lydstyrke).
+
 ## Speakers 0.26.93 — frigiv gendannet radio-slot efter genstart
 
 - Et gendannet, ukendt radio-park-slot fra en proces der er død frigives nu også når der ingen custody-række findes (Green-tilstanden efter 0.26.92). Kræver stadig: ingen session, ingen igangværende start, ingen åben Spotify-writer og ingen ventende cold-detachment. Hvert udfald (frigivet/bevaret + årsag) logges én gang.

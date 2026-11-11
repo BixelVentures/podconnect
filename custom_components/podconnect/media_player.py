@@ -234,6 +234,10 @@ class PodConnectMediaPlayer(
     def volume_level(self) -> float | None:
         dev = self._device
         vol = dev.get("volume_percent") if dev else None
+        runtime = getattr(self.coordinator.config_entry, "runtime_data", None)
+        commands = getattr(runtime, "commands", None)
+        if commands is not None and dev is not None:
+            vol = commands.displayed_volume(self._device_id, vol)
         return vol / 100 if vol is not None else None
 
     @property
@@ -415,6 +419,14 @@ class PodConnectMediaPlayer(
                 or not isinstance(binding, dict)
                 or binding.get("target_id") != self._device_id
             ):
+                if action == "pause":
+                    # Pause must always be possible on the Native engine, also
+                    # when no exact room route is observed (e.g. after a failed
+                    # move). Speakers' local pause can never start or move audio.
+                    await speakers.pause_native_engine()
+                    owned(same_poll=False)
+                    await coordinator.async_refresh_after_command()
+                    return True
                 raise HomeAssistantError("Native route unavailable")
             room, homepod = binding["native_room_id"], binding["homepod_id"]
             owner = (

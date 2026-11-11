@@ -315,6 +315,23 @@ class SpeakersClient:
             seen.add(row["id"])
         return rows
 
+    async def pause_native_engine(self) -> None:
+        """Account-agnostic local pause of the primary Native engine and its AirPlay.
+
+        Speakers' /api/stop only pauses (it can never start or move audio), so it
+        is the always-available stop when no exact room route can be bound, e.g.
+        after a failed move (issue #140).
+        """
+        rows = await self.rooms()
+        primary = [row for row in rows if row.get("alias") is False]
+        if len(primary) != 1:
+            raise SpeakersError("Native engine room unavailable")
+        reply = await self._request(
+            "POST", "/api/stop?" + urlencode({"room": primary[0]["id"]})
+        )
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            raise SpeakersError("Native local pause failed")
+
     async def outputs(self) -> dict:
         data = await self._request("GET", "/api/state")
         if not isinstance(data, dict) or type(data.get("owntone_up")) is not bool:
