@@ -1,6 +1,8 @@
-## Speakers 0.26.92 — diagnose blocked radio handoff
+## Speakers 0.26.92 — frigiv forladt radio-hold
 
-- Log why a restored radio handoff row closes startup and which radio state blocks a Spotify start. Existing ownership, playback actions and recovery decisions are unchanged.
+- Et output frigives igen, naar den proces eller modtagerforbindelse der holdt radioen er vaek (genstart, tabt RTSP-forbindelse), uden aaben Spotify-writer og uden levende session. Ingen Stop-kvittering opfindes; modtagerens gamle session udloeber selv. En levende radio frigives aldrig.
+- Ugyldige radio-handoff-raekker ved opstart blokerer kun deres eget output og logges (hidtil tavs global blokering).
+- Nye logs: opstartsraekker, afviste raekker, `Radio orphan released/kept` og hvorfor `radio_target_blocked` afviser.
 
 ## Speakers 0.26.91 — diagnose speaker readiness
 
