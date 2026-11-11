@@ -2,4 +2,3 @@ podconnect/patches/*.patch -whitespace
 packaging/patches/*.patch -whitespace
 packaging/patches/*.diff -whitespace
 .github/fixtures/*.patch -whitespace
-scripts/radio-ha-worker/*.patch -whitespace

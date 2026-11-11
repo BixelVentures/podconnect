@@ -51,6 +51,11 @@ type device struct {
 	Selected          bool                     `json:"selected"`
 	NeedsAuth         bool                     `json:"needs_auth"`
 	AttentionIdentity *nativeAttentionIdentity `json:"attention_identity,omitempty"`
+
+	// volume is the output's own level (0..100) as OwnTone reports it, valid
+	// when hasVolume. Unexported: it is not part of the /api/state device shape.
+	volume    int
+	hasVolume bool
 }
 
 type stateResp struct {
@@ -218,12 +223,20 @@ func fetchOutputsFrom(base string) ([]device, bool) {
 				native = &decoded
 			}
 		}
+		volume, hasVolume := 0, false
+		if n, ok := o["volume"].(json.Number); ok {
+			if v, err := n.Int64(); err == nil && v >= 0 && v <= 100 {
+				volume, hasVolume = int(v), true
+			}
+		}
 		out = append(out, device{
 			ID:                fmt.Sprint(o["id"]), // works whether id is a JSON string or number
 			Name:              name,
 			Selected:          asBool(o["selected"]),
 			NeedsAuth:         asBool(o["needs_auth_key"]) || asBool(o["requires_auth"]),
 			AttentionIdentity: native,
+			volume:            volume,
+			hasVolume:         hasVolume,
 		})
 	}
 	return out, true
@@ -746,6 +759,9 @@ func routeAliasOutputWithGuardOutcome(primaryOwnTone string, aliasId int, live *
 		}
 		target = rooms[aliasId-1]
 	}
+	// Spotify is about to take this speaker: radio there stops first, so the
+	// HomePod has one sender (last command wins).
+	radioOwner.yield(context.Background(), target.ID)
 	var nativeRequest *nativeManualObservation
 	if live != nil {
 		nativeRequest = live.nativeCatalogRequest()
@@ -992,6 +1008,10 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 
 			playing := gl.Active && !gl.Paused && !gl.Stopped
 			released := fileExists(releasedPath(room))
+			// Spotify audio on a speaker wins over radio there (last command wins).
+			if room.Idx == 0 && playing && radioOwner.playingOn("") {
+				radioOwner.spotifyPlaying(spotifyRouteRoomID(gl, loadRooms()))
+			}
 
 			// Never-loud on transfer: when you move playback to ANOTHER device (e.g. pick "this Mac"
 			// in Spotify), go-librespot stays Active but not-playing and reports a remembered/default
@@ -1348,26 +1368,13 @@ func startRoomBridge(room *Room) {
 }
 
 func main() {
-	radioGuardianEntry() // exact private-radio guardian exits before ordinary startup
-	radioWorkerGuardianEntry()
 	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	store = newRoomStore()
 	mgr = newRoomManager(store)
-	if dataDir == "/data" {
-		fence, err := openPrimaryOwnerFence(dataDir)
-		if err != nil {
-			log.Fatalf("primary owner lifetime fence unavailable: %v", err)
-		}
-		defer fence.file.Close() // Never unlock the shared description while a child retains it.
-		mgr.primaryOwnerFence = fence
-	}
-	// Radio prepares only its own private settings. A failed radio opt-in must
-	// never prevent the existing Spotify service from starting.
-	if err := ensureRadioWorkerSettings(); err != nil {
-		log.Printf("radio: private startup settings unavailable")
-	}
-	radioOwner = configuredRadioOwner()
+	// Earlier releases persisted radio custody, holds and parks. None of it may
+	// survive into this release or block Spotify, so clear it before any engine starts.
+	cleanupLegacyRadioState(dataDir, loadRooms())
 
 	// Single-engine: run ONLY the primary room's engine. The other rooms are Spotify device-aliases
 	// advertised on it (one session = no contention); output is routed per alias by the primary bridge.
@@ -1380,7 +1387,9 @@ func main() {
 		startRoomBridge(rm)
 	}
 
-	startConfiguredRadioBuiltin(signals, radioOwner)
+	// Radio is a plain stream on its own player. It never holds a speaker for Spotify.
+	radioOwner = newRadioPlayer(radioPlayerConfigFromOptions())
+	go radioOwner.run(signals)
 
 	lastCount := -1
 
@@ -1415,6 +1424,13 @@ func main() {
 			resp.NowPlaying = nowPlaying(rm.Librespot)
 			if gl.HasVol {
 				resp.Volume = gl.VolPct
+			}
+			// The real level is the routed HomePod output's own volume.
+			rooms := loadRooms()
+			if route := roomByIDIn(rooms, activeRouteRoomID(rooms, devs, gl)); route != nil {
+				if idx, _ := matchOutput(devs, route.HomepodID, route.HomepodName); idx >= 0 && devs[idx].hasVolume {
+					resp.Volume = devs[idx].volume
+				}
 			}
 		}
 		writeJSON(w, resp)
@@ -1459,40 +1475,39 @@ func main() {
 	// spawn, select. DELETE /api/rooms/<id> — remove a speaker.
 	http.HandleFunc("/api/rooms/", roomsItemHandler)
 
-	http.HandleFunc("/api/room-switch", roomSwitchHandler)
+	http.HandleFunc("/api/room-switch", spotifyTakesOver(roomSwitchHandler))
 	http.HandleFunc("/api/room-transport/state", transportStateHandler)
-	http.HandleFunc("/api/room-transport/prepare", transportPrepareHandler)
-	http.HandleFunc("/api/room-transport/commit", transportCommitHandler)
+	http.HandleFunc("/api/room-transport/prepare", spotifyTakesOver(transportPrepareHandler))
+	http.HandleFunc("/api/room-transport/commit", spotifyTakesOver(transportCommitHandler))
 	http.HandleFunc("/api/room-volume/state", roomVolumeStateHandler)
-	http.HandleFunc("/api/room-volume/prepare", roomVolumePrepareHandler)
-	http.HandleFunc("/api/room-volume/commit", roomVolumeCommitHandler)
+	http.HandleFunc("/api/room-volume/prepare", spotifyTakesOver(roomVolumePrepareHandler))
+	http.HandleFunc("/api/room-volume/commit", spotifyTakesOver(roomVolumeCommitHandler))
 	http.HandleFunc("/api/room-volume/cancel", roomVolumeCancelHandler)
 	http.HandleFunc("/api/room-volume/result", roomVolumeResultHandler)
 	http.HandleFunc("/api/room-content/state", roomContentStateHandler)
-	http.HandleFunc("/api/room-content/prepare", roomContentPrepareHandler)
+	http.HandleFunc("/api/room-content/prepare", spotifyTakesOver(roomContentPrepareHandler))
 	http.HandleFunc("/api/room-content/result", roomContentResultHandler)
-	http.HandleFunc("/api/room-content/commit", roomContentCommitHandler)
+	http.HandleFunc("/api/room-content/commit", spotifyTakesOver(roomContentCommitHandler))
 	http.HandleFunc("/api/room-content/cancel", roomContentCancelHandler)
 	http.HandleFunc("/api/room-move/state", roomMoveStateHandler)
-	http.HandleFunc("/api/room-move/prepare", roomMovePrepareHandler)
+	http.HandleFunc("/api/room-move/prepare", spotifyTakesOver(roomMovePrepareHandler))
 	http.HandleFunc("/api/room-move/result", roomMoveResultHandler)
-	http.HandleFunc("/api/room-move/commit", roomMoveCommitHandler)
+	http.HandleFunc("/api/room-move/commit", spotifyTakesOver(roomMoveCommitHandler))
 	http.HandleFunc("/api/room-move/cancel", roomMoveCancelHandler)
 	http.HandleFunc("/api/queue-occurrences", queueReadHandler)
-	http.HandleFunc("/api/queue-occurrence", queueJumpHandler)
+	http.HandleFunc("/api/queue-occurrence", spotifyTakesOver(queueJumpHandler))
 	http.HandleFunc("/api/room-queue/state", roomQueueStateHandler)
-	http.HandleFunc("/api/room-queue/prepare", roomQueuePrepareHandler)
-	http.HandleFunc("/api/room-queue/commit", roomQueueCommitHandler)
-	http.HandleFunc("/api/start-volume", startRequest)
+	http.HandleFunc("/api/room-queue/prepare", spotifyTakesOver(roomQueuePrepareHandler))
+	http.HandleFunc("/api/room-queue/commit", spotifyTakesOver(roomQueueCommitHandler))
+	http.HandleFunc("/api/start-volume", spotifyTakesOver(startRequest))
 	http.HandleFunc("/api/start-volume/identity", startIdentityRequest)
-	http.HandleFunc("/api/start-volume/commit", commitStartRequest)
-	http.HandleFunc("/api/select", speakerSelectHandler)
+	http.HandleFunc("/api/start-volume/commit", spotifyTakesOver(commitStartRequest))
+	http.HandleFunc("/api/select", spotifyTakesOver(speakerSelectHandler))
 
-	// Radio is additive and defaults off; existing release handlers retain ownership.
+	// Radio is a plain stream. Any Spotify command for the same speaker stops it first.
 	http.HandleFunc("/api/radio/state", radioStateHandler)
 	http.HandleFunc("/api/radio/action", radioActionHandler)
 	http.HandleFunc("/api/radio/result", radioResultHandler)
-	http.HandleFunc("/api/radio/native-preempt", radioNativePreemptHandler)
 
 	http.HandleFunc("/api/test", speakerTestHandler)
 
@@ -1502,17 +1517,17 @@ func main() {
 	// go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the session
 	// (e.g. a family member's) — the account-agnostic "stop the music here" the Web API can't do
 	// across accounts. The bridge's transState then mirrors the pause onto OwnTone.
-	http.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/stop", spotifyTakesOver(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		transportRooms(w, targetRooms(r), "pause")
-	})
+	}))
 
 	// /api/play resumes playback (go-librespot resume). The bridge's transState then mirrors the
 	// resume onto OwnTone. Counterpart to /api/stop for the HA integration.
-	http.HandleFunc("/api/play", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/play", spotifyTakesOver(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1528,11 +1543,11 @@ func main() {
 			return
 		}
 		transportRooms(w, targetRooms(r), "resume")
-	})
+	}))
 
 	// /api/volume sets the speaker volume (0..100) via go-librespot; the bridge mirrors the change to
 	// the HomePod's OwnTone output. PUT with {"volume":<int>, "room"?:"<id>"}.
-	http.HandleFunc("/api/volume", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/volume", spotifyTakesOver(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1562,7 +1577,7 @@ func main() {
 		}
 		log.Printf("volume set to %d%% (via API)", pct)
 		writeJSON(w, map[string]bool{"ok": true})
-	})
+	}))
 
 	// /api/attention[/release] — the duck primitive for external agents (e.g. a voice gatekeeper).
 	// Extracted into package-level handlers (below) so they're testable; see attentionHandler.

@@ -297,32 +297,55 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 		roomsItemHandler(w, r)
 		return
 	}
+	rooms := loadRooms()
+	// Audio follows the single Spotify engine's active OwnTone route, so the
+	// playing room and its volume come from that route, never from a room's own
+	// (alias) engine status. After a move, the destination room plays.
+	var (
+		gl      glStatus
+		devs    []device
+		up      bool
+		primary *Room
+	)
+	for _, rm := range rooms {
+		if rm.Idx == 0 {
+			primary = rm
+			break
+		}
+	}
+	if primary != nil {
+		gl = librespotStatus(primary.Librespot)
+		devs, up = fetchOutputsFrom(primary.OwnTone)
+	}
+	route := activeRouteRoomID(rooms, devs, gl)
+	spotifyPlaying := gl.Active && !gl.Paused && !gl.Stopped
+	nowPlayingText := ""
+	if primary != nil && route != "" {
+		nowPlayingText = nowPlaying(primary.Librespot)
+	}
 	out := []roomInfo{}
-	for _, rm := range loadRooms() {
+	for _, rm := range rooms {
 		isAlias := rm.Idx != 0
-		gl := librespotStatus(rm.Librespot)
 		// A non-primary room has no engine of its own — don't probe it (it'd always read down). It's an
 		// alias advertised on the primary; output is routed there on selection.
-		up := isAlias
-		if !isAlias {
-			_, up = fetchOutputsFrom(rm.OwnTone)
-		}
 		info := roomInfo{
 			ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName, HomepodID: rm.HomepodID,
-			OwntoneUp:  up,
-			Alias:      isAlias,
-			Playing:    gl.Active && !gl.Paused && !gl.Stopped,
-			Released:   fileExists(releasedPath(rm)),
-			NowPlaying: nowPlaying(rm.Librespot),
-			Volume:     -1,
+			OwntoneUp: isAlias || up,
+			Alias:     isAlias,
+			Playing:   spotifyPlaying && rm.ID == route,
+			Released:  fileExists(releasedPath(rm)),
+			Volume:    -1,
 
 			GraceMinutes:      roomGrace(rm),
 			GraceOverridden:   rm.GraceMinutes != nil,
 			Bitrate:           roomBitrate(rm),
 			BitrateOverridden: rm.Bitrate != "",
 		}
-		if gl.HasVol {
-			info.Volume = gl.VolPct
+		if rm.ID == route {
+			info.NowPlaying = nowPlayingText
+		}
+		if idx, _ := matchOutput(devs, rm.HomepodID, rm.HomepodName); idx >= 0 && devs[idx].hasVolume {
+			info.Volume = devs[idx].volume
 		}
 		if includeRelease {
 			info.Release = roomReleaseForDisplay(r.Context(), rm)
@@ -330,4 +353,38 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 		out = append(out, info)
 	}
 	writeJSON(w, map[string]any{"rooms": out})
+}
+
+func roomByIDIn(rooms []*Room, id string) *Room {
+	for _, rm := range rooms {
+		if rm.ID == id {
+			return rm
+		}
+	}
+	return nil
+}
+
+// activeRouteRoomID names the room whose HomePod the primary OwnTone actually
+// outputs to: the selected output that belongs to a configured room. With no
+// readable selection it falls back to the engine's selected alias.
+func activeRouteRoomID(rooms []*Room, devs []device, gl glStatus) string {
+	alias := spotifyRouteRoomID(gl, rooms)
+	var selected []string
+	for _, rm := range rooms {
+		if idx, _ := matchOutput(devs, rm.HomepodID, rm.HomepodName); idx >= 0 && devs[idx].Selected {
+			selected = append(selected, rm.ID)
+		}
+	}
+	switch {
+	case len(selected) == 1:
+		return selected[0]
+	case len(selected) > 1:
+		for _, id := range selected {
+			if id == alias {
+				return id
+			}
+		}
+		return selected[0]
+	}
+	return alias
 }

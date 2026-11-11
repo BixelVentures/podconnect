@@ -534,10 +534,10 @@ index 0000000..783423d
 +	return pending, nil
 +}
 diff --git a/daemon/controls.go b/daemon/controls.go
-index be84257..8c1b0b4 100644
+index 05570a0..6e76d95 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -295,10 +295,10 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
+@@ -274,10 +274,10 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
  		return fmt.Errorf("failed creating track list: %w", err)
  	}
  
@@ -550,7 +550,7 @@ index be84257..8c1b0b4 100644
  	p.state.setPaused(paused)
  
  	sessionId := make([]byte, 16)
-@@ -332,9 +332,30 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
+@@ -311,9 +311,30 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
  	p.state.player.Timestamp = time.Now().UnixMilli()
  	p.state.player.PositionAsOfTimestamp = 0
  
@@ -582,7 +582,7 @@ index be84257..8c1b0b4 100644
  			return fmt.Errorf("failed shuffling context")
  		}
  
-@@ -349,22 +370,10 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
+@@ -328,22 +349,10 @@ func (p *AppPlayer) loadPreparedContext(ctx context.Context, spotCtx *connectpb.
  		}
  
  		// shuffle afterwards
@@ -606,7 +606,7 @@ index be84257..8c1b0b4 100644
  	return nil
  }
  
-@@ -770,13 +779,23 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
+@@ -740,13 +749,23 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
  	// GoStart below rewinds an exhausted context. Retain the track that actually
  	// reached this boundary, rather than inventing a seed from the rewound queue.
  	playedTrackURI := p.state.player.GetTrack().GetUri()
@@ -631,7 +631,7 @@ index be84257..8c1b0b4 100644
  
  			// if we could not get the next track we probably ended the context
  			if !hasNextTrack {
-@@ -805,6 +824,16 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
+@@ -775,6 +794,16 @@ func (p *AppPlayer) advanceNext(ctx context.Context, forceNext, drop bool) (bool
  	if !hasNextTrack && !p.app.cfg.DisableAutoplay && !strings.HasPrefix(p.state.player.ContextUri, "spotify:station:") {
  		p.state.player.Suppressions = &connectpb.Suppressions{}
  
@@ -649,10 +649,10 @@ index be84257..8c1b0b4 100644
  		var prevTrackUris []string
  		if p.state.tracks != nil {
 diff --git a/daemon/player.go b/daemon/player.go
-index 4261414..68c029a 100644
+index 577ea24..ae391cd 100644
 --- a/daemon/player.go
 +++ b/daemon/player.go
-@@ -63,6 +63,8 @@ type AppPlayer struct {
+@@ -59,6 +59,8 @@ type AppPlayer struct {
  	queueOccurrenceOffer             *nativeQueueOffer
  	queuePresentationContinuation    *nativeQueueOffer
  	queueMetadata                    queueMetadataCache
@@ -661,7 +661,7 @@ index 4261414..68c029a 100644
  	app                              *App
  	sess                             *session.Session
  
-@@ -719,7 +721,7 @@ func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPay
+@@ -666,7 +668,7 @@ func (p *AppPlayer) handlePlayCommand(ctx context.Context, req dealer.RequestPay
  		}
  	}
  
@@ -670,26 +670,19 @@ index 4261414..68c029a 100644
  }
  
  func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request) error {
-@@ -774,7 +776,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
- 		}
- 	}
- 	switch req.Type {
--	case ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypePause, apiContentClaim, apiMoveClaim, apiRoomBoundPrepare, apiRoomTransportPrepare:
-+	case ApiRequestTypePlay, ApiRequestTypeResume, ApiRequestTypePlayPause, ApiRequestTypePause, apiContentClaim, apiMoveClaim, apiRoomBoundPrepare, apiRoomAutoplayPrepare, apiRoomTransportPrepare:
- 		if req.Type != ApiRequestTypePause && p.radioSourceMoveIntentBlocked() {
- 			return nil, ErrAliasConflict
- 		}
-@@ -784,7 +786,7 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
- 	}
- 	if p.radioHeld() {
+@@ -684,10 +686,6 @@ func (p *AppPlayer) handleDealerRequest(ctx context.Context, req dealer.Request)
+ }
+ 
+ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, error) {
+-	// Limit ourselves to 30 seconds for handling API requests
+-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+-	defer cancel()
+-
+ 	if p.roomVolumeBusy() {
  		switch req.Type {
--		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue:
-+		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, ApiRequestTypeToken, ApiRequestTypeQueueOccurrences, apiContentObserve, apiContentOffer, apiMoveObserve, apiMoveOffer, apiRoomTransportState, apiRoomBoundState, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomBoundQueue, apiRoomBoundQueueAutoplay, apiRoomBoundQueueAutoplayFinish:
- 		case ApiRequestTypeWebApi:
- 			data, ok := req.Data.(ApiRequestDataWebApi)
- 			if !ok || data.Method != "GET" {
-@@ -842,6 +844,14 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
- 			}
+ 		case ApiRequestTypeRoot, ApiRequestTypeStatus, ApiRequestTypeAliases, ApiRequestTypeGetVolume, apiRoomReleaseLookup, apiRoomReleaseClose, apiRoomVolumeState, apiRoomVolumeBoundState, apiRoomVolumeEffect, apiRoomBoundConsume, apiRoomTransportConsume, apiRoomTransportEffect, apiRoomTransportAbort, apiMoveConsume:
+@@ -695,6 +693,18 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+ 			return nil, ErrAliasConflict
  		}
  	}
 +	// The queue read bounds its own request. Its detached preview follows
@@ -700,10 +693,14 @@ index 4261414..68c029a 100644
 +			req.Type != apiRoomBoundQueue, req.Type == apiRoomBoundQueueAutoplay)
 +	}
 +
- 	// Limit ourselves to 30 seconds for handling API requests
- 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
- 	defer cancel()
-@@ -854,9 +864,6 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
++	// Limit ourselves to 30 seconds for handling API requests
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++	defer cancel()
++
+ 	switch req.Type {
+ 	case ApiRequestTypeResume, ApiRequestTypePause, ApiRequestTypeStop, ApiRequestTypePlayPause, ApiRequestTypeSeek, ApiRequestTypePrev, ApiRequestTypeNext, ApiRequestTypePlay, ApiRequestTypeSetVolume, ApiRequestTypeSetRepeatingContext, ApiRequestTypeSetRepeatingTrack, ApiRequestTypeSetShufflingContext, ApiRequestTypeAddToQueue, ApiRequestTypeQueueOccurrence:
+ 		if p.app.manualReleasePending() {
+@@ -703,9 +713,6 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		p.invalidateRoomTransportGeneration()
  	}
  	switch req.Type {
@@ -713,7 +710,7 @@ index 4261414..68c029a 100644
  	case apiMoveObserve:
  		return p.captureMove(req.Data.(roomVolumeScope))
  	case apiMoveOffer:
-@@ -919,6 +926,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
+@@ -768,6 +775,8 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any,
  		return p.prepareRoomTransportVersion(ctx, req.Data.(roomTransportPrepareRequest), true)
  	case apiRoomBoundConsume:
  		return p.consumeRoomTransportVersion(ctx, req.Data.(roomTransportConsumeRequest), true)
@@ -722,7 +719,7 @@ index 4261414..68c029a 100644
  	case apiRoomTransportState:
  		return p.roomTransportState(ctx, req.Data.(roomTransportStateRequest))
  	case apiRoomTransportPrepare:
-@@ -1326,6 +1335,7 @@ func (p *AppPlayer) Close() {
+@@ -1130,6 +1139,7 @@ func (p *AppPlayer) Close() {
  
  func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
  	defer p.clearRoomTransport()
@@ -730,7 +727,7 @@ index 4261414..68c029a 100644
  	transportCleanup := time.NewTicker(time.Second)
  	defer transportCleanup.Stop()
  	err := p.sess.Dealer().Connect(ctx)
-@@ -1353,6 +1363,10 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+@@ -1155,6 +1165,10 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
  			return
  		case <-transportCleanup.C:
  			p.discardExpiredRoomTransport()
@@ -741,7 +738,7 @@ index 4261414..68c029a 100644
  		case <-p.stop:
  			return
  		case pkt, ok := <-apRecv:
-@@ -1441,6 +1455,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
+@@ -1243,6 +1257,7 @@ func (p *AppPlayer) Run(ctx context.Context, apiRecv <-chan ApiRequest, mprisRec
  // disconnect. Never execute or replay commands against this stranded session.
  func (p *AppPlayer) runFailedTransport(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaPlayer2PlayerCommand) {
  	p.clearRoomTransport()
