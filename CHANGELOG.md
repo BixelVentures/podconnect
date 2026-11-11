@@ -1,3 +1,7 @@
+## Speakers 0.26.93 — frigiv gendannet radio-slot efter genstart
+
+- Et gendannet, ukendt radio-park-slot fra en proces der er død frigives nu også når der ingen custody-række findes (Green-tilstanden efter 0.26.92). Kræver stadig: ingen session, ingen igangværende start, ingen åben Spotify-writer og ingen ventende cold-detachment. Hvert udfald (frigivet/bevaret + årsag) logges én gang.
+
 ## Speakers 0.26.92 — radio holder aldrig en højttaler efter radioen er væk
 
 - OwnTone ejer radio-ejerskabet. Et forladt radio-hold frigives, når afsenderen er væk (anden proces end den nuværende, dvs. efter genstart), og der hverken er session, åben Spotify-writer eller igangværende start. Ingen Stop-kvittering opfindes; modtageren afgør selv sin gamle session.
