@@ -136,6 +136,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/connect-transfer-retirement-native.patch \
   && git apply --check /patches/room-autoplay-native.patch \
   && git apply /patches/room-autoplay-native.patch \
+  && git apply --check /patches/radio-orphan-park-native.patch \
+  && git apply /patches/radio-orphan-park-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -161,6 +163,10 @@ COPY patches/start-journal-diagnostics-owntone.patch /patches/start-journal-diag
 COPY patches/start-journal-diagnostics-owntone.sha256 /patches/start-journal-diagnostics-owntone.sha256
 COPY patches/radio-primary-owntone.patch /patches/radio-primary-owntone.patch
 COPY patches/radio-primary-owntone.sha256 /patches/radio-primary-owntone.sha256
+COPY patches/radio-startup-diagnostics-owntone.patch /patches/radio-startup-diagnostics-owntone.patch
+COPY patches/radio-startup-diagnostics-owntone.sha256 /patches/radio-startup-diagnostics-owntone.sha256
+COPY patches/radio-orphan-release-owntone.patch /patches/radio-orphan-release-owntone.patch
+COPY patches/radio-orphan-release-owntone.sha256 /patches/radio-orphan-release-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -325,6 +331,12 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/radio-primary-owntone.sha256 \
   && git apply --check /patches/radio-primary-owntone.patch \
   && git apply /patches/radio-primary-owntone.patch \
+  && sha256sum -c /patches/radio-startup-diagnostics-owntone.sha256 \
+  && git apply --check /patches/radio-startup-diagnostics-owntone.patch \
+  && git apply /patches/radio-startup-diagnostics-owntone.patch \
+  && sha256sum -c /patches/radio-orphan-release-owntone.sha256 \
+  && git apply --check /patches/radio-orphan-release-owntone.patch \
+  && git apply /patches/radio-orphan-release-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

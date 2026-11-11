@@ -1,0 +1,147 @@
+diff --git a/src/outputs_radio_handoff.inc.c b/src/outputs_radio_handoff.inc.c
+index bb85148..7348e4c 100644
+--- a/src/outputs_radio_handoff.inc.c
++++ b/src/outputs_radio_handoff.inc.c
+@@ -237,27 +237,29 @@ static int radio_handoff_save(void)
+ }
+ static void radio_handoff_startup(void)
+ {
++  const char *fault_stage="unknown";
++#define RH_STARTUP_FAULT(stage) do{fault_stage=stage;goto fault;}while(0)
+   char *value=NULL;json_object *root=NULL,*rows=NULL,*field=NULL;size_t i,j;bool retired=false;
+   int found=db_radio_handoff_load(&value);
+   primary_cold_detachment_reset();
+   memset(radio_handoffs,0,sizeof(radio_handoffs));radio_handoff_fault=false;
+   free(radio_handoff_journal_expected);radio_handoff_journal_expected=NULL;
+   if(found==0)return;
+-  if(found<0 || !value || !(radio_handoff_journal_expected=strdup(value)))goto fault;
++  if(found<0 || !value || !(radio_handoff_journal_expected=strdup(value)))RH_STARTUP_FAULT("journal_load");
+   root=json_tokener_parse(value);
+   if(!root || !json_object_object_get_ex(root,"schema",&field)
+       || strcmp(json_object_get_string(field),"podconnect.output_radio_handoff_journal.v1")
+       || !json_object_object_get_ex(root,"record_size",&field)
+       || json_object_get_uint64(field)!=sizeof(struct output_radio_handoff_result)
+       || !json_object_object_get_ex(root,"records",&rows) || !json_object_is_type(rows,json_type_array)
+-      || json_object_array_length(rows)>RADIO_HANDOFF_SLOTS)goto fault;
++      || json_object_array_length(rows)>RADIO_HANDOFF_SLOTS)RH_STARTUP_FAULT("rows_shape");
+   for(i=0;i<json_object_array_length(rows);i++){
+     const char *encoded=json_object_get_string(json_object_array_get_idx(rows,i));
+     unsigned char *bytes=(unsigned char *)&radio_handoffs[i].result;
+-    if(!encoded || strlen(encoded)!=sizeof(struct output_radio_handoff_result)*2)goto fault;
++    if(!encoded || strlen(encoded)!=sizeof(struct output_radio_handoff_result)*2)RH_STARTUP_FAULT("row_encoding_length");
+     for(j=0;j<sizeof(struct output_radio_handoff_result);j++){
+       char a=encoded[j*2],b=encoded[j*2+1];
+-      if(!((a>='0'&&a<='9')||(a>='a'&&a<='f')) || !((b>='0'&&b<='9')||(b>='a'&&b<='f')))goto fault;
++      if(!((a>='0'&&a<='9')||(a>='a'&&a<='f')) || !((b>='0'&&b<='9')||(b>='a'&&b<='f')))RH_STARTUP_FAULT("row_encoding_hex");
+       bytes[j]=(a<='9'?a-'0':a-'a'+10)*16+(b<='9'?b-'0':b-'a'+10);
+     }
+     struct output_radio_handoff_request *r=&radio_handoffs[i].result.command;
+@@ -272,8 +274,8 @@ static void radio_handoff_startup(void)
+         || !radio_handoff_uuid(r->handoff_id) || !transport_hex(r->token,32)
+         || !radio_native_source_owner_valid(&r->native_owner) || !radio_handoff_uuid(r->radio_process)
+         || (!radio_primary_park_command(r) && !transport_hex(r->receiver_key_digest,64))
+-        || !r->radio_owner_epoch)goto fault;
+-    for(j=0;j<i;j++)if(radio_handoffs[j].result.command.identity.device_id==r->identity.device_id)goto fault;
++        || !r->radio_owner_epoch)RH_STARTUP_FAULT("row_validation");
++    for(j=0;j<i;j++)if(radio_handoffs[j].result.command.identity.device_id==r->identity.device_id)RH_STARTUP_FAULT("duplicate_device");
+     struct output_radio_handoff_result *saved=&radio_handoffs[i].result;
+     bool local_park = radio_primary_park_command(r);
+     if (local_park
+@@ -283,7 +285,7 @@ static void radio_handoff_startup(void)
+                 && saved->phase != OUTPUT_RADIO_REACQUIRED && saved->phase != OUTPUT_RADIO_RELEASED)
+             || (saved->phase == OUTPUT_RADIO_RELEASED && !radio_primary_park_released(saved))
+             || (saved->phase == OUTPUT_RADIO_SUSPENDED && (saved->stop_code != 200 || saved->stop_cseq <= 0))))
+-      goto fault;
++      RH_STARTUP_FAULT("local_park_phase");
+     /* A terminal record was written only after the current radio drain ticket
+      * was consumed durably. It carries no authority to restore a live route.
+      * Ordinary START has its own crash journal after a delegated release. */
+@@ -299,7 +301,7 @@ static void radio_handoff_startup(void)
+             || (resume->phase == OUTPUT_RADIO_REACQUIRE_DELEGATED
+                 && (strnlen(resume->delegated_token, sizeof(resume->delegated_token)) != 32
+                     || !transport_hex(resume->delegated_token, 32))))
+-          goto fault;
++          RH_STARTUP_FAULT("local_park_reacquired");
+         /* Only a separate START delegation can transfer startup ownership. */
+         released = resume->phase == OUTPUT_RADIO_REACQUIRE_DELEGATED;
+         retired = released || retired;
+@@ -315,7 +317,7 @@ static void radio_handoff_startup(void)
+               || (v->command.final_volume_kind==RADIO_FINAL_VOLUME_UNCHANGED && !v->command.final_volume_revision && v->command.final_volume_percent==r->initial_volume_percent))
+           || (v->phase!=OUTPUT_RADIO_REACQUIRE_OPENED && v->phase!=OUTPUT_RADIO_REACQUIRE_DELEGATED)
+           || (v->phase==OUTPUT_RADIO_REACQUIRE_OPENED && !v->writer_barrier_verified)
+-          || (v->phase==OUTPUT_RADIO_REACQUIRE_DELEGATED && (!memchr(v->delegated_token,0,sizeof(v->delegated_token)) || !transport_hex(v->delegated_token,32))))goto fault;
++          || (v->phase==OUTPUT_RADIO_REACQUIRE_DELEGATED && (!memchr(v->delegated_token,0,sizeof(v->delegated_token)) || !transport_hex(v->delegated_token,32))))RH_STARTUP_FAULT("reacquired_fields");
+       released=true;retired=true;
+     }
+     radio_handoffs[i].primary_cold_candidate = local_park && saved->phase == OUTPUT_RADIO_SUSPENDED;
+@@ -337,11 +339,18 @@ static void radio_handoff_startup(void)
+     memset(radio_handoffs[i].result.suspended_signature,0,sizeof(radio_handoffs[i].result.suspended_signature));
+   }
+   json_object_put(root);free(value);
+-  if(retired && radio_handoff_save()<0)radio_handoff_fault=true;
++  if(retired && radio_handoff_save()<0){fault_stage="restore_save";radio_handoff_fault=true;DPRINTF(E_LOG,L_PLAYER,"Radio handoff startup fault: %s\n",fault_stage);}
++  for(i=0;i<RADIO_HANDOFF_SLOTS;i++)
++    if(radio_handoffs[i].used)
++      DPRINTF(E_LOG,L_PLAYER,"Radio handoff startup slot: output=%" PRIu64 " phase=%d cold_candidate=%d fault=%d\n",
++          radio_handoffs[i].result.command.identity.device_id,(int)radio_handoffs[i].result.phase,
++          radio_handoffs[i].primary_cold_candidate?1:0,radio_handoff_fault?1:0);
+   return;
+  fault:
++  DPRINTF(E_LOG,L_PLAYER,"Radio handoff startup fault: %s\n",fault_stage);
+   if(root)json_object_put(root);
+   free(value);radio_handoff_fault=true;
++#undef RH_STARTUP_FAULT
+ }
+ static void radio_handoff_unknown(struct radio_handoff_slot *s)
+ {s->result.phase=OUTPUT_RADIO_UNKNOWN;memset(s->result.suspended_signature,0,sizeof(s->result.suspended_signature));(void)radio_handoff_save();}
+diff --git a/src/outputs_radio_parked_absence.inc.c b/src/outputs_radio_parked_absence.inc.c
+index 2169fb1..5efb91b 100644
+--- a/src/outputs_radio_parked_absence.inc.c
++++ b/src/outputs_radio_parked_absence.inc.c
+@@ -167,3 +167,12 @@ int outputs_radio_parked_absence(int action,const struct output_radio_parked_abs
+  if(radio_parked_absence_save()<0){s->result.phase=OUTPUT_RADIO_PARKED_UNKNOWN;memset(s->result.suspended_signature,0,sizeof(s->result.suspended_signature));return -1;}
+  *out=s->result;return 0;
+ }
++
++/* Diagnostic only: names which radio_target_blocked inputs are set. Constant
++ * labels and numeric phase/id only; it changes no state and repeats no predicate. */
++static void radio_blocked_diagnostic(uint64_t id)
++{
++  const struct radio_handoff_slot *slot=radio_handoff_find(id);
++  DPRINTF(E_LOG,L_PLAYER,"radio_target_blocked detail: output=%" PRIu64 " handoff_fault=%d absence_fault=%d parked_absence_fault=%d handoff_slot=%d handoff_phase=%d\n",
++      id,radio_handoff_fault?1:0,radio_absence_fault?1:0,radio_parked_absence_fault?1:0,slot?1:0,slot?(int)slot->result.phase:0);
++}
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+index cd00cda..ca87a29 100644
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -604,6 +604,7 @@ static const char *start_journal_denial(const struct output_start_request *r)
+     return "owner_mismatch";
+   return NULL;
+ }
++static void radio_blocked_diagnostic(uint64_t id);
+ static bool start_available_reason(const struct output_start_request *r, bool diagnostic)
+ {
+   /* Each predicate retains original short-circuit order and is evaluated once. */
+@@ -612,11 +613,18 @@ static bool start_available_reason(const struct output_start_request *r, bool di
+       && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r)
+       && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r),
+       "radio_source_reserved");
+-  START_CHECK(outputs_radio_handoff_blocked(r->device_id)
++  if (outputs_radio_handoff_blocked(r->device_id)
+       && !outputs_radio_absence_current_start_admissible(r) && !outputs_radio_reacquire_start_admissible(r)
+       && !outputs_radio_absence_start_admissible(r) && !outputs_radio_move_admissible(r)
+-      && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r),
+-      "radio_target_blocked");
++      && !outputs_radio_parked_bridge_start_admissible(r) && !outputs_radio_parked_bridge_move_admissible(r))
++    {
++      if (diagnostic)
++        {
++          DPRINTF(E_LOG,L_PLAYER,"START state rejected: radio_target_blocked\n");
++          radio_blocked_diagnostic(r->device_id); /* Reads only; no predicate is repeated. */
++        }
++      return false;
++    }
+   struct output_device *d=outputs_device_get(r->device_id),*scan; char digest[65];
+   /* An unproved radio drain never opens a START reservation. */
+   START_CHECK(!outputs_primary_radio_custody_available(r->device_id), "radio_custody_unavailable");

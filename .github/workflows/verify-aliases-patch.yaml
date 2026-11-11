@@ -72,6 +72,8 @@ jobs:
           git apply "$patch_dir/connect-transfer-retirement-native.patch"
           git apply --check "$patch_dir/room-autoplay-native.patch"
           git apply "$patch_dir/room-autoplay-native.patch"
+          git apply --check "$patch_dir/radio-orphan-park-native.patch"
+          git apply "$patch_dir/radio-orphan-park-native.patch"
           fixture="$GITHUB_WORKSPACE/.github/fixtures/primary-held-teardown-native.patch"
           git apply --check "$fixture"
           git apply "$fixture"
@@ -198,7 +200,7 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone; do
+          for patch in retire-fieldcodes-owntone radio-handoff-owntone start-journal-diagnostics-owntone radio-primary-owntone radio-startup-diagnostics-owntone radio-orphan-release-owntone; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"

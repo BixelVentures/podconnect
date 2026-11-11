@@ -53,3 +53,4 @@ b3a114a83109aecf027bcfeccc9aefe4fb87282da728e539db849e9bfa676149  /patches/radio
 71e014a60e3e88827a8feac52f964d589fc606cdee09ba368241ad1ad5dcb650  /patches/queue-writer-inspection-native.patch
 7f84b6791c79c0a8e5a3a44fdabbb65abae217b04f62bd0d5d68ae3ff46d080a  /patches/connect-transfer-retirement-native.patch
 8da41eb82caf4792472eb2e2aff4952cf049e9c7f1da36629790b26c0e6ba6b2  /patches/room-autoplay-native.patch
+4b988944794fbc59473060ba87e2b9042934979aea0e2934681f390db0fe0640  /patches/radio-orphan-park-native.patch

@@ -1,3 +1,10 @@
+## Speakers 0.26.92 — radio holder aldrig en højttaler efter radioen er væk
+
+- OwnTone ejer radio-ejerskabet. Et forladt radio-hold frigives, når afsenderen er væk (anden proces end den nuværende, dvs. efter genstart), og der hverken er session, åben Spotify-writer eller igangværende start. Ingen Stop-kvittering opfindes; modtageren afgør selv sin gamle session.
+- Native holder kun en cache: spørger OwnTone før en Spotify-start og dropper sit gamle parkerede radio-hold, når OwnTone ikke længere ejer det. En levende radio frigives aldrig.
+- Ugyldige radio-handoff-rækker ved opstart blokerer kun deres eget output og logges (ingen tavs global blokering).
+- Nye logs: `Radio orphan released/kept`, opstartsrækker og hvorfor `radio_target_blocked` afviser.
+
 ## Speakers 0.26.91 — diagnose speaker readiness
 
 - Report the first readiness check that rejects a configured output for Spotify start or radio. Existing ownership, playback actions and recovery decisions are unchanged.
