@@ -21,18 +21,16 @@ func TestRadioPlainStreamOnActualOwnTone(t *testing.T) {
 	p := newRadioPlayer(radioPlayerConfig{Enabled: true})
 	p.base = base
 	p.rooms = func() []*Room { return []*Room{{ID: "r7", Idx: 7, Name: "Fridas", HomepodName: output}} }
-	p.speakerVolume = func(*Room) int { return -1 }
 	spotify := &fakeSpotify{route: "r0"}
 	p.spotify = spotify
 	ctx := context.Background()
-	ten := 10
-	if _, err := p.execute(ctx, radioCommand{ActionID: "real-start", Action: "start", StationID: "p3", TargetID: "r7", VolumePercent: &ten}); err != nil {
+	if _, err := p.execute(ctx, radioCommand{ActionID: "real-start", Action: "start", StationID: "p3", TargetID: "r7"}); err != nil {
 		t.Fatal("actual OwnTone did not play the plain stream:", err)
 	}
 	time.Sleep(2 * time.Second)
 	status, err := p.player(ctx)
 	outputs, _ := p.playerOutputs(ctx)
-	if err != nil || status.State != "play" || len(outputs) != 1 || !outputs[0].Selected || outputs[0].Volume != 10 {
+	if err != nil || status.State != "play" || len(outputs) != 1 || !outputs[0].Selected || outputs[0].Volume != startVolumePercent {
 		t.Fatalf("actual player %+v %+v %v", status, outputs, err)
 	}
 	if !p.yield(ctx, "r7") {

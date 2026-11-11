@@ -124,7 +124,6 @@ func newTestRadio(t *testing.T) (*radioPlayer, *fakeRadioPlayer, *fakeSpotify) {
 	p := newRadioPlayer(radioPlayerConfig{Enabled: true})
 	p.base = server.URL
 	p.rooms = radioRooms
-	p.speakerVolume = func(*Room) int { return -1 }
 	spotify := &fakeSpotify{route: "r0"}
 	p.spotify = spotify
 	previous := radioOwner
@@ -141,15 +140,14 @@ func radioStart(t *testing.T, p *radioPlayer, id, station, target string, volume
 
 func TestRadioStartPlaysPlainStreamOnChosenSpeaker(t *testing.T) {
 	p, fake, spotify := newTestRadio(t)
-	ten := 10
-	if err := radioStart(t, p, "a1", "p3", "r7", &ten); err != nil {
+	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
 		t.Fatal(err)
 	}
 	s := p.snapshot()
-	if s.State != "playing" || s.SourceKind != "radio" || s.TargetID != "r7" || s.StationID != "p3" || s.VolumePercent == nil || *s.VolumePercent != 10 {
+	if s.State != "playing" || s.SourceKind != "radio" || s.TargetID != "r7" || s.StationID != "p3" || s.VolumePercent == nil || *s.VolumePercent != startVolumePercent {
 		t.Fatalf("state %+v", s)
 	}
-	if len(fake.selected) != 1 || fake.selected[0] != "107" || fake.volumes["107"] != 10 || len(fake.queue) != 1 || fake.queue[0] != radioStreamURLs["p3"] {
+	if len(fake.selected) != 1 || fake.selected[0] != "107" || fake.volumes["107"] != startVolumePercent || len(fake.queue) != 1 || fake.queue[0] != radioStreamURLs["p3"] {
 		t.Fatalf("player %+v %+v %+v", fake.selected, fake.volumes, fake.queue)
 	}
 	if spotify.pauses != 0 {
@@ -386,20 +384,29 @@ func TestRadioMoveAndVolumeStayOnOwnPlayer(t *testing.T) {
 	}
 }
 
-func TestRadioStartWithoutVolumeNeverStartsLoud(t *testing.T) {
+func TestRadioStartsAtTheSharedStartVolume(t *testing.T) {
 	p, fake, _ := newTestRadio(t)
 	fake.volumes["107"] = 90 // the radio player's own remembered level
 	if err := radioStart(t, p, "a1", "p3", "r7", nil); err != nil {
 		t.Fatal(err)
 	}
-	if fake.volumes["107"] != startVolumePercent || *p.snapshot().VolumePercent != startVolumePercent {
+	if fake.volumes["107"] != startVolumePercent || startVolumePercent != 35 {
 		t.Fatalf("radio started at %d", fake.volumes["107"])
 	}
-	p.speakerVolume = func(*Room) int { return 8 }
-	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a2", Action: "start", StationID: "p1", TargetID: "r0"}); err != nil {
+	// A start cannot carry its own level: the 35 % rule is the only start level.
+	ten := 10
+	if err := radioStart(t, p, "a2", "p1", "r0", &ten); err == nil {
+		t.Fatal("start with its own volume was accepted")
+	}
+	// After an explicit volume change, a move is a new start and uses 35 % again.
+	five := 5
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a3", Action: "volume", VolumePercent: &five}); err != nil {
 		t.Fatal(err)
 	}
-	if fake.volumes["101"] != 8 {
-		t.Fatalf("radio ignored the speaker's lower level: %d", fake.volumes["101"])
+	if _, err := p.execute(context.Background(), radioCommand{ActionID: "a4", Action: "move", TargetID: "r0"}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.volumes["101"] != startVolumePercent || *p.snapshot().VolumePercent != startVolumePercent {
+		t.Fatalf("move started at %d", fake.volumes["101"])
 	}
 }

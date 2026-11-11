@@ -146,11 +146,7 @@ type radioPlayer struct {
 	client  *http.Client
 	rooms   func() []*Room
 	spotify radioSpotify
-	// speakerVolume reads the HomePod's current level from Spotify's player
-	// (-1 unknown). A start without an explicit volume never exceeds the
-	// Spotify start level, so radio cannot start loud.
-	speakerVolume func(*Room) int
-	launch        func(context.Context) error // nil: the player process is managed elsewhere (tests)
+	launch  func(context.Context) error // nil: the player process is managed elsewhere (tests)
 
 	op sync.Mutex // one effect at a time; a newer command waits, then wins
 
@@ -178,17 +174,6 @@ func newRadioPlayer(cfg radioPlayerConfig) *radioPlayer {
 		client:  &http.Client{Timeout: 4 * time.Second},
 		rooms:   loadRooms,
 		spotify: managerSpotify{},
-		speakerVolume: func(room *Room) int {
-			primary := primaryRoom()
-			if primary == nil || room == nil {
-				return -1
-			}
-			devs, _ := fetchOutputsFrom(primary.OwnTone)
-			if idx, _ := matchOutput(devs, room.HomepodID, room.HomepodName); idx >= 0 && devs[idx].hasVolume {
-				return devs[idx].volume
-			}
-			return -1
-		},
 		outputs: map[string]string{},
 		results: map[string]radioActionResult{},
 		state: radioState{
@@ -408,7 +393,7 @@ func (p *radioPlayer) setVolume(ctx context.Context, outputID string, volume int
 }
 
 // play selects exactly one speaker and starts the stream there.
-func (p *radioPlayer) play(ctx context.Context, station string, room *Room, volume *int) (int, error) {
+func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (int, error) {
 	outputs, err := p.playerOutputs(ctx)
 	if err != nil {
 		return 0, err
@@ -423,12 +408,9 @@ func (p *radioPlayer) play(ctx context.Context, station string, room *Room, volu
 	p.mu.Lock()
 	p.outputs = map[string]string{room.ID: output.ID}
 	p.mu.Unlock()
+	// Every new start uses the shared start level (startVolumePercent), the
+	// same single rule as Spotify. Only a later explicit volume action changes it.
 	level := startVolumePercent
-	if volume != nil {
-		level = *volume
-	} else if current := p.speakerVolume(room); current >= 0 && current < level {
-		level = current
-	}
 	if err := p.setVolume(ctx, output.ID, level); err != nil {
 		return 0, err
 	}
@@ -709,7 +691,8 @@ func (p *radioPlayer) validate(q radioCommand) (*Room, error) {
 		if _, ok := radioStreamURLs[station]; !ok {
 			return nil, errRadioInvalid
 		}
-		if q.VolumePercent != nil && (*q.VolumePercent < 0 || *q.VolumePercent > 100) {
+		// The start level is the shared 35 % rule; a start never carries its own.
+		if q.VolumePercent != nil {
 			return nil, errRadioInvalid
 		}
 		for _, t := range s.Targets {
@@ -759,13 +742,8 @@ func (p *radioPlayer) apply(ctx context.Context, q radioCommand, room *Room, bef
 		return nil
 	}
 	station := q.StationID
-	volume := q.VolumePercent
 	if q.Action == "move" {
 		station = before.StationID
-		if volume == nil && before.VolumePercent != nil {
-			v := *before.VolumePercent
-			volume = &v
-		}
 	}
 	// Last command wins: Spotify playing on this speaker is paused first, the
 	// same way choosing another AirPlay source would take the speaker.
@@ -774,7 +752,7 @@ func (p *radioPlayer) apply(ctx context.Context, q radioCommand, room *Room, bef
 			log.Printf("radio: pausing Spotify before radio failed: %v", err)
 		}
 	}
-	level, err := p.play(ctx, station, room, volume)
+	level, err := p.play(ctx, station, room)
 	if err != nil {
 		// A failed start leaves nothing behind: no selected speaker, no queue.
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)

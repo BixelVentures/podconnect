@@ -1,10 +1,10 @@
 ## Speakers 0.26.95 — enkel radio, Spotify altid først
 
-- Radio er nu en almindelig DR-stream på sin egen afspiller. Sidste kommando vinder (som Spotify Connect/AirPlay): radio-start tager den valgte højttaler (Spotify pauses kun, hvis Spotify spiller netop dér), og enhver Spotify-kommando eller Spotify-afspilning på den højttaler stopper radioen først. Radioen holder kun en højttaler, mens den faktisk spiller; en mislykket start efterlader intet.
+- Radio er nu en almindelig DR-stream på sin egen afspiller. Sidste kommando vinder (som Spotify Connect/AirPlay): radio-start tager den valgte højttaler (Spotify pauses kun, hvis Spotify spiller netop dér), og enhver Spotify-kommando eller Spotify-afspilning på den højttaler stopper radioen først. Radioen holder kun en højttaler, mens den faktisk spiller; en mislykket start efterlader intet. Radio starter (også ved flyt) altid på den fælles startlydstyrke 35 %, samme regel som Spotify; kun en senere lydstyrke-handling ændrer den.
 - Al radio-custody er fjernet fra Spotify-motoren (Native) og OwnTone: ingen radio-holds, parks, handoff, primary-readiness, reacquire eller primary-owner-lås. Pause, lydstyrke, prepare og flyt fungerer som i 0.26.64. Spotify-rettelserne efter 0.26.64 (kø, autoplay, diagnose, transfer) er bevaret.
 - Ved hver opstart slettes alle gemte radio-holds/parks/custody-rækker i OwnTone-databasen og radio-filer fra tidligere versioner, inden motorerne starter (fx de gamle holds på Svends og Fridas HomePods, der gav 409-reacquire hvert 2. sekund).
 - `/api/rooms` viser nu det rum, der faktisk spiller (OwnTone-rutens ejer): efter en flytning fra Køkkenalrum til Fridas står Fridas som spillende og Køkkenalrum ikke. Lydstyrken er højttalerens egen output-lydstyrke.
-- Radio-API'et (`/api/radio/state`, `/api/radio/action`, `/api/radio/result`) har samme form. Nyt: `expected_*`-felter afviser ikke længere (sidste kommando vinder), og `start` må have `volume_percent`. `/api/radio/native-preempt` er fjernet (blev kun brugt internt).
+- Radio-API'et (`/api/radio/state`, `/api/radio/action`, `/api/radio/result`) har samme form. Nyt: `expected_*`-felter afviser ikke længere (sidste kommando vinder). `/api/radio/native-preempt` er fjernet (blev kun brugt internt).
 
 ## Speakers 0.26.94 — hver afvisning siger hvorfor (#140)
 
