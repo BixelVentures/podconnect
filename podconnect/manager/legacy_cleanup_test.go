@@ -129,6 +129,11 @@ func TestStartupCleanupToleratesMissingSqlite(t *testing.T) {
 // Spotify control must not pass through any radio custody gate again: the
 // image builds Native and OwnTone without a single radio patch.
 func TestImageBuildsNativeAndOwnToneWithoutRadioPatches(t *testing.T) {
+	// The image's manager build stage holds only the manager sources; this
+	// repository check runs in the source tree (go test and CI).
+	if _, err := os.Stat("../Dockerfile"); os.IsNotExist(err) {
+		t.Skip("repository tree not present")
+	}
 	for _, path := range []string{"../Dockerfile", "../patches/native-stack.sha256"} {
 		raw, err := os.ReadFile(path)
 		if err != nil {
