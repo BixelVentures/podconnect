@@ -1,3 +1,7 @@
+## Speakers 0.26.91 — diagnose speaker readiness
+
+- Report the first readiness check that rejects a configured output for Spotify start or radio. Existing ownership, playback actions and recovery decisions are unchanged.
+
 ## Speakers 0.26.90 and Control 0.10.40 — Spotify autoplay queue
 
 - Expose upcoming autoplay tracks through the existing room queue. Keep the remaining rows stable when autoplay becomes the active queue, and validate each explicit selection against the current session and audio route.
