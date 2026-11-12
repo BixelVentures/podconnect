@@ -10,6 +10,7 @@
 - Home Assistant har nu én `media_player` pr. PodConnect-rum (Køkkenalrum, Svend, Frida). Tilstanden kommer fra Speakers (spiller/pause/buffering/ledig, Spotify eller radio, med cover og tidslinje), og knapperne er hver ét direkte kald – ens, uanset om musikken blev startet fra PodView, stemmen eller Spotify-appen. `play_media` vælger rummet og spiller dér.
 - Telefoner, computere, biler og gamle Spotify-id'er bliver ikke længere HA-entiteter, og dem, ældre versioner har efterladt, slettes ved opstart. De kan stadig vælges som mål for flytning.
 - Den gamle samlede Spotify-entitet er skjult (ikke slettet), indtil PodView er gået over til rum-afspillerne.
+- Spiller egen konto på en anden enhed (fx iPhone), kan der nu også spoles derfra (`get_playback_controls`/`control_playback` tilbyder `seek`), så pause, næste, forrige og spol alle virker, uanset enhed.
 
 ## Speakers 0.26.97 — hurtigere radiostart
 
