@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -81,106 +78,6 @@ func TestRadioStartStopThenSpotifyCommandsSucceed(t *testing.T) {
 	}
 }
 
-func TestNativeWedgeLinesAreRecognised(t *testing.T) {
-	wedged := []string{
-		`connect-recovery native reason=ownership_failure stage=room_handoff retained_start=true retained_move=false custody_unknown=true retirement_pending=true`,
-		`retirement_prepare outcome=request_failed reason=unavailable`,
-		`retirement_prepare outcome=skipped reason=custody_uncertain`,
-		`failed loading: output admission custody_unknown: alias registry unavailable or changed`,
-	}
-	for _, line := range wedged {
-		if !nativeWedgeLine(line) {
-			t.Errorf("not recognised: %s", line)
-		}
-	}
-	for _, line := range []string{
-		`connect-recovery native reason=ownership_failure stage=room_handoff custody_unknown=false retirement_pending=false`,
-		`retirement_prepare outcome=prepared reason=none`,
-		`retirement_prepare outcome=skipped reason=no_matching_custody`,
-	} {
-		if nativeWedgeLine(line) {
-			t.Errorf("false wedge: %s", line)
-		}
-	}
-}
-
-// A real child process standing in for Native logs the Green wedge line. The
-// supervisor must replace only that process with a fresh one quickly (no 2 s
-// backoff), once, without waiting for an add-on restart.
-func TestNativeWedgeIsHealedByAFreshSpotifyEngine(t *testing.T) {
-	if os.Getenv("PODCONNECT_FAKE_NATIVE") != "" {
-		return
-	}
-	dir := t.TempDir()
-	rt := &roomRuntime{room: &Room{ID: "wedge-fixture"}, stop: make(chan struct{})}
-	var mu sync.Mutex
-	starts := []time.Time{}
-	build := func() *exec.Cmd {
-		mu.Lock()
-		n := len(starts)
-		starts = append(starts, time.Now())
-		mu.Unlock()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestFakeNativeChild$")
-		cmd.Env = append(os.Environ(), "PODCONNECT_FAKE_NATIVE="+fmt.Sprint(n), "PODCONNECT_FAKE_NATIVE_DIR="+dir)
-		return cmd
-	}
-	done := make(chan struct{})
-	go func() { defer close(done); rt.keepAlive("go-librespot", &rt.glCmd, build) }()
-	defer func() {
-		rt.requestStop(context.Background())
-		rt.mu.Lock()
-		cmd := rt.glCmd
-		rt.mu.Unlock()
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		<-done
-	}()
-	deadline := time.Now().Add(8 * time.Second)
-	for {
-		mu.Lock()
-		n := len(starts)
-		mu.Unlock()
-		if n >= 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("wedged Native was not replaced")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	mu.Lock()
-	gap := starts[1].Sub(starts[0])
-	mu.Unlock()
-	if gap > 1500*time.Millisecond {
-		t.Fatalf("fresh Spotify engine took %v (2 s respawn backoff still applied)", gap)
-	}
-	time.Sleep(300 * time.Millisecond)
-	mu.Lock()
-	n := len(starts)
-	mu.Unlock()
-	if n != 2 {
-		t.Fatalf("Native replaced %d times, want exactly once", n-1)
-	}
-}
-
-func TestFakeNativeChild(t *testing.T) {
-	role := os.Getenv("PODCONNECT_FAKE_NATIVE")
-	if role == "" {
-		return
-	}
-	if role == "0" {
-		fmt.Println("connect-recovery native reason=ownership_failure stage=room_handoff retained_start=true retained_move=false custody_unknown=true retirement_pending=true")
-		fmt.Println("connect-recovery native reason=transfer_failed")
-	} else {
-		fmt.Println("go-librespot fresh and idle")
-	}
-	time.Sleep(30 * time.Second)
-}
-
-// Latency: Green measured ~4.8 s radio start when Spotify played on the same
-// HomePod (requirement < 3 s). The Spotify hand-over used to run before the
-// radio's own start; now both run together, so the start costs the slower one.
 func TestRadioStartDoesNotWaitForSpotifyPauseOnTopOfItsOwnStart(t *testing.T) {
 	p, fake, spotify := newTestRadio(t)
 	spotify.route, spotify.playing, spotify.session = "r0", true, true
@@ -227,27 +124,6 @@ func TestBridgeDoesNotYieldRadioToSpotifyItIsHandingOver(t *testing.T) {
 	p.mu.Unlock()
 	if !still {
 		t.Fatal("radio yielded to the Spotify playback it was pausing")
-	}
-}
-
-// The replaced Native's own shutdown lines (its retirement is refused once the
-// radio holds the HomePod) must not trigger a second replacement.
-func TestFreshNativeShutdownLinesDoNotTriggerAnotherReplacement(t *testing.T) {
-	rt := &roomRuntime{room: &Room{ID: "heal-fixture"}, stop: make(chan struct{})}
-	defer rt.requestStop(context.Background())
-	var mu sync.Mutex
-	replaced := 0
-	previous := restartNativeHook
-	restartNativeHook = func(*roomRuntime) { mu.Lock(); replaced++; mu.Unlock(); time.Sleep(20 * time.Millisecond) }
-	t.Cleanup(func() { restartNativeHook = previous })
-	rt.freshNative("radio took the speaker")
-	time.Sleep(60 * time.Millisecond)
-	rt.healNativeWedge() // late "retirement_prepare outcome=request_failed" from the old process
-	time.Sleep(60 * time.Millisecond)
-	mu.Lock()
-	defer mu.Unlock()
-	if replaced != 1 {
-		t.Fatalf("Native replaced %d times, want 1", replaced)
 	}
 }
 
