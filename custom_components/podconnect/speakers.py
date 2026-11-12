@@ -398,8 +398,7 @@ class SpeakersClient:
             not isinstance(reply, dict)
             or reply.get("schema") != "podconnect.start_identity.v1"
             or not isinstance(reply.get("engine_device_id"), str)
-            or len(reply["engine_device_id"]) != 40
-            or any(ch not in "0123456789abcdef" for ch in reply["engine_device_id"])
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reply["engine_device_id"])
         ):
             raise SpeakersError("Native engine identity unavailable")
         return reply["engine_device_id"]

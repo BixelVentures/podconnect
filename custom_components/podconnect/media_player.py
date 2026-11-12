@@ -1,4 +1,8 @@
-"""Media player platform for PodConnect — one entity per Spotify Connect device."""
+"""Media player platform for PodConnect.
+
+With Speakers configured there is one entity: the PodConnect speaker itself. Phones, laptops and
+cars on the Spotify account are transfer targets, never HA entities.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +27,9 @@ from homeassistant.components.media_player import (
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_platform
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -149,12 +155,37 @@ async def async_setup_entry(
         "async_play_from_library",
     )
 
+    engine: dict[str, str | None] = {"id": None}
+    identity_task: list[asyncio.Task] = []
+
+    async def _read_engine() -> None:
+        from .speakers import SpeakersError
+
+        try:
+            async with asyncio.timeout(5):
+                engine["id"] = await speakers.start_identity()
+        except (SpeakersError, ClientError, TimeoutError):
+            return  # Retried on the next poll; no entity until the speaker is known.
+        _remove_foreign_entities(hass, entry.entry_id, engine["id"])
+        _discover()
+
+    def _wanted(device_id: str) -> bool:
+        return speakers is None or device_id == engine["id"]
+
     @callback
     def _discover() -> None:
+        if speakers is not None and engine["id"] is None:
+            if not identity_task or identity_task[0].done():
+                identity_task[:] = [
+                    entry.async_create_background_task(
+                        hass, _read_engine(), "podconnect engine identity"
+                    )
+                ]
+            return
         new: list[PodConnectMediaPlayer] = []
         for dev in (coordinator.data or {}).get("devices", []):
             device_id = dev.get("id")
-            if device_id and device_id not in known:
+            if device_id and device_id not in known and _wanted(device_id):
                 known.add(device_id)
                 new.append(
                     PodConnectMediaPlayer(
@@ -167,8 +198,24 @@ async def async_setup_entry(
         if new:
             async_add_entities(new)
 
-    _discover()
+    if speakers is not None:
+        await _read_engine()
+    else:
+        _discover()
     entry.async_on_unload(coordinator.async_add_listener(_discover))
+
+
+def _remove_foreign_entities(hass, entry_id: str, engine_id: str) -> None:
+    """Delete entities and devices this entry made for anything but the PodConnect speaker."""
+    keep = f"{entry_id}_{engine_id}"
+    entities = er.async_get(hass)
+    for item in er.async_entries_for_config_entry(entities, entry_id):
+        if item.domain == "media_player" and item.unique_id != keep:
+            entities.async_remove(item.entity_id)
+    devices = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(devices, entry_id):
+        if (DOMAIN, engine_id) not in device.identifiers:
+            devices.async_update_device(device.id, remove_config_entry_id=entry_id)
 
 
 class PodConnectMediaPlayer(

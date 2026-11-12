@@ -28,6 +28,7 @@ def search_track(index):
 
 
 class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
+    engine_identity = 'spotify-one'
     _cleanup = fixture.TargetFrameworkTests._cleanup
     _task = fixture.TargetFrameworkTests._task
     _writes = fixture.TargetFrameworkTests._writes

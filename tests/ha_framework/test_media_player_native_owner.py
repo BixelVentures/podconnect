@@ -10,7 +10,7 @@ import test_room_content as fixtures
 import test_room_move as move_fixtures
 from aiohttp import web
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry
+from homeassistant.helpers import device_registry, entity_registry
 
 from custom_components.podconnect.speakers import SpeakersError
 
@@ -73,6 +73,7 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             )
         )
         self.alias_reads = 0
+        self.identity_entered.clear()  # Set by entity setup's own identity read.
         self.data = self.entries[0].runtime_data
         registry = entity_registry.async_get(self.hass)
         self.entity_id = registry.async_get_entity_id(
@@ -562,15 +563,6 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             (self.prepares(), self.content_commits(), self._writes()), ([], [], [])
         )
 
-    async def test_media_native_library_external_target_preserves_raw_adapter(self):
-        self.entity_id = entity_registry.async_get(self.hass).async_get_entity_id(
-            "media_player", "podconnect", "account-alpha_" + self.external_id
-        )
-        await self.library_call(shuffle=True)
-        self.assertEqual(len(self._writes()), 2)
-        self.assertEqual(self.command_queries[-1]["device_id"], self.external_id)
-        self.assertEqual((self.prepares(), self.content_commits()), ([], []))
-
     async def test_media_native_selected_track_and_context_use_room_content(self):
         for uri, action, key in (
             ("spotify:track:" + "A" * 22, "play_track", "track_uri"),
@@ -769,23 +761,54 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             (self.prepares(), self.content_commits(), self._writes()), ([], [], [])
         )
 
-    async def test_media_native_other_device_keeps_existing_play_media_path(self):
+    async def test_only_the_podconnect_speaker_is_an_entity(self):
+        """A phone or laptop on the account is a transfer target, never an HA entity."""
         registry = entity_registry.async_get(self.hass)
-        other = registry.async_get_entity_id(
-            "media_player", "podconnect", "account-alpha_" + self.external_id
+        self.assertIsNone(
+            registry.async_get_entity_id(
+                "media_player", "podconnect", "account-alpha_" + self.external_id
+            )
         )
-        await self.hass.services.async_call(
-            "media_player",
-            "play_media",
-            {
-                "entity_id": other,
-                "media_content_type": "track",
-                "media_content_id": "spotify:track:" + "A" * 22,
-            },
-            blocking=True,
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        await self.hass.async_block_till_done()
+        self.assertIsNone(
+            registry.async_get_entity_id(
+                "media_player", "podconnect", "account-alpha_" + self.external_id
+            )
         )
-        self.assertEqual(len(self._writes()), 1)
-        self.assertEqual((self.prepares(), self.content_commits()), ([], []))
+
+    async def test_reload_removes_entities_left_by_older_versions(self):
+        """Green: iPhone/MacBook/Tesla entities from older Control versions disappear."""
+        entry = self.entries[0]
+        registry = entity_registry.async_get(self.hass)
+        devices = device_registry.async_get(self.hass)
+        for device_id in (self.external_id, "c" * 40):
+            device = devices.async_get_or_create(
+                config_entry_id=entry.entry_id, identifiers={("podconnect", device_id)}
+            )
+            registry.async_get_or_create(
+                "media_player",
+                "podconnect",
+                "account-alpha_" + device_id,
+                config_entry=entry,
+                device_id=device.id,
+            )
+        self.assertTrue(await self.hass.config_entries.async_reload(entry.entry_id))
+        await self.hass.async_block_till_done()
+        kept = [
+            item.unique_id
+            for item in entity_registry.async_entries_for_config_entry(
+                registry, entry.entry_id
+            )
+        ]
+        self.assertEqual(kept, ["account-alpha_" + self.native_id])
+        identifiers = [
+            device.identifiers
+            for device in device_registry.async_entries_for_config_entry(
+                devices, entry.entry_id
+            )
+        ]
+        self.assertEqual(identifiers, [{("podconnect", self.native_id)}])
 
     async def test_media_select_configured_alias_uses_room_move_preserving_pause(self):
         self.source_selection_fixture = True
@@ -1398,20 +1421,6 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         self.assertEqual(len(self.room_posts), 1)
         self.assertEqual(self._writes(), [])
 
-    async def test_media_native_other_device_seek_keeps_existing_spotify_path(self):
-        other = entity_registry.async_get(self.hass).async_get_entity_id(
-            "media_player", "podconnect", "account-alpha_" + self.external_id
-        )
-        await self.hass.services.async_call(
-            "media_player",
-            "media_seek",
-            {"entity_id": other, "seek_position": 2.5},
-            blocking=True,
-        )
-        self.assertEqual(len(self._writes()), 1)
-        self.assertEqual(self.command_queries[-1]["position_ms"], "2500")
-        self.assertEqual(self.room_posts, [])
-
     async def test_media_native_seek_does_not_expand_closed_v3_observation(self):
         self.playing = True
         await self.data.coordinator.async_refresh()
@@ -1606,19 +1615,6 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         self.assertEqual(
             (self._writes(), self.room_posts, self.volume_posts), ([], [], [])
         )
-
-    async def test_media_native_proven_other_device_retains_existing_api_path(self):
-        registry = entity_registry.async_get(self.hass)
-        entity_id = registry.async_get_entity_id(
-            "media_player", "podconnect", "account-alpha_" + self.external_id
-        )
-        await self.hass.services.async_call(
-            "media_player", "media_pause", {"entity_id": entity_id}, blocking=True
-        )
-        self.assertEqual(len(self._writes()), 1)
-        self.assertEqual(self.command_queries, [{"device_id": self.external_id}])
-        self.assertEqual((self.room_posts, self.volume_posts), ([], []))
-        self.assertEqual(self.data.commands.command_sequence, 0)
 
     async def test_media_native_exhausted_sequence_is_closed_before_any_write(self):
         self.data.commands.command_sequence = 2**53 - 1

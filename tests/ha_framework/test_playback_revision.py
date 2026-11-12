@@ -25,6 +25,8 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.provider_changed_at = 1_790_000_000_000
         self.position = 0
         self.engine_reads = 0
+        # Entity setup reads the engine identity too; count only the push watch's reads.
+        self.count_engine_reads = False
         self.initial_engine_mismatch = (
             self._testMethodName
             == "test_held_poll_coalesces_hints_and_falls_back_on_failure"
@@ -42,6 +44,7 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.account_overrides = {"account-alpha": "native-user"}
             await self.start_manager(binary)
         await fixture.TargetFrameworkTests.asyncSetUp(self)
+        self.count_engine_reads = True
         self.holds.append(self.release_read)
         await self.hass.config_entries.async_unload(self.entries[1].entry_id)
         self.entry = self.entries[0]
@@ -90,7 +93,7 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
         if request.method != "GET":
             self.writes.append((request.method, request.path))
         if request.path == "/api/start-volume/identity":
-            self.engine_reads += 1
+            self.engine_reads += self.count_engine_reads
             return web.json_response(
                 {
                     "schema": "podconnect.start_identity.v1",
