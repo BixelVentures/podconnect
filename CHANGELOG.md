@@ -1,3 +1,16 @@
+## Speakers 0.26.98 — ærlig rumstatus, enkel betjening, ingen låsning efter flyt
+
+- `/api/rooms` siger kun "spiller", når rummets HomePod faktisk får lyd (Spotify-motoren spiller, OwnTone spiller, og HomePod'en er valgt). Hvert rum har nu `source` (spotify/radio) og `state` (playing/paused/connecting/idle), og det spillende rum har sporet (titel, kunstnere, album, cover, position, varighed). Før kunne Svends rum stå som spillende med en tavs HomePod.
+- Nyt `POST /api/room-control`: pause, fortsæt, næste, forrige, spol og lydstyrke på et rum i ét kald. Sidste kommando vinder; radio og Spotify styres ens. Det gamle prepare/commit findes stadig for ældre PodView.
+- Spotify-motoren låser ikke længere, når en flytning eller radio efterlader overdragelsen usikker: næste kommando går igennem (før: "alias registry unavailable" og afviste knapper indtil genstart). Overdragelsen til OwnTone forsøges som før.
+- Supervisoren læser ikke længere motorens log for at genstarte den; låsningen, den reddede, findes ikke mere.
+
+## Control 0.10.44 — én afspiller pr. rum
+
+- Home Assistant har nu én `media_player` pr. PodConnect-rum (Køkkenalrum, Svend, Frida). Tilstanden kommer fra Speakers (spiller/pause/buffering/ledig, Spotify eller radio, med cover og tidslinje), og knapperne er hver ét direkte kald – ens, uanset om musikken blev startet fra PodView, stemmen eller Spotify-appen. `play_media` vælger rummet og spiller dér.
+- Telefoner, computere, biler og gamle Spotify-id'er bliver ikke længere HA-entiteter, og dem, ældre versioner har efterladt, slettes ved opstart. De kan stadig vælges som mål for flytning.
+- Den gamle samlede Spotify-entitet er skjult (ikke slettet), indtil PodView er gået over til rum-afspillerne.
+
 ## Speakers 0.26.97 — hurtigere radiostart
 
 - Radioens egen afspiller bruger nu samme korte startbuffer som Spotify (`buffer_ms`, standard 500 ms). Den manglede indstillingen og brugte OwnTones standard på 2250 ms, før lyden gik i gang — ca. 1,75 s af de målte 4,3 s.
