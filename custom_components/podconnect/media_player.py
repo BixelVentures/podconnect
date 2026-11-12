@@ -1,7 +1,8 @@
 """Media player platform for PodConnect.
 
-With Speakers configured there is one entity: the PodConnect speaker itself. Phones, laptops and
-cars on the Spotify account are transfer targets, never HA entities.
+With Speakers configured there is one entity per PodConnect room (room_player.py), plus the
+hidden speaker engine. Phones, laptops and cars on the Spotify account are transfer targets,
+never HA entities.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
 from .coordinator import PodConnectCoordinator
 from .native_start import start_guards
+from .room_player import async_setup_rooms, room_device_key, room_unique_id
 from .targets import configured_alias_targets, select_playback_source
 
 # SEARCH_MEDIA + SearchMedia/SearchMediaQuery landed in HA 2025.5. Import defensively so the
@@ -193,12 +195,14 @@ async def async_setup_entry(
                         entry.entry_id,
                         device_id,
                         dev.get("name") or device_id,
+                        visible=speakers is None,
                     )
                 )
         if new:
             async_add_entities(new)
 
     if speakers is not None:
+        await async_setup_rooms(hass, entry, async_add_entities)
         await _read_engine()
     else:
         _discover()
@@ -206,16 +210,32 @@ async def async_setup_entry(
 
 
 def _remove_foreign_entities(hass, entry_id: str, engine_id: str) -> None:
-    """Delete entities and devices this entry made for anything but the PodConnect speaker."""
+    """Keep only the room entities and the (hidden) speaker engine; delete the rest.
+
+    The engine entity stays hidden while its older command paths are still in use; the
+    rooms are what people and voice control.
+    """
     keep = f"{entry_id}_{engine_id}"
+    rooms = room_unique_id(entry_id, "")
     entities = er.async_get(hass)
     for item in er.async_entries_for_config_entry(entities, entry_id):
-        if item.domain == "media_player" and item.unique_id != keep:
+        if item.domain != "media_player" or item.unique_id.startswith(rooms):
+            continue
+        if item.unique_id != keep:
             entities.async_remove(item.entity_id)
+        elif item.hidden_by is None:
+            entities.async_update_entity(
+                item.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION
+            )
     devices = dr.async_get(hass)
+    room_device = room_device_key("")
     for device in dr.async_entries_for_config_entry(devices, entry_id):
-        if (DOMAIN, engine_id) not in device.identifiers:
-            devices.async_update_device(device.id, remove_config_entry_id=entry_id)
+        if (DOMAIN, engine_id) in device.identifiers or any(
+            domain == DOMAIN and key.startswith(room_device)
+            for domain, key in device.identifiers
+        ):
+            continue
+        devices.async_update_device(device.id, remove_config_entry_id=entry_id)
 
 
 class PodConnectMediaPlayer(
@@ -234,9 +254,12 @@ class PodConnectMediaPlayer(
         entry_id: str,
         device_id: str,
         device_name: str,
+        *,
+        visible: bool = True,
     ) -> None:
         """Initialise the entity."""
         super().__init__(coordinator)
+        self._attr_entity_registry_visible_default = visible
         self._entry_id = entry_id
         self._device_id = device_id
         # Optimistic play/pause: HA's state comes from a 10s Spotify poll, so the card's

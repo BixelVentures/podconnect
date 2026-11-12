@@ -315,6 +315,24 @@ class SpeakersClient:
             seen.add(row["id"])
         return rows
 
+    async def room_control(
+        self,
+        room_id: str,
+        action: str,
+        *,
+        position_ms: int | None = None,
+        volume: int | None = None,
+    ) -> None:
+        """One direct control of a room's current source; last command wins."""
+        body: dict = {"room_id": room_id, "action": action}
+        if position_ms is not None:
+            body["position_ms"] = int(position_ms)
+        if volume is not None:
+            body["volume"] = int(volume)
+        reply = await self._request("POST", "/api/room-control", body)
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            raise SpeakersError("Room control rejected")
+
     async def pause_native_engine(self) -> None:
         """Account-agnostic local pause of the primary Native engine and its AirPlay.
 
