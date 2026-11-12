@@ -319,6 +319,12 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	route := activeRouteRoomID(rooms, devs, gl)
 	spotifyPlaying := gl.Active && !gl.Paused && !gl.Stopped
+	// "Playing" is what the speaker outputs: the engine plays, OwnTone plays and
+	// the room's HomePod is the selected output. The engine alone is not proof.
+	outputPlaying := false
+	if primary != nil && spotifyPlaying && outputSelected(devs, roomByIDIn(rooms, route)) {
+		outputPlaying = owntonePlayerState(primary.OwnTone) == "play"
+	}
 	nowPlayingText := ""
 	if primary != nil && route != "" {
 		nowPlayingText = nowPlaying(primary.Librespot)
@@ -332,7 +338,7 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 			ID: rm.ID, Name: rm.Name, HomepodName: rm.HomepodName, HomepodID: rm.HomepodID,
 			OwntoneUp: isAlias || up,
 			Alias:     isAlias,
-			Playing:   spotifyPlaying && rm.ID == route,
+			Playing:   outputPlaying && rm.ID == route,
 			Released:  fileExists(releasedPath(rm)),
 			Volume:    -1,
 
@@ -341,8 +347,12 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 			Bitrate:           roomBitrate(rm),
 			BitrateOverridden: rm.Bitrate != "",
 		}
+		info.Source, info.State = roomSource(rm.ID, route, gl, outputPlaying)
 		if rm.ID == route {
 			info.NowPlaying = nowPlayingText
+		}
+		if info.Source == "radio" {
+			info.Playing, info.NowPlaying = true, ""
 		}
 		if idx, _ := matchOutput(devs, rm.HomepodID, rm.HomepodName); idx >= 0 && devs[idx].hasVolume {
 			info.Volume = devs[idx].volume
@@ -353,6 +363,34 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 		out = append(out, info)
 	}
 	writeJSON(w, map[string]any{"rooms": out})
+}
+
+// roomSource is the one room status every client shows: which source owns the room
+// ("spotify", "radio" or "") and its state ("playing", "paused", "connecting" or "idle").
+// "connecting" means Spotify plays but the HomePod does not output it yet.
+func roomSource(roomID, route string, gl glStatus, outputPlaying bool) (string, string) {
+	if radioOwner.playingOn(roomID) {
+		return "radio", "playing"
+	}
+	if roomID != route || !gl.Active || gl.Stopped {
+		return "", "idle"
+	}
+	switch {
+	case gl.Paused:
+		return "spotify", "paused"
+	case outputPlaying:
+		return "spotify", "playing"
+	}
+	return "spotify", "connecting"
+}
+
+// outputSelected reports whether the room's HomePod is a selected OwnTone output.
+func outputSelected(devs []device, rm *Room) bool {
+	if rm == nil {
+		return false
+	}
+	idx, _ := matchOutput(devs, rm.HomepodID, rm.HomepodName)
+	return idx >= 0 && devs[idx].Selected
 }
 
 func roomByIDIn(rooms []*Room, id string) *Room {
