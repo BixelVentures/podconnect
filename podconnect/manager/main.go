@@ -1512,6 +1512,7 @@ func main() {
 	http.HandleFunc("/api/test", speakerTestHandler)
 
 	http.HandleFunc("/api/release", speakerReleaseHandler)
+	http.HandleFunc("/api/room-control", roomControlHandler)
 
 	// /api/stop pauses whatever is playing on a speaker WITHOUT giving the HomePod away. It talks to
 	// go-librespot LOCALLY, so it stops playback regardless of which Spotify account owns the session
