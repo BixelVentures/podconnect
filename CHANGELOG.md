@@ -1,3 +1,8 @@
+## Control 0.10.43 — udgivelse af 0.10.42-indholdet
+
+- Samme Control som 0.10.42 (se nedenfor). 0.10.42's GitHub-udgivelse fejlede efter at tagget var oprettet, så HACS kunne ikke se den; 0.10.43 udgiver indholdet.
+- Udgivelsesjobbet skriver nu den faste årsag, når det stopper (fx `Rejected: release creation failed`), i stedet for kun `Rejected`.
+
 ## Speakers 0.26.96 — Spotify Connect virker igen efter radio
 
 - Radio-start på den HomePod, Spotify bruger, pauser Spotify og afslutter Spotify-sessionen rent (frisk, ledig Spotify-motor i baggrunden), ligesom når man vælger en anden AirPlay-kilde. Før tog radioens AirPlay-forbindelse HomePod'en fra Spotifys OwnTone; Native låste sig så (`alias registry unavailable or changed`, `custody_uncertain`), og hver overførsel fra telefonen, pause og spol fejlede indtil add-on-genstart. Spotify i et andet rum røres ikke.

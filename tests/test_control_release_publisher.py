@@ -256,3 +256,24 @@ class PublisherTests(unittest.TestCase):
         self.assertNotIn("contents: write", before)
         self.assertIn("contents: write", publish)
         self.assertNotIn("speaker", publish.lower())
+
+
+class FailureReasonTests(unittest.TestCase):
+    def test_rejected_publication_names_its_fixed_reason(self):
+        """Speakers 0.26.96/Control 0.10.42: the release job printed only
+        "Rejected", so nobody could tell which check stopped publication."""
+        import subprocess
+        import sys
+
+        script = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "publish_control_release.py"
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            env={"GITHUB_EVENT_NAME": "pull_request"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Control publication failed closed: Rejected: only this repository main push may publish",
+            result.stderr,
+        )
