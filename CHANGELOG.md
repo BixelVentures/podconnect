@@ -11,6 +11,7 @@
 - Pause, næste og lydstyrke lige efter et rumskift er lige så hurtige som ellers: rum-betjeningens læsning afvises ikke længere, fordi Control selv lander Spotify-polls efter flytningen (før op til ~3,5 s med genforsøg). Konto, ejer, mål og Speakers-rute kontrolleres stadig ved afsendelse.
 - Køen viser ikke længere afspillede numre efter skip: den gemte kø-læsning gælder kun for det nummer, den blev læst til; ved nummerskift læses Spotify igen (ellers op til 10 s gammel kø).
 - Push fra Speakers (afspilningsændringer) genoptages inden for 2 s efter et rumskift i stedet for op til 60 s, så en pause fra Spotify-appen når HA hurtigt.
+- Stemme/`media_player.play_media` (fx HassMediaSearchAndPlay) starter nu også musik, når Spotify-motoren er ledig eller kontoen spiller et andet sted (fx på iPhonen): Control vælger rummet som PodView (det spillende rum, ellers primærrummet Køkkenalrum) og starter via rummets Native-start, som overtager kontoen. Før: "Native content unavailable".
 
 ## Speakers 0.26.95 — enkel radio, Spotify altid først
 

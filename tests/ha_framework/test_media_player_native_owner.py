@@ -94,6 +94,22 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         return value
 
     async def _backend(self, request):
+        if getattr(self, "account_elsewhere", False):
+            # Green A12: the account plays on the iPhone, Native has no bound room.
+            if request.path == "/api/room-switch" and request.method == "GET":
+                self.alias_reads += 1
+                return web.json_response(
+                    {"binding": {"ready": False}, "aliases": []}
+                )
+            if request.path == "/api/rooms" and request.method == "GET":
+                return web.json_response(
+                    {
+                        "rooms": [
+                            {"id": "room-alpha", "homepod_id": "123", "alias": False, "playing": False},
+                            {"id": "room-beta", "homepod_id": "456", "alias": True, "playing": False},
+                        ]
+                    }
+                )
         if getattr(self, "local_stop_fixture", False):
             if request.path == "/api/rooms" and request.method == "GET":
                 return web.json_response(
@@ -586,6 +602,27 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         self.assertIsNone(self.entity._optimistic_repeat)
         self.assertIsNone(self.entity._optimistic_poll_floor)
         self.assertEqual(self.data.commands.command_sequence, 5)
+
+    async def test_media_native_voice_start_while_account_plays_elsewhere(self):
+        """Green A12: HassMediaSearchAndPlay failed with "Native content unavailable".
+
+        With the account on the iPhone Native has no bound room; the start must
+        still go to a room (primary Køkkenalrum) through the room-content path,
+        like PodView, and never through a raw Web API write.
+        """
+        self.account_elsewhere = True
+        await self.data.coordinator.async_refresh()
+        await self.native_call(
+            "play_media", media_content_type="music", media_content_id="chosen song"
+        )
+        sent = self.prepares()[-1]
+        self.assertEqual(sent["args"]["track_uri"], self.search_uri)
+        self.assertEqual(
+            (sent["scope"]["room_id"], sent["scope"]["homepod_id"]),
+            ("room-alpha", "123"),
+        )
+        self.assertEqual(len(self.content_commits()), 1)
+        self.assertEqual(self._writes(), [])
 
     async def test_media_native_selected_search_preserves_actual_uri_and_owner(self):
         self.no_playback = True
