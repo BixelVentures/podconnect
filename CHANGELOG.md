@@ -1,3 +1,17 @@
+## Speakers 0.26.96 — Spotify Connect virker igen efter radio
+
+- Radio-start på den HomePod, Spotify bruger, pauser Spotify og afslutter Spotify-sessionen rent (frisk, ledig Spotify-motor i baggrunden), ligesom når man vælger en anden AirPlay-kilde. Før tog radioens AirPlay-forbindelse HomePod'en fra Spotifys OwnTone; Native låste sig så (`alias registry unavailable or changed`, `custody_uncertain`), og hver overførsel fra telefonen, pause og spol fejlede indtil add-on-genstart. Spotify i et andet rum røres ikke.
+- Sikkerhedsnet: logger Native at dens Spotify-custody er låst (`custody_unknown=true`, mislykket `retirement_prepare`), erstattes kun Spotify-motoren af en frisk proces, så snart intet spiller — uden 2 s ventetid, højst én gang pr. 20 s. Den gamle proces' nedlukningslinjer udløser ingen ny genstart. OwnTone og radio røres ikke.
+- Radio-start venter ikke længere på Spotify-pausen oven i sin egen start (de kører samtidig), og radioen tjekker hvert 0,1 s om streamen spiller (før 0,25 s). Test: 0,6 s i stedet for ≥1,2 s for den del.
+- En pause/fortsæt fra Spotify-appen efter et rumskift sendes nu altid straks videre til Control (før blev den tabt, indtil næste Spotify-poll).
+- Radio-API'et (`/api/radio/*`) er uændret.
+
+## Control 0.10.42 — hurtig betjening efter flyt, frisk kø, hurtig status
+
+- Pause, næste og lydstyrke lige efter et rumskift er lige så hurtige som ellers: rum-betjeningens læsning afvises ikke længere, fordi Control selv lander Spotify-polls efter flytningen (før op til ~3,5 s med genforsøg). Konto, ejer, mål og Speakers-rute kontrolleres stadig ved afsendelse.
+- Køen viser ikke længere afspillede numre efter skip: den gemte kø-læsning gælder kun for det nummer, den blev læst til; ved nummerskift læses Spotify igen (ellers op til 10 s gammel kø).
+- Push fra Speakers (afspilningsændringer) genoptages inden for 2 s efter et rumskift i stedet for op til 60 s, så en pause fra Spotify-appen når HA hurtigt.
+
 ## Speakers 0.26.95 — enkel radio, Spotify altid først
 
 - Radio er nu en almindelig DR-stream på sin egen afspiller. Sidste kommando vinder (som Spotify Connect/AirPlay): radio-start tager den valgte højttaler (Spotify pauses kun, hvis Spotify spiller netop dér), og enhver Spotify-kommando eller Spotify-afspilning på den højttaler stopper radioen først. Radioen holder kun en højttaler, mens den faktisk spiller; en mislykket start efterlader intet. Radio starter (også ved flyt) altid på den fælles startlydstyrke 35 %, samme regel som Spotify; kun en senere lydstyrke-handling ændrer den.
