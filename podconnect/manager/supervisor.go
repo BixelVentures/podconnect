@@ -376,7 +376,8 @@ func (rt *roomRuntime) freshNative(reason string) {
 	rt.mu.Unlock()
 	log.Printf("rooms[%s]: fresh Spotify engine (%s)", rt.room.ID, reason)
 	go func() {
-		defer func() { rt.mu.Lock(); rt.nativeHealing = false; rt.mu.Unlock() }()
+		// Lines the old process logs while it shuts down never trigger another replacement.
+		defer func() { rt.mu.Lock(); rt.nativeHealing = false; rt.lastNativeHeal = time.Now(); rt.mu.Unlock() }()
 		rt.restartNative()
 	}()
 }

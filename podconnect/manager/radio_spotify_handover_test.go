@@ -229,3 +229,24 @@ func TestBridgeDoesNotYieldRadioToSpotifyItIsHandingOver(t *testing.T) {
 		t.Fatal("radio yielded to the Spotify playback it was pausing")
 	}
 }
+
+// The replaced Native's own shutdown lines (its retirement is refused once the
+// radio holds the HomePod) must not trigger a second replacement.
+func TestFreshNativeShutdownLinesDoNotTriggerAnotherReplacement(t *testing.T) {
+	rt := &roomRuntime{room: &Room{ID: "heal-fixture"}, stop: make(chan struct{})}
+	defer rt.requestStop(context.Background())
+	var mu sync.Mutex
+	replaced := 0
+	previous := restartNativeHook
+	restartNativeHook = func(*roomRuntime) { mu.Lock(); replaced++; mu.Unlock(); time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { restartNativeHook = previous })
+	rt.freshNative("radio took the speaker")
+	time.Sleep(60 * time.Millisecond)
+	rt.healNativeWedge() // late "retirement_prepare outcome=request_failed" from the old process
+	time.Sleep(60 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if replaced != 1 {
+		t.Fatalf("Native replaced %d times, want 1", replaced)
+	}
+}
