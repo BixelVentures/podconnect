@@ -1,0 +1,314 @@
+diff --git a/daemon/device_alias.go b/daemon/device_alias.go
+index 3640faf..dc71041 100644
+--- a/daemon/device_alias.go
++++ b/daemon/device_alias.go
+@@ -207,6 +207,7 @@ func (p *AppPlayer) idleAliasCurrentLocked() bool {
+ 	}
+ 	p.app.moveCustodyMu.Lock()
+ 	defer p.app.moveCustodyMu.Unlock()
++	p.app.recoverUncertainCustodyLocked()
+ 	return !p.app.moveCustodyUnknown && p.app.retirementPending == nil && p.app.startCustody == nil && p.app.moveCustody == nil && p.app.startOutputPermit == nil && p.app.manualRelease == nil && p.app.openedWriterOwner == nil && p.app.openedWriter.FD == ""
+ }
+ 
+diff --git a/daemon/device_alias_test.go b/daemon/device_alias_test.go
+index 396408d..7a4aae5 100644
+--- a/daemon/device_alias_test.go
++++ b/daemon/device_alias_test.go
+@@ -160,7 +160,7 @@ func TestIdleAliasActualHandlerOnlySelectsLocalWithoutCRead(t *testing.T) {
+ }
+ 
+ func TestIdleAliasActualHandlerRejectsNonIdleCustodyAndCancellation(t *testing.T) {
+-	for _, mode := range []string{"active", "playing", "session", "primary", "source", "writer-owner", "writer-fd", "start-custody", "move-custody", "unknown", "retirement", "permit", "quarantine", "cancel", "registry", "incarnation", "read-source", "read-start-custody"} {
++	for _, mode := range []string{"active", "playing", "session", "primary", "source", "writer-owner", "writer-fd", "start-custody", "move-custody", "retirement", "permit", "quarantine", "cancel", "registry", "incarnation", "read-source", "read-start-custody"} {
+ 		t.Run(mode, func(t *testing.T) {
+ 			p, events, creates := idleAliasFixture(t)
+ 			var reads atomic.Int32
+@@ -194,8 +194,6 @@ func TestIdleAliasActualHandlerRejectsNonIdleCustodyAndCancellation(t *testing.T
+ 				p.app.startCustody = &contentOperation{}
+ 			case "move-custody":
+ 				p.app.moveCustody = &moveOperation{}
+-			case "unknown":
+-				p.app.moveCustodyUnknown = true
+ 			case "retirement":
+ 				p.app.retirementPending = &retirementAttempt{}
+ 			case "permit":
+diff --git a/daemon/player.go b/daemon/player.go
+index ae391cd..dc4f2f8 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -1309,6 +1309,7 @@ func (p *AppPlayer) handoffDealerRoomTransfer(parent context.Context, req dealer
+ 		return false, nil
+ 	}
+ 	p.app.moveCustodyMu.Lock()
++	p.app.recoverUncertainCustodyLocked()
+ 	owned := p.app.startCustody != nil || p.app.moveCustody != nil
+ 	blocked := p.app.moveCustodyUnknown || p.app.retirementPending != nil
+ 	p.app.moveCustodyMu.Unlock()
+diff --git a/daemon/room_completed_writer.go b/daemon/room_completed_writer.go
+index 93c34bb..366f56f 100644
+--- a/daemon/room_completed_writer.go
++++ b/daemon/room_completed_writer.go
+@@ -104,7 +104,8 @@ func sameCompletedRoom(a, b roomTransportIdentity) bool {
+ func (app *App) completedWriterCurrent(owner *AppPlayer, identity roomTransportIdentity) (*completedWriter, error) {
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
+-	if app.moveCustodyUnknown || app.retirementPending != nil {
++	app.recoverUncertainCustodyLocked()
++	if app.retirementPending != nil {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	if app.startCustody == nil && app.moveCustody == nil {
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index f8e0245..189d32c 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -573,6 +573,7 @@ func (p *AppPlayer) dealerTransferStartRequired(req dealer.RequestPayload) (bool
+ 		return false, nil
+ 	}
+ 	p.app.moveCustodyMu.Lock()
++	p.app.recoverUncertainCustodyLocked()
+ 	fresh := p.app.openedWriterGeneration == 0
+ 	clean := p.app.openedWriterOwner == nil && p.app.startCustody == nil && p.app.moveCustody == nil && !p.app.moveCustodyUnknown && p.app.retirementPending == nil
+ 	p.app.moveCustodyMu.Unlock()
+@@ -627,6 +628,7 @@ func (p *AppPlayer) startPreparedDealerTransfer(ctx context.Context, paused bool
+ 		return nil, ErrAliasConflict
+ 	}
+ 	p.app.moveCustodyMu.Lock()
++	p.app.recoverUncertainCustodyLocked()
+ 	fresh := p.app.openedWriterGeneration == 0 && p.app.openedWriterOwner == nil &&
+ 		p.app.startCustody == nil && p.app.moveCustody == nil && !p.app.moveCustodyUnknown &&
+ 		p.app.retirementPending == nil && p.app.startOutputPermit == nil && !p.app.queueWriterBusyLocked()
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 8653909..f769f6a 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -603,7 +603,7 @@ func TestStart35ElapsedDeadlineCannotOpenOwnerReplacementGap(t *testing.T) {
+ // synthetic AP welcome seeds only the existing account getter; no provider
+ // authentication, HomePod or physical audio is claimed by this regression.
+ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+-	modes := []string{"playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "unknown-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation", "direct-pause-current", "direct-pause-unknown-state", "direct-pause-route", "direct-pause-foreign-prepare", "direct-pause-late-generation", "direct-pause-late-intent", "direct-pause-unknown-commit", "direct-pause-unknown-confirm", "episode-stage", "episode-metadata404", "episode-decode404", "episode-wrongmetadata", "episode-owner-stale", "episode-owner-late", "episode-wronggid", "episode-commit", "episode-invalid-overflow", "episode-invalid-maxplus", "episode-invalid-malformed", "episode-resolved-overflow", "episode-missinggid", "episode-malformedgid"}
++	modes := []string{"playing", "paused", "dealer-playing", "dealer-stale-paused-resume", "dealer-paused", "dealer-lazy404", "dealer-lazy404-paused", "cancel", "alias-aba", "unknown", "foreign-pipe", "complete-fails", "writer-lost", "prior-generation", "foreign-owner", "start-custody", "move-custody", "pending-retirement", "start-permit", "queue-custody", "late-generation", "direct-pause-current", "direct-pause-unknown-state", "direct-pause-route", "direct-pause-foreign-prepare", "direct-pause-late-generation", "direct-pause-late-intent", "direct-pause-unknown-commit", "direct-pause-unknown-confirm", "episode-stage", "episode-metadata404", "episode-decode404", "episode-wrongmetadata", "episode-owner-stale", "episode-owner-late", "episode-wronggid", "episode-commit", "episode-invalid-overflow", "episode-invalid-maxplus", "episode-invalid-malformed", "episode-resolved-overflow", "episode-missinggid", "episode-malformedgid"}
+ 	if mode := os.Getenv("PC_NATIVE_START_MODE"); mode != "" {
+ 		if mode != "actual-c-paused" && mode != "actual-c-playing" && mode != "actual-c-eof" && mode != "actual-c-selected" && mode != "actual-c-selected-stage" && mode != "actual-c-selected-successor" && mode != "actual-c-selected-rtp" && mode != "selected-sustained" && mode != "actual-c-native-pause" {
+ 			t.Fatal("invalid C compose mode")
+@@ -885,9 +885,6 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 			case "move-custody":
+ 				p.app.moveCustody = &moveOperation{Owner: &AppPlayer{}}
+ 				preexisting = true
+-			case "unknown-custody":
+-				p.app.moveCustodyUnknown = true
+-				preexisting = true
+ 			case "pending-retirement":
+ 				p.app.retirementPending = &retirementAttempt{}
+ 				preexisting = true
+@@ -2480,6 +2477,14 @@ func testDealerRoomChangeRetainedOwner(t *testing.T, p *AppPlayer, stream *playe
+ 		p.secondaryStream = nil
+ 	}
+ 	transferErr := p.handlePlayerCommandWithSpclient(ctx, req, p.sess.Spclient())
++	if negative == "unknown_custody" {
++		// Green, 11-12 Nov 2026: a room change from the Spotify app after an
++		// uncertain hand-over is the newest command and wins.
++		if transferErr != nil || p.app.moveCustodyUnknown || aliasEvents() == beforeAliasEvents {
++			t.Fatal("room change stayed locked out after an uncertain hand-over", transferErr)
++		}
++		return
++	}
+ 	if negative != "" {
+ 		if negative == "cancel_after_possible" || negative == "stale_after_possible" {
+ 			p.Close()
+diff --git a/daemon/room_move_custody.go b/daemon/room_move_custody.go
+index 679b65f..39453a7 100644
+--- a/daemon/room_move_custody.go
++++ b/daemon/room_move_custody.go
+@@ -43,9 +43,28 @@ func (app *App) supersedeMoveCustody(ctx context.Context, op *moveOperation) err
+ 	return nil
+ }
+ 
++// recoverUncertainCustodyLocked: last command wins. A hand-over whose outcome
++// stayed unknown used to quarantine every later output, transfer and control
++// until the engine restarted (Green, 11-12 Nov 2026). The hand-over is still
++// attempted; only when it stayed uncertain does the next command drop it.
++func (app *App) recoverUncertainCustodyLocked() {
++	if !app.moveCustodyUnknown {
++		return
++	}
++	app.moveCustody = nil
++	app.startCustody = nil
++	app.startOutputPermit = nil
++	app.retirementPending = nil
++	app.moveCustodyUnknown = false
++	if app.log != nil {
++		app.log.Warnf("uncertain room custody dropped: the newest command wins")
++	}
++}
++
+ func (app *App) contentCustodySnapshot() (*moveOperation, *contentOperation, error) {
+ 	app.moveCustodyMu.Lock()
+ 	defer app.moveCustodyMu.Unlock()
++	app.recoverUncertainCustodyLocked()
+ 	if app.moveCustodyUnknown || app.retirementPending != nil {
+ 		return nil, nil, ErrAliasConflict
+ 	}
+@@ -119,9 +138,7 @@ func (app *App) withNewOutput(owner *AppPlayer, create func() (output.Output, er
+ 	if app.queueWriterBusyLocked() {
+ 		return nil, fmt.Errorf("output admission queue_busy: %w", ErrAliasConflict)
+ 	}
+-	if app.moveCustodyUnknown {
+-		return nil, fmt.Errorf("output admission custody_unknown: %w", ErrAliasConflict)
+-	}
++	app.recoverUncertainCustodyLocked()
+ 	if app.retirementPending != nil {
+ 		return nil, fmt.Errorf("output admission retirement_pending: %w", ErrAliasConflict)
+ 	}
+@@ -132,7 +149,11 @@ func (app *App) withNewOutput(owner *AppPlayer, create func() (output.Output, er
+ 		return nil, fmt.Errorf("output admission start_custody: %w", ErrAliasConflict)
+ 	}
+ 	if err := app.revokeCompletedMoveCustodyLocked(nil); err != nil {
+-		return nil, fmt.Errorf("output admission move_retirement_unproven: %w", err)
++		// The MOVE was cancelled once and is never retried; a new output wins.
++		app.recoverUncertainCustodyLocked()
++		if app.retirementPending != nil || app.startCustody != nil {
++			return nil, fmt.Errorf("output admission move_retirement_unproven: %w", err)
++		}
+ 	}
+ 	return app.openRegisteredOutputLocked(owner, create)
+ }
+diff --git a/daemon/room_move_custody_test.go b/daemon/room_move_custody_test.go
+index 0931dd3..d9affcf 100644
+--- a/daemon/room_move_custody_test.go
++++ b/daemon/room_move_custody_test.go
+@@ -140,7 +140,6 @@ func TestFreshPlayerWriterReportsExactCustodyRefusalWithoutOpeningFIFO(t *testin
+ 		name    string
+ 		arrange func(*App, *AppPlayer)
+ 	}{
+-		{"custody_unknown", func(app *App, _ *AppPlayer) { app.moveCustodyUnknown = true }},
+ 		{"retirement_pending", func(app *App, owner *AppPlayer) { app.retirementPending = &retirementAttempt{owner: owner} }},
+ 		{"start_custody", func(app *App, owner *AppPlayer) {
+ 			app.startCustody = &contentOperation{Owner: owner, State: "complete", Terminal: true, CReceipt: &contentCReceipt{Phase: "completed"}}
+@@ -407,7 +406,7 @@ func TestStart35CommitCannotOvertakeFIFODescriptorAdmission(t *testing.T) {
+ 	}
+ }
+ 
+-func TestRoomMoveNewAppFIFOEmissionWaitsForExactOldCRevocation(t *testing.T) {
++func TestRoomMoveNewAppFIFOEmissionWaitsForOldCRevocationThenWins(t *testing.T) {
+ 	entered, release := make(chan struct{}), make(chan struct{})
+ 	var releaseOnce sync.Once
+ 	defer releaseOnce.Do(func() { close(release) })
+@@ -474,10 +473,31 @@ func TestRoomMoveNewAppFIFOEmissionWaitsForExactOldCRevocation(t *testing.T) {
+ 	}
+ 	select {
+ 	case err := <-newWriter:
+-		if err == nil {
+-			t.Fatal("UNKNOWN C cancel was credited as retirement and opened a new FIFO")
++		// The old token was revoked first; its UNKNOWN outcome no longer locks the new writer out.
++		if err != nil {
++			t.Fatalf("new writer stayed locked out after the old C cancel: %v", err)
+ 		}
+ 	case <-time.After(time.Second):
+-		t.Fatal("new FIFO writer did not return after C UNKNOWN quarantine")
++		t.Fatal("new FIFO writer did not return after the old C cancel")
++	}
++}
++
++// Green, 11-12 Nov 2026: after a move or radio, an UNKNOWN hand-over refused every
++// later output, Connect transfer and control until the engine restarted.
++func TestUnknownCustodyLetsTheNextCommandWin(t *testing.T) {
++	app := &App{}
++	owner := &AppPlayer{app: app}
++	app.moveCustodyUnknown = true
++	app.startCustody = &contentOperation{Owner: &AppPlayer{}}
++	app.retirementPending = &retirementAttempt{}
++	if err := attemptCustodyOutput(app, owner); err != nil {
++		t.Fatalf("new output refused after an unknown hand-over: %v", err)
++	}
++	if app.moveCustodyUnknown || app.startCustody != nil || app.retirementPending != nil || app.openedWriterOwner != owner {
++		t.Fatal("unknown custody was not replaced by the newest output")
++	}
++	app.moveCustodyUnknown = true
++	if _, err := app.completedWriterCurrent(owner, roomTransportIdentity{}); err != nil {
++		t.Fatalf("controls refused after an unknown hand-over: %v", err)
+ 	}
+ }
+diff --git a/daemon/room_release.go b/daemon/room_release.go
+index 0569699..8ad1a36 100644
+--- a/daemon/room_release.go
++++ b/daemon/room_release.go
+@@ -128,6 +128,7 @@ func (p *AppPlayer) fenceRoomRelease(ctx context.Context, offer *nativeTransport
+ 	}
+ 	p.app.moveCustodyMu.Lock()
+ 	defer p.app.moveCustodyMu.Unlock()
++	p.app.recoverUncertainCustodyLocked()
+ 	if p.app.manualRelease != nil || p.app.moveCustodyUnknown || p.app.retirementPending != nil {
+ 		return nil, ErrAliasConflict
+ 	}
+diff --git a/daemon/room_retirement_test.go b/daemon/room_retirement_test.go
+index 5dddfb9..6dfd559 100644
+--- a/daemon/room_retirement_test.go
++++ b/daemon/room_retirement_test.go
+@@ -230,8 +230,13 @@ func TestClosedPriorSTARTUnknownNeverRetriesOrAdmitsWriter(t *testing.T) {
+ 	if app.retireClosedPriorStartFor(context.Background(), fresh) == nil || app.retireClosedPriorStartFor(context.Background(), fresh) == nil {
+ 		t.Fatal("unknown closed-prior outcome escaped quarantine")
+ 	}
+-	if orphan.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
+-		t.Fatal("unknown outcome retried or admitted a new FIFO writer")
++	if orphan.Load() != 1 || !app.moveCustodyUnknown || app.startCustody == nil {
++		t.Fatal("unknown outcome was retried or credited")
++	}
++	// Last command wins: the next writer drops the uncertain custody instead of
++	// waiting for an engine restart.
++	if err := attemptCustodyOutput(app, fresh); err != nil || app.moveCustodyUnknown || app.startCustody != nil {
++		t.Fatalf("next writer stayed locked out after an unknown outcome: %v", err)
+ 	}
+ }
+ 
+@@ -290,8 +295,10 @@ func TestClosedPriorSTARTLateTerminalCannotClearNewWriterGeneration(t *testing.T
+ 				if err == nil || app.moveCustodyUnknown || app.retirementPending == nil {
+ 					t.Fatal("late closed-prior terminal poisoned a different attempt")
+ 				}
+-			} else if err == nil || !app.moveCustodyUnknown || app.startCustody == nil || attemptCustodyOutput(app, fresh) == nil {
++			} else if err == nil || !app.moveCustodyUnknown || app.startCustody == nil {
+ 				t.Fatal("late terminal credited a changed admission owner")
++			} else if err := attemptCustodyOutput(app, fresh); mode != "queue_writer" && err != nil {
++				t.Fatalf("next writer stayed locked out after a late terminal: %v", err)
+ 			}
+ 		})
+ 	}
+@@ -513,7 +520,7 @@ func TestRoomKnownRetirementPendingBlocksConcurrentNewFIFO(t *testing.T) {
+ 	}
+ }
+ 
+-func TestRoomKnownRetirementUncertainPrepareQuarantinesPhoneStop(t *testing.T) {
++func TestRoomKnownRetirementUncertainPrepareLetsTheNextWriterWin(t *testing.T) {
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		w.WriteHeader(http.StatusServiceUnavailable)
+ 	}))
+@@ -525,12 +532,12 @@ func TestRoomKnownRetirementUncertainPrepareQuarantinesPhoneStop(t *testing.T) {
+ 	}
+ 	owner.player.Stop()
+ 	owner.Close()
+-	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
+-		t.Fatal("new FIFO admitted after uncertain retirement prepare")
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err != nil {
++		t.Fatalf("next writer stayed locked out after an uncertain retirement prepare: %v", err)
+ 	}
+ }
+ 
+-func TestRoomKnownRetirementTerminalWithoutFreshReaderStaysClosed(t *testing.T) {
++func TestRoomKnownRetirementTerminalWithoutFreshReaderLetsTheNextWriterWin(t *testing.T) {
+ 	var writer output.MovePipeIdentity
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		var body map[string]json.RawMessage
+@@ -552,10 +559,10 @@ func TestRoomKnownRetirementTerminalWithoutFreshReaderStaysClosed(t *testing.T)
+ 	writer = app.openedWriter
+ 	owner.Close()
+ 	if !app.moveCustodyUnknown {
+-		t.Fatal("terminal witness without a fresh FIFO reader admitted a replacement")
++		t.Fatal("terminal witness without a fresh FIFO reader was credited as retirement")
+ 	}
+-	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err == nil {
+-		t.Fatal("new writer admitted without C fresh-reader readiness")
++	if err := attemptCustodyOutput(app, &AppPlayer{app: app}); err != nil {
++		t.Fatalf("next writer stayed locked out without C fresh-reader readiness: %v", err)
+ 	}
+ }
+ 
