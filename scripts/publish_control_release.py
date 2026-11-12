@@ -197,6 +197,9 @@ if __name__ == "__main__":
         OSError,
         subprocess.CalledProcessError,
     ) as error:
+        # Rejected carries only fixed reasons (and an HTTP method/status), never
+        # tokens or payloads; naming it makes a failed publication actionable.
+        reason = f": {error}" if isinstance(error, Rejected) else ""
         raise SystemExit(
-            f"Control publication failed closed: {type(error).__name__}"
+            f"Control publication failed closed: {type(error).__name__}{reason}"
         ) from None
