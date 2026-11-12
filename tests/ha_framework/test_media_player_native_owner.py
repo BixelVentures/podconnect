@@ -884,6 +884,20 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
         )
         self.assertEqual(self.source_move_posts, [])
 
+    async def test_move_to_a_room_takes_over_playback_from_the_phone(self):
+        """State f: "Flyt til Køkkenalrum" while the account plays on the iPhone."""
+        self.source_selection_fixture = True
+        self.source_current_target = self.external_id
+        self.playing = True
+        await self.native_call("select_source", source="Beta")
+        self.assertEqual(
+            [path for path, _ in self.source_effects],
+            ["/api/room-switch", "/spotify/me/player"],
+        )
+        self.assertEqual(
+            self.source_effects[-1][1], {"device_ids": [self.native_id], "play": True}
+        )
+
     async def test_media_select_idle_native_uses_explicit_idle_guard(self):
         self.source_selection_fixture = True
         self.source_current_target = self.external_id
