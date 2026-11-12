@@ -720,7 +720,24 @@ class PodConnectMediaPlayer(
                     raise HomeAssistantError("Native room unavailable")
                 return binding, matches[0]["homepod_id"]
 
-            first = selected(await configured_alias_targets(speakers))
+            async def resolve():
+                try:
+                    return selected(await configured_alias_targets(speakers))
+                except SpeakersError:
+                    # No bound Native route: the engine is idle or the account
+                    # plays elsewhere (e.g. the iPhone). Start on a configured
+                    # room like PodView does: the room Speakers reports as
+                    # playing, else the primary room. The start itself takes
+                    # the account over to the room's Native engine.
+                    rows = [r for r in await speakers.rooms() if r["homepod_id"]]
+                    playing = [r for r in rows if r.get("playing") is True]
+                    primary = [r for r in rows if r.get("alias") is False]
+                    chosen = playing if len(playing) == 1 else primary
+                    if len(chosen) != 1:
+                        raise HomeAssistantError("Native room unavailable")
+                    return {"room_id": chosen[0]["id"]}, chosen[0]["homepod_id"]
+
+            first = await resolve()
             owned()
             room, homepod = first[0]["room_id"], first[1]
             content = commands.room_content
@@ -759,7 +776,7 @@ class PodConnectMediaPlayer(
                 owned(same_poll=False)
                 if not prepared:
                     raise HomeAssistantError("Native content preparation unavailable")
-                if selected(await configured_alias_targets(speakers)) != first:
+                if await resolve() != first:
                     raise HomeAssistantError("Native room changed")
                 owned(same_poll=False)
                 started = True

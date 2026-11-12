@@ -29,6 +29,7 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls /me/player and /me/player/devices once per cycle for all entities."""
 
     _NATIVE_ENGINE_RECHECK_SECONDS = 60
+    _NATIVE_WATCH_MAX_BACKOFF_SECONDS = 2
 
     def __init__(self, hass: HomeAssistant, entry, api: SpotifyApi) -> None:
         """Initialise the coordinator."""
@@ -171,7 +172,10 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Older/unavailable Speakers keep normal Spotify polling in charge.
                 engine_checked = False
                 await asyncio.sleep(delay)
-                delay = min(60, delay * 2)
+                # A room move or a fresh Speakers engine briefly has no bound
+                # route. Retry quickly so external pauses keep pushing to HA
+                # (a 60 s backoff left HA on the old state for a minute).
+                delay = min(self._NATIVE_WATCH_MAX_BACKOFF_SECONDS, delay * 2)
                 continue
             delay = 1
             if reply is None:

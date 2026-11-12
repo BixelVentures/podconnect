@@ -94,6 +94,20 @@ type fakeSpotify struct {
 	route   string
 	playing bool
 	pauses  int
+	session bool
+	ended   int
+	delay   time.Duration // simulated Spotify pause round trip
+}
+
+func (s *fakeSpotify) routeState() (string, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.route, s.playing, s.session || s.playing
+}
+func (s *fakeSpotify) endSession() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ended++
 }
 
 func (s *fakeSpotify) routeRoom() (string, bool) {
@@ -102,6 +116,7 @@ func (s *fakeSpotify) routeRoom() (string, bool) {
 	return s.route, s.playing
 }
 func (s *fakeSpotify) pause() error {
+	time.Sleep(s.delay)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pauses++

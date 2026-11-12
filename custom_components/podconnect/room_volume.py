@@ -186,7 +186,9 @@ class RoomVolume:
                 source, self.commands.room_transport.observation_source(hass, entry)
             )
             if passive
-            else any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence"))
+            # A routine poll during the read is not a changed room; ``latest``
+            # re-proves owner and target, and Speakers fences the route.
+            else before["owner_epoch"] != latest["owner_epoch"]
         ):
             raise CommandRejected("stale_observation")
         if (

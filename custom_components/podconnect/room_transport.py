@@ -68,6 +68,16 @@ def same_playback_read(before, after):
     )
 
 
+def same_owner_read(before, after):
+    """A newer routine poll of the same account owner; the caller re-checks target."""
+    return (
+        before[:2] == after[:2]
+        and after[2] >= before[2]
+        and after[3] >= before[3]
+        and after[4] >= before[4]
+    )
+
+
 def valid_identity(native, route, scope):
     if (
         not isinstance(native, dict)
@@ -187,8 +197,16 @@ class RoomTransport:
             copy.deepcopy(raw["playback"]),
         )
 
-    async def observe(self, hass, entry, target, room, homepod, *, passive=False):
-        """Validate passive Native/C facts without requiring a permitted action."""
+    async def observe(
+        self, hass, entry, target, room, homepod, *, passive=False, routine=False
+    ):
+        """Validate passive Native/C facts without requiring a permitted action.
+
+        ``routine`` admits a Web API poll published during the Speakers read
+        (for example the follow-up reads after a room move): the Speakers
+        route is the authority for the room, and the caller re-checks account,
+        owner, target and capability against the newest poll.
+        """
         from .commands import CommandRejected
 
         scope = self.scope(hass, entry, target, room, homepod)
@@ -203,7 +221,13 @@ class RoomTransport:
         if self.scope(hass, entry, target, room, homepod) != scope:
             raise CommandRejected("native_account_unproven")
         after = self.observation_source(hass, entry)
-        if not (same_playback_read(before, after) if passive else after == before):
+        if not (
+            same_playback_read(before, after)
+            if passive
+            else same_owner_read(before, after)
+            if routine
+            else after == before
+        ):
             raise CommandRejected("stale_observation")
         if (
             not _snapshot(
@@ -431,9 +455,12 @@ class RoomTransport:
         from .commands import CommandRejected
 
         before = self.commands.controls(entry, target, native_room_phase=True)
-        state = await self.observe(hass, entry, target, room, homepod)
+        state = await self.observe(hass, entry, target, room, homepod, routine=True)
+        # A routine poll landing during the read is not a changed room: the
+        # latest poll re-proves owner, target and capability, and Speakers
+        # fences the exact route again at prepare/commit.
         latest = self.commands.controls(entry, target, native_room_phase=True)
-        if any(before[k] != latest[k] for k in ("owner_epoch", "poll_sequence")):
+        if before["owner_epoch"] != latest["owner_epoch"]:
             raise CommandRejected("stale_observation")
         if not state["actions"]:
             raise CommandRejected("room_transport_unavailable")

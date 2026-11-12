@@ -117,11 +117,18 @@ type radioOutput struct {
 	Volume   int
 }
 
-// radioSpotify is how the radio reaches Spotify: only to pause it when the
-// radio takes the speaker Spotify currently plays on. Replaced in tests.
+// radioSpotify is how the radio reaches Spotify: only to hand the speaker
+// over when the radio takes the speaker Spotify currently holds. Replaced in tests.
 type radioSpotify interface {
 	routeRoom() (roomID string, playing bool)
+	// routeState is one read of Spotify's route room, whether it plays and
+	// whether it has a session at all.
+	routeState() (roomID string, playing, active bool)
 	pause() error
+	// endSession ends Spotify's session in the background (fresh, idle
+	// Spotify engine) so the speaker carries no Spotify leftovers. It never
+	// blocks the radio and never starts audio.
+	endSession()
 }
 
 type radioPlayerConfig struct {
@@ -140,6 +147,9 @@ const (
 // radioStartWait bounds how long a start waits for the stream to play.
 var radioStartWait = 8 * time.Second
 
+// radioPlayPoll is how often a start reads whether the stream plays yet.
+const radioPlayPoll = 100 * time.Millisecond
+
 type radioPlayer struct {
 	cfg     radioPlayerConfig
 	base    string
@@ -150,13 +160,14 @@ type radioPlayer struct {
 
 	op sync.Mutex // one effect at a time; a newer command waits, then wins
 
-	mu      sync.Mutex
-	state   radioState
-	pending bool
-	outputs map[string]string // room id -> radio player output id while selected
-	results map[string]radioActionResult
-	order   []string
-	up      bool
+	mu       sync.Mutex
+	state    radioState
+	pending  bool
+	outputs  map[string]string // room id -> radio player output id while selected
+	starting string            // room a start is taking right now (Spotify is being handed over)
+	results  map[string]radioActionResult
+	order    []string
+	up       bool
 }
 
 var radioOwner = newRadioPlayer(radioPlayerConfig{})
@@ -429,7 +440,7 @@ func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (int
 		}
 		select {
 		case <-ctx.Done():
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(radioPlayPoll):
 		}
 	}
 }
@@ -745,13 +756,38 @@ func (p *radioPlayer) apply(ctx context.Context, q radioCommand, room *Room, bef
 	if q.Action == "move" {
 		station = before.StationID
 	}
-	// Last command wins: Spotify playing on this speaker is paused first, the
-	// same way choosing another AirPlay source would take the speaker.
-	if routeRoom, playing := p.spotify.routeRoom(); playing && routeRoom == room.ID {
-		if err := p.spotify.pause(); err != nil {
-			log.Printf("radio: pausing Spotify before radio failed: %v", err)
+	// Last command wins: Spotify on this speaker is paused and its Connect
+	// session ends, the same way choosing another AirPlay source takes the
+	// speaker from Spotify. Without ending the session, the radio's AirPlay
+	// connection replaced Spotify's HomePod session underneath Spotify's
+	// OwnTone, and Spotify's engine then refused every later transfer from the
+	// phone ("alias registry unavailable") until the add-on restarted.
+	// The hand-over runs in parallel with the radio's own start, so a start
+	// waits for the slower of the two, not for both.
+	p.mu.Lock()
+	p.starting = room.ID
+	p.mu.Unlock()
+	defer func() { p.mu.Lock(); p.starting = ""; p.mu.Unlock() }()
+	handover := make(chan struct{})
+	go func() {
+		defer close(handover)
+		route, playing, active := p.spotify.routeState()
+		if route != room.ID || !(playing || active) {
+			return
 		}
-	}
+		if playing {
+			if err := p.spotify.pause(); err != nil {
+				log.Printf("radio: pausing Spotify before radio failed: %v", err)
+			}
+		}
+		p.spotify.endSession()
+	}()
+	defer func() {
+		select {
+		case <-handover:
+		case <-time.After(radioYieldTimeout):
+		}
+	}()
 	level, err := p.play(ctx, station, room)
 	if err != nil {
 		// A failed start leaves nothing behind: no selected speaker, no queue.
@@ -814,6 +850,12 @@ func (p *radioPlayer) spotifyPlaying(roomID string) {
 	if roomID == "" || !p.playingOn(roomID) {
 		return
 	}
+	p.mu.Lock()
+	handingOver := p.starting == roomID
+	p.mu.Unlock()
+	if handingOver {
+		return // The radio start is the newer command; Spotify is being paused now.
+	}
 	go p.yield(context.Background(), roomID)
 }
 
@@ -828,6 +870,25 @@ func (managerSpotify) routeRoom() (string, bool) {
 	}
 	gl := librespotStatus(room.Librespot)
 	return spotifyRouteRoomID(gl, loadRooms()), gl.Active && !gl.Paused && !gl.Stopped
+}
+
+func (managerSpotify) routeState() (string, bool, bool) {
+	room := primaryRoom()
+	if room == nil {
+		return "", false, false
+	}
+	gl := librespotStatus(room.Librespot)
+	return spotifyRouteRoomID(gl, loadRooms()), gl.Active && !gl.Paused && !gl.Stopped, gl.Active
+}
+
+func (managerSpotify) endSession() {
+	room := primaryRoom()
+	if room == nil || mgr == nil {
+		return
+	}
+	if rt := mgr.runtime(room.ID); rt != nil {
+		rt.freshNative("radio took the speaker")
+	}
 }
 
 func (managerSpotify) pause() error {

@@ -230,6 +230,35 @@ class PlaybackRevisionFrameworkTests(unittest.IsolatedAsyncioTestCase):
         os.environ.get("PODCONNECT_PLAYBACK_REVISION_BINARY"),
         "uses fault-injected replies",
     )
+    async def test_native_push_returns_quickly_after_unbound_route(self):
+        """Green 0.26.95: after a room move the bound route is briefly missing.
+
+        The push watch must come back within seconds, not after a doubling
+        backoff up to a minute, so a pause from the Spotify app reaches HA fast.
+        """
+        self.assertEqual(await self.next_request(), f"{self.generation}:0")
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(3):
+            await self.native_replies.put(None)  # 409: no bound route yet
+            async with asyncio.timeout(8):
+                await self.native_requests.get()
+        took = loop.time() - started
+        # 1 + 2 + 2 s with the cap; the old doubling needed 1 + 2 + 4 s.
+        self.assertLess(took, 6.0)
+        reads = self.provider_reads
+        self.playing = False
+        self.provider_changed_at += 1000
+        await self.native_replies.put((1, True))
+        async with asyncio.timeout(1.5):
+            while self.coordinator.data["playback"]["is_playing"]:
+                await asyncio.sleep(0.02)
+        self.assertEqual(self.provider_reads, reads + 1)
+
+    @unittest.skipIf(
+        os.environ.get("PODCONNECT_PLAYBACK_REVISION_BINARY"),
+        "uses fault-injected replies",
+    )
     async def test_held_poll_coalesces_hints_and_falls_back_on_failure(self):
         self.assertEqual(await self.next_request(), f"{self.generation}:0")
         self.assertEqual(self.engine_reads, 2)

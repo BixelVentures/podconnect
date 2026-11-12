@@ -521,3 +521,33 @@ func TestPlaybackRevisionRetiresBetweenOwnerProbes(t *testing.T) {
 		t.Fatal("revision probes dispatched an effect")
 	}
 }
+
+// Green 0.26.95: pausing from the Spotify app after a room move left HA and
+// /api/rooms on "playing" for >5 s. The move's alias event cleared the item
+// identity, so Native's "paused" event was dropped and Control only learned it
+// from the next Spotify poll. An external pause/resume must always wake Control.
+func TestExternalPauseAfterAliasResetStillWakesControl(t *testing.T) {
+	l := &glLive{}
+	l.st = glStatus{Active: true}
+	uri := "spotify:track:0000000000000000000000"
+	l.applyEvent("metadata", map[string]any{"uri": uri})
+	l.applyEvent("playing", map[string]any{"uri": uri, "resume": true})
+	l.applyEvent("selected_alias", map[string]any{"id": 2.0}) // a move resets the item
+	before := l.playbackRevision
+	l.applyEvent("paused", map[string]any{"uri": uri})
+	if l.playbackRevision == before {
+		t.Fatal("external pause after a move produced no push to Control")
+	}
+	if st := l.Get(); !st.Paused {
+		t.Fatal("live state still playing after Native paused")
+	}
+	before = l.playbackRevision
+	l.applyEvent("paused", map[string]any{"uri": uri})
+	if l.playbackRevision != before {
+		t.Fatal("repeated pause woke Control twice")
+	}
+	l.applyEvent("playing", map[string]any{"uri": uri, "resume": true})
+	if l.playbackRevision == before {
+		t.Fatal("external resume produced no push to Control")
+	}
+}

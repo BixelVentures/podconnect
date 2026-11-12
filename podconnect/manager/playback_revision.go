@@ -80,6 +80,12 @@ func (l *glLive) observePlaybackRevisionEventLocked(typ string, data map[string]
 			return
 		}
 		paused := typ == "paused"
+		if item.uri == "" && validPlaybackRevisionURI(uri) && l.st.Active && !l.st.Stopped {
+			// No item identity yet (e.g. a room move or alias event just reset it):
+			// an external pause/resume from the Spotify app must still wake Control
+			// at once instead of waiting for the next Spotify poll.
+			*item = playbackRevisionItem{uri: uri, paused: !paused}
+		}
 		if uri == "" || uri != item.uri || !l.st.Active || l.st.Stopped || paused == item.paused {
 			return
 		}
