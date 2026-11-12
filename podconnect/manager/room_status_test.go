@@ -65,7 +65,8 @@ func roomsRead(t *testing.T, glStatusBody, outputs, playerState string) map[stri
 
 const (
 	playingEngine = `{"username":"u","volume":40,"volume_steps":100,"paused":false,"stopped":false,` +
-		`"selected_alias_id":1,"track":{"name":"Song","artist_names":["Artist"]}}`
+		`"selected_alias_id":1,"track":{"uri":"spotify:track:abc","name":"Song","artist_names":["Artist"],` +
+		`"album_name":"Album","album_cover_url":"https://i.scdn.co/image/x","position":61000,"duration":200000}}`
 	fridaSelected = `{"outputs":[` +
 		`{"id":"101","name":"Køkken HomePod","type":"AirPlay 2","selected":false,"volume":30},` +
 		`{"id":"47226606268305","name":"Svends HomePod","type":"AirPlay 2","selected":false,"volume":12},` +
@@ -83,6 +84,15 @@ func TestRoomsReportTheRoomThatActuallyOutputsAfterMove(t *testing.T) {
 	r7 := byID["r7"]
 	if !r7.Playing || r7.Volume != 8 || r7.NowPlaying != "Artist — Song" || r7.Source != "spotify" || r7.State != "playing" {
 		t.Fatalf("r7 should be the playing room: %+v", r7)
+	}
+	want := roomTrack{URI: "spotify:track:abc", Title: "Song", Artists: []string{"Artist"}, Album: "Album",
+		ArtworkURL: "https://i.scdn.co/image/x", PositionMS: 61000, DurationMS: 200000}
+	if r7.Track == nil || r7.Track.URI != want.URI || r7.Track.ArtworkURL != want.ArtworkURL ||
+		r7.Track.PositionMS != want.PositionMS || r7.Track.DurationMS != want.DurationMS || r7.Track.Album != want.Album {
+		t.Fatalf("r7 track: %+v", r7.Track)
+	}
+	if byID["r0"].Track != nil || byID["r6"].Track != nil {
+		t.Fatal("only the playing room carries the track")
 	}
 	if byID["r0"].Playing || byID["r0"].NowPlaying != "" || byID["r0"].Volume != 30 || byID["r0"].State != "idle" {
 		t.Fatalf("r0 must not report the moved session: %+v", byID["r0"])

@@ -6,7 +6,7 @@ source is Spotify or radio. Every control is one direct Speakers call; last comm
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
@@ -17,6 +17,7 @@ from homeassistant.components.media_player import (
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
@@ -65,12 +66,14 @@ class RoomStatus(DataUpdateCoordinator[dict[str, dict]]):
             update_interval=ROOM_POLL,
         )
         self.speakers = speakers
+        self.read_at: datetime | None = None
 
     async def _async_update_data(self) -> dict[str, dict]:
         try:
             rows = await self.speakers.rooms()
         except SpeakersError as err:
             raise UpdateFailed(str(err)) from err
+        self.read_at = dt_util.utcnow()
         return {row["id"]: row for row in rows}
 
 
@@ -153,14 +156,48 @@ class PodConnectRoomPlayer(CoordinatorEntity[RoomStatus], MediaPlayerEntity):
         return (title, artist) if sep else (text, None)
 
     @property
+    def _track(self) -> dict:
+        track = (self._row or {}).get("track")
+        return track if isinstance(track, dict) else {}
+
+    @property
     def media_title(self) -> str | None:
         if (self._row or {}).get("source") == "radio":
             return "Radio"
-        return self._now_playing()[0]
+        return self._track.get("title") or self._now_playing()[0]
 
     @property
     def media_artist(self) -> str | None:
+        artists = self._track.get("artists")
+        if isinstance(artists, list) and artists:
+            return ", ".join(str(a) for a in artists)
         return self._now_playing()[1]
+
+    @property
+    def media_album_name(self) -> str | None:
+        return self._track.get("album") or None
+
+    @property
+    def media_content_id(self) -> str | None:
+        return self._track.get("uri") or None
+
+    @property
+    def media_image_url(self) -> str | None:
+        return self._track.get("artwork_url") or None
+
+    @property
+    def media_duration(self) -> float | None:
+        duration = self._track.get("duration_ms")
+        return duration / 1000 if isinstance(duration, int) and duration > 0 else None
+
+    @property
+    def media_position(self) -> float | None:
+        position = self._track.get("position_ms")
+        return position / 1000 if isinstance(position, int) and position >= 0 else None
+
+    @property
+    def media_position_updated_at(self) -> datetime | None:
+        return self.coordinator.read_at if self.media_position is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:

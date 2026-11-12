@@ -326,8 +326,10 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 		outputPlaying = owntonePlayerState(primary.OwnTone) == "play"
 	}
 	nowPlayingText := ""
+	var track *roomTrack
 	if primary != nil && route != "" {
 		nowPlayingText = nowPlaying(primary.Librespot)
+		track = currentTrack(primary.Librespot)
 	}
 	out := []roomInfo{}
 	for _, rm := range rooms {
@@ -350,6 +352,9 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 		info.Source, info.State = roomSource(rm.ID, route, gl, outputPlaying)
 		if rm.ID == route {
 			info.NowPlaying = nowPlayingText
+			if info.Source == "spotify" {
+				info.Track = track
+			}
 		}
 		if info.Source == "radio" {
 			info.Playing, info.NowPlaying = true, ""
