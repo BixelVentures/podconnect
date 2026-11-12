@@ -35,6 +35,13 @@ PodConnect ships **two cooperating halves from ONE repo** (monorepo):
 4. Update the docs that describe behavior (`CHANGELOG.md` + `README.md`/`TODO.md`/`control-plan.md`
    as relevant — see memory: keep-docs-in-sync-on-release).
 
+### If a Control release is missing
+The `publish-control` job (in *Verify HA service and client boundaries*) publishes the
+manifest version after both test jobs pass on main. If a run stopped after the tag but
+before the release (Control 0.10.42), the next green main run publishes the missing
+release at that same tag; to do it at once, start *Verify HA service and client
+boundaries* manually on `main` (Actions → Run workflow). It never moves or replaces a tag.
+
 ## Changelog template
 ```
 PodConnect <Speakers|Control> X.Y.Z  (part of PodConnect 2026.N)

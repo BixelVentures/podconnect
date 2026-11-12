@@ -10,30 +10,68 @@ on:
       - "podconnect/Dockerfile"
       - ".github/fixtures/**"
       - ".github/workflows/verify-aliases-patch.yaml"
+      - ".github/actions/apt-cached/**"
   pull_request:
     paths:
       - "podconnect/manager/**"
       - "podconnect/patches/**"
       - "podconnect/Dockerfile"
       - ".github/fixtures/**"
+      - ".github/workflows/verify-aliases-patch.yaml"
+      - ".github/actions/apt-cached/**"
   workflow_dispatch:
+
+# A newer push to the same PR replaces the older run; every main run gets its own group and finishes.
+concurrency:
+  group: verify-stacks-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A stalled cache download fails over to a fresh build instead of hanging.
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
 
 # Keep producers and the composed-fixture consumer on one supported ABI.
 # ubuntu-latest rolled to 26.04; its cold dependency download exhausted this job.
 jobs:
   build-fork:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
       - uses: actions/setup-go@v5
+        timeout-minutes: 3
         with:
           go-version: "1.25"
+          cache: false
+      # Module downloads and compiled packages (also -race) are reused between runs.
+      # Go's build cache is keyed by content, so a stale entry is never used for changed code.
+      - uses: actions/cache@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-native-${{ runner.arch }}-${{ hashFiles('podconnect/patches/*native*', 'podconnect/patches/*v0.7.3*', '.github/fixtures/*native*', 'podconnect/manager/**') }}
+          restore-keys: go-native-${{ runner.arch }}-
       - name: Install go-librespot C deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libflac-dev libasound2-dev libvorbis-dev libogg-dev
+        timeout-minutes: 12
+        uses: ./.github/actions/apt-cached
+        with:
+          name: native
+          packages: pkg-config libflac-dev libasound2-dev libvorbis-dev libogg-dev
       - name: Clone go-librespot v0.7.3
-        run: git clone --depth 1 --branch v0.7.3 https://github.com/devgianlu/go-librespot.git /tmp/gl
+        timeout-minutes: 3
+        run: |
+          for attempt in 1 2 3; do
+            rm -rf /tmp/gl
+            timeout 120 git clone --depth 1 --branch v0.7.3 https://github.com/devgianlu/go-librespot.git /tmp/gl && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
       - name: Verify and apply the complete pinned Native patch stack
+        timeout-minutes: 3
         run: |
           cd /tmp/gl
           test "$(git rev-parse HEAD)" = c191a43c548e698c1dfc83590665f455fc54f084
@@ -71,39 +109,63 @@ jobs:
             exit 1
           fi
       - name: Test Manager radio, room status and legacy cleanup
+        timeout-minutes: 8
         run: cd podconnect/manager && go test ./... -run '^(TestRadio|TestSpotify|TestRooms|TestActiveRoute|TestStartupCleanup|TestImageBuilds|TestPlaybackRevision)' -count=1
       - name: Test Native queue, transport, output and retained packages
-        run: cd /tmp/gl && go test -race ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
+        timeout-minutes: 12
+        run: cd /tmp/gl && go test -race -count=1 ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis && go vet ./daemon ./player ./tracks ./output ./zeroconf ./spclient ./vorbis
       - name: Build existing daemon-test artifact for composed fixture
+        timeout-minutes: 6
         run: cd /tmp/gl && go test -race -c -o /tmp/native-tests ./daemon
       - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
         with:
           name: selected-native-tests
           path: /tmp/native-tests
           if-no-files-found: error
           retention-days: 3
       - name: Build patched fork
+        timeout-minutes: 6
         run: cd /tmp/gl && go build -trimpath -o /tmp/go-librespot-fork ./cmd/daemon
       - name: Smoke-check binary
+        timeout-minutes: 1
         run: /tmp/go-librespot-fork --help >/dev/null 2>&1 || test $? -eq 0 -o $? -eq 1
 
   build-owntone:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
       - name: Install pinned OwnTone build dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          build-essential git autoconf automake libtool gettext gawk gperf bison flex pkg-config
-          libsqlite3-dev libavcodec-dev libavformat-dev libavfilter-dev libswscale-dev libavutil-dev
-          libasound2-dev libgcrypt20-dev libavahi-client-dev zlib1g-dev libevent-dev libplist-dev
-          libsodium-dev libjson-c-dev libwebsockets-dev libcurl4-openssl-dev libprotobuf-c-dev
-          libunistring-dev libgnutls28-dev libconfuse-dev libxml2-dev nodejs npm ca-certificates
-          libflac-dev libvorbis-dev libogg-dev
+        timeout-minutes: 12
+        uses: ./.github/actions/apt-cached
+        with:
+          name: owntone
+          packages: >-
+            ccache build-essential git autoconf automake libtool gettext gawk gperf bison flex pkg-config
+            libsqlite3-dev libavcodec-dev libavformat-dev libavfilter-dev libswscale-dev libavutil-dev
+            libasound2-dev libgcrypt20-dev libavahi-client-dev zlib1g-dev libevent-dev libplist-dev
+            libsodium-dev libjson-c-dev libwebsockets-dev libcurl4-openssl-dev libprotobuf-c-dev
+            libunistring-dev libgnutls28-dev libconfuse-dev libxml2-dev nodejs npm ca-certificates
+            libflac-dev libvorbis-dev libogg-dev
+      # Unchanged C files compile from ccache; changed ones always recompile.
+      - uses: actions/cache@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ~/.cache/ccache
+          key: ccache-owntone-${{ runner.arch }}-${{ hashFiles('podconnect/patches/*owntone*', 'podconnect/patches/native-attention-fa607.patch', '.github/fixtures/*') }}
+          restore-keys: ccache-owntone-${{ runner.arch }}-
       - name: Verify and apply the complete pinned OwnTone patch stack
+        timeout-minutes: 4
         run: |
-          git clone --depth 1 --branch 29.2 https://github.com/owntone/owntone-server.git /tmp/owntone
+          for attempt in 1 2 3; do
+            rm -rf /tmp/owntone
+            timeout 120 git clone --depth 1 --branch 29.2 https://github.com/owntone/owntone-server.git /tmp/owntone && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep $((attempt * 10))
+          done
           cd /tmp/owntone
           test "$(git rev-parse HEAD)" = fa607a02768d9e29cd87065ac30ac66ea673f1ae
           patch_dir="$GITHUB_WORKSPACE/podconnect/patches"
@@ -195,8 +257,12 @@ jobs:
             exit 1
           fi
       - name: Compile and run actual queue C owner modes
+        timeout-minutes: 15
         run: |
           set -Eeuo pipefail
+          export CCACHE_DIR="$HOME/.cache/ccache" CCACHE_MAXSIZE=400M CCACHE_COMPILERCHECK=content
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache --zero-stats >/dev/null
           cd /tmp/owntone
           dump_owner_logs() {
             status=$?
@@ -243,7 +309,9 @@ jobs:
           sudo -n src/airplay_callback_owner --start-retire-closed-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-no-session-wire
           sudo -n src/airplay_callback_owner --start-retire-closed-empty-wire
+          ccache --show-stats || true
       - uses: actions/upload-artifact@v4
+        timeout-minutes: 5
         with:
           name: selected-c-callback
           path: |
@@ -256,26 +324,33 @@ jobs:
   selected-start-clock:
     needs: [build-fork, build-owntone]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
       - name: Install shared libraries for the existing compiled fixtures
-        run: >-
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev
-          libgcrypt20-dev libplist-dev libjson-c-dev libevent-dev libxml2-dev
-          libsodium-dev libcurl4-openssl-dev libconfuse-dev libprotobuf-c-dev
-          libavahi-client-dev libwebsockets-dev libasound2-dev libsqlite3-dev
-          libunistring-dev libflac-dev libvorbis-dev libogg-dev
+        timeout-minutes: 12
+        uses: ./.github/actions/apt-cached
+        with:
+          name: selected
+          packages: >-
+            libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev
+            libgcrypt20-dev libplist-dev libjson-c-dev libevent-dev libxml2-dev
+            libsodium-dev libcurl4-openssl-dev libconfuse-dev libprotobuf-c-dev
+            libavahi-client-dev libwebsockets-dev libasound2-dev libsqlite3-dev
+            libunistring-dev libflac-dev libvorbis-dev libogg-dev
       - uses: actions/download-artifact@v4
+        timeout-minutes: 5
         with:
           name: selected-c-callback
           path: /tmp/owntone
       - uses: actions/download-artifact@v4
+        timeout-minutes: 5
         with:
           name: selected-native-tests
           path: /tmp/owntone
       - name: Verify held fresh START and explicit late paused Resume against actual C
+        timeout-minutes: 10
         working-directory: /tmp/owntone
         run: |
           set -Eeuo pipefail

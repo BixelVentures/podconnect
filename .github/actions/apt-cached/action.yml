@@ -1,0 +1,49 @@
+name: Install apt packages from cache
+description: >-
+  Installs Ubuntu packages without touching the network when the cached .deb files and
+  package lists fit, and otherwise downloads them with short timeouts, retries and a mirror
+  fallback. A broken Ubuntu mirror then costs minutes of retries, never a 45-minute hang.
+inputs:
+  packages:
+    description: Space or newline separated package names.
+    required: true
+  name:
+    description: Cache name for this package set.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        pkgs=$(printf '%s\n' $PACKAGES | sort -u | tr '\n' ' ')
+        hash=$(printf '%s' "$pkgs" | sha256sum | cut -c1-16)
+        prefix="apt-v1-${{ inputs.name }}-${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS}-${hash}-"
+        echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "key=${prefix}${ImageVersion}" >> "$GITHUB_OUTPUT"
+        echo "dir=$HOME/.apt-cached/${{ inputs.name }}" >> "$GITHUB_OUTPUT"
+
+    - id: restore
+      uses: actions/cache/restore@v4
+      continue-on-error: true
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+
+    - id: install
+      shell: bash
+      env:
+        PACKAGES: ${{ steps.key.outputs.packages }}
+        CACHE_DIR: ${{ steps.key.outputs.dir }}
+      run: bash "$GITHUB_ACTION_PATH/install.sh"
+
+    - if: steps.install.outputs.downloaded == 'true' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}

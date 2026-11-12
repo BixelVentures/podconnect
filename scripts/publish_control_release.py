@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
@@ -33,13 +34,21 @@ def git(*args):
 
 
 def candidate(env, run=git):
-    if (
-        env.get("GITHUB_EVENT_NAME"),
+    event = env.get("GITHUB_EVENT_NAME")
+    if event not in ("push", "workflow_dispatch") or (
         env.get("GITHUB_REF"),
         env.get("GITHUB_REPOSITORY"),
-    ) != ("push", "refs/heads/main", REPOSITORY):
+    ) != ("refs/heads/main", REPOSITORY):
         raise Rejected("only this repository main push may publish")
     sha, before = env.get("GITHUB_SHA", ""), env.get("RELEASE_BEFORE", "")
+    if event == "workflow_dispatch":
+        # A manual run on main publishes nothing new by itself; it only lets
+        # recover() finish a verified version whose release was missed.
+        if not SHA.fullmatch(sha):
+            raise Rejected("invalid commit boundary")
+        if run("rev-parse", "HEAD") != sha:
+            raise Rejected("checkout is not the verified commit")
+        return None
     if not SHA.fullmatch(sha) or not SHA.fullmatch(before) or set(before) == {"0"}:
         raise Rejected("invalid commit boundary")
     if run("rev-parse", "HEAD") != sha:
@@ -63,6 +72,18 @@ class API:
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def __call__(self, method, path, body=None):
+        # Reads are retried on transient network/server errors. Writes are sent
+        # once; publish() reads back the state after a failed write instead.
+        attempts = 4 if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._once(method, path, body)
+            except Transient:
+                if attempt == attempts:
+                    raise Rejected(f"GitHub API unavailable for {method}") from None
+                time.sleep(5 * attempt)
+
+    def _once(self, method, path, body):
         request = urllib.request.Request(
             f"https://api.github.com/repos/{REPOSITORY}/{path}",
             data=None if body is None else json.dumps(body).encode(),
@@ -80,9 +101,21 @@ class API:
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 return 404, None
+            if method == "GET" and (error.code >= 500 or error.code == 429):
+                raise Transient() from None
             raise Rejected(
                 f"GitHub API rejected {method}: status {error.code}"
             ) from None
+        except Rejected:
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if method == "GET":
+                raise Transient() from None
+            raise Rejected(f"GitHub API unreachable for {method}") from None
+
+
+class Transient(Exception):
+    pass
 
 
 def tag_target(api, name):
@@ -161,7 +194,24 @@ def publish(api, name, sha):
     if tag_target(api, name) != sha:
         raise Rejected("tag changed before release creation")
     current_main(api, sha)
-    code, release = api(
+    try:
+        code, release = create_release(api, name, sha)
+    except Rejected:
+        # The write may have landed even though its response was lost.
+        status, release = api("GET", f"releases/tags/{name}")
+        if status != 200:
+            raise
+        code = 201
+    if code != 201:
+        raise Rejected("release creation failed")
+    release_valid(release, name, sha)
+    if tag_target(api, name) != sha:
+        raise Rejected("tag changed during release creation")
+    return "published"
+
+
+def create_release(api, name, sha):
+    return api(
         "POST",
         "releases",
         {
@@ -173,21 +223,72 @@ def publish(api, name, sha):
             "generate_release_notes": True,
         },
     )
+
+
+def is_ancestor(older, newer):
+    if not SHA.fullmatch(older or "") or not SHA.fullmatch(newer or ""):
+        return False
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", older, newer],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+    ).returncode == 0
+
+
+def manifest_version(rev, run=git):
+    return version(json.loads(run("show", f"{rev}:{MANIFEST}"))["version"])
+
+
+def recover(api, sha, run=git, ancestor=is_ancestor):
+    """Finish the verified main version when an earlier run missed its release.
+
+    Control 0.10.42 got its tag but no release, and the next push with the same
+    version printed "version unchanged", so HACS never saw it. The current
+    version is published here when it has no release yet: at an earlier exact
+    tag that main still contains and whose manifest names that version, or else
+    at this verified commit. A foreign tag or release is still never replaced.
+    """
+    name = manifest_version(sha, run)
+    status, release = api("GET", f"releases/tags/{name}")
+    if status not in (200, 404):
+        raise Rejected("unknown release state")
+    target = tag_target(api, name)
+    if target is None or target == sha:
+        if status == 200 and target is None:
+            raise Rejected("release tag missing")
+        if status == 200:
+            release_valid(release, name, sha)
+            return "version unchanged"
+        return publish(api, name, sha)
+    if not ancestor(target, sha) or manifest_version(target, run) != name:
+        raise Rejected("tag collision: refusing retag")
+    if status == 200:
+        release_valid(release, name, target)
+        return "version unchanged"
+    try:
+        code, release = create_release(api, name, target)
+    except Rejected:
+        status, release = api("GET", f"releases/tags/{name}")
+        if status != 200:
+            raise
+        code = 201
     if code != 201:
         raise Rejected("release creation failed")
-    release_valid(release, name, sha)
-    if tag_target(api, name) != sha:
+    release_valid(release, name, target)
+    if tag_target(api, name) != target:
         raise Rejected("tag changed during release creation")
-    return "published"
+    return "published missed release"
 
 
 if __name__ == "__main__":
     try:
         selected = candidate(os.environ)
+        api = API(os.environ.get("GITHUB_TOKEN"))
         print(
-            "version unchanged"
+            recover(api, os.environ["GITHUB_SHA"])
             if selected is None
-            else publish(API(os.environ.get("GITHUB_TOKEN")), *selected)
+            else publish(api, *selected)
         )
     except (
         Rejected,

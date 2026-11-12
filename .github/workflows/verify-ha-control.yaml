@@ -15,22 +15,47 @@ on:
       - "tests/ha_framework/**"
       - ".github/workflows/verify-ha-control.yaml"
       - "scripts/publish_control_release.py"
+  # Manual run on main: finishes a verified Control version whose release was missed.
+  workflow_dispatch:
+
+# A newer push to the same PR replaces the older run; every main run gets its own group and finishes.
+concurrency:
+  group: verify-ha-control-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   boundary-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Test shipped service and client bodies with inert I/O
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
-  framework-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
+      - uses: actions/setup-python@v5
+        timeout-minutes: 3
+        with:
+          python-version: "3.12"
+      - name: Test shipped service and client bodies with inert I/O
+        timeout-minutes: 5
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+  framework-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      HA_IMAGE: ghcr.io/home-assistant/home-assistant@sha256:56690a89c79a0de98035e1719f8324a92d5859c1192ff45adb0230ea81cb42a5
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+      - name: Pull pinned HA 2026.8.2
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            timeout 150 docker pull --quiet --platform linux/amd64 "$HA_IMAGE" && exit 0
+            echo "::warning::HA image pull attempt $attempt failed; retrying."
+            sleep $((attempt * 10))
+          done
+          exit 1
       - name: Test complete shipped integration in pinned HA 2026.8.2
+        timeout-minutes: 8
         run: |
           docker run --rm --platform linux/amd64 --network none --read-only \
             --cap-drop ALL --security-opt no-new-privileges --user 65534:65534 \
@@ -38,13 +63,13 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=128m \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/repo,readonly" \
             --workdir /repo --entrypoint python \
-            ghcr.io/home-assistant/home-assistant@sha256:56690a89c79a0de98035e1719f8324a92d5859c1192ff45adb0230ea81cb42a5 \
+            "$HA_IMAGE" \
             -B -m unittest discover -s tests/ha_framework -p 'test_*.py' -v
 
   publish-control:
     timeout-minutes: 5
     needs: [boundary-tests, framework-tests]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.boundary-tests.result == 'success' && needs.framework-tests.result == 'success'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && needs.boundary-tests.result == 'success' && needs.framework-tests.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -53,14 +78,17 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
+        timeout-minutes: 3
         with:
           python-version: "3.12"
       - name: Publish exact verified Control version change
+        timeout-minutes: 3
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_BEFORE: ${{ github.event.before }}
