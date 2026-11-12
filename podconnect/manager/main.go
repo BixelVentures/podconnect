@@ -1275,7 +1275,9 @@ type roomInfo struct {
 	HomepodName string                 `json:"homepod_name"`
 	HomepodID   string                 `json:"homepod_id"`
 	OwntoneUp   bool                   `json:"owntone_up"`
-	Playing     bool                   `json:"playing"`
+	Playing     bool                   `json:"playing"` // the HomePod outputs this room's source
+	Source      string                 `json:"source"`  // "spotify", "radio" or ""
+	State       string                 `json:"state"`   // "playing", "paused", "connecting" or "idle"
 	Released    bool                   `json:"released"`
 	NowPlaying  string                 `json:"now_playing"`
 	Volume      int                    `json:"volume"` // 0..100, or -1 if unknown
