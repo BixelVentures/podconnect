@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +43,10 @@ type roomRuntime struct {
 	mu    sync.Mutex
 	glCmd *exec.Cmd
 	otCmd *exec.Cmd
+
+	freshNativePending bool      // a fresh Native process was requested; respawn without the 2 s backoff
+	nativeHealing      bool      // one fresh-Native replacement at a time
+	lastNativeHeal     time.Time // wedge self-heal rate limit
 
 	tonePlaying boolFlag  // per-room test-tone gate (pauses that room's bridge)
 	live        glLive    // Wave 3: latest go-librespot state, pushed by runGLEvents (poll fallback)
@@ -232,7 +237,15 @@ func (rt *roomRuntime) keepAlive(label string, slot **exec.Cmd, build func() *ex
 		default:
 		}
 		log.Printf("rooms[%s]: %s exited (%v) — respawning", rt.room.ID, label, err)
-		if rt.sleepOrStop(2 * time.Second) {
+		backoff := 2 * time.Second
+		rt.mu.Lock()
+		if slot == &rt.glCmd && rt.freshNativePending {
+			// A requested fresh Native is wanted now: Spotify Connect comes back at once.
+			rt.freshNativePending = false
+			backoff = 50 * time.Millisecond
+		}
+		rt.mu.Unlock()
+		if rt.sleepOrStop(backoff) {
 			return
 		}
 	}
@@ -346,6 +359,80 @@ func (rt *roomRuntime) restartGL() {
 		log.Printf("rooms[%s]: Native replacement incomplete or superseded; retirement UNKNOWN", rt.room.ID)
 	}
 }
+
+// freshNative replaces only the Spotify engine (Native) with a fresh process.
+// The Spotify OwnTone treats a new Native process as "old writer retired", so
+// every Spotify custody/retirement record of the old process is gone at once:
+// the next transfer from the phone starts clean. It never touches OwnTone or
+// the radio, and it never starts audio (a fresh Native is idle).
+func (rt *roomRuntime) freshNative(reason string) {
+	rt.mu.Lock()
+	if rt.nativeHealing {
+		rt.mu.Unlock()
+		return
+	}
+	rt.nativeHealing = true
+	rt.freshNativePending = true
+	rt.mu.Unlock()
+	log.Printf("rooms[%s]: fresh Spotify engine (%s)", rt.room.ID, reason)
+	go func() {
+		defer func() { rt.mu.Lock(); rt.nativeHealing = false; rt.mu.Unlock() }()
+		rt.restartNative()
+	}()
+}
+
+// restartNative is replaced in tests.
+var restartNativeHook func(rt *roomRuntime)
+
+func (rt *roomRuntime) restartNative() {
+	if restartNativeHook != nil {
+		restartNativeHook(rt)
+		return
+	}
+	rt.restartGL()
+}
+
+// nativeWedgeLine recognises Native's fixed, content-free log lines that mean
+// its process-wide Spotify custody is stuck ("unknown"): from then on every
+// transfer, play and seek would be refused until the process is replaced.
+func nativeWedgeLine(line string) bool {
+	return strings.Contains(line, "custody_unknown=true") ||
+		strings.Contains(line, "output admission custody_unknown") ||
+		strings.Contains(line, "retirement_prepare outcome=request_failed") ||
+		strings.Contains(line, "retirement_prepare outcome=receipt_rejected") ||
+		strings.Contains(line, "retirement_prepare outcome=skipped reason=custody_uncertain")
+}
+
+const nativeHealInterval = 20 * time.Second
+
+// nativeHealPoll is how often a pending self-heal re-checks that Spotify audio stopped.
+var nativeHealPoll = 500 * time.Millisecond
+
+// healNativeWedge is Spotify-always-wins insurance: a stuck Native is replaced
+// as soon as it plays nothing (current audio is never cut), at most once per
+// nativeHealInterval.
+func (rt *roomRuntime) healNativeWedge() {
+	rt.mu.Lock()
+	if rt.nativeHealing || time.Since(rt.lastNativeHeal) < nativeHealInterval {
+		rt.mu.Unlock()
+		return
+	}
+	rt.lastNativeHeal = time.Now()
+	rt.mu.Unlock()
+	go func() {
+		for {
+			st := rt.live.Get()
+			if !(st.Active && !st.Paused && !st.Stopped) {
+				break
+			}
+			if rt.sleepOrStop(nativeHealPoll) {
+				return
+			}
+		}
+		rt.freshNative("Spotify custody was stuck")
+	}()
+}
+
 func (rt *roomRuntime) restartOT() bool { return rt.replaceChildren(true) }
 
 // killAll is the ordered teardown used by the runtime stop owner. Keep C alive
@@ -370,20 +457,31 @@ func (rt *roomRuntime) killAll() {
 func (rt *roomRuntime) pipeOutput(label string, cmd *exec.Cmd) {
 	prefix := "rooms[" + rt.room.ID + "/" + label + "] "
 	stdout, err := cmd.StdoutPipe()
+	var onLine func(string)
+	if label == "go-librespot" {
+		onLine = func(line string) {
+			if nativeWedgeLine(line) {
+				rt.healNativeWedge()
+			}
+		}
+	}
 	if err == nil {
-		go logLines(prefix, stdout)
+		go logLines(prefix, stdout, onLine)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err == nil {
-		go logLines(prefix, stderr)
+		go logLines(prefix, stderr, onLine)
 	}
 }
 
-func logLines(prefix string, rc io.ReadCloser) {
+func logLines(prefix string, rc io.ReadCloser, onLine func(string)) {
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		log.Printf("%s%s", prefix, sc.Text())
+		if onLine != nil {
+			onLine(sc.Text())
+		}
 	}
 }
 
