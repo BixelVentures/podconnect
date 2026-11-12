@@ -49,6 +49,9 @@ from custom_components.podconnect.const import DOMAIN, SPOTIFY_SCOPES
 
 
 class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
+    # The PodConnect speaker's Spotify id; only that device becomes an HA entity.
+    engine_identity = "a" * 40
+
     async def asyncSetUp(self):
         self.stack = AsyncExitStack()
         await self.stack.__aenter__()
@@ -303,7 +306,10 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
         }
         if request.path == "/api/start-volume/identity":
             return web.json_response(
-                {"schema": "podconnect.start_identity.v1", "engine_device_id": "a" * 40}
+                {
+                    "schema": "podconnect.start_identity.v1",
+                    "engine_device_id": self.engine_identity,
+                }
             )
         if request.path == "/api/room-switch":
             if request.method == "GET":
@@ -639,9 +645,17 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(dict(entry.options), original)
             self.assertEqual(self._writes(), [])
 
+    async def speaker_entities_for(self, engine_id):
+        self.engine_identity = engine_id
+        for entry in self.entries:
+            if entry.state is ConfigEntryState.LOADED:
+                self.assertTrue(await self.hass.config_entries.async_reload(entry.entry_id))
+        await self.hass.async_block_till_done()
+
     async def test_live_registry_metadata_exact_account_aliases_and_entity_area_override(
         self,
     ):
+        await self.speaker_entities_for("spotify-one")
         async with asyncio.timeout(15):
             entities = entity_registry.async_get(self.hass)
             devices = device_registry.async_get(self.hass)
@@ -844,6 +858,7 @@ class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self._writes()), 1)
 
     async def test_actual_entity_held_spotify_lookup_cannot_transfer_after_unload(self):
+        await self.speaker_entities_for("spotify-one")
         async with asyncio.timeout(15):
             entry = self.entries[0]
             entity_id = entity_registry.async_get(self.hass).async_get_entity_id(

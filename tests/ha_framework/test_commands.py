@@ -23,6 +23,7 @@ start_guards = importlib.import_module(
 
 
 class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
+    engine_identity = "spotify-one"
     _cleanup = fixture.TargetFrameworkTests._cleanup
     _task = fixture.TargetFrameworkTests._task
     _service = fixture.TargetFrameworkTests._service
