@@ -213,6 +213,77 @@ class RoomMoveFrameworkTests(RoomContentFrameworkTests):
         if tasks:
             await asyncio.wait_for(asyncio.gather(*tasks), 2)
 
+    async def test_move_then_pause_next_volume_do_not_wait_for_a_poll(self):
+        """Pause/next/volume in the new room are as fast as a normal pause.
+
+        After a committed move Control's own follow-up reads and the native
+        revision hints land Spotify polls continuously. Reading the new room's
+        controls must not be rejected (and so retried by the caller) only
+        because such a poll was published during the Speakers read.
+        """
+        self.playing = True
+        data = self.entries[0].runtime_data
+        await data.coordinator.async_refresh()
+        self.move_target = "spotify-one"
+        request = self.move_request()
+        self.assertEqual(
+            (await self.move_invoke("prepare_room_move_playback", request))["state"],
+            "staged",
+        )
+        receipt = await self.move_invoke("move_room_playback", request)
+        self.assertEqual(receipt["outcome"], "accepted")
+        # Speakers now serves the moved session from room-beta / HomePod 456.
+        self.native_source_room = self.output_room = "room-beta"
+        self.output_homepod = "456"
+        speakers = data.speakers
+        polls = []
+
+        def landing_poll(read):
+            async def wrapped(*args, **kwargs):
+                value = await read(*args, **kwargs)
+                # A routine post-move Web API poll is published mid-read.
+                await data.coordinator.async_refresh()
+                polls.append(data.coordinator.poll_sequence)
+                return value
+
+            return wrapped
+
+        room = {"room_id": "room-beta", "homepod_id": "456"}
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with (
+            patch.object(
+                speakers,
+                "room_transport_state",
+                landing_poll(speakers.room_transport_state),
+            ),
+            patch.object(
+                speakers, "room_volume_state", landing_poll(speakers.room_volume_state)
+            ),
+        ):
+            for action in ("pause", "next"):
+                offer = await self.room_offer(**room)
+                self.assertTrue(offer.get("ok"), (action, offer))
+                self.assertIn(action, offer["actions"])
+                self.room_posts.clear()
+                result = await self.room_invoke(
+                    self.request(
+                        action, native=offer["native"], route=offer["route"], **room
+                    )
+                )
+                self.assertEqual(result["outcome"], "accepted", action)
+                self.assertEqual(
+                    [p for p, _ in self.room_posts],
+                    ["/api/room-transport/prepare", "/api/room-transport/commit"],
+                )
+            volume = await self.volume_offer(**room)
+            self.assertTrue(volume.get("ok"), volume)
+            self.assertEqual(volume["actions"], ["volume"])
+        # One read per offer: no rejected read, no retry, no wait for a poll.
+        self.assertEqual(len(polls), 3)
+        self.assertLess(loop.time() - started, 1.0)
+        self.assertEqual(self._writes(), [])
+
     async def test_move_read_exact_native_owner_without_webapi_volume_flag(
         self,
     ):

@@ -110,6 +110,19 @@ class ObservationReader:
         self._queue_cached_at = 0.0
         self._queue_cache_ttl = QUEUE_CACHE_S
         self._queue_next_read_at = 0.0
+        self._queue_cache_key = None
+
+    def _queue_playback_key(self):
+        """The observed track/device the cached queue snapshot was read for."""
+        data = self.coordinator.data
+        playback = data.get("playback") if isinstance(data, dict) else None
+        if not isinstance(playback, dict):
+            return None
+        item, device = playback.get("item"), playback.get("device")
+        return (
+            item.get("uri") if isinstance(item, dict) else None,
+            device.get("id") if isinstance(device, dict) else None,
+        )
 
     def playback(self, entry_id):
         coordinator = self.coordinator
@@ -190,12 +203,24 @@ class ObservationReader:
             return _error("malformed_response")
 
     async def queue(self, entry_id, limit, is_current):
+        key = self._queue_playback_key()
+        # A track change (next/previous/skip) makes the upcoming list of the
+        # cached snapshot already-played rows; never serve it across one. A
+        # Spotify rate-limit backoff is still honoured.
+        changed = (
+            self._queue_cache is not None
+            and key != self._queue_cache_key
+            and self._queue_cache.get("error_kind") != "rate_limited"
+        )
         if (
             self._queue_cache is not None
+            and not changed
             and time.monotonic() - self._queue_cached_at < self._queue_cache_ttl
         ):
             return self._queue_view(self._queue_cache, limit)
-        if self._queue_busy or time.monotonic() < self._queue_next_read_at:
+        if self._queue_busy or (
+            not changed and time.monotonic() < self._queue_next_read_at
+        ):
             return _error("busy")
         self._queue_busy = True  # No await before admission; no unbounded waiter queue.
         self._queue_next_read_at = time.monotonic() + QUEUE_CACHE_S
@@ -254,6 +279,7 @@ class ObservationReader:
         is_current()  # No cache publication after account unload/replacement, including errors.
         self._queue_cache, self._queue_cached_at = result, time.monotonic()
         self._queue_cache_ttl = cache_ttl
+        self._queue_cache_key = key  # Read start: a change during the read refetches.
         return self._queue_view(result, limit)
 
     @staticmethod

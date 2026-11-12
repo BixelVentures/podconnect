@@ -270,6 +270,36 @@ class ObservationFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue_calls, 3)
         self.assertEqual(self._writes(), [])
 
+    async def test_queue_after_skips_never_returns_already_played_upcoming(self):
+        """K2: Stolen Dance -> Riptide -> Hey Soul Sister -> Sunroof in < 10 s."""
+        songs = ['spotify:track:' + name.ljust(22, '0') for name in
+                 ('StolenDance', 'Riptide', 'HeySoulSister', 'Sunroof', 'Next1', 'Next2')]
+        coord = self.entries[0].runtime_data.coordinator
+
+        async def now_playing(index):
+            self.playback_override = {
+                'is_playing': True, 'device': {'id': 'spotify-one', 'name': 'Kitchen'},
+                'item': track(songs[index]), 'timestamp': 1000 + index, 'progress_ms': 0,
+                'shuffle_state': False, 'repeat_state': 'off'}
+            self.queue_payload = {'currently_playing': track(songs[index]),
+                                  'queue': [track(uri) for uri in songs[index + 1:]]}
+            await coord.async_refresh()
+
+        await now_playing(0)
+        first = await self.service('get_queue')
+        self.assertEqual([row['uri'] for row in first['items'][:3]], songs[1:4])
+        for index in (1, 2, 3):  # Three explicit next presses, observed by Control.
+            await now_playing(index)
+        after = await self.service('get_queue')
+        self.assertTrue(after['ok'], after)
+        self.assertEqual(after['currently_playing']['uri'], songs[3])
+        self.assertEqual([row['uri'] for row in after['items']], songs[4:])
+        self.assertNotEqual(after['snapshot_id'], first['snapshot_id'])
+        # Without a track change the short cache still bounds Spotify reads.
+        calls = self.queue_calls
+        self.assertEqual((await self.service('get_queue'))['snapshot_id'], after['snapshot_id'])
+        self.assertEqual(self.queue_calls, calls)
+
     async def test_queue_empty_episode_malformed_and_bounds(self):
         reader = self.entries[0].runtime_data.observations
         episode = {'type': 'episode', 'uri': 'spotify:episode:one', 'name': 'Episode', 'show': {'name': 'Show'}}
