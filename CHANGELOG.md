@@ -11,6 +11,7 @@
 - Telefoner, computere, biler og gamle Spotify-id'er bliver ikke længere HA-entiteter, og dem, ældre versioner har efterladt, slettes ved opstart. De kan stadig vælges som mål for flytning.
 - Den gamle samlede Spotify-entitet er skjult (ikke slettet), indtil PodView er gået over til rum-afspillerne.
 - Spiller egen konto på en anden enhed (fx iPhone), kan der nu også spoles derfra (`get_playback_controls`/`control_playback` tilbyder `seek`), så pause, næste, forrige og spol alle virker, uanset enhed.
+- "Flyt til <rum>", mens egen konto spiller på telefonen, flytter nu musikken over på rummets højttaler (som at vælge rummet i Spotify-appen). Før valgte den kun rummet.
 
 ## Speakers 0.26.97 — hurtigere radiostart
 
