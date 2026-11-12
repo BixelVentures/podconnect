@@ -1,3 +1,8 @@
+## Speakers 0.26.97 — hurtigere radiostart
+
+- Radioens egen afspiller bruger nu samme korte startbuffer som Spotify (`buffer_ms`, standard 500 ms). Den manglede indstillingen og brugte OwnTones standard på 2250 ms, før lyden gik i gang — ca. 1,75 s af de målte 4,3 s.
+- Hver radiostart logger én linje med millisekunder pr. trin (`radio: start timing outcome=playing outputs_read=… output_selected=… volume_set=… stream_queued=… playing=…`), så en enhedstest viser præcis, hvor tiden går. Ingen id'er eller indhold i linjen.
+
 ## Control 0.10.43 — udgivelse af 0.10.42-indholdet
 
 - Samme Control som 0.10.42 (se nedenfor). 0.10.42's GitHub-udgivelse fejlede efter at tagget var oprettet, så HACS kunne ikke se den; 0.10.43 udgiver indholdet.

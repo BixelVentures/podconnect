@@ -250,3 +250,18 @@ func TestFreshNativeShutdownLinesDoNotTriggerAnotherReplacement(t *testing.T) {
 		t.Fatalf("Native replaced %d times, want 1", replaced)
 	}
 }
+
+// Latency: Green measured radio start at 4.3 s (requirement < 3 s). The radio
+// player had no start_buffer_ms, so OwnTone used its 2250 ms default before
+// audio started; Spotify's OwnTone already uses the buffer_ms option (500 ms).
+func TestRadioPlayerUsesTheSameShortStartBufferAsSpotify(t *testing.T) {
+	p := newRadioPlayer(radioPlayerConfig{Enabled: true, Root: t.TempDir()})
+	conf := p.config()
+	want := fmt.Sprintf("start_buffer_ms = %d", readBufferMs())
+	if !strings.Contains(conf, want) {
+		t.Fatalf("radio player config lacks %q (OwnTone falls back to 2250 ms):\n%s", want, conf)
+	}
+	if readBufferMs() >= 2250 {
+		t.Fatalf("start buffer %d ms is not shorter than OwnTone's default", readBufferMs())
+	}
+}

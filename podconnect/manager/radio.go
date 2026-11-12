@@ -404,8 +404,21 @@ func (p *radioPlayer) setVolume(ctx context.Context, outputID string, volume int
 }
 
 // play selects exactly one speaker and starts the stream there.
-func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (int, error) {
+func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (level int, err error) {
+	// One content-free timing line per start (milliseconds per step) so a
+	// device test shows exactly where a start spends its time.
+	began := time.Now()
+	var marks []string
+	mark := func(step string) { marks = append(marks, fmt.Sprintf("%s=%d", step, time.Since(began).Milliseconds())) }
+	defer func() {
+		outcome := "playing"
+		if err != nil {
+			outcome = "failed"
+		}
+		log.Printf("radio: start timing outcome=%s %s", outcome, strings.Join(marks, " "))
+	}()
 	outputs, err := p.playerOutputs(ctx)
+	mark("outputs_read")
 	if err != nil {
 		return 0, err
 	}
@@ -416,23 +429,27 @@ func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (int
 	if err := p.call(ctx, http.MethodPut, "/api/outputs/set", map[string]any{"outputs": []string{output.ID}}, nil); err != nil {
 		return 0, err
 	}
+	mark("output_selected")
 	p.mu.Lock()
 	p.outputs = map[string]string{room.ID: output.ID}
 	p.mu.Unlock()
 	// Every new start uses the shared start level (startVolumePercent), the
 	// same single rule as Spotify. Only a later explicit volume action changes it.
-	level := startVolumePercent
+	level = startVolumePercent
 	if err := p.setVolume(ctx, output.ID, level); err != nil {
 		return 0, err
 	}
+	mark("volume_set")
 	query := url.Values{"uris": {radioStreamURLs[station]}, "clear": {"true"}, "playback": {"start"}}
 	if err := p.call(ctx, http.MethodPost, "/api/queue/items/add?"+query.Encode(), nil, nil); err != nil {
 		return 0, err
 	}
+	mark("stream_queued")
 	deadline := time.Now().Add(radioStartWait)
 	for {
 		status, err := p.player(ctx)
 		if err == nil && status.State == "play" {
+			mark("playing")
 			return level, nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
@@ -455,6 +472,9 @@ func (p *radioPlayer) config() string {
 	cache_dir = "%s"
 	logfile = "%s/radio.log"
 	websocket_port = %d
+	# Same output pre-buffer as Spotify's OwnTone (buffer_ms, default 500 ms).
+	# OwnTone's own default is 2250 ms, which delayed every radio start ~1.75 s.
+	start_buffer_ms = %d
 }
 library {
 	port = %d
@@ -468,7 +488,7 @@ audio {
 mpd {
 	port = 0
 }
-`, root, root, root, p.cfg.WSPort, p.cfg.APIPort, root)
+`, root, root, root, p.cfg.WSPort, readBufferMs(), p.cfg.APIPort, root)
 }
 
 // runProcess keeps one radio player process alive, like the room engines.
