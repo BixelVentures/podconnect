@@ -23,6 +23,15 @@ class RoomPlayerFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 "playing": True,
                 "now_playing": "Artist — Song",
                 "volume": 30,
+                "track": {
+                    "uri": "spotify:track:" + "A" * 22,
+                    "title": "Song",
+                    "artists": ["Artist", "Guest"],
+                    "album": "Album",
+                    "artwork_url": "https://i.scdn.co/image/x",
+                    "position_ms": 61000,
+                    "duration_ms": 200000,
+                },
             },
             "room-beta": {
                 "name": "Beta",
@@ -90,7 +99,13 @@ class RoomPlayerFrameworkTests(unittest.IsolatedAsyncioTestCase):
         alpha = self.hass.states.get(self.entity_id("room-alpha"))
         self.assertEqual(alpha.state, "playing")
         self.assertEqual(alpha.attributes["media_title"], "Song")
-        self.assertEqual(alpha.attributes["media_artist"], "Artist")
+        self.assertEqual(alpha.attributes["media_artist"], "Artist, Guest")
+        self.assertEqual(alpha.attributes["media_album_name"], "Album")
+        self.assertEqual(alpha.attributes["media_content_id"], "spotify:track:" + "A" * 22)
+        self.assertEqual(alpha.attributes["entity_picture"][:1], "/")  # HA proxies the artwork
+        self.assertEqual(alpha.attributes["media_duration"], 200.0)
+        self.assertEqual(alpha.attributes["media_position"], 61.0)
+        self.assertIn("media_position_updated_at", alpha.attributes)
         self.assertEqual(alpha.attributes["volume_level"], 0.3)
         self.assertEqual(alpha.attributes["podconnect_source"], "spotify")
         self.assertEqual(self.hass.states.get(self.entity_id("room-beta")).state, "idle")

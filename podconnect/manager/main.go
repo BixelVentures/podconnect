@@ -555,6 +555,50 @@ func setGLDeviceName(r *Room, name string) bool {
 
 // nowPlaying returns a best-effort "Artist — Track" from go-librespot's /status ("" if idle or the
 // field shape differs — it's only a status-line nicety).
+// roomTrack is the Spotify item a room plays, for players that show artwork and a timeline.
+type roomTrack struct {
+	URI        string   `json:"uri"`
+	Title      string   `json:"title"`
+	Artists    []string `json:"artists"`
+	Album      string   `json:"album"`
+	ArtworkURL string   `json:"artwork_url,omitempty"`
+	PositionMS int64    `json:"position_ms"`
+	DurationMS int      `json:"duration_ms"`
+}
+
+// currentTrack reads the engine's current item; nil when nothing is loaded.
+func currentTrack(base string) *roomTrack {
+	cl := &http.Client{Timeout: 2 * time.Second}
+	resp, err := cl.Get(base + "/status")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var st struct {
+		Track *struct {
+			URI         string   `json:"uri"`
+			Name        string   `json:"name"`
+			ArtistNames []string `json:"artist_names"`
+			AlbumName   string   `json:"album_name"`
+			AlbumCover  *string  `json:"album_cover_url"`
+			Position    int64    `json:"position"`
+			Duration    int      `json:"duration"`
+		} `json:"track"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&st) != nil || st.Track == nil || st.Track.Name == "" {
+		return nil
+	}
+	t := &roomTrack{URI: st.Track.URI, Title: st.Track.Name, Artists: st.Track.ArtistNames,
+		Album: st.Track.AlbumName, PositionMS: st.Track.Position, DurationMS: st.Track.Duration}
+	if t.Artists == nil {
+		t.Artists = []string{}
+	}
+	if st.Track.AlbumCover != nil {
+		t.ArtworkURL = *st.Track.AlbumCover
+	}
+	return t
+}
+
 func nowPlaying(base string) string {
 	cl := &http.Client{Timeout: 2 * time.Second}
 	resp, err := cl.Get(base + "/status")
@@ -1275,9 +1319,10 @@ type roomInfo struct {
 	HomepodName string                 `json:"homepod_name"`
 	HomepodID   string                 `json:"homepod_id"`
 	OwntoneUp   bool                   `json:"owntone_up"`
-	Playing     bool                   `json:"playing"` // the HomePod outputs this room's source
-	Source      string                 `json:"source"`  // "spotify", "radio" or ""
-	State       string                 `json:"state"`   // "playing", "paused", "connecting" or "idle"
+	Playing     bool                   `json:"playing"`         // the HomePod outputs this room's source
+	Source      string                 `json:"source"`          // "spotify", "radio" or ""
+	State       string                 `json:"state"`           // "playing", "paused", "connecting" or "idle"
+	Track       *roomTrack             `json:"track,omitempty"` // the Spotify item on this room
 	Released    bool                   `json:"released"`
 	NowPlaying  string                 `json:"now_playing"`
 	Volume      int                    `json:"volume"` // 0..100, or -1 if unknown
