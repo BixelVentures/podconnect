@@ -9,14 +9,38 @@ on:
     paths:
       - 'podconnect/manager/**'
       - '.github/workflows/verify-native-start.yaml'
+
+# A newer push to the same PR replaces the older run; every main run gets its own group and finishes.
+concurrency:
+  group: verify-native-start-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
+
 jobs:
   manager:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
       - uses: actions/setup-go@v5
+        timeout-minutes: 3
         with:
           go-version: '1.25'
+          cache: false
+      # Compiled packages (also -race) are reused; Go's content-keyed cache never reuses changed code.
+      - uses: actions/cache@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-manager-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('podconnect/manager/**') }}
+          restore-keys: go-manager-${{ runner.os }}-${{ runner.arch }}-
       - name: Test native start and retained transport without provider access
+        timeout-minutes: 10
         working-directory: podconnect/manager
-        run: go test -race ./... && go vet ./...
+        run: go test -race -count=1 ./... && go vet ./...

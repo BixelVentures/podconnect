@@ -24,6 +24,7 @@ jobs:
   publish:
     name: publish-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     concurrency:
       group: podconnect-speakers-${{ matrix.arch }}
       cancel-in-progress: false
@@ -42,10 +43,15 @@ jobs:
             platform: linux/amd64
             base: ghcr.io/home-assistant/amd64-base-debian:bookworm
             runner: ubuntu-latest
+    env:
+      # A stalled cache download falls back to building instead of hanging.
+      SEGMENT_DOWNLOAD_TIMEOUT_MINS: "3"
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
 
       - uses: docker/setup-buildx-action@v3
+        timeout-minutes: 5
         with:
           buildkitd-config-inline: |
             [registry."docker.io"]
@@ -53,6 +59,7 @@ jobs:
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
+        timeout-minutes: 3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -60,31 +67,61 @@ jobs:
 
       - name: Read add-on version
         id: ver
+        timeout-minutes: 1
         run: |
           version=$(grep '^version:' podconnect/config.yaml | cut -d'"' -f2)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Admit first build or exact-source immutable promotion
         id: promotion
-        run: >-
-          python3 scripts/native_image_promotion.py
-          --arch '${{ matrix.arch }}'
-          --version '${{ steps.ver.outputs.version }}'
-          --output "$GITHUB_OUTPUT"
+        timeout-minutes: 5
+        # Read-only registry check; a network blip is retried, a real mismatch still fails.
+        run: |
+          for attempt in 1 2 3; do
+            python3 scripts/native_image_promotion.py \
+              --arch '${{ matrix.arch }}' \
+              --version '${{ steps.ver.outputs.version }}' \
+              --output "$GITHUB_OUTPUT" && exit 0
+            echo "::warning::Registry check attempt $attempt failed; retrying."
+            sleep $((attempt * 15))
+          done
+          exit 1
 
       - name: Build & push (${{ matrix.arch }})
         if: steps.promotion.outputs.action == 'build'
         uses: docker/build-push-action@v6
+        timeout-minutes: 30
+        with:
+          context: ./podconnect
+          file: ./podconnect/Dockerfile
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,version=2,scope=podconnect-${{ matrix.arch }}
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }}
+          labels: |
+            io.bixelventures.podconnect.source-tree=${{ steps.promotion.outputs.source_tree }}
+            io.bixelventures.podconnect.arch=${{ matrix.arch }}
+          build-args: |
+            BUILD_FROM=${{ matrix.base }}
+            BUILD_ARCH=${{ matrix.arch }}
+
+      # The image is already pushed above. Uploading the layer cache once stalled 17 min
+      # after a 4 min build (0.26.93), so it runs separately, time-boxed and non-blocking.
+      # Every layer is already in the local builder, so this rebuild only exports.
+      - name: Save build cache for the next release (${{ matrix.arch }})
+        if: steps.promotion.outputs.action == 'build'
+        uses: docker/build-push-action@v6
+        timeout-minutes: 8
+        continue-on-error: true
         with:
           context: ./podconnect
           file: ./podconnect/Dockerfile
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,version=2,scope=podconnect-${{ matrix.arch }}
           cache-to: type=gha,version=2,scope=podconnect-${{ matrix.arch }},mode=max,ignore-error=true
-          push: true
-          provenance: false
-          sbom: false
-          tags: ghcr.io/bixelventures/${{ matrix.arch }}-podconnect:${{ steps.ver.outputs.version }}
+          outputs: type=cacheonly
           labels: |
             io.bixelventures.podconnect.source-tree=${{ steps.promotion.outputs.source_tree }}
             io.bixelventures.podconnect.arch=${{ matrix.arch }}
