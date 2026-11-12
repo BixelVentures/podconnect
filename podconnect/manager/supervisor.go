@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,9 +43,8 @@ type roomRuntime struct {
 	glCmd *exec.Cmd
 	otCmd *exec.Cmd
 
-	freshNativePending bool      // a fresh Native process was requested; respawn without the 2 s backoff
-	nativeHealing      bool      // one fresh-Native replacement at a time
-	lastNativeHeal     time.Time // wedge self-heal rate limit
+	freshNativePending bool // a fresh Native process was requested; respawn without the 2 s backoff
+	nativeHealing      bool // one fresh-Native replacement at a time
 
 	tonePlaying boolFlag  // per-room test-tone gate (pauses that room's bridge)
 	live        glLive    // Wave 3: latest go-librespot state, pushed by runGLEvents (poll fallback)
@@ -376,8 +374,7 @@ func (rt *roomRuntime) freshNative(reason string) {
 	rt.mu.Unlock()
 	log.Printf("rooms[%s]: fresh Spotify engine (%s)", rt.room.ID, reason)
 	go func() {
-		// Lines the old process logs while it shuts down never trigger another replacement.
-		defer func() { rt.mu.Lock(); rt.nativeHealing = false; rt.lastNativeHeal = time.Now(); rt.mu.Unlock() }()
+		defer func() { rt.mu.Lock(); rt.nativeHealing = false; rt.mu.Unlock() }()
 		rt.restartNative()
 	}()
 }
@@ -391,47 +388,6 @@ func (rt *roomRuntime) restartNative() {
 		return
 	}
 	rt.restartGL()
-}
-
-// nativeWedgeLine recognises Native's fixed, content-free log lines that mean
-// its process-wide Spotify custody is stuck ("unknown"): from then on every
-// transfer, play and seek would be refused until the process is replaced.
-func nativeWedgeLine(line string) bool {
-	return strings.Contains(line, "custody_unknown=true") ||
-		strings.Contains(line, "output admission custody_unknown") ||
-		strings.Contains(line, "retirement_prepare outcome=request_failed") ||
-		strings.Contains(line, "retirement_prepare outcome=receipt_rejected") ||
-		strings.Contains(line, "retirement_prepare outcome=skipped reason=custody_uncertain")
-}
-
-const nativeHealInterval = 20 * time.Second
-
-// nativeHealPoll is how often a pending self-heal re-checks that Spotify audio stopped.
-var nativeHealPoll = 500 * time.Millisecond
-
-// healNativeWedge is Spotify-always-wins insurance: a stuck Native is replaced
-// as soon as it plays nothing (current audio is never cut), at most once per
-// nativeHealInterval.
-func (rt *roomRuntime) healNativeWedge() {
-	rt.mu.Lock()
-	if rt.nativeHealing || time.Since(rt.lastNativeHeal) < nativeHealInterval {
-		rt.mu.Unlock()
-		return
-	}
-	rt.lastNativeHeal = time.Now()
-	rt.mu.Unlock()
-	go func() {
-		for {
-			st := rt.live.Get()
-			if !(st.Active && !st.Paused && !st.Stopped) {
-				break
-			}
-			if rt.sleepOrStop(nativeHealPoll) {
-				return
-			}
-		}
-		rt.freshNative("Spotify custody was stuck")
-	}()
 }
 
 func (rt *roomRuntime) restartOT() bool { return rt.replaceChildren(true) }
@@ -458,31 +414,20 @@ func (rt *roomRuntime) killAll() {
 func (rt *roomRuntime) pipeOutput(label string, cmd *exec.Cmd) {
 	prefix := "rooms[" + rt.room.ID + "/" + label + "] "
 	stdout, err := cmd.StdoutPipe()
-	var onLine func(string)
-	if label == "go-librespot" {
-		onLine = func(line string) {
-			if nativeWedgeLine(line) {
-				rt.healNativeWedge()
-			}
-		}
-	}
 	if err == nil {
-		go logLines(prefix, stdout, onLine)
+		go logLines(prefix, stdout)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err == nil {
-		go logLines(prefix, stderr, onLine)
+		go logLines(prefix, stderr)
 	}
 }
 
-func logLines(prefix string, rc io.ReadCloser, onLine func(string)) {
+func logLines(prefix string, rc io.ReadCloser) {
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		log.Printf("%s%s", prefix, sc.Text())
-		if onLine != nil {
-			onLine(sc.Text())
-		}
 	}
 }
 
