@@ -350,6 +350,18 @@ class SpeakersClient:
         if not isinstance(reply, dict) or reply.get("ok") is not True:
             raise SpeakersError("Native local pause failed")
 
+    async def set_spotify_room_volume(self, percent: int) -> None:
+        """Volume for the one room Spotify plays in, through /api/room-control.
+
+        The always-available volume when no exact Native room route can be
+        bound (Green 13 Nov 16:08, after a selection start): last command wins.
+        """
+        rows = await self.rooms()
+        rooms = [row for row in rows if row.get("source") == "spotify"]
+        if len(rooms) != 1:
+            raise SpeakersError("Spotify room unavailable")
+        await self.room_control(rooms[0]["id"], "volume", volume=int(percent))
+
     async def outputs(self) -> dict:
         data = await self._request("GET", "/api/state")
         if not isinstance(data, dict) or type(data.get("owntone_up")) is not bool:

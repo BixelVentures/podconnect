@@ -1,0 +1,110 @@
+diff --git a/daemon/blocked_decoder_regression_test.go b/daemon/blocked_decoder_regression_test.go
+index 33b7630..504b762 100644
+--- a/daemon/blocked_decoder_regression_test.go
++++ b/daemon/blocked_decoder_regression_test.go
+@@ -635,3 +635,57 @@ func TestCurrentObservationWriterVerificationWithHeldReadRejectsStaleProofs(t *t
+ 	held.CancelRead()
+ 	owner.player.Close()
+ }
++
++// Green 13 Nov 16:08: after a selection start the bound route could not be
++// bound and every pause answered 409 while the music played. The pause must
++// still stop the engine: the next command always goes through.
++func TestPauseStopsTheEngineWhenTheBoundRouteIsUnavailable(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusConflict) }))
++	defer srv.Close()
++	app, owner, _ := retirementOwnerFixture(t, srv.URL, "start")
++	app.cfg = &Config{AudioBackend: "pipe", ExternalVolume: true, RoomTransportOwnToneURL: srv.URL}
++	app.log = &librespot.NullLogger{}
++	owner.state = pc13ExistingPlayer(t, true).state
++	owner.sess = &session.Session{}
++	owner.prefetchTimer = time.NewTimer(time.Hour)
++	defer owner.prefetchTimer.Stop()
++	writer := app.openedWriter
++	current, err := owner.player.Start35CurrentSource(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	held := &retirementHeldRead{entered: make(chan struct{}), release: make(chan struct{})}
++	defer held.CancelRead()
++	owner.primaryStream = &player.Stream{Source: held}
++	guard := func(m func()) error { m(); return nil }
++	if _, _, err = owner.player.Start35(context.Background(), "publish", held, current, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err = owner.player.Start35(context.Background(), "resume", nil, held, writer.PipeIdentity, "1", guard); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case <-held.entered:
++	case <-time.After(time.Second):
++		t.Fatal("no held read")
++	}
++	if handled, err := owner.pauseBoundRoom(context.Background()); !handled || err == nil {
++		t.Fatalf("fixture: bound route unexpectedly available: handled=%t err=%v", handled, err)
++	}
++	done := make(chan error, 1)
++	go func() { done <- owner.pause(context.Background()) }()
++	select {
++	case err = <-done:
++		if err != nil {
++			t.Fatalf("pause refused while the bound route was unavailable: %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		held.CancelRead()
++		t.Fatal("pause blocked")
++	}
++	if !owner.state.player.IsPaused {
++		t.Fatal("engine not paused")
++	}
++	held.CancelRead()
++	owner.player.Close()
++}
+diff --git a/daemon/controls.go b/daemon/controls.go
+index 6e76d95..ab628c2 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -601,7 +601,19 @@ func (p *AppPlayer) playObserved(ctx context.Context, ordinal uint64) error {
+ 
+ func (p *AppPlayer) pause(ctx context.Context) error {
+ 	if handled, err := p.pauseBoundRoom(ctx); handled {
+-		return err
++		if err == nil {
++			return nil
++		}
++		// Green 13 Nov 16:08: after a selected-content start the bound route
++		// could not be bound, so every pause (PodView, HA and the Spotify app)
++		// answered 409 while the music played on. A pause can never start or
++		// move audio: when the bound route is unavailable the engine pauses
++		// locally, which stops the room's PCM. The next command always wins.
++		reason := "other"
++		if errors.Is(err, ErrAliasConflict) {
++			reason = "alias_conflict"
++		}
++		p.app.log.Infof("pause: bound route unavailable reason=%s; local engine pause", reason)
+ 	}
+ 	if p.primaryStream == nil {
+ 		return fmt.Errorf("no primary stream")
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 50d489c..098ccf7 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -1034,12 +1034,13 @@ func TestPreparedDealerSTARTUsesRealFIFOAndPreservesTransfer(t *testing.T) {
+ 					p.prefetchTimer = time.NewTimer(time.Hour)
+ 					defer p.prefetchTimer.Stop()
+ 					_, e := p.handleApiRequest(ctx, ApiRequest{Type: ApiRequestTypePause})
+-					good := mode == "direct-pause-current"
+-					if (e == nil) != good {
+-						t.Fatal("REST Pause reported wrong owner outcome", mode, e)
++					// Green 13 Nov 16:08: an unusable bound route must never keep the
++					// music playing. The bound attempt runs first (calls below are
++					// unchanged); when it fails the engine pauses locally.
++					if e != nil {
++						t.Fatal("REST Pause refused", mode, e)
+ 					}
+-					wantPaused := good || mode == "direct-pause-unknown-confirm"
+-					if p.state.player.IsPaused != wantPaused {
++					if !p.state.player.IsPaused {
+ 						t.Fatal("invalid owner/unknown mutated actual Pause", mode, p.state.player.IsPaused)
+ 					}
+ 					mu.Lock()

@@ -116,14 +116,17 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
                 return web.json_response(
                     {
                         "rooms": [
-                            {"id": "r0", "homepod_id": "123", "alias": False},
-                            {"id": "r6", "homepod_id": "456", "alias": True},
+                            {"id": "r0", "homepod_id": "123", "alias": False, "source": "spotify"},
+                            {"id": "r6", "homepod_id": "456", "alias": True, "source": ""},
                         ]
                     }
                 )
             if request.path == "/api/stop":
                 self.local_stops.append((request.method, dict(request.query)))
                 return web.json_response({"ok": True})
+            if request.path == "/api/room-control":
+                self.local_stops.append(("room-control", await request.json()))
+                return web.json_response({"ok": True, "source": "spotify"})
         if self.source_selection_fixture:
             if (
                 request.path == "/api/rooms"
@@ -1497,6 +1500,23 @@ class MediaPlayerNativeOwnerTests(fixtures.RoomContentFrameworkTests):
             "\n".join(logs.output),
         )
         self.assertEqual(self.local_stops, [("POST", {"room": "r0"})])
+        self.assertEqual(self._writes(), [])
+        self.assertEqual(self.room_posts, [])
+
+    async def test_media_native_volume_without_route_goes_to_the_spotify_room(self):
+        # Green 13 Nov 16:08: after a selection start no exact route could be
+        # bound and volume_set failed with "Native route unavailable". Volume,
+        # like pause, must always go through: to the room Spotify plays in.
+        self.playing = True
+        await self.data.coordinator.async_refresh()
+        self.local_stop_fixture, self.local_stops = True, []
+        self.output_selected = ["123", "456"]
+        with self.assertLogs("custom_components.podconnect", "WARNING"):
+            await self.native_call("volume_set", volume_level=0.08)
+        self.assertEqual(
+            self.local_stops,
+            [("room-control", {"room_id": "r0", "action": "volume", "volume": 8})],
+        )
         self.assertEqual(self._writes(), [])
         self.assertEqual(self.room_posts, [])
 
