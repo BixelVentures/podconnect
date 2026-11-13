@@ -1,3 +1,7 @@
+## Speakers 0.26.101 — lydstyrke kan sættes, mens der er stille
+
+- Et stille rum tager nu imod lydstyrke. Den gemmes som rummets ønskede lydstyrke, og rummets første lyd spiller på den (dog aldrig over 35 %). Før svarede rummet "volume failed", og lydstyrken kunne ikke sænkes før start.
+
 ## Speakers 0.26.100 — pause melder ikke længere fejl
 
 - Pause bekræftes nu ud fra Spotify-motorens egen pause, så OwnTones fejlsvar (HTTP 500), når HomePod'en allerede er stoppet, ikke længere giver "pause fejlede" og fejlbesked i PodView.
