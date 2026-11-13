@@ -1,3 +1,7 @@
+## Speakers 0.26.100 — pause melder ikke længere fejl
+
+- Pause bekræftes nu ud fra Spotify-motorens egen pause, så OwnTones fejlsvar (HTTP 500), når HomePod'en allerede er stoppet, ikke længere giver "pause fejlede" og fejlbesked i PodView.
+
 ## Speakers 0.26.99 og Control 0.10.45 — pause og afspil virker, køen holder
 
 - Pause og afspil i PodView virker og bekræftes, ligesom næste og spoling. "Højttaleren afviste handlingen …" kommer ikke længere ved almindelig pause/afspil (før: `pause failed` fra OwnTone, selvom musikken pausede).
