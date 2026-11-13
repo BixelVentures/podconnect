@@ -1,3 +1,10 @@
+## Speakers 0.26.99 og Control 0.10.45 — pause og afspil virker, køen holder
+
+- Pause og afspil i PodView virker og bekræftes, ligesom næste og spoling. "Højttaleren afviste handlingen …" kommer ikke længere ved almindelig pause/afspil (før: `pause failed` fra OwnTone, selvom musikken pausede).
+- Afspil efter pause starter også HomePod'en igen.
+- Køen flimrer ikke og bliver ikke tom under normal afspilning: flere skærme kan læse den samtidig, og en Spotify-opdatering midt i en læsning kasserer den ikke længere.
+- Home Assistants advarsel om en forældet registreringsfunktion fra PodConnect er væk.
+
 ## Speakers 0.26.98 — ærlig rumstatus, enkel betjening, ingen låsning efter flyt
 
 - `/api/rooms` siger kun "spiller", når rummets HomePod faktisk får lyd (Spotify-motoren spiller, OwnTone spiller, og HomePod'en er valgt). Hvert rum har nu `source` (spotify/radio) og `state` (playing/paused/connecting/idle), og det spillende rum har sporet (titel, kunstnere, album, cover, position, varighed). Før kunne Svends rum stå som spillende med en tavs HomePod.
