@@ -5,7 +5,7 @@ import unittest
 import test_targets as fixture
 from aiohttp import web
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry
+from homeassistant.helpers import device_registry, entity_registry
 
 
 class RoomPlayerFrameworkTests(unittest.IsolatedAsyncioTestCase):
@@ -94,6 +94,31 @@ class RoomPlayerFrameworkTests(unittest.IsolatedAsyncioTestCase):
             registry.async_get_entity_id("media_player", "podconnect", "account-alpha_spotify-one")
         )
         self.assertIs(engine.hidden_by, entity_registry.RegistryEntryHider.INTEGRATION)
+
+    async def test_reload_removes_old_devices_without_deprecated_registry_calls(self):
+        # Testnoter 13. nov.: HA 2026.11 warned that podconnect removes devices
+        # through async_update_device(remove_config_entry_id=...).
+        entry = self.hass.config_entries.async_get_entry("account-alpha")
+        devices = device_registry.async_get(self.hass)
+        old = devices.async_get_or_create(
+            config_entry_id=entry.entry_id, identifiers={("podconnect", "c" * 40)}
+        )
+        legacy = []
+        real_update = devices.async_update_device
+
+        def update_device(device_id, **changes):
+            if {"add_config_entry_id", "remove_config_entry_id"} & changes.keys():
+                legacy.append(sorted(changes))
+            return real_update(device_id, **changes)
+
+        devices.async_update_device = update_device
+        try:
+            self.assertTrue(await self.hass.config_entries.async_reload(entry.entry_id))
+            await self.hass.async_block_till_done()
+        finally:
+            devices.async_update_device = real_update
+        self.assertEqual(legacy, [])
+        self.assertIsNone(devices.async_get(old.id))
 
     async def test_room_state_is_what_its_homepod_outputs(self):
         alpha = self.hass.states.get(self.entity_id("room-alpha"))

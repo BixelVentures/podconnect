@@ -28,7 +28,11 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.queue_corrupt_state = None
         self.queue_corrupt_prepare = None
         self.queue_corrupt_ack = None
+        self.queue_state_hold = False
+        self.queue_state_entered = asyncio.Event()
+        self.queue_state_release = asyncio.Event()
         await super().asyncSetUp()
+        self.holds.append(self.queue_state_release)
         self.holds.extend((self.queue_release, self.queue_commit_release))
 
     def native(self):
@@ -88,6 +92,10 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
             }
             if self.queue_corrupt_state:
                 self.queue_corrupt_state(value)
+            if self.queue_state_hold:
+                self.queue_state_hold = False
+                self.queue_state_entered.set()
+                await self.queue_state_release.wait()
             return web.json_response(value)
         if request.path in {"/api/room-queue/prepare", "/api/room-queue/commit"}:
             body = await request.json()
@@ -429,6 +437,32 @@ class RoomQueueFrameworkTests(RoomTransportFrameworkTests):
         self.assertEqual(result["outcome"], "accepted")
         self.assertEqual(len(self.queue_posts), 2)
         self.assertEqual(self.entries[0].runtime_data.commands.command_sequence, 1)
+
+    async def test_queue_read_survives_routine_poll_landing_meanwhile(self):
+        # Testnoter 13. nov., fejl 4: a Spotify poll landing while Speakers
+        # answered made the read fail (poll_sequence_changed) and the screen
+        # showed an empty, flickering queue during normal playback.
+        self.queue_state_hold = True
+        running = self._task(self.queue_read())
+        await asyncio.wait_for(self.queue_state_entered.wait(), 2)
+        await self.entries[0].runtime_data.coordinator.async_refresh()
+        self.queue_state_release.set()
+        result = await running
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["items"]), 2)
+
+    async def test_two_screens_reading_the_queue_at_once_both_get_it(self):
+        # Testnoter 13. nov., fejl 4: iPad and Mac read the same room's queue;
+        # the second read made the first fail as read_revision_changed.
+        self.queue_state_hold = True
+        first = self._task(self.queue_read())
+        await asyncio.wait_for(self.queue_state_entered.wait(), 2)
+        second = await self.queue_read()
+        self.queue_state_release.set()
+        first = await first
+        self.assertTrue(second["ok"])
+        self.assertTrue(first["ok"])
+        self.assertEqual(len(first["items"]), 2)
 
     async def test_queue_prepare_rejection_names_first_failed_check(self):
         # Issue #140: PodVoice only sees a not-ok preparation; Control must log why.

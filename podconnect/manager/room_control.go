@@ -88,18 +88,18 @@ func (q roomControlRequest) invalid() string {
 	return ""
 }
 
-// roomControlSpotify sends the command to the one Spotify engine. A pause also
-// pauses OwnTone, so the HomePod goes quiet even if the engine is slow.
+// roomControlSpotify sends the command to the one Spotify engine. Pause and
+// resume are confirmed against what the players report afterwards: the room is
+// paused when the engine paused and OwnTone does not play; it plays again when
+// the engine resumed (a paused OwnTone is resumed with it).
 func roomControlSpotify(primary *Room, q roomControlRequest) error {
 	base := primary.Librespot
 	switch q.Action {
 	case "pause":
-		err := librespotTransport(base, "pause")
-		if airplayErr := owntoneTransport(primary.OwnTone, "pause"); err == nil {
-			err = airplayErr
-		}
-		return err
-	case "resume", "next":
+		return roomControlPause(primary)
+	case "resume":
+		return roomControlResume(primary)
+	case "next":
 		return librespotTransport(base, q.Action)
 	case "previous":
 		return librespotTransport(base, "prev")
@@ -111,6 +111,44 @@ func roomControlSpotify(primary *Room, q roomControlRequest) error {
 		return nil
 	}
 	return fmt.Errorf("unsupported action %q", q.Action)
+}
+
+// roomControlPause silences the HomePod and pauses the engine. OwnTone answers
+// a pause with an error when it has already stopped; a quiet room is still the
+// confirmed result, so only the observed state decides.
+func roomControlPause(primary *Room) error {
+	engineErr := librespotTransport(primary.Librespot, "pause")
+	airplayErr := owntoneTransport(primary.OwnTone, "pause")
+	gl := librespotStatus(primary.Librespot)
+	engineQuiet := gl.Active && (gl.Paused || gl.Stopped)
+	if !engineQuiet {
+		if engineErr == nil {
+			engineErr = fmt.Errorf("engine still playing after pause")
+		}
+		return engineErr
+	}
+	if state := owntonePlayerState(primary.OwnTone); state == "play" || state == "" {
+		if airplayErr == nil {
+			airplayErr = fmt.Errorf("HomePod output state %q after pause", state)
+		}
+		return airplayErr
+	}
+	return nil
+}
+
+// roomControlResume resumes the engine and, when the HomePod output was paused,
+// OwnTone as well: OwnTone never restarts a paused pipe by itself.
+func roomControlResume(primary *Room) error {
+	if err := librespotTransport(primary.Librespot, "resume"); err != nil {
+		return err
+	}
+	if gl := librespotStatus(primary.Librespot); !gl.Active || gl.Paused || gl.Stopped {
+		return fmt.Errorf("engine not playing after resume")
+	}
+	if owntonePlayerState(primary.OwnTone) == "pause" {
+		return owntoneTransport(primary.OwnTone, "play")
+	}
+	return nil
 }
 
 // roomControlRadio maps the room command onto the radio: pause stops the
