@@ -184,7 +184,6 @@ class RoomQueue:
         self.commands = commands
         self.observations = {}
         self.preparations = {}
-        self.read_revision = 0
         self._queue_read_log_after = {}
         self._metadata_task = None
 
@@ -296,9 +295,12 @@ class RoomQueue:
             reason = "playback_before_unavailable"
             before = self.commands.controls(entry, target)
             observed = before
-            self.read_revision += 1
-            revision = self.read_revision
-            self.observations.clear()
+            # Several screens read the same room's queue. A newer read never
+            # invalidates an older one; Speakers fences each occurrence at
+            # prepare and commit, so only expired observations are dropped.
+            now = time.monotonic()
+            for key in [k for k, v in self.observations.items() if v["deadline"] <= now]:
+                del self.observations[key]
             started = time.monotonic()
             reason = "speakers_unavailable"
             value = await self.commands.data.speakers.room_queue_state(
@@ -310,15 +312,11 @@ class RoomQueue:
             reason = "scope_changed"
             if self._scope(hass, entry, target, room, homepod) != scope:
                 raise CommandRejected("stale_observation")
-            reason = "read_revision_changed"
-            if revision != self.read_revision:
-                raise CommandRejected("stale_observation")
             reason = "owner_epoch_changed"
             if before["owner_epoch"] != latest["owner_epoch"]:
                 raise CommandRejected("stale_observation")
-            reason = "poll_sequence_changed"
-            if before["poll_sequence"] != latest["poll_sequence"]:
-                raise CommandRejected("stale_observation")
+            # A routine Spotify poll landing meanwhile is not a new owner
+            # (AGENTS.md); the queue read stays valid.
         except (CommandRejected, SpeakersError):
             self._trace_read_failure(reason, observed)
             raise

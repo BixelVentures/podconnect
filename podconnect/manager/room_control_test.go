@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,10 @@ import (
 type controlFixture struct {
 	mu     sync.Mutex
 	writes []string // "METHOD host/path body"
+	// The engine's and OwnTone's player state, as their real APIs report it.
+	enginePaused bool
+	engineRefuse map[string]bool // engine actions answered with HTTP 500, state unchanged
+	ownTone      string          // OwnTone /api/player state: play, pause or stop
 }
 
 // newControlFixture: Spotify plays on Frida's HomePod (r7) through the one engine.
@@ -31,12 +36,17 @@ func newControlFixture(t *testing.T) *controlFixture {
 	if err := os.WriteFile(filepath.Join(dataDir, "rooms.json"), []byte(rooms), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f := &controlFixture{}
+	f := &controlFixture{ownTone: "play", engineRefuse: map[string]bool{}}
 	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		body := `{}`
+		body, status := `{}`, 200
+		f.mu.Lock()
+		defer f.mu.Unlock()
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/status":
-			body = `{"username":"u","volume":40,"volume_steps":100,"paused":false,"stopped":false,"selected_alias_id":3}`
+			body = fmt.Sprintf(`{"username":"u","volume":40,"volume_steps":100,"paused":%t,"stopped":false,`+
+				`"selected_alias_id":3}`, f.enginePaused)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/player":
+			body = `{"state":"` + f.ownTone + `"}`
 		case r.Method == http.MethodGet && r.URL.Path == "/api/outputs":
 			body = `{"outputs":[{"id":"101","name":"Køkken HomePod","selected":false},` +
 				`{"id":"106","name":"Svends HomePod","selected":false},` +
@@ -47,13 +57,33 @@ func newControlFixture(t *testing.T) *controlFixture {
 				b, _ := io.ReadAll(r.Body)
 				sent = string(b)
 			}
-			f.mu.Lock()
 			f.writes = append(f.writes, strings.TrimSpace(r.Method+" "+r.URL.Host+r.URL.Path+" "+sent))
-			f.mu.Unlock()
+			status = f.apply(r.Method, r.URL.Path)
 		}
-		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
 	return f
+}
+
+// apply mirrors the real players: the engine pauses/resumes unless told to refuse,
+// and OwnTone answers 500 to a pause while stopped (player.c playback_pause).
+func (f *controlFixture) apply(method, path string) int {
+	switch {
+	case method == http.MethodPost && (path == "/player/pause" || path == "/player/resume"):
+		action := strings.TrimPrefix(path, "/player/")
+		if f.engineRefuse[action] {
+			return 500
+		}
+		f.enginePaused = action == "pause"
+	case method == http.MethodPut && path == "/api/player/pause":
+		if f.ownTone == "stop" {
+			return 500
+		}
+		f.ownTone = "pause"
+	case method == http.MethodPut && path == "/api/player/play":
+		f.ownTone = "play"
+	}
+	return 200
 }
 
 func (f *controlFixture) sent() []string {
@@ -102,6 +132,57 @@ func TestRoomControlPauseAlsoPausesTheHomePod(t *testing.T) {
 	want := []string{"POST localhost:3678/player/pause", "PUT localhost:3689/api/player/pause"}
 	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q", got)
+	}
+}
+
+// Testnoter 13. nov., fejl 2: the engine paused, but OwnTone had already stopped
+// and answered 500, so the whole pause was reported as failed. The room is quiet:
+// that is the confirmed outcome.
+func TestRoomControlPauseIsConfirmedWhenTheHomePodAlreadyStopped(t *testing.T) {
+	f := newControlFixture(t)
+	f.ownTone = "stop"
+	if code, reply := roomControl(t, `{"room_id":"r7","action":"pause"}`); code != 200 || !reply.OK {
+		t.Fatalf("quiet room reported as failed pause: %d %+v", code, reply)
+	}
+	if !f.enginePaused {
+		t.Fatal("engine not paused")
+	}
+}
+
+// A pause is only confirmed when the engine really paused; otherwise the honest answer is failure.
+func TestRoomControlPauseFailsWhenTheEngineKeepsPlaying(t *testing.T) {
+	f := newControlFixture(t)
+	f.engineRefuse["pause"] = true
+	code, reply := roomControl(t, `{"room_id":"r7","action":"pause"}`)
+	if code != http.StatusBadGateway || reply.OK || reply.Error != "speaker_unavailable" {
+		t.Fatalf("unpaused engine reported as paused: %d %+v", code, reply)
+	}
+}
+
+// Afspil after pause: the engine resumes and the paused HomePod plays again
+// (OwnTone does not restart a paused pipe on its own).
+func TestRoomControlResumeAlsoResumesAPausedHomePod(t *testing.T) {
+	f := newControlFixture(t)
+	f.enginePaused, f.ownTone = true, "pause"
+	if code, reply := roomControl(t, `{"room_id":"r7","action":"resume"}`); code != 200 || !reply.OK {
+		t.Fatalf("%d %+v", code, reply)
+	}
+	want := []string{"POST localhost:3678/player/resume", "PUT localhost:3689/api/player/play"}
+	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", got, want)
+	}
+	if f.enginePaused || f.ownTone != "play" {
+		t.Fatalf("room not playing after resume: engine paused=%t owntone=%s", f.enginePaused, f.ownTone)
+	}
+}
+
+// A resume the engine did not carry out is reported, not claimed.
+func TestRoomControlResumeFailsWhenTheEngineStaysPaused(t *testing.T) {
+	f := newControlFixture(t)
+	f.enginePaused, f.engineRefuse["resume"] = true, true
+	code, reply := roomControl(t, `{"room_id":"r7","action":"resume"}`)
+	if code != http.StatusBadGateway || reply.OK {
+		t.Fatalf("paused engine reported as resumed: %d %+v", code, reply)
 	}
 }
 

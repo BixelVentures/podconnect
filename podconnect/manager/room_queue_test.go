@@ -593,3 +593,36 @@ func TestRoomQueuePrepareRejectionNamesFirstFailedCheck(t *testing.T) {
 		t.Fatal("identifier leaked into diagnostics", logged)
 	}
 }
+
+// Two screens (iPad and Mac) read the same room's queue at once. The second read
+// waits for the first instead of failing as busy, so neither screen shows an
+// empty queue during normal playback (testnoter 13. nov., fejl 4).
+func TestRoomQueueConcurrentReadWaitsInsteadOfBusy(t *testing.T) {
+	f := newRoomQueueFixture(t)
+	if !acquireRoomQueue() {
+		t.Fatal("fixture admission unavailable")
+	}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		releaseRoomQueue()
+	}()
+	if out := f.read(t); out.Code != http.StatusOK {
+		t.Fatalf("concurrent queue read failed instead of waiting: %d %s", out.Code, out.Body.String())
+	}
+}
+
+// A read never waits without bound: a stuck command still yields an honest busy.
+func TestRoomQueueReadStillBusyWhenAdmissionStaysHeld(t *testing.T) {
+	f := newRoomQueueFixture(t)
+	if !acquireRoomQueue() {
+		t.Fatal("fixture admission unavailable")
+	}
+	defer releaseRoomQueue()
+	started := time.Now()
+	if out := f.read(t); out.Code != http.StatusConflict || !strings.Contains(out.Body.String(), "busy") {
+		t.Fatalf("held admission did not reject as busy: %d %s", out.Code, out.Body.String())
+	}
+	if waited := time.Since(started); waited > roomQueueReadWait+time.Second {
+		t.Fatalf("read waited %s, beyond its bound", waited)
+	}
+}

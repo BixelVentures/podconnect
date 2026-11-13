@@ -388,7 +388,7 @@ func roomQueueStateHandler(w http.ResponseWriter, r *http.Request) {
 		roomReject(w, "room_queue_state", "arguments", "arguments", 400)
 		return
 	}
-	if !acquireRoomQueue() {
+	if !acquireRoomQueueRead(r.Context()) {
 		roomReject(w, "room_queue_state", "busy", "busy", 409)
 		return
 	}
@@ -466,10 +466,33 @@ func decodeRoomQueueBody(r *http.Request, out any) error {
 	}
 	return queueClosedJSON(raw, out)
 }
+
+// roomQueueReadWait bounds how long a queue read waits for another read or a
+// command on the same manager to finish. Screens poll the queue; a second
+// screen must not fail just because the first one is reading.
+const roomQueueReadWait = 2 * time.Second
+
 func acquireRoomQueue() bool {
 	// The existing bound transport admission serializes queue preparation and
 	// commit with ordinary transport commands on the same manager process.
 	return acquireRoomTransport()
+}
+
+// acquireRoomQueueRead waits, bounded by roomQueueReadWait, for the shared
+// admission. Preparation and commit keep the immediate busy answer.
+func acquireRoomQueueRead(ctx context.Context) bool {
+	deadline := time.Now().Add(roomQueueReadWait)
+	for !acquireRoomQueue() {
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	return true
 }
 func releaseRoomQueue() {
 	releaseRoomTransport()

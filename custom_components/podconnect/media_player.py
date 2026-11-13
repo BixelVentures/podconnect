@@ -235,7 +235,7 @@ def _remove_foreign_entities(hass, entry_id: str, engine_id: str) -> None:
             for domain, key in device.identifiers
         ):
             continue
-        devices.async_update_device(device.id, remove_config_entry_id=entry_id)
+        devices.async_remove_device(device.id)
 
 
 class PodConnectMediaPlayer(
