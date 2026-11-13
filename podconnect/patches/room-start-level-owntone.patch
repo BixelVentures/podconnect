@@ -146,3 +146,31 @@ index 83a4a35..aa671b1 100644
    admission=outputs_connect_recovery_status(p->speaker.spk_id);
    if (admission<0) {
      p->temporary_busy_no_effect=admission==-2;
+diff --git a/tests/airplay_callback_owner.c b/tests/airplay_callback_owner.c
+index 6d83e91..c3e8479 100644
+--- a/tests/airplay_callback_owner.c
++++ b/tests/airplay_callback_owner.c
+@@ -863,9 +863,7 @@ static void recovery_wire_read(struct bufferevent *peer,void *arg)
+     } else wplist_dict_add_uint(plist,"eventPort",1); // Owned local refused event endpoint, allowed existing fallback.
+   } else if(!strncmp(header,"SET_PARAMETER ",14)) {
+       float mapped = airplay_volume_from_pct(
+-          ((f->mode == 29 && getenv("PC70_RELEASE_COMPOSE")
+-               && ((!strcmp(getenv("PC70_RELEASE_COMPOSE"), "ordinary") && f->volumes == 0)
+-                   || (!strcmp(getenv("PC70_RELEASE_COMPOSE"), "move") && f->volumes < 2)))
++          (f->mode == 29 /* start policy v2: the native start keeps the device's own 27 % (below 35) */
+               || f->mode == 16 || (f->mode == 17 && f->phase != 4) || f->mode == 19 || f->mode == 20 || f->mode == 22
+               || f->mode == 23 || f->mode == 24 || f->mode == 25)
+               ? 27
+diff --git a/tests/start35_wire_owner.inc.c b/tests/start35_wire_owner.inc.c
+index 8addc1d..002cc56 100644
+--- a/tests/start35_wire_owner.inc.c
++++ b/tests/start35_wire_owner.inc.c
+@@ -1741,7 +1741,7 @@ static void native_start_done_poll(int fd,short events,void *arg)
+       puts("PASS actual Native UNKNOWN teardown -> C pending -> exact writer joined -> FULL terminal; next paused writer and proper START state admitted");
+   }else if(!atomic_load(&wire->completed) || !start_active
+       || start_active->result.phase!=OUTPUT_START_COMPLETED || !f->device->selected
+-      || !f->device->session || f->device->volume!=35 || f->volumes!=(getenv("PC_NATIVE_START_EXPECT_TWO")?2:1)){
++      || !f->device->session || f->device->volume!=(f->mode==29 ? 27 : 35) /* policy v2: native start keeps the device's own 27 % */ || f->volumes!=(getenv("PC_NATIVE_START_EXPECT_TWO")?2:1)){
+     recovery_wire_fail(f,"actual Native did not finish after real C COMPLETED/route35");return;
+   }
+   if(f->mode==29 && getenv("PC_EXPECT_PAUSED_CLOCK")
