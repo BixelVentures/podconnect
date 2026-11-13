@@ -1151,8 +1151,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// new session can't blast (the active branch's one-shot never-loud cap takes over from there).
 			if !gl.Active && !released && !boundNativeRoute && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
-				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startLevelForOutput(id)) > volTol {
-					setOwntoneOutputVolume(room.OwnTone, id, startLevelForOutput(id))
+				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startLevelFor(v)) > volTol {
+					setOwntoneOutputVolume(room.OwnTone, id, startLevelFor(v))
 				}
 			}
 

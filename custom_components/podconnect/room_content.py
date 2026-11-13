@@ -54,6 +54,10 @@ _EPISODE = re.compile(r"spotify:episode:[A-Za-z0-9]{22}")
 _CONTEXT = re.compile(r"spotify:(?:playlist|album|artist|show):[A-Za-z0-9]{22}")
 
 
+# A start plays at the room's own output level, never above this (policy v2).
+START_LEVEL_MAX = 35
+
+
 def _text(value, limit=1024):
     return isinstance(value, str) and 1 <= len(value) <= limit
 
@@ -70,7 +74,7 @@ def valid_start_offer(value):
         and all(_hex(value[k], _HEX32) for k in ("offer_id", "native_incarnation"))
         and all(_hex(value[k], _HEX64) for k in ("binding_id", "policy_revision"))
         and type(value["start_volume_percent"]) is int
-        and value["start_volume_percent"] == 35
+        and 0 <= value["start_volume_percent"] <= START_LEVEL_MAX
         and type(value["expires_after_ms"]) is int
         and 1 <= value["expires_after_ms"] <= 5000
     )
@@ -137,7 +141,9 @@ def valid_selected_receipt(
     volume_valid=None,
 ):
     if volume_valid is None:
-        volume_valid = lambda volume: type(volume) is int and volume == 35
+        volume_valid = lambda volume: (
+            type(volume) is int and 0 <= volume <= START_LEVEL_MAX
+        )
     keys = (
         _RECEIPT_KEYS
         - {"accepted_selected_content", "start_operation_id", "start_volume_percent"}
@@ -274,10 +280,13 @@ class RoomContent:
     valid_arguments = staticmethod(valid_selected_arguments)
 
     def valid_result(self, value, request, suffix):
-        return valid_manager_result(value, request, suffix)
+        return valid_manager_result(
+            value, request, suffix, expected_volume=self.expected_volume(request)
+        )
 
     def expected_volume(self, request):
-        return 35
+        # The room's own start level, as PodConnect offered it (at most 35 %).
+        return request["start_offer"]["start_volume_percent"]
 
     def client_method(self, client, purpose):
         method = (

@@ -241,7 +241,7 @@ func decodeRoomContentResult(raw []byte, endpoint string, record *roomContentRec
 			return result, fmt.Errorf("null required result field")
 		}
 	}
-	if err != nil || json.Unmarshal(raw, &result) != nil || result.Schema != "podconnect.native_room_content_"+endpoint+".v1" || result.Offer != record.Request.Offer.ID || result.Binding != record.Request.Offer.Binding || result.Room != record.Request.Scope.Room || result.Homepod != record.Request.Scope.Homepod || result.Physical || !slices.Contains([]string{"staging", "staged", "committing", "complete", "rejected", "cancelled", "unknown"}, result.State) || result.OK != (result.State == "complete") || result.Accepted != result.OK || result.Operation != nil && *result.Operation != result.Offer || result.Percent != nil && *result.Percent != 35 || result.OK && (result.Operation == nil || result.Percent == nil) {
+	if err != nil || json.Unmarshal(raw, &result) != nil || result.Schema != "podconnect.native_room_content_"+endpoint+".v1" || result.Offer != record.Request.Offer.ID || result.Binding != record.Request.Offer.Binding || result.Room != record.Request.Scope.Room || result.Homepod != record.Request.Scope.Homepod || result.Physical || !slices.Contains([]string{"staging", "staged", "committing", "complete", "rejected", "cancelled", "unknown"}, result.State) || result.OK != (result.State == "complete") || result.Accepted != result.OK || result.Operation != nil && *result.Operation != result.Offer || result.Percent != nil && *result.Percent != record.Request.Offer.Percent || result.OK && (result.Operation == nil || result.Percent == nil) {
 		return result, fmt.Errorf("invalid actual content result")
 	}
 	if endpoint == "prepare" && (result.State == "committing" || result.State == "complete") {

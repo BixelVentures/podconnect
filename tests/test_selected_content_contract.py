@@ -55,7 +55,10 @@ class SelectedContentContractTests(unittest.TestCase):
             ("binding_id", "b" * 63),
             ("native_incarnation", ""),
             ("policy_revision", True),
-            ("start_volume_percent", 27),
+            ("start_volume_percent", 36),
+            ("start_volume_percent", -1),
+            ("start_volume_percent", 8.0),
+            ("start_volume_percent", True),
             ("expires_after_ms", True),
             ("expires_after_ms", 5001),
             ("expires_after_ms", 0),
@@ -68,6 +71,17 @@ class SelectedContentContractTests(unittest.TestCase):
             value = self.offer()
             del value[key]
             self.assertFalse(contract.valid_start_offer(value))
+
+    def test_offer_carries_the_rooms_own_start_level_never_above_35(self):
+        # Green 13 Nov 14:56: a room set to 8 % started at 35 % from the queue and
+        # Find musik. Policy v2: the offer carries the room's own level (0-35).
+        for percent in (0, 8, 34, 35):
+            offer = {**self.offer(), "start_volume_percent": percent}
+            self.assertTrue(contract.valid_start_offer(offer), percent)
+            request = {"start_offer": offer}
+            self.assertEqual(
+                contract.RoomContent.expected_volume(None, request), percent
+            )
 
     def test_selected_source_accepts_exact_track_or_playlist_with_authorized_ceiling(
         self,

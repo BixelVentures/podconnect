@@ -172,3 +172,37 @@ func TestContentStateFailureStagesPreserveReadOnlyContractAndPrivateData(t *test
 		})
 	}
 }
+
+// Green 13 Nov 14:56: Køkkenalrum set to 8 % while quiet, then started from the
+// queue and from Find musik: it played at 35 %. Queue, Find musik and play_media
+// all start through this offer. Policy v2: the offer carries the room's own
+// level (0-35, as OwnTone reports it), and the result must report that level.
+func TestRoomContentStartCarriesTheRoomsOwnLevelNeverAbove35(t *testing.T) {
+	offer := func(percent int) roomContentOffer {
+		return roomContentOffer{"podconnect.room_content_offer.v1", strings.Repeat("b", 32), strings.Repeat("c", 64), strings.Repeat("d", 32), roomContentPolicy, percent, 5000}
+	}
+	for _, tc := range []struct {
+		percent int
+		ok      bool
+	}{{8, true}, {0, true}, {35, true}, {36, false}, {-1, false}} {
+		if got := validRoomContentOffer(offer(tc.percent)); got != tc.ok {
+			t.Fatalf("offer at %d%% valid=%t, want %t", tc.percent, got, tc.ok)
+		}
+	}
+	old := offer(35)
+	old.Policy = "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
+	if validRoomContentOffer(old) {
+		t.Fatal("policy v1 (fixed 35 %) offer accepted")
+	}
+	record := &roomContentRecord{Request: roomContentRequest{Scope: roomTransportScope{Room: "r0", Homepod: "101"}, Offer: offer(8)}}
+	result := func(percent int) []byte {
+		return []byte(fmt.Sprintf(`{"schema":"podconnect.native_room_content_commit.v1","ok":true,"offer_id":%q,"binding_id":%q,"state":"complete","accepted_selected_content":true,"start_operation_id":%q,"start_volume_percent":%d,"room_id":"r0","homepod_id":"101","physical_result_verified":false}`,
+			record.Request.Offer.ID, record.Request.Offer.Binding, record.Request.Offer.ID, percent))
+	}
+	if _, err := decodeRoomContentResult(result(8), "commit", record); err != nil {
+		t.Fatalf("start at the room's 8 %% refused: %v", err)
+	}
+	if _, err := decodeRoomContentResult(result(35), "commit", record); err == nil {
+		t.Fatal("start at 35 % accepted for a room offered at 8 %")
+	}
+}

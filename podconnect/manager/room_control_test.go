@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,9 @@ type controlFixture struct {
 	ownTonePauseRefused bool
 	enginePauseLag      int // /status reads that still report playing after a pause
 	engineStopped       bool
+	// Each HomePod output's own volume, as OwnTone reports it: the room's start level source.
+	volumes       map[string]int
+	volumeRefused bool
 }
 
 // newControlFixture: Spotify plays on Frida's HomePod (r7) through the one engine.
@@ -41,7 +45,7 @@ func newControlFixture(t *testing.T) *controlFixture {
 	if err := os.WriteFile(filepath.Join(dataDir, "rooms.json"), []byte(rooms), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f := &controlFixture{ownTone: "play", engineRefuse: map[string]bool{}}
+	f := &controlFixture{ownTone: "play", engineRefuse: map[string]bool{}, volumes: map[string]int{"101": 50, "106": 50, "107": 40}}
 	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body, status := `{}`, 200
 		f.mu.Lock()
@@ -58,9 +62,10 @@ func newControlFixture(t *testing.T) *controlFixture {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/player":
 			body = `{"state":"` + f.ownTone + `"}`
 		case r.Method == http.MethodGet && r.URL.Path == "/api/outputs":
-			body = `{"outputs":[{"id":"101","name":"Køkken HomePod","selected":false},` +
-				`{"id":"106","name":"Svends HomePod","selected":false},` +
-				`{"id":"107","name":"Fridas HomePod","selected":true}]}`
+			body = fmt.Sprintf(`{"outputs":[{"id":"101","name":"Køkken HomePod","type":"AirPlay 2","selected":false,"volume":%d},`+
+				`{"id":"106","name":"Svends HomePod","type":"AirPlay 2","selected":false,"volume":%d},`+
+				`{"id":"107","name":"Fridas HomePod","type":"AirPlay 2","selected":true,"volume":%d}]}`,
+				f.volumes["101"], f.volumes["106"], f.volumes["107"])
 		case r.Method != http.MethodGet:
 			sent := ""
 			if r.Body != nil {
@@ -73,6 +78,14 @@ func newControlFixture(t *testing.T) *controlFixture {
 			}
 			f.writes = append(f.writes, strings.TrimSpace(r.Method+" "+target+" "+sent))
 			status = f.apply(r.Method, r.URL.Path)
+			if r.Method == http.MethodPut && r.URL.Path == "/api/player/volume" {
+				status = 204
+				if f.volumeRefused {
+					status = 500
+				} else if v, err := strconv.Atoi(r.URL.Query().Get("volume")); err == nil {
+					f.volumes[r.URL.Query().Get("output_id")] = v
+				}
+			}
 		}
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
@@ -267,8 +280,8 @@ func TestRoomControlOnARadioRoomControlsTheRadio(t *testing.T) {
 
 // Green check 13 Nov 12:38: volume_set on a quiet Køkkenalrum failed with
 // "r0: volume failed" (room_not_playing), so a sound test could not set 10 %
-// before play. A quiet room always accepts its volume: it is put on its HomePod
-// at once and is the room's start level for the first sound.
+// before play. A quiet room always accepts its volume: it goes on its HomePod
+// output, and that output volume is the room's start level.
 func TestRoomControlVolumeOnAQuietRoomIsAcceptedAndSetOnItsHomePod(t *testing.T) {
 	f := newControlFixture(t) // Spotify plays in Fridas (r7); Køkkenalrum (r0) is quiet
 	code, reply := roomControl(t, `{"room_id":"r0","action":"volume","volume":8}`)
@@ -279,11 +292,11 @@ func TestRoomControlVolumeOnAQuietRoomIsAcceptedAndSetOnItsHomePod(t *testing.T)
 	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("sent %q, want %q (the playing engine must not be touched)", got, want)
 	}
-	if got := startLevelForOutput("101"); got != 8 {
+	if got := startLevelForRoom("r0"); got != 8 {
 		t.Fatalf("Køkkenalrum start level %d, want 8", got)
 	}
-	if got := startLevelForOutput("107"); got != startVolumePercent {
-		t.Fatalf("another room's start level changed to %d", got)
+	if got := startLevelForRoom("r7"); got != 35 {
+		t.Fatalf("Fridas (output 40 %%) start level %d, want the 35 %% ceiling", got)
 	}
 }
 
@@ -299,21 +312,35 @@ func TestRoomControlVolumeIsAcceptedWhenNothingPlays(t *testing.T) {
 	}
 }
 
-// The first sound plays at the chosen level: the start prime seats the room's
-// level, not the shared 35 %. A level above the shared one never makes a start louder.
-func TestRoomStartLevelIsTheChosenVolumeButNeverLouderThanTheSharedLevel(t *testing.T) {
+// A quiet volume OwnTone did not take is reported, not claimed.
+func TestRoomControlQuietVolumeOwnToneRefusedIsAFailure(t *testing.T) {
+	f := newControlFixture(t)
+	f.volumeRefused = true
+	code, reply := roomControl(t, `{"room_id":"r0","action":"volume","volume":8}`)
+	if code != http.StatusBadGateway || reply.OK || reply.Error != "speaker_unavailable" {
+		t.Fatalf("refused volume claimed: %d %+v", code, reply)
+	}
+}
+
+// The start prime (bridge start, release reclaim, connect-recovery) seats the
+// room's own level, never above 35 %: one source, the HomePod output volume.
+func TestRoomStartLevelIsTheOutputVolumeButNeverAbove35(t *testing.T) {
 	f := newControlFixture(t)
 	roomControl(t, `{"room_id":"r0","action":"volume","volume":10}`)
 	primeConfiguredStartVolume("http://localhost:3689", "101", false)
 	if got := f.sent(); len(got) != 2 || got[1] != "PUT localhost:3689/api/player/volume?output_id=101&volume=10" {
 		t.Fatalf("start prime sent %q, want the room's 10 %%", got)
 	}
-	roomControl(t, `{"room_id":"r0","action":"volume","volume":80}`)
-	if got := startLevelForRoom("r0"); got != startVolumePercent {
-		t.Fatalf("start level %d after 80 %%, want the never-loud %d", got, startVolumePercent)
+	primeConfiguredStartVolume("http://localhost:3689", "101", false, true)
+	if got := f.sent(); len(got) != 3 || got[2] != "PUT localhost:3689/api/player/volume?output_id=101&recovery=connect&volume=10" {
+		t.Fatalf("connect-recovery prime sent %q, want the room's 10 %%", got)
 	}
-	if got := startLevelForRoom("r6"); got != startVolumePercent {
-		t.Fatalf("untouched room start level %d", got)
+	roomControl(t, `{"room_id":"r0","action":"volume","volume":80}`)
+	if got := startLevelForRoom("r0"); got != 35 {
+		t.Fatalf("start level %d after 80 %%, want the 35 %% ceiling", got)
+	}
+	if got := startLevelForOutput("unknown"); got != 35 {
+		t.Fatalf("unreadable output start level %d, want the ceiling", got)
 	}
 }
 

@@ -176,6 +176,7 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
         self.content_commit_corrupt = None
         self.content_offer_id = "a" * 32
         self.content_target = "native-owned-engine"
+        self.content_level = 35  # the room's own start level PodConnect offers
         await super().asyncSetUp()
         self.holds.extend((self.content_release, self.content_commit_release))
         self.content_commands = self.entries[0].runtime_data.commands
@@ -187,7 +188,7 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
             "binding_id": "b" * 64,
             "native_incarnation": "c" * 32,
             "policy_revision": "d" * 64,
-            "start_volume_percent": 35,
+            "start_volume_percent": self.content_level,
             "expires_after_ms": 5000,
         }
 
@@ -201,7 +202,7 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
             "state": state,
             "accepted_selected_content": complete,
             "start_operation_id": self.content_offer_id,
-            "start_volume_percent": 35,
+            "start_volume_percent": self.content_level,
             "room_id": "room-beta",
             "homepod_id": "456",
             "physical_result_verified": False,
@@ -334,6 +335,16 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
             set(services["cancel_room_content_preparation"]["fields"]),
             set(self.cancel_args(self.content_request())),
         )
+
+    async def test_content_queue_and_find_musik_start_at_the_rooms_own_lower_level(self):
+        # Green 13 Nov 14:56: Køkkenalrum set to 8 % while quiet started at 35 %
+        # from the queue and Find musik. Policy v2: the start uses the room's 8 %.
+        self.content_level = 8
+        request = self.content_request(context=True)
+        await self.content_invoke("prepare_room_selected_content", request)
+        result = await self.content_invoke("start_room_selected_content", request)
+        self.assertTrue(result["accepted_selected_content"])
+        self.assertEqual(result["start_volume_percent"], 8)
 
     async def test_content_stage_returns_to_caller_before_explicit_same_request_start(
         self,

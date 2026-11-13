@@ -601,7 +601,7 @@ func commitStartRequest(w http.ResponseWriter, r *http.Request) {
 	if !ok || !claim.Proof.OutputSelected || claim.Intent != lease.Claim.Intent || claim.Released != lease.Claim.Released || claim.Proof.PolicyRevision != lease.Claim.Proof.PolicyRevision ||
 		!sameAliasBinding(claim.Proof.AliasBinding, lease.Claim.Proof.AliasBinding) || claim.Proof.Mode != lease.Claim.Proof.Mode ||
 		(claim.Proof.Mode == "fresh_start" &&
-			!startLevelAccepted(claim.Proof.OutputVolume, startLevelForOutput(claim.Proof.HomepodID))) ||
+			!startLevelAccepted(claim.Proof.OutputVolume, lease.Claim.Proof.OutputVolume)) ||
 		(body.MaxVolume != nil && claim.Proof.OutputVolume > *body.MaxVolume) {
 		w.WriteHeader(http.StatusConflict)
 		return

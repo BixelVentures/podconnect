@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-const roomContentPolicy = "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
+// Policy v2: a start plays at the room's own output level, at most 35 %.
+const roomContentPolicy = "7e366aa677fbbb1c47ff92edf6b11cc95647ba9f349f112bc1bc960066dbcfee"
 
 type roomContentOffer struct {
 	Schema      string `json:"schema"`
@@ -37,7 +38,7 @@ type nativeRoomContentControls struct {
 }
 
 func validRoomContentOffer(offer roomContentOffer) bool {
-	return offer.Schema == "podconnect.room_content_offer.v1" && queueObservationPattern.MatchString(offer.ID) && transportDigest.MatchString(offer.Binding) && queueObservationPattern.MatchString(offer.Incarnation) && offer.Policy == roomContentPolicy && offer.Percent == 35 && offer.Expires >= 1 && offer.Expires <= 5000
+	return offer.Schema == "podconnect.room_content_offer.v1" && queueObservationPattern.MatchString(offer.ID) && transportDigest.MatchString(offer.Binding) && queueObservationPattern.MatchString(offer.Incarnation) && offer.Policy == roomContentPolicy && offer.Percent >= 0 && offer.Percent <= startVolumePercent && offer.Expires >= 1 && offer.Expires <= 5000
 }
 
 func validRoomContentActions(actions []string) bool {

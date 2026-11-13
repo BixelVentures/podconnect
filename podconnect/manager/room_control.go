@@ -47,15 +47,6 @@ func roomControlHandler(w http.ResponseWriter, r *http.Request) {
 		roomControlFail(w, http.StatusNotFound, "", "unknown_room")
 		return
 	}
-	if q.Action == "volume" {
-		// The room's last explicit volume is also its next start level, so a
-		// volume set before play holds for the first sound (never loud at start).
-		if err := rememberRoomVolume(room.ID, *q.Volume); err != nil {
-			log.Printf("room-control[%s]: volume not stored: %v", room.ID, err)
-			roomControlFail(w, http.StatusInternalServerError, "", "volume_not_stored")
-			return
-		}
-	}
 	if radioOwner.playingOn(room.ID) {
 		roomControlRadio(w, r, q)
 		return
@@ -64,10 +55,12 @@ func roomControlHandler(w http.ResponseWriter, r *http.Request) {
 	devs, _ := fetchOutputsFrom(primary.OwnTone)
 	if !gl.Active || gl.Stopped || activeRouteRoomID(rooms, devs, gl) != room.ID {
 		if q.Action == "volume" {
-			// A quiet room always accepts its volume. It is stored above; put it
-			// on the HomePod now when OwnTone answers, else at the next start.
-			if err := setQuietRoomVolume(primary, room); err != nil {
-				log.Printf("room-control[%s]: quiet volume stored, applies at next start: %v", room.ID, err)
+			// A quiet room always accepts its volume: it goes on the room's
+			// HomePod output, which is also the room's start level (max 35 %).
+			if err := setQuietRoomVolume(primary, room, *q.Volume); err != nil {
+				log.Printf("room-control[%s]: quiet volume failed: %v", room.ID, err)
+				roomControlFail(w, http.StatusBadGateway, "", "speaker_unavailable")
+				return
 			}
 			writeJSON(w, roomControlReply{OK: true, Source: "idle"})
 			return
