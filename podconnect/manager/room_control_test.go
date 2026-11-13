@@ -20,6 +20,10 @@ type controlFixture struct {
 	enginePaused bool
 	engineRefuse map[string]bool // engine actions answered with HTTP 500, state unchanged
 	ownTone      string          // OwnTone /api/player state: play, pause or stop
+	// Green 13 Nov 11:41: OwnTone refuses the pause with 500 and keeps reporting
+	// "play", and the engine reports its pause only after a few status reads.
+	ownTonePauseRefused bool
+	enginePauseLag      int // /status reads that still report playing after a pause
 }
 
 // newControlFixture: Spotify plays on Frida's HomePod (r7) through the one engine.
@@ -43,8 +47,13 @@ func newControlFixture(t *testing.T) *controlFixture {
 		defer f.mu.Unlock()
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/status":
+			reported := f.enginePaused
+			if reported && f.enginePauseLag > 0 {
+				f.enginePauseLag--
+				reported = false
+			}
 			body = fmt.Sprintf(`{"username":"u","volume":40,"volume_steps":100,"paused":%t,"stopped":false,`+
-				`"selected_alias_id":3}`, f.enginePaused)
+				`"selected_alias_id":3}`, reported)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/player":
 			body = `{"state":"` + f.ownTone + `"}`
 		case r.Method == http.MethodGet && r.URL.Path == "/api/outputs":
@@ -76,7 +85,7 @@ func (f *controlFixture) apply(method, path string) int {
 		}
 		f.enginePaused = action == "pause"
 	case method == http.MethodPut && path == "/api/player/pause":
-		if f.ownTone == "stop" {
+		if f.ownTone == "stop" || f.ownTonePauseRefused {
 			return 500
 		}
 		f.ownTone = "pause"
@@ -146,6 +155,17 @@ func TestRoomControlPauseIsConfirmedWhenTheHomePodAlreadyStopped(t *testing.T) {
 	}
 	if !f.enginePaused {
 		t.Fatal("engine not paused")
+	}
+}
+
+// Green 13 Nov 11:41 (Speakers 0.26.99): the music stopped, but PodView showed a
+// failure toast because OwnTone answered 500, still reported "play", and the engine
+// confirmed its pause a moment later. The engine stops the sound: its pause decides.
+func TestRoomControlPauseIsConfirmedWhenTheEnginePausesAfterOwnToneRefused(t *testing.T) {
+	f := newControlFixture(t)
+	f.ownTonePauseRefused, f.enginePauseLag = true, 2
+	if code, reply := roomControl(t, `{"room_id":"r7","action":"pause"}`); code != 200 || !reply.OK {
+		t.Fatalf("stopped music reported as failed pause: %d %+v", code, reply)
 	}
 }
 

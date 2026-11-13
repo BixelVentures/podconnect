@@ -113,27 +113,33 @@ func roomControlSpotify(primary *Room, q roomControlRequest) error {
 	return fmt.Errorf("unsupported action %q", q.Action)
 }
 
-// roomControlPause silences the HomePod and pauses the engine. OwnTone answers
-// a pause with an error when it has already stopped; a quiet room is still the
-// confirmed result, so only the observed state decides.
+// roomControlPausePoll bounds how long a pause waits for the engine to report
+// it: the engine confirms a pause a moment after the command (Green 13 Nov).
+const roomControlPausePoll = 1500 * time.Millisecond
+
+// roomControlPause pauses the engine, which stops the room's sound, and also
+// asks OwnTone to pause the HomePod. The engine's reported pause decides the
+// outcome: the patched OwnTone may refuse a plain pause with 500 and keep
+// reporting "play" although no PCM reaches it any more.
 func roomControlPause(primary *Room) error {
 	engineErr := librespotTransport(primary.Librespot, "pause")
-	airplayErr := owntoneTransport(primary.OwnTone, "pause")
-	gl := librespotStatus(primary.Librespot)
-	engineQuiet := gl.Active && (gl.Paused || gl.Stopped)
-	if !engineQuiet {
-		if engineErr == nil {
-			engineErr = fmt.Errorf("engine still playing after pause")
-		}
-		return engineErr
+	if err := owntoneTransport(primary.OwnTone, "pause"); err != nil {
+		log.Printf("room-control: HomePod pause not acknowledged (engine decides): %v", err)
 	}
-	if state := owntonePlayerState(primary.OwnTone); state == "play" || state == "" {
-		if airplayErr == nil {
-			airplayErr = fmt.Errorf("HomePod output state %q after pause", state)
+	deadline := time.Now().Add(roomControlPausePoll)
+	for {
+		if gl := librespotStatus(primary.Librespot); gl.Active && (gl.Paused || gl.Stopped) {
+			return nil
 		}
-		return airplayErr
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
+	if engineErr == nil {
+		engineErr = fmt.Errorf("engine still playing after pause")
+	}
+	return engineErr
 }
 
 // roomControlResume resumes the engine and, when the HomePod output was paused,
