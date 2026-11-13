@@ -530,6 +530,13 @@ class PodConnectMediaPlayer(
                     owned(same_poll=False)
                     await coordinator.async_refresh_after_command()
                     return True
+                if action == "volume":
+                    # Volume, like pause, never waits for an exact route: it goes
+                    # to the room Spotify plays in (Green 13 Nov 16:08).
+                    await speakers.set_spotify_room_volume(args["percent"])
+                    owned(same_poll=False)
+                    await coordinator.async_refresh_after_command()
+                    return True
                 raise HomeAssistantError("Native route unavailable")
             room, homepod = binding["native_room_id"], binding["homepod_id"]
             owner = (

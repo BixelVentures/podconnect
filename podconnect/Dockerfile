@@ -135,6 +135,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/last-command-wins-native.patch \
   && git apply --check /patches/room-start-level-native.patch \
   && git apply /patches/room-start-level-native.patch \
+  && git apply --check /patches/pause-local-fallback-native.patch \
+  && git apply /patches/pause-local-fallback-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
