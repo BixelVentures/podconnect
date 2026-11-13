@@ -893,7 +893,7 @@ func routeAliasOutputWithGuardOutcome(primaryOwnTone string, aliasId int, live *
 		attentionActive := att != nil && att.snapshot(time.Now()).Active
 		if attentionActive {
 			volume, selected := selectedStartOutput(primaryOwnTone, target.HomepodID)
-			if !selected || volume > startVolumePercent {
+			if !selected || volume > startLevelForOutput(target.HomepodID) {
 				return false, current()
 			}
 		} else if !checkedStartVolume(primaryOwnTone, target.HomepodID, recovery) {
@@ -969,6 +969,9 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					volCanon = -1
 					if completed.startOwned {
 						volCanon = startVolumePercent
+						if completed.binding != nil {
+							volCanon = startLevelForRoom(completed.binding.RoomID)
+						}
 					}
 				}
 				prevActive = gl.Active
@@ -1129,7 +1132,7 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 					}
 					// Reclaim is a fresh output claim. An intervening AirPlay sender may have
 					// left it loud; seat the one native start level before reconciling.
-					restore := startVolumePercent
+					restore := startLevelForOutput(preprimeID)
 					if !checkedStartVolume(room.OwnTone, preprimeID) {
 						prevActive = gl.Active
 						time.Sleep(200 * time.Millisecond)
@@ -1148,8 +1151,8 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 			// new session can't blast (the active branch's one-shot never-loud cap takes over from there).
 			if !gl.Active && !released && !boundNativeRoute && time.Now().After(prearmNext) {
 				prearmNext = time.Now().Add(2 * time.Second)
-				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startVolumePercent) > volTol {
-					setOwntoneOutputVolume(room.OwnTone, id, startVolumePercent)
+				if v, id, ok := owntoneOutputVolume(room.OwnTone); ok && id != "" && abs(v-startLevelForOutput(id)) > volTol {
+					setOwntoneOutputVolume(room.OwnTone, id, startLevelForOutput(id))
 				}
 			}
 
@@ -1179,16 +1182,17 @@ func roomBridge(room *Room, tone *boolFlag, live *glLive, att *attention) {
 						time.Sleep(200 * time.Millisecond)
 						continue // the engine's starting level is still unknown
 					}
-					if abs(gl.VolPct-startVolumePercent) > volTol {
-						setLibrespotVolumePctOwned(room.Librespot, startVolumePercent)
+					level := startLevelForOutput(outputID)
+					if abs(gl.VolPct-level) > volTol {
+						setLibrespotVolumePctOwned(room.Librespot, level)
 						volCanon = -1
 						prevActive = gl.Active
 						time.Sleep(200 * time.Millisecond)
 						continue // await the actual engine observation, not a best-effort write
 					}
 					capped = true
-					volCanon = startVolumePercent
-					log.Printf("volume [%s]: fresh start primed to %d%%", room.Name, startVolumePercent)
+					volCanon = level
+					log.Printf("volume [%s]: fresh start primed to %d%%", room.Name, level)
 				}
 				otVol, otID, otVolOk := owntoneOutputVolumeForIntent(room.OwnTone, live)
 				otState := owntonePlayerState(room.OwnTone)
