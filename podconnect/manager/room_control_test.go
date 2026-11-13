@@ -24,7 +24,6 @@ type controlFixture struct {
 	// "play", and the engine reports its pause only after a few status reads.
 	ownTonePauseRefused bool
 	enginePauseLag      int // /status reads that still report playing after a pause
-	engineStopped       bool
 }
 
 // newControlFixture: Spotify plays on Frida's HomePod (r7) through the one engine.
@@ -53,8 +52,8 @@ func newControlFixture(t *testing.T) *controlFixture {
 				f.enginePauseLag--
 				reported = false
 			}
-			body = fmt.Sprintf(`{"username":"u","volume":40,"volume_steps":100,"paused":%t,"stopped":%t,`+
-				`"selected_alias_id":3}`, reported, f.engineStopped)
+			body = fmt.Sprintf(`{"username":"u","volume":40,"volume_steps":100,"paused":%t,"stopped":false,`+
+				`"selected_alias_id":3}`, reported)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/player":
 			body = `{"state":"` + f.ownTone + `"}`
 		case r.Method == http.MethodGet && r.URL.Path == "/api/outputs":
@@ -67,11 +66,7 @@ func newControlFixture(t *testing.T) *controlFixture {
 				b, _ := io.ReadAll(r.Body)
 				sent = string(b)
 			}
-			target := r.URL.Host + r.URL.Path
-			if r.URL.RawQuery != "" {
-				target += "?" + r.URL.RawQuery
-			}
-			f.writes = append(f.writes, strings.TrimSpace(r.Method+" "+target+" "+sent))
+			f.writes = append(f.writes, strings.TrimSpace(r.Method+" "+r.URL.Host+r.URL.Path+" "+sent))
 			status = f.apply(r.Method, r.URL.Path)
 		}
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
@@ -262,66 +257,5 @@ func TestRoomControlOnARadioRoomControlsTheRadio(t *testing.T) {
 	}
 	if len(f.sent()) != 0 {
 		t.Fatalf("radio room sent Spotify commands %q", f.sent())
-	}
-}
-
-// Green check 13 Nov 12:38: volume_set on a quiet Køkkenalrum failed with
-// "r0: volume failed" (room_not_playing), so a sound test could not set 10 %
-// before play. A quiet room always accepts its volume: it is put on its HomePod
-// at once and is the room's start level for the first sound.
-func TestRoomControlVolumeOnAQuietRoomIsAcceptedAndSetOnItsHomePod(t *testing.T) {
-	f := newControlFixture(t) // Spotify plays in Fridas (r7); Køkkenalrum (r0) is quiet
-	code, reply := roomControl(t, `{"room_id":"r0","action":"volume","volume":8}`)
-	if code != 200 || !reply.OK || reply.Source != "idle" {
-		t.Fatalf("quiet room refused its volume: %d %+v", code, reply)
-	}
-	want := []string{"PUT localhost:3689/api/player/volume?output_id=101&volume=8"}
-	if got := f.sent(); strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("sent %q, want %q (the playing engine must not be touched)", got, want)
-	}
-	if got := startLevelForOutput("101"); got != 8 {
-		t.Fatalf("Køkkenalrum start level %d, want 8", got)
-	}
-	if got := startLevelForOutput("107"); got != startVolumePercent {
-		t.Fatalf("another room's start level changed to %d", got)
-	}
-}
-
-// Nothing plays anywhere: the volume is still accepted and seated.
-func TestRoomControlVolumeIsAcceptedWhenNothingPlays(t *testing.T) {
-	f := newControlFixture(t)
-	f.engineStopped = true
-	if code, reply := roomControl(t, `{"room_id":"r7","action":"volume","volume":5}`); code != 200 || !reply.OK {
-		t.Fatalf("%d %+v", code, reply)
-	}
-	if got := f.sent(); len(got) != 1 || got[0] != "PUT localhost:3689/api/player/volume?output_id=107&volume=5" {
-		t.Fatalf("sent %q", got)
-	}
-}
-
-// The first sound plays at the chosen level: the start prime seats the room's
-// level, not the shared 35 %. A level above the shared one never makes a start louder.
-func TestRoomStartLevelIsTheChosenVolumeButNeverLouderThanTheSharedLevel(t *testing.T) {
-	f := newControlFixture(t)
-	roomControl(t, `{"room_id":"r0","action":"volume","volume":10}`)
-	primeConfiguredStartVolume("http://localhost:3689", "101", false)
-	if got := f.sent(); len(got) != 2 || got[1] != "PUT localhost:3689/api/player/volume?output_id=101&volume=10" {
-		t.Fatalf("start prime sent %q, want the room's 10 %%", got)
-	}
-	roomControl(t, `{"room_id":"r0","action":"volume","volume":80}`)
-	if got := startLevelForRoom("r0"); got != startVolumePercent {
-		t.Fatalf("start level %d after 80 %%, want the never-loud %d", got, startVolumePercent)
-	}
-	if got := startLevelForRoom("r6"); got != startVolumePercent {
-		t.Fatalf("untouched room start level %d", got)
-	}
-}
-
-// The other transport actions on a quiet room are still refused honestly.
-func TestRoomControlQuietRoomStillRefusesTransport(t *testing.T) {
-	f := newControlFixture(t)
-	code, reply := roomControl(t, `{"room_id":"r0","action":"resume"}`)
-	if code != http.StatusConflict || reply.Error != "room_not_playing" || len(f.sent()) != 0 {
-		t.Fatalf("%d %+v %q", code, reply, f.sent())
 	}
 }

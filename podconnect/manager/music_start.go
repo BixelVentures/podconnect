@@ -293,7 +293,7 @@ func preflightReleasedResume(primary *Room) bool {
 	if !valid || check.Intent != claim.Intent ||
 		!sameAliasBinding(check.Proof.AliasBinding, claim.Proof.AliasBinding) ||
 		check.Proof.PolicyRevision != claim.Proof.PolicyRevision ||
-		!check.Proof.OutputSelected || check.Proof.OutputVolume > startLevelForOutput(claim.Proof.HomepodID) {
+		!check.Proof.OutputSelected || check.Proof.OutputVolume > startVolumePercent {
 		return false
 	}
 	// Keep the release marker until the bridge observes playing and finishes its
@@ -302,7 +302,7 @@ func preflightReleasedResume(primary *Room) bool {
 	final, valid := currentStartClaimAllowReleased(roomID, id, true)
 	return valid && final.Intent == claim.Intent && final.Proof.OutputSelected &&
 		final.Proof.PolicyRevision == claim.Proof.PolicyRevision &&
-		startLevelAccepted(final.Proof.OutputVolume, startLevelForOutput(claim.Proof.HomepodID))
+		final.Proof.OutputVolume <= startVolumePercent && final.Proof.OutputVolume >= startVolumePercent-volTol
 }
 
 type startPrimeOutcome uint8
@@ -327,8 +327,7 @@ func primeConfiguredStartVolumeOutcome(base, id string, requireSelected bool, re
 			log.Printf("connect-recovery volume reason=%s", reason)
 		}
 	}
-	level := startLevelForOutput(id)
-	query := url.Values{"volume": {fmt.Sprint(level)}, "output_id": {id}}
+	query := url.Values{"volume": {fmt.Sprint(startVolumePercent)}, "output_id": {id}}
 	if len(recovery) > 0 && recovery[0] {
 		query.Set("recovery", "connect")
 	}
@@ -355,10 +354,10 @@ func primeConfiguredStartVolumeOutcome(base, id string, requireSelected bool, re
 	}
 	diagnostic("http_accepted")
 	vol, selected, ok := knownStartOutput(base, id)
-	if !ok || (requireSelected && !selected) || !startLevelAccepted(vol, level) {
+	if !ok || (requireSelected && !selected) || vol > startVolumePercent || vol < startVolumePercent-volTol {
 		diagnostic("readback_rejected")
 	}
-	if ok && (!requireSelected || selected) && startLevelAccepted(vol, level) {
+	if ok && (!requireSelected || selected) && vol <= startVolumePercent && vol >= startVolumePercent-volTol {
 		return startPrimeAccepted
 	}
 	return startPrimeRejected
@@ -509,7 +508,7 @@ func startRequest(w http.ResponseWriter, r *http.Request) {
 			!sameAliasBinding(claim.Proof.AliasBinding, before.Proof.AliasBinding) ||
 			claim.Proof.Mode != "fresh_start" || !claim.Proof.OutputSelected || claim.Proof.PolicyRevision != body.PolicyRevision ||
 			claim.Proof.AliasBinding.Incarnation != body.AliasIncarnation ||
-			!startLevelAccepted(claim.Proof.OutputVolume, startLevelForOutput(claim.Proof.HomepodID)) {
+			claim.Proof.OutputVolume > startVolumePercent || claim.Proof.OutputVolume < startVolumePercent-volTol {
 			w.WriteHeader(http.StatusConflict)
 			return
 		}
@@ -601,7 +600,7 @@ func commitStartRequest(w http.ResponseWriter, r *http.Request) {
 	if !ok || !claim.Proof.OutputSelected || claim.Intent != lease.Claim.Intent || claim.Released != lease.Claim.Released || claim.Proof.PolicyRevision != lease.Claim.Proof.PolicyRevision ||
 		!sameAliasBinding(claim.Proof.AliasBinding, lease.Claim.Proof.AliasBinding) || claim.Proof.Mode != lease.Claim.Proof.Mode ||
 		(claim.Proof.Mode == "fresh_start" &&
-			!startLevelAccepted(claim.Proof.OutputVolume, startLevelForOutput(claim.Proof.HomepodID))) ||
+			(claim.Proof.OutputVolume > startVolumePercent || claim.Proof.OutputVolume < startVolumePercent-volTol)) ||
 		(body.MaxVolume != nil && claim.Proof.OutputVolume > *body.MaxVolume) {
 		w.WriteHeader(http.StatusConflict)
 		return

@@ -433,9 +433,9 @@ func (p *radioPlayer) play(ctx context.Context, station string, room *Room) (lev
 	p.mu.Lock()
 	p.outputs = map[string]string{room.ID: output.ID}
 	p.mu.Unlock()
-	// Every new start uses the room's start level (startLevelForRoom), the same
-	// single rule as Spotify: the shared level, or the room's lower chosen one.
-	level = startLevelForRoom(room.ID)
+	// Every new start uses the shared start level (startVolumePercent), the
+	// same single rule as Spotify. Only a later explicit volume action changes it.
+	level = startVolumePercent
 	if err := p.setVolume(ctx, output.ID, level); err != nil {
 		return 0, err
 	}
