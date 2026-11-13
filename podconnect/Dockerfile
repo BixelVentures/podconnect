@@ -133,6 +133,8 @@ RUN git clone --depth 1 --branch "${GO_LIBRESPOT_VERSION}" https://github.com/de
   && git apply /patches/room-autoplay-native.patch \
   && git apply --check /patches/last-command-wins-native.patch \
   && git apply /patches/last-command-wins-native.patch \
+  && git apply --check /patches/room-start-level-native.patch \
+  && git apply /patches/room-start-level-native.patch \
   && go test ./ap ./daemon ./player ./output ./tracks ./audio ./session ./zeroconf ./spclient ./vorbis \
   && go build -trimpath -ldflags="-s -w" -o /go-librespot ./cmd/daemon
 
@@ -154,6 +156,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG OWNTONE_REF=29.2
 COPY patches/start-journal-diagnostics-owntone.patch /patches/start-journal-diagnostics-owntone.patch
 COPY patches/start-journal-diagnostics-owntone.sha256 /patches/start-journal-diagnostics-owntone.sha256
+COPY patches/room-start-level-owntone.patch /patches/room-start-level-owntone.patch
+COPY patches/room-start-level-owntone.sha256 /patches/room-start-level-owntone.sha256
 COPY patches/native-attention-fa607.patch /patches/native-attention-fa607.patch
 COPY patches/room-transport-owntone.patch /patches/room-transport-owntone.patch
 COPY patches/room-volume-owntone.patch /patches/room-volume-owntone.patch
@@ -312,6 +316,9 @@ RUN git clone --depth 1 --branch "${OWNTONE_REF}" https://github.com/owntone/own
   && sha256sum -c /patches/start-journal-diagnostics-owntone.sha256 \
   && git apply --check /patches/start-journal-diagnostics-owntone.patch \
   && git apply /patches/start-journal-diagnostics-owntone.patch \
+  && sha256sum -c /patches/room-start-level-owntone.sha256 \
+  && git apply --check /patches/room-start-level-owntone.patch \
+  && git apply /patches/room-start-level-owntone.patch \
   && autoreconf -fi \
   && ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
        --disable-install_systemd --disable-install_user \

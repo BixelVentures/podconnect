@@ -250,6 +250,9 @@ func TestNativeReleasedOutputPrepareAndOneUseCommit(t *testing.T) {
 	if tooQuiet.Code != http.StatusConflict {
 		t.Fatal("lowered native output retained fixed-start provider permission")
 	}
+	// Policy v2: the output's own volume is the next start level. Leave it loud
+	// again so the next prepare seats the 35 % ceiling, as this fixture expects.
+	volume = 90
 	newLeaseResponse = httptest.NewRecorder()
 	startRequest(newLeaseResponse, httptest.NewRequest(http.MethodPost, "/api/start-volume", bytes.NewReader(body)))
 	if newLeaseResponse.Code != http.StatusOK || json.Unmarshal(newLeaseResponse.Body.Bytes(), &newer) != nil {

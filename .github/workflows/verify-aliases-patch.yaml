@@ -95,7 +95,7 @@ jobs:
           done
           git apply --check "$patch_dir/dealer-fieldcodes-native.patch"
           git apply "$patch_dir/dealer-fieldcodes-native.patch"
-          for patch in queue-occurrence-continuity-native.patch status-health-diagnostics-native.patch queue-writer-inspection-native.patch connect-transfer-retirement-native.patch room-autoplay-native.patch last-command-wins-native.patch; do
+          for patch in queue-occurrence-continuity-native.patch status-health-diagnostics-native.patch queue-writer-inspection-native.patch connect-transfer-retirement-native.patch room-autoplay-native.patch last-command-wins-native.patch room-start-level-native.patch; do
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
@@ -241,7 +241,7 @@ jobs:
             git apply --check "$patch_dir/$patch"
             git apply "$patch_dir/$patch"
           done
-          for patch in retire-fieldcodes-owntone start-journal-diagnostics-owntone; do
+          for patch in retire-fieldcodes-owntone start-journal-diagnostics-owntone room-start-level-owntone; do
             sed "s@ /patches/@ $patch_dir/@" "$patch_dir/$patch.sha256" | sha256sum -c -
             git apply --check "$patch_dir/$patch.patch"
             git apply "$patch_dir/$patch.patch"

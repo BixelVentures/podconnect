@@ -1,0 +1,148 @@
+diff --git a/src/db.c b/src/db.c
+index d339540..5d64741 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -4935,7 +4935,7 @@ int db_bound_base_save(uint64_t id,int volume,const struct timespec *deadline)
+ }
+ /* Mechanical persistence only: callers must hold their actual purpose token. */
+ int db_start_base_save(uint64_t id,int volume,const struct timespec *deadline)
+-{ return volume==35 ? db_bound_base_save(id,volume,deadline) : -1; }
++{ return volume>=0 && volume<=35 ? db_bound_base_save(id,volume,deadline) : -1; }
+ int db_room_volume_base_save(uint64_t id,int volume,const struct timespec *deadline)
+ { return volume>=0 && volume<=100 ? db_bound_base_save(id,volume,deadline) : -1; }
+ int
+diff --git a/src/httpd_jsonapi.c b/src/httpd_jsonapi.c
+index 9632ed8..97fa23a 100644
+--- a/src/httpd_jsonapi.c
++++ b/src/httpd_jsonapi.c
+@@ -3371,12 +3371,14 @@ jsonapi_reply_player_volume(struct httpd_request *hreq)
+     char canonical[32]; bool temporary_busy_no_effect=false;
+     param=httpd_query_value_find(hreq->query,"output_id");
+     param_volume=httpd_query_value_find(hreq->query,"volume");
+-    if (strcmp(recovery,"connect") || !param || !param_volume || strcmp(param_volume,"35")
++    char canonical_volume[8];
++    if (strcmp(recovery,"connect") || !param || !param_volume || safe_atoi32(param_volume,(int32_t *)&volume)<0 || !OUTPUT_START_LEVEL_OK(volume)
+         || httpd_query_value_find(hreq->query,"step") || safe_atou64(param,&output_id)<0 || !output_id)
+       return HTTP_BADREQUEST;
+     snprintf(canonical,sizeof(canonical),"%" PRIu64,output_id);
+-    if (strcmp(param,canonical)) return HTTP_BADREQUEST;
+-    ret=player_volume_set_connect_recovery(output_id,35,&temporary_busy_no_effect);
++    snprintf(canonical_volume,sizeof(canonical_volume),"%d",volume);
++    if (strcmp(param,canonical) || strcmp(param_volume,canonical_volume)) return HTTP_BADREQUEST;
++    ret=player_volume_set_connect_recovery(output_id,volume,&temporary_busy_no_effect);
+     if (temporary_busy_no_effect) {
+       /* Only the synchronous owner predicate emits this before any mutation.
+        * Generic errors and lost responses carry no replay permission. */
+diff --git a/src/httpd_jsonapi_start.inc.c b/src/httpd_jsonapi_start.inc.c
+index 52ca733..e82c201 100644
+--- a/src/httpd_jsonapi_start.inc.c
++++ b/src/httpd_jsonapi_start.inc.c
+@@ -37,7 +37,7 @@ static json_object *start_result_json(const char *endpoint,const struct output_s
+   attention_json_u64(o,"native_revision",r->command.native_revision);
+   json_object_object_add(o,"native_reservation_id",json_object_new_string(r->command.native_reservation_id));
+   json_object_object_add(o,"policy_revision",json_object_new_string(r->command.policy_revision));
+-  json_object_object_add(o,"start_volume_percent",json_object_new_int(35));
++  json_object_object_add(o,"start_volume_percent",json_object_new_int(r->command.move_existing_session ? 35 : r->command.start_volume_percent));
+   json_object_object_add(o,"intended_native_owner",transport_native_json(&r->command.intended_native_owner));
+   json_object_object_add(o,"actual_native_owner",r->actual_owner_present ? transport_native_json(&r->command.committed_native_owner) : NULL);
+   json_object_object_add(o,"target_identity",start_target_json(r->process,r->command.device_id,r->target_incarnation));
+@@ -105,7 +105,7 @@ static int jsonapi_reply_start_write(struct httpd_request *hreq)
+       json_object_object_add(reply, "ready", json_object_new_boolean(state.ready));
+       json_object_object_add(reply, "busy", json_object_new_boolean(state.busy));
+       json_object_object_add(reply, "policy_revision", json_object_new_string(OUTPUT_START_POLICY));
+-      json_object_object_add(reply, "start_volume_percent", json_object_new_int(35));
++      json_object_object_add(reply, "start_volume_percent", json_object_new_int(state.start_volume_percent));
+       json_object_object_add(
+           reply, "target_identity", start_target_json(state.process, state.device_id, state.device_incarnation));
+       if (r.require_clean_absent)
+@@ -123,8 +123,8 @@ static int jsonapi_reply_start_write(struct httpd_request *hreq)
+     if(prepare){
+       if(start_json_owner(body,"intended_native_owner",&r.intended_native_owner,false,NULL)<0
+           || !transport_json_string(body,"policy_revision",r.policy_revision,sizeof(r.policy_revision))
+-          || !json_object_object_get_ex(body,"start_volume_percent",&value) || !json_object_is_type(value,json_type_int) || json_object_get_int64(value)!=35)goto out;
+-      r.start_volume_percent=35;
++          || !json_object_object_get_ex(body,"start_volume_percent",&value) || !json_object_is_type(value,json_type_int) || !OUTPUT_START_LEVEL_OK(json_object_get_int64(value)))goto out;
++      r.start_volume_percent=(int)json_object_get_int64(value);
+     }else{
+       if(!transport_json_string(body,"token",r.token,sizeof(r.token)) || !transport_json_string(body,"native_reservation_id",r.native_reservation_id,sizeof(r.native_reservation_id))
+           || !start_json_true(body,"pending_native_mutators_drained"))goto out;
+diff --git a/src/outputs.h b/src/outputs.h
+index 38b5dc5..3f6a40c 100644
+--- a/src/outputs.h
++++ b/src/outputs.h
+@@ -154,7 +154,11 @@ void outputs_transport_input_changed(uint64_t item_id, const char *path, bool pi
+ /* Selected new content has its own route/source/35 authority. */
+ #define OUTPUT_START_WINDOW_MS 8000
+ #define OUTPUT_START_PIN_MS 15000
+-#define OUTPUT_START_POLICY "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
++/* Policy v2: a start plays at the target output's own volume, never above
++ * OUTPUT_START_LEVEL_MAX (a room set lower starts at its own level). */
++#define OUTPUT_START_POLICY "7e366aa677fbbb1c47ff92edf6b11cc95647ba9f349f112bc1bc960066dbcfee"
++#define OUTPUT_START_LEVEL_MAX 35
++#define OUTPUT_START_LEVEL_OK(v) ((v)>=0 && (v)<=OUTPUT_START_LEVEL_MAX)
+ #define OUTPUT_MOVE_POLICY "a674d94e377e8ba2b51ca4ea5f541370bd9dd7f2ecc6fabb2cf3e2f50cbdb5b4"
+ struct output_start_request {
+   struct output_native_process native_process;
+@@ -192,6 +196,7 @@ struct output_start_state {
+   struct output_transport_identity old_route_identity;
+   uint64_t old_base_revision,target_base_revision;
+   int session_volume_percent;
++  int start_volume_percent;
+   bool paused;
+   bool clean_absent;
+ };
+diff --git a/src/outputs_start.inc.c b/src/outputs_start.inc.c
+index 59217a7..8f1670c 100644
+--- a/src/outputs_start.inc.c
++++ b/src/outputs_start.inc.c
+@@ -646,6 +646,8 @@ int outputs_start_state_get(const struct output_start_request *r,struct output_s
+   START_STATE_CHECK(d->type!=OUTPUT_TYPE_AIRPLAY,"target_type");
+ #undef START_STATE_CHECK
+   memset(out,0,sizeof(*out));memcpy(out->process,outputs_process,37);out->device_id=d->id;out->device_incarnation=d->incarnation;
++  /* The room's own volume is its start level, never above the shared maximum. */
++  out->start_volume_percent=d->volume<0 ? 0 : d->volume>OUTPUT_START_LEVEL_MAX ? OUTPUT_START_LEVEL_MAX : d->volume;
+   if(r->move_existing_session){
+     if(!move_old_owner_current(r,&old,&old_identity))return -1;
+     out->old_route_identity=old_identity;out->old_base_revision=old->base_revision;
+@@ -688,7 +690,7 @@ int outputs_start_prepare(const struct output_start_request *r,struct output_sta
+   if (!out || !r || !start_available(r) || !r->native_revision || r->native_revision==UINT64_MAX
+       || !transport_hex(r->offer_id,32) || !transport_hex(r->binding_id,64)
+       || (r->move_existing_session ? strcmp(r->policy_revision,OUTPUT_MOVE_POLICY)
+-          : !transport_hex(r->content_digest,64) || strcmp(r->policy_revision,OUTPUT_START_POLICY) || r->start_volume_percent!=35)
++          : !transport_hex(r->content_digest,64) || strcmp(r->policy_revision,OUTPUT_START_POLICY) || !OUTPUT_START_LEVEL_OK(r->start_volume_percent))
+       || !native_owner_valid(&r->intended_native_owner,r->device_id)
+       || (r->move_existing_session && (!move_old_owner_current(r,&old,&old_identity)
+           || strcmp(r->old_native_owner.session_id,r->intended_native_owner.session_id)
+@@ -825,7 +827,7 @@ static void start_connected(struct output_device *d,enum output_device_state sta
+   s->volume_pending=true;
+   if(transport_identity_get(d->id,&v.identity)<0){start_fail(s);return;}
+   memcpy(v.command.token,s->result.command.token,33);
+-  v.command.percent=s->result.command.move_existing_session ? s->result.session_volume_percent : 35;
++  v.command.percent=s->result.command.move_existing_session ? s->result.session_volume_percent : s->result.command.start_volume_percent;
+   if(outputs[d->type]->device_start35(d,&v)<0)start_fail(s);
+ }
+ int outputs_start_barrier_begin(const struct output_start_request *r,struct output_start_result *out)
+@@ -894,8 +896,8 @@ bool outputs_start35_before_write(const char *token)
+         || !start_move_base_current(s,d)){start_fail(s);return false;}
+     base_revision_advance(d);d->volume=s->result.session_volume_percent;vol_adjust();
+   }else{
+-    if(db_start_base_save(d->id,35,&s->deadline)<0 || !outputs_start35_dispatch_current(token))return false;
+-    base_revision_advance(d);d->volume=35;vol_adjust();
++    if(db_start_base_save(d->id,s->result.command.start_volume_percent,&s->deadline)<0 || !outputs_start35_dispatch_current(token))return false;
++    base_revision_advance(d);d->volume=s->result.command.start_volume_percent;vol_adjust();
+   }
+   s->volume_admitted=true;
+   s->target_base_revision=d->base_revision;
+diff --git a/src/player.c b/src/player.c
+index 83a4a35..aa671b1 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -3435,7 +3435,7 @@ volume_set_connect_recovery(void *arg, int *retval)
+ {
+   struct connect_recovery_volume_param *p=arg;
+   int admission;
+-  if (p->speaker.volume!=35) { *retval=-1; return COMMAND_END; }
++  if (!OUTPUT_START_LEVEL_OK(p->speaker.volume)) { *retval=-1; return COMMAND_END; }
+   admission=outputs_connect_recovery_status(p->speaker.spk_id);
+   if (admission<0) {
+     p->temporary_busy_no_effect=admission==-2;

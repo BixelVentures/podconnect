@@ -133,7 +133,7 @@ func radioRooms() []*Room {
 
 func newTestRadio(t *testing.T) (*radioPlayer, *fakeRadioPlayer, *fakeSpotify) {
 	t.Helper()
-	fake := &fakeRadioPlayer{state: "stop", volumes: map[string]int{"101": 20, "107": 15}}
+	fake := &fakeRadioPlayer{state: "stop", volumes: map[string]int{"101": 60, "107": 50}} // above the 35 % start ceiling
 	server := httptest.NewServer(fake.handler(t))
 	t.Cleanup(server.Close)
 	p := newRadioPlayer(radioPlayerConfig{Enabled: true})
@@ -396,6 +396,18 @@ func TestRadioMoveAndVolumeStayOnOwnPlayer(t *testing.T) {
 	}
 	if spotify.pauses != 0 {
 		t.Fatal("radio paused Spotify that was not playing on its speaker")
+	}
+}
+
+// Policy v2: a room whose HomePod is set lower starts the radio at its own level.
+func TestRadioStartsAtTheRoomsOwnLowerVolume(t *testing.T) {
+	p, fake, _ := newTestRadio(t)
+	fake.volumes["101"] = 8 // Køkkenalrum set to 8 % while quiet
+	if err := radioStart(t, p, "a1", "p3", "r0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if fake.volumes["101"] != 8 || *p.snapshot().VolumePercent != 8 {
+		t.Fatalf("radio started at %d, want the room's 8 %%", fake.volumes["101"])
 	}
 }
 

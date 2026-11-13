@@ -53,3 +53,4 @@ b0b63d6944e0f9a1a72beeab16d00b3fac3f7579676d12afe4c3659f7b55c9b0  /patches/statu
 7f84b6791c79c0a8e5a3a44fdabbb65abae217b04f62bd0d5d68ae3ff46d080a  /patches/connect-transfer-retirement-native.patch
 5c014eba087992ed6cab5f2cdd07e1b2f5ab4d2c521675427b036c2f12ac343d  /patches/room-autoplay-native.patch
 66dadfc8fc46659e97eb3ed08d0493b2f995873ad97b861023e01f7754f04172  /patches/last-command-wins-native.patch
+2767c114de255878ca3a67bc01fae717271f2a547cb97f7c88a9682212d0524b  /patches/room-start-level-native.patch

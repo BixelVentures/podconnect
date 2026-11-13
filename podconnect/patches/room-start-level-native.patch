@@ -1,0 +1,240 @@
+diff --git a/daemon/device_alias.go b/daemon/device_alias.go
+index dc71041..99f02f1 100644
+--- a/daemon/device_alias.go
++++ b/daemon/device_alias.go
+@@ -264,7 +264,7 @@ func readIdleAliasCState(ctx context.Context, capture *contentCapture) error {
+ 	if err := contentHTTP(ctx, "POST", capture.endpoint("state"), request, &state); err != nil {
+ 		return err
+ 	}
+-	if state.Schema != "podconnect.output_start_state.v1" || !state.OK || !state.Ready || state.Busy || !state.CleanAbsent || state.Policy != start35Policy || state.Percent != 35 || state.Target.DeviceID != capture.Scope.HomePodID || !volumeUUID.MatchString(state.Target.Process) || !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0" || state.Physical {
++	if state.Schema != "podconnect.output_start_state.v1" || !state.OK || !state.Ready || state.Busy || !state.CleanAbsent || state.Policy != start35Policy || !validStartLevel(state.Percent) || state.Target.DeviceID != capture.Scope.HomePodID || !volumeUUID.MatchString(state.Target.Process) || !volumeCounter(state.Target.Incarnation) || state.Target.Incarnation == "0" || state.Physical {
+ 		return ErrAliasConflict
+ 	}
+ 	return nil
+diff --git a/daemon/room_content.go b/daemon/room_content.go
+index 189d32c..68a0679 100644
+--- a/daemon/room_content.go
++++ b/daemon/room_content.go
+@@ -25,7 +25,13 @@ import (
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+-const start35Policy = "7fc3239b1c5e65cdb49cca308ad9368c50ef0a90d4cd5fd537a9f97de488625d"
++// start35Policy v2: a start plays at the room's HomePod output level as C
++// reports it, never above startLevelMax (the room's own volume, at most 35 %).
++const start35Policy = "7e366aa677fbbb1c47ff92edf6b11cc95647ba9f349f112bc1bc960066dbcfee"
++const startLevelMax = 35
++
++func validStartLevel(percent int) bool { return percent >= 0 && percent <= startLevelMax }
++
+ const (
+ 	apiContentObserve ApiRequestType = "content_observe"
+ 	apiContentOffer   ApiRequestType = "content_offer"
+@@ -150,6 +156,7 @@ type contentOfferActorRequest struct {
+ 	Capture *contentCapture
+ 	Target  contentTarget
+ 	Context context.Context
++	Percent int
+ }
+ type contentReservation struct {
+ 	Operation *contentOperation
+@@ -209,7 +216,7 @@ func (op *contentOperation) receipt(endpoint string) contentReceipt {
+ 	op.mu.Lock()
+ 	defer op.mu.Unlock()
+ 	complete := op.State == "complete"
+-	return contentReceipt{"podconnect.native_room_content_" + endpoint + ".v1", complete, op.Offer.OfferID, op.Offer.BindingID, op.State, complete, op.Offer.OfferID, 35, op.Capture.Scope.RoomID, op.Capture.Scope.HomePodID, false}
++	return contentReceipt{"podconnect.native_room_content_" + endpoint + ".v1", complete, op.Offer.OfferID, op.Offer.BindingID, op.State, complete, op.Offer.OfferID, op.Offer.StartVolumePercent, op.Capture.Scope.RoomID, op.Capture.Scope.HomePodID, false}
+ }
+ func (op *contentOperation) finish(state string) {
+ 	op.mu.Lock()
+@@ -311,7 +318,7 @@ func (p *AppPlayer) contentCurrentLocked(c *contentCapture) bool {
+ func (p *AppPlayer) offerContent(request contentOfferActorRequest) (any, error) {
+ 	p.aliasMu.Lock()
+ 	defer p.aliasMu.Unlock()
+-	if request.Context.Err() != nil || !p.contentCurrentLocked(request.Capture) {
++	if request.Context.Err() != nil || !p.contentCurrentLocked(request.Capture) || !validStartLevel(request.Percent) {
+ 		return nil, ErrAliasConflict
+ 	}
+ 	id, err := randomQueueID(16)
+@@ -326,7 +333,7 @@ func (p *AppPlayer) offerContent(request contentOfferActorRequest) (any, error)
+ 		Target                                                contentTarget
+ 		Primary                                               string
+ 	}{c.Scope, c.Incarnation, c.Registry, c.Connection, c.SessionID, c.PipeDigest, c.OwnTone, c.AliasRevision, c.Generation, c.Intent, request.Target, fmt.Sprintf("%p", c.Primary)})
+-	op := &contentOperation{Owner: p, Capture: c, Offer: contentOffer{"podconnect.room_content_offer.v1", id, binding, c.Incarnation, start35Policy, 35, 5000}, Target: request.Target, Expires: time.Now().Add(5 * time.Second), RetainUntil: time.Now().Add(45 * time.Second), State: "staging", TerminalSignal: make(chan struct{})}
++	op := &contentOperation{Owner: p, Capture: c, Offer: contentOffer{"podconnect.room_content_offer.v1", id, binding, c.Incarnation, start35Policy, request.Percent, 5000}, Target: request.Target, Expires: time.Now().Add(5 * time.Second), RetainUntil: time.Now().Add(45 * time.Second), State: "staging", TerminalSignal: make(chan struct{})}
+ 	return op, nil
+ }
+ 
+@@ -643,7 +650,7 @@ func (p *AppPlayer) startPreparedDealerTransfer(ctx context.Context, paused bool
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	value, err := p.offerContent(contentOfferActorRequest{capture, target.Target, ctx})
++	value, err := p.offerContent(contentOfferActorRequest{capture, target.Target, ctx, target.Percent})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/daemon/room_content_actor.go b/daemon/room_content_actor.go
+index 9c57abb..ced978c 100644
+--- a/daemon/room_content_actor.go
++++ b/daemon/room_content_actor.go
+@@ -104,7 +104,7 @@ func (p *AppPlayer) applyContentStep(step contentStep) error {
+ 			p.state.tracks = op.Tracks
+ 			p.state.player = op.Prepared
+ 			p.state.active = true
+-			p.state.device.Volume = uint32(player.MaxStateVolume * 35 / 100)
++			p.state.device.Volume = uint32(player.MaxStateVolume * op.Offer.StartVolumePercent / 100)
+ 			if p.prefetchTimer != nil {
+ 				p.prefetchTimer.Stop()
+ 			}
+diff --git a/daemon/room_content_c.go b/daemon/room_content_c.go
+index bd68b29..a17f7ca 100644
+--- a/daemon/room_content_c.go
++++ b/daemon/room_content_c.go
+@@ -171,7 +171,7 @@ func (c *contentCapture) readCState(ctx context.Context) (contentCState, error)
+ 		stage = "busy"
+ 	case state.Policy != start35Policy:
+ 		stage = "policy"
+-	case state.Percent != 35:
++	case !validStartLevel(state.Percent):
+ 		stage = "volume"
+ 	case state.Target.DeviceID != c.Scope.HomePodID:
+ 		stage = "target"
+@@ -201,7 +201,7 @@ func (op *contentOperation) cPrepareBody() any {
+ 		PathDigest  string                 `json:"expected_input_path_digest"`
+ 		Policy      string                 `json:"policy_revision"`
+ 		Percent     int                    `json:"start_volume_percent"`
+-	}{op.Capture.Process, op.Offer.OfferID, op.Offer.BindingID, op.ContentDigest, op.Capture.Incarnation, op.Revision, op.Capture.OldOwner, op.Intended, op.Capture.Pipe, op.Capture.PipeDigest, start35Policy, 35}
++	}{op.Capture.Process, op.Offer.OfferID, op.Offer.BindingID, op.ContentDigest, op.Capture.Incarnation, op.Revision, op.Capture.OldOwner, op.Intended, op.Capture.Pipe, op.Capture.PipeDigest, start35Policy, op.Offer.StartVolumePercent}
+ }
+ func (op *contentOperation) cValid(reply contentCReceipt, endpoint string) bool {
+ 	op.mu.Lock()
+@@ -210,7 +210,7 @@ func (op *contentOperation) cValid(reply contentCReceipt, endpoint string) bool
+ 	epoch := op.Epoch
+ 	pipe := op.Pipe
+ 	op.mu.Unlock()
+-	if reply.Schema != "podconnect.output_start_"+endpoint+".v1" || !reply.OK || !volumeHex32.MatchString(reply.Token) || reply.OfferID != op.Offer.OfferID || reply.BindingID != op.Offer.BindingID || reply.ContentDigest != op.ContentDigest || reply.Incarnation != op.Capture.Incarnation || reply.Revision != op.Revision || reply.ReservationID != reservation || reply.Policy != start35Policy || reply.Percent != 35 || reply.Intended != op.Intended || reply.Target != op.Target || reply.InputDigest != op.Capture.PipeDigest || !volumeCounter(reply.InputEpoch) || !volumeCounter(reply.WriterEpoch) || reply.PinRemaining < 0 || reply.PinRemaining > 15000 || reply.Expires != 8000 || reply.Physical {
++	if reply.Schema != "podconnect.output_start_"+endpoint+".v1" || !reply.OK || !volumeHex32.MatchString(reply.Token) || reply.OfferID != op.Offer.OfferID || reply.BindingID != op.Offer.BindingID || reply.ContentDigest != op.ContentDigest || reply.Incarnation != op.Capture.Incarnation || reply.Revision != op.Revision || reply.ReservationID != reservation || reply.Policy != start35Policy || reply.Percent != op.Offer.StartVolumePercent || reply.Intended != op.Intended || reply.Target != op.Target || reply.InputDigest != op.Capture.PipeDigest || !volumeCounter(reply.InputEpoch) || !volumeCounter(reply.WriterEpoch) || reply.PinRemaining < 0 || reply.PinRemaining > 15000 || reply.Expires != 8000 || reply.Physical {
+ 		return false
+ 	}
+ 	if previous != nil && previous.Route != nil && (reply.Phase == "opened" || reply.Phase == "completed") && (reply.Route == nil || *reply.Route != *previous.Route || reply.InputEpoch != previous.InputEpoch || reply.Pipe == nil || previous.Pipe == nil || *reply.Pipe != *previous.Pipe) {
+diff --git a/daemon/room_content_http.go b/daemon/room_content_http.go
+index f9f05ac..1ed34f4 100644
+--- a/daemon/room_content_http.go
++++ b/daemon/room_content_http.go
+@@ -105,7 +105,7 @@ func (s *ConcreteApiServer) handleContentControls(w http.ResponseWriter, r *http
+ 		roomTransportResponse(w, nil, err)
+ 		return
+ 	}
+-	value, err = s.roomTransportAsk(ctx, apiContentOffer, contentOfferActorRequest{capture, state.Target, ctx})
++	value, err = s.roomTransportAsk(ctx, apiContentOffer, contentOfferActorRequest{capture, state.Target, ctx, state.Percent})
+ 	if err != nil {
+ 		s.log.Warnf("content_read_failed stage=offer_unavailable")
+ 		roomTransportResponse(w, nil, err)
+diff --git a/daemon/room_content_test.go b/daemon/room_content_test.go
+index 50d489c..2fcfd36 100644
+--- a/daemon/room_content_test.go
++++ b/daemon/room_content_test.go
+@@ -1314,7 +1314,7 @@ func testSelectedContentCommitActualCOnServer(t *testing.T, p *AppPlayer, worker
+ 	if err != nil {
+ 		t.Fatal("actual C state", err)
+ 	}
+-	offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++	offered, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx, state.Percent})
+ 	if err != nil {
+ 		t.Fatal("offer", err)
+ 	}
+@@ -1826,7 +1826,7 @@ func testSelectedStageSustainedPCM(t *testing.T, p *AppPlayer, worker *player.Pl
+ 	if err != nil {
+ 		t.Fatal("protocol state adapter", err)
+ 	}
+-	value, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++	value, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx, state.Percent})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -2019,7 +2019,7 @@ func testSelectedEpisodeStage(t *testing.T, p *AppPlayer, worker *player.Player,
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	value, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx})
++	value, err := p.offerContent(contentOfferActorRequest{capture, state.Target, ctx, state.Percent})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -2805,7 +2805,7 @@ func TestContentCStateReportsFirstSafeReason(t *testing.T) {
+ 				case "policy":
+ 					state.Policy = "wrong"
+ 				case "volume":
+-					state.Percent = 0
++					state.Percent = 36 // above the start ceiling; any 0-35 room level is valid
+ 				case "target":
+ 					state.Target.DeviceID = "other"
+ 				case "output_process":
+diff --git a/daemon/room_release_test.go b/daemon/room_release_test.go
+index c8649c4..3e575cd 100644
+--- a/daemon/room_release_test.go
++++ b/daemon/room_release_test.go
+@@ -948,7 +948,7 @@ func testManualReleaseBlockedContentMoveClaims(t *testing.T, p *AppPlayer, heldM
+ 		t.Error("freshcontentcapture fixture", err)
+ 		return
+ 	}
+-	value, err := p.offerContent(contentOfferActorRequest{Capture: capture, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "101", "1"}, Context: ctx})
++	value, err := p.offerContent(contentOfferActorRequest{Capture: capture, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "101", "1"}, Context: ctx, Percent: 35})
+ 	if err != nil {
+ 		t.Error(err)
+ 		return
+diff --git a/daemon/room_start_level_test.go b/daemon/room_start_level_test.go
+new file mode 100644
+index 0000000..4d77327
+--- /dev/null
++++ b/daemon/room_start_level_test.go
+@@ -0,0 +1,48 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++// Policy v2: a start plays at the room's HomePod output level as C reports it,
++// never above 35 %. A room set to 8 % starts at 8 %.
++func TestStartLevelIsTheRoomLevelReportedByCNeverAbove35(t *testing.T) {
++	for _, tc := range []struct {
++		percent int
++		ok      bool
++	}{{8, true}, {0, true}, {35, true}, {36, false}, {-1, false}} {
++		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			_ = json.NewEncoder(w).Encode(contentCState{Schema: "podconnect.output_start_state.v1", OK: true, Ready: true, Policy: start35Policy, Percent: tc.percent, Target: contentTarget{"11111111-1111-1111-1111-111111111111", "101", "1"}})
++		}))
++		capture := &contentCapture{OwnTone: server.URL, Scope: roomVolumeScope{"account", "engine", "r0", "101"}}
++		state, err := capture.readCState(context.Background())
++		server.Close()
++		if tc.ok && (err != nil || state.Percent != tc.percent) {
++			t.Fatalf("C level %d refused: %v", tc.percent, err)
++		}
++		if !tc.ok && err == nil {
++			t.Fatalf("C level %d above the start ceiling accepted", tc.percent)
++		}
++	}
++}
++
++// The offered level is what C prepares and what the receipt reports.
++func TestStartLevelTravelsFromOfferToCPrepareAndReceipt(t *testing.T) {
++	op := &contentOperation{Capture: &contentCapture{Scope: roomVolumeScope{"account", "engine", "r0", "101"}}, Offer: contentOffer{"podconnect.room_content_offer.v1", strings.Repeat("a", 32), strings.Repeat("b", 64), strings.Repeat("c", 32), start35Policy, 8, 5000}, State: "complete"}
++	raw, _ := json.Marshal(op.cPrepareBody())
++	var body struct {
++		Percent int    `json:"start_volume_percent"`
++		Policy  string `json:"policy_revision"`
++	}
++	if err := json.Unmarshal(raw, &body); err != nil || body.Percent != 8 || body.Policy != start35Policy {
++		t.Fatalf("C prepare %s, want the room's 8 %%", raw)
++	}
++	if got := op.receipt("commit"); got.StartVolume != 8 {
++		t.Fatalf("receipt percent %d, want 8", got.StartVolume)
++	}
++}
