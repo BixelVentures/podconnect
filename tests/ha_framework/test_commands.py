@@ -165,6 +165,7 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
             "/spotify/me/player/next",
             "/spotify/me/player/previous",
             "/spotify/me/player/volume",
+            "/spotify/me/player/seek",
         }:
             self.assertEqual(
                 request.headers["Authorization"], "Bearer inert-fixture-only"
@@ -496,7 +497,9 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await self.controls()
         self.assertEqual(result["volume_percent"], 30)
-        self.assertEqual(result["actions"], ["resume", "next", "previous", "volume"])
+        self.assertEqual(
+            result["actions"], ["resume", "next", "previous", "seek", "volume"]
+        )
         self.assertEqual(self.calls, [])
         self.assertNotIn("NEVER_PUBLIC", json.dumps(result))
         status, _body = await self._service(
@@ -927,11 +930,20 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.invoke(request))["outcome"], "unknown")
         self.assertEqual(len(self._writes()), 1)
 
+    async def test_direct_device_seek_is_one_spotify_call(self):
+        """The account playing on a phone keeps seek (user rule: own account never loses control)."""
+        self.assertIn("seek", (await self.controls())["actions"])
+        result = await self.invoke(self.request("seek", args={"position_ms": 2500}))
+        self.assertTrue(result["ok"], result)
+        seeks = [c for c in self.calls if c[1] == "/spotify/me/player/seek"]
+        self.assertEqual(len(seeks), 1)
+        self.assertEqual(self.command_queries[-1]["position_ms"], "2500")
+
     async def test_missing_volume_support_and_disallows_do_not_advertise_controls(self):
         data = self.entries[0].runtime_data.coordinator.data
         data["playback"]["device"].pop("supports_volume")
         data["playback"]["actions"]["disallows"].update(
-            resuming=True, skipping_next=True, skipping_prev=True
+            resuming=True, skipping_next=True, skipping_prev=True, seeking=True
         )
         self.assertEqual((await self.controls())["actions"], [])
         self.assertEqual(

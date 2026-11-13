@@ -277,6 +277,11 @@ async def select_playback_source(
                     execution_guard=owned,
                 )
                 owned()
+                if isinstance(playback, dict) and playback["is_playing"] is True:
+                    # The account plays on another device (e.g. a phone): the room
+                    # takes the playback over, like choosing it in the Spotify app.
+                    await api.transfer(native_id, play=True)
+                    owned(same_poll=False)
                 return {
                     "kind": "configured_alias",
                     "target_id": selected["target_id"],

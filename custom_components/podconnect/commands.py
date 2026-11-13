@@ -352,6 +352,9 @@ class PlaybackCommands:
                     and playback["state"] != "paused"
                 )
             ]
+        if not native_room_phase and not disallows.get("seeking", False):
+            # The account's own device elsewhere (e.g. a phone): seek through Spotify.
+            actions.append("seek")
         volume = device.get("volume_percent")
         volume = volume if type(volume) is int and 0 <= volume <= 100 else None
         if device.get("supports_volume") is True and volume is not None:
@@ -759,7 +762,7 @@ class PlaybackCommands:
             logged.append(True)
             return value
 
-        if action in {"seek", "shuffle", "repeat"} and room_transport is None:
+        if action in {"shuffle", "repeat"} and room_transport is None:
             return rejected("native_room_required")
         if epoch != self.owner_epoch:
             return rejected("stale_owner")
@@ -1065,6 +1068,10 @@ class PlaybackCommands:
                     elif action == "volume":
                         await methods[action](
                             request["args"]["percent"], target_id, **kwargs
+                        )
+                    elif action == "seek":
+                        await self.data.api.seek(
+                            request["args"]["position_ms"], target_id, **kwargs
                         )
                     else:
                         await methods[action](target_id, **kwargs)

@@ -309,12 +309,24 @@ class SpotifyApi:
             ),
         )
 
-    async def seek(self, position_ms: int, device_id: str | None = None) -> None:
+    async def seek(
+        self,
+        position_ms: int,
+        device_id: str | None = None,
+        *,
+        execution_guard: Callable[[], bool] | None = None,
+        on_send: Callable[[], None] | None = None,
+    ) -> None:
         """PUT /me/player/seek."""
         await self._request(
             "PUT",
             "/me/player/seek",
             params={"position_ms": int(position_ms), "device_id": device_id},
+            **(
+                {"execution_guard": execution_guard, "on_send": on_send}
+                if execution_guard is not None
+                else {}
+            ),
         )
 
     async def set_volume(
