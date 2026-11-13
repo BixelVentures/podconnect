@@ -1,3 +1,8 @@
+## Speakers 0.26.102 og Control 0.10.46 — startlydstyrke og pause/lydstyrke går altid igennem
+
+- Musik starter på rummets egen lydstyrke og aldrig over 35 %, ad alle veje (kø, Find musik, stemme/Home Assistant, Spotify-appen og radio). Før startede kø og Find musik altid på præcis 35 %, også når rummet stod lavere.
+- Pause og lydstyrke virker altid, også efter en start fra Find musik. Før kunne begge blive afvist ("pause failed", "Native route unavailable"), både fra PodView og fra Spotify-appen.
+
 ## Speakers 0.26.101 — lydstyrke kan sættes, mens der er stille
 
 - Et stille rum tager nu imod lydstyrke. Den gemmes som rummets ønskede lydstyrke, og rummets første lyd spiller på den (dog aldrig over 35 %). Før svarede rummet "volume failed", og lydstyrken kunne ikke sænkes før start.
