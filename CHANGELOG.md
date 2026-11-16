@@ -1,3 +1,8 @@
+## Speakers 0.26.103 og Control 0.10.47 — rummet siger, om det er din Spotify-konto
+
+- Hvert rums afspiller i Home Assistant har nu `podconnect_account`: `own`, når Spotify-motorens indloggede bruger er den samme som PodConnects konto, `other`, når den med sikkerhed er en anden, og `unknown` ellers (fx intet spiller, eller rummet spiller radio). Intet navn opdigtes; Speakers sender kun en hash af brugeren, aldrig selve navnet.
+- AirPlay fra en anden enhed kan endnu ikke ses: HomePod'erne giver ikke afspilningsstatus uden parring.
+
 ## Speakers 0.26.102 og Control 0.10.46 — startlydstyrke og pause/lydstyrke går altid igennem
 
 - Musik starter på rummets egen lydstyrke og aldrig over 35 %, ad alle veje (kø, Find musik, stemme/Home Assistant, Spotify-appen og radio). Før startede kø og Find musik altid på præcis 35 %, også når rummet stod lavere.

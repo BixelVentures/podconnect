@@ -6,6 +6,9 @@ source is Spotify or radio. Every control is one direct Speakers call; last comm
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import re
 from datetime import datetime, timedelta
 
 from homeassistant.components.media_player import (
@@ -44,6 +47,24 @@ _SEARCH_TYPES = {
     "podcast": "show",
     "episode": "episode",
 }
+
+
+_HEX64 = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def room_account(row: dict | None, configured_id: str | None) -> str:
+    """"own"/"other" only from a byte comparison of the engine's logged-in username digest
+    with the configured account's /me.id; "unknown" whenever either side is missing."""
+    digest = (row or {}).get("account_sha256")
+    if (
+        not isinstance(digest, str)
+        or _HEX64.fullmatch(digest) is None
+        or not isinstance(configured_id, str)
+        or not configured_id
+    ):
+        return "unknown"
+    mine = hashlib.sha256(configured_id.encode("utf-8")).hexdigest()
+    return "own" if hmac.compare_digest(mine, digest) else "other"
 
 
 def room_unique_id(entry_id: str, room_id: str) -> str:
@@ -201,7 +222,11 @@ class PodConnectRoomPlayer(CoordinatorEntity[RoomStatus], MediaPlayerEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"podconnect_source": (self._row or {}).get("source") or None}
+        row = self._row or {}
+        return {
+            "podconnect_source": row.get("source") or None,
+            "podconnect_account": room_account(row, self._entry.unique_id),
+        }
 
     async def _control(self, action: str, **arguments) -> None:
         try:

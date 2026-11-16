@@ -354,6 +354,7 @@ func roomsStateHandler(w http.ResponseWriter, r *http.Request) {
 			info.NowPlaying = nowPlayingText
 			if info.Source == "spotify" {
 				info.Track = track
+				info.AccountSHA256 = gl.accountSHA
 			}
 		}
 		if info.Source == "radio" {
