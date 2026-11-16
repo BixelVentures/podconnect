@@ -167,3 +167,21 @@ func TestActiveRouteFallsBackToSelectedAlias(t *testing.T) {
 		t.Fatalf("selected output wins over a stale alias: %q", got)
 	}
 }
+
+// PodView shows "anden konto" only from a real comparison: the Spotify room carries the
+// digest of the engine's logged-in username (never the raw name); other rooms carry none.
+func TestSpotifyRoomCarriesEngineAccountDigestOnly(t *testing.T) {
+	byID := roomsRead(t, playingEngine, fridaSelected, "play")
+	if got, want := byID["r7"].AccountSHA256, canonicalUsernameDigest("u"); got == "" || got != want {
+		t.Fatalf("r7 account digest = %q, want %q", got, want)
+	}
+	if byID["r0"].AccountSHA256 != "" || byID["r6"].AccountSHA256 != "" {
+		t.Fatal("idle rooms must not claim an account")
+	}
+	idle := roomsRead(t, `{}`, noneSelected, "stop")
+	for id, row := range idle {
+		if row.AccountSHA256 != "" {
+			t.Fatalf("%s without a session claims an account", id)
+		}
+	}
+}

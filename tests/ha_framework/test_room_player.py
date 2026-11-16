@@ -1,5 +1,6 @@
 """Room entities: state is Speakers' room status; each control is one direct call."""
 
+import hashlib
 import unittest
 
 import test_targets as fixture
@@ -145,6 +146,29 @@ class RoomPlayerFrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(beta.state, "playing")
         self.assertEqual(beta.attributes["media_title"], "Radio")
         self.assertEqual(beta.attributes["podconnect_source"], "radio")
+
+    async def test_account_is_own_other_or_unknown_from_engine_digest(self):
+        configured = self.hass.config_entries.async_get_entry("account-alpha").unique_id
+        cases = {
+            "own": hashlib.sha256(configured.encode()).hexdigest(),
+            "other": hashlib.sha256(b"someone-else").hexdigest(),
+            "unknown": None,
+        }
+        for want, digest in cases.items():
+            with self.subTest(want):
+                if digest is None:
+                    self.room_rows["room-alpha"].pop("account_sha256", None)
+                else:
+                    self.room_rows["room-alpha"]["account_sha256"] = digest
+                await self.call("media_pause", "room-alpha")
+                alpha = self.hass.states.get(self.entity_id("room-alpha"))
+                self.assertEqual(alpha.attributes["podconnect_account"], want)
+        self.room_rows["room-alpha"]["account_sha256"] = "not-a-digest"
+        await self.call("media_pause", "room-alpha")
+        state = self.hass.states.get(self.entity_id("room-alpha"))
+        self.assertEqual(state.attributes["podconnect_account"], "unknown")
+        beta = self.hass.states.get(self.entity_id("room-beta"))
+        self.assertEqual(beta.attributes["podconnect_account"], "unknown")
 
     async def test_controls_are_one_direct_room_call_each(self):
         await self.call("media_pause", "room-alpha")

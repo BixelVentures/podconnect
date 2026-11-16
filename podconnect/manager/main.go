@@ -341,6 +341,7 @@ type glStatus struct {
 	SelAlias     int           // device-aliases: currently selected alias id (0 = none), from the fork's /status
 	AliasBinding *aliasBinding // nil preserves the old engine protocol; nonnil must be current
 	trackURI     string        // private item anchor for revision hints
+	accountSHA   string        // sha256 of the engine's logged-in canonical username, "" if unread
 }
 
 // librespotStatus reads go-librespot's /status once (volume + transport). With external_volume:true
@@ -369,6 +370,7 @@ func librespotStatus(base string) glStatus {
 		return glStatus{} // empty body / no session
 	}
 	out := glStatus{Active: st.Username != "" || st.Volume != nil, Paused: st.Paused, Stopped: st.Stopped, AliasBinding: st.AliasBinding}
+	out.accountSHA = canonicalUsernameDigest(st.Username)
 	var track struct {
 		URI string `json:"uri"`
 	}
@@ -1327,6 +1329,9 @@ type roomInfo struct {
 	Source      string                 `json:"source"`          // "spotify", "radio" or ""
 	State       string                 `json:"state"`           // "playing", "paused", "connecting" or "idle"
 	Track       *roomTrack             `json:"track,omitempty"` // the Spotify item on this room
+	// AccountSHA256 is the sha256 of the Spotify engine's logged-in canonical username, set only
+	// on the room whose source is Spotify. Never the raw username; Control compares it.
+	AccountSHA256 string `json:"account_sha256,omitempty"`
 	Released    bool                   `json:"released"`
 	NowPlaying  string                 `json:"now_playing"`
 	Volume      int                    `json:"volume"` // 0..100, or -1 if unknown
