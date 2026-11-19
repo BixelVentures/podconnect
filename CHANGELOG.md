@@ -1,3 +1,9 @@
+## Control 0.10.48 — Find musik kan vise kunstnere, album, podcasts og senest spillede
+
+- Nye læsetjenester til PodViews nye Find musik: `top_artists` (dine mest spillede kunstnere), `saved_albums` (gemte album), `saved_shows` (gemte podcasts) og `recent_contexts` (de playlister, album, kunstnere og podcasts, du senest har spillet fra). Kun data fra din egen Spotify-konto; intet opdigtes, og ingen nye tilladelser kræves.
+- Søgning beder nu højst om 10 resultater ad gangen. Spotify sænkede grænsen fra 50 til 10 i februar 2026, så søgninger med flere end 10 fejlede.
+- Album, kunstnere og podcasts kan startes i et rum ad samme vej som playlister (testet).
+
 ## Speakers 0.26.103 og Control 0.10.47 — rummet siger, om det er din Spotify-konto
 
 - Hvert rums afspiller i Home Assistant har nu `podconnect_account`: `own`, når Spotify-motorens indloggede bruger er den samme som PodConnects konto, `other`, når den med sikkerhed er en anden, og `unknown` ellers (fx intet spiller, eller rummet spiller radio). Intet navn opdigtes; Speakers sender kun en hash af brugeren, aldrig selve navnet.

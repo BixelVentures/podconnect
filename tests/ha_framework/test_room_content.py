@@ -163,6 +163,66 @@ class RoomContentFrameworkTests(RoomVolumeFrameworkTests):
                     )
                 )
 
+    async def test_find_musik_album_artist_show_and_playlist_start_through_room_flow(
+        self,
+    ):
+        # Find musik shelves start albums, artists and podcasts like playlists:
+        # staged, then one explicit commit under the same owner epoch.
+        data = self.entries[0].runtime_data
+        for index, kind in enumerate(("album", "artist", "show", "playlist")):
+            with self.subTest(kind=kind):
+                self.content_posts.clear()
+                self.content_offer_id = "%032x" % (index + 1)
+                uri = "spotify:" + kind + ":" + "C" * 21 + str(index)
+                request = self.content_request(
+                    context=True,
+                    args={"context_uri": uri, "max_volume": 35},
+                    start_offer=self.content_offer_value(),
+                )
+                self.assertEqual(
+                    (
+                        await self.content_invoke(
+                            "prepare_room_selected_content", request
+                        )
+                    )["state"],
+                    "staged",
+                )
+                self.assertEqual(self.content_commits(), [])
+                self.assertEqual(
+                    [body["args"] for body in self.prepares()],
+                    [{"context_uri": uri, "max_volume": 35}],
+                )
+                self.assertEqual(self.prepares()[0]["action"], "play_context")
+                receipt = await self.content_invoke(
+                    "start_room_selected_content", request
+                )
+                self.assertEqual(
+                    (receipt["outcome"], receipt["action"], receipt["owner_epoch"]),
+                    ("accepted", "play_context", data.coordinator.owner_epoch),
+                )
+                self.assertEqual(len(self.content_commits()), 1)
+                # Replaying the same start never commits twice.
+                await self.content_invoke("start_room_selected_content", request)
+                self.assertEqual(len(self.content_commits()), 1)
+
+    async def test_find_musik_context_start_rejects_replaced_owner_epoch(self):
+        for kind in ("album", "artist", "show"):
+            with self.subTest(kind=kind):
+                self.content_posts.clear()
+                request = self.content_request(
+                    context=True,
+                    owner_epoch="replaced-owner",
+                    args={
+                        "context_uri": "spotify:" + kind + ":" + "D" * 22,
+                        "max_volume": 35,
+                    },
+                )
+                result = await self.content_invoke(
+                    "prepare_room_selected_content", request
+                )
+                self.assertEqual(result["state"], "rejected")
+                self.assertEqual(self.content_posts, [])
+
     async def asyncSetUp(self):
         self.content_posts = []
         self.content_hold = False

@@ -84,3 +84,21 @@ def spotify_playlist_artwork(playlist: object) -> dict | None:
         if url is not None:
             return {"kind": "playlist_cover", "provider": "spotify", "url": url}
     return None
+
+
+def spotify_image_artwork(value: object, kind: str) -> dict | None:
+    """Project the first canonical i.scdn.co image of an album, artist or show."""
+    if kind not in {"album_cover", "artist_image", "show_cover"}:
+        return None
+    if not isinstance(value, dict):
+        return None
+    images = value.get("images")
+    if not isinstance(images, list) or len(images) > 20:
+        return None
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        url = _allowed_spotify_image_url(image.get("url"), canonical=True)
+        if url is not None:
+            return {"kind": kind, "provider": "spotify", "url": url}
+    return None

@@ -18,6 +18,18 @@ from homeassistant.helpers.config_entry_oauth2_flow import OAuth2Session
 
 from .const import SPOTIFY_API
 
+# Highest `limit` Spotify's /search accepts since the February 2026 API change.
+SEARCH_PROVIDER_MAX_LIMIT = 10
+
+# Read-only library endpoints the Find musik shelves may call (exact or by prefix).
+_LIBRARY_READ_PATHS = (
+    "/me/top/artists",
+    "/me/albums",
+    "/me/shows",
+    "/me/player/recently-played",
+)
+_LIBRARY_READ_PREFIXES = ("/albums/", "/artists/", "/playlists/", "/shows/")
+
 
 class SpotifyApiError(Exception):
     """Raised when a Spotify Web API request fails."""
@@ -172,6 +184,31 @@ class SpotifyApi:
             async_execution_guard=owner_guard,
         )
 
+    async def library_read(
+        self,
+        path: str,
+        params: dict[str, Any] | None,
+        *,
+        owner_guard: Callable[[], Awaitable[None]],
+        max_bytes: int = 262144,
+    ) -> Any:
+        """One bounded GET of a read-only library endpoint through this owner."""
+        if path not in _LIBRARY_READ_PATHS and not (
+            path.startswith(_LIBRARY_READ_PREFIXES)
+            and path.count("/") == 2
+            and path.rsplit("/", 1)[1].isascii()
+            and path.rsplit("/", 1)[1].isalnum()
+            and len(path.rsplit("/", 1)[1]) == 22
+        ):
+            raise SpotifyApiError("Unsupported library read")
+        return await self._request(
+            "GET",
+            path,
+            params=params,
+            max_bytes=max_bytes,
+            async_execution_guard=owner_guard,
+        )
+
     async def search(
         self,
         query: str,
@@ -179,6 +216,9 @@ class SpotifyApi:
         limit: int = 8,
     ) -> dict[str, Any]:
         """GET /search — returns {tracks,artists,albums,playlists: {items:[...]}}."""
+        # Spotify's February 2026 Web API caps search at 10 results per type
+        # (default 5); asking for more fails, so callers get at most 10 rows.
+        limit = max(1, min(int(limit), SEARCH_PROVIDER_MAX_LIMIT))
         return (
             await self._request(
                 "GET", "/search", params={"q": query, "type": types, "limit": limit}
