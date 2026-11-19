@@ -922,6 +922,7 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     PodConnectData=lambda **kw: SimpleNamespace(**kw, active=False),
                     _register_services=lambda h: None,
                     register_playlist_search=lambda *args: None,
+                    register_library_shelves=lambda *args: None,
                     _library_owner=object(), _search_query=object(), _search_limit=object(),
                     register_target_services=lambda h: None,
                     register_observation_services=lambda h: None,

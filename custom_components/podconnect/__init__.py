@@ -35,6 +35,7 @@ from .commands import PlaybackCommands, register_command_services
 from .const import CONF_SPEAKERS_URL, DOMAIN, SPOTIFY_SCOPES
 from .const import LOGGER as LOGGER
 from .coordinator import PodConnectCoordinator
+from .library_shelves import register_library_shelves
 from .observations import ObservationReader, current, register_observation_services
 from .playlist_catalogue import register_playlist_search
 from .speakers import SpeakersClient
@@ -316,6 +317,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     entry.runtime_data.commands = PlaybackCommands(entry.runtime_data)
     _register_services(hass)
     register_playlist_search(hass, _library_owner, _search_query, _search_limit)
+    register_library_shelves(hass, _library_owner)
     register_command_services(hass)
     register_observation_services(hass)
     register_account_diagnostic_service(hass)
