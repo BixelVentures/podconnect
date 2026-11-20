@@ -1,3 +1,9 @@
+## Control 0.10.49 — Spotify-pause respekteres, og PodConnect starter alligevel
+
+- Når Spotify siger "vent" (HTTP 429, for mange forespørgsler), venter PodConnect nu hele den tid, Spotify beder om, før kontoen spørger igen. Før blev afspilningen hentet hvert 3. sekund under hele pausen, hvilket kun forlængede udelukkelsen (i dag ca. 1 t 50 min, 16/11 ca. 14 t). Uden ventetid fra Spotify ventes 30 s, derefter dobbelt så længe op til 15 min. I loggen står én linje, når pausen starter (med sluttidspunkt), og én, når den slutter.
+- Under pausen sendes intet til Spotify: tryk, der kræver Spotify (fx søgning, bibliotek, kø og afspilningskommandoer gennem Spotify), svarer straks "rate limited … try again later" i stedet for at fejle langsomt. Sidst kendte afspilning vises fortsat, mærket som forældet (`stale_reason: rate_limited`).
+- En 429 under opstart stopper ikke længere hele PodConnect. Før endte integrationen i "prøver igen" uden tjenester, så PodView, PodVoice og Home Assistant mistede al styring, til Spotify-pausen var forbi. Nu indlæses den, tjenesterne og rummenes afspillere virker med det samme (rummene kommer fra Speakers, ikke Spotify), og Spotify-tilstanden kommer af sig selv, når pausen er slut.
+
 ## Control 0.10.48 — Find musik kan vise kunstnere, album, podcasts og senest spillede
 
 - Nye læsetjenester til PodViews nye Find musik: `top_artists` (dine mest spillede kunstnere), `saved_albums` (gemte album), `saved_shows` (gemte podcasts) og `recent_contexts` (de playlister, album, kunstnere og podcasts, du senest har spillet fra). Kun data fra din egen Spotify-konto; intet opdigtes, og ingen nye tilladelser kræves.

@@ -266,6 +266,15 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:  # noqa: BLE001
             return  # Notification only; never affects the observation itself.
 
+    def _rate_limit_remaining(self) -> float:
+        remaining = getattr(self.api, "rate_limit_remaining", None)
+        return remaining() if callable(remaining) else 0.0
+
+    @property
+    def rate_limited(self) -> bool:
+        """Spotify's backoff is active and the last poll did not succeed."""
+        return not self.last_update_success and self._rate_limit_remaining() > 0
+
     def _check_command_owner(self):
         if self.command_owner_guard is not None and not self.command_owner_guard():
             raise UpdateFailed("Observation owner replaced")
@@ -333,6 +342,14 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch playback state + the device list."""
         self._check_command_owner()
+        # Spotify asked this account to back off: no read, no per-tick log line, and
+        # HA schedules the next poll for when the backoff ends. Last data is kept.
+        remaining = getattr(self.api, "rate_limit_remaining", lambda: 0.0)()
+        if remaining > 0:
+            raise UpdateFailed(
+                f"Spotify rate limited (retry-after={int(remaining + 0.999)}s)",
+                retry_after=remaining,
+            )
         self.poll_sequence += 1
         poll_sequence = self.poll_sequence
         poll_owner_epoch = getattr(self, "owner_epoch", None)
@@ -413,6 +430,9 @@ class PodConnectCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except SpotifyApiError as err:
             outcome = "spotify_api"
+            remaining = getattr(self.api, "rate_limit_remaining", lambda: 0.0)()
+            if remaining > 0:
+                raise UpdateFailed(str(err), retry_after=remaining) from err
             raise UpdateFailed(str(err)) from err
         except asyncio.CancelledError:
             outcome = "outer_cancelled"

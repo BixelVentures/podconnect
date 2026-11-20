@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import logging
+import random
 import sys
 import time
 import unittest
@@ -30,6 +32,9 @@ API = load_isolated(
         "SPOTIFY_API": "https://example.invalid",
         "CONF_ACCESS_TOKEN": "access_token",
         "json_module": json,
+        "time": time,
+        "random": random,
+        "LOGGER": logging.getLogger("podconnect-isolated-api"),
     },
     {"SpotifyApiError", "SpotifyApi"},
 )

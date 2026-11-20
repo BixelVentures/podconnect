@@ -34,6 +34,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import PodConnectConfigEntry
 from .api import SpotifyApiError
@@ -308,6 +309,27 @@ class PodConnectMediaPlayer(
         if self._optimistic_playing is not None:
             playing = self._optimistic_playing  # show intent until the poll confirms
         return MediaPlayerState.PLAYING if playing else MediaPlayerState.PAUSED
+
+    @property
+    def available(self) -> bool:
+        """During Spotify's backoff the last observation stays visible, marked stale."""
+        return super().available or (
+            getattr(self.coordinator, "rate_limited", False) is True
+            and self.coordinator.data is not None
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if getattr(self.coordinator, "rate_limited", False) is not True:
+            return None
+        until = getattr(self.coordinator.api, "rate_limited_until_epoch", None)
+        return {
+            "observation": "stale",
+            "stale_reason": "rate_limited",
+            "rate_limited_until": dt_util.utc_from_timestamp(until).isoformat()
+            if isinstance(until, (int, float))
+            else None,
+        }
 
     @callback
     def _handle_coordinator_update(self) -> None:

@@ -7,6 +7,8 @@ token handling, talks to the Web API with the shared aiohttp client session.
 from __future__ import annotations
 
 import json as json_module
+import random
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,7 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.config_entry_oauth2_flow import OAuth2Session
 
-from .const import SPOTIFY_API
+from .const import LOGGER, SPOTIFY_API
 
 # Highest `limit` Spotify's /search accepts since the February 2026 API change.
 SEARCH_PROVIDER_MAX_LIMIT = 10
@@ -45,10 +47,92 @@ class SpotifyApiError(Exception):
 class SpotifyApi:
     """Thin Spotify Web API client."""
 
+    # Retry-After missing or unreadable: 30 s doubling to 15 min. A stated
+    # Retry-After is honoured in full (Spotify has asked for hours), max one day.
+    RATE_LIMIT_FALLBACK_S = 30
+    RATE_LIMIT_FALLBACK_MAX_S = 900
+    RATE_LIMIT_MAX_S = 86400
+
     def __init__(self, hass: HomeAssistant, session: OAuth2Session) -> None:
         """Initialise with an OAuth2 session that owns token refresh."""
         self._session = session
         self._web: ClientSession = async_get_clientsession(hass)
+
+    # --- account-wide rate-limit backoff (one Spotify account per entry) ---
+    def _clock(self) -> float:
+        return time.monotonic()
+
+    def _jitter(self) -> float:
+        return random.uniform(0.5, 3.0)
+
+    def rate_limit_remaining(self) -> float:
+        """Seconds left of Spotify's requested backoff; 0 when requests may go out."""
+        until = getattr(self, "_rate_limited_until", None)
+        if until is None:
+            return 0.0
+        return max(0.0, until - self._clock())
+
+    def _note_rate_limited(self, header: str | None) -> None:
+        """A 429: no request of any kind to Spotify until the deadline passes."""
+        previous_until = getattr(self, "_rate_limited_until", None)
+        active = previous_until is not None and previous_until > self._clock()
+        stated = (
+            isinstance(header, str)
+            and header.isascii()
+            and header.isdigit()
+            and len(header) <= 6
+        )
+        if stated:
+            seconds = int(header)
+        elif active:
+            return  # A parallel read's 429 belongs to the backoff already running.
+        else:
+            previous = getattr(self, "_rate_limit_fallback_s", None)
+            seconds = (
+                self.RATE_LIMIT_FALLBACK_S
+                if previous is None
+                else min(self.RATE_LIMIT_FALLBACK_MAX_S, previous * 2)
+            )
+            self._rate_limit_fallback_s = seconds
+        seconds = min(self.RATE_LIMIT_MAX_S, max(1, seconds))
+        until = self._clock() + seconds + self._jitter()
+        self._rate_limited_until = max(until, previous_until or until)
+        # Wall-clock deadline, for logs and the stale marker on the entity.
+        self.rate_limited_until_epoch = (
+            time.time() + self._rate_limited_until - self._clock()
+        )
+        if not active:
+            LOGGER.warning(
+                "spotify_rate_limit event=started retry_after_s=%s until=%s",
+                seconds,
+                time.strftime(
+                    "%Y-%m-%dT%H:%M:%S%z",
+                    time.localtime(self.rate_limited_until_epoch),
+                ),
+            )
+
+    def _note_not_rate_limited(self) -> None:
+        """Spotify answered without 429 after a backoff: the backoff has ended."""
+        if (
+            getattr(self, "_rate_limited_until", None) is None
+            # A reply to a request sent before the 429 does not end the backoff.
+            or self.rate_limit_remaining() > 0
+        ):
+            return
+        self._rate_limited_until = None
+        self.rate_limited_until_epoch = None
+        self._rate_limit_fallback_s = None
+        LOGGER.warning("spotify_rate_limit event=ended")
+
+    def _admit(self) -> None:
+        remaining = self.rate_limit_remaining()
+        if remaining > 0:
+            retry_after = max(1, int(remaining + 0.999))
+            raise SpotifyApiError(
+                f"rate limited (retry-after={retry_after}s)",
+                status=429,
+                retry_after=retry_after,
+            )
 
     async def _request(
         self,
@@ -64,6 +148,8 @@ class SpotifyApi:
         on_send: Callable[[], None] | None = None,
     ) -> Any:
         """Make an authenticated request; returns parsed JSON or None."""
+        # During Spotify's requested backoff nothing is sent, not even a token refresh.
+        self._admit()
         await self._session.async_ensure_token_valid()
         token = self._session.token[CONF_ACCESS_TOKEN]
         # Drop None-valued query params (Spotify rejects empty device_id).
@@ -89,6 +175,10 @@ class SpotifyApi:
                 else {}
             ),
         ) as resp:
+            if resp.status == 429:
+                self._note_rate_limited(resp.headers.get("Retry-After"))
+            else:
+                self._note_not_rate_limited()
             if execution_guard is not None and resp.status != 204:
                 raise SpotifyApiError(
                     "Spotify command did not return acceptance", status=resp.status
@@ -121,9 +211,12 @@ class SpotifyApi:
             if resp.status == 204:
                 return None
             if resp.status == 429:
+                header = resp.headers.get("Retry-After")
+                waited = max(1, int(self.rate_limit_remaining()))
                 raise SpotifyApiError(
-                    f"rate limited (retry-after={resp.headers.get('Retry-After')}s)",
+                    f"rate limited (retry-after={header or waited}s)",
                     status=resp.status,
+                    retry_after=waited,
                 )
             if resp.status >= 400:
                 raise SpotifyApiError(

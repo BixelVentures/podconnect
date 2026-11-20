@@ -48,6 +48,18 @@ spotify_api = importlib.import_module("custom_components.podconnect.api")
 from custom_components.podconnect.const import DOMAIN, SPOTIFY_SCOPES
 
 
+def expire_spotify_backoff(entries):
+    """Time moves past Spotify's Retry-After for every account.
+
+    A 429 now holds the whole account back (no request until the deadline), so a
+    test that checks several provider statuses in a row lets that time pass first.
+    """
+    for entry in entries:
+        api = entry.runtime_data.api
+        if getattr(api, "_rate_limited_until", None) is not None:
+            api._rate_limited_until = api._clock() - 1
+
+
 class TargetFrameworkTests(unittest.IsolatedAsyncioTestCase):
     # The PodConnect speaker's Spotify id; only that device becomes an HA entity.
     engine_identity = "a" * 40

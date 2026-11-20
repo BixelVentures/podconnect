@@ -128,6 +128,9 @@ class ObservationReader:
         coordinator = self.coordinator
         data = coordinator.data
         if not coordinator.last_update_success or not isinstance(data, dict):
+            # Honest reason while Spotify's backoff holds; commands fail fast on it.
+            if getattr(coordinator, "rate_limited", False) is True:
+                return _error("rate_limited")
             return _error("unavailable")
         observed = data.get("playback_observed_at")
         monotonic = data.get("playback_observed_monotonic")
