@@ -40,6 +40,7 @@ _REJECT_KINDS = frozenset(
         "invalid_target",
         "capabilities_unavailable",
         "unavailable",
+        "rate_limited",
     }
 )
 

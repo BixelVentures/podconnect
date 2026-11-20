@@ -205,6 +205,10 @@ def _register_services(hass: HomeAssistant) -> None:
             try:
                 items = await getattr(owner.api, method_name)()
             except SpotifyApiError as err:
+                if getattr(err, "status", None) == 429:
+                    raise HomeAssistantError(
+                        f"Spotify rate limited {method_name}; try again later"
+                    ) from err
                 raise HomeAssistantError(
                     f"Spotify library request failed: {err}"
                 ) from err
@@ -245,6 +249,10 @@ def _register_services(hass: HomeAssistant) -> None:
                 result = await owner.api.search(query, types="track", limit=limit)
             except SpotifyApiError as err:
                 current(hass, entry.entry_id, owner)
+                if getattr(err, "status", None) == 429:
+                    raise HomeAssistantError(
+                        "Spotify rate limited search; try again later"
+                    ) from err
                 raise HomeAssistantError("Spotify search failed") from err
             current(hass, entry.entry_id, owner)
             return _search_projection(result, entry.entry_id, query, limit)
@@ -300,7 +308,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
 
     api = SpotifyApi(hass, session)
     coordinator = PodConnectCoordinator(hass, entry, api)
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady:
+        # A Spotify rate limit is not a broken setup: load anyway so services and
+        # local Speakers control keep working; the poll resumes after Retry-After.
+        if api.rate_limit_remaining() <= 0:
+            raise
+        LOGGER.warning(
+            "PodConnect loaded while Spotify is rate limited; "
+            "Spotify state follows when the limit ends"
+        )
 
     base = entry.options.get(CONF_SPEAKERS_URL)
     speakers = SpeakersClient(async_get_clientsession(hass), base) if base else None

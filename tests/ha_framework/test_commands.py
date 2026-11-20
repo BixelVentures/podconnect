@@ -958,6 +958,7 @@ class CommandFrameworkTests(unittest.IsolatedAsyncioTestCase):
         coord = self.entries[0].runtime_data.coordinator
         for status in (200, 302, 403, 429, 500):
             self.command_status = status
+            fixture.expire_spotify_backoff(self.entries)
             await coord.async_refresh()
             result = await self.invoke(self.request())
             self.assertEqual(result["outcome"], "unknown")
