@@ -175,6 +175,7 @@ class UserPlaylistFrameworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_errors_size_and_rate_limit_are_single_sanitized_failure(self):
         for status in (302, 403, 429, 500):
+            fixture.expire_spotify_backoff(self.entries)
             self.calls.clear()
             self.provider_status = status
             code, body = await self._service(
@@ -184,6 +185,7 @@ class UserPlaylistFrameworkTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("PRIVATE", str(body))
             self.assertEqual(len(self.calls), 1)
         self.provider_status = 200
+        fixture.expire_spotify_backoff(self.entries)
         self.oversized = True
         self.calls.clear()
         self.assertNotEqual(

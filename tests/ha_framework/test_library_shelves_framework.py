@@ -398,6 +398,7 @@ class LibraryShelvesFrameworkTests(unittest.IsolatedAsyncioTestCase):
         }
         for service, path in cases.items():
             with self.subTest(service=service):
+                fixture.expire_spotify_backoff(self.entries)
                 self.calls.clear()
                 self.statuses = {path: 429}
                 with self.assertRaisesRegex(HomeAssistantError, "rate limited") as err:
@@ -405,6 +406,7 @@ class LibraryShelvesFrameworkTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("PRIVATE", str(err.exception))
                 self.assertEqual(len(self.reads()), 1)
         # A rate limit while resolving stops every later lookup.
+        fixture.expire_spotify_backoff(self.entries)
         self.calls.clear()
         self.statuses = {"/spotify/artists/" + sid("R", 3): 429}
         with self.assertRaisesRegex(HomeAssistantError, "rate limited"):
