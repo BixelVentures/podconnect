@@ -1058,3 +1058,36 @@ recent_contexts:
           min: 1
           max: 12
           mode: box
+
+set_speaker_rules:
+  name: Set the family's speaker rules
+  description: Admin only. Per-room music permissions, a per-room volume ceiling and the other-account guard, enforced on every PodConnect write (room and speaker media players, play_media, volume_set/volume_up, move and the control services) whoever calls. Give exactly one of podview_policy (PodVoice's podview_control_policy JSON; this account's room rows are taken over), rules, or clear. Takes effect at once, without reloading.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect
+    podview_policy:
+      required: false
+      selector:
+        text:
+          multiline: true
+    rules:
+      required: false
+      selector:
+        object:
+    clear:
+      required: false
+      selector:
+        boolean:
+
+get_speaker_rules:
+  name: Read the family's speaker rules
+  description: Response-only. The speaker rules this account enforces, or null when none are set.
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: podconnect

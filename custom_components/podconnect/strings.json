@@ -53,5 +53,22 @@
       "speaker_changed": "This speaker changed while settings were open. Open settings again.",
       "configuration_changed": "Settings changed while this form was open. Open settings again."
     }
+  },
+  "exceptions": {
+    "room_action_not_allowed": {
+      "message": "The family's speaker rules do not allow {action} in {room}."
+    },
+    "other_account_playing": {
+      "message": "Another Spotify account is playing in {room}; PodConnect does not {action} someone else's music."
+    },
+    "room_unknown": {
+      "message": "PodConnect cannot tell which room the speaker plays in, so the family's speaker rules block {action}."
+    },
+    "invalid_speaker_rules": {
+      "message": "The speaker rules are invalid ({reason})."
+    },
+    "unknown_account": {
+      "message": "No PodConnect account with that config entry id."
+    }
   }
 }

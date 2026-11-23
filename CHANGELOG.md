@@ -1,3 +1,11 @@
+## Control 0.10.50 — familiens højttalerregler gælder, uanset hvem der styrer
+
+- Rummenes musiktilladelser, lydstyrkeloft og "en anden Spotify-konto spiller her"-værnet håndhæves nu af PodConnect selv. Før gjaldt de kun, når PodVoice sendte kaldet; PodView-panelet i Home Assistant, automationer, andre dashboards og stemmens almindelige Home Assistant-kald (fx "skru op") gik udenom.
+- Det gælder alle skriveveje: rummets og højttalerens afspiller i Home Assistant (afspil, pause, næste/forrige, spol, `volume_set`, `volume_up`/`volume_down`, `play_media`, bibliotek), PodConnects styretjenester (rumafspilning, rumlydstyrke, kø, valgt indhold, flyt) og `move_playback`.
+- Reglerne er de samme som PodVoices i dag: en handling kræver, at rummets regel tillader den; lydstyrke over rummets loft sænkes til loftet (som PodVoice gør), og en start beder aldrig om mere end loftet; pause, afspil, næste/forrige, spol og lydstyrke afvises, mens en anden Spotify-konto spiller i rummet, men egen musik kan stadig startes. Shuffle, gentag og radio via Speakers er ikke omfattet, som i dag.
+- En afvisning er en tydelig fejl i Home Assistant, der nævner rummet og handlingen (oversat, med egen fejlnøgle), aldrig en stille ingenting.
+- Reglerne sættes af en administrator med den nye tjeneste `podconnect.set_speaker_rules` (fx ved at indsætte PodVoices `podview_control_policy`) og kan læses med `podconnect.get_speaker_rules`. De virker med det samme uden genindlæsning. Uden regler opfører PodConnect sig præcis som før.
+
 ## Control 0.10.49 — Spotify-pause respekteres, og PodConnect starter alligevel
 
 - Når Spotify siger "vent" (HTTP 429, for mange forespørgsler), venter PodConnect nu hele den tid, Spotify beder om, før kontoen spørger igen. Før blev afspilningen hentet hvert 3. sekund under hele pausen, hvilket kun forlængede udelukkelsen (i dag ca. 1 t 50 min, 16/11 ca. 14 t). Uden ventetid fra Spotify ventes 30 s, derefter dobbelt så længe op til 15 min. I loggen står én linje, når pausen starter (med sluttidspunkt), og én, når den slutter.

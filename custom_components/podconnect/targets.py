@@ -164,6 +164,7 @@ async def select_playback_source(
         raise HomeAssistantError("Invalid source selection")
     from .commands import CommandRejected
     from .observations import current
+    from .speaker_rules import enforce
     from .speakers import SpeakersError
 
     data = current(hass, entry_id)
@@ -264,6 +265,8 @@ async def select_playback_source(
         )
         if alias_matches:
             selected = alias_matches[0]
+            # Moving playback into a room is governed by that room's speaker rules.
+            enforce(entry, selected["target_id"], "move_existing_session")
             if not selected["homepod_id"]:
                 raise HomeAssistantError("Configured output unavailable")
             if not native_playback:

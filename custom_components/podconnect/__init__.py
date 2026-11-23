@@ -38,6 +38,8 @@ from .coordinator import PodConnectCoordinator
 from .library_shelves import register_library_shelves
 from .observations import ObservationReader, current, register_observation_services
 from .playlist_catalogue import register_playlist_search
+from .speaker_rules import OPTION as SPEAKER_RULES
+from .speaker_rules_service import register_speaker_rules_services
 from .speakers import SpeakersClient
 from .targets import register_target_services
 
@@ -56,6 +58,8 @@ class PodConnectData:
     observations: ObservationReader | None = None
     commands: PlaybackCommands | None = None
     configuration_identity: tuple[str | None, str, str] | None = None
+    # Speakers' room observation (room_player.RoomStatus); the speaker rules read it.
+    rooms: object | None = None
 
 
 PodConnectConfigEntry = ConfigEntry[PodConnectData]
@@ -280,7 +284,11 @@ def _configuration_identity(
     """Configuration requiring a new owner; OAuth token refresh retains its session."""
     return (
         entry.unique_id,
-        json.dumps(dict(entry.options), sort_keys=True),
+        # Speaker rules are read on every write and never need a new owner.
+        json.dumps(
+            {k: v for k, v in entry.options.items() if k != SPEAKER_RULES},
+            sort_keys=True,
+        ),
         json.dumps(
             {key: value for key, value in entry.data.items() if key != CONF_TOKEN},
             sort_keys=True,
@@ -340,6 +348,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: PodConnectConfigEntry) -
     register_observation_services(hass)
     register_account_diagnostic_service(hass)
     register_target_services(hass)
+    register_speaker_rules_services(hass)
     entry.async_on_unload(entry.add_update_listener(_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.runtime_data.active = True

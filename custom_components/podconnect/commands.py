@@ -1126,6 +1126,66 @@ class PlaybackCommands:
         return copy.deepcopy(receipt)
 
 
+# Write services the family's speaker rules govern (speaker_rules.py). Reads, cancels
+# and shuffle/repeat are not part of the rules.
+_GOVERNED_SERVICES = frozenset(
+    {
+        "control_playback",
+        "control_room_playback",
+        "control_room_volume",
+        "prepare_room_queue",
+        "control_room_queue",
+        "prepare_room_selected_content",
+        "start_room_selected_content",
+        "prepare_room_move_playback",
+        "move_room_playback",
+    }
+)
+
+
+def _governed(hass, name, handler):
+    """Refuse (ServiceValidationError) or cap a write before its handler runs."""
+    from homeassistant.core import ServiceCall
+
+    from .speaker_rules import enforce, enforce_on_route, governs
+
+    async def guarded(call):
+        entry = hass.config_entries.async_get_entry(call.data["config_entry_id"])
+        if entry is None or entry.domain != DOMAIN or not governs(entry):
+            return await handler(call)
+        action = call.data["action"]
+        args = call.data.get("args")
+        key = "percent" if action == "volume" else "max_volume"
+        percent = (
+            args[key]
+            if isinstance(args, dict) and type(args.get(key)) is int
+            else None
+        )
+        room = call.data.get("room_id")
+        if name == "control_playback":
+            room = (
+                args.get("room_id")
+                if action in ("play_track", "play_context") and isinstance(args, dict)
+                else None
+            )
+        if isinstance(room, str):
+            allowed = enforce(entry, room, action, percent=percent)
+        else:
+            allowed = await enforce_on_route(entry, action, percent=percent)
+        if percent is not None and allowed != percent:
+            call = ServiceCall(
+                hass,
+                call.domain,
+                call.service,
+                {**call.data, "args": {**args, key: allowed}},
+                call.context,
+                call.return_response,
+            )
+        return await handler(call)
+
+    return guarded if name in _GOVERNED_SERVICES else handler
+
+
 def register_command_services(hass):
     from .room_transport import ACTIONS as room_transport_actions
     from .room_transport import OBSERVED_ACTIONS
@@ -1456,7 +1516,7 @@ def register_command_services(hass):
             hass.services.async_register(
                 DOMAIN,
                 name,
-                handler,
+                _governed(hass, name, handler),
                 schema=vol.Schema(schema),
                 supports_response=SupportsResponse.ONLY,
             )

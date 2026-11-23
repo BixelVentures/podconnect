@@ -835,7 +835,12 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_unload_and_options_reload_owners(self):
         ns = load_body(
             "__init__.py",
-            dict(PLATFORMS=["media_player"], json=json, CONF_TOKEN="token"),
+            dict(
+                PLATFORMS=["media_player"],
+                json=json,
+                CONF_TOKEN="token",
+                SPEAKER_RULES="speaker_rules",
+            ),
             names={"async_unload_entry", "_options_updated", "_configuration_identity"},
         )
         hass, data, entries, reg = services()
@@ -926,6 +931,8 @@ class TargetTests(unittest.IsolatedAsyncioTestCase):
                     _library_owner=object(), _search_query=object(), _search_limit=object(),
                     register_target_services=lambda h: None,
                     register_observation_services=lambda h: None,
+                    register_speaker_rules_services=lambda h: None,
+                    SPEAKER_RULES="speaker_rules",
                     _options_updated=object(),
                     PLATFORMS=["media_player"],
                 ),
