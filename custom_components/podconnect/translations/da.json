@@ -53,5 +53,22 @@
       "speaker_changed": "Højttaleren er ændret. Åbn indstillingerne igen.",
       "configuration_changed": "Indstillingerne er ændret. Åbn dem igen."
     }
+  },
+  "exceptions": {
+    "room_action_not_allowed": {
+      "message": "Familiens højttalerregler tillader ikke {action} i {room}."
+    },
+    "other_account_playing": {
+      "message": "En anden Spotify-konto spiller i {room}; PodConnect styrer ikke andres musik ({action})."
+    },
+    "room_unknown": {
+      "message": "PodConnect kan ikke se, hvilket rum højttaleren spiller i, så familiens højttalerregler blokerer {action}."
+    },
+    "invalid_speaker_rules": {
+      "message": "Højttalerreglerne er ugyldige ({reason})."
+    },
+    "unknown_account": {
+      "message": "Ingen PodConnect-konto med det config entry id."
+    }
   }
 }

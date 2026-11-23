@@ -84,6 +84,7 @@ class ControlErrorTests(unittest.IsolatedAsyncioTestCase):
             else:
                 entity.coordinator.api.saved_tracks.return_value = result
             entity._send = AsyncMock()
+            entity._rules = AsyncMock()  # No speaker rules on this account.
             with self.assertRaises(HomeAssistantError):
                 await load_send('async_play_from_library')(entity, 'liked')
             entity._send.assert_not_awaited()

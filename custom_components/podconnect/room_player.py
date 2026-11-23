@@ -6,9 +6,6 @@ source is Spotify or radio. Every control is one direct Speakers call; last comm
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import re
 from datetime import datetime, timedelta
 
 from homeassistant.components.media_player import (
@@ -29,6 +26,7 @@ from homeassistant.helpers.update_coordinator import (
 
 from .api import SpotifyApiError
 from .const import DOMAIN, LOGGER
+from .speaker_rules import enforce, room_account
 from .speakers import SpeakersError
 
 ROOM_POLL = timedelta(seconds=2)
@@ -47,24 +45,6 @@ _SEARCH_TYPES = {
     "podcast": "show",
     "episode": "episode",
 }
-
-
-_HEX64 = re.compile(r"[a-f0-9]{64}\Z")
-
-
-def room_account(row: dict | None, configured_id: str | None) -> str:
-    """"own"/"other" only from a byte comparison of the engine's logged-in username digest
-    with the configured account's /me.id; "unknown" whenever either side is missing."""
-    digest = (row or {}).get("account_sha256")
-    if (
-        not isinstance(digest, str)
-        or _HEX64.fullmatch(digest) is None
-        or not isinstance(configured_id, str)
-        or not configured_id
-    ):
-        return "unknown"
-    mine = hashlib.sha256(configured_id.encode("utf-8")).hexdigest()
-    return "own" if hmac.compare_digest(mine, digest) else "other"
 
 
 def room_unique_id(entry_id: str, room_id: str) -> str:
@@ -101,6 +81,8 @@ class RoomStatus(DataUpdateCoordinator[dict[str, dict]]):
 async def async_setup_rooms(hass, entry, async_add_entities) -> None:
     """Add a room entity for every configured room, now and when rooms are added."""
     status = RoomStatus(hass, entry, entry.runtime_data.speakers)
+    # The speaker rules read each room's account from the same observation.
+    entry.runtime_data.rooms = status
     await status.async_refresh()
     known: set[str] = set()
 
@@ -236,23 +218,34 @@ class PodConnectRoomPlayer(CoordinatorEntity[RoomStatus], MediaPlayerEntity):
         finally:
             await self.coordinator.async_refresh()
 
+    def _allowed(self, action: str, percent: int | None = None):
+        """The family's speaker rules for this room, before anything is sent."""
+        return enforce(self._entry, self.room_id, action, percent=percent)
+
     async def async_media_play(self) -> None:
+        self._allowed("resume")
         await self._control("resume")
 
     async def async_media_pause(self) -> None:
+        self._allowed("pause")
         await self._control("pause")
 
     async def async_media_next_track(self) -> None:
+        self._allowed("next")
         await self._control("next")
 
     async def async_media_previous_track(self) -> None:
+        self._allowed("previous")
         await self._control("previous")
 
     async def async_media_seek(self, position: float) -> None:
+        self._allowed("seek")
         await self._control("seek", position_ms=round(position * 1000))
 
     async def async_set_volume_level(self, volume: float) -> None:
-        await self._control("volume", volume=round(volume * 100))
+        # volume_up/volume_down arrive here too (HA steps through volume_set).
+        percent = self._allowed("volume", round(volume * 100))
+        await self._control("volume", volume=percent)
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         """Start Spotify content in this room: select the room, then play on the speaker."""
@@ -262,6 +255,10 @@ class PodConnectRoomPlayer(CoordinatorEntity[RoomStatus], MediaPlayerEntity):
             uri = media_id if media_id.startswith("spotify:") else None
             if uri is None:
                 uri = await _search_top_uri(api, media_id, media_type)
+            kind = uri.split(":")[1] if uri.count(":") >= 2 else ""
+            self._allowed(
+                "play_track" if kind in ("track", "episode") else "play_context"
+            )
             catalog = await speakers.aliases()
             if (catalog.get("binding") or {}).get("room_id") != self.room_id:
                 await speakers.move(self.room_id, catalog)

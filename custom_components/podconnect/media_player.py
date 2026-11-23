@@ -630,7 +630,16 @@ class PodConnectMediaPlayer(
             )
             raise
 
+    async def _rules(self, action: str, percent: int | None = None):
+        """The family's speaker rules for the room this speaker plays in."""
+        from .speaker_rules import enforce_on_route
+
+        return await enforce_on_route(
+            self.coordinator.config_entry, action, percent=percent
+        )
+
     async def async_media_play(self) -> None:
+        await self._rules("resume")
         if await self._native_command("resume"):
             return
         self._optimistic_playing = True
@@ -651,6 +660,7 @@ class PodConnectMediaPlayer(
         )
 
     async def async_media_pause(self) -> None:
+        await self._rules("pause")
         if await self._native_command("pause"):
             return
         self._optimistic_playing = False
@@ -658,11 +668,13 @@ class PodConnectMediaPlayer(
         await self._send(self.coordinator.api.pause(self._device_id))
 
     async def async_media_next_track(self) -> None:
+        await self._rules("next")
         if await self._native_command("next"):
             return
         await self._send(self.coordinator.api.next(self._device_id))
 
     async def async_media_previous_track(self) -> None:
+        await self._rules("previous")
         if await self._native_command("previous"):
             return
         await self._send(self.coordinator.api.previous(self._device_id))
@@ -675,16 +687,17 @@ class PodConnectMediaPlayer(
         ):
             raise HomeAssistantError("Invalid seek position")
         position_ms = int(position * 1000)
+        await self._rules("seek")
         if await self._native_command("seek", {"position_ms": position_ms}):
             return
         await self._send(self.coordinator.api.seek(position_ms, self._device_id))
 
     async def async_set_volume_level(self, volume: float) -> None:
-        if await self._native_command("volume", {"percent": round(volume * 100)}):
+        # volume_up/volume_down arrive here too (HA steps through volume_set).
+        percent = await self._rules("volume", round(volume * 100))
+        if await self._native_command("volume", {"percent": percent}):
             return
-        await self._send(
-            self.coordinator.api.set_volume(round(volume * 100), self._device_id)
-        )
+        await self._send(self.coordinator.api.set_volume(percent, self._device_id))
 
     async def async_set_shuffle(self, shuffle: bool) -> None:
         if type(shuffle) is not bool:
@@ -931,6 +944,11 @@ class PodConnectMediaPlayer(
             media_id = await self._search_top_uri(query, media_type) or ""
             if not media_id:
                 raise HomeAssistantError(f"No Spotify match for {query!r}")
+        await self._rules(
+            "play_track"
+            if media_id.startswith(("spotify:track:", "spotify:episode:"))
+            else "play_context"
+        )
         if await self._native_selected_content(media_id, source):
             return
         if media_id.startswith(("spotify:track:", "spotify:episode:")):
@@ -976,6 +994,7 @@ class PodConnectMediaPlayer(
 
         if source not in {"liked", "top_tracks", "recent"} or type(shuffle) is not bool:
             raise HomeAssistantError("Invalid library selection")
+        await self._rules("play_tracks")
         hass = self.coordinator.hass
         data = current(hass, self._entry_id)
         coordinator, api = self.coordinator, self.coordinator.api
